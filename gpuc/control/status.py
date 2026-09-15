@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings
+from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.transport import TransportError
 
@@ -83,6 +84,7 @@ class HostView:
     draining: bool = False
     paused: bool = False
     owned: list[str] = field(default_factory=list)
+    pod: Pod | None = None
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
@@ -128,7 +130,9 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             attempt=entry.get("attempt", 1),
             started_at=entry.get("started_at"),
             ended_at=entry.get("ended_at"),
-            util_recent=[float(u) for u in entry.get("util_recent") or []],
+            # A sample is null when nvidia-smi failed; drop it rather than
+            # counting a missing reading as 0% and calling the job a suspect.
+            util_recent=[float(u) for u in entry.get("util_recent") or [] if u is not None],
         )
         if view.status == "running":
             running.append(view)
@@ -142,9 +146,18 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
 
 
 def gather(
-    entry: HostEntry, settings: Settings | None = None, *, session: HostSession | None = None
+    entry: HostEntry,
+    settings: Settings | None = None,
+    *,
+    session: HostSession | None = None,
+    provider: Provider | None = None,
 ) -> HostView:
     view = HostView(entry=entry, owned=list(entry.gpus))
+    if provider is not None and entry.kind == "runpod" and entry.pod_id:
+        try:
+            view.pod = provider.get(entry.pod_id)
+        except ProviderError as exc:
+            view.error = f"could not read pod {entry.pod_id}: {exc}"
     try:
         session = session or open_session(entry, settings)
         payload = session.host_json("status", timeout=60.0)
@@ -160,6 +173,17 @@ def gather(
     return view
 
 
+def pod_line(pod: Pod | None) -> str | None:
+    if pod is None:
+        return None
+    age = "age ?" if pod.age is None else f"age {pod.age.total_seconds() / 60.0:.0f}m"
+    util = ",".join(f"{u}%" for u in pod.gpu_utils) if pod.gpu_utils else "--"
+    return (
+        f"  pod     {pod.id} {pod.status} {pod.gpu_name or '?'} "
+        f"${pod.cost_usd_hr:.3f}/h cuda {pod.cuda_version or '?'} {age} util {util}"
+    )
+
+
 def _fmt_util(job: JobView) -> str:
     return "util --" if job.last_util is None else f"util {job.last_util:.0f}%"
 
@@ -172,11 +196,15 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
     entry = view.entry
     target = entry.ssh or "this machine"
     if not view.reachable:
-        return (
-            f"host {entry.name} [{entry.kind}] {target}: UNREACHABLE\n"
-            f"  {view.error}\n"
-            f"  try: gpuc host probe {entry.name}"
-        )
+        lines = [
+            f"host {entry.name} [{entry.kind}] {target}: UNREACHABLE",
+            f"  {view.error}",
+        ]
+        pod = pod_line(view.pod)
+        if pod:
+            lines.append(pod)
+        lines.append(f"  try: gpuc host probe {entry.name}")
+        return "\n".join(lines)
     flags = []
     if view.draining:
         flags.append("DRAINING")
@@ -194,6 +222,9 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
     if flags:
         header += "  " + " ".join(flags)
     lines = [header]
+    pod = pod_line(view.pod)
+    if pod:
+        lines.append(pod + ("  PAST TTL" if view.past_ttl else ""))
 
     if suspects_only:
         for job in view.suspects:

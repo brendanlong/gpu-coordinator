@@ -128,3 +128,21 @@ def test_an_ephemeral_host_past_its_ttl_is_a_suspect() -> None:
     )
     assert old.past_ttl
     assert "older than 1.0h" in render(old, suspects_only=True)
+
+
+def test_null_utilization_samples_are_dropped() -> None:
+    _, running, _ = job_views(
+        {
+            "jobs": [
+                {
+                    "job_id": "j",
+                    "status": "running",
+                    "phase": "main",
+                    "gpus": [GPU],
+                    "util_recent": [90.0, None, 80.0],
+                }
+            ]
+        }
+    )
+    assert running[0].util_recent == [90.0, 80.0]
+    assert not running[0].suspect

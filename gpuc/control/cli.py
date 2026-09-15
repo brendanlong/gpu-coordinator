@@ -10,6 +10,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from gpuc.control import pods as pods_mod
+from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import status as status_mod
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host
 from gpuc.control.config import (
@@ -24,12 +26,22 @@ from gpuc.control.config import (
     utc_now,
 )
 from gpuc.control.probe import probe_host
+from gpuc.control.providers.base import Cloud, Constraints, Provider, ProviderError
+from gpuc.control.providers.runpod import RunPodProvider
+from gpuc.control.provision import ProvisionError, runpod_host
 from gpuc.control.remote import RemoteError, open_session
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError, job_log_uri
-from gpuc.control.submit import SubmitError, submit_file, submit_spec, validate
+from gpuc.control.submit import (
+    JobSpecModel,
+    SubmitError,
+    expand_job_id,
+    load_document,
+    submit_file,
+    submit_spec,
+    validate,
+)
 from gpuc.control.transport import SshTransport, Transport, TransportError
-
-NOT_IMPLEMENTED = "not implemented yet"
+from gpuc.host import jobs
 
 
 class CliError(RuntimeError):
@@ -111,13 +123,77 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+CLOUDS: dict[str, list[Cloud]] = {
+    "secure": ["SECURE"],
+    "community": ["COMMUNITY"],
+    "any": ["SECURE", "COMMUNITY"],
+}
+
+
+def make_provider(settings: Settings) -> Provider:
+    return RunPodProvider(caps=settings.caps())
+
+
+def constraints_from(args: argparse.Namespace) -> Constraints:
+    names = _gpu_list(args.gpu)
+    if not names:
+        raise CliError(
+            "--runpod needs --gpu <name>[,<name>] (for example --gpu A40,RTX4090).\n"
+            "Names are matched against the RunPod catalog, short or full."
+        )
+    return Constraints(
+        gpu_names=names,
+        min_vram_gb=args.min_vram,
+        max_price_usd_hr=args.max_price,
+        clouds=CLOUDS[args.cloud],
+        cuda_min=args.cuda_min,
+        gpu_count=args.gpu_count,
+    )
+
+
+def runpod_target(args: argparse.Namespace, settings: Settings) -> HostEntry:
+    return runpod_host(
+        constraints_from(args),
+        settings,
+        provider=make_provider(settings),
+        reuse=not args.no_reuse,
+        name_hint=args.name_hint,
+        idle_minutes=args.idle_min,
+        ttl_hours=args.ttl_hours,
+        disk_gb=args.disk,
+        health_args=args.health_args,
+    )
+
+
+def mirror_spec_first(model: JobSpecModel, job_id: str, settings: Settings) -> list[str]:
+    """Put the spec in S3 before spending any money, so a lost pod is still requeueable."""
+    s3 = S3Index.from_settings(settings)
+    if s3 is None:
+        return [
+            "s3_bucket is unset, so the spec was not mirrored before provisioning; "
+            "`gpuc requeue` will need the job file again"
+        ]
+    try:
+        s3.put_spec(expand_job_id(model.to_spec(job_id)))
+    except S3IndexError as exc:
+        return [f"could not mirror the spec to S3 before provisioning: {exc}"]
+    return []
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
+    settings = load_settings()
     if args.runpod:
-        print(f"submit --runpod is {NOT_IMPLEMENTED}; submit to a registered host with --host")
-        return 1
+        document = load_document(args.job_file)
+        model = validate(document, str(args.job_file))
+        job_id = jobs.new_job_id()
+        notes = mirror_spec_first(model, job_id, settings)
+        entry = runpod_target(args, settings)
+        result = submit_spec(entry, model, settings, workdir=Path.cwd(), job_id=job_id)
+        result.notes.extend(notes)
+        print(result.render())
+        return 0
     if not args.host:
         raise CliError("submit needs --host <name> (see `gpuc host list`)")
-    settings = load_settings()
     entry = load_registry().require(args.host)
     result = submit_file(entry, args.job_file, settings, workdir=Path.cwd())
     print(result.render())
@@ -137,14 +213,26 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not entries:
         print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
         return 0
+    provider = _provider_for_status(entries, settings)
     seen: set[str] = set()
     for entry in entries:
-        view = status_mod.gather(entry, settings)
+        view = status_mod.gather(entry, settings, provider=provider)
         seen.update(job.job_id for job in view.queue + view.running + view.finished)
         print(status_mod.render(view, suspects_only=args.suspects))
     if args.all and not args.suspects:
         _print_unhosted(settings, seen)
     return 0
+
+
+def _provider_for_status(entries: list[HostEntry], settings: Settings) -> Provider | None:
+    """Only build a provider when an ephemeral host is on screen, and never fail on it."""
+    if not any(entry.kind == "runpod" for entry in entries):
+        return None
+    try:
+        return make_provider(settings)
+    except ProviderError as exc:
+        print(f"note: pod status unavailable: {exc}", file=sys.stderr)
+        return None
 
 
 def _print_unhosted(settings: Settings, seen: set[str]) -> None:
@@ -257,16 +345,12 @@ def _logs_from_s3(
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
-    if args.runpod:
-        print(f"requeue --runpod is {NOT_IMPLEMENTED}; use --host <name>")
-        return 1
     settings = load_settings()
     registry = load_registry()
     index = LocalIndex().get(args.job_id)
-    target = args.host or (index.host if index else None)
-    if not target:
+    target = args.host or (None if args.runpod else (index.host if index else None))
+    if not target and not args.runpod:
         raise CliError(f"requeue needs --host <name>: nothing local knows where {args.job_id} ran")
-    entry = registry.require(target)
     s3 = S3Index.from_settings(settings)
     if s3 is None:
         raise CliError(
@@ -277,6 +361,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     for key in ("job_id", "attempt"):
         document.pop(key, None)
     attempt = (index.attempt if index else 1) + 1
+    entry = runpod_target(args, settings) if target is None else registry.require(target)
     result = submit_spec(
         entry,
         validate(document, f"spec for {args.job_id}"),
@@ -289,14 +374,29 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_reconcile(_: argparse.Namespace) -> int:
-    print(f"reconcile is {NOT_IMPLEMENTED}")
-    return 1
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    if args.install:
+        reconcile_mod.install(args.interval)
+        return 0
+    settings = load_settings()
+    provider = make_provider(settings)
+    if args.once:
+        result = reconcile_mod.reconcile_once(settings, provider)
+        print(result.render())
+        return 1 if result.errors else 0
+    print(f"reconciling every {args.interval:.0f}s; Ctrl-C to stop")
+    try:
+        reconcile_mod.run_loop(settings, provider, interval_s=args.interval)
+    except KeyboardInterrupt:
+        print("stopped")
+    return 0
 
 
-def cmd_pods(_: argparse.Namespace) -> int:
-    print(f"pods is {NOT_IMPLEMENTED}")
-    return 1
+def cmd_pods(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    view = pods_mod.gather(settings, make_provider(settings), heartbeats=not args.no_heartbeat)
+    print(pods_mod.render(view))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -336,7 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit = sub.add_parser("submit", help="submit a job file to a host")
     submit.add_argument("job_file")
     submit.add_argument("--host")
-    submit.add_argument("--runpod", action="store_true")
+    add_runpod_flags(submit)
     submit.set_defaults(func=cmd_submit)
 
     status = sub.add_parser("status", help="per-host queue, running and recent jobs")
@@ -366,12 +466,41 @@ def build_parser() -> argparse.ArgumentParser:
     requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
     requeue.add_argument("job_id")
     requeue.add_argument("--host")
-    requeue.add_argument("--runpod", action="store_true")
+    add_runpod_flags(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
-    sub.add_parser("reconcile", help=f"({NOT_IMPLEMENTED})").set_defaults(func=cmd_reconcile)
-    sub.add_parser("pods", help=f"({NOT_IMPLEMENTED})").set_defaults(func=cmd_pods)
+    reconcile = sub.add_parser(
+        "reconcile", help="terminate leaked or expired pods; --install for a systemd timer"
+    )
+    reconcile.add_argument("--once", action="store_true", help="one pass, then exit")
+    reconcile.add_argument("--interval", type=float, default=reconcile_mod.DEFAULT_INTERVAL_S)
+    reconcile.add_argument(
+        "--install", action="store_true", help="write (but do not enable) systemd --user units"
+    )
+    reconcile.set_defaults(func=cmd_reconcile)
+
+    pods = sub.add_parser("pods", help="every pod with our prefix, cost, util, age, desired?")
+    pods.add_argument(
+        "--no-heartbeat", action="store_true", help="skip the per-pod dispatcher ssh check"
+    )
+    pods.set_defaults(func=cmd_pods)
     return parser
+
+
+def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--runpod", action="store_true", help="reuse or provision a RunPod pod")
+    parser.add_argument("--gpu", help="comma-separated GPU names, cheapest match wins")
+    parser.add_argument("--gpu-count", type=int, default=1)
+    parser.add_argument("--min-vram", type=int)
+    parser.add_argument("--max-price", type=float, help="USD per hour, for the whole pod")
+    parser.add_argument("--cloud", choices=sorted(CLOUDS), default="secure")
+    parser.add_argument("--cuda-min", default=None, help="host CUDA floor, default 12.8")
+    parser.add_argument("--idle-min", type=float, default=15.0)
+    parser.add_argument("--ttl-hours", type=float, default=24.0)
+    parser.add_argument("--disk", type=int, default=50, help="container disk in GB")
+    parser.add_argument("--no-reuse", action="store_true", help="always create a new pod")
+    parser.add_argument("--name-hint", default="job", help="goes into the pod name")
+    parser.add_argument("--health-args", default="", help="extra flags for `gpuc.host health`")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -383,6 +512,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ConfigError,
         SubmitError,
         BootstrapError,
+        ProvisionError,
+        ProviderError,
         RemoteError,
         S3IndexError,
         TransportError,

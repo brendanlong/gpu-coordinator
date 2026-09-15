@@ -63,6 +63,8 @@ class Pod(BaseModel):
     name: str
     status: PodStatus
     cost_usd_hr: float
+    gpu_name: str | None = None
+    gpu_count: int = 0
     cuda_version: str | None = None
     ssh_direct: SshEndpoint | None = None
     gpu_utils: list[int] = Field(default_factory=list)
@@ -103,6 +105,11 @@ def check_caps(caps: Caps, pods: list[Pod], new_price_usd_hr: float) -> None:
 
 
 class Provider(ABC):
+    caps: Caps
+
+    def list_ours(self) -> list[Pod]:
+        return owned_pods(self.list(), self.caps.prefix)
+
     @abstractmethod
     def offers(self, constraints: Constraints) -> list[Offer]: ...
 

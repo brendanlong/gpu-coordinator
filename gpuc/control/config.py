@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from gpuc.control.providers.base import Caps, Offer
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.jobs import HostConfig
 
@@ -28,6 +29,10 @@ DEFAULT_POD_PREFIX = "gpuc-"
 
 class ConfigError(RuntimeError):
     pass
+
+
+class DesiredUnreadable(ConfigError):
+    """The reaper's fail-closed signal: we cannot tell which pods are ours."""
 
 
 def config_dir() -> Path:
@@ -54,6 +59,16 @@ def hosts_file() -> Path:
 
 def known_hosts_file() -> Path:
     return state_dir() / "known_hosts"
+
+
+def pod_known_hosts_file(name: str) -> Path:
+    """One known_hosts per ephemeral host.
+
+    RunPod recycles ``host:port`` between pods, so a shared file plus
+    StrictHostKeyChecking=accept-new wedges the *second* pod to land on a
+    reused endpoint with a host key mismatch.
+    """
+    return state_dir() / "known_hosts.d" / f"{name}"
 
 
 def lock_file() -> Path:
@@ -84,6 +99,13 @@ class Settings(BaseModel):
     @property
     def ssh_key_path(self) -> str | None:
         return str(Path(self.ssh_key).expanduser()) if self.ssh_key else None
+
+    def caps(self) -> Caps:
+        return Caps(
+            prefix=self.runpod_pod_prefix,
+            max_pods=self.max_pods,
+            max_total_usd_per_hour=self.max_total_usd_per_hour,
+        )
 
 
 def load_settings() -> Settings:
@@ -212,6 +234,84 @@ def registry_transaction() -> Iterator[Registry]:
         save_registry(registry)
 
 
+class DesiredHost(BaseModel):
+    """What we asked the provider for, written before the pod can be lost.
+
+    This file is the only thing that distinguishes a pod we are waiting on from
+    a leaked one, so it is written immediately after `create` returns and
+    removed only once the pod is gone.
+    """
+
+    name: str
+    pod_id: str
+    offer: Offer
+    created_at: str
+    ceiling_at: str
+    idle_minutes: float = 15.0
+    ttl_hours: float = 24.0
+    image: str | None = None
+    bootstrapped_at: str | None = None
+
+    @property
+    def bootstrapped(self) -> bool:
+        return self.bootstrapped_at is not None
+
+
+def desired_file(name: str) -> Path:
+    return desired_dir() / f"{name}.json"
+
+
+def write_desired(desired: DesiredHost) -> Path:
+    directory = desired_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = desired_file(desired.name)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    tmp.write_text(desired.model_dump_json(indent=2) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
+def read_desired(name: str) -> DesiredHost | None:
+    path = desired_file(name)
+    if not path.exists():
+        return None
+    try:
+        return DesiredHost.model_validate_json(path.read_text())
+    except (OSError, ValidationError):
+        return None
+
+
+def remove_desired(name: str) -> None:
+    desired_file(name).unlink(missing_ok=True)
+
+
+def load_desired() -> list[DesiredHost]:
+    """Every desired host, or raise: a partial answer would reap live pods."""
+    directory = desired_dir()
+    if not directory.is_dir():
+        raise DesiredUnreadable(
+            f"{directory} does not exist, so nothing is known about which pods are ours.\n"
+            f"That is not the same as `no pods`, so nothing will be terminated. "
+            f"It is created by `gpuc submit --runpod`."
+        )
+    try:
+        paths = sorted(directory.glob("*.json"))
+    except OSError as exc:
+        raise DesiredUnreadable(
+            f"cannot list {directory}: {exc}\nFix its permissions; nothing was terminated."
+        ) from exc
+    hosts: list[DesiredHost] = []
+    for path in paths:
+        try:
+            hosts.append(DesiredHost.model_validate_json(path.read_text()))
+        except (OSError, ValidationError) as exc:
+            raise DesiredUnreadable(
+                f"{path} is not a readable desired-host record: {exc}\n"
+                f"Nothing was terminated. Check `gpuc pods`, then fix or delete that file."
+            ) from exc
+    return hosts
+
+
 def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transport:
     settings = settings or load_settings()
     ensure_state_dir()
@@ -228,6 +328,7 @@ def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transpo
         port=entry.port,
         key=settings.ssh_key_path,
         state_dir=state_dir(),
+        known_hosts=pod_known_hosts_file(entry.name) if entry.kind == "runpod" else None,
     )
 
 

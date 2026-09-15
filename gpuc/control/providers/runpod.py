@@ -23,7 +23,6 @@ from .base import (
     SshEndpoint,
     check_caps,
     cuda_key,
-    owned_pods,
 )
 
 BASE_URL = "https://api.runpod.io/v2"
@@ -259,9 +258,6 @@ class RunPodProvider(Provider):
         payload = self._json("GET", "/pods", params={"includeClusterPods": "true"})
         return [_pod_from_api(pod) for pod in payload["pods"]]
 
-    def list_ours(self) -> list[Pod]:
-        return owned_pods(self.list(), self.caps.prefix)
-
     def ensure_ssh_key(self, public_key: str) -> bool:
         entry = public_key.strip()
         blob = entry.split()[1]
@@ -281,11 +277,15 @@ def _pod_from_api(payload: dict[str, Any]) -> Pod:
     direct = (payload.get("ssh") or {}).get("direct")
     runtime = payload.get("runtime") or {}
     created_at = payload.get("createdAt")
+    gpu = payload.get("gpu") or {}
+    machine = payload.get("machine") or {}
     return Pod(
         id=payload["id"],
         name=payload["name"],
         status=payload["status"],
         cost_usd_hr=payload.get("cost") or 0.0,
+        gpu_name=gpu.get("id") or machine.get("gpuTypeId") or payload.get("gpuTypeId"),
+        gpu_count=int(gpu.get("count") or payload.get("gpuCount") or 0),
         cuda_version=payload.get("cudaVersion"),
         ssh_direct=SshEndpoint(**{k: direct[k] for k in ("host", "port", "username")})
         if direct
