@@ -24,7 +24,7 @@ def minutes_ago(minutes: float) -> str:
 
 def payload(**overrides: Any) -> dict[str, Any]:
     document: dict[str, Any] = {
-        "host": "spar",
+        "host": "gpubox",
         "gpus": [GPU, "GPU-b"],
         "ephemeral": False,
         "draining": False,
@@ -58,7 +58,7 @@ def payload(**overrides: Any) -> dict[str, Any]:
 
 
 def view(**overrides: Any) -> HostView:
-    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
     host_view = HostView(entry=entry, reachable=True, owned=[GPU, "GPU-b"], heartbeat_age_s=2.0)
     host_view.queue, host_view.running, host_view.finished = job_views(payload(**overrides))
     return host_view
@@ -99,7 +99,7 @@ def test_a_host_on_another_build_cannot_break_the_whole_status() -> None:
     assert running[0].priority is None
     assert running[0].util_recent == [90.0]
 
-    host_view = HostView(entry=HostEntry(name="spar", kind="ssh", ssh="me@box"), reachable=True)
+    host_view = HostView(entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), reachable=True)
     host_view.queue, host_view.running, host_view.finished = queued, running, finished
     assert "dispatcher DOWN" in render(host_view)
 
@@ -193,7 +193,7 @@ def test_a_cpu_only_job_is_never_a_suspect() -> None:
 
 def test_render_shows_the_host_line_queue_running_and_recent() -> None:
     text = render(view())
-    assert "host spar [ssh] me@box  dispatcher 2s ago  gpus 1/2 free" in text
+    assert "host gpubox [ssh] me@box  dispatcher 2s ago  gpus 1/2 free" in text
     assert "running j-running train phase=main" in text
     assert "util 90%" in text
     assert "queued  j-queued next prio=10" in text
@@ -201,10 +201,10 @@ def test_render_shows_the_host_line_queue_running_and_recent() -> None:
 
 
 def test_an_unreachable_host_says_what_to_run_next() -> None:
-    down = HostView(entry=HostEntry(name="spar", kind="ssh", ssh="me@box"), error="ssh timed out")
+    down = HostView(entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), error="ssh timed out")
     text = render(down)
     assert "UNREACHABLE" in text
-    assert "gpuc host probe spar" in text
+    assert "gpuc host probe gpubox" in text
 
 
 def test_a_stale_heartbeat_reads_as_a_dead_dispatcher() -> None:
@@ -345,7 +345,7 @@ def with_workdir_bytes(*sizes: int) -> HostView:
 def test_finished_workdirs_over_a_gigabyte_are_called_out() -> None:
     rendered = render(with_workdir_bytes(4 * GIB, 3 * GIB))
     assert "7.0 GiB still in 2 finished job workdir(s)" in rendered
-    assert "gpuc clean --host spar --all-finished" in rendered
+    assert "gpuc clean --host gpubox --all-finished" in rendered
 
 
 def test_a_small_leftover_is_not_worth_a_line() -> None:
@@ -402,7 +402,7 @@ def test_finished_jobs_with_unconfirmed_outputs_are_flagged() -> None:
             "outputs_pending": True,
         }
     )
-    view = HostView(entry=HostEntry(name="spar", kind="ssh", ssh="me@box"), reachable=True)
+    view = HostView(entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), reachable=True)
     view.queue, view.running, view.finished = job_views(document)
     out = render(view)
     assert "outputs not uploaded" in out
@@ -429,7 +429,7 @@ def test_a_lost_output_says_so_louder() -> None:
 def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     """`config.gpus` may name cards by index, and only the host knows today's
     numbering -- so free/busy, and the per-card lines, come from its answer."""
-    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", gpus=["0", "7"])
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "7"])
     host_view = HostView(entry=entry, reachable=True, heartbeat_age_s=2.0)
     host_view.owned, host_view.indices = owned_gpus(
         payload(
@@ -451,7 +451,7 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
 
 
 def test_a_host_from_before_the_resolved_table_still_reports_its_gpus() -> None:
-    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
     owned, indices = owned_gpus(payload(), entry)
     assert owned == [GPU, "GPU-b"]
     assert indices == {}

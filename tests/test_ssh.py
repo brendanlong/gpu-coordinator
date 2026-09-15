@@ -19,7 +19,7 @@ JOB = "20260915-120000-abc123"
 class RecordingTransport:
     """A transport that runs nothing and remembers what it was asked to run."""
 
-    host = "spar"
+    host = "gpubox"
 
     def __init__(self, returncode: int = 0) -> None:
         self.commands: list[str] = []
@@ -50,7 +50,7 @@ def ssh_transport(tmp_path: Path) -> SshTransport:
     # tmp_path does not (which control_path() refuses, loudly, by design).
     control = Path("/tmp") / f"gpuc-test-{os.getpid()}"
     return SshTransport(
-        host="spar",
+        host="gpubox",
         target="me@box",
         port=2222,
         key=str(tmp_path / "id_ed25519"),
@@ -122,15 +122,15 @@ def test_a_local_host_gets_a_shell_not_an_ssh(tmp_path: Path) -> None:
 def test_print_shows_a_copyable_command_line(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    main(["host", "add", "spar", "--ssh", "me@box", "--port", "2222", "--gpus", GPU])
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--port", "2222", "--gpus", GPU])
     capsys.readouterr()
-    assert main(["ssh", "spar", "--print"]) == EXIT_OK
+    assert main(["ssh", "gpubox", "--print"]) == EXIT_OK
     line = capsys.readouterr().out.strip()
     assert line.startswith("ssh ")
     assert "me@box" in line
     assert "-p 2222" in line
 
-    assert main(["ssh", "spar", "--print", "--", "nvidia-smi"]) == EXIT_OK
+    assert main(["ssh", "gpubox", "--print", "--", "nvidia-smi"]) == EXIT_OK
     with_command = capsys.readouterr().out.strip()
     assert "nvidia-smi" in with_command
 

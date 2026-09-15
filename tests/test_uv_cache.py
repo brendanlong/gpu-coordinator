@@ -182,10 +182,10 @@ def test_health_warns_loudly_when_the_cache_is_on_another_filesystem(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(health, "same_filesystem", lambda _a, _b: False)
-    check = health.check_uv_cache(HostConfig(host="spar"))
+    check = health.check_uv_cache(HostConfig(host="gpubox"))
     assert check.ok and check.warn
     assert "DIFFERENT filesystem" in check.detail
-    assert "gpuc host set spar --cache-dir" in check.detail
+    assert "gpuc host set gpubox --cache-dir" in check.detail
 
 
 def test_health_never_fails_a_host_over_its_cache(gpuc_home: Path) -> None:
@@ -220,7 +220,7 @@ home_dev=99
 
 
 def test_probe_reports_the_cache_size_and_that_it_is_shared() -> None:
-    report = parse_probe("spar", PROBE_SHARED)
+    report = parse_probe("gpubox", PROBE_SHARED)
     assert report.uv_cache["size"] == "18G"
     assert report.cache_shares_gpuc_home_fs is True
     rendered = report.render()

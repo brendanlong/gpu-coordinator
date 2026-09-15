@@ -53,7 +53,7 @@ def test_every_committed_registry_shape_parses(name: str, control_env: Path) -> 
 @pytest.mark.parametrize("name", CONFIG_SHAPES)
 def test_every_committed_host_config_shape_parses(name: str) -> None:
     config = HostConfig.from_dict(load(name))
-    assert config.host == "spar"
+    assert config.host == "gpubox"
     assert config.gpus
     assert isinstance(config.idle_minutes, float)
 
@@ -62,7 +62,7 @@ def test_the_older_registry_keeps_its_ttl_and_defaults_what_it_never_had(
     control_env: Path,
 ) -> None:
     (control_env / "state" / "hosts.json").write_text((FIXTURES / "hosts.older.json").read_text())
-    entry = read_registry().registry.hosts["spar"]
+    entry = read_registry().registry.hosts["gpubox"]
     assert entry.ttl_hours == 24.0
     assert entry.retention_days is None
     assert entry.gpu_info == {}
@@ -105,13 +105,13 @@ def test_todays_files_carry_a_schema_version(control_env: Path) -> None:
 
 
 def test_a_null_ttl_in_the_registry_is_no_ttl_not_the_old_default() -> None:
-    entry = HostEntry.model_validate({"name": "spar", "ttl_hours": None})
+    entry = HostEntry.model_validate({"name": "gpubox", "ttl_hours": None})
     assert entry.ttl_hours is None
 
 
 def test_a_null_non_optional_field_falls_back_to_its_default() -> None:
     entry = HostEntry.model_validate(
-        {"name": "spar", "idle_minutes": None, "port": None, "gpus": None, "env": None}
+        {"name": "gpubox", "idle_minutes": None, "port": None, "gpus": None, "env": None}
     )
     assert (entry.idle_minutes, entry.port, entry.gpus, entry.env) == (15.0, 22, [], {})
 
@@ -142,7 +142,7 @@ def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -
     optional field has been explicitly nulled, one at a time and all at once.
     """
     populated = HostEntry(
-        name="spar",
+        name="gpubox",
         kind="ssh",
         ssh="me@box",
         port=2222,
@@ -156,7 +156,7 @@ def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -
         cache_dir="/home/u/.cache/uv",
         idle_minutes=30.0,
         ttl_hours=24.0,
-        s3_prefix="s3://bucket/gpuc/spar",
+        s3_prefix="s3://bucket/gpuc/gpubox",
         retention_days=14.0,
         created_at="2026-09-15T20:00:00+00:00",
         bootstrapped_at="2026-09-15T20:00:00+00:00",
@@ -194,11 +194,11 @@ OPTIONAL_CONFIG_FIELDS = ["ttl_hours", "retention_days", "s3_prefix", "provider"
 def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> None:
     """The host-side twin: `float(None)` in the dispatcher is what started this."""
     populated = HostConfig(
-        host="spar",
+        host="gpubox",
         gpus=["GPU-a"],
         idle_minutes=30.0,
         ttl_hours=24.0,
-        s3_prefix="s3://bucket/gpuc/spar",
+        s3_prefix="s3://bucket/gpuc/gpubox",
         retention_days=14.0,
         provider={"kind": "runpod", "pod_id": "p"},
         pkg_commit="b" * 40,
@@ -209,7 +209,7 @@ def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> N
     for field in OPTIONAL_CONFIG_FIELDS:
         config = HostConfig.from_dict({**document, field: None})
         assert getattr(config, field) is None, field
-        assert config.host == "spar" and config.idle_minutes == 30.0
+        assert config.host == "gpubox" and config.idle_minutes == 30.0
 
     all_null = HostConfig.from_dict({**document, **dict.fromkeys(OPTIONAL_CONFIG_FIELDS, None)})
     assert [getattr(all_null, key) for key in OPTIONAL_CONFIG_FIELDS] == [None] * len(
@@ -221,8 +221,8 @@ def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> N
 
 
 def test_an_unknown_key_never_reaches_a_model() -> None:
-    entry = HostEntry.model_validate({"name": "spar", "favourite_colour": "blue"})
-    assert entry.name == "spar"
+    entry = HostEntry.model_validate({"name": "gpubox", "favourite_colour": "blue"})
+    assert entry.name == "gpubox"
     settings = Settings.model_validate({"s3_bucket": None, "max_pods": None, "future": 1})
     assert settings.s3_bucket is None and settings.max_pods == 3
     index = IndexEntry.model_validate({"job_id": "j", "host": None, "attempt": None, "x": 1})
@@ -258,7 +258,7 @@ def test_host_config_from_a_null_or_junk_document_never_raises() -> None:
 
 
 def test_a_string_number_is_still_a_number() -> None:
-    config = HostConfig.from_dict({"host": "spar", "idle_minutes": "30", "ttl_hours": "6"})
+    config = HostConfig.from_dict({"host": "gpubox", "idle_minutes": "30", "ttl_hours": "6"})
     assert (config.idle_minutes, config.ttl_hours) == (30.0, 6.0)
 
 

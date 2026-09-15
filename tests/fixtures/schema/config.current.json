@@ -5,12 +5,12 @@
     "GPU-80646905-50a9-afc1-4375-43ca475b15e4",
     "GPU-83123e65-fe58-7831-6b21-1814b07c25f7"
   ],
-  "host": "spar",
+  "host": "gpubox",
   "idle_minutes": 15.0,
   "pkg_commit": null,
   "provider": null,
   "retention_days": 14.0,
-  "s3_prefix": "s3://brendanlong-experiments/gpuc/spar",
+  "s3_prefix": "s3://brendanlong-experiments/gpuc/gpubox",
   "schema_version": 1,
   "ttl_hours": 24.0
 }
