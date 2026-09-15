@@ -2,18 +2,29 @@
 
 Date: 2026-09-14. Input: the requirements list, the wiki's
 `gpu-job-runner-failure-catalog` and `skypilot-runpod-gotchas` pages, the
-2026-09-14 scoping journal, the experiments repo's `skypilot/lib.sh`,
-`shared/gpu.py`, `robust_launch.sh` and `train.sh`, the RunPod v2 OpenAPI
-spec, a live RunPod catalog query, the Vast CLI's offer-filter list, and the
-`huggingface_hub` upload docs.
+2026-07-24 incident-mining journal (including its "final state" section, which
+supersedes the earlier guidance in the same file), the 2026-09-14 scoping
+journal, the experiments repo's `skypilot/lib.sh`, `shared/gpu.py`,
+`robust_launch.sh` and `train.sh`, the RunPod v2 OpenAPI spec, live RunPod
+catalog and pod queries, the Vast CLI's offer-filter list, the
+`huggingface_hub` upload docs, and an independent review pass over a first
+draft of this document.
 
-Verdict up front: **nothing in the list is infeasible, and no two requirements
-conflict outright.** Three of them pull against each other and need an
-explicit decision (auto-down vs. no long-lived launcher, "no daemon" vs.
-automatic re-provisioning, incremental upload vs. files that get rewritten).
-Two are risky as phrased (automatic kill-and-move on health failure; "logs go to
-S3, not local"). About ten things are missing, most of them the boring
-interlocks that the failure catalog says were the actual cost.
+## Verdict
+
+Every requirement is buildable, with one exception that must be stated
+honestly: **a guaranteed teardown is not achievable.** Neither RunPod nor Vast
+offers a pod TTL or idle-stop (verified against the v2 spec; the only
+`idleTimeout` is serverless-only). Anything that runs on the pod cannot fire
+in the catalog's most expensive incident, where the container never starts.
+So auto-down is layered and off-host, and the design has to name the residual
+exposure rather than claim to eliminate it. Everything else on the list is
+feasible. Three requirements pull against each other and need a decision
+(auto-down vs. no surviving launcher; "no daemon" vs. automatic
+re-provisioning; incremental HF upload vs. files that get rewritten). Two are
+risky as phrased (automatic kill-and-move during a job; "logs not local").
+About fifteen things are missing, most of them the interlocks the failure
+catalog says were the actual cost.
 
 ## 1. Requirement-by-requirement
 
@@ -21,316 +32,408 @@ interlocks that the failure catalog says were the actual cost.
 
 Feasible, and easier than under SkyPilot. Verified against the v2 API today:
 
-- `GET /v2/catalog/gpus?include=AVAILABILITY&product=POD` returns, per GPU
-  type, list price per cloud, a stock level, and **per-host-CUDA-version
-  availability**. Today's A40 row: `$0.49/h, HIGH, 12.8/13.0/13.2 all
-  available`. RTX 3090: `$0.50, LOW, only 13.0 in stock`.
+- `GET /v2/catalog/gpus?include=AVAILABILITY&product=POD&cloud=<tier>`
+  returns, per GPU type, list price per cloud, a stock level, and
+  **per-host-CUDA-version availability**. The stock fields are scoped by the
+  `cloud` query parameter (default SECURE), so a query per tier is needed
+  before comparing community prices against community stock.
 - `POST /v2/pods` takes `gpu.minCudaVersion` or `gpu.allowedCudaVersions`,
-  `gpu.minRamPerGpu`, `gpu.minVcpuCountPerGpu`, `dataCenterIds`, `cloud`
-  (SECURE/COMMUNITY), `disk`, `ports`, `env`, `image` or `templateId`.
-- The response carries `cudaVersion` for the host actually drawn, `cost`,
-  `runtime.gpus[].util`, and `ssh.direct` (host, port) when `22/tcp` is in
-  `ports`. The proxy SSH endpoint is interactive-only; **rsync needs the
-  direct port**, so every pod must expose `22/tcp`.
+  `gpu.minRamPerGpu`, `gpu.minVcpuCountPerGpu`, `dataCenterIds`, `cloud`,
+  `disk`, `ports`, `env`, `image` or `templateId`, and `startSsh`.
+- The pod response carries `cudaVersion` for the host actually drawn, `cost`,
+  `runtime.gpus[].util` (verified live: 100% on a running A40), the pod's
+  `env`, and `ssh.direct` (host, port).
+- `GET /v2/pods/{id}/logs` streams container and system logs over SSE with
+  `tail`, `since`, and `Last-Event-ID`. This is the pod-log view the catalog
+  says SkyPilot could not see, and it is where the `/dev/dri/cardN`
+  crash-loop is visible.
 
-Two corrections to the failure catalog:
+SSH is the part most likely to produce an unreachable pod:
 
-- The catalog says create-pod "takes `gpuTypeIds` as a list". That is the MCP
-  tool's parameter. The v2 REST endpoint takes **one** `gpu.id` and its own
-  description says it "does not search for capacity, and it does not fall back
-  to a different GPU". The tool has to iterate candidates itself. That is a
-  five-line loop, not a problem, but it means the "pick cheapest" logic is ours.
-- RunPod filters by **host CUDA version**, not driver version. They map 1:1
-  (12.8 → 570, 13.0 → 580), so this is the same filter under a different name.
+- `startSsh: true` injects `PUBLIC_KEY` from the account's registered keys
+  and **does nothing if no keys are registered** (`PUT /v2/account/ssh-keys`).
+  Alternatively set `env.PUBLIC_KEY` explicitly.
+- The proxy endpoint is interactive-only. Rsync needs `ssh.direct`, which is
+  populated only when `22/tcp` is in `ports` **and** the pod has been assigned
+  a public port. Exposing the port is necessary, not sufficient. "RUNNING
+  for N seconds with no direct endpoint" must count as a placement failure.
+
+Corrections to the failure catalog, all verified:
+
+- create-pod does not take `gpuTypeIds` as a list. That is the MCP tool. The
+  v2 endpoint takes **one** `gpu.id` and its description says it "does not
+  search for capacity, and it does not fall back". The tool iterates.
+- There is no `sshPublicKey` field in v2. Use `startSsh` plus registered keys.
+- Live GPU utilization is in REST v2 (`runtime.gpus[].util`). The GraphQL
+  dependency is no longer needed.
+
+RunPod filters by **host CUDA version**, not driver version. The two move
+together (12.8 is driver 570, 13.0 is driver 580), so this is the same filter
+under a different name; see section 2.6 for how tight to set it.
 
 Vast: `vastai search offers` filters on `driver_version`, `cuda_vers`,
 `gpu_name`, `gpu_ram`, `dph`, `reliability`, `inet_down`, `inet_up`,
-`disk_space`, `verified`, `direct_port_count`. So a provider interface of
+`disk_space`, `verified`, `direct_port_count`. A provider interface of
 "constraints in, priced offers out; create(image, onstart, ssh key); status;
-destroy" fits both. Recommendation: define that interface now, implement
-RunPod only. Vast has been broken under SkyPilot for months and one working
-provider is what proves the design.
+logs; destroy" fits both. Recommendation: define that interface now,
+implement RunPod only. Vast has been broken under SkyPilot for months and one
+working provider is what proves the design.
 
-**Missing from both providers' filters: network health.** The dead-network
-B200 (0 bytes received over 10 s, 266 open connections) is not something you
-can filter for. That has to be a post-provision health check (section 1.5).
+**No provider can filter for network health.** The dead-network B200 (0 bytes
+received over 10 s, 266 open connections) is only catchable by a
+post-provision timed download (section 1.5).
 
 ### 1.2 Auto-down after the last queued job ends
 
-Feasible but it is the single highest-risk requirement, because **neither
-provider has a native TTL or idle-stop.** The create-pod body has no such
-field; SkyPilot's `-i 15 --down` is implemented by a daemon SkyPilot installs
-on the host. We have to build the same thing, and it must not depend on the
-launcher surviving.
+Feasible as a layered best effort, not as a guarantee. The layers, from
+inside out, and what each one cannot cover:
 
-What works:
+1. **On-host idle terminate.** The dispatcher (section 1.3) terminates its own
+   pod once the queue has been empty for N minutes **and** the final
+   S3 flush of the last job's status and outputs has been confirmed. Covers
+   the normal case. Cannot fire if the container never started, if the host
+   has no network, or if the terminate call is rejected.
+2. **On-host staleness rule (the actual dead-man switch).** The local
+   reconciler writes a heartbeat to the host (a file over SSH, or an object
+   the host polls). If the heartbeat is stale beyond T and the queue is
+   idle, the host terminates itself. If a job is running, it keeps going
+   (a local reboot must not kill a healthy job); the hard TTL bounds that.
+3. **Hard TTL**, set at creation and enforced by the dispatcher refusing to
+   start jobs past it and terminating when idle past it. Same blind spots
+   as layer 1.
+4. **Local reaper** in the reconciler: list provider pods carrying our name
+   prefix, terminate any not in desired state or past TTL. This is the
+   **only** layer that covers a pod stuck in PROVISIONING or crash-looping
+   in STARTING. It also gets the ~15-minute provisioning ceiling (section
+   1.5). It fails if the desktop is down.
+5. **Off-host reaper.** Because layer 4 is the only cover for the worst
+   case, it needs a second home that is not the desktop: a scheduled GitHub
+   Actions job or a cloud routine holding the RunPod key, running the same
+   list-and-compare every 15 minutes against the desired-state object in S3.
+   The wiki already uses Actions as an uptime prober.
 
-- The on-host queue dispatcher (which has to exist anyway, section 1.3) is the
-  natural dead-man switch: it knows when the queue has been empty for N
-  minutes, and it can call the provider's terminate API on its own pod.
-- Belt and braces: a hard TTL on the pod set at creation (`sleep TTL; terminate`
-  in the container, or the dispatcher refusing to start jobs past a deadline)
-  and a local reaper that lists provider pods with our name prefix and kills
-  anything not in the desired-state file.
+Residual exposure after all five: a pod stuck pre-RUNNING while both the
+desktop and the off-host job are unavailable, bounded by whichever comes back
+first. Say so in the README.
 
-One thing to verify on day one of the RunPod work: RunPod injects a pod-scoped
-`RUNPOD_API_KEY`, and there are reports of it returning 403 on terminate. If
-so, the tool must inject a **scoped account API key** (RunPod supports scoped
-keys) with terminate permission as an env var. Test this with a 1-minute pod
-before building anything on it.
+Two failure paths the first draft got wrong:
 
-Semantic tension to decide: "after its last queued job ends" is judged by the
-host, but new jobs are enqueued from the local machine. Between the host
-deciding to terminate and a new enqueue arriving there is a race. Resolution:
-the dispatcher writes a `draining` marker under its lock before terminating;
-an enqueue that sees `draining` fails and the local side treats the host as
-gone and re-provisions. The window is seconds and the cost is one extra
-provision, which is acceptable.
+- **Terminate can fail.** The pod-scoped `RUNPOD_API_KEY` is reported to
+  return 403 on terminate. If the on-host terminate fails, the dispatcher
+  must clear its `draining` marker and go back to accepting work, and the
+  reconciler must alert. Otherwise the host refuses jobs and bills forever
+  with an empty queue.
+- **Draining plus re-provision can double-bill.** The local side must only
+  provision a replacement after the provider reports the old pod
+  `TERMINATED` (or after the reaper has issued the terminate itself), never
+  on the strength of a `draining` marker.
+
+If an account-level key has to sit on the pod for self-terminate, its blast
+radius is every pod in the account, including the two `subrep-*` A40 pods
+another session is running right now. The v2 spec exposes no per-pod scoping.
+Mitigations: hard-code the pod's own id into the terminate path, prefer the
+pod-scoped key if a first-day test shows it works, and treat this as the one
+place where the never-touch-others rule rests on code rather than on
+permissions. Also note `GET /v2/pods` returns the pod's full `env`, so any
+key placed there at create time is readable by any holder of an account key
+and persists in the pod record (section 2.2).
 
 ### 1.3 Per-host user-level queue, local and over SSH, GPU subset by UUID
 
 Feasible with nothing outside `$HOME`. Constraints checked:
 
 - `flock` (util-linux), `setsid`, `nohup` are on every Linux host. `uv`
-  installs to `~/.local/bin` and brings its own CPython, so the on-host part
-  can be a Python package with **zero third-party dependencies** and still run
-  anywhere `uv` can be curl-installed.
+  installs to `~/.local/bin` and brings its own CPython.
 - `CUDA_VISIBLE_DEVICES=<uuid>` works and fails closed (verified in the
   catalog: a stale UUID gives `device_count()==0`). Config per host is a list
   of owned UUIDs; a job requests 0..N of them; the runner asserts the
   `nvidia-smi --query-gpu=index,uuid` mapping before launch.
-- Zero-GPU jobs are just jobs that are assigned an empty set. No special case.
+- Zero-GPU jobs are jobs assigned an empty set. No special case.
+
+Dependency boundary, which the first draft blurred: the **queue core**
+(enqueue, lock, dispatch, cancel, reorder, exit-code discipline) is stdlib
+only, so a broken environment cannot take out the queue. The **runner
+helpers** (preflight matmul, S3 and HF sync, health checks) live in a
+separate uv-managed venv owned by the tool. A sync-venv failure fails the job,
+not the host.
 
 Tension: the failure catalog argues for "no daemon" (a `flock` loop so nothing
 depends on an SSH session surviving), but reorder, cancel and status all want
-something to talk to. The reconciliation: a **per-host dispatcher process**
-that any `enqueue` starts idempotently under a lock (`flock -n` on a pidfile;
-if held, someone is already dispatching), detached with `setsid nohup`, that
-exits when the queue is empty. State is a directory of job files, so
-"reorder" is renaming a priority prefix and "cancel" is writing a marker plus
-killing the job's process group. There is no long-lived process to lose, and
-whoever enqueues next restarts it. This gets the robustness of the flock loop
-with the features of a daemon.
+something to talk to. The reconciliation is a **per-host dispatcher** that any
+`enqueue` starts idempotently, detached with `setsid nohup`, that exits when
+the queue is empty. Rules that keep it from becoming the wedged controller of
+failure class #5:
 
-Two things to probe on the SPAR box before designing around it, because they
-vary by distro config and cannot be assumed:
+- `enqueue` writes the job file first and never depends on acquiring the
+  dispatcher lock. A wedged dispatcher can never lose an enqueue.
+- The dispatcher holds `flock` on an open fd (released by the kernel on
+  death, so a crash frees it) **and** touches a heartbeat file every few
+  seconds. A new dispatcher that finds the lock held but the heartbeat stale
+  kills the holder's process group and takes over.
+- State is a directory of job files. "Reorder" is renaming a priority prefix.
+  "Cancel" is a marker plus a kill of the job's process group.
+
+"No long-lived process to lose" was a misleading phrase in the first draft.
+The dispatcher lives as long as the queue does. What is true is that no
+process's death loses state, and whoever enqueues next restarts it.
+
+Cancel semantics vary by host. On brendan-desktop as `claude`,
+`systemd-run --user --scope` works (verified), so cancel can kill a whole
+cgroup and catch double-forked children. RunPod containers have no systemd,
+and the SPAR box is unknown. **Process-group kill is the baseline**; cgroup
+kill is an upgrade where available.
+
+Two things to probe on the SPAR box before designing around it:
 
 - Whether detached processes survive SSH logout (`KillUserProcesses` in
-  logind; the default is `no`, but some admins flip it).
-- Whether `systemd-run --user --scope` works (needs a user manager and cgroup
-  delegation). It does on brendan-desktop as the `claude` user. If it works,
-  cancel can kill the whole cgroup, which catches double-forked children.
-  Otherwise fall back to process-group kill and accept that daemonized
-  grandchildren escape.
+  logind; the default is `no`, but admins flip it).
+- Whether a user systemd manager exists at all.
 
 The host-probe script offered in the scoping journal (driver, owned UUIDs,
-disk quota, network throughput to S3/HF, existing scheduler, the two items
-above) should be the first thing written.
+disk quota, network throughput to S3 and HF, existing scheduler, the two items
+above, and whether another user already has a process on an "owned" card)
+should be the first thing written.
 
 ### 1.4 Status, logging, enqueue / cancel / reorder
 
-Feasible. The only subtlety is the exit-code discipline the catalog documents:
-the job's status must be the job's exit code, captured before any cleanup, and
-a failed final upload must fail an otherwise-green job. Copy the existing
-`lib.sh` semantics; they were measured, not guessed.
+Feasible. The exit-code discipline the catalog documents is the important
+part: the job's status is the job's exit code, captured before any cleanup,
+and a failed final upload fails an otherwise-green job. Copy the `lib.sh`
+semantics; they were measured, not guessed.
 
-Logs: S3 has no append, so "stream logs to S3" means re-uploading the log
-file every N seconds (fine up to tens of MB) or rotating into numbered chunks
-(needed for multi-hour runs with verbose output). Keep the log on the host
-too; see section 2.5.
+Logs: S3 has no append, so streaming means either re-uploading the file every
+N seconds or rotating into numbered chunks. Both cost a PUT per tick, and a
+`sync` costs a LIST per run. The August 2026 bill spike (2.48M Tier-1
+requests, 624 GB egress, from one replication loop) is the warning. Budget
+it: sync every 2 to 5 minutes, chunk logs so each tick uploads only the new
+chunk, and have `status` tail the host over SSH rather than read S3. Keep
+the log on the host; see section 2.5.
 
 ### 1.5 Health checks: driver, GPU availability, speed test; kill and re-place on failure
 
-Feasible, with two qualifications.
+Feasible, with the automation boundary drawn carefully. Brendan's final
+policy from the 2026-07-24 journal (its last section, which supersedes the
+"judgment only" framing above it):
 
-The checks themselves:
+- **Pre-RUNNING is cheap but not free.** Be patient about capacity, do not
+  escalate to a pricier GPU over a few minutes' wait, but **provisioning
+  should not take more than about 15 minutes**. Past that, something is
+  wrong. The gotchas page independently says INIT beyond ~10 minutes is
+  failed.
+- **RUNNING and billing:** watch progress, do not auto-kill on a clock.
 
-- Driver: a real GPU op in the torch the job will actually use, not
-  `nvidia-smi` (which passes on driver-too-old hosts). `shared/gpu.py` is
-  this; port it as-is.
-- GPU availability: UUID count matches the assignment; `torch.cuda.device_count()`
-  equals the expected number.
-- Speed: a timed download of ~100 MB from S3 and from HF (catches the
-  dead-network host), a timed disk write, and a small matmul benchmark
-  compared against a per-GPU-type floor (catches a throttled or shared card).
-- Disk: free space on the working volume, and `HF_HOME` pointed somewhere with
-  room (the `/workspace/.cache` fill is in the catalog).
+So the automation is:
 
-Qualification one: this check belongs in **two** places. At provision time it
-gates the host. At job start it runs again inside the job's venv, because the
-sub-venv CPU-torch failure passes a host-level check. The catalog is explicit
-on this.
+- **Provision phase:** destroy and re-place automatically on a hard
+  signature in the pod logs (`card[0-9]`, `device nodes`, `OCI runtime`,
+  `runc create`, `failed to create shim`), on a provision log with no new
+  lines for 15 minutes, or on the ~15-minute ceiling without RUNNING plus
+  a reachable direct SSH port.
+- **Preflight phase (host up, before any job):** destroy and re-place on a
+  failed check. Checks: a real GPU op in the torch the job will use
+  (`shared/gpu.py`, ported as-is); `device_count()` equals the assignment;
+  timed ~100 MB downloads from S3 and from HF with a generous floor (the
+  dead-network signature is 0 bytes in 10 s, not "slow"); a timed disk
+  write; a small matmul against a per-GPU-type floor; free space on the
+  working volume; `HF_HOME` on the large volume.
+- **Job phase:** the same preflight runs again **inside the job's venv**
+  (a sub-venv CPU torch passes a host-level check; the catalog is explicit).
+  A failure here fails the job and marks the host suspect. Mid-job stalls
+  are flagged in `status` (section 2.11), not killed. The hard TTL is the
+  only mid-job automatic action.
 
-Qualification two, and this is the "bad idea as phrased" item: **automatic
-kill-and-move must be limited to provision-time failures with a hard
-signature.** Brendan's 2026-07-24 guidance in the incident-mining journal is
-that detectors must be signal-based, not wall-clock-based, and that mid-run
-"broken vs slow vs degraded" is left to judgment. The `robust_launch.sh`
-12-minute deadline that killed four healthy clusters is the canonical
-counterexample. So: pre-job preflight fails → destroy, re-place, requeue,
-automatically. Mid-job stall → flag it loudly in `status`, do not act, except
-for the hard TTL. Every timer must exceed the slowest legitimate phase
-(cold `uv sync` with a torch download is 5-10 minutes on a healthy host).
+Every timer must exceed the slowest legitimate phase: a cold `uv sync` with
+a torch download is 5 to 10 minutes on a healthy host.
 
-"Move the jobs" also needs a resume policy (section 2.3).
+"Move the jobs" needs two things the first draft missed: a resume policy for
+the running job (section 2.3) and **moving the queued backlog**, which
+otherwise dies with the host. That is why the queue of an ephemeral host must
+be authoritative in S3, not on the host (section 1.9).
 
 ### 1.6 Python via uv only; use a typical docker image where possible
 
 Feasible, and the two halves do not conflict as long as the image carries
-**only system-level things**. On RunPod use `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
-(or the cu130 sibling) because it gives sshd honoring `PUBLIC_KEY`, rsync,
-and the CUDA toolkit. Its bundled torch is irrelevant since `uv sync` installs
-the project's own. On SPAR and local there is no container and the same
-runner script runs bare. Anything project-specific baked into the image would
-make the three targets diverge, which is exactly the layer-split failure the
-catalog warns about.
+**only system-level things**. On RunPod use
+`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (or the cu130 sibling): it
+gives sshd honoring `PUBLIC_KEY`, rsync, and the CUDA toolkit. Its bundled
+torch is irrelevant since `uv sync` installs the project's own. On SPAR and
+local there is no container and the same runner runs bare. Anything
+project-specific baked into the image would make the three targets diverge,
+which is the layer-split failure the catalog warns about.
 
-Choose the image's CUDA version to be at most the `minCudaVersion` you request,
-and set `HF_HUB_ENABLE_HF_TRANSFER=0` unless `hf_transfer` is installed.
+The image carries its own `cuda>=X.Y` requirement (the "unsatisfied
+condition" init failure in the catalog is this). Request `minCudaVersion`
+at least as high as the image's, and set `HF_HUB_ENABLE_HF_TRANSFER=0` unless
+`hf_transfer` is installed.
 
 ### 1.7 List of options, pick cheapest
 
-Feasible: query the catalog with availability, filter by constraints, sort by
-price, try in order, advance on a capacity error. Two policy knobs worth
-exposing from the start, both from Brendan's own guidance: a max price cap (so
-"wait for the cheap one at $0" is the default and "take the next tier" is
-opt-in), and a preference for SECURE over COMMUNITY at equal price. Cross-
-provider price comparison can wait for Vast.
+Feasible: query the catalog per cloud tier with availability, filter, sort by
+price, try in order, advance on a capacity error or on a pod that never gets
+a direct SSH port. The policy question the first draft dodged: **community is
+30 to 55% cheaper than secure** (A40 $0.35 vs $0.49, RTX 3090 $0.22 vs
+$0.50, 4090 $0.34 vs $0.74 today), and the catalog's own observation is that
+cheap pools hit more host-side failures. Expose the tier as a job-level
+choice with a default, and record per-tier failure counts in the job
+metadata so the default can be revisited with data. Also expose a max price
+cap so "wait for the cheap one at $0" is the default and "take the next tier"
+is opt-in. Cross-provider price comparison waits for Vast.
 
 ### 1.8 Saved outputs uploaded to HF and/or S3 as produced
 
 Feasible. Details that matter:
 
-- S3: periodic `sync` of an output directory, as `lib.sh` does now. Prefer
-  `boto3` inside the tool's own venv over depending on an `aws` binary, since
-  SPAR has no sudo and the tool already has a venv.
-- HF: `huggingface_hub.CommitScheduler` uploads a folder every N minutes in a
-  background thread. It is **append-only by contract**: overwriting or
-  deleting files "can corrupt the repository", and every push is a git commit,
-  so the docs recommend at least 5 minutes between pushes. `upload_folder`
-  is resumable and multi-commit and is the right call for checkpoints.
-- Partial files: a sync can pick up a half-written checkpoint. Require atomic
-  writes in jobs (write to a temp name, rename), and have the syncer skip files
-  modified in the last few seconds.
-- The collision problem: the catalog documents that mid-run sync into the
-  canonical prefix trips the overwrite guard at the end of the run. The fix is
-  in section 2.1: make the namespace unique by construction so there is no
-  guard.
+- S3: periodic sync of an output directory. The `aws` CLI v2 is a
+  self-contained bundle that installs into `$HOME` without sudo, so it is
+  usable on SPAR; `boto3` has no `sync`, so choosing it means writing the
+  size-and-mtime diff. Either is fine; pick one and say so.
+- HF: `huggingface_hub.CommitScheduler` uploads a folder every N minutes.
+  It is **append-only by contract**: overwriting or deleting files "can
+  corrupt the repository", each push is a git commit, and the docs
+  recommend at least 5 minutes between pushes. `upload_folder` is resumable
+  and multi-commit and is the right call for checkpoints. Only one uploader
+  process per folder, which matters with several sessions (section 2.9).
+- HF repos created by the library are **public unless the org default is
+  private**. Logs and checkpoints must go to explicitly private repos.
+  Repo limits (100k files, 10k per folder, 50 GB per file hard) will be
+  reached by per-job namespacing; plan one repo per experiment, not one
+  global one.
+- Partial files: a sync can pick up a half-written checkpoint. Require
+  atomic writes in jobs (temp name, then rename) and have the syncer skip
+  files modified in the last few seconds.
+- The collision problem the catalog documents (mid-run sync tripping the
+  overwrite guard at the end) is removed by section 2.1.
 
 ### 1.9 Robust to reboots, including of the local service
 
-Feasible if you accept one framing: **make every local process a restartable
-reconciler, not a stateful controller.** Concretely:
+Feasible if every local process is a **restartable reconciler, not a
+stateful controller**, and if authority is placed correctly:
 
-- Job specs and status live on each host (authoritative, because only the host
-  knows) and are mirrored to S3 (durable index). The local CLI is stateless:
-  it rebuilds its view from S3 plus SSH.
-- The one thing that needs to be "awake" on the local side is provisioning and
-  the reaper. Run it as a `systemd --user` unit under the `claude` user, which
-  already has linger enabled (verified: `Linger=yes`). It loops: read desired
-  state, list provider pods, act on the difference. Every action is idempotent
-  (pod names embed a host id, so a duplicate create is detectable) and safe to
-  interrupt anywhere.
-- Auto-down never depends on the local side (section 1.2).
-
-This is the opposite of the current setup, where a wedged controller blocks
-every launch. Note that "the main local service" in the requirement should
-end up being about 200 lines and hold no state that is not also in S3.
+- **For ephemeral hosts, S3 is authoritative** for the job queue and job
+  status, because the host will be destroyed. The host holds a working copy
+  and flushes status changes before acting on them (in particular before
+  self-terminating). For SPAR and local, the host is authoritative and S3 is
+  the mirror.
+- The local CLI is stateless: it rebuilds its view from S3 plus SSH.
+- The reconciler (provision, reaper, heartbeat) runs as a `systemd --user`
+  unit under `claude`, which has linger enabled (verified). It loops: read
+  desired state, list provider pods, act on the difference. Every action is
+  idempotent and safe to interrupt. It is single-instance under an fd lock
+  with a heartbeat and staleness takeover, same rule as the dispatcher, so
+  a hung holder cannot block provisioning.
+- Auto-down never depends on the local side (section 1.2), and the worst
+  case has an off-host reaper.
 
 ## 2. What is missing
 
 ### 2.1 Job identity and output namespace
 
-Assign a unique job id at enqueue (timestamp plus random suffix, or ULID) and
-put **everything** under `<prefix>/<job-id>/`: logs, outputs, metadata,
-attempts. A retry is a new attempt under the same id. Collisions become
-impossible by construction, which deletes the three-layer overwrite guard, the
-`in-progress/` subprefix workaround, and `ALLOW_OVERWRITE=1`. Human-readable
-names go in metadata and in an index file, not in the path.
+Assign a unique job id at enqueue and put everything under
+`<prefix>/<job-id>/`: logs, outputs, metadata, attempts. A retry is a new
+attempt under the same id. Collisions become impossible by construction,
+which deletes the three-layer overwrite guard, the `in-progress/` subprefix
+workaround, and `ALLOW_OVERWRITE=1`. Human-readable names go in metadata and
+an index file, not in the path.
 
 ### 2.2 Credentials
 
-- Never on argv. Ship secrets to hosts via the SSH session environment or a
-  mode-0600 file (`/proc/<pid>/cmdline` is world-readable).
-- Write-test S3 and HF before the expensive work starts (`s3_preflight`
-  already does S3). A missing credential should fail at enqueue time or
-  preflight, never at the final upload.
-- wandb is optional and unavailability must degrade, not kill.
-- On RunPod, an account-scoped key for self-termination (section 1.2).
+- Never on argv (`/proc/<pid>/cmdline` is world-readable).
+- **Not in pod `env` at create time either**: it is returned by
+  `GET /v2/pods` and persists in the pod record. Push credentials over SSH
+  after boot, as a mode-0600 file written from stdin. `SendEnv` does not
+  work on SPAR because `AcceptEnv` needs an sshd config change.
+- Write-test S3 and HF at enqueue time locally and again in preflight on the
+  host. A missing credential fails before the expensive work, never at the
+  final upload.
+- wandb is optional and unavailability degrades, never kills.
+- The on-pod terminate key's blast radius is stated in section 1.2.
 
 ### 2.3 Resume policy for moved or retried jobs
 
-"Move the jobs" and "requeue on failure" need the job spec to say what a
-restart means: from scratch (default), or resume from the last checkpoint at
-`<job-id>/attempts/<n-1>/`. Without this, moving a job that had run for two
-hours silently discards two hours. Also record which attempt produced which
-output.
+The job spec says what a restart means: from scratch (default), or resume
+from the last checkpoint at `<job-id>/attempts/<n-1>/`. Without it, moving a
+job that ran for two hours silently discards two hours. Record which attempt
+produced which output.
 
 ### 2.4 Cost interlocks
 
-- Hard TTL per host, set at creation, independent of everything else.
-- Max runtime per job.
-- Max $/hour per provision request.
-- A reaper that lists all pods carrying our name prefix and terminates any not
-  in desired state, and that **never touches pods without our prefix**. Two
-  A40 pods from another session (`subrep-*`) are running in the account right
-  now; the current rule that agents do not touch pods they did not start must
-  survive into the tool.
-- Verify teardown against the provider (`GET /v2/pods`), not our own state,
-  and remember billing lags about an hour.
+- Hard TTL per host; max runtime per job; max $/hour per provision request.
+- **Account-wide caps**, because several sessions provision independently:
+  max concurrent pods with our prefix and max total $/hour, checked against
+  `GET /v2/pods` (with `includeClusterPods=true`) before every create.
+- The reaper **fails closed**: if desired state is unreadable or empty it
+  does nothing and alerts. It must never interpret "no state" as "terminate
+  everything with our prefix", which would be failure class #4 again.
+- The reaper never touches pods without our prefix.
+- Verify teardown against the provider, not our own state, and remember
+  billing lags about an hour.
 
 ### 2.5 Logs and state on the host as well as S3
 
-"Logs go to S3 and not the local machine" should read "S3 is the durable copy".
-The host must keep the log file (the job writes there, the syncer reads it),
-and local `status` should be able to `tail` a host directly for the seconds
-between syncs. What should not exist is local-only state that a reboot loses.
+"Logs go to S3 and not the local machine" should read "S3 is the durable
+copy". The host keeps the log file, `status` tails the host directly, and
+nothing local-only survives a reboot by design because nothing local-only
+exists.
 
 ### 2.6 Torch build vs host driver, closed at the source
 
-The tool can infer the CUDA build the project's lockfile pins (the torch wheel
-tag in `uv.lock`, or `torch.version.cuda` in the synced env) and pass it as
-`minCudaVersion`. That turns failure class #1 from "preflight catches it after
-provisioning" into "we never draw that host". Today's fleet is 12.8 / 13.0 /
-13.2, so cu128 and cu130 wheels both have stock; cu126 is unnecessary.
+The tool should derive a CUDA floor from the project's lockfile and pass it
+as `minCudaVersion`, so the driver-lottery host is never drawn. The floor
+should be the **max of the image's `cuda>=` requirement and the wheel's CUDA
+major**, not the wheel's exact minor: within a major, driver minor-version
+compatibility lets a cu128 wheel run on a 12.4 host for ordinary ops, and an
+exact-minor floor throws away stock (A100 80GB has 12.4 hosts today). The
+major boundary (cu13 needs 13.0, driver 580) is hard. Verify the minor-
+compat claim with the preflight on first use; the preflight is the backstop
+either way. Today's fleet is mostly 12.8 / 13.0 / 13.2, so the practical
+impact is small until it isn't.
 
 ### 2.7 Code sync and reproducibility
 
 Rsync only git-tracked files (`git ls-files`), record the commit hash and the
-diff of uncommitted changes in job metadata, and never rsync data. Record the
-host's actual GPU, CUDA version, and provider id per attempt.
+diff of uncommitted changes in job metadata, never rsync data. Record the
+host's GPU, CUDA version, provider id, tier, and attempt outcome per attempt.
 
 ### 2.8 Environment build cost
 
-A cold `uv sync` per job is 5-10 minutes on a good host and is the phase most
-often mistaken for a hang. Keep `UV_CACHE_DIR` and the project venv on the
-host across jobs; the dispatcher only re-syncs when the lockfile hash changes.
-Use `uv sync --frozen` and `uv run --no-sync` so a verified env cannot be
+A cold `uv sync` per job is 5 to 10 minutes on a good host and is the phase
+most often mistaken for a hang. Keep `UV_CACHE_DIR` and the project venv on
+the host across jobs; re-sync only when the lockfile hash changes. Use
+`uv sync --frozen` and `uv run --no-sync` so a verified env cannot be
 re-resolved at run time (the `ncclCommResume` incident).
 
 ### 2.9 Multiple local sessions
 
 Several agent sessions run as the same user and will enqueue concurrently.
-Local state goes in `~/.local/share/gpu-coordinator/`, not a worktree, and the
-reconciler is single-instance under a lock. On-host enqueue is already
-serialized by the host's lock.
+Local state goes in `~/.local/share/gpu-coordinator/`, not a worktree. The
+reconciler is single-instance with staleness takeover (section 1.9), the
+HF uploader is single-instance per folder (section 1.8), and account-wide
+caps (section 2.4) are what stop N sessions from provisioning N pods.
 
 ### 2.10 SSH hygiene for ephemeral hosts
 
-Pin the host key on first contact and store it per pod id, use
-`ControlMaster` to avoid reconnect storms, retry with backoff during the
-STARTING window, and time out individual commands.
+Pin the host key on first contact per pod id, use `ControlMaster`, retry
+with backoff during STARTING, time out individual commands, and treat
+"no direct port" as a placement failure (section 1.1).
 
 ### 2.11 Observability that answers the money question
 
-`status` should show, per host: provider state, `cost`, `runtime.gpus[].util`
-from the provider, queue depth, current job and its last log lines, and
-minutes since the last output file changed. A `--suspects` filter for
-"RUNNING, billing, util ~0, no output progress" is the single most useful
-view the catalog asks for. Alert (not kill) on suspects and on any pod older
-than its TTL.
+`status` shows, per host: provider state, `cost`, `runtime.gpus[].util`
+from the provider, queue depth, current job and phase, its last log lines,
+and minutes since the last output file changed. A `--suspects` filter for
+"billing, util ~0, no output progress" must be **phase-aware**: during
+`uv sync` and model download that signature is normal. It applies only once
+a job's preflight has passed and its main phase has started. Alert, do not
+kill, on suspects and on any pod older than its TTL.
 
-### 2.12 Disk hygiene between jobs
+### 2.12 Shared-box citizenship
+
+Pinning UUIDs is not enough on SPAR. Cap dataloader workers and thread
+counts explicitly (a `os.cpu_count()`-sized loader is antisocial there),
+respect the disk quota, and have the probe and preflight detect another
+user's process on an "owned" card before assigning it.
+
+### 2.13 Disk hygiene between jobs
 
 Point `HF_HOME` and `UV_CACHE_DIR` at the large volume, report free space in
 health checks, and offer a per-job "clean HF model cache after" flag.
@@ -347,17 +450,19 @@ health checks, and offer a per-job "clean HF model cache after" flag.
 
 ## 4. Build order
 
-Same as the scoping journal, with one addition:
+Same as the scoping journal, with the money-safety work last and exercised
+first under a cap:
 
 1. Host probe script; run it on the SPAR box and locally.
-2. On-host package: queue, dispatcher, runner, UUID assignment, preflight,
-   periodic sync, exit-code discipline. Test on the local GPU.
+2. On-host queue core (stdlib only) and runner venv: dispatcher with fd lock
+   and heartbeat, UUID assignment, preflight, periodic sync, exit-code
+   discipline. Test on the local GPU.
 3. Same package over SSH on SPAR.
-4. Provider interface plus RunPod driver, reconciler, dead-man switch, reaper,
-   TTL. First test: provision the cheapest available GPU, run a 1-minute job,
-   verify teardown against `GET /v2/pods`, with a $1 cap.
-5. Only then: health-check-driven re-placement, HF upload, Vast.
-
-The money-safety code is written last on purpose, after the runner and queue
-are proven on two free targets, and it is exercised first with a one-minute
-job under a hard cap.
+4. Provider interface plus RunPod driver, reconciler, the five teardown
+   layers, account caps. First test: register an SSH key, provision the
+   cheapest available GPU with `startSsh` and `22/tcp`, confirm
+   `ssh.direct`, run a 1-minute job, verify teardown against `GET /v2/pods`,
+   with a $1 cap. Second test: whether the pod-scoped key can terminate its
+   own pod.
+5. Only then: health-check-driven re-placement, HF upload, off-host reaper,
+   Vast.
