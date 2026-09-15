@@ -519,6 +519,7 @@ class JobRunner:
             phase=None,
             pid=None,
             pgid=None,
+            outputs_synced_at=sync_loop.outputs_synced_at,
         )
         self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")
         # After the final state write, and only then: the outputs the sync just
@@ -526,19 +527,37 @@ class JobRunner:
         # the run's results on the way past.
         jobs.update_state(self.job_id, workdir_removed=self._cleanup_workdir(status, log))
         try:
-            sync.sync_job_meta(
+            warning = sync.final_meta_sync(
                 self.job_id,
                 self.config.s3_prefix,
                 runner=self.deps.command_runner,
                 env=self.env or None,
             )
+            if warning:
+                self._log(log, f"WARNING: {warning}")
         except sync.SyncError as exc:
+            # meta_synced_at stays null, so `purge` will refuse to delete this
+            # job dir: the only copy of the log lives here.
             self._log(log, f"final state upload failed: {exc}")
         # Only now: the final sync and the state upload authenticate with the
         # secrets this file holds, so removing it earlier would break exactly
-        # the upload that matters most.
-        paths.job_env_file(self.job_id).unlink(missing_ok=True)
+        # the upload that matters most. On an ephemeral host with outputs still
+        # unconfirmed it stays: the drain gets one more go at uploading them,
+        # and the file dies with the pod in minutes either way.
+        if self._keep_secrets_for_drain(sync_loop):
+            self._log(
+                log,
+                "outputs are not confirmed uploaded; keeping this job's secrets file so the "
+                "host's drain can retry the upload before the pod goes away",
+            )
+        else:
+            paths.job_env_file(self.job_id).unlink(missing_ok=True)
         return exit_code
+
+    def _keep_secrets_for_drain(self, sync_loop: sync.SyncLoop) -> bool:
+        return bool(
+            self.config.ephemeral and self.spec.outputs and sync_loop.outputs_synced_at is None
+        )
 
     def _cleanup_workdir(self, status: str, log: IO[bytes]) -> bool:
         """Apply the spec's `cleanup:` policy to `workdir/`, and nothing else.

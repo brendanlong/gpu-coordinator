@@ -67,6 +67,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         # its size is meaningless, and walking a live venv on every `gpuc
         # status` would be pure cost.
         entry["workdir_bytes"] = cleanup.workdir_size(job_id) if state.finished else None
+        # "this job produced something that is still only here": the control
+        # side cannot work it out, since it never sees the spec's `outputs:`.
+        entry["outputs_pending"] = (
+            not cleanup.outputs_confirmed(job_id, state)[0] if state.finished else False
+        )
         entries.append(entry)
     heartbeat = dispatcher.DispatcherLock().heartbeat_age()
     print(
@@ -115,6 +120,20 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 1 if result.errors else 0
 
 
+def cmd_purge(args: argparse.Namespace) -> int:
+    result = cleanup.purge(
+        older_than_days=args.older_than,
+        dry_run=args.dry_run,
+        force=args.force,
+        # `--only ''` means "none of them", which is not the same as not
+        # passing it at all: the control side's `--verify` sends exactly that
+        # when no candidate's mirror could be confirmed.
+        only=None if args.only is None else [j for j in args.only.split(",") if j],
+    )
+    print(json.dumps(result.to_dict(), indent=2))
+    return 1 if result.errors else 0
+
+
 def cmd_resume(_: argparse.Namespace) -> int:
     paths.paused_file().unlink(missing_ok=True)
     dispatcher.spawn_detached_dispatcher()
@@ -155,6 +174,29 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--older-than", type=float, metavar="DAYS")
     clean.add_argument("--dry-run", action="store_true")
     clean.set_defaults(func=cmd_clean)
+
+    purge = sub.add_parser(
+        "purge", help="remove whole job dirs of old, mirrored, finished jobs (implies clean)"
+    )
+    purge.add_argument(
+        "--older-than",
+        type=float,
+        default=cleanup.DEFAULT_RETENTION_DAYS,
+        metavar="DAYS",
+        help=f"measured from ended_at; default {cleanup.DEFAULT_RETENTION_DAYS:g}",
+    )
+    purge.add_argument("--dry-run", action="store_true")
+    purge.add_argument(
+        "--force",
+        action="store_true",
+        help="purge even without a confirmed mirror or confirmed outputs",
+    )
+    purge.add_argument(
+        "--only",
+        help="comma-separated job ids that may be purged, and no others; the implied "
+        "workdir sweep is unaffected. Empty means purge nothing.",
+    )
+    purge.set_defaults(func=cmd_purge)
 
     sub.add_parser("resume", help="clear a low-util pause and restart dispatching").set_defaults(
         func=cmd_resume

@@ -43,6 +43,12 @@ class JobView:
     workdir_bytes: int | None = None
     """Disk still held by this job's `workdir/`; the host only measures it for
     finished jobs."""
+    outputs_pending: bool = False
+    """The job declared `outputs:` and no final upload of them was confirmed, so
+    what it produced may exist only on this host. The host works this out; the
+    control side never sees the spec."""
+    outputs_lost: bool = False
+    """An ephemeral host's drain retried the upload to the end and gave up."""
 
     @property
     def minutes(self) -> float | None:
@@ -112,6 +118,11 @@ class HostView:
         return [job for job in self.running if job.suspect]
 
     @property
+    def outputs_at_risk(self) -> list[JobView]:
+        """Finished jobs holding the only copy of what they produced."""
+        return [job for job in self.finished if job.outputs_pending]
+
+    @property
     def leftover_bytes(self) -> int:
         """Disk held by workdirs of jobs that are over: reclaimable by `gpuc clean`."""
         return sum(job.workdir_bytes or 0 for job in self.finished)
@@ -156,6 +167,8 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             # counting a missing reading as 0% and calling the job a suspect.
             util_recent=[float(u) for u in entry.get("util_recent") or [] if u is not None],
             workdir_bytes=entry.get("workdir_bytes"),
+            outputs_pending=bool(entry.get("outputs_pending")),
+            outputs_lost=bool(entry.get("outputs_lost")),
         )
         if view.status == "running":
             running.append(view)
@@ -284,9 +297,25 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
         lines.append(f"  queued  {job.job_id} {job.name or '-'} prio={job.priority}")
     for job in view.finished[:recent]:
         detail = job.reason or (f"exit {job.exit_code}" if job.exit_code else "")
+        flag = ""
+        if job.outputs_lost:
+            flag = "  OUTPUTS LOST"
+        elif job.outputs_pending:
+            flag = "  outputs not uploaded"
         lines.append(
             f"  done    {job.job_id} {job.name or '-'} {job.status}"
-            f"{f' ({detail})' if detail else ''}"
+            f"{f' ({detail})' if detail else ''}{flag}"
+        )
+    at_risk = view.outputs_at_risk
+    if at_risk:
+        # Worth a line of its own: these are the jobs whose results a purge (or
+        # a pod going away) would take with them, and only a human can decide
+        # whether to requeue them or copy them off.
+        lines.append(
+            f"  outputs {len(at_risk)} finished job(s) produced outputs that never reached "
+            f"S3/HF: {', '.join(job.job_id for job in at_risk[:3])}"
+            f"{' ...' if len(at_risk) > 3 else ''}; `gpuc requeue` them or copy them off "
+            f"before they are purged"
         )
     leftover = view.leftover_bytes
     if leftover > LEFTOVER_FLOOR_BYTES:

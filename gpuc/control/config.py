@@ -194,6 +194,12 @@ class HostEntry(BaseModel):
     idle_minutes: float = 15.0
     ttl_hours: float = 24.0
     s3_prefix: str | None = None
+    retention_days: float | None = None
+    """Auto-purge horizon for this host, in days; None never auto-purges.
+
+    Only ever acts on jobs whose log and state are confirmed mirrored, so a
+    host with no `s3_prefix` (and no `s3_bucket` to derive one from) can set
+    this and nothing will ever be deleted."""
     created_at: str | None = None
     bootstrapped_at: str | None = None
 
@@ -248,6 +254,7 @@ class HostEntry(BaseModel):
             ttl_hours=self.ttl_hours,
             s3_prefix=self.s3_prefix,
             created_at=self.created_at,
+            retention_days=self.retention_days,
             env=self.job_env(),
         )
 

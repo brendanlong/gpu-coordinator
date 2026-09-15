@@ -302,6 +302,46 @@ def sync_job_meta(
             copy_file_to_s3(path, f"{base}/{path.name}", runner=runner, timeout=timeout, env=env)
 
 
+def final_meta_sync(
+    job_id: str,
+    s3_prefix: str | None,
+    *,
+    runner: CommandRunner = run_command,
+    timeout: float | None = 300.0,
+    env: Env = None,
+) -> str | None:
+    """Mirror a finished job's log and state, then record that it happened.
+
+    `meta_synced_at` is the precondition `purge` checks before deleting a job
+    dir, so it is written only once the upload has actually succeeded -- a
+    raised SyncError, or no `s3_prefix` at all, leaves it null and the job dir
+    unpurgeable. Writing it changes `state.json`, so state goes up once more
+    afterwards (a few hundred bytes) and the mirror matches the local file.
+
+    Returns a warning when only that trailing PUT failed: the local state is
+    the authority on "was this backed up", and log + state are already in S3,
+    so a stale mirrored copy of `state.json` is not worth undoing the record.
+    """
+    if not s3_prefix:
+        return None
+    sync_job_meta(job_id, s3_prefix, runner=runner, timeout=timeout, env=env)
+    prefix = s3_prefix.rstrip("/")
+    jobs.update_state(job_id, meta_synced_at=jobs.utc_now(), meta_synced_to=prefix)
+    state = paths.state_file(job_id)
+    try:
+        if state.exists():
+            copy_file_to_s3(
+                state,
+                f"{prefix}/jobs/{job_id}/state.json",
+                runner=runner,
+                timeout=timeout,
+                env=env,
+            )
+    except SyncError as exc:
+        return f"the mirrored state.json is one revision behind (re-upload failed): {exc}"
+    return None
+
+
 class SyncLoop:
     """Background periodic sync; `final()` runs one last synchronous pass.
 
@@ -332,6 +372,11 @@ class SyncLoop:
         self._thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
         self.last_error: str | None = None
+        self.outputs_synced_at: str | None = None
+        """Set by the tick that uploaded `outputs:` without raising. `final()`
+        clears it first, so after `final()` it is non-null only when the *last*
+        upload -- the one that includes everything written since the last tick
+        -- actually succeeded."""
 
     def _note(self, message: str) -> None:
         try:
@@ -357,6 +402,11 @@ class SyncLoop:
                 timeout=timeout,
                 env=self._env,
             )
+            # Only when there was something to upload: a spec with no
+            # `outputs:` has nothing to confirm, and a timestamp there would
+            # read as a promise nobody made.
+            if self._spec.outputs:
+                self.outputs_synced_at = jobs.utc_now()
             sync_job_meta(
                 self._spec.job_id,
                 self._s3_prefix,
@@ -391,6 +441,12 @@ class SyncLoop:
             self._thread = None
 
     def final(self) -> None:
-        """Stop the loop and do one complete sync, including files just written."""
+        """Stop the loop and do one complete sync, including files just written.
+
+        `outputs_synced_at` is cleared first: an earlier tick having worked says
+        nothing about the files the job wrote in its last minute, and `purge`
+        reads that field as "everything this job produced is somewhere else".
+        """
         self.stop()
+        self.outputs_synced_at = None
         self._tick(min_age_s=0.0, timeout=None)

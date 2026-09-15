@@ -65,6 +65,7 @@ out to binaries the bootstrap installs into `$HOME` (`aws` CLI v2 bundle,
 ```
 config.json          # {"host": "<name>", "gpus": ["GPU-uuid", ...], "provider": null | {"kind":"runpod","pod_id":..},
                      #  "idle_minutes": 15, "ttl_hours": 24, "s3_prefix": "s3://bucket/gpuc/<host>",
+                     #  "retention_days": null | N,   # auto-purge horizon; null never purges
                      #  "env": {"HF_HOME": ...}}      # host-wide, hand-set; see Persistent root
 secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
 incoming/<jobid>.json # a spec staged 0644 by `submit`, fed to `enqueue -` and deleted
@@ -77,7 +78,14 @@ jobs/<jobid>/
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null, "sync_error": str|null,
                      #  "util_recent": [float|null, ...], "util_sampled_at": str|null,
-                     #  "workdir_removed": bool}
+                     #  "workdir_removed": bool,
+                     #  "meta_synced_at": str|null, "meta_synced_to": str|null,
+                     #  "outputs_synced_at": str|null, "outputs_lost": bool}
+                     # meta_synced_* are written only after a *successful* final sync_job_meta
+                     # (and state.json goes up once more so the mirror matches); they are the
+                     # precondition `purge` checks. outputs_synced_at is set only when the final
+                     # upload of `outputs:` succeeded; outputs_lost is set by an ephemeral host's
+                     # drain after it retried and gave up.
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and the sample must not be read as 0%.
                      # pgid is the *job's* group, published by the runner when it spawns a phase.
@@ -193,7 +201,10 @@ queue's lexical order, not submission order below one second.
    any earlier removal would delete the run's results on the way past. Record
    `workdir_removed` in `state.json`, then upload state and log. A removal that
    fails is logged and nothing more: the job's outcome is already decided, and
-   leftover disk is not worth turning a green run red.
+   leftover disk is not worth turning a green run red. That last upload records
+   `meta_synced_at`/`meta_synced_to` and puts `state.json` up once more, so the
+   mirror includes the record of itself; `outputs_synced_at` is written in the
+   final state write when the final output upload succeeded. See Retention.
 
 ## Workdir cleanup
 
@@ -219,6 +230,49 @@ or unreadable, and (under `--older-than`) a job with no parseable `ended_at`
 are all skipped. It also removes `incoming/<id>.json` staged specs whose job
 has finished, or which name no job at all and are over an hour old -- the
 window in which that file is load-bearing is one SSH round trip.
+
+## Retention and purge
+
+`clean` keeps `spec.json`, `state.json` and `log.txt` forever. `python -m
+gpuc.host purge [--older-than DAYS] [--dry-run] [--force] [--only IDS]` (driven
+by `gpuc clean --host H --purge`) removes the whole `jobs/<id>/`, plus any stray
+queue marker, secrets file and staged spec, for finished jobs older than DAYS
+(default 7, from `ended_at`) that carry two records in their own `state.json`:
+
+- `meta_synced_at` -- the final `sync_job_meta` returned 0, so log and state are
+  in S3. The local state is the authority: the host cannot consult the mirror
+  without credentials it may not have. Without it, the skip reason is `not
+  backed up: no s3_prefix on this host` or `not backed up: final upload failed`.
+- confirmed outputs -- `outputs_synced_at` set, or a spec with no `outputs:`, or
+  a workdir that is already gone. `outputs:` paths resolve inside the workdir and
+  a failed job keeps its workdir, so a purge could otherwise bin the only copy of
+  a checkpoint. Without it: `outputs not confirmed uploaded`.
+
+`--force` overrides both and marks each removal `forced` so the report says so
+loudly. Running, queued and unreadable-state jobs are never purged, forced or
+not. `--purge` also runs the ordinary workdir sweep -- which is what reclaims
+the jobs the purge refused -- and `--only` narrows what may be *purged* and
+nothing else.
+
+`HostConfig.retention_days` (registry `HostEntry.retention_days`, `gpuc host
+add|set --retention-days N`, null by default) makes the dispatcher purge, never
+forced, once at startup and then at most once an hour. A non-ephemeral host's
+dispatcher only lives while there is work, so in practice that sweep happens on
+the next submit.
+
+An ephemeral host's drain retries unconfirmed outputs before terminating --
+three attempts a minute apart, five minutes in total, with the job's secrets
+file (the runner leaves it in place exactly for this) or the host env -- then
+records `outputs_lost` with the last error in `sync_error`, mirrors state, and
+terminates anyway: the pod is billing and the TTL that sent us here does not
+pause.
+
+Control side only: `--verify` HEADs `<s3_prefix>/jobs/<id>/log.txt` with the
+local credentials before deleting the original and purges only what answered
+(with `--force`, the rest too, loudly). The default trusts `meta_synced_at`.
+
+After a purge, `gpuc status --all` still lists the job from the S3 index, and
+`gpuc logs <id>` says `purged from host` and falls back to the mirror.
 
 The host's `status` reports `workdir_bytes` per *finished* job (a live job's
 workdir is still being written to, and walking it on every status call would be
@@ -267,6 +321,7 @@ gpuc host add spar   --ssh user@host [--port N] --gpus GPU-uuid,.. # shared box
                      [--env K=V]                  # extra environment for every job on this host
                      [--cache-dir PATH]           # pin UV_CACHE_DIR; else bootstrap picks one
 gpuc host set <host> [--gpus ..] [--persistent-root R] [--gpuc-home PATH] [--cache-dir PATH] [--s3-prefix ..]
+                     [--retention-days N]             # auto-purge horizon; '' clears it
                      [--idle-min N] [--ttl-hours N]   # edit one entry in place; only the flags given change
 gpuc host bootstrap <host>        # install uv + package, write config, run host preflight, start dispatcher
 gpuc host probe <host>            # print driver, GPUs+UUIDs, disk + $HOME's fs type, logind KillUserProcesses, systemd --user, uv cache size + whether it shares gpuc home's fs, network timing
@@ -280,6 +335,7 @@ gpuc status [--host H] [--all] [--suspects]
 gpuc logs <jobid> [-f]           # tail from the host over transport; S3 fallback with a note
 gpuc cancel <jobid>
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]
+gpuc clean --host H --purge [--older-than DAYS] [--verify] [--force] [--dry-run]
 gpuc reorder <jobid> --priority N
 gpuc requeue <jobid> [--host H | --runpod ...]   # resubmit from the S3 spec, new attempt
 gpuc reconcile [--once]          # the loop; installable as a systemd --user service via `gpuc reconcile --install`
@@ -421,6 +477,10 @@ and timer but does not enable them, and prints the `systemctl` lines and the
 An ephemeral host whose pod the provider reports as missing or TERMINATED is
 `POD GONE`: no ssh is attempted, and the line says to run `gpuc reconcile
 --once` rather than printing a connection error.
+
+`status` also flags a finished job whose `outputs:` never reached S3/HF
+(`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
+those are the jobs a purge -- or a pod going away -- would take with them.
 
 Per host: kind, reachable?, dispatcher alive?, GPUs (owned/free), queue
 (id, name, prio), running (id, name, phase, minutes, last util), recent

@@ -46,10 +46,10 @@ without it they fail immediately with one line rather than part-way through.
 ```
 gpuc host add <name> [--ssh user@host] [--port N] [--gpus UUID,..] [--gpuc-home PATH]
                      [--persistent-root PATH] [--env K=V] [--cache-dir PATH]
-                     [--s3-prefix s3://..] [--idle-min N] [--ttl-hours N]
+                     [--s3-prefix s3://..] [--retention-days N] [--idle-min N] [--ttl-hours N]
 gpuc host set <name> [--gpus UUID,..] [--persistent-root PATH] [--gpuc-home PATH]
                      [--env K=V] [--cache-dir PATH] [--s3-prefix s3://..]
-                     [--idle-min N] [--ttl-hours N]
+                     [--retention-days N] [--idle-min N] [--ttl-hours N]
 gpuc host bootstrap <name> [--health-args "..."]     # idempotent; also restarts the dispatcher
 gpuc host probe <name>                               # driver, GPUs+UUIDs, disk+fs type, systemd, network
 gpuc host clean <name> --uv-cache                    # `uv cache prune` on the host
@@ -59,6 +59,7 @@ gpuc status [--host H] [--all] [--suspects]          # --all adds jobs only the 
 gpuc logs <job-id> [-f] [-n LINES] [--host H]        # host first, S3 mirror as a noted fallback
 gpuc cancel <job-id> [--host H]
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]   # free finished workdirs
+gpuc clean --host H --purge [--older-than DAYS] [--verify] [--force] [--dry-run]  # whole job dirs
 gpuc reorder <job-id> --priority N [--host H]        # queued jobs only
 gpuc requeue <job-id> [--host H | --runpod ...]      # re-reads the spec from S3, attempt+1
 gpuc reconcile [--once] [--interval S] [--install]
@@ -333,6 +334,106 @@ missing or unreadable, and (under `--older-than`) a job with no usable
 over an hour old — and never anything else. Sizes are `du`-style allocated
 blocks, so a venv sharing extents with the uv cache reads as an upper bound.
 
+### Retention: what is kept, and what `--purge` removes
+
+`clean` never touches `spec.json`, `state.json` or `log.txt` — a cleaned job
+still answers `gpuc logs` and `gpuc status`. Those three files are small, but
+they are kept *forever*, and on a long-lived box "forever" eventually shows up
+in `ls`. `gpuc clean --purge` is the one command that removes them:
+
+| | `clean` | `clean --purge` |
+| --- | --- | --- |
+| `workdir/` (code + venv + outputs) | removed | removed |
+| `spec.json`, `state.json`, `log.txt` | **kept** | removed |
+| stale `incoming/<id>.json` | removed | removed |
+| a stray queue marker for the job | — | removed |
+| running or queued jobs | never touched | never touched |
+
+```sh
+gpuc clean --host spar --purge --dry-run              # default: ended over 7 days ago
+gpuc clean --host spar --purge --older-than 30        # a month instead
+gpuc clean --host spar --purge --older-than 30 --verify   # HEAD each mirrored log first
+gpuc clean --host spar --purge --older-than 0 --force     # delete unmirrored records too
+```
+
+**The precondition: it must be backed up.** After a job's last upload, the
+runner writes `meta_synced_at` and `meta_synced_to` into `state.json` — set
+only when the upload actually returned 0 — and then re-uploads `state.json`
+once more so the mirror matches. A purge refuses any job without that record:
+
+```
+  SKIPPED 20260901-101500-a1b2c3  not backed up: no s3_prefix on this host
+  SKIPPED 20260902-090000-d4e5f6  not backed up: final upload failed
+```
+
+Outputs are the second precondition. `outputs:` paths live *inside* the
+workdir, and a failed or cancelled job keeps its workdir, so a job that ended
+`failed: sync` can hold the only copy of a checkpoint. The runner records
+`outputs_synced_at` only when the *final* output upload succeeded, and a purge
+skips anything unconfirmed with `outputs not confirmed uploaded` (a spec with
+no `outputs:`, or a workdir that is already gone, has nothing to confirm).
+`gpuc status` flags those jobs so you can `gpuc requeue` them or copy them off:
+
+```
+  done    20260902-090000-d4e5f6 bulky failed (sync)  outputs not uploaded
+  outputs 1 finished job(s) produced outputs that never reached S3/HF: 20260902-090000-d4e5f6; ...
+```
+
+An ephemeral host retries those uploads while it drains — three tries a minute
+apart, five minutes at most — and if they still fail it records
+`outputs_lost: true` and terminates anyway (the pod is billing, and its TTL
+does not pause). `gpuc status --all` shows `OUTPUTS LOST` against such a job.
+
+`--force` overrides both preconditions, removes the record anyway, and says so
+loudly per job. `--verify` (control side only) HEADs each candidate's
+`<s3_prefix>/jobs/<id>/log.txt` with your own credentials before deleting the
+original; without it the host's `meta_synced_at` is trusted, which is the only
+answer a host with no credentials of ours can give.
+
+**Automatic retention.** `--retention-days N` makes the host's dispatcher do
+this by itself — never with `--force`:
+
+```sh
+gpuc host set spar --retention-days 14
+gpuc host bootstrap spar        # the setting reaches the host in config.json
+gpuc host set spar --retention-days ''      # back to keeping everything (the default)
+```
+
+The dispatcher purges once at startup and then at most once an hour. On an
+ephemeral host that is the whole of its life; on a **non-ephemeral host the
+dispatcher only lives while jobs are queued or running**, so the sweep happens
+on your next `gpuc submit` rather than on a timer. Each pass also does the
+ordinary workdir clean over the same horizon, which needs no mirror — so on a
+host with no `--s3-prefix`, `--retention-days` reclaims old venvs and nothing
+else.
+
+For any of this to ever delete anything, the host itself must have an
+`s3_prefix` in its `config.json`:
+
+```sh
+gpuc host set spar --s3-prefix s3://my-bucket/gpuc/spar
+gpuc host bootstrap spar        # the prefix only reaches the host here
+```
+
+A pod from `gpuc submit --runpod` gets one derived from `s3_bucket`
+automatically. A `local` or `ssh` host does **not**: `s3_bucket` on its own
+mirrors specs and the job index from this machine, not each job's log and state
+from the host, so `--s3-prefix` is the flag that matters. (Set it only on a host
+whose jobs can actually authenticate to that bucket — `secrets:` or an instance
+role — since a final sync that fails turns an otherwise green job into
+`failed: sync`.) Without a prefix every job stays `not backed up: no s3_prefix
+on this host` and `--retention-days` is a no-op, which is the intended failure
+mode: nothing is deleted that nothing else has a copy of.
+
+After a purge, `gpuc status --all` still lists the job from the S3 index, and
+`gpuc logs <id>` says it was purged from the host and falls back to the mirror:
+
+```
+note: job 20260901-101500-a1b2c3 was purged from host spar (gpuc clean --purge removes the
+      whole job dir once it is mirrored)
+note: falling back to the S3 mirror at s3://bucket/gpuc/spar/jobs/20260901-101500-a1b2c3/log.txt
+```
+
 `gpuc status` adds one line per host once finished workdirs hold more than 1 GiB:
 
 ```
@@ -403,7 +504,13 @@ in `$XDG_RUNTIME_DIR/gpuc/` (or `/tmp/gpuc-<uid>/`), because a unix socket path
 must fit in 108 bytes.
 
 With `s3_bucket` set, specs go to `s3://<bucket>/gpuc/specs/<jobid>.json` and
-each job's `log.txt` and `state.json` are mirrored under the host's prefix.
+the job index to `gpuc/index/`. Each job's `log.txt` and `state.json` are
+mirrored by the *host*, which needs its own `--s3-prefix` (pods get one
+derived from `s3_bucket`; a `local` or `ssh` host is told to set it).
+`state.json` records `meta_synced_at`/`meta_synced_to` once that mirror is
+confirmed and `outputs_synced_at` once the final output upload is, which is
+what `gpuc clean --purge` requires before it deletes a job dir
+([Retention](#retention-what-is-kept-and-what---purge-removes)).
 
 ## Troubleshooting
 
@@ -417,6 +524,10 @@ each job's `log.txt` and `state.json` are mirrored under the host's prefix.
 | job is `failed: sync` (or `...+sync`) | the final upload failed; the run itself may have been fine | check the tail of `gpuc logs <jobid>`; the usual cause is missing `secrets:` for the destination, or no `aws`/`hf` on the host (re-run bootstrap) |
 | job is `failed: no-outputs` | the `outputs` path was never written | check the job actually wrote to that path, relative to the workdir |
 | a host is out of disk, or `status` shows a `disk` line | finished jobs' workdirs (usually venvs) are still there | `gpuc clean --host <host> --all-finished`, and set `cleanup: always` on jobs you never need to inspect |
+| `clean --purge` skips everything as "not backed up" | the host has no `s3_prefix`, so nothing is mirrored and deleting a job dir would lose its log | `gpuc host set <host> --s3-prefix s3://bucket/gpuc/<host>` + `gpuc host bootstrap`, or accept the loss with `--force` |
+| `status` says a job's `outputs not uploaded` | the final upload of its `outputs:` failed, so the results exist only on that host | copy them off (`gpuc logs` shows the sync error), or `gpuc requeue <id>`; a purge will not remove it until they are confirmed |
+| a job is `OUTPUTS LOST` | an ephemeral host drained, retried the upload three times and gave up before terminating | the results are gone; `gpuc requeue <id>` re-runs it, and fix the credential or bucket first |
+| `--retention-days` never deletes anything | the dispatcher only lives while a non-ephemeral host has work, and it never purges an unmirrored job | check `gpuc status` for `not backed up`, and remember the sweep runs on the next submit |
 | `uv sync` re-downloads torch on every job | uv's cache is on a different filesystem from gpuc home, so it copies instead of linking | `gpuc host bootstrap <host>` (it sets `UV_CACHE_DIR` for you), or pin one with `--cache-dir` |
 | `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc reconcile --once` |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | `gpuc host bootstrap <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` what you still want ([runbook](#hosts-whose-home-directory-is-wiped-on-restart)) |

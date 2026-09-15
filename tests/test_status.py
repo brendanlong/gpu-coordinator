@@ -275,3 +275,39 @@ def test_workdir_bytes_survives_the_host_payload() -> None:
 
 def test_a_host_that_never_reports_sizes_is_fine() -> None:
     assert view().leftover_bytes == 0
+
+
+def test_finished_jobs_with_unconfirmed_outputs_are_flagged() -> None:
+    document = payload()
+    document["jobs"].append(
+        {
+            "job_id": "j-pending",
+            "name": "bulky",
+            "status": "failed",
+            "reason": "sync",
+            "ended_at": minutes_ago(5),
+            "outputs_pending": True,
+        }
+    )
+    view = HostView(entry=HostEntry(name="spar", kind="ssh", ssh="me@box"), reachable=True)
+    view.queue, view.running, view.finished = job_views(document)
+    out = render(view)
+    assert "outputs not uploaded" in out
+    assert "never reached S3/HF: j-pending" in out
+
+
+def test_a_lost_output_says_so_louder() -> None:
+    document = payload()
+    document["jobs"].append(
+        {
+            "job_id": "j-lost",
+            "name": "bulky",
+            "status": "succeeded",
+            "ended_at": minutes_ago(5),
+            "outputs_pending": True,
+            "outputs_lost": True,
+        }
+    )
+    view = HostView(entry=HostEntry(name="pod", kind="runpod"), reachable=True)
+    view.queue, view.running, view.finished = job_views(document)
+    assert "OUTPUTS LOST" in render(view)

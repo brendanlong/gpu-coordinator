@@ -4,7 +4,14 @@
 A finished job's `workdir` is nearly always the largest thing gpuc owns -- a
 torch venv measures ~6.5 GB -- and it is the only part of a job dir that can be
 recreated: `gpuc requeue` re-syncs it from git. `spec.json`, `state.json` and
-`log.txt` are the record of what happened and are never touched here.
+`log.txt` are the record of what happened, and `clean` never touches them.
+
+`purge` is the one thing here that does: it deletes a whole `jobs/<id>/` once
+the job is old enough *and* its own `state.json` says both the record
+(`meta_synced_at`) and whatever the job produced (`outputs_synced_at`) are
+somewhere else. Without those, a purge is the only copy of a run's log and its
+checkpoints going in the bin, which is why it is refused unless the caller
+passes `--force` -- and then told, loudly, what it just did.
 """
 
 from __future__ import annotations
@@ -12,12 +19,20 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gpuc.host import jobs, paths
+from gpuc.host import jobs, paths, queue
 from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS
+
+DEFAULT_RETENTION_DAYS = 7.0
+"""How old a finished job must be before `purge` will consider it.
+
+A week is long enough that "I'll look at that failure tomorrow" survives a
+weekend, and the mirror precondition means nothing is actually lost either way.
+"""
 
 INCOMING_STALE_S = 3600.0
 """How old an orphaned staged spec must be before `clean` removes it.
@@ -123,6 +138,11 @@ class Candidate:
     bytes: int
     ended_at: str | None = None
     age_days: float | None = None
+    meta_synced_at: str | None = None
+    meta_synced_to: str | None = None
+    forced: bool = False
+    """Purged without a confirmed mirror or confirmed outputs, because the
+    caller passed `--force`."""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -131,6 +151,9 @@ class Candidate:
             "bytes": self.bytes,
             "ended_at": self.ended_at,
             "age_days": None if self.age_days is None else round(self.age_days, 2),
+            "meta_synced_at": self.meta_synced_at,
+            "meta_synced_to": self.meta_synced_to,
+            "forced": self.forced,
         }
 
 
@@ -147,13 +170,20 @@ class Skipped:
 class CleanResult:
     dry_run: bool = False
     removed: list[Candidate] = field(default_factory=list)
+    """Jobs whose `workdir/` went; the rest of the job dir stayed."""
     skipped: list[Skipped] = field(default_factory=list)
+    purged: list[Candidate] = field(default_factory=list)
+    """Jobs whose whole `jobs/<id>/` went, mirror confirmed (or forced)."""
+    purge_skipped: list[Skipped] = field(default_factory=list)
     incoming_removed: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    s3_prefix: str | None = None
+    """This host's mirror target, so the control side can say why nothing is
+    backed up without a second round trip."""
 
     @property
     def freed_bytes(self) -> int:
-        return sum(c.bytes for c in self.removed)
+        return sum(c.bytes for c in self.removed) + sum(c.bytes for c in self.purged)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -161,8 +191,11 @@ class CleanResult:
             "freed_bytes": self.freed_bytes,
             "removed": [c.to_dict() for c in self.removed],
             "skipped": [s.to_dict() for s in self.skipped],
+            "purged": [c.to_dict() for c in self.purged],
+            "purge_skipped": [s.to_dict() for s in self.purge_skipped],
             "incoming_removed": self.incoming_removed,
             "errors": self.errors,
+            "s3_prefix": self.s3_prefix,
         }
 
 
@@ -171,6 +204,7 @@ def candidates(
     all_finished: bool = False,
     older_than_days: float | None = None,
     now: datetime | None = None,
+    only: Iterable[str] | None = None,
 ) -> tuple[list[Candidate], list[Skipped]]:
     """Which finished jobs' workdirs may be removed, and why the rest may not.
 
@@ -180,9 +214,12 @@ def candidates(
     says the job is over.
     """
     moment = now or datetime.now(UTC)
+    wanted = None if only is None else set(only)
     picked: list[Candidate] = []
     skipped: list[Skipped] = []
     for job_id in jobs.list_job_ids():
+        if wanted is not None and job_id not in wanted:
+            continue
         workdir = paths.workdir(job_id)
         if not workdir.is_dir():
             continue
@@ -214,6 +251,8 @@ def candidates(
                 bytes=dir_size(workdir),
                 ended_at=state.ended_at,
                 age_days=age_days,
+                meta_synced_at=state.meta_synced_at,
+                meta_synced_to=state.meta_synced_to,
             )
         )
     return picked, skipped
@@ -260,11 +299,12 @@ def clean(
     older_than_days: float | None = None,
     dry_run: bool = False,
     now: datetime | None = None,
+    only: Iterable[str] | None = None,
 ) -> CleanResult:
     picked, skipped = candidates(
-        all_finished=all_finished, older_than_days=older_than_days, now=now
+        all_finished=all_finished, older_than_days=older_than_days, now=now, only=only
     )
-    result = CleanResult(dry_run=dry_run, skipped=skipped)
+    result = CleanResult(dry_run=dry_run, skipped=skipped, s3_prefix=host_s3_prefix())
     for candidate in picked:
         if dry_run:
             result.removed.append(candidate)
@@ -289,4 +329,166 @@ def clean(
                 result.errors.append(f"could not remove {path}: {exc}")
                 continue
         result.incoming_removed.append(path.name)
+    return result
+
+
+# -- purge: the whole job dir, once its record lives somewhere else ------------
+
+
+def host_s3_prefix() -> str | None:
+    """This host's mirror target, or None if it has no `s3_prefix` at all."""
+    try:
+        return jobs.read_config().s3_prefix or None
+    except (RuntimeError, OSError, ValueError):
+        return None
+
+
+def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | None]:
+    """Is everything this job produced known to be somewhere other than here?
+
+    `outputs:` paths resolve *inside* `workdir/`, and a failed or cancelled job
+    keeps its workdir by default, so a job that ended `failed: sync` can be
+    holding the only copy of a checkpoint. Three ways to be satisfied: the
+    final upload was confirmed, the spec declared no outputs, or the workdir is
+    already gone (whatever it held went with `cleanup:`, not with us). An
+    unreadable spec cannot answer the question, so it fails closed.
+    """
+    if state.outputs_synced_at:
+        return True, None
+    try:
+        spec = jobs.read_spec(job_id)
+    except (RuntimeError, FileNotFoundError, OSError):
+        return False, "spec.json is unreadable, so its outputs cannot be checked"
+    if not spec.outputs:
+        return True, None
+    if not paths.workdir(job_id).is_dir():
+        return True, None
+    detail = " (the drain gave up: outputs_lost)" if state.outputs_lost else ""
+    return False, f"outputs not confirmed uploaded{detail}"
+
+
+def _not_backed_up(prefix: str | None) -> str:
+    if prefix is None:
+        return "not backed up: no s3_prefix on this host"
+    return "not backed up: final upload failed"
+
+
+def purge_candidates(
+    *,
+    older_than_days: float = DEFAULT_RETENTION_DAYS,
+    now: datetime | None = None,
+    force: bool = False,
+    only: Iterable[str] | None = None,
+) -> tuple[list[Candidate], list[Skipped]]:
+    """Which finished jobs' whole directories may go, and why the rest may not.
+
+    Fails closed exactly as `clean` does -- unreadable state, not finished, no
+    usable `ended_at`, too young -- and then adds the two preconditions that
+    make deleting the record itself safe: `meta_synced_at` (log and state are
+    mirrored) and confirmed outputs. `force` overrides only those last two, and
+    the candidate is marked `forced` so the report can say so.
+    """
+    moment = now or datetime.now(UTC)
+    wanted = None if only is None else set(only)
+    prefix = host_s3_prefix()
+    picked: list[Candidate] = []
+    skipped: list[Skipped] = []
+    for job_id in jobs.list_job_ids():
+        if wanted is not None and job_id not in wanted:
+            continue
+        try:
+            state = jobs.read_state(job_id)
+        except (RuntimeError, FileNotFoundError, OSError):
+            skipped.append(Skipped(job_id, "no readable state.json"))
+            continue
+        if not state.finished:
+            skipped.append(Skipped(job_id, f"status {state.status}"))
+            continue
+        ended = _parse(state.ended_at)
+        if ended is None:
+            skipped.append(Skipped(job_id, "finished but records no usable ended_at"))
+            continue
+        age_days = (moment - ended).total_seconds() / 86400.0
+        if age_days < older_than_days:
+            skipped.append(Skipped(job_id, f"only {age_days:.1f} days old"))
+            continue
+        reasons: list[str] = []
+        if not state.meta_synced_at:
+            reasons.append(_not_backed_up(prefix))
+        confirmed, why = outputs_confirmed(job_id, state)
+        if not confirmed and why:
+            reasons.append(why)
+        if reasons and not force:
+            skipped.append(Skipped(job_id, "; ".join(reasons)))
+            continue
+        picked.append(
+            Candidate(
+                job_id=job_id,
+                status=state.status,
+                bytes=dir_size(paths.job_dir(job_id)),
+                ended_at=state.ended_at,
+                age_days=age_days,
+                meta_synced_at=state.meta_synced_at,
+                meta_synced_to=state.meta_synced_to,
+                forced=bool(reasons),
+            )
+        )
+    return picked, skipped
+
+
+def remove_job_dir(job_id: str) -> int:
+    """Delete `jobs/<id>/` and every stray trace of the job. Bytes freed."""
+    directory = paths.job_dir(job_id)
+    size = dir_size(directory) if directory.is_dir() else 0
+    if directory.is_dir():
+        shutil.rmtree(directory)
+    # A finished job has no business in the queue, but a marker left by a
+    # crash would make the next dispatcher launch a job with no spec.
+    queue.remove_marker(job_id)
+    with contextlib.suppress(OSError):
+        paths.job_env_file(job_id).unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        (paths.home() / "incoming" / f"{job_id}.json").unlink(missing_ok=True)
+    return size
+
+
+def purge(
+    *,
+    older_than_days: float = DEFAULT_RETENTION_DAYS,
+    dry_run: bool = False,
+    force: bool = False,
+    now: datetime | None = None,
+    only: Iterable[str] | None = None,
+) -> CleanResult:
+    """Remove whole job dirs, then run the ordinary workdir sweep over the rest.
+
+    `--purge` implying `clean` is what makes one command enough: the jobs a
+    purge refuses (no mirror, unconfirmed outputs) are exactly the ones whose
+    workdirs are still worth reclaiming. `only` therefore narrows what may be
+    *purged* and nothing else -- it exists for the control side's `--verify`,
+    which cannot let an unverified job dir go but has no reason to keep its
+    venv either.
+    """
+    picked, skipped = purge_candidates(
+        older_than_days=older_than_days, now=now, force=force, only=only
+    )
+    result = CleanResult(dry_run=dry_run, purge_skipped=skipped, s3_prefix=host_s3_prefix())
+    for candidate in picked:
+        if dry_run:
+            result.purged.append(candidate)
+            continue
+        try:
+            remove_job_dir(candidate.job_id)
+        except OSError as exc:
+            result.errors.append(f"{candidate.job_id}: could not remove the job dir: {exc}")
+            continue
+        result.purged.append(candidate)
+    purged_ids = {candidate.job_id for candidate in result.purged}
+    sweep = clean(older_than_days=older_than_days, dry_run=dry_run, now=now)
+    # In a dry run the purged dirs are still there, so the sweep sees their
+    # workdirs too; counting both would report the same bytes twice.
+    result.removed = [c for c in sweep.removed if c.job_id not in purged_ids]
+    result.skipped = [s for s in sweep.skipped if s.job_id not in purged_ids]
+    result.incoming_removed = sweep.incoming_removed
+    result.errors += sweep.errors
     return result

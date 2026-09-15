@@ -27,6 +27,12 @@ class FakeS3Client:
         self.objects[f"{Bucket}/{Key}"] = Body
         return {}
 
+    def head_object(self, *, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:
+        try:
+            return {"ContentLength": len(self.objects[f"{Bucket}/{Key}"])}
+        except KeyError as exc:
+            raise RuntimeError("404") from exc
+
     def get_object(self, *, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:
         try:
             return {"Body": _Body(self.objects[f"{Bucket}/{Key}"])}

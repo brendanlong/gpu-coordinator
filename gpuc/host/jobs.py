@@ -212,6 +212,29 @@ class JobState:
     """Whether `workdir/` has been deleted, by the job's `cleanup:` policy or by
     `gpuc clean`. Recorded so `status` and `logs` can say "gone on purpose"
     rather than leaving an empty job dir to look like data loss."""
+    meta_synced_at: str | None = None
+    """When this job's `log.txt` and `state.json` were last confirmed mirrored.
+
+    Written only after a *successful* final `sync_job_meta`, and the whole
+    precondition for `purge`: the local state is the authority on whether a job
+    dir may be deleted, because the mirror cannot be consulted from the host
+    without credentials the host may not have. Null means "no confirmed backup"
+    -- either the upload failed or this host has no `s3_prefix` at all."""
+    meta_synced_to: str | None = None
+    """The `s3_prefix` the confirmed mirror went to, so a purge can name it."""
+    outputs_synced_at: str | None = None
+    """When the *final* upload of this job's `outputs:` finished without error.
+
+    `outputs:` paths live inside `workdir/`, so a job that ended `failed: sync`
+    -- or was killed between periodic ticks -- may hold the only copy of what it
+    produced. Null with a declared `outputs:` and a workdir still on disk means
+    `purge` must not delete it. A spec that declares no outputs leaves this null
+    too; there is simply nothing to confirm."""
+    outputs_lost: bool = False
+    """The drain retried this job's output upload to the end and it still
+    failed, so an ephemeral host is about to take the only copy with it.
+    `sync_error` holds the last failure. Surfaced by `status` because nothing
+    fixes it afterwards except re-running the job."""
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> JobState:
@@ -282,6 +305,12 @@ class HostConfig:
     ttl_hours: float = 24.0
     s3_prefix: str | None = None
     created_at: str | None = None
+    retention_days: float | None = None
+    """Automatic purge horizon, in days. Null (the default) never auto-purges.
+
+    When set, the dispatcher purges finished, mirrored job dirs older than this
+    at startup and at most once an hour while it lives. Never forced: a job
+    without a confirmed mirror is kept however old it is."""
     env: dict[str, str] = field(default_factory=dict)
     """Host-wide environment, applied to every job before the job's own `env`.
 
@@ -300,6 +329,9 @@ class HostConfig:
             ttl_hours=float(d.get("ttl_hours", 24.0)),
             s3_prefix=d.get("s3_prefix"),
             created_at=d.get("created_at"),
+            retention_days=(
+                None if d.get("retention_days") is None else float(d["retention_days"])
+            ),
             env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
         )
 

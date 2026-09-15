@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -285,3 +286,88 @@ def _wait_for(predicate, timeout: float = 20.0) -> None:  # type: ignore[no-unty
             return
         time.sleep(0.05)
     raise AssertionError("condition never became true")
+
+
+# -- recording the backup -----------------------------------------------------
+
+
+class FlakyRunner(RecordingRunner):
+    """Fails the Nth command onwards, so a partial mirror can be tested."""
+
+    def __init__(self, fail_from: int) -> None:
+        super().__init__()
+        self.fail_from = fail_from
+
+    def __call__(
+        self, argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
+        result = super().__call__(argv, timeout, env)
+        if len(self.calls) >= self.fail_from:
+            return sync.CommandResult(argv, 1, "AccessDenied")
+        return result
+
+
+def enqueued_job() -> str:
+    from gpuc.host import queue as q
+
+    job_id = q.enqueue(make_spec())
+    paths.log_file(job_id).write_text("hello\n")
+    return job_id
+
+
+def test_final_meta_sync_records_when_and_where(gpuc_home: Path, fake_aws: str) -> None:
+    job_id = enqueued_job()
+    runner = RecordingRunner()
+    assert sync.final_meta_sync(job_id, "s3://bucket/gpuc/host/", runner=runner) is None
+    state = jobs.read_state(job_id)
+    assert state.meta_synced_at and state.meta_synced_to == "s3://bucket/gpuc/host"
+    # log, state, then state again now that it records the backup.
+    assert [call[-2] for call in runner.calls] == [
+        f"s3://bucket/gpuc/host/jobs/{job_id}/log.txt",
+        f"s3://bucket/gpuc/host/jobs/{job_id}/state.json",
+        f"s3://bucket/gpuc/host/jobs/{job_id}/state.json",
+    ]
+    mirrored = json.loads(paths.state_file(job_id).read_text())
+    assert mirrored["meta_synced_at"] == state.meta_synced_at
+
+
+def test_a_failed_meta_sync_records_nothing(gpuc_home: Path, fake_aws: str) -> None:
+    job_id = enqueued_job()
+    with pytest.raises(sync.SyncError):
+        sync.final_meta_sync(job_id, "s3://bucket/x", runner=RecordingRunner(returncode=1))
+    state = jobs.read_state(job_id)
+    assert (state.meta_synced_at, state.meta_synced_to) == (None, None)
+
+
+def test_no_prefix_records_nothing_and_uploads_nothing(gpuc_home: Path, fake_aws: str) -> None:
+    job_id = enqueued_job()
+    runner = RecordingRunner()
+    assert sync.final_meta_sync(job_id, None, runner=runner) is None
+    assert runner.calls == []
+    assert jobs.read_state(job_id).meta_synced_at is None
+
+
+def test_only_the_trailing_state_put_failing_keeps_the_record(
+    gpuc_home: Path, fake_aws: str
+) -> None:
+    job_id = enqueued_job()
+    warning = sync.final_meta_sync(job_id, "s3://bucket/x", runner=FlakyRunner(fail_from=3))
+    assert warning and "one revision behind" in warning
+    # The local state is the authority: log and state did reach S3.
+    assert jobs.read_state(job_id).meta_synced_at is not None
+
+
+def test_final_clears_outputs_synced_at_before_trying(gpuc_home: Path, fake_aws: str) -> None:
+    job_id = jobs.new_job_id()
+    paths.ensure_job_layout(job_id)
+    spec = make_spec(job_id=job_id, outputs=[{"path": "outputs", "s3": "s3://b/o"}])
+    loop = sync.SyncLoop(spec, paths.workdir(job_id), None, runner=RecordingRunner())
+    with pytest.raises(sync.MissingOutput):
+        loop.final()  # the output path was never written
+    assert loop.outputs_synced_at is None
+    (paths.workdir(job_id) / "outputs").mkdir(parents=True)
+    loop.final()
+    assert loop.outputs_synced_at is not None
+    no_outputs = sync.SyncLoop(make_spec(), paths.workdir(job_id), None)
+    no_outputs.final()
+    assert no_outputs.outputs_synced_at is None  # nothing was declared

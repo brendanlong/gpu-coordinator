@@ -568,3 +568,161 @@ def test_spawned_children_get_the_home_tool_dirs_on_path(
     env = host_dispatcher._child_env(tmp_path / "pkg")
     assert env["PATH"].split(":")[0] == str(fake_home / ".local/bin")
     assert env["PYTHONPATH"].startswith(str(tmp_path / "pkg"))
+
+
+# -- automatic retention ------------------------------------------------------
+
+
+def finished_job(days_old: float = 30.0, *, mirrored: bool = True) -> str:
+    job_id = queue.enqueue(make_spec())
+    queue.remove_marker(job_id)
+    ended = (datetime.now(UTC) - timedelta(days=days_old)).isoformat()
+    jobs.update_state(
+        job_id,
+        status="succeeded",
+        ended_at=ended,
+        meta_synced_at=ended if mirrored else None,
+        meta_synced_to="s3://b/gpuc/h" if mirrored else None,
+    )
+    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
+    (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
+    return job_id
+
+
+def configure_retention(days: float | None) -> None:
+    jobs.write_config(
+        HostConfig(host="h", gpus=list(FAKE_GPUS), s3_prefix="s3://b/gpuc/h", retention_days=days)
+    )
+
+
+def test_no_retention_setting_never_purges(gpuc_home: Path) -> None:
+    configure_retention(None)
+    job_id = finished_job()
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert paths.state_file(job_id).exists()
+
+
+def test_retention_purges_at_startup(gpuc_home: Path) -> None:
+    configure_retention(7.0)
+    old = finished_job(days_old=30.0)
+    young = finished_job(days_old=1.0)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert not paths.job_dir(old).exists()
+    assert paths.state_file(young).exists()
+    assert "retention (7 days): purged 1 job dir" in paths.dispatcher_log().read_text()
+
+
+def test_retention_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
+    configure_retention(7.0)
+    clock = FakeClock()
+    dispatcher, _ = make_dispatcher(clock=clock)
+    dispatcher.run_once()
+
+    later = finished_job(days_old=30.0)
+    clock.advance(59 * 60)
+    dispatcher.run_once()
+    assert paths.state_file(later).exists(), "purged again inside the hour"
+
+    clock.advance(2 * 60)
+    dispatcher.run_once()
+    assert not paths.job_dir(later).exists()
+
+
+def test_retention_never_forces(gpuc_home: Path) -> None:
+    configure_retention(1.0)
+    unmirrored = finished_job(days_old=30.0, mirrored=False)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert paths.state_file(unmirrored).exists()
+    # ...but the ordinary workdir sweep still ran over it.
+    assert not paths.workdir(unmirrored).exists()
+
+
+def test_retention_never_touches_a_running_job(gpuc_home: Path) -> None:
+    configure_retention(0.0)
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "running"
+    dispatcher._last_purge_at = None
+    dispatcher.run_once()
+    assert paths.job_dir(job_id).is_dir()
+
+
+# -- the drain's last go at unconfirmed outputs -------------------------------
+
+
+def job_with_pending_outputs() -> str:
+    spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
+    job_id = queue.enqueue(spec)
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now())
+    (paths.workdir(job_id) / "results").mkdir(parents=True, exist_ok=True)
+    (paths.workdir(job_id) / "results" / "a.txt").write_text("hi\n")
+    return job_id
+
+
+def test_the_drain_retries_unconfirmed_outputs_and_records_success(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    configure_pod(idle_minutes=0.0)
+    job_id = job_with_pending_outputs()
+    dispatcher, _ = make_dispatcher()
+    dispatcher.drain_and_terminate("test")
+    state = jobs.read_state(job_id)
+    assert state.outputs_synced_at is not None
+    assert state.outputs_lost is False
+
+
+def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    configure_pod(idle_minutes=0.0)
+    job_id = job_with_pending_outputs()
+    attempts: list[list[str]] = []
+    slept: list[float] = []
+    clock = FakeClock()
+
+    def failing(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        attempts.append(argv)
+        # The meta upload has to keep working, or the drain aborts before it
+        # can write down that the outputs are gone.
+        ok = "state.json" in " ".join(argv) or "log.txt" in " ".join(argv)
+        return sync.CommandResult(argv, 0 if ok else 1, "" if ok else "AccessDenied")
+
+    dispatcher, _ = make_dispatcher(clock=clock)
+    dispatcher.deps.command_runner = failing
+    dispatcher.deps.sleep = lambda seconds: (slept.append(seconds), clock.advance(seconds))[0]
+    terminated: list[str] = []
+    dispatcher.deps.terminate_call = lambda pod, key: terminated.append(pod) or ""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    dispatcher.drain_and_terminate("test")
+
+    output_attempts = [a for a in attempts if "s3://bucket/" in " ".join(a)]
+    assert len(output_attempts) == 3
+    assert slept == [60.0, 60.0]
+    state = jobs.read_state(job_id)
+    assert state.outputs_lost is True
+    assert state.sync_error and "AccessDenied" in state.sync_error
+    # The pod still goes away: it is billing, and the TTL that sent us here
+    # does not pause for a bucket we cannot reach.
+    assert terminated == ["pod-1"]
+
+
+def test_the_drain_records_the_meta_backup_for_every_job(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=0.0)
+    job_id = queue.enqueue(make_spec())
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="succeeded", ended_at=jobs.utc_now())
+    dispatcher, _ = make_dispatcher()
+    dispatcher.drain_and_terminate("test")
+    state = jobs.read_state(job_id)
+    assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/pod"

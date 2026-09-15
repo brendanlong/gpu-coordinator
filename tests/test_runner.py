@@ -557,3 +557,123 @@ def test_no_secret_value_is_ever_written_to_a_log(gpuc_home: Path) -> None:
     dispatcher_log = paths.dispatcher_log()
     if dispatcher_log.exists():
         assert secret not in dispatcher_log.read_text()
+
+
+# -- the backup record the purge depends on -----------------------------------
+
+
+def uploading(
+    ok: bool = True, fail_dest: str | None = None
+) -> tuple[sync.CommandRunner, list[list[str]]]:
+    calls: list[list[str]] = []
+
+    def command_runner(
+        argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
+        calls.append(argv)
+        failed = not ok or (fail_dest is not None and fail_dest in " ".join(argv))
+        return sync.CommandResult(argv, 1 if failed else 0, "AccessDenied" if failed else "")
+
+    return command_runner, calls
+
+
+def test_a_successful_final_sync_records_the_backup(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
+    command_runner, _ = uploading()
+    job_id = prepare(command="true")
+    assert runner.run_job(job_id, deps(command_runner=command_runner)) == 0
+    state = jobs.read_state(job_id)
+    assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/h"
+
+
+def test_a_failed_final_meta_sync_records_no_backup(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
+    command_runner, _ = uploading(ok=False)
+    job_id = prepare(command="true")
+    runner.run_job(job_id, deps(command_runner=command_runner))
+    state = jobs.read_state(job_id)
+    assert (state.meta_synced_at, state.meta_synced_to) == (None, None)
+    assert "final state upload failed" in log_of(job_id)
+
+
+def test_a_host_with_no_prefix_records_no_backup(gpuc_home: Path) -> None:
+    jobs.write_config(HostConfig(host="h", gpus=[]))
+    job_id = prepare(command="true")
+    assert runner.run_job(job_id, deps()) == 0
+    state = jobs.read_state(job_id)
+    assert (state.meta_synced_at, state.outputs_synced_at) == (None, None)
+
+
+def test_confirmed_outputs_are_recorded(gpuc_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
+    command_runner, _ = uploading()
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+    )
+    assert runner.run_job(job_id, deps(command_runner=command_runner)) == 0
+    assert jobs.read_state(job_id).outputs_synced_at is not None
+
+
+def test_an_output_upload_that_fails_leaves_outputs_unconfirmed(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
+    command_runner, _ = uploading(fail_dest="s3://bucket/")
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+    )
+    runner.run_job(job_id, deps(command_runner=command_runner))
+    state = jobs.read_state(job_id)
+    assert state.outputs_synced_at is None
+    assert (state.status, state.reason) == ("failed", "sync")
+    # The log and state still made it, so the record itself is backed up.
+    assert state.meta_synced_at is not None
+
+
+def test_an_ephemeral_host_keeps_the_secrets_file_for_the_drain(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(
+        HostConfig(
+            host="pod",
+            gpus=[],
+            s3_prefix="s3://b/gpuc/pod",
+            provider={"kind": "runpod", "pod_id": "p1"},
+        )
+    )
+    command_runner, _ = uploading(fail_dest="s3://bucket/")
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+        secrets=["AWS_ACCESS_KEY_ID"],
+    )
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    runner.run_job(job_id, deps(command_runner=command_runner))
+    assert paths.job_env_file(job_id).exists()
+
+
+def test_a_shared_host_still_removes_the_secrets_file(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
+    command_runner, _ = uploading(fail_dest="s3://bucket/")
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+        secrets=["AWS_ACCESS_KEY_ID"],
+    )
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    runner.run_job(job_id, deps(command_runner=command_runner))
+    assert not paths.job_env_file(job_id).exists()

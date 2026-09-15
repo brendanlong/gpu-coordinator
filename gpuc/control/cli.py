@@ -33,7 +33,7 @@ from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import Cloud, Constraints, Provider, ProviderError
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.provision import ProvisionError, runpod_host
-from gpuc.control.remote import RemoteError, open_session
+from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError, job_log_uri
 from gpuc.control.submit import (
     JobSpecModel,
@@ -47,6 +47,7 @@ from gpuc.control.submit import (
 )
 from gpuc.control.transport import SshTransport, Transport, TransportError
 from gpuc.host import jobs
+from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
 
 class CliError(RuntimeError):
@@ -81,6 +82,7 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         env=_env_dict(args.env),
         cache_dir=args.cache_dir,
         s3_prefix=args.s3_prefix,
+        retention_days=_retention(args.retention_days),
         idle_minutes=args.idle_min,
         ttl_hours=args.ttl_hours,
         created_at=utc_now(),
@@ -94,6 +96,19 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         f"next: gpuc host bootstrap {entry.name}"
     )
     return 0
+
+
+def _retention(raw: str | None) -> float | None:
+    """`--retention-days`: a number, or '' to go back to keeping everything."""
+    if raw is None or raw == "":
+        return None
+    try:
+        days = float(raw)
+    except ValueError as exc:
+        raise CliError(f"--retention-days wants a number of days or '', got {raw!r}") from exc
+    if days < 0:
+        raise CliError("--retention-days cannot be negative")
+    return days
 
 
 def _home_line(entry: HostEntry) -> str:
@@ -113,6 +128,7 @@ _SET_FIELDS = (
     "env",
     "cache_dir",
     "s3_prefix",
+    "retention_days",
     "idle_min",
     "ttl_hours",
 )
@@ -136,6 +152,8 @@ def cmd_host_set(args: argparse.Namespace) -> int:
         # The whole dict, not a merge: "set it to exactly this" is the only
         # rule that can also express "set it to nothing" (`--env ''`).
         changes["env"] = _env_dict([pair for pair in args.env if pair])
+    if args.retention_days is not None:
+        changes["retention_days"] = _retention(args.retention_days)
     if args.idle_min is not None:
         changes["idle_minutes"] = args.idle_min
     if args.ttl_hours is not None:
@@ -202,12 +220,24 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
 def cmd_clean(args: argparse.Namespace) -> int:
     settings = load_settings()
     entry = load_registry().require(args.host)
+    if (args.force or args.verify) and not args.purge:
+        raise CliError("--force and --verify only mean something with --purge")
+    if not args.purge and not args.all_finished and args.older_than is None:
+        # argparse cannot express "required unless --purge", and --purge has a
+        # default horizon of its own.
+        raise SystemExit(
+            f"gpuc clean: pass --all-finished, --older-than DAYS, or --purge "
+            f"(which defaults to --older-than {DEFAULT_RETENTION_DAYS:g})"
+        )
     report = clean_host(
         entry,
         settings,
         all_finished=args.all_finished,
         older_than_days=args.older_than,
         dry_run=args.dry_run,
+        purge=args.purge,
+        force=args.force,
+        verify=args.verify,
     )
     print(report.render())
     return 1 if report.errors else 0
@@ -388,9 +418,45 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
         return
     scope = f" for host {host}" if host else ""
     print(f"jobs known only to the index{scope} (their host is gone, or lost its state):")
+    lost = _outputs_lost_ids(s3, elsewhere[:MIRROR_STATE_LOOKUPS])
     for entry in elsewhere:
-        print(f"  {entry.job_id} {entry.name or '-'} host={entry.host} attempt={entry.attempt}")
+        note = (
+            " OUTPUTS LOST (the host went away before they uploaded)"
+            if entry.job_id in lost
+            else ""
+        )
+        print(
+            f"  {entry.job_id} {entry.name or '-'} host={entry.host} attempt={entry.attempt}{note}"
+        )
     print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")
+
+
+MIRROR_STATE_LOOKUPS = 25
+"""How many index-only jobs `--all` reads `state.json` for. One GET each, and
+the answer (did this job's outputs make it off the host?) matters most for the
+handful at the top of a recovery list."""
+
+
+def _outputs_lost_ids(s3: S3Index | None, entries: Sequence[IndexEntry]) -> set[str]:
+    """Which of these jobs the mirror records as having lost their outputs.
+
+    Best effort: a job whose state.json is missing or unreadable simply does not
+    get the flag, because this is a note on a listing, not a decision.
+    """
+    if s3 is None:
+        return set()
+    lost: set[str] = set()
+    for entry in entries:
+        if not entry.s3_prefix:
+            continue
+        uri = f"{entry.s3_prefix.rstrip('/')}/jobs/{entry.job_id}/state.json"
+        try:
+            document = json.loads(s3.get_uri(uri))
+        except (S3IndexError, json.JSONDecodeError):
+            continue
+        if isinstance(document, dict) and document.get("outputs_lost"):
+            lost.add(entry.job_id)
+    return lost
 
 
 def find_job_host(
@@ -445,6 +511,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
     settings = load_settings()
     entry, index = find_job_host(args.job_id, load_registry(), args.host)
     remote = None
+    purged = False
     try:
         session = open_session(entry, settings)
         remote = f"{session.job_dir(args.job_id)}/log.txt"
@@ -454,11 +521,30 @@ def cmd_logs(args: argparse.Namespace) -> int:
         if result.returncode == 0:
             sys.stdout.write(result.stdout)
             return 0
+        purged = _job_dir_gone(session, args.job_id)
         note = result.output.strip().splitlines()[-1:] or ["no log file on the host"]
     except (RemoteError, TransportError) as exc:
         note = [str(exc).splitlines()[0]]
-    print(f"note: could not read {remote or 'the host log'}: {note[0]}", file=sys.stderr)
-    return _logs_from_s3(args.job_id, entry, index, settings)
+    if purged:
+        # The whole job dir is gone, which is what `gpuc clean --purge` does on
+        # purpose. Saying "purged" beats printing a `tail: No such file`.
+        print(
+            f"note: job {args.job_id} was purged from host {entry.name} "
+            f"(gpuc clean --purge removes the whole job dir once it is mirrored)",
+            file=sys.stderr,
+        )
+    else:
+        print(f"note: could not read {remote or 'the host log'}: {note[0]}", file=sys.stderr)
+    return _logs_from_s3(args.job_id, entry, index, settings, purged=purged)
+
+
+def _job_dir_gone(session: HostSession, job_id: str) -> bool:
+    """Is the job dir itself missing, rather than just its log?"""
+    try:
+        result = session.run(f"test -d {shlex.quote(session.job_dir(job_id))}", timeout=30.0)
+    except TransportError:
+        return False
+    return result.returncode != 0
 
 
 def _follow(transport: Transport, remote: str, lines: int) -> int:
@@ -470,13 +556,25 @@ def _follow(transport: Transport, remote: str, lines: int) -> int:
 
 
 def _logs_from_s3(
-    job_id: str, entry: HostEntry, index: IndexEntry | None, settings: Settings
+    job_id: str,
+    entry: HostEntry,
+    index: IndexEntry | None,
+    settings: Settings,
+    *,
+    purged: bool = False,
 ) -> int:
     s3 = S3Index.from_settings(settings)
     prefix = (index.s3_prefix if index else None) or entry.s3_prefix
     if s3 is None or not prefix:
+        gone = (
+            f"Its job dir was purged from host {entry.name}, so this log no longer exists "
+            f"anywhere.\n"
+            if purged
+            else ""
+        )
         raise CliError(
             f"no S3 mirror to fall back on for {job_id}.\n"
+            f"{gone}"
             f"Set s3_bucket in ~/.config/gpu-coordinator/config.toml to keep logs after a "
             f"host goes away."
         )
@@ -574,6 +672,11 @@ def build_parser() -> argparse.ArgumentParser:
         "filesystem when they differ",
     )
     add.add_argument("--s3-prefix", help="s3://bucket/prefix for log and state mirroring")
+    add.add_argument(
+        "--retention-days",
+        help="auto-purge job dirs older than this, once the host has confirmed their log "
+        "and state are mirrored; omit to keep everything forever",
+    )
     add.add_argument("--idle-min", type=float, default=15.0)
     add.add_argument("--ttl-hours", type=float, default=24.0)
     add.set_defaults(func=cmd_host_add)
@@ -593,6 +696,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-dir", help="pin UV_CACHE_DIR for this host; pass '' to let bootstrap decide"
     )
     edit.add_argument("--s3-prefix", help="pass '' to stop mirroring")
+    edit.add_argument(
+        "--retention-days", help="auto-purge horizon in days; pass '' to keep everything"
+    )
     edit.add_argument("--idle-min", type=float)
     edit.add_argument("--ttl-hours", type=float)
     edit.set_defaults(func=cmd_host_set)
@@ -634,12 +740,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     clean = sub.add_parser("clean", help="remove finished jobs' workdirs on a host")
     clean.add_argument("--host", required=True)
-    selection = clean.add_mutually_exclusive_group(required=True)
+    selection = clean.add_mutually_exclusive_group()
     selection.add_argument(
         "--all-finished", action="store_true", help="every succeeded, failed or cancelled job"
     )
     selection.add_argument(
         "--older-than", type=float, metavar="DAYS", help="only jobs that ended over DAYS ago"
+    )
+    clean.add_argument(
+        "--purge",
+        action="store_true",
+        help=f"remove the whole jobs/<id>/ of finished jobs whose log and state are "
+        f"confirmed mirrored and whose outputs are confirmed uploaded "
+        f"(default --older-than {DEFAULT_RETENTION_DAYS:g}); implies the workdir clean",
+    )
+    clean.add_argument(
+        "--force",
+        action="store_true",
+        help="with --purge: delete job dirs that have no confirmed backup anyway",
+    )
+    clean.add_argument(
+        "--verify",
+        action="store_true",
+        help="with --purge: HEAD each job's mirrored log.txt in S3 before deleting it",
     )
     clean.add_argument("--dry-run", action="store_true", help="list what would go, delete nothing")
     clean.set_defaults(func=cmd_clean)

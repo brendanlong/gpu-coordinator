@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from gpuc.control import reconcile as reconcile_mod
+from gpuc.control.clean import purge_host
 from gpuc.control.cli import main
 from gpuc.control.config import HostEntry, Settings, config_file, load_registry, load_settings
 from gpuc.control.providers.base import Constraints
+from gpuc.control.remote import HostSession
 from gpuc.control.submit import SubmitResult
 from tests.fakeprovider import FakeProvider, running_pod
 from tests.fakes3 import FakeS3Client
@@ -366,3 +369,125 @@ def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
     assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
     assert "GPUC_DEFINITELY_UNSET" in capsys.readouterr().err
     assert created == []
+
+
+# -- clean --purge --verify ---------------------------------------------------
+
+
+class StubSession:
+    """A host that answers `purge` with whatever the test wants."""
+
+    def __init__(self, payloads: list[dict[str, object]]) -> None:
+        self.payloads = payloads
+        self.calls: list[str] = []
+
+    def host_json(self, args: str, *, timeout: float = 0.0) -> object:
+        self.calls.append(args)
+        return self.payloads.pop(0)
+
+
+def purged_entry(job_id: str, prefix: str | None = "s3://bucket/gpuc/spar") -> dict[str, object]:
+    return {
+        "job_id": job_id,
+        "status": "succeeded",
+        "bytes": 1024,
+        "age_days": 30.0,
+        "meta_synced_at": "2026-01-01T00:00:00+00:00",
+        "meta_synced_to": prefix,
+        "forced": False,
+    }
+
+
+def as_session(session: StubSession) -> HostSession:
+    return cast("HostSession", session)
+
+
+def test_verify_purges_only_the_jobs_whose_mirror_answers(control_env: Path) -> None:
+    client = FakeS3Client(objects={"bucket/gpuc/spar/jobs/kept/log.txt": b"hello\n"})
+    entry = HostEntry(name="spar", kind="ssh", ssh="me@spar", python="/usr/bin/python3")
+    session = StubSession(
+        [
+            {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
+            {"dry_run": False, "purged": [purged_entry("kept")], "freed_bytes": 1024},
+        ]
+    )
+    report = purge_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        older_than_days=7.0,
+        verify=True,
+        s3_client=client,
+    )
+    assert report.verified == ["kept"]
+    assert [job["job_id"] for job in report.purged] == ["kept"]
+    assert any("no mirrored log" in str(job["why"]) for job in report.purge_skipped)
+    assert "--only kept" in session.calls[1]
+
+
+def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> None:
+    client = FakeS3Client()
+    entry = HostEntry(name="spar", kind="ssh", ssh="me@spar", python="/usr/bin/python3")
+    session = StubSession(
+        [
+            {"dry_run": True, "purged": [purged_entry("gone")]},
+            {"dry_run": False, "purged": [purged_entry("gone")], "freed_bytes": 1024},
+        ]
+    )
+    report = purge_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        older_than_days=7.0,
+        force=True,
+        verify=True,
+        s3_client=client,
+    )
+    assert [job["job_id"] for job in report.purged] == ["gone"]
+    assert any("purged anyway because --force" in note for note in report.notes)
+
+
+def test_verify_without_purge_is_refused(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["host", "add", "spar", "--ssh", "me@box"])
+    assert main(["clean", "--host", "spar", "--verify", "--all-finished"]) == 1
+    assert "only mean something with --purge" in capsys.readouterr().err
+
+
+def test_clean_with_no_selection_and_no_purge_exits(control_env: Path) -> None:
+    main(["host", "add", "spar", "--ssh", "me@box"])
+    with pytest.raises(SystemExit):
+        main(["clean", "--host", "spar"])
+
+
+def test_retention_days_is_stored_and_cleared(control_env: Path) -> None:
+    assert main(["host", "add", "spar", "--ssh", "me@box", "--retention-days", "14"]) == 0
+    assert load_registry().require("spar").retention_days == 14.0
+    assert load_registry().require("spar").host_config().retention_days == 14.0
+    assert main(["host", "set", "spar", "--retention-days", ""]) == 0
+    assert load_registry().require("spar").retention_days is None
+
+
+def test_a_bad_retention_value_is_rejected(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "spar", "--ssh", "me@box", "--retention-days", "soon"]) == 1
+    assert "wants a number of days" in capsys.readouterr().err
+
+
+def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:
+    from gpuc.control.cli import _outputs_lost_ids
+    from gpuc.control.s3index import IndexEntry, S3Index
+
+    client = FakeS3Client(
+        objects={
+            "bucket/gpuc/pod/jobs/lost/state.json": b'{"outputs_lost": true}',
+            "bucket/gpuc/pod/jobs/fine/state.json": b'{"outputs_lost": false}',
+        }
+    )
+    entries = [
+        IndexEntry(job_id=job_id, host="pod", s3_prefix="s3://bucket/gpuc/pod")
+        for job_id in ("lost", "fine", "missing")
+    ]
+    assert _outputs_lost_ids(S3Index("bucket", client), entries) == {"lost"}

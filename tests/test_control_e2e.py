@@ -410,3 +410,98 @@ def test_clean_needs_a_selection(
 ) -> None:
     with pytest.raises(SystemExit):
         main(["clean", "--host", "local"])
+
+
+# -- purge --------------------------------------------------------------------
+
+
+def mark_mirrored(home: Path, job_id: str, prefix: str = "s3://bucket/gpuc/local") -> None:
+    """Stand in for a successful final meta sync on a host with a prefix."""
+    path = home / "jobs" / job_id / "state.json"
+    document = json.loads(path.read_text())
+    document["meta_synced_at"] = document.get("ended_at")
+    document["meta_synced_to"] = prefix
+    path.write_text(json.dumps(document, indent=2) + "\n")
+
+
+def test_purge_skips_an_unmirrored_job_and_force_removes_it(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = big_file_job(home, workdir)
+    capsys.readouterr()
+
+    assert main(["clean", "--host", "local", "--purge", "--older-than", "0", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert f"SKIPPED {job_id}" in out
+    assert "no s3_prefix on this host" in out
+    assert (home / "jobs" / job_id / "state.json").exists()
+
+    assert main(["clean", "--host", "local", "--purge", "--older-than", "0", "--force"]) == 0
+    out = capsys.readouterr().out
+    assert "PURGED" in out and job_id in out and "FORCED" in out
+    assert not (home / "jobs" / job_id).exists()
+
+
+def test_purge_removes_a_mirrored_job_whole(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = big_file_job(home, workdir)
+    mark_mirrored(home, job_id)
+    capsys.readouterr()
+
+    assert main(["clean", "--host", "local", "--purge", "--older-than", "0", "--dry-run"]) == 0
+    assert "WOULD PURGE" in capsys.readouterr().out
+    assert (home / "jobs" / job_id / "log.txt").exists()
+
+    assert main(["clean", "--host", "local", "--purge", "--older-than", "0"]) == 0
+    assert "PURGED" in capsys.readouterr().out
+    assert not (home / "jobs" / job_id).exists()
+
+
+def test_purge_leaves_a_running_job_alone(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    running = submit(workdir, "name: sleepy\ncommand: sleep 300\ngpus: 0\ncleanup: never\n")
+    wait_for_main_phase(home, running)
+    capsys.readouterr()
+    assert main(["clean", "--host", "local", "--purge", "--older-than", "0", "--force"]) == 0
+    out = capsys.readouterr().out
+    assert f"SKIPPED {running}  status running" in out
+    assert (home / "jobs" / running / "state.json").exists()
+    assert main(["cancel", running]) == 0
+
+
+def test_logs_and_status_after_a_purge(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = big_file_job(home, workdir)
+    mark_mirrored(home, job_id)
+    assert main(["clean", "--host", "local", "--purge", "--older-than", "0"]) == 0
+    capsys.readouterr()
+
+    # No S3 mirror is configured locally, so `logs` can only say where it went.
+    assert main(["logs", job_id]) == 1
+    captured = capsys.readouterr()
+    assert "purged from host local" in captured.err
+    assert "no S3 mirror to fall back on" in captured.err
+    assert "purged from host local" in captured.err
+
+    assert main(["status", "--all"]) == 0
+    out = capsys.readouterr().out
+    assert "jobs known only to the index" in out
+    assert job_id in out
+
+
+def test_retention_days_reaches_the_host_config(
+    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    assert main(["host", "set", "local", "--retention-days", "14"]) == 0
+    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
+    assert json.loads((home / "config.json").read_text())["retention_days"] == 14.0
+    assert main(["host", "set", "local", "--retention-days", ""]) == 0
+    assert load_registry().require("local").retention_days is None

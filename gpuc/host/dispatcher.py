@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gpuc.host import gpus, jobs, paths, queue, sync, terminate
+from gpuc.host import cleanup, gpus, jobs, paths, queue, sync, terminate
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.runner import (
     boot_id,
@@ -41,6 +41,16 @@ LOOP_INTERVAL_S = 2.0
 KILL_GRACE_S = 15.0
 TERMINATE_RETRY_S = 600.0
 MAX_CONSECUTIVE_FAILURES = 20
+RETENTION_INTERVAL_S = 3600.0
+"""How often a dispatcher with `retention_days` set runs the purge.
+
+Once at startup and then hourly: deleting week-old job dirs is not urgent, and
+on a non-ephemeral host the dispatcher only lives while there is work, so the
+startup pass is the one that usually fires.
+"""
+OUTPUT_RETRY_ATTEMPTS = 3
+OUTPUT_RETRY_INTERVAL_S = 60.0
+OUTPUT_RETRY_BUDGET_S = 300.0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -351,6 +361,7 @@ class Dispatcher:
     _queue_empty_since: float | None = None
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
+    _last_purge_at: float | None = None
     consecutive_failures: int = 0
     should_exit: bool = False
 
@@ -623,6 +634,7 @@ class Dispatcher:
         config = self.config
         self.log(f"draining: {why}")
         jobs.atomic_write_text(paths.draining_file(), f"{why}\n")
+        self._guard(self._drain_retry_outputs)
         try:
             self._final_sync_all(config)
             terminate.self_terminate(config, terminate_call=self.deps.terminate_call)
@@ -644,11 +656,116 @@ class Dispatcher:
         errors: list[str] = []
         for job_id in jobs.list_job_ids():
             try:
-                sync.sync_job_meta(job_id, config.s3_prefix, runner=self.deps.command_runner)
+                warning = sync.final_meta_sync(
+                    job_id, config.s3_prefix, runner=self.deps.command_runner
+                )
             except sync.SyncError as exc:
                 errors.append(str(exc))
+                continue
+            if warning:
+                self.log(f"job {job_id}: {warning}")
         if errors:
             raise sync.SyncError("; ".join(errors))
+
+    # -- outputs the pod would otherwise take with it --------------------
+    def _drain_retry_outputs(self) -> None:
+        self.retry_unconfirmed_outputs(self.config)
+
+    def unconfirmed_output_jobs(self) -> list[str]:
+        """Finished jobs whose `outputs:` are still only on this host."""
+        pending: list[str] = []
+        for job_id in jobs.list_job_ids():
+            try:
+                state = jobs.read_state(job_id)
+            except (RuntimeError, OSError):
+                continue
+            if not state.finished:
+                continue
+            if not cleanup.outputs_confirmed(job_id, state)[0]:
+                pending.append(job_id)
+        return pending
+
+    def retry_unconfirmed_outputs(self, config: jobs.HostConfig) -> None:
+        """One last attempt to upload what a terminating host is still holding.
+
+        Bounded on purpose: three tries a minute apart, five minutes in total.
+        A pod that cannot reach S3 now is billing while it tries, and the TTL
+        that sent us here does not pause -- so a job whose outputs still will
+        not go up is marked `outputs_lost` and the host terminates anyway.
+        """
+        pending = self.unconfirmed_output_jobs()
+        if not pending:
+            return
+        self.log(f"drain: {len(pending)} finished job(s) have unconfirmed outputs; retrying")
+        deadline = self.deps.monotonic() + OUTPUT_RETRY_BUDGET_S
+        last_error: dict[str, str] = {}
+        for attempt in range(1, OUTPUT_RETRY_ATTEMPTS + 1):
+            for job_id in list(pending):
+                try:
+                    self._upload_outputs(job_id, config)
+                except (sync.SyncError, RuntimeError, OSError) as exc:
+                    last_error[job_id] = str(exc)
+                    continue
+                pending.remove(job_id)
+                with contextlib.suppress(RuntimeError, OSError, KeyError):
+                    jobs.update_state(job_id, outputs_synced_at=jobs.utc_now(), outputs_lost=False)
+                self.log(f"drain: job {job_id} outputs uploaded on attempt {attempt}")
+            if not pending or attempt == OUTPUT_RETRY_ATTEMPTS:
+                break
+            remaining = deadline - self.deps.monotonic()
+            if remaining <= 0:
+                break
+            self.deps.sleep(min(OUTPUT_RETRY_INTERVAL_S, remaining))
+        for job_id in pending:
+            error = last_error.get(job_id, "outputs were never confirmed uploaded")
+            self.log(f"drain: job {job_id} OUTPUTS LOST: {error}")
+            with contextlib.suppress(RuntimeError, OSError, KeyError):
+                jobs.update_state(job_id, outputs_lost=True, sync_error=error)
+
+    def _upload_outputs(self, job_id: str, config: jobs.HostConfig) -> None:
+        spec = jobs.read_spec(job_id)
+        # The job's own secrets file if the runner left it (it does exactly for
+        # this case on an ephemeral host); otherwise our own environment, which
+        # already carries the host env.
+        env: dict[str, str] | None = None
+        env_file = paths.job_env_file(job_id)
+        if env_file.exists():
+            env = config.apply_env(dict(os.environ))
+            env.update(jobs.parse_env_file(env_file))
+        sync.sync_outputs(
+            spec.outputs,
+            paths.workdir(job_id),
+            job_id,
+            min_age_s=0.0,
+            runner=self.deps.command_runner,
+            timeout=None,
+            env=env,
+        )
+
+    # -- retention -------------------------------------------------------
+    def maybe_purge(self) -> None:
+        """Run the retention purge at startup, then at most once an hour.
+
+        Never forced: an automatic sweep that could delete the only copy of a
+        job's log is not something anyone should have to opt out of.
+        """
+        days = self.config.retention_days
+        if days is None:
+            return
+        now = self.deps.monotonic()
+        if self._last_purge_at is not None and now - self._last_purge_at < RETENTION_INTERVAL_S:
+            return
+        self._last_purge_at = now
+        result = cleanup.purge(older_than_days=days, now=self.deps.utcnow())
+        if result.purged or result.removed:
+            purged = ", ".join(c.job_id for c in result.purged) or "none"
+            self.log(
+                f"retention ({days:g} days): purged {len(result.purged)} job dir(s) and "
+                f"{len(result.removed)} workdir(s), freeing "
+                f"{cleanup.human_bytes(result.freed_bytes)}; purged: {purged}"
+            )
+        for error in result.errors:
+            self.log(f"retention: {error}")
 
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
@@ -656,6 +773,7 @@ class Dispatcher:
         self.handle_cancels()
         self.check_pause()
         self.launch_ready()
+        self.maybe_purge()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:
