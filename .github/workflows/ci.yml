@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch: a new push cancels the run it superseded.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: ./check.sh lint
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: ./check.sh typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      # The control e2e bootstraps this runner as a `local` host, and bootstrap
+      # installs anything it cannot find on PATH. `aws` is on the image already;
+      # `hf` is not, and letting bootstrap install it would put a `uv tool
+      # install` inside a test. No credentials: nothing here talks to AWS,
+      # RunPod or Hugging Face, it only looks for the binaries.
+      - name: Put `hf` on PATH so bootstrap installs nothing
+        run: |
+          uv tool install huggingface_hub
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: ./check.sh test
