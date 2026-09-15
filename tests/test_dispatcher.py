@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import subprocess
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+from gpuc.host import jobs, paths, queue, sync, terminate
+from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
+from gpuc.host.jobs import HostConfig
+from tests.conftest import FAKE_GPUS, make_spec
+
+
+class FakeRunnerProcess:
+    """Stands in for a spawned runner: alive until the test finishes it."""
+
+    _next_pid = 500000
+
+    def __init__(self, job_id: str) -> None:
+        FakeRunnerProcess._next_pid += 1
+        self.pid = FakeRunnerProcess._next_pid
+        self.job_id = job_id
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def finish(self, status: str = "succeeded", reason: str | None = None) -> None:
+        self.returncode = 0
+        jobs.update_state(
+            self.job_id,
+            status=status,
+            reason=reason,
+            exit_code=0 if status == "succeeded" else 1,
+            ended_at=jobs.utc_now(),
+        )
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def make_dispatcher(
+    clock: FakeClock | None = None,
+    terminate_call: terminate.TerminateCall | None = None,
+    utcnow: Callable[[], datetime] | None = None,
+) -> tuple[Dispatcher, dict[str, FakeRunnerProcess]]:
+    spawned: dict[str, FakeRunnerProcess] = {}
+
+    def spawn(job_id: str) -> subprocess.Popen[bytes]:
+        proc = FakeRunnerProcess(job_id)
+        spawned[job_id] = proc
+        return cast("subprocess.Popen[bytes]", proc)
+
+    deps = DispatcherDeps(
+        spawn_runner=spawn,
+        monotonic=clock or FakeClock(),
+        terminate_call=terminate_call or (lambda pod, key: "{}"),
+        command_runner=lambda argv, timeout: sync.CommandResult(argv, 0, ""),
+        utcnow=utcnow or (lambda: datetime.now(UTC)),
+        kill_grace_s=1.0,
+    )
+    return Dispatcher(deps=deps), spawned
+
+
+def test_queued_job_is_launched_with_assigned_uuids(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert state.status == "running"
+    assert state.gpus == [FAKE_GPUS[0]]
+    assert state.runner_pid == spawned[job_id].pid
+    assert queue.list_queued() == []
+
+
+def test_two_single_gpu_jobs_run_concurrently(gpuc_home: Path) -> None:
+    first = queue.enqueue(make_spec(gpus=1, priority=10))
+    second = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(first).gpus == [FAKE_GPUS[0]]
+    assert jobs.read_state(second).gpus == [FAKE_GPUS[1]]
+    assert len(dispatcher.running) == 2
+
+
+def test_a_job_waits_when_not_enough_gpus_are_free(gpuc_home: Path) -> None:
+    big = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(big).gpus == FAKE_GPUS
+
+    waiting = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher.run_once()
+    assert jobs.read_state(waiting).status == "queued"
+
+    spawned[big].finish()
+    dispatcher.run_once()
+    assert jobs.read_state(waiting).status == "running"
+
+
+def test_a_zero_gpu_job_never_waits(gpuc_home: Path) -> None:
+    hog = queue.enqueue(make_spec(gpus=2, priority=10))
+    cpu_job = queue.enqueue(make_spec(gpus=0, priority=90))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(hog).status == "running"
+    assert jobs.read_state(cpu_job).status == "running"
+    assert jobs.read_state(cpu_job).gpus == []
+
+
+def test_a_job_larger_than_the_host_fails_instead_of_blocking(gpuc_home: Path) -> None:
+    impossible = queue.enqueue(make_spec(gpus=8, priority=10))
+    runnable = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    state = jobs.read_state(impossible)
+    assert state.status == "failed"
+    assert "host owns 2" in (state.reason or "")
+    assert jobs.read_state(runnable).status == "running"
+
+
+def test_a_job_cancelled_while_queued_is_never_launched(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    paths.cancel_file(job_id).touch()
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert spawned == {}
+    assert jobs.read_state(job_id).status == "cancelled"
+
+
+def test_cancel_signals_the_job_process_group_then_the_runner(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    dispatcher, spawned = make_dispatcher(clock=clock)
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    jobs.update_state(job_id, pgid=123456)
+
+    signals: list[tuple[int | None, int]] = []
+    monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
+    queue.cancel(job_id)
+    dispatcher.handle_cancels()
+    assert signals == [(123456, 15)]
+
+    clock.advance(2.0)
+    dispatcher.handle_cancels()
+    assert signals[-1] == (123456, 9)
+
+    clock.advance(2.0)
+    dispatcher.handle_cancels()
+    assert signals[-1] == (spawned[job_id].pid, 9)
+
+
+def test_a_runner_that_dies_without_final_state_fails_the_job(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "runner-died")
+    assert dispatcher.running == {}
+
+
+def test_orphans_from_a_dead_dispatcher_are_reconciled(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=2**30)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+    assert jobs.read_state(job_id).reason == "runner-died"
+
+
+def test_a_live_orphan_is_adopted_not_failed(gpuc_home: Path) -> None:
+    import os
+
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=os.getpid())
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+    assert jobs.read_state(job_id).status == "running"
+    assert job_id in dispatcher.running
+    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
+
+
+def _finish_low_util(dispatcher: Dispatcher, spawned: dict[str, FakeRunnerProcess]) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    spawned[job_id].finish(status="failed", reason="low-util")
+    dispatcher.run_once()
+
+
+def test_two_consecutive_low_util_failures_pause_the_host(gpuc_home: Path) -> None:
+    dispatcher, spawned = make_dispatcher()
+    _finish_low_util(dispatcher, spawned)
+    assert not dispatcher.paused()
+    _finish_low_util(dispatcher, spawned)
+    assert dispatcher.paused()
+    assert "low-util" in paths.paused_file().read_text()
+
+    blocked = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    assert jobs.read_state(blocked).status == "queued"
+
+
+def test_a_success_between_low_util_failures_does_not_pause(gpuc_home: Path) -> None:
+    dispatcher, spawned = make_dispatcher()
+    _finish_low_util(dispatcher, spawned)
+    good = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    spawned[good].finish()
+    dispatcher.run_once()
+    _finish_low_util(dispatcher, spawned)
+    assert not dispatcher.paused()
+
+
+def test_a_non_provider_host_never_self_terminates(gpuc_home: Path) -> None:
+    clock = FakeClock()
+    terminated: list[str] = []
+    dispatcher, _ = make_dispatcher(
+        clock=clock, terminate_call=lambda pod, key: terminated.append(pod) or ""
+    )
+    dispatcher.run_once()
+    clock.advance(10 * 3600)
+    dispatcher.run_once()
+    assert terminated == []
+    assert not paths.draining_file().exists()
+    assert dispatcher.idle_and_not_ephemeral()
+
+
+def configure_pod(idle_minutes: float = 15.0, ttl_hours: float = 24.0, age_h: float = 0.0) -> None:
+    created = datetime.now(UTC) - timedelta(hours=age_h)
+    jobs.write_config(
+        HostConfig(
+            host="pod",
+            gpus=list(FAKE_GPUS),
+            provider={"kind": "runpod", "pod_id": "pod-1"},
+            idle_minutes=idle_minutes,
+            ttl_hours=ttl_hours,
+            s3_prefix="s3://b/gpuc/pod",
+            created_at=created.isoformat(),
+        )
+    )
+
+
+def test_idle_terminate_drains_syncs_and_calls_the_provider(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda: "/fake/aws")
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    monkeypatch.setenv("RUNPOD_POD_ID", "pod-1")
+    configure_pod(idle_minutes=15.0)
+    clock = FakeClock()
+    terminated: list[str] = []
+    dispatcher, _ = make_dispatcher(
+        clock=clock, terminate_call=lambda pod, key: terminated.append(pod) or ""
+    )
+    dispatcher.run_once()
+    assert terminated == []
+    clock.advance(14 * 60)
+    dispatcher.run_once()
+    assert terminated == []
+    clock.advance(2 * 60)
+    dispatcher.run_once()
+    assert terminated == ["pod-1"]
+    assert paths.draining_file().exists()
+    assert dispatcher.should_exit
+
+
+def test_a_running_job_resets_the_idle_timer(gpuc_home: Path) -> None:
+    configure_pod(idle_minutes=1.0)
+    clock = FakeClock()
+    terminated: list[str] = []
+    dispatcher, spawned = make_dispatcher(
+        clock=clock, terminate_call=lambda pod, key: terminated.append(pod) or ""
+    )
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    clock.advance(600)
+    dispatcher.run_once()
+    assert terminated == []
+    spawned[job_id].finish()
+    dispatcher.run_once()
+    clock.advance(30)
+    dispatcher.run_once()
+    assert terminated == []
+    clock.advance(40)
+    dispatcher.run_once()
+    assert terminated == ["pod-1"]
+
+
+def test_ttl_terminates_an_old_but_idle_pod(gpuc_home: Path) -> None:
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    terminated: list[str] = []
+    dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
+    dispatcher.run_once()
+    assert terminated == ["pod-1"]
+
+
+def test_failed_terminate_removes_draining_and_keeps_dispatching(gpuc_home: Path) -> None:
+    configure_pod(idle_minutes=0.0)
+    clock = FakeClock()
+    attempts: list[str] = []
+
+    def failing(pod: str, key: str) -> str:
+        attempts.append(pod)
+        raise terminate.TerminateError("HTTP 500 from runpod")
+
+    dispatcher, _ = make_dispatcher(clock=clock, terminate_call=failing)
+    dispatcher.run_once()
+    assert attempts == ["pod-1"]
+    assert not paths.draining_file().exists()
+    assert not dispatcher.should_exit
+
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "running"
+    assert len(attempts) == 1
+
+    log = paths.dispatcher_log().read_text()
+    assert "SELF-TERMINATE FAILED" in log
+    assert "HTTP 500 from runpod" in log
+
+
+def test_terminate_is_retried_after_ten_minutes(gpuc_home: Path) -> None:
+    configure_pod(idle_minutes=0.0)
+    clock = FakeClock()
+    attempts: list[str] = []
+    outcomes: list[Any] = [terminate.TerminateError("nope"), None]
+
+    def flaky(pod: str, key: str) -> str:
+        attempts.append(pod)
+        outcome = outcomes.pop(0) if outcomes else None
+        if isinstance(outcome, Exception):
+            raise outcome
+        return "{}"
+
+    dispatcher, _ = make_dispatcher(clock=clock, terminate_call=flaky)
+    dispatcher.run_once()
+    clock.advance(60)
+    dispatcher.run_once()
+    assert len(attempts) == 1
+    clock.advance(600)
+    dispatcher.run_once()
+    assert len(attempts) == 2
+    assert dispatcher.should_exit
+
+
+def test_a_failed_final_drain_sync_does_not_terminate(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda: None)
+    configure_pod(idle_minutes=0.0)
+    terminated: list[str] = []
+    dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
+    queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    dispatcher.running.clear()
+    queue.list_queued()
+    dispatcher.run_once()
+    assert terminated == []
+    assert not paths.draining_file().exists()
+
+
+def test_dispatcher_does_not_launch_while_draining(gpuc_home: Path) -> None:
+    paths.draining_file().write_text("idle\n")
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.launch_ready()
+    assert spawned == {}
+    assert jobs.read_state(job_id).status == "queued"
+
+
+def test_a_job_with_an_unreadable_spec_is_dropped(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    paths.spec_file(job_id).write_text("{not json")
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert spawned == {}
+    assert jobs.read_state(job_id).reason == "bad-spec"
+    assert queue.list_queued() == []
