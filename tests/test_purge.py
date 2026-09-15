@@ -245,7 +245,6 @@ def test_host_cli_purge_defaults_to_a_week(
     assert host_cli.main(["purge", "--dry-run"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["purged"] == []
-    assert cleanup.DEFAULT_RETENTION_DAYS == 7.0
 
 
 def test_host_cli_purge_only_empty_means_none(

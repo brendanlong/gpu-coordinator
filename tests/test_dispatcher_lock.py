@@ -118,7 +118,9 @@ def test_the_heartbeat_thread_beats_while_the_main_loop_is_busy(gpuc_home: Path)
         lock.start_heartbeat()
         stale = time.time() - 120
         os.utime(paths.heartbeat_file(), (stale, stale))
-        deadline = time.time() + 5
+        # Generous: this asserts the thread beats *at all* while the main loop
+        # holds the GIL, not that it manages it inside any particular second.
+        deadline = time.time() + 30
         while time.time() < deadline:
             age = lock.heartbeat_age()
             if age is not None and age < 1.0:

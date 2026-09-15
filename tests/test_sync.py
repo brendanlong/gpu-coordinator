@@ -248,8 +248,15 @@ def test_the_periodic_thread_survives_any_exception_and_records_it(
 
 
 def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: str) -> None:
+    """`final()` has to wait for a tick already in flight, not race it.
+
+    Driven off the tick's own event rather than a sleep: `final()` is called
+    while a periodic tick is provably still inside the runner, which is the
+    only moment an overlap could happen, and no wall-clock guess decides it.
+    """
     overlaps: list[str] = []
     inside = threading.Lock()
+    tick_running = threading.Event()
 
     def slow(
         argv: list[str], timeout: float | None = None, env: sync.Env = None
@@ -257,6 +264,7 @@ def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: str) ->
         if not inside.acquire(blocking=False):
             overlaps.append(" ".join(argv))
         else:
+            tick_running.set()
             time.sleep(0.2)
             inside.release()
         return sync.CommandResult(argv, 0, "")
@@ -265,8 +273,11 @@ def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: str) ->
     loop = loop_for(job_id, slow)
     (paths.workdir(job_id) / "outputs").mkdir(parents=True)
     loop.start()
-    time.sleep(1.1)
-    loop.final()
+    try:
+        assert tick_running.wait(30.0), "the periodic tick never ran"
+        loop.final()
+    finally:
+        loop.stop()
     assert overlaps == []
 
 

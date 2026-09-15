@@ -9,6 +9,8 @@ running". Both halves of that have to be impossible now.
 from __future__ import annotations
 
 import json
+import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,7 @@ from gpuc.control.cli import (
     main,
 )
 from gpuc.control.config import HostEntry, backup_path, hosts_file, load_registry, read_registry
-from gpuc.control.status import HostView, JobView
+from gpuc.control.status import HostView
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 
@@ -177,49 +179,79 @@ def test_an_unreadable_config_file_is_three(
 # -- status --json ------------------------------------------------------------
 
 
-def running_view(entry: HostEntry) -> HostView:
-    return HostView(
-        entry=entry,
-        reachable=True,
-        heartbeat_age_s=3.0,
-        owned=[GPU],
-        running=[
-            JobView(
-                job_id="20260915-120000-abc123",
-                name="lego-s4",
-                status="running",
-                phase="main",
-                gpus=[GPU],
-                started_at="2026-09-15T12:00:00+00:00",
-                util_recent=[90.0, 95.0],
-                isolation="cgroup",
-            )
-        ],
-        finished=[
-            JobView(
-                job_id="20260915-100000-def456",
-                name="probe",
-                status="failed",
-                reason="low-util",
-                ended_at="2026-09-15T11:00:00+00:00",
-                outputs_pending=True,
-            )
-        ],
-    )
-
-
 def status_json(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
     document = json.loads(capsys.readouterr().out)
     assert isinstance(document, dict)
     return document
 
 
+RUNNING_JOB = "20260915-120000-abc123"
+FINISHED_JOB = "20260915-100000-def456"
+
+
+@pytest.fixture
+def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env: Path) -> Path:
+    """A registered `local` host whose GPUC_HOME really answers `gpuc.host status`.
+
+    `gather()` shells out to the on-host package with `PYTHONPATH=<home>/pkg`,
+    so the symlink is what makes this a real round trip rather than a fake: the
+    JSON below is produced by `gpuc.host.__main__.cmd_status`, parsed by
+    `gather`, and rendered by `status.document` with nothing stubbed.
+    """
+    from gpuc.host import jobs, paths
+    from gpuc.host.jobs import HostConfig, JobSpec, JobState
+
+    home = tmp_path / "host-home"
+    monkeypatch.setenv("GPUC_HOME", str(home))
+    paths.ensure_layout()
+    jobs.write_config(HostConfig(host="local", gpus=[GPU]))
+    paths.heartbeat_file().touch()
+
+    started = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+    ended = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    jobs.write_spec(
+        JobSpec.from_dict({"job_id": RUNNING_JOB, "name": "lego-s4", "command": "train", "gpus": 1})
+    )
+    jobs.write_state(
+        RUNNING_JOB,
+        JobState(
+            status="running",
+            phase="main",
+            gpus=[GPU],
+            started_at=started,
+            util_recent=[90.0, 95.0],
+            isolation="cgroup",
+        ),
+    )
+    jobs.write_spec(
+        JobSpec.from_dict(
+            {
+                "job_id": FINISHED_JOB,
+                "name": "probe",
+                "command": "probe",
+                # Declared but never confirmed uploaded: this is what makes the
+                # host report `outputs_pending`, and only the host can know it.
+                "outputs": [{"path": "results", "s3": "s3://bucket/{job_id}"}],
+            }
+        )
+    )
+    paths.workdir(FINISHED_JOB).mkdir(parents=True, exist_ok=True)
+    jobs.write_state(
+        FINISHED_JOB, JobState(status="failed", reason="low-util", ended_at=ended, exit_code=1)
+    )
+    monkeypatch.delenv("GPUC_HOME")
+
+    (home / "pkg").symlink_to(Path(__file__).resolve().parents[1])
+    entry = HostEntry(
+        name="local", kind="local", gpus=[GPU], gpuc_home=str(home), python=sys.executable
+    )
+    write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
+    return home
+
+
 def test_status_json_is_one_document_with_the_promised_shape(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
-    capsys.readouterr()
-    monkeypatch.setattr(status_mod, "gather", lambda entry, *a, **k: running_view(entry))
     assert main(["status", "--json"]) == EXIT_OK
     document = status_json(capsys)
     assert document["schema_version"] == 1
@@ -228,18 +260,11 @@ def test_status_json_is_one_document_with_the_promised_shape(
     assert host["name"] == "local"
     assert host["kind"] == "local"
     assert host["reachable"] is True
-    assert host["dispatcher"] == {"alive": True, "heartbeat_age_s": 3.0}
-    assert host["gpus"] == [
-        {
-            "index": None,
-            "uuid": GPU,
-            "name": "",
-            "vram_mib": None,
-            "busy_job": "20260915-120000-abc123",
-        }
-    ]
+    assert host["dispatcher"]["alive"] is True
+    assert 0 <= host["dispatcher"]["heartbeat_age_s"] < 60
     assert host["queued"] == []
-    job = host["running"][0]
+
+    job = next(j for j in host["running"] if j["job_id"] == RUNNING_JOB)
     assert set(job) == {
         "job_id",
         "name",
@@ -253,12 +278,25 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "ended_at",
         "outputs_pending",
     }
+    assert (job["name"], job["status"], job["phase"]) == ("lego-s4", "running", "main")
     assert job["util"] == 95.0
     assert job["gpus"] == [GPU]
     assert job["iso"] == "cgroup"
     assert job["elapsed_s"] > 0
-    assert host["finished"][0]["reason"] == "low-util"
-    assert host["finished"][0]["outputs_pending"] is True
+
+    done = next(j for j in host["finished"] if j["job_id"] == FINISHED_JOB)
+    assert done["reason"] == "low-util"
+    assert done["outputs_pending"] is True
+
+    # One row for the owned card. Which shape it takes says whether nvidia-smi
+    # on *this* machine could resolve it, which is not what this test is about.
+    (row,) = host["gpus"]
+    if row.get("available") is False:
+        assert row == {"owned_as": GPU, "available": False}
+    else:
+        assert set(row) == {"index", "uuid", "name", "vram_mib", "busy_job"}
+        assert row["uuid"] == GPU
+        assert row["busy_job"] == RUNNING_JOB
 
 
 def test_status_json_says_unreachable_rather_than_empty(
@@ -417,11 +455,3 @@ def test_the_installed_commit_comes_from_direct_url_json(
         version_mod.Distribution, "from_name", staticmethod(lambda _: PathDistribution(dist_info))
     )
     assert version_mod.installed_commit() == "c" * 40
-
-
-def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_env: Path) -> None:
-    from gpuc.control import version as version_mod
-
-    entry = HostEntry(name="spar", pkg_commit=version_mod.local_commit())
-    assert entry.host_config().pkg_commit == entry.pkg_commit
-    assert entry.host_config().to_dict()["schema_version"] == 1

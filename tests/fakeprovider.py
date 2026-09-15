@@ -28,6 +28,7 @@ from gpuc.control.providers.base import (
     ProviderError,
     SshEndpoint,
 )
+from gpuc.control.provision import offer_satisfies
 from gpuc.control.transport import CommandResult, Transport, TransportError
 
 CAPACITY_ERROR = "no capacity for this gpu type right now"
@@ -93,7 +94,22 @@ class FakeProvider(Provider):
 
     # -- Provider ---------------------------------------------------------
     def offers(self, constraints: Constraints) -> list[Offer]:
-        return sorted(self._offers, key=lambda o: o.price_usd_hr)
+        """Filtered, like a real catalog query.
+
+        A fake that hands back everything lets a selection test pass on an
+        offer the real provider would never have shown it -- which is the one
+        thing those tests exist to check. `offer_satisfies` is the same
+        predicate `provision` applies, and `availability` is the one further
+        ground `RunpodProvider._offers_from_catalog` drops a GPU on.
+        """
+        return sorted(
+            (
+                offer
+                for offer in self._offers
+                if offer.availability != "NONE" and offer_satisfies(offer, constraints)
+            ),
+            key=lambda o: (o.price_usd_hr, o.gpu_id, o.cloud),
+        )
 
     def create(
         self,
@@ -211,17 +227,24 @@ class FakeTransport:
     home: str = "/root"
     commands: list[str] = field(default_factory=list)
     files: dict[str, str] = field(default_factory=dict)
-    raise_on_ssh: bool = False
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
+        """`check` means the same thing here as in Local/SshTransport: raise.
+
+        A fake that quietly returned the failure would let caller code that
+        forgot `check=False` look correct in tests and blow up in production.
+        """
         self.commands.append(command)
+        result = self._answer(command)
+        if check and result.returncode != 0:
+            raise TransportError(result)
+        return result
+
+    def _answer(self, command: str) -> CommandResult:
         if command == "true":
             if self.ssh_failures > 0:
                 self.ssh_failures -= 1
-                result = CommandResult(self.host, ["ssh", command], 255, "", "connection refused")
-                if self.raise_on_ssh:
-                    raise TransportError(result)
-                return result
+                return CommandResult(self.host, ["ssh", command], 255, "", "connection refused")
             return CommandResult(self.host, ["ssh", command], 0, "", "")
         if command.startswith("nvidia-smi"):
             return CommandResult(

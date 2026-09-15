@@ -23,9 +23,24 @@ from tests.conftest import make_spec
 
 pytestmark = pytest.mark.usefixtures("gpuc_home")
 
-requires_scopes = pytest.mark.skipif(
-    not scope.probe(use_cache=False), reason="no usable systemd --user scope on this machine"
-)
+
+@pytest.fixture(scope="session")
+def systemd_scopes() -> bool:
+    """Can this machine make a `systemd-run --user --scope`?
+
+    A fixture, not a module-level `skipif`: `scope.probe()` execs systemd, and
+    collecting this file must not run anything on the machine.
+    """
+    return scope.probe(use_cache=False)
+
+
+@pytest.fixture
+def needs_scopes(systemd_scopes: bool) -> None:
+    if not systemd_scopes:
+        pytest.skip(
+            "no user systemd: `systemd-run --user --scope` is unusable here, so the cgroup "
+            "kill path -- the only one that reaps a double-forked grandchild -- was NOT tested"
+        )
 
 
 def test_a_phase_without_a_scope_is_a_plain_pipefail_shell() -> None:
@@ -71,7 +86,7 @@ def test_a_pgid_host_records_its_isolation_in_state() -> None:
     assert (state.isolation, state.cgroup_unit) == ("pgid", None)
 
 
-@requires_scopes
+@pytest.mark.usefixtures("needs_scopes")
 def test_a_cgroup_host_records_its_unit_while_a_phase_runs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(scope.ISOLATION_ENV, scope.CGROUP)
     job_id = prepare("sleep 5")
@@ -151,7 +166,7 @@ def reap(pid: int) -> None:
         os.kill(pid, 9)
 
 
-@requires_scopes
+@pytest.mark.usefixtures("needs_scopes")
 def test_cancel_under_a_cgroup_reaps_a_double_forked_grandchild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

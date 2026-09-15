@@ -170,7 +170,7 @@ def test_desired_state_is_written_before_the_pod_is_ready(control_env: Path, ssh
 
 def test_capacity_error_advances_to_the_next_offer(control_env: Path, ssh_key: Path) -> None:
     provider = FakeProvider(
-        [make_offer("cheap", 0.20), make_offer("dearer", 0.40)],
+        [make_offer(price=0.20, gpu_id="cheap"), make_offer(price=0.40, gpu_id="dearer")],
         scripts=[PodScript(create_error=CAPACITY_ERROR), PodScript()],
     )
     entry = run(provider)
@@ -181,7 +181,7 @@ def test_capacity_error_advances_to_the_next_offer(control_env: Path, ssh_key: P
 
 def test_broken_host_log_terminates_and_replaces(control_env: Path, ssh_key: Path) -> None:
     provider = FakeProvider(
-        [make_offer("first", 0.20), make_offer("second", 0.40)],
+        [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")],
         scripts=[PodScript(ssh_after_polls=-1, log_text=BROKEN_LOG), PodScript()],
     )
     reports: list[str] = []
@@ -195,7 +195,7 @@ def test_broken_host_log_terminates_and_replaces(control_env: Path, ssh_key: Pat
 
 def test_dead_pod_status_is_a_placement_failure(control_env: Path, ssh_key: Path) -> None:
     provider = FakeProvider(
-        [make_offer("first", 0.20), make_offer("second", 0.40)],
+        [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")],
         scripts=[PodScript(ssh_after_polls=-1, status_after_polls={1: "EXITED"}), PodScript()],
     )
     entry = run(provider)
@@ -379,13 +379,17 @@ def test_no_offers_says_what_to_relax(control_env: Path, ssh_key: Path) -> None:
 
 def test_every_offer_failing_lists_them(control_env: Path, ssh_key: Path) -> None:
     provider = FakeProvider(
-        [make_offer("a", 0.2), make_offer("b", 0.3)],
+        [make_offer(price=0.2, gpu_id="a"), make_offer(price=0.3, gpu_id="b")],
         scripts=[PodScript(create_error=CAPACITY_ERROR)] * 2,
     )
     with pytest.raises(ProvisionError) as error:
         run(provider)
-    assert "- a/secure" in str(error.value) and "- b/secure" in str(error.value)
-    assert "terminated" in str(error.value)
+    message = str(error.value)
+    # One line per offer tried, cheapest first, each carrying its own reason.
+    assert "- A40/secure $0.200/h" in message
+    assert "- A40/secure $0.300/h" in message
+    assert message.count(CAPACITY_ERROR) == 2
+    assert "terminated" in message
 
 
 def test_pod_name_is_prefixed_and_unique() -> None:

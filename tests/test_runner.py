@@ -171,6 +171,40 @@ def test_low_util_watchdog_kills_only_after_grace_and_window(gpuc_home: Path) ->
     assert "low-util watchdog" in log_of(job_id)
 
 
+def test_a_zero_util_setup_phase_can_never_trip_the_watchdog(gpuc_home: Path) -> None:
+    """The failure this rules out: a job killed for the hour its setup spent
+    downloading a checkpoint at 0% util.
+
+    Two separate rules do it. Sampling happens in `main` only, so nothing a
+    setup phase does can reach `util_recent` at all; and inside `main` the kill
+    window does not open until `grace_min` has passed, so a slow start is not
+    evidence either.
+    """
+    job_id = prepare(
+        gpus=[FAKE_GPUS[0]],
+        setup="sleep 0.3",
+        command="sleep 0.3",
+        low_util={"enabled": True, "window_min": 0.001, "floor_pct": 50, "grace_min": 60.0},
+    )
+    seen: list[tuple[str | None, int]] = []
+
+    def idle(uuids: Sequence[str]) -> float:
+        state = jobs.read_state(job_id)
+        seen.append((state.phase, len(state.util_recent)))
+        return 0.0
+
+    assert runner.run_job(job_id, deps(sampler=idle)) == 0
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("succeeded", None)
+    assert "low-util watchdog" not in log_of(job_id)
+
+    assert seen, "the sampler was never called, so this proved nothing"
+    assert {phase for phase, _ in seen} == {"main"}
+    # The first sample of main found an empty history: setup recorded nothing.
+    assert seen[0][1] == 0
+    assert state.util_recent and set(state.util_recent) == {0.0}
+
+
 def test_busy_gpu_is_never_killed_by_the_watchdog(gpuc_home: Path) -> None:
     job_id = prepare(
         gpus=[FAKE_GPUS[0]],
@@ -434,6 +468,21 @@ def test_a_failed_utilization_sample_is_recorded_as_unknown_not_as_idle(
     recent = jobs.read_state(job_id).util_recent
     assert recent and recent[0] is None
     assert "utilization sample failed" in log_of(job_id)
+
+
+def test_the_generated_preflight_asks_torch_whether_the_card_is_there() -> None:
+    """The command the injected `echo` below stands in for.
+
+    It runs under `uv run --no-sync` because the job's workdir is a uv project
+    and the repo's own venv has no torch, and it has to actually *count*
+    devices: importing torch proves nothing about a host whose driver is gone.
+    """
+    command = runner.preflight_command()
+    assert command.startswith("uv run --no-sync python -c ")
+    assert "import os, sys, torch" in command
+    assert "torch.cuda.device_count()" in command
+    assert 'os.environ["GPUC_EXPECTED_GPUS"]' in command
+    assert "device_count()=={count}, expected {expected}" in command
 
 
 def test_preflight_is_a_real_phase(gpuc_home: Path) -> None:

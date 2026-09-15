@@ -24,17 +24,21 @@ from tests.test_bootstrap import ScriptedHost, entry
 
 # -- (a) nothing we ship may defeat uv's linking ------------------------------
 
+# Anchored at the repo, not at the cwd: `pytest` from anywhere but the project
+# root would otherwise read nothing and pass.
+REPO = Path(__file__).resolve().parents[1]
 SHIPPED = [
-    Path("gpuc/host/runner.py"),
-    Path("gpuc/host/dispatcher.py"),
-    Path("gpuc/host/jobs.py"),
-    Path("gpuc/host/paths.py"),
-    Path("gpuc/control/submit.py"),
+    REPO / "gpuc/host/runner.py",
+    REPO / "gpuc/host/dispatcher.py",
+    REPO / "gpuc/host/jobs.py",
+    REPO / "gpuc/host/paths.py",
+    REPO / "gpuc/control/submit.py",
 ]
 
 
 def test_nothing_in_the_job_path_ever_sets_uv_link_mode() -> None:
     for path in SHIPPED:
+        assert path.is_file(), path
         assert "UV_LINK_MODE" not in path.read_text(), path
 
 

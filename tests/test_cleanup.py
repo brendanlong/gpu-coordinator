@@ -46,7 +46,6 @@ def test_no_policy_ever_removes_an_unfinished_job(policy: str, status: str) -> N
 
 def test_the_default_policy_is_on_success() -> None:
     assert make_spec().cleanup == "on_success"
-    assert jobs.DEFAULT_CLEANUP == "on_success"
 
 
 def test_an_unknown_policy_is_rejected_at_the_spec() -> None:
@@ -86,6 +85,9 @@ def test_the_runner_applies_the_policy(
     assert state.status == status
     assert paths.workdir(job_id).exists() is not expected
     assert state.workdir_removed is expected
+    # Deleting the workdir must not cost the one fact a failed run is kept for.
+    if status == "failed":
+        assert (state.exit_code, state.reason) == (7, "exit 7")
 
 
 def test_cleanup_keeps_spec_state_and_log(gpuc_home: Path) -> None:

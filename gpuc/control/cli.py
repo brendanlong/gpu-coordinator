@@ -293,6 +293,13 @@ def cmd_host_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_host_resume(args: argparse.Namespace) -> int:
+    entry = named_registry().require(args.name)
+    open_session(entry, load_settings()).host_cli("resume")
+    print(f"host {args.name}: low-util pause cleared, dispatcher restarted")
+    return 0
+
+
 def cmd_host_list(_: argparse.Namespace) -> int:
     read = read_registry()
     for error in read.errors:
@@ -1099,6 +1106,11 @@ def build_parser() -> argparse.ArgumentParser:
     host_clean.set_defaults(func=cmd_host_clean)
 
     host.add_parser("list", help="list registered hosts").set_defaults(func=cmd_host_list)
+    resume = host.add_parser(
+        "resume", help="clear a low-util pause on a host and restart its dispatcher"
+    )
+    resume.add_argument("name")
+    resume.set_defaults(func=cmd_host_resume)
     remove = host.add_parser("remove", help="forget a host")
     remove.add_argument("name")
     remove.set_defaults(func=cmd_host_remove)

@@ -1,5 +1,14 @@
 # Requirements review: GPU provisioning and queueing tool
 
+> **Snapshot, not the contract.** This is the reasoning as it stood on
+> **2026-09-14**, kept because the *why* behind most decisions has not changed.
+> The code has moved since. Where this document disagrees with
+> [ARCHITECTURE.md](ARCHITECTURE.md), **ARCHITECTURE wins** — most visibly on
+> the hard per-host TTL proposed below, which was replaced by the idle
+> terminate plus the dead-dispatcher rule (`--ttl-hours` still exists, but it is
+> opt-in and off by default). For what the tool does today, read
+> [usage.md](usage.md); for how it is built, ARCHITECTURE.md.
+
 Date: 2026-09-14. Input: the requirements list, the wiki's
 `gpu-job-runner-failure-catalog` and `skypilot-runpod-gotchas` pages, the
 2026-07-24 incident-mining journal (including its "final state" section, which

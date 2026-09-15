@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -13,24 +15,29 @@ from gpuc.control.transport import LocalTransport, SshTransport, SshUnusable, Tr
 
 # A real ControlPath has to fit in sun_path, so the fixtures use a short one;
 # pytest's own tmp_path is deliberately too long (see the control-path tests).
-SHORT_CONTROL_DIR = Path("/tmp/gpuc-test-cm")
+# The pid keeps two concurrent runs (or two users) off one socket directory
+# while staying far inside the 108-byte limit.
+SHORT_CONTROL_DIR = Path(tempfile.gettempdir()) / f"gpuc-test-cm-{os.getpid()}"
 
 
-def ssh_localhost_works() -> bool:
+@pytest.fixture(scope="session")
+def ssh_localhost() -> None:
+    """Skip unless `ssh localhost` works without a password.
+
+    A fixture rather than a module-level `skipif`: the old form ran a real ssh
+    (and waited on its 5s connect timeout) during *collection*, on every run of
+    the suite, whether or not anything in this file was selected.
+    """
     if shutil.which("ssh") is None:
-        return False
+        pytest.skip("no ssh binary")
     proc = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "localhost", "true"],
         capture_output=True,
         timeout=30,
         check=False,
     )
-    return proc.returncode == 0
-
-
-needs_ssh_localhost = pytest.mark.skipif(
-    not ssh_localhost_works(), reason="`ssh localhost` needs passwordless key auth"
-)
+    if proc.returncode != 0:
+        pytest.skip("`ssh localhost` needs passwordless key auth")
 
 
 def make_ssh(tmp_path: Path) -> SshTransport:
@@ -182,8 +189,7 @@ def test_a_missing_binary_is_a_transport_error(monkeypatch: pytest.MonkeyPatch) 
     assert "not found" in str(excinfo.value)
 
 
-@needs_ssh_localhost
-def test_ssh_transport_against_localhost(tmp_path: Path) -> None:
+def test_ssh_transport_against_localhost(ssh_localhost: None, tmp_path: Path) -> None:
     ssh = SshTransport(
         host="localhost",
         target="localhost",

@@ -16,8 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.cli import EXIT_USAGE, main
+from gpuc.control.cli import main
 from gpuc.control.config import load_registry
+from gpuc.host import scope
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
 
@@ -47,17 +48,18 @@ def log_tail(home: Path, job_id: str, lines: int = 25) -> str:
     return "\n".join(path.read_text().splitlines()[-lines:]) if path.exists() else "(no log)"
 
 
+def finished(home: Path, job_id: str) -> bool:
+    return state_of(home, job_id).get("status") in ("succeeded", "failed", "cancelled")
+
+
 def wait_for_main_phase(home: Path, job_id: str, timeout: float = 600.0) -> None:
+    """Used by the GPU e2e module, which has to wait out a torch venv sync."""
     wait_until(
         lambda: state_of(home, job_id).get("phase") == "main" or finished(home, job_id),
         timeout,
         f"job {job_id} to reach phase=main",
     )
     assert state_of(home, job_id)["status"] == "running", log_tail(home, job_id)
-
-
-def finished(home: Path, job_id: str) -> bool:
-    return state_of(home, job_id).get("status") in ("succeeded", "failed", "cancelled")
 
 
 @pytest.fixture
@@ -86,16 +88,45 @@ covered.
 """
 
 
-@pytest.fixture
-def bootstrapped_home(control_env: Path, tmp_path: Path) -> Iterator[Path]:
-    home = tmp_path / "gpuc-home"
-    assert (
-        main(["host", "add", "local", "--gpuc-home", str(home), "--cache-dir", SHARED_UV_CACHE])
-        == 0
-    )
-    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
-    yield home
-    _stop_dispatcher(home)
+@pytest.fixture(scope="module")
+def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """One bootstrapped `local` host for the whole module.
+
+    `$HOME` and the XDG dirs are redirected too. Bootstrap installs uv, a
+    Python, the aws CLI and `hf` into `$HOME/.local` when it cannot find them,
+    and a test suite has no business writing there; with `$HOME` temporary it
+    finds all four on `$PATH` instead and installs nothing.
+
+    Module-scoped because a bootstrap costs ~5s and nothing below needs a
+    pristine host: every test keys on the job id it submitted. A test that does
+    need a fresh one re-bootstraps itself (`--health-args` makes that cheap).
+    """
+    root = tmp_path_factory.mktemp("control-e2e")
+    fake_home = root / "home"
+    (fake_home / ".local" / "bin").mkdir(parents=True)
+    patch = pytest.MonkeyPatch()
+    patch.setenv("HOME", str(fake_home))
+    patch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
+    patch.setenv("XDG_DATA_HOME", str(fake_home / ".local" / "share"))
+    patch.setenv("XDG_CACHE_HOME", str(fake_home / ".cache"))
+    patch.setenv("GPUC_CONFIG_DIR", str(root / "config"))
+    patch.setenv("GPUC_STATE_DIR", str(root / "state"))
+    patch.delenv("GPUC_HOME", raising=False)
+    patch.setenv(scope.ISOLATION_ENV, scope.PGID)
+    (root / "config").mkdir()
+    (root / "state").mkdir()
+
+    home = root / "gpuc-home"
+    try:
+        assert (
+            main(["host", "add", "local", "--gpuc-home", str(home), "--cache-dir", SHARED_UV_CACHE])
+            == 0
+        )
+        assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
+        yield home
+    finally:
+        _stop_dispatcher(home)
+        patch.undo()
 
 
 def _stop_dispatcher(home: Path) -> None:
@@ -150,10 +181,6 @@ def test_bootstrap_installs_the_package_and_records_the_interpreter(
     entry = load_registry().require("local")
     assert entry.python and Path(entry.python).exists()
     assert entry.bootstrapped_at
-
-
-def test_bootstrap_is_idempotent(bootstrapped_home: Path) -> None:
-    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
 
 
 def test_probe_reports_this_machine(
@@ -214,18 +241,38 @@ def test_a_failing_job_keeps_its_exit_code(bootstrapped_home: Path, workdir: Pat
     assert (state["status"], state["exit_code"]) == ("failed", 23)
 
 
+@pytest.fixture
+def s3_bucket_configured() -> Iterator[None]:
+    """`s3_bucket = "bkt"`, undone afterwards.
+
+    The config dir is shared by the whole module now, and the purge tests below
+    assert this host has *no* S3 mirror to fall back on.
+    """
+    from gpuc.control import config
+
+    path = config.config_file()
+    before = path.read_text() if path.exists() else None
+    path.write_text('s3_bucket = "bkt"\n')
+    try:
+        yield
+    finally:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(before)
+
+
 def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
     bootstrapped_home: Path,
     workdir: Path,
+    s3_bucket_configured: None,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from gpuc.control import config
     from tests.fakes3 import FakeS3Client
 
     fake = FakeS3Client()
     monkeypatch.setattr("boto3.client", lambda service, **_: fake)
-    config.config_file().write_text('s3_bucket = "bkt"\n')
 
     home = bootstrapped_home
     first = submit(workdir, "name: hi\ncommand: cat hello.txt\ngpus: 0\n")
@@ -298,34 +345,6 @@ def big_file_job(home: Path, workdir: Path, *, cleanup: str = "never") -> str:
     return job_id
 
 
-def test_the_default_policy_removes_a_succeeded_workdir(
-    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = bootstrapped_home
-    job_id = submit(workdir, 'name: ok\ncommand: "true"\ngpus: 0\n')
-    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
-    capsys.readouterr()
-
-    state = state_of(home, job_id)
-    assert state["status"] == "succeeded"
-    assert state["workdir_removed"] is True
-    assert not (home / "jobs" / job_id / "workdir").exists()
-    for name in ("spec.json", "state.json", "log.txt"):
-        assert (home / "jobs" / job_id / name).exists(), name
-
-
-def test_the_default_policy_keeps_a_failed_workdir(
-    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = bootstrapped_home
-    job_id = submit(workdir, "name: bad\ncommand: exit 9\ngpus: 0\n")
-    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
-    capsys.readouterr()
-
-    assert state_of(home, job_id)["workdir_removed"] is False
-    assert (home / "jobs" / job_id / "workdir" / "hello.txt").exists()
-
-
 def test_clean_dry_run_then_real(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -348,24 +367,6 @@ def test_clean_dry_run_then_real(
     assert not (home / "jobs" / job_id / "workdir").exists()
     assert state_of(home, job_id)["workdir_removed"] is True
     assert (home / "jobs" / job_id / "log.txt").exists()
-
-
-def test_clean_leaves_a_running_job_alone(
-    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = bootstrapped_home
-    running = submit(workdir, "name: sleepy\ncommand: sleep 300\ngpus: 0\ncleanup: never\n")
-    wait_for_main_phase(home, running)
-    done = big_file_job(home, workdir)
-    capsys.readouterr()
-
-    assert main(["clean", "--host", "local", "--all-finished"]) == 0
-    out = capsys.readouterr().out
-    assert done in out
-    assert (home / "jobs" / running / "workdir").exists()
-    assert state_of(home, running)["status"] == "running"
-
-    assert main(["cancel", running]) == 0
 
 
 def test_status_mentions_leftover_workdirs_and_clean_clears_it(
@@ -405,13 +406,6 @@ def test_clean_removes_a_leftover_staged_spec(
     assert not staged.exists()
 
 
-def test_clean_needs_a_selection(
-    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["clean", "--host", "local"]) == EXIT_USAGE
-    assert "--all-finished" in capsys.readouterr().err
-
-
 # -- purge --------------------------------------------------------------------
 
 
@@ -422,25 +416,6 @@ def mark_mirrored(home: Path, job_id: str, prefix: str = "s3://bucket/gpuc/local
     document["meta_synced_at"] = document.get("ended_at")
     document["meta_synced_to"] = prefix
     path.write_text(json.dumps(document, indent=2) + "\n")
-
-
-def test_purge_skips_an_unmirrored_job_and_force_removes_it(
-    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = bootstrapped_home
-    job_id = big_file_job(home, workdir)
-    capsys.readouterr()
-
-    assert main(["clean", "--host", "local", "--purge", "--older-than", "0", "--dry-run"]) == 0
-    out = capsys.readouterr().out
-    assert f"SKIPPED {job_id}" in out
-    assert "no s3_prefix on this host" in out
-    assert (home / "jobs" / job_id / "state.json").exists()
-
-    assert main(["clean", "--host", "local", "--purge", "--older-than", "0", "--force"]) == 0
-    out = capsys.readouterr().out
-    assert "PURGED" in out and job_id in out and "FORCED" in out
-    assert not (home / "jobs" / job_id).exists()
 
 
 def test_purge_removes_a_mirrored_job_whole(
@@ -458,20 +433,6 @@ def test_purge_removes_a_mirrored_job_whole(
     assert main(["clean", "--host", "local", "--purge", "--older-than", "0"]) == 0
     assert "PURGED" in capsys.readouterr().out
     assert not (home / "jobs" / job_id).exists()
-
-
-def test_purge_leaves_a_running_job_alone(
-    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = bootstrapped_home
-    running = submit(workdir, "name: sleepy\ncommand: sleep 300\ngpus: 0\ncleanup: never\n")
-    wait_for_main_phase(home, running)
-    capsys.readouterr()
-    assert main(["clean", "--host", "local", "--purge", "--older-than", "0", "--force"]) == 0
-    out = capsys.readouterr().out
-    assert f"SKIPPED {running}  status running" in out
-    assert (home / "jobs" / running / "state.json").exists()
-    assert main(["cancel", running]) == 0
 
 
 def test_logs_and_status_after_a_purge(

@@ -3,14 +3,13 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
+import tempfile
 import textwrap
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from gpuc.control.config import HostEntry
 from gpuc.host import jobs, paths, scope
 from gpuc.host.jobs import HostConfig, JobSpec
 
@@ -47,12 +46,20 @@ def make_spec(**overrides: object) -> JobSpec:
 
 
 def fake_smi(uuids: list[str] | None = None, utilization: dict[str, float] | None = None):
-    """A stand-in for `nvidia-smi` that answers the two queries gpus.py makes."""
+    """A stand-in for `nvidia-smi` that answers the two queries gpus.py makes.
+
+    `--format=` is honoured rather than assumed: real nvidia-smi prints a header
+    row unless `noheader` is asked for, and a caller that forgets it gets a
+    field-name line where it expected data. A fake that never emits one would
+    hide exactly that bug.
+    """
     listed = FAKE_GPUS if uuids is None else uuids
 
     def run(args: list[str]) -> str:
         query = next(a for a in args if a.startswith("--query-gpu="))
         fields = query.split("=", 1)[1].split(",")
+        fmt = next((a for a in args if a.startswith("--format=")), "--format=csv")
+        options = fmt.split("=", 1)[1].split(",")
         selected = listed
         if "-i" in args:
             wanted = args[args.index("-i") + 1].split(",")
@@ -74,6 +81,8 @@ def fake_smi(uuids: list[str] | None = None, utilization: dict[str, float] | Non
                 else:
                     cells.append("")
             rows.append(", ".join(cells))
+        if "noheader" not in options:
+            rows.insert(0, ", ".join(fields))
         return "\n".join(rows) + "\n"
 
     return run
@@ -97,7 +106,20 @@ requires_gpu = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="session")
-def torch_project() -> Path:
+def session_monkeypatch() -> Iterator[pytest.MonkeyPatch]:
+    """`monkeypatch` is function-scoped; session fixtures need their own."""
+    patch = pytest.MonkeyPatch()
+    yield patch
+    patch.undo()
+
+
+def default_torch_project() -> Path:
+    """A per-user path: /tmp is shared, and two users must not collide there."""
+    return Path(tempfile.gettempdir()) / f"gpuc-test-torch-project-{os.getuid()}"
+
+
+@pytest.fixture(scope="session")
+def torch_project(session_monkeypatch: pytest.MonkeyPatch) -> Path:
     """A minimal uv project with torch, reused across runs via the uv cache.
 
     The repo's own venv has no torch, and the runner's GPU preflight is
@@ -105,9 +127,12 @@ def torch_project() -> Path:
     real GPU job needs a workdir that is a uv project.
     """
     # Every job syncs its own venv under /tmp; copying ~3 GB of torch per job
-    # fills the shared tmpfs, so link the cache instead.
-    os.environ.setdefault("UV_LINK_MODE", "symlink")
-    root = Path(os.environ.get("GPUC_TEST_TORCH_PROJECT", "/tmp/gpuc-test-torch-project"))
+    # fills the shared tmpfs, so link the cache instead. Set through monkeypatch
+    # so the variable does not outlive the session that wanted it.
+    if "UV_LINK_MODE" not in os.environ:
+        session_monkeypatch.setenv("UV_LINK_MODE", "symlink")
+    override = os.environ.get("GPUC_TEST_TORCH_PROJECT")
+    root = Path(override) if override else default_torch_project()
     root.mkdir(parents=True, exist_ok=True)
     (root / "pyproject.toml").write_text(
         textwrap.dedent(
@@ -146,14 +171,3 @@ def control_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
     (root / "config").mkdir(parents=True)
     (root / "state").mkdir(parents=True)
     yield root
-
-
-def local_host_entry(name: str, home: Path, gpus: list[str] | None = None) -> HostEntry:
-    """A `local` host whose ~/.gpuc is redirected, so tests never touch the real one."""
-    return HostEntry(
-        name=name,
-        kind="local",
-        gpus=gpus or [],
-        gpuc_home=str(home),
-        python=sys.executable,
-    )

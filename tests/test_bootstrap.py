@@ -269,3 +269,16 @@ def test_bootstrap_records_what_the_cards_are(control_env: Path) -> None:
     assert updated.gpu_info["GPU-a"].name == "NVIDIA A40"
     assert updated.gpu_info["GPU-a"].vram_mib == 46068
     assert updated.driver_version == "580.173.02"
+
+
+def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_env: Path) -> None:
+    """`gpuc version` warns by comparing these two, so a bootstrap that wrote
+    neither would report every host as up to date forever."""
+    from gpuc.control import version as version_mod
+
+    host = ScriptedHost()
+    updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    assert updated.pkg_commit == version_mod.local_commit()
+    config = json.loads(host.puts["/home/u/.gpuc/config.json"][0])
+    assert config["pkg_commit"] == updated.pkg_commit
+    assert config["schema_version"] == 1

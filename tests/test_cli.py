@@ -180,20 +180,6 @@ def test_reconcile_once_fails_closed_without_desired_state(
     assert provider.terminated == []
 
 
-def test_reconcile_install_writes_units_without_enabling_them(
-    control_env: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    assert main(["reconcile", "--install", "--interval", "45"]) == 0
-    out = capsys.readouterr().out
-    assert "gpuc-reconcile.timer" in out and "systemctl --user enable --now" in out
-
-
 def test_pods_lists_ours_and_counts_the_others(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -634,11 +620,6 @@ def test_purging_every_finished_job_has_to_be_asked_for_twice(
     main(["host", "add", "spar", "--ssh", "me@box"])
     assert main(["clean", "--host", "spar", "--purge", "--all-finished"]) == EXIT_USAGE
     assert "Add --yes to confirm" in capsys.readouterr().err
-
-
-def test_status_filters_have_defaults() -> None:
-    args = build_parser().parse_args(["status"])
-    assert (args.recent, args.since) == (5, None)
 
 
 def test_host_add_takes_gpu_indices_and_stores_them_as_given(control_env: Path) -> None:

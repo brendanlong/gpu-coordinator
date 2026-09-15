@@ -116,40 +116,108 @@ def test_a_null_non_optional_field_falls_back_to_its_default() -> None:
     assert (entry.idle_minutes, entry.port, entry.gpus, entry.env) == (15.0, 22, [], {})
 
 
-def test_every_optional_registry_field_round_trips_as_none() -> None:
-    entry = HostEntry(name="spar")
-    optional = [
-        "ssh",
-        "driver_version",
-        "pod_id",
-        "python",
-        "uv",
-        "gpuc_home",
-        "persistent_root",
-        "cache_dir",
-        "ttl_hours",
-        "s3_prefix",
-        "retention_days",
-        "created_at",
-        "bootstrapped_at",
-        "pkg_commit",
-    ]
-    document = json.loads(entry.model_dump_json())
-    assert [key for key in optional if document[key] is not None] == []
-    again = HostEntry.model_validate(document)
-    assert again == entry
-    assert again.ttl_hours is None and again.retention_days is None and again.s3_prefix is None
+OPTIONAL_REGISTRY_FIELDS = [
+    "ssh",
+    "driver_version",
+    "pod_id",
+    "python",
+    "uv",
+    "gpuc_home",
+    "persistent_root",
+    "cache_dir",
+    "ttl_hours",
+    "s3_prefix",
+    "retention_days",
+    "created_at",
+    "bootstrapped_at",
+    "pkg_commit",
+]
 
 
-def test_every_optional_host_config_field_round_trips_as_none() -> None:
-    config = HostConfig(host="spar")
-    again = HostConfig.from_dict(json.loads(json.dumps(config.to_dict())))
-    assert again == config
-    assert again.ttl_hours is None
-    assert again.retention_days is None
-    assert again.s3_prefix is None
-    assert again.provider is None
-    assert again.pkg_commit is None
+def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -> None:
+    """The rule that broke: `null` must mean null, not "apply the default".
+
+    A default-constructed entry proves nothing -- every optional field is
+    already None -- so this round-trips a fully populated entry in which each
+    optional field has been explicitly nulled, one at a time and all at once.
+    """
+    populated = HostEntry(
+        name="spar",
+        kind="ssh",
+        ssh="me@box",
+        port=2222,
+        gpus=["GPU-a"],
+        driver_version="580.173.02",
+        pod_id="pod1",
+        python="/home/u/.local/python3.12",
+        uv="/home/u/.local/bin/uv",
+        gpuc_home="/home/u/.gpuc",
+        persistent_root="/workspace/me",
+        cache_dir="/home/u/.cache/uv",
+        idle_minutes=30.0,
+        ttl_hours=24.0,
+        s3_prefix="s3://bucket/gpuc/spar",
+        retention_days=14.0,
+        created_at="2026-09-15T20:00:00+00:00",
+        bootstrapped_at="2026-09-15T20:00:00+00:00",
+        pkg_commit="b" * 40,
+    )
+    document = json.loads(populated.model_dump_json())
+    assert [key for key in OPTIONAL_REGISTRY_FIELDS if document[key] is None] == []
+
+    for field in OPTIONAL_REGISTRY_FIELDS:
+        entry = HostEntry.model_validate({**document, field: None})
+        assert getattr(entry, field) is None, field
+        # Nulling one field may not quietly reset any of the others.
+        untouched = [k for k in OPTIONAL_REGISTRY_FIELDS if k != field]
+        assert [getattr(entry, k) for k in untouched] == [
+            getattr(populated, k) for k in untouched
+        ], field
+
+    all_null = HostEntry.model_validate(
+        {**document, **dict.fromkeys(OPTIONAL_REGISTRY_FIELDS, None)}
+    )
+    assert [getattr(all_null, key) for key in OPTIONAL_REGISTRY_FIELDS] == [None] * len(
+        OPTIONAL_REGISTRY_FIELDS
+    )
+    # And a re-serialised entry still carries the nulls, rather than dropping
+    # the keys and letting the next reader default them.
+    again = json.loads(all_null.model_dump_json())
+    assert [again[key] for key in OPTIONAL_REGISTRY_FIELDS] == [None] * len(
+        OPTIONAL_REGISTRY_FIELDS
+    )
+
+
+OPTIONAL_CONFIG_FIELDS = ["ttl_hours", "retention_days", "s3_prefix", "provider", "pkg_commit"]
+
+
+def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> None:
+    """The host-side twin: `float(None)` in the dispatcher is what started this."""
+    populated = HostConfig(
+        host="spar",
+        gpus=["GPU-a"],
+        idle_minutes=30.0,
+        ttl_hours=24.0,
+        s3_prefix="s3://bucket/gpuc/spar",
+        retention_days=14.0,
+        provider={"kind": "runpod", "pod_id": "p"},
+        pkg_commit="b" * 40,
+    )
+    document = json.loads(json.dumps(populated.to_dict()))
+    assert [key for key in OPTIONAL_CONFIG_FIELDS if document[key] is None] == []
+
+    for field in OPTIONAL_CONFIG_FIELDS:
+        config = HostConfig.from_dict({**document, field: None})
+        assert getattr(config, field) is None, field
+        assert config.host == "spar" and config.idle_minutes == 30.0
+
+    all_null = HostConfig.from_dict({**document, **dict.fromkeys(OPTIONAL_CONFIG_FIELDS, None)})
+    assert [getattr(all_null, key) for key in OPTIONAL_CONFIG_FIELDS] == [None] * len(
+        OPTIONAL_CONFIG_FIELDS
+    )
+    assert not all_null.ephemeral  # a null provider is not an ephemeral host
+    again = HostConfig.from_dict(json.loads(json.dumps(all_null.to_dict())))
+    assert again == all_null
 
 
 def test_an_unknown_key_never_reaches_a_model() -> None:
