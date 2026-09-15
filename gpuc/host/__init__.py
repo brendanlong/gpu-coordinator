@@ -1,4 +1,6 @@
 """On-host queue. Stdlib only: a broken venv must not be able to break the queue."""
 
-USER_AGENT = "gpuc/0.1"
-"""Cloudflare 403s urllib's default User-Agent as a banned browser signature."""
+from gpuc._version import user_agent
+
+USER_AGENT = user_agent()
+"""Also load-bearing for RunPod: Cloudflare 403s urllib's default User-Agent."""

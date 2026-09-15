@@ -118,7 +118,9 @@ def test_failed_final_sync_turns_a_succeeded_job_into_failed_sync(
         command="mkdir -p out && echo x > out/x",
         outputs=[{"path": "out", "s3": "s3://bucket/{job_id}"}],
     )
-    assert runner.run_job(job_id, deps()) == 1
+    # The preflight would catch the missing binary first; this test is about the
+    # final sync, which is the last line of defence behind it.
+    assert runner.run_job(job_id, deps(sync_preflight=False)) == 1
     state = jobs.read_state(job_id)
     assert (state.status, state.reason, state.exit_code) == ("failed", "sync", 1)
     assert "final sync FAILED" in log_of(job_id)
@@ -132,7 +134,7 @@ def test_failed_final_sync_does_not_mask_a_failed_job(
         command="mkdir -p out && exit 7",
         outputs=[{"path": "out", "s3": "s3://bucket/{job_id}"}],
     )
-    assert runner.run_job(job_id, deps()) == 7
+    assert runner.run_job(job_id, deps(sync_preflight=False)) == 7
     state = jobs.read_state(job_id)
     assert state.status == "failed"
     assert state.reason == "exit 7+sync"
@@ -459,7 +461,7 @@ def test_a_missing_output_dir_fails_the_job_as_no_outputs_not_as_sync(
     job_id = prepare(
         command="true", outputs=[{"path": "never-written", "s3": "s3://bucket/{job_id}"}]
     )
-    assert runner.run_job(job_id, deps()) == 1
+    assert runner.run_job(job_id, deps(sync_preflight=False)) == 1
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("failed", "no-outputs")
 
@@ -632,7 +634,7 @@ def test_an_output_upload_that_fails_leaves_outputs_unconfirmed(
         command="mkdir -p results && echo hi > results/a.txt",
         outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
     )
-    runner.run_job(job_id, deps(command_runner=command_runner))
+    runner.run_job(job_id, deps(command_runner=command_runner, sync_preflight=False))
     state = jobs.read_state(job_id)
     assert state.outputs_synced_at is None
     assert (state.status, state.reason) == ("failed", "sync")

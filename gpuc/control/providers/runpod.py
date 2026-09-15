@@ -11,6 +11,8 @@ from datetime import datetime
 from http.client import HTTPResponse
 from typing import Any
 
+from gpuc._version import user_agent
+
 from .base import (
     DEFAULT_IMAGE,
     Caps,
@@ -27,7 +29,7 @@ from .base import (
 
 BASE_URL = "https://api.runpod.io/v2"
 # Cloudflare in front of api.runpod.io rejects the default urllib User-Agent with a 1010.
-USER_AGENT = "gpuc/0.1"
+USER_AGENT = user_agent()
 MAX_RATE_LIMIT_SLEEP_S = 60.0
 
 

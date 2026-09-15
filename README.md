@@ -35,7 +35,8 @@ gpuc config show      # the effective settings, file or not
 ```
 
 Keys: `s3_bucket`, `runpod_pod_prefix`, `max_pods`, `max_total_usd_per_hour`,
-`ssh_key`, `image`, `disk_gb`.
+`ssh_key`, `image`, `disk_gb`, `dead_dispatcher_minutes` (how long an ephemeral
+host may be silent before `gpuc reconcile` terminates it; 30 by default).
 
 `--runpod`, `gpuc pods` and `gpuc reconcile` need `RUNPOD_API_KEY` exported;
 without it they fail immediately with one line rather than part-way through.
@@ -54,14 +55,15 @@ gpuc host bootstrap <name> [--health-args "..."]     # idempotent; also restarts
 gpuc host probe <name>                               # driver, GPUs+UUIDs, disk+fs type, systemd, network
 gpuc host clean <name> --uv-cache                    # `uv cache prune` on the host
 gpuc host list | gpuc host remove <name>             # remove forgets locally; the host is untouched
-gpuc submit <job.yaml|-> --host <name>               # or --runpod ... (flags below)
+gpuc submit <job.yaml|-> --host <name> [--no-git]    # or --runpod ... (flags below)
 gpuc status [--host H] [--all] [--suspects]          # --all adds jobs only the index knows
+           [--recent N] [--since 24h|7d|90m]         # how much of the finished list to show
 gpuc logs <job-id> [-f] [-n LINES] [--host H]        # host first, S3 mirror as a noted fallback
 gpuc cancel <job-id> [--host H]
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]   # free finished workdirs
 gpuc clean --host H --purge [--older-than DAYS] [--verify] [--force] [--dry-run]  # whole job dirs
 gpuc reorder <job-id> --priority N [--host H]        # queued jobs only
-gpuc requeue <job-id> [--host H | --runpod ...]      # re-reads the spec from S3, attempt+1
+gpuc requeue <job-id> [--host H | --runpod ...] [--no-git]   # re-reads the spec from S3, attempt+1
 gpuc reconcile [--once] [--interval S] [--install]
 gpuc pods [--no-heartbeat]                           # --no-heartbeat skips the per-pod ssh check
 gpuc config init [--force] | gpuc config show
@@ -97,6 +99,19 @@ gpuc host probe spar        # driver, every GPU as `[index] UUID name`, disk, sy
                             # and whether $HOME is on an overlay (see below)
 gpuc host bootstrap spar
 gpuc submit job.yaml --host spar
+```
+
+`gpuc host list` and `gpuc status` name the cards once a host has been probed or
+bootstrapped, so a registry of UUIDs is readable at a glance:
+
+```
+spar   ssh   spar_cluster   gpus=2 (2x NVIDIA A40 45 GB, driver 580.65.06) python=... bootstrapped=...
+  NVIDIA A40                   45 GB   GPU-80646905-50a9-afc1-4375-43ca475b15e4
+  NVIDIA A40                   45 GB   GPU-83123e65-fe58-7831-6b21-1814b07c25f7
+
+host spar [ssh] spar_cluster  dispatcher 2s ago  gpus 1/2 free (2x NVIDIA A40 45 GB, driver 580.65.06)
+  gpu     NVIDIA A40 45 GB  GPU-80646905-...  busy 20260915-195133-be2d4a
+  gpu     NVIDIA A40 45 GB  GPU-83123e65-...  free
 ```
 
 Run `probe` **before** `host add` if you do not know the UUIDs: it prints every
@@ -195,7 +210,7 @@ for you; see [the uv cache](#disk-workdirs-and-the-uv-cache).)
 
 ```sh
 export RUNPOD_API_KEY=...
-gpuc submit job.yaml --runpod --gpu A40 --max-price 0.6 --idle-min 15 --ttl-hours 24
+gpuc submit job.yaml --runpod --gpu A40 --max-price 0.6 --idle-min 15
 gpuc pods                   # every pod with our prefix: cost, util, age, is it wanted?
 gpuc reconcile --once       # terminate leaked or expired pods now
 gpuc reconcile --install    # write a systemd --user service + timer (it prints how to enable it)
@@ -211,14 +226,16 @@ Flags for `--runpod` (the same set on `gpuc submit` and `gpuc requeue`):
 | `--max-price USD` | none | **whole pod** per hour, so at `--gpu-count 2` it is compared against twice the per-GPU price |
 | `--cloud secure\|community\|any` | `secure` | `any` queries both tiers and sorts the merged list by price |
 | `--cuda-min X.Y` | `12.8` | host CUDA floor, passed to the catalog query and to `create` |
-| `--idle-min N` / `--ttl-hours N` | `15` / `24` | the pod's own auto-down timers |
+| `--idle-min N` | `15` | idle minutes before the pod terminates itself |
+| `--ttl-hours N` | none | optional hard cap on the pod's life; see [auto-down](#auto-down) |
 | `--disk GB` / `--image REF` | from `config.toml` | container disk and pod image |
 | `--no-reuse` | reuse is on | always create a new pod |
 | `--name-hint TEXT` | `job` | goes into the pod name after the prefix |
 | `--health-args "..."` | none | extra flags for the on-host health check, e.g. `--min-mbps 0.1` |
 
 Provisioning checks what it can locally first (spec validity, `secrets:`
-present in your shell, a git workdir, `gpus:` against `--gpu-count`), mirrors
+present in your shell, a git workdir unless `--no-git`, `gpus:` against
+`--gpu-count`, and `max_runtime_min` against any `--ttl-hours`), mirrors
 the spec to S3, then walks the catalog offers cheapest-first: create, wait for
 a direct SSH endpoint, bootstrap, host health check, enqueue. Any failure
 terminates that pod and tries the next offer; a cap that the cheapest offer
@@ -230,17 +247,35 @@ provider says the pod is `RUNNING`, its dispatcher heartbeat is under 30 s
 old, and it is neither draining nor paused. A registry entry whose pod the
 provider no longer has is forgotten on the spot rather than dialled.
 
+<a name="auto-down"></a>
 **Auto-down.** The pod terminates itself when the queue has been empty and
-nothing has run for `--idle-min`, or when `--ttl-hours` has elapsed with
-nothing running, or after two consecutive `low-util` failures. It drains
-(final sync of every job's log and state) before calling the provider.
+nothing has run for `--idle-min`, or after two consecutive `low-util` failures.
+It drains (final sync of every job's log and state) before calling the provider.
+
+**There is no overall TTL by default.** `--ttl-hours` is an opt-in hard cap: a
+wall clock that kills a training run at hour 24 is a worse failure than a pod
+that idles for fifteen minutes first. When you do set one, the *dispatcher*
+enforces it — past the cap it stops the running job with reason `ttl`, lets the
+runner sync its outputs, then drains and terminates — and the reaper enforces it
+as a backstop from the provider's own `createdAt`. `gpuc submit --runpod`
+refuses a job whose `max_runtime_min` is longer than the TTL you asked for,
+rather than letting the TTL kill it halfway. `gpuc host set <host> --ttl-hours
+-1` takes a cap back off.
+
+**What stops a forgotten pod instead.** `gpuc reconcile` terminates a
+bootstrapped pod whose dispatcher heartbeat has been dead — or whose ssh has not
+answered at all — for `dead_dispatcher_minutes` (30 by default) with no job
+running, and says so loudly. A pod running a job is never touched, however old
+it is; a pod that cannot tell us it is running one cannot idle-terminate itself
+either, and it is billing all the same.
 
 What that does **not** guarantee: self-terminate needs the pod to still be
 reachable and the provider API to answer. If the pod wedges, loses network, or
 the API call fails, it keeps billing. `gpuc reconcile` is the backstop — it
-terminates pods with our prefix that no `desired/` record wants or that are
-past their TTL (TTL measured from the provider's own `createdAt`, not from
-when this machine first heard of the pod) — and it only runs when you run it,
+terminates pods with our prefix that no `desired/` record wants, that have gone
+silent for `dead_dispatcher_minutes`, or that are past a TTL you set (measured
+from the provider's own `createdAt`, not from when this machine first heard of
+the pod) — and it only runs when you run it,
 so install the timer. `--install` writes the units but deliberately does not
 enable them; it prints the `systemctl --user` lines and where to put
 `RUNPOD_API_KEY` for the service.
@@ -280,7 +315,7 @@ S3 and Hugging Face outputs and secrets. Fields:
 | `gpus` | `1` | how many of the host's owned GPUs to assign; `0` never waits |
 | `env` | `{}` | plain environment for the job |
 | `secrets` | `[]` | names read from *your* shell, delivered 0600 as `~/.gpuc/secrets/<jobid>.env` |
-| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path}`; `path` is relative to the workdir |
+| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir |
 | `sync_interval_s` | `180` | background upload cadence |
 | `priority` | `50` | 0 first, 99 last |
 | `max_runtime_min` | none | wall clock cap; over it the job is `failed: timeout` |
@@ -289,7 +324,35 @@ S3 and Hugging Face outputs and secrets. Fields:
 | `cleanup` | `on_success` | when to delete `workdir/`: `on_success`, `always` or `never` |
 
 `{job_id}` expands in output destinations. Output namespaces are unique by
-construction, so nothing guards against overwriting.
+construction, so nothing guards against overwriting. `hf_create: true` on an
+output lets the sync preflight create a Hugging Face repo that does not exist
+yet; without it, a missing repo fails the job in seconds instead of creating
+`org/typo`.
+
+**Files already under an output path are not your job's outputs.** A checkout
+usually ships committed files where the results go — `results/report-elephant.md`
+from the last run, a figure in `figures/`. Those arrive in the workdir with the
+code, so before `setup` the runner records every declared output path's contents
+(relative path, size, mtime) in `jobs/<id>/outputs_baseline.json`. Every upload
+skips files that still match it, and a path that ends up holding *only* those
+files counts as having produced nothing (`failed: no-outputs`). `gpuc submit`
+says so up front:
+
+```
+WARNING: 3 pre-existing file(s) under results/ are in the checkout and will not be
+         uploaded as this job's outputs; use a job-specific output dir
+         (for example results/{job_id}/) if you meant them to be
+```
+
+**The sync preflight.** Before `main`, and after the GPU preflight, the runner
+proves the uploads can actually happen: with S3 outputs (or a host `s3_prefix`)
+the `aws` binary must resolve and a small `.preflight` object must upload to
+every destination and to the host's mirror prefix; with HF outputs, `hf` must
+resolve, `hf auth whoami` must succeed with the job's token, and a `.preflight`
+file must upload to each repo. A failure is `failed: sync-preflight` with the
+command and its error in the log — seconds in, rather than after four hours of
+training with the only copy of a checkpoint on a pod that is about to go away.
+A job with no outputs on a host with no mirror checks nothing.
 
 Secrets never appear in argv, in a pod's provider-visible env, or in any log.
 The runner loads them into the job's environment *and* into the environment the
@@ -381,8 +444,8 @@ no `outputs:`, or a workdir that is already gone, has nothing to confirm).
 
 An ephemeral host retries those uploads while it drains — three tries a minute
 apart, five minutes at most — and if they still fail it records
-`outputs_lost: true` and terminates anyway (the pod is billing, and its TTL
-does not pause). `gpuc status --all` shows `OUTPUTS LOST` against such a job.
+`outputs_lost: true` and terminates anyway (the pod is billing, and whatever
+sent it away — an idle timer, a TTL, the reaper — does not pause). `gpuc status --all` shows `OUTPUTS LOST` against such a job.
 
 `--force` overrides both preconditions, removes the record anyway, and says so
 loudly per job. `--verify` (control side only) HEADs each candidate's
@@ -473,6 +536,41 @@ and whether it shares a filesystem with gpuc home:
 `gpuc host clean <host> --uv-cache` runs `uv cache prune` there, which drops
 unused and unreachable entries but keeps the wheels a venv still links to.
 
+## What gets synced to the host
+
+`gpuc submit` rsyncs `git ls-files --cached --others --exclude-standard`: every
+tracked file **and** every untracked one git would keep. A file you have just
+written and not yet `git add`ed is part of the experiment, and leaving it behind
+used to mean running the wrong code on the GPU; `.gitignore` is still obeyed, so
+`.venv/` and caches stay home. Files in the index but deleted on disk are
+dropped rather than sent. One line says what happened:
+
+```
+syncing 43 files (2 modified, 1 untracked, ignoring .gitignore'd)
+```
+
+`uncommitted.patch` in the job dir is `git diff HEAD` taken against a copy of
+the index with `git add -N` applied, so it contains your untracked files too and
+your real staging area is never touched.
+
+For a directory that is not a repository at all, `--no-git` rsyncs all of it
+except `.venv`, `__pycache__`, `.git`, `*.pyc`, `node_modules` and `.uv-cache`,
+with a warning — nothing reads `.gitignore` in that mode, and `gpuc requeue`
+cannot rebuild that workdir from a commit.
+
+## How a job is killed
+
+A job's phases run inside a transient `systemd --user` scope wherever the host
+has one (this desktop does; a RunPod pod and most shared boxes do not). That
+matters for one reason: a grandchild that double-forks (`setsid`, `nohup`, a
+daemonising server) escapes the job's process group and survives a
+`kill -- -PGID`, holding a GPU the next job is about to be given — but it cannot
+leave its cgroup, so `systemctl --user stop <unit>` reaps the whole tree.
+
+`gpuc status` says which mode a host is in per job (`isolation: cgroup` or
+`pgid` in `state.json`). Under `pgid` the daemonised-grandchild hole is real and
+not fixed; `gpuc cancel` still stops everything in the job's process group.
+
 ## Low-util and cancel
 
 The runner samples the assigned GPUs every 30 s, but only during phase `main`,
@@ -486,6 +584,22 @@ that are heading that way and never kills anything.
 process group (SIGTERM, 15 s, SIGKILL), runs the final sync, and records
 `cancelled`. A job cancelled before its first phase starts never starts one.
 A queued job is cancelled by removing its queue marker.
+
+## Who we say we are
+
+Every request gpuc makes to somebody else's service carries one user agent,
+from `gpuc/_version.py`:
+
+```
+gpuc/0.1.0 (+https://github.com/brendanlong/gpu-coordinator; self@brendanlong.com)
+```
+
+The RunPod API calls, a pod's self-terminate, the health check's download
+measurement, bootstrap's `curl` for the uv installer, every boto3 client on this
+machine, and `HF_HUB_USER_AGENT_ORIGIN` in each job's environment (so `hf`
+sends it too; a job can override it in `env:`). The one thing that cannot carry
+it is the **`aws` CLI on a host**: its User-Agent is not overridable, so S3
+requests made by the CLI are anonymous. That is a limitation, not an oversight.
 
 ## Where state lives
 
@@ -522,7 +636,9 @@ what `gpuc clean --purge` requires before it deletes a job dir
 | bootstrap fails with "host health failed" | the driver, disk or network check on the host said no | read the named check; fix the host (free disk, load the driver) and re-run bootstrap |
 | job is `failed: low-util` | the GPU sat under `floor_pct` for `window_min` of phase `main` | raise `low_util.grace_min`, lower `floor_pct`, or set `low_util.enabled: false` for genuinely CPU-bound work |
 | job is `failed: sync` (or `...+sync`) | the final upload failed; the run itself may have been fine | check the tail of `gpuc logs <jobid>`; the usual cause is missing `secrets:` for the destination, or no `aws`/`hf` on the host (re-run bootstrap) |
-| job is `failed: no-outputs` | the `outputs` path was never written | check the job actually wrote to that path, relative to the workdir |
+| job is `failed: sync-preflight` | the upload the job would do at the end cannot work: no `aws`/`hf`, a missing secret, a bucket or repo that is not writable | the log names the exact command and error; fix the credential, the destination, or add `hf_create: true`, then re-submit |
+| job is `failed: ttl` | this host has an opt-in `--ttl-hours` cap and it ran out; the outputs were synced before the host went away | raise or drop the cap (`gpuc host set <host> --ttl-hours -1`), then `gpuc requeue <id>` |
+| job is `failed: no-outputs` | the `outputs` path was never written, or everything in it came with the checkout | check the job actually wrote to that path, relative to the workdir |
 | a host is out of disk, or `status` shows a `disk` line | finished jobs' workdirs (usually venvs) are still there | `gpuc clean --host <host> --all-finished`, and set `cleanup: always` on jobs you never need to inspect |
 | `clean --purge` skips everything as "not backed up" | the host has no `s3_prefix`, so nothing is mirrored and deleting a job dir would lose its log | `gpuc host set <host> --s3-prefix s3://bucket/gpuc/<host>` + `gpuc host bootstrap`, or accept the loss with `--force` |
 | `status` says a job's `outputs not uploaded` | the final upload of its `outputs:` failed, so the results exist only on that host | copy them off (`gpuc logs` shows the sync error), or `gpuc requeue <id>`; a purge will not remove it until they are confirmed |
@@ -530,4 +646,5 @@ what `gpuc clean --purge` requires before it deletes a job dir
 | `--retention-days` never deletes anything | the dispatcher only lives while a non-ephemeral host has work, and it never purges an unmirrored job | check `gpuc status` for `not backed up`, and remember the sweep runs on the next submit |
 | `uv sync` re-downloads torch on every job | uv's cache is on a different filesystem from gpuc home, so it copies instead of linking | `gpuc host bootstrap <host>` (it sets `UV_CACHE_DIR` for you), or pin one with `--cache-dir` |
 | `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc reconcile --once` |
+| `reconcile` reports `DEAD DISPATCHER` and terminates a pod | its dispatcher stopped beating (or ssh stopped answering) for `dead_dispatcher_minutes` with nothing running | expected: that pod could no longer stop itself. Raise `dead_dispatcher_minutes` if your hosts go quiet legitimately |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | `gpuc host bootstrap <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` what you still want ([runbook](#hosts-whose-home-directory-is-wiped-on-restart)) |

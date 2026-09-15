@@ -16,7 +16,7 @@ HEALTH_OK = {
     "gpus": ["GPU-a"],
     "ok": True,
     "checks": [
-        {"name": "driver", "ok": True, "detail": "nvidia driver 580"},
+        {"name": "driver", "ok": True, "detail": "nvidia driver 580", "value": "580.173.02"},
         {"name": "disk", "ok": True, "detail": "900 GB free"},
     ],
 }
@@ -47,7 +47,7 @@ class ScriptedHost:
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
 
     def _answer(self, command: str) -> tuple[int, str]:
-        if "curl -LsSf https://astral.sh/uv" in command:
+        if "astral.sh/uv" in command:
             self.uv_present = True
             return 0, ""
         if ".local/bin/uv" in command and "-x" in command:
@@ -79,6 +79,8 @@ class ScriptedHost:
             return 0, "4242\n"
         if command.startswith("printf %s"):
             return 0, "/home/u/.gpuc"
+        if "nvidia-smi --query-gpu=uuid" in command:
+            return 0, "GPU-a, NVIDIA A40, 46068\n"
         return 0, ""
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
@@ -93,7 +95,11 @@ class ScriptedHost:
         self.puts[remote_path] = (text, mode)
 
     def rsync(
-        self, local_root: Path, remote_path: str, files: Sequence[str] | None = None
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Sequence[str] | None = None,
+        excludes: Sequence[str] = (),
     ) -> CommandResult:
         self.events.append(f"rsync {remote_path}")
         self.rsyncs.append((local_root, remote_path, list(files) if files else None))
@@ -199,3 +205,37 @@ def test_the_dispatcher_is_started_with_the_home_tool_dirs_on_path(control_env: 
     bootstrap_host(entry(), transport=host, report=lambda _: None)
     command = next(e for e in host.events if "spawn_detached_dispatcher" in e)
     assert command.startswith('PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"')
+
+
+def test_a_mirroring_host_fails_bootstrap_when_the_aws_cli_will_not_install(
+    control_env: Path,
+) -> None:
+    class NoAws(ScriptedHost):
+        def _answer(self, command: str) -> tuple[int, str]:
+            if "awscli-exe-linux" in command:
+                return 1, "curl: (6) could not resolve host"
+            return super()._answer(command)
+
+    host = NoAws(aws_present=False)
+    with pytest.raises(BootstrapError) as caught:
+        bootstrap_host(entry(s3_prefix="s3://bucket/gpuc/h"), transport=host, report=lambda _: None)
+    assert "aws CLI could not be installed" in str(caught.value)
+    assert "--s3-prefix ''" in str(caught.value)
+
+
+def test_a_host_without_a_mirror_only_warns_about_a_missing_aws_cli(control_env: Path) -> None:
+    class NoAws(ScriptedHost):
+        def _answer(self, command: str) -> tuple[int, str]:
+            if "awscli-exe-linux" in command:
+                return 1, "curl: (6) could not resolve host"
+            return super()._answer(command)
+
+    _, result = bootstrap_host(entry(), transport=NoAws(aws_present=False), report=lambda _: None)
+    assert any("aws CLI install failed" in warning for warning in result.warnings)
+
+
+def test_bootstrap_records_what_the_cards_are(control_env: Path) -> None:
+    updated, _ = bootstrap_host(entry(), transport=ScriptedHost(), report=lambda _: None)
+    assert updated.gpu_info["GPU-a"].name == "NVIDIA A40"
+    assert updated.gpu_info["GPU-a"].vram_mib == 46068
+    assert updated.driver_version == "580.173.02"

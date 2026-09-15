@@ -3,7 +3,8 @@
 #   gpuc submit job.example.yaml --runpod --gpu A40 --max-price 0.60
 #
 # Only `command` is required. Paths in `outputs` are relative to the workdir,
-# which is an rsync of this repository's git-tracked files.
+# which is an rsync of this repository's tracked *and* untracked files (git's
+# .gitignore is obeyed; `--no-git` syncs a non-repo directory instead).
 
 name: lego-s4                                   # a label, not an identifier
 command: uv run python -m experiments.lego.train --k-max 6
@@ -23,12 +24,17 @@ secrets:
   - HF_TOKEN
   - WANDB_API_KEY
 
+# Before `main`, the runner proves it can write every destination below (a
+# small `.preflight` object) and fails the job as `sync-preflight` in seconds if
+# it cannot. Files already under an output path in the checkout are recorded
+# first and never uploaded as this job's results.
 outputs:
   - path: results                               # relative to the workdir
     s3: s3://my-bucket/lego/{job_id}/results
   - path: checkpoints
     hf: my-org/lego-checkpoints
     hf_path: "{job_id}"
+    hf_create: false                            # true: create the repo if it is missing
 
 sync_interval_s: 180                            # background upload cadence
 priority: 50                                    # 0 (first) .. 99 (last)

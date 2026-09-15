@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,7 +111,11 @@ class Transport(Protocol):
     def put_file(self, content: str | bytes, remote_path: str, mode: int = ...) -> None: ...
 
     def rsync(
-        self, local_root: Path, remote_path: str, files: Sequence[str] | None = ...
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Sequence[str] | None = ...,
+        excludes: Sequence[str] = ...,
     ) -> CommandResult: ...
 
     def tail(self, remote_path: str, lines: int = ..., follow: bool = ...) -> CommandResult: ...
@@ -183,9 +189,13 @@ class LocalTransport:
         os.replace(tmp, path)
 
     def rsync(
-        self, local_root: Path, remote_path: str, files: Sequence[str] | None = None
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Sequence[str] | None = None,
+        excludes: Sequence[str] = (),
     ) -> CommandResult:
-        argv = rsync_argv(local_root, remote_path, files, ssh_command=None)
+        argv = rsync_argv(local_root, remote_path, files, ssh_command=None, excludes=excludes)
         return _execute(self.host, argv, timeout=3600.0, check=True, stdin=_files_stdin(files))
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
@@ -284,11 +294,19 @@ class SshTransport:
         return shlex.join(["ssh", *self.ssh_options()])
 
     def rsync(
-        self, local_root: Path, remote_path: str, files: Sequence[str] | None = None
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Sequence[str] | None = None,
+        excludes: Sequence[str] = (),
     ) -> CommandResult:
         self._prepare()
         argv = rsync_argv(
-            local_root, f"{self.target}:{remote_path}", files, self.rsync_ssh_command()
+            local_root,
+            f"{self.target}:{remote_path}",
+            files,
+            self.rsync_ssh_command(),
+            excludes=excludes,
         )
         return _execute(self.host, argv, timeout=3600.0, check=True, stdin=_files_stdin(files))
 
@@ -306,10 +324,13 @@ def rsync_argv(
     destination: str,
     files: Sequence[str] | None,
     ssh_command: str | None,
+    excludes: Sequence[str] = (),
 ) -> list[str]:
     argv = ["rsync", "-a"]
     if ssh_command:
         argv += ["-e", ssh_command]
+    for pattern in excludes:
+        argv += ["--exclude", pattern]
     if files is None:
         argv += ["--delete-after"]
     else:
@@ -329,27 +350,96 @@ def _files_stdin(files: Sequence[str] | None) -> bytes | None:
     return "".join(f"{name}\0" for name in files).encode()
 
 
-def git_tracked_files(root: Path) -> list[str]:
-    # quotePath=false and -z: without both, a path with a space, a quote or a
-    # non-ASCII byte comes back C-quoted and rsync then looks for a file whose
-    # name contains literal backslashes.
-    argv = ["git", "-C", str(root), "-c", "core.quotePath=false", "ls-files", "-z"]
-    proc = subprocess.run(argv, capture_output=True, check=False)
-    stdout = proc.stdout.decode("utf-8", "replace")
-    if proc.returncode != 0:
+NO_GIT_EXCLUDES = (".venv", "__pycache__", ".git", "*.pyc", "node_modules", ".uv-cache")
+"""What `--no-git` leaves behind when there is no `.gitignore` to obey.
+
+Not a policy, just the handful of things that are always regenerable and always
+enormous; anything else in a non-repo directory is assumed to be wanted."""
+
+
+def _git(root: Path, args: list[str], env: dict[str, str] | None = None) -> tuple[int, bytes, str]:
+    argv = ["git", "-C", str(root), "-c", "core.quotePath=false", *args]
+    proc = subprocess.run(argv, capture_output=True, check=False, env=env)
+    return proc.returncode, proc.stdout, proc.stderr.decode("utf-8", "replace")
+
+
+def _git_or_raise(root: Path, args: list[str]) -> list[str]:
+    code, stdout, stderr = _git(root, args)
+    if code != 0:
+        argv = ["git", "-C", str(root), *args]
         raise TransportError(
-            CommandResult(
-                "local", argv, proc.returncode, stdout, proc.stderr.decode("utf-8", "replace")
-            )
+            CommandResult("local", argv, code, stdout.decode("utf-8", "replace"), stderr)
         )
-    return [name for name in stdout.split("\0") if name]
+    return [name for name in stdout.decode("utf-8", "replace").split("\0") if name]
+
+
+def git_tracked_files(root: Path) -> list[str]:
+    """Everything worth syncing: tracked files *and* untracked ones git would keep.
+
+    Tracked-only was the old rule, and it silently dropped the file someone had
+    just written and not yet `git add`ed -- which on a fresh experiment is the
+    whole experiment. `--exclude-standard` keeps .gitignore honoured, so venvs
+    and caches still stay home. quotePath=false and -z: without both, a path
+    with a space or a non-ASCII byte comes back C-quoted and rsync then looks
+    for a file whose name contains literal backslashes.
+
+    A file that is in the index but deleted on disk is dropped rather than
+    named: rsync would otherwise be asked for a file that is not there.
+    """
+    names = _git_or_raise(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+    # lexists, not exists: a dangling symlink is a real entry rsync can copy.
+    return [name for name in dict.fromkeys(names) if os.path.lexists(root / name)]
+
+
+@dataclass
+class GitSummary:
+    """What `submit` prints, so the sync is never a surprise."""
+
+    files: list[str]
+    modified: int
+    untracked: int
+
+    def render(self) -> str:
+        return (
+            f"syncing {len(self.files)} files ({self.modified} modified, "
+            f"{self.untracked} untracked, ignoring .gitignore'd)"
+        )
+
+
+def git_summary(root: Path) -> GitSummary:
+    files = git_tracked_files(root)
+    untracked = set(_git_or_raise(root, ["ls-files", "-z", "--others", "--exclude-standard"]))
+    code, stdout, _ = _git(root, ["diff", "-z", "--name-only", "HEAD"])
+    changed = (
+        {n for n in stdout.decode("utf-8", "replace").split("\0") if n} if code == 0 else set()
+    )
+    known = set(files)
+    return GitSummary(
+        files=files,
+        modified=len(changed & known),
+        untracked=len(untracked & known),
+    )
 
 
 def uncommitted_patch(root: Path) -> str:
-    proc = subprocess.run(
-        ["git", "-C", str(root), "diff", "HEAD"], capture_output=True, text=True, check=False
-    )
-    return proc.stdout if proc.returncode == 0 else ""
+    """`git diff HEAD` including untracked files, via a throwaway index.
+
+    A patch that omits the files the run's results depend on is worse than no
+    patch: `git add -N` in a copy of the index makes new files show up as
+    additions without touching the real index or the user's staging.
+    """
+    code, stdout, _ = _git(root, ["rev-parse", "--absolute-git-dir"])
+    if code != 0:
+        return ""
+    real_index = Path(stdout.decode().strip()) / "index"
+    with tempfile.TemporaryDirectory(prefix="gpuc-index-") as tmp:
+        index = Path(tmp) / "index"
+        if real_index.exists():
+            shutil.copy2(real_index, index)
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        _git(root, ["add", "-N", "--", "."], env)
+        code, stdout, _ = _git(root, ["diff", "HEAD"], env)
+    return stdout.decode("utf-8", "replace") if code == 0 else ""
 
 
 def make_transport(

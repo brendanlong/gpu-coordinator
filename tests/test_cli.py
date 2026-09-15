@@ -8,8 +8,15 @@ import pytest
 
 from gpuc.control import reconcile as reconcile_mod
 from gpuc.control.clean import purge_host
-from gpuc.control.cli import main
-from gpuc.control.config import HostEntry, Settings, config_file, load_registry, load_settings
+from gpuc.control.cli import build_parser, main
+from gpuc.control.config import (
+    HostEntry,
+    Settings,
+    config_file,
+    load_registry,
+    load_settings,
+    registry_transaction,
+)
 from gpuc.control.providers.base import Constraints
 from gpuc.control.remote import HostSession
 from gpuc.control.submit import SubmitResult
@@ -491,3 +498,29 @@ def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path)
         for job_id in ("lost", "fine", "missing")
     ]
     assert _outputs_lost_ids(S3Index("bucket", client), entries) == {"lost"}
+
+
+def test_submit_and_requeue_both_take_no_git() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["submit", "job.yaml", "--host", "h", "--no-git"]).no_git
+    assert parser.parse_args(["requeue", "id", "--host", "h", "--no-git"]).no_git
+    assert not parser.parse_args(["submit", "job.yaml", "--host", "h"]).no_git
+
+
+def test_ttl_is_unset_unless_asked_for() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["host", "add", "h"]).ttl_hours is None
+    assert parser.parse_args(["submit", "j", "--runpod", "--gpu", "A40"]).ttl_hours is None
+    assert parser.parse_args(["host", "add", "h", "--ttl-hours", "6"]).ttl_hours == 6.0
+
+
+def test_a_negative_ttl_clears_the_cap(control_env: Path) -> None:
+    with registry_transaction() as registry:
+        registry.put(HostEntry(name="h", gpus=[], ttl_hours=6.0))
+    assert main(["host", "set", "h", "--ttl-hours", "-1"]) == 0
+    assert load_registry().hosts["h"].ttl_hours is None
+
+
+def test_status_filters_have_defaults() -> None:
+    args = build_parser().parse_args(["status"])
+    assert (args.recent, args.since) == (5, None)

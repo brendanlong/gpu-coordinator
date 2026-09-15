@@ -23,7 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from gpuc.host import jobs, paths
+from gpuc.host import baseline, jobs, paths
 from gpuc.host.jobs import JobSpec, Output
 
 MIN_AGE_S = 10.0
@@ -159,6 +159,7 @@ def sync_dir_to_s3(
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
+    exclude: Sequence[str] = (),
 ) -> None:
     aws = aws_binary(env)
     if aws is None:
@@ -169,6 +170,7 @@ def sync_dir_to_s3(
     if not local.exists():
         raise MissingOutput(f"output path does not exist: {local}")
     argv = [aws, "s3", "sync", str(local), dest.rstrip("/"), "--only-show-errors"]
+    argv += _named_excludes("--exclude", exclude)
     argv += exclude_args("--exclude", local, min_age_s)
     result = runner(argv, timeout, env)
     if result.returncode != 0:
@@ -202,6 +204,7 @@ def upload_dir_to_hf(
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
+    exclude: Sequence[str] = (),
 ) -> None:
     hf = hf_binary(env)
     if hf is None:
@@ -212,10 +215,18 @@ def upload_dir_to_hf(
     if not local.exists():
         raise MissingOutput(f"output path does not exist: {local}")
     argv = [hf, "upload", repo, str(local), path_in_repo]
+    argv += _named_excludes("--exclude", exclude)
     argv += exclude_args("--exclude", local, min_age_s)
     result = runner(argv, timeout, env)
     if result.returncode != 0:
         _fail(result)
+
+
+def _named_excludes(flag: str, names: Sequence[str]) -> list[str]:
+    args: list[str] = []
+    for name in names:
+        args += [flag, name]
+    return args
 
 
 def resolve_local(output: Output, workdir: Path, job_id: str) -> Path:
@@ -231,8 +242,18 @@ def sync_output(
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
+    baseline_entries: baseline.Entries | None = None,
 ) -> None:
     local = resolve_local(output, workdir, job_id)
+    entries = baseline_entries or {}
+    # Files that were in the checkout and have not been touched are not this
+    # job's output; uploading them would publish the last run's results under
+    # this run's name.
+    exclude = () if baseline.too_many(entries) else tuple(baseline.unchanged(local, entries))
+    if entries and local.exists() and not baseline.has_new_content(local, entries):
+        raise MissingOutput(
+            f"nothing new under {local}: every file there was already in the checkout"
+        )
     if output.s3:
         sync_dir_to_s3(
             local,
@@ -241,6 +262,7 @@ def sync_output(
             runner=runner,
             timeout=timeout,
             env=env,
+            exclude=exclude,
         )
     if output.hf:
         upload_dir_to_hf(
@@ -251,6 +273,7 @@ def sync_output(
             runner=runner,
             timeout=timeout,
             env=env,
+            exclude=exclude,
         )
 
 
@@ -263,6 +286,7 @@ def sync_outputs(
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
+    baseline_map: baseline.Baseline | None = None,
 ) -> None:
     errors: list[SyncError] = []
     for output in outputs:
@@ -275,6 +299,7 @@ def sync_outputs(
                 runner=runner,
                 timeout=timeout,
                 env=env,
+                baseline_entries=(baseline_map or {}).get(baseline.output_key(output, job_id)),
             )
         except SyncError as exc:
             errors.append(exc)
@@ -401,6 +426,7 @@ class SyncLoop:
                 runner=self._runner,
                 timeout=timeout,
                 env=self._env,
+                baseline_map=baseline.read(self._spec.job_id),
             )
             # Only when there was something to upload: a spec with no
             # `outputs:` has nothing to confirm, and a timestamp there would

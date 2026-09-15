@@ -99,8 +99,22 @@ def outputs_dir(job_id: str) -> Path:
     return job_dir(job_id) / "outputs"
 
 
+def outputs_baseline_file(job_id: str) -> Path:
+    """What was already under the job's `outputs:` paths when it started."""
+    return job_dir(job_id) / "outputs_baseline.json"
+
+
 def cancel_file(job_id: str) -> Path:
     return job_dir(job_id) / "cancel"
+
+
+def kill_file(job_id: str) -> Path:
+    """A kill request with a reason in it, written by the dispatcher.
+
+    Separate from `cancel`: a TTL or an operator stop must end as
+    `failed: ttl`, not as a cancellation nobody asked for, and the runner is
+    still the process that does the killing and the final sync."""
+    return job_dir(job_id) / "kill"
 
 
 def lock_file() -> Path:

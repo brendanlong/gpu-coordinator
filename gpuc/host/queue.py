@@ -103,6 +103,18 @@ def is_cancelled(job_id: str) -> bool:
     return paths.cancel_file(job_id).exists()
 
 
+def request_kill(job_id: str, reason: str) -> None:
+    """Ask the runner to stop this job and record `reason` as why."""
+    jobs.atomic_write_text(paths.kill_file(job_id), f"{reason}\n")
+
+
+def kill_reason(job_id: str) -> str | None:
+    try:
+        return paths.kill_file(job_id).read_text().strip() or None
+    except OSError:
+        return None
+
+
 def running_job_ids() -> list[str]:
     return [j for j in jobs.list_job_ids() if _status(j) == "running"]
 

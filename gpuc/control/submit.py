@@ -29,7 +29,14 @@ from gpuc.control.s3index import (
     S3IndexError,
     default_s3_prefix,
 )
-from gpuc.control.transport import Transport, TransportError, git_tracked_files, uncommitted_patch
+from gpuc.control.transport import (
+    NO_GIT_EXCLUDES,
+    Transport,
+    TransportError,
+    git_summary,
+    git_tracked_files,
+    uncommitted_patch,
+)
 from gpuc.host import jobs
 from gpuc.host.jobs import JobSpec
 
@@ -47,6 +54,8 @@ class OutputModel(BaseModel):
     s3: str | None = None
     hf: str | None = None
     hf_path: str | None = None
+    hf_create: bool = False
+    """Let the sync preflight create this Hugging Face repo if it is missing."""
 
 
 class LowUtilModel(BaseModel):
@@ -164,6 +173,8 @@ def precheck_local(
     *,
     gpu_count: int | None = None,
     environ: Mapping[str, str] | None = None,
+    use_git: bool = True,
+    ttl_hours: float | None = None,
 ) -> None:
     """Everything a submit can fail on without a host, checked before we buy one.
 
@@ -176,13 +187,28 @@ def precheck_local(
             f"the spec asks for {model.gpus} GPU(s) but this request would create a pod with "
             f"{gpu_count}.\nRaise --gpu-count, or lower `gpus:` in the spec."
         )
+    if (
+        ttl_hours is not None
+        and model.max_runtime_min is not None
+        and model.max_runtime_min > ttl_hours * 60.0
+    ):
+        raise SubmitError(
+            f"the job's max_runtime_min ({model.max_runtime_min:g} min) is longer than the "
+            f"pod's --ttl-hours ({ttl_hours:g} h = {ttl_hours * 60.0:g} min), so the TTL would "
+            f"kill the job before it could finish.\n"
+            f"Raise --ttl-hours, drop it (the default is no TTL at all), or lower "
+            f"max_runtime_min."
+        )
     gather_secrets(model.secrets, environ)
+    if not use_git:
+        return
     try:
         git_tracked_files(workdir)
     except TransportError as exc:
         raise SubmitError(
             f"{workdir} is not a git repository, so there is nothing to sync: {exc}\n"
-            f"Run `git init && git add -A` there, or submit from your project directory."
+            f"Run `git init && git add -A` there, submit from your project directory, or pass "
+            f"--no-git to rsync the directory as it is."
         ) from exc
 
 
@@ -218,18 +244,52 @@ class SubmitResult:
         return "\n".join(lines)
 
 
-def push_workdir(session: HostSession, job_id: str, workdir: Path) -> int:
+def preexisting_output_warnings(spec: JobSpec, workdir: Path) -> list[str]:
+    """Say so at submit time when an `outputs:` path is not empty in the checkout.
+
+    Those files are synced to the host with the code and are not this job's
+    results; the runner's baseline keeps them out of the upload, but the job
+    that wanted them uploaded should hear about it here rather than wonder why
+    nothing arrived.
+    """
+    warnings: list[str] = []
+    for output in spec.outputs:
+        root = workdir / output.path.format(job_id=spec.job_id)
+        if not root.exists():
+            continue
+        count = sum(1 for path in root.rglob("*") if path.is_file()) if root.is_dir() else 1
+        if count:
+            warnings.append(
+                f"{count} pre-existing file(s) under {output.path}/ are in the checkout and will "
+                f"not be uploaded as this job's outputs; use a job-specific output dir "
+                f"(for example {output.path}/{{job_id}}/) if you meant them to be"
+            )
+    return warnings
+
+
+def push_workdir(
+    session: HostSession,
+    job_id: str,
+    workdir: Path,
+    *,
+    use_git: bool = True,
+    report: Reporter = print,
+) -> int:
+    remote = f"{session.job_dir(job_id)}/workdir"
+    session.transport.run(f'mkdir -p "{remote}"', check=True)
+    if not use_git:
+        return _push_without_git(session, job_id, workdir, remote, report)
     try:
-        files = git_tracked_files(workdir)
+        summary = git_summary(workdir)
     except TransportError as exc:
         raise SubmitError(
             f"{workdir} is not a git repository, so there is nothing to sync: {exc}\n"
-            f"Run `git init && git add -A` there, or submit from your project directory."
+            f"Run `git init && git add -A` there, submit from your project directory, or pass "
+            f"--no-git to rsync the directory as it is."
         ) from exc
-    remote = f"{session.job_dir(job_id)}/workdir"
-    session.transport.run(f'mkdir -p "{remote}"', check=True)
-    if files:
-        session.transport.rsync(workdir, remote, files)
+    report(summary.render())
+    if summary.files:
+        session.transport.rsync(workdir, remote, summary.files)
     patch = uncommitted_patch(workdir)
     if patch:
         session.transport.put_file(patch, f"{session.job_dir(job_id)}/uncommitted.patch", 0o644)
@@ -238,7 +298,30 @@ def push_workdir(session: HostSession, job_id: str, workdir: Path) -> int:
         f"{session.job_dir(job_id)}/source.json",
         0o644,
     )
-    return len(files)
+    return len(summary.files)
+
+
+def _push_without_git(
+    session: HostSession, job_id: str, workdir: Path, remote: str, report: Reporter
+) -> int:
+    """`--no-git`: rsync the directory, minus the things that are always junk.
+
+    Loud, because nothing here can tell a 40 GB dataset from a checkpoint
+    somebody wants, and `gpuc requeue` cannot rebuild this workdir from git.
+    """
+    report(
+        f"WARNING: --no-git, so all of {workdir} is being synced except "
+        f"{', '.join(NO_GIT_EXCLUDES)}. Nothing is read from .gitignore, and `gpuc requeue` "
+        f"cannot re-create this workdir from a commit."
+    )
+    session.transport.rsync(workdir, remote, None, NO_GIT_EXCLUDES)
+    source = {"submitted_from": str(workdir), "submitted_at": utc_now(), "git": None}
+    session.transport.put_file(
+        json.dumps(source, indent=2) + "\n",
+        f"{session.job_dir(job_id)}/source.json",
+        0o644,
+    )
+    return sum(1 for path in workdir.rglob("*") if path.is_file())
 
 
 def enqueue_spec(session: HostSession, spec: JobSpec) -> dict[str, Any]:
@@ -265,6 +348,7 @@ def submit_spec(
     job_id: str | None = None,
     local_index: LocalIndex | None = None,
     s3: S3Index | None = None,
+    use_git: bool = True,
     report: Reporter = print,
 ) -> SubmitResult:
     settings = settings or Settings()
@@ -279,9 +363,13 @@ def submit_spec(
             f"Submit to a bigger host, or lower `gpus:` in the spec."
         )
 
+    for warning in preexisting_output_warnings(spec, workdir):
+        report(f"WARNING: {warning}")
+        notes.append(warning)
+
     session = session or open_session(entry, settings, transport)
-    files = push_workdir(session, spec.job_id, workdir)
-    report(f"synced {files} git-tracked files to {session.job_dir(spec.job_id)}/workdir")
+    files = push_workdir(session, spec.job_id, workdir, use_git=use_git, report=report)
+    report(f"synced to {session.job_dir(spec.job_id)}/workdir")
 
     if secrets_body:
         session.transport.put_file(secrets_body, f"{session.home}/secrets/{spec.job_id}.env", 0o600)

@@ -16,6 +16,7 @@ from gpuc.control.submit import (
     SubmitError,
     gather_secrets,
     load_document,
+    precheck_local,
     submit_file,
     submit_spec,
     validate,
@@ -33,6 +34,7 @@ class FakeHost:
     commands: list[str] = field(default_factory=list)
     puts: dict[str, tuple[str, int]] = field(default_factory=dict)
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
+    excludes: list[str] = field(default_factory=list)
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
         self.commands.append(command)
@@ -46,9 +48,14 @@ class FakeHost:
         self.puts[remote_path] = (text, mode)
 
     def rsync(
-        self, local_root: Path, remote_path: str, files: Sequence[str] | None = None
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Sequence[str] | None = None,
+        excludes: Sequence[str] = (),
     ) -> CommandResult:
         self.rsyncs.append((local_root, remote_path, list(files) if files else None))
+        self.excludes = list(excludes)
         return CommandResult(self.host, ["rsync"], 0, "", "")
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
@@ -65,7 +72,11 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     (root / "src").mkdir(parents=True)
     (root / "src" / "train.py").write_text("print('hi')\n")
-    (root / "big.bin").write_text("not tracked\n")
+    (root / "new.py").write_text("just written, not added\n")
+    (root / ".gitignore").write_text(".venv/\nbig.bin\n")
+    (root / "big.bin").write_text("ignored junk\n")
+    (root / ".venv").mkdir()
+    (root / ".venv" / "huge").write_text("x" * 100)
     for argv in (
         ["git", "init", "-q"],
         ["git", "config", "user.email", "t@example.com"],
@@ -163,10 +174,39 @@ def test_submit_expands_job_id_in_output_destinations(control_env: Path, repo: P
     assert "{job_id}" not in json.dumps(spec["outputs"])
 
 
-def test_submit_ships_only_git_tracked_files_plus_the_patch(control_env: Path, repo: Path) -> None:
+def test_submit_ships_tracked_and_untracked_files_but_not_ignored_ones(
+    control_env: Path, repo: Path
+) -> None:
     (repo / "src" / "train.py").write_text("print('changed')\n")
     host = FakeHost()
+    lines: list[str] = []
     result = submit_spec(
+        HostEntry(name="spar", gpus=["GPU-a"]),
+        validate(job_document()),
+        Settings(),
+        workdir=repo,
+        session=session(host),
+        environ={},
+        report=lines.append,
+    )
+    root, dest, files = host.rsyncs[0]
+    assert root == repo
+    assert dest == f"{REMOTE_HOME}/jobs/{result.job_id}/workdir"
+    assert sorted(files or []) == [".gitignore", "new.py", "src/train.py"]
+    assert any(
+        line == "syncing 3 files (1 modified, 2 untracked, ignoring .gitignore'd)" for line in lines
+    )
+    patch, _ = host.puts[f"{REMOTE_HOME}/jobs/{result.job_id}/uncommitted.patch"]
+    assert "print('changed')" in patch
+    assert "just written, not added" in patch
+    source = json.loads(host.puts[f"{REMOTE_HOME}/jobs/{result.job_id}/source.json"][0])
+    assert len(source["commit"]) == 40
+
+
+def test_a_file_deleted_but_still_in_the_index_is_not_sent(control_env: Path, repo: Path) -> None:
+    (repo / "src" / "train.py").unlink()
+    host = FakeHost()
+    submit_spec(
         HostEntry(name="spar", gpus=["GPU-a"]),
         validate(job_document()),
         Settings(),
@@ -175,14 +215,50 @@ def test_submit_ships_only_git_tracked_files_plus_the_patch(control_env: Path, r
         environ={},
         report=lambda _: None,
     )
+    _, _, files = host.rsyncs[0]
+    assert "src/train.py" not in (files or [])
+
+
+def test_no_git_syncs_everything_except_the_default_excludes(
+    control_env: Path, tmp_path: Path
+) -> None:
+    plain = tmp_path / "not-a-repo"
+    (plain / "data").mkdir(parents=True)
+    (plain / "data" / "a.txt").write_text("hello\n")
+    host = FakeHost()
+    lines: list[str] = []
+    result = submit_spec(
+        HostEntry(name="spar", gpus=["GPU-a"]),
+        validate(job_document()),
+        Settings(),
+        workdir=plain,
+        session=session(host),
+        environ={},
+        use_git=False,
+        report=lines.append,
+    )
     root, dest, files = host.rsyncs[0]
-    assert root == repo
-    assert dest == f"{REMOTE_HOME}/jobs/{result.job_id}/workdir"
-    assert files == ["src/train.py"]
-    patch, _ = host.puts[f"{REMOTE_HOME}/jobs/{result.job_id}/uncommitted.patch"]
-    assert "print('changed')" in patch
-    source = json.loads(host.puts[f"{REMOTE_HOME}/jobs/{result.job_id}/source.json"][0])
-    assert len(source["commit"]) == 40
+    assert (root, dest) == (plain, f"{REMOTE_HOME}/jobs/{result.job_id}/workdir")
+    assert files is None
+    assert host.excludes == [".venv", "__pycache__", ".git", "*.pyc", "node_modules", ".uv-cache"]
+    assert any("WARNING: --no-git" in line for line in lines)
+    assert f"{REMOTE_HOME}/jobs/{result.job_id}/uncommitted.patch" not in host.puts
+
+
+def test_a_non_repo_without_no_git_says_how_to_fix_it(control_env: Path, tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with pytest.raises(SubmitError) as caught:
+        submit_spec(
+            HostEntry(name="spar", gpus=["GPU-a"]),
+            validate(job_document()),
+            Settings(),
+            workdir=plain,
+            session=session(FakeHost()),
+            environ={},
+            report=lambda _: None,
+        )
+    assert "--no-git" in str(caught.value)
 
 
 def test_submit_delivers_secrets_0600_and_never_on_argv(control_env: Path, repo: Path) -> None:
@@ -288,3 +364,45 @@ def test_submit_file_reads_yaml(control_env: Path, repo: Path) -> None:
     )
     assert result.host == "spar"
     assert result.attempt == 1
+
+
+def test_a_job_longer_than_the_pods_ttl_is_refused_before_anything_is_created() -> None:
+    model = validate(job_document(max_runtime_min=180))
+    with pytest.raises(SubmitError) as caught:
+        precheck_local(model, Path.cwd(), ttl_hours=1.0)
+    assert "max_runtime_min" in str(caught.value)
+    assert "--ttl-hours" in str(caught.value)
+
+
+def test_without_a_ttl_a_long_job_is_fine(repo: Path) -> None:
+    precheck_local(validate(job_document(max_runtime_min=6000)), repo, ttl_hours=None)
+
+
+def test_a_job_that_fits_its_ttl_is_fine(repo: Path) -> None:
+    precheck_local(validate(job_document(max_runtime_min=30)), repo, ttl_hours=1.0)
+
+
+def test_submit_warns_about_files_already_under_an_output_path(
+    control_env: Path, repo: Path
+) -> None:
+    (repo / "results").mkdir()
+    (repo / "results" / "report-elephant.md").write_text("from the last run\n")
+    lines: list[str] = []
+    result = submit_spec(
+        HostEntry(name="spar", gpus=["GPU-a"]),
+        validate(job_document(outputs=[{"path": "results", "s3": "s3://b/{job_id}"}])),
+        Settings(),
+        workdir=repo,
+        session=session(FakeHost()),
+        environ={},
+        report=lines.append,
+    )
+    assert any("1 pre-existing file(s) under results/" in line for line in lines)
+    assert any("pre-existing" in note for note in result.notes)
+
+
+def test_hf_create_survives_validation_into_the_spec() -> None:
+    model = validate(job_document(outputs=[{"path": "ckpt", "hf": "org/repo", "hf_create": True}]))
+    spec = model.to_spec("20260915-000000-aaaaaa")
+    assert spec.outputs[0].hf_create is True
+    assert validate(job_document(outputs=[{"path": "ckpt", "hf": "org/repo"}]))

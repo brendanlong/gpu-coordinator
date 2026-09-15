@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
 
-from gpuc.host import cleanup, gpus, jobs, paths, queue, sync
+from gpuc._version import user_agent
+from gpuc.host import baseline, cleanup, gpus, jobs, paths, preflight, queue, scope, sync
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.jobs import JobSpec
 
@@ -191,6 +192,9 @@ class RunnerDeps:
     kill_grace_s: float = KILL_GRACE_S
     preflight: bool = True
     preflight_command: Callable[[], str] = preflight_command
+    sync_preflight: bool = True
+    isolation: str | None = None
+    """`cgroup`, `pgid`, or None to ask `scope.isolation()` at job start."""
 
     def util_sampler(self) -> UtilSampler:
         if self.sampler is not None:
@@ -243,6 +247,9 @@ def build_env(
     env["GPUC_JOB_DIR"] = str(paths.job_dir(spec.job_id))
     env["GPUC_OUTPUTS"] = str(paths.outputs_dir(spec.job_id))
     env["GPUC_EXPECTED_GPUS"] = str(len(assigned))
+    # `hf` puts this in its own User-Agent, so a Hub-side question about our
+    # traffic has something to point at. A job may still override it.
+    env.setdefault("HF_HUB_USER_AGENT_ORIGIN", user_agent())
     return env
 
 
@@ -256,7 +263,9 @@ class JobRunner:
         self.config = jobs.read_config()
         self.kill_reason: str | None = None
         self.env: dict[str, str] = {}
+        self.isolation: str = self.deps.isolation or scope.isolation()
         self._current: subprocess.Popen[bytes] | None = None
+        self._current_unit: str | None = None
         self._terminating = False
 
     # -- logging ---------------------------------------------------------
@@ -265,9 +274,13 @@ class JobRunner:
         log.flush()
 
     # -- phases ----------------------------------------------------------
-    def _spawn(self, command: str, env: dict[str, str], log: IO[bytes]) -> subprocess.Popen[bytes]:
+    def _spawn(
+        self, phase: str, command: str, env: dict[str, str], log: IO[bytes]
+    ) -> subprocess.Popen[bytes]:
+        unit = scope.unit_name(self.job_id, phase) if self.isolation == scope.CGROUP else None
+        self._current_unit = unit
         return subprocess.Popen(
-            ["bash", "-eo", "pipefail", "-c", command],
+            scope.phase_argv(command, unit),
             cwd=str(paths.workdir(self.job_id)),
             env=env,
             stdout=log,
@@ -281,7 +294,14 @@ class JobRunner:
     ) -> int:
         deps = self.deps
         pgid = proc.pid
-        jobs.update_state(self.job_id, phase=phase, pid=proc.pid, pgid=pgid)
+        jobs.update_state(
+            self.job_id,
+            phase=phase,
+            pid=proc.pid,
+            pgid=pgid,
+            isolation=self.isolation,
+            cgroup_unit=self._current_unit,
+        )
         sampler = deps.util_sampler()
         low_util = self.spec.low_util
         record_util = phase == "main" and bool(self.assigned)
@@ -302,6 +322,10 @@ class JobRunner:
             t = deps.now()
             if queue.is_cancelled(self.job_id):
                 self._kill(proc, "cancelled", log)
+                break
+            requested = queue.kill_reason(self.job_id)
+            if requested:
+                self._kill(proc, requested, log)
                 break
             if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
                 self._kill(proc, "timeout", log)
@@ -337,7 +361,15 @@ class JobRunner:
 
     def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
         self.kill_reason = reason
-        self._log(log, f"killing process group {proc.pid}: {reason}")
+        unit = self._current_unit
+        if unit is not None:
+            self._log(log, f"stopping scope {unit}: {reason}")
+            if not scope.stop_unit(unit):
+                self._log(log, f"systemctl --user stop {unit} failed; falling back to the group")
+        else:
+            self._log(log, f"killing process group {proc.pid}: {reason}")
+        # Always, scope or not: the group kill is the fallback, and against a
+        # cgroup that is already empty it costs one ProcessLookupError.
         kill_process_group(
             proc.pid,
             grace_s=self.deps.kill_grace_s,
@@ -350,12 +382,14 @@ class JobRunner:
         self, phase: str, command: str, env: dict[str, str], log: IO[bytes], job_start: float
     ) -> int:
         self._log(log, f"phase={phase}: {command}")
-        proc = self._spawn(command, env, log)
+        proc = self._spawn(phase, command, env, log)
         # Left set if _monitor raises: a terminating runner needs the handle to
-        # the group it must take down.
+        # the group (and the scope) it must take down.
         self._current = proc
         code = self._monitor(proc, phase, log, job_start)
         self._current = None
+        jobs.update_state(self.job_id, cgroup_unit=None)
+        self._current_unit = None
         self._log(log, f"phase={phase} exited {code}")
         return code
 
@@ -418,6 +452,7 @@ class JobRunner:
             status="running",
             phase="setup",
             started_at=self.state.started_at or jobs.utc_now(),
+            isolation=self.isolation,
             runner_pid=os.getpid(),
             runner_boot_id=boot_id(),
             runner_starttime=starttime(os.getpid()),
@@ -433,6 +468,8 @@ class JobRunner:
             f"job {self.job_id} on {self.config.host} "
             f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES'] or '(none)'}",
         )
+
+        self._capture_output_baseline(log)
 
         cancelled = self._cancelled_before("setup", sync_loop, log)
         if cancelled is not None:
@@ -451,6 +488,12 @@ class JobRunner:
             if code != 0 or self.kill_reason:
                 return self._finalize(code, *self._classify(code, "gpu-preflight"), sync_loop, log)
 
+        failure = self._sync_preflight(log)
+        if failure is not None:
+            return self._finalize(
+                1, "failed", "sync-preflight", sync_loop, log, skip_output_sync=True
+            )
+
         cancelled = self._cancelled_before("main", sync_loop, log)
         if cancelled is not None:
             return cancelled
@@ -459,6 +502,48 @@ class JobRunner:
         code = self._run_phase("main", self.spec.command, env, log, job_start)
         status, reason = self._classify(code, None)
         return self._finalize(code, status, reason, sync_loop, log)
+
+    def _capture_output_baseline(self, log: IO[bytes]) -> None:
+        """Record what the checkout already had where the outputs go.
+
+        Before `setup`, because a setup step may legitimately write into an
+        output path and that *is* this job's doing.
+        """
+        if not self.spec.outputs:
+            return
+        found = baseline.capture(self.spec, paths.workdir(self.job_id), self.job_id)
+        for line in baseline.describe(found):
+            self._log(log, f"outputs baseline: {line}")
+        for path, entries in sorted(found.items()):
+            if baseline.too_many(entries):
+                self._log(
+                    log,
+                    f"WARNING: {path} already holds more than {baseline.MAX_TRACKED} files, too "
+                    f"many to exclude one by one, so pre-existing files there WILL be uploaded. "
+                    f"Point `outputs:` at a directory this job creates.",
+                )
+
+    def _sync_preflight(self, log: IO[bytes]) -> str | None:
+        """Prove the uploads work before the job spends hours producing outputs.
+
+        The alternative is finding out at the final sync, when the only copy of
+        a checkpoint is on a host that may be about to go away.
+        """
+        if not self.deps.sync_preflight:
+            return None
+        jobs.update_state(self.job_id, phase="preflight")
+        try:
+            destinations = preflight.run(
+                self.spec,
+                self.config,
+                runner=self.deps.command_runner,
+                env=self.env or None,
+            )
+        except preflight.PreflightFailed as exc:
+            self._log(log, f"sync preflight FAILED: {exc}")
+            return str(exc)
+        self._log(log, preflight.describe(destinations))
+        return None
 
     def _cancelled_before(self, phase: str, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int | None:
         """A job cancelled during the launch window never starts a phase."""
@@ -497,18 +582,25 @@ class JobRunner:
         reason: str | None,
         sync_loop: sync.SyncLoop,
         log: IO[bytes],
+        skip_output_sync: bool = False,
     ) -> int:
         jobs.update_state(self.job_id, phase="sync")
-        try:
-            sync_loop.final()
-        except sync.MissingOutput as exc:
-            self._log(log, f"final sync found no outputs: {exc}")
-            status, reason, exit_code = self._blame(status, reason, exit_code, "no-outputs")
-        except sync.SyncError as exc:
-            self._log(log, f"final sync FAILED: {exc}")
-            status, reason, exit_code = self._blame(status, reason, exit_code, "sync")
-        if sync_loop.last_error and status == "succeeded":
-            self._log(log, f"periodic sync had errors: {sync_loop.last_error}")
+        if skip_output_sync:
+            # The preflight already proved these uploads cannot work, and the
+            # job never ran, so a second failure would only add a confusing
+            # `+no-outputs` to a reason that is already exact.
+            self._log(log, "skipping the final output sync after a failed sync preflight")
+        else:
+            try:
+                sync_loop.final()
+            except sync.MissingOutput as exc:
+                self._log(log, f"final sync found no outputs: {exc}")
+                status, reason, exit_code = self._blame(status, reason, exit_code, "no-outputs")
+            except sync.SyncError as exc:
+                self._log(log, f"final sync FAILED: {exc}")
+                status, reason, exit_code = self._blame(status, reason, exit_code, "sync")
+            if sync_loop.last_error and status == "succeeded":
+                self._log(log, f"periodic sync had errors: {sync_loop.last_error}")
 
         jobs.update_state(
             self.job_id,
@@ -519,6 +611,7 @@ class JobRunner:
             phase=None,
             pid=None,
             pgid=None,
+            cgroup_unit=None,
             outputs_synced_at=sync_loop.outputs_synced_at,
         )
         self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")

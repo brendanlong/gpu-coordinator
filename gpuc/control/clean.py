@@ -15,7 +15,7 @@ from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, load_settings, transport_for
 from gpuc.control.remote import HostSession, open_session
-from gpuc.control.s3index import S3Index, job_log_uri, split_uri
+from gpuc.control.s3index import S3Index, job_log_uri, make_s3_client, split_uri
 from gpuc.control.transport import Transport
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS, human_bytes
 
@@ -238,9 +238,7 @@ def _s3_client(settings: Settings) -> Any:
     index = S3Index.from_settings(settings)
     if index is not None:
         return index.client
-    import boto3
-
-    return boto3.client("s3")
+    return make_s3_client()
 
 
 def verify_mirror(

@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import gpuc
+from gpuc._version import user_agent
 from gpuc.control.config import HostEntry, Settings, transport_for, utc_now
+from gpuc.control.gpuinfo import discover, summarize
 from gpuc.control.remote import HostSession, parse_last_json, resolve_home
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 
@@ -126,6 +128,10 @@ def ensure_persistent_root(transport: Transport, entry: HostEntry, report: Repor
     report(f"persistent root: {_first_line(result.stdout)}")
 
 
+def uv_installer_command() -> str:
+    return f"curl -LsSf -A {shlex.quote(user_agent())} {UV_INSTALLER} | sh"
+
+
 def find_uv(transport: Transport) -> str | None:
     result = transport.run(
         'if [ -x "$HOME/.local/bin/uv" ]; then echo "$HOME/.local/bin/uv"; '
@@ -136,11 +142,11 @@ def find_uv(transport: Transport) -> str | None:
 
 
 def install_uv(transport: Transport) -> str:
-    transport.run(f"curl -LsSf {UV_INSTALLER} | sh", timeout=INSTALL_TIMEOUT_S, check=False)
+    transport.run(uv_installer_command(), timeout=INSTALL_TIMEOUT_S, check=False)
     uv = find_uv(transport)
     if uv is None:
         raise BootstrapError(
-            f"uv is still missing after `curl -LsSf {UV_INSTALLER} | sh` on host "
+            f"uv is still missing after `{uv_installer_command()}` on host "
             f"{transport.host}.\nCheck outbound HTTPS on the host, or install uv by hand "
             f"into ~/.local/bin and re-run bootstrap."
         )
@@ -196,20 +202,27 @@ def sync_package(transport: Transport, home: str, report: Reporter) -> int:
     return len(files)
 
 
-def ensure_aws_cli(transport: Transport, report: Reporter) -> str | None:
+def find_aws_cli(transport: Transport) -> str | None:
     install_dir = "$HOME/.local/aws-cli"
-    bin_dir = "$HOME/.local/bin"
     present = transport.run(
         f'if [ -x "{install_dir}/v2/current/bin/aws" ]; then '
         f'echo "{install_dir}/v2/current/bin/aws"; '
         "else command -v aws 2>/dev/null; fi",
         check=False,
     )
-    if _first_line(present.stdout):
+    return _first_line(present.stdout) or None
+
+
+def ensure_aws_cli(transport: Transport, report: Reporter) -> str | None:
+    install_dir = "$HOME/.local/aws-cli"
+    bin_dir = "$HOME/.local/bin"
+    if find_aws_cli(transport):
         return None
     report("installing the aws CLI v2 bundle into ~/.local/aws-cli")
     result = transport.run(
         "set -e; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; "
+        # No -A here for the bundle itself: this is a plain S3 object fetch, and
+        # the aws CLI's own User-Agent is not overridable anyway.
         f'curl -LsSf {AWS_CLI_ZIP} -o "$tmp/awscliv2.zip"; '
         # No unzip on a slim container image, and no sudo to install one; the
         # stdlib module is always there, but it drops the exec bits.
@@ -219,7 +232,7 @@ def ensure_aws_cli(transport: Transport, report: Reporter) -> str | None:
         timeout=INSTALL_TIMEOUT_S,
         check=False,
     )
-    if result.returncode != 0:
+    if result.returncode != 0 or not find_aws_cli(transport):
         return (
             f"aws CLI install failed (exit {result.returncode}); jobs with s3 outputs will "
             f"fail their sync step until it is installed:\n{result.output.strip()[-500:]}"
@@ -357,6 +370,14 @@ def run_health(session: HostSession, health_args: str = "") -> dict[str, Any]:
     return report
 
 
+def driver_version(health: dict[str, Any]) -> str | None:
+    """The `driver` check's value, so `gpuc host list` can name it for free."""
+    for check in health.get("checks", []):
+        if check.get("name") == "driver" and isinstance(check.get("value"), str):
+            return str(check["value"])
+    return None
+
+
 def start_dispatcher(session: HostSession) -> int:
     # The dispatcher re-derives PATH and the host env from config.json itself;
     # setting them here means the very first process in the chain already has
@@ -413,10 +434,19 @@ def bootstrap_host(
     if cache_dir != entry.cache_dir:
         entry = entry.model_copy(update={"cache_dir": cache_dir})
 
-    for warning in (
-        ensure_aws_cli(transport, report),
-        ensure_hf_cli(transport, uv, entry, report),
-    ):
+    aws_warning = ensure_aws_cli(transport, report)
+    if aws_warning and entry.s3_prefix:
+        # This host is registered to mirror every job's log and state to S3. With
+        # no `aws` there, each job's final sync fails, every job ends
+        # `failed: sync`, and nothing is ever purgeable -- a broken host that
+        # looks bootstrapped is worse than a bootstrap that says no.
+        raise BootstrapError(
+            f"host {entry.name} has s3_prefix {entry.s3_prefix} but the aws CLI could not be "
+            f"installed:\n{aws_warning}\n"
+            f"Install it by hand into ~/.local/aws-cli, or drop the mirror with "
+            f"`gpuc host set {entry.name} --s3-prefix ''`."
+        )
+    for warning in (aws_warning, ensure_hf_cli(transport, uv, entry, report)):
         if warning:
             warnings.append(warning)
             report(f"WARNING: {warning}")
@@ -434,11 +464,16 @@ def bootstrap_host(
     pid = start_dispatcher(session)
     report(f"dispatcher running (pid {pid})")
 
+    gpu_info = discover(transport) or entry.gpu_info
+    if entry.gpus:
+        report(f"gpus: {summarize(entry.gpus, gpu_info)}")
     updated = entry.model_copy(
         update={
             "uv": uv,
             "python": python,
             "cache_dir": cache_dir,
+            "gpu_info": gpu_info,
+            "driver_version": driver_version(health) or entry.driver_version,
             "bootstrapped_at": utc_now(),
         }
     )

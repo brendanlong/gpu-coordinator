@@ -251,7 +251,9 @@ def test_a_non_provider_host_never_self_terminates(gpuc_home: Path) -> None:
     assert dispatcher.idle_and_not_ephemeral()
 
 
-def configure_pod(idle_minutes: float = 15.0, ttl_hours: float = 24.0, age_h: float = 0.0) -> None:
+def configure_pod(
+    idle_minutes: float = 15.0, ttl_hours: float | None = None, age_h: float = 0.0
+) -> None:
     created = datetime.now(UTC) - timedelta(hours=age_h)
     jobs.write_config(
         HostConfig(
@@ -726,3 +728,58 @@ def test_the_drain_records_the_meta_backup_for_every_job(
     dispatcher.drain_and_terminate("test")
     state = jobs.read_state(job_id)
     assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/pod"
+
+
+# -- the TTL is opt-in, and when it is on the dispatcher enforces it ------------
+
+
+def test_without_a_ttl_an_ancient_idle_pod_waits_for_its_idle_timer(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=600.0, ttl_hours=None, age_h=500.0)
+    terminated: list[str] = []
+    dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
+
+    dispatcher.run_once()
+
+    assert terminated == []
+
+
+def test_a_ttl_kills_the_running_job_with_reason_ttl_then_terminates(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    terminated: list[str] = []
+    dispatcher, spawned = make_dispatcher(
+        terminate_call=lambda pod, key: terminated.append(pod) or ""
+    )
+    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
+    dispatcher.run_once()
+    assert job_id in dispatcher.running
+
+    dispatcher.run_once()
+    # The runner owns the kill: the dispatcher asks, with the reason recorded.
+    assert queue.kill_reason(job_id) == "ttl"
+    assert terminated == []
+
+    spawned[job_id].finish(status="failed", reason="ttl")
+    dispatcher.run_once()
+    assert terminated == ["pod-1"]
+    assert paths.draining_file().exists()
+
+
+def test_a_ttl_kill_is_only_asked_for_once(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    dispatcher, _ = make_dispatcher()
+    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
+    dispatcher.run_once()
+    dispatcher.run_once()
+    written = paths.kill_file(job_id).stat().st_mtime_ns
+    dispatcher.run_once()
+    assert paths.kill_file(job_id).stat().st_mtime_ns == written

@@ -239,9 +239,12 @@ def test_rsync_actually_runs_a_remote_shell_whose_path_contains_a_space(tmp_path
 
 
 def test_git_tracked_files_asks_for_nul_separated_unquoted_paths(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     seen: list[list[str]] = []
+    (tmp_path / "a.py").write_text("")
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "dir" / "b with space.py").write_text("")
 
     class Result:
         returncode = 0
@@ -253,9 +256,77 @@ def test_git_tracked_files_asks_for_nul_separated_unquoted_paths(
         return Result()
 
     monkeypatch.setattr(transport.subprocess, "run", fake_run)
-    assert transport.git_tracked_files(Path("/repo")) == ["a.py", "dir/b with space.py"]
+    assert transport.git_tracked_files(tmp_path) == ["a.py", "dir/b with space.py"]
     assert "core.quotePath=false" in seen[0]
-    assert seen[0][-2:] == ["ls-files", "-z"]
+    assert seen[0][-4:] == ["-z", "--cached", "--others", "--exclude-standard"]
+
+
+def repo_with(root: Path, files: dict[str, str], commit: list[str]) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    for name, body in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "t"],
+        ["git", "add", *commit],
+        ["git", "commit", "-qm", "init"],
+    ):
+        subprocess.run(argv, cwd=root, check=True, capture_output=True)
+    return root
+
+
+def test_untracked_files_are_synced_and_ignored_ones_are_not(tmp_path: Path) -> None:
+    root = repo_with(
+        tmp_path / "r",
+        {"tracked.py": "1\n", "fresh.py": "2\n", ".gitignore": "junk\n", "junk": "3\n"},
+        ["tracked.py", ".gitignore"],
+    )
+    assert sorted(transport.git_tracked_files(root)) == [".gitignore", "fresh.py", "tracked.py"]
+
+
+def test_a_deleted_but_cached_file_is_dropped(tmp_path: Path) -> None:
+    root = repo_with(tmp_path / "r", {"a.py": "1\n", "b.py": "2\n"}, ["a.py", "b.py"])
+    (root / "b.py").unlink()
+    assert transport.git_tracked_files(root) == ["a.py"]
+
+
+def test_git_summary_counts_modified_and_untracked(tmp_path: Path) -> None:
+    root = repo_with(tmp_path / "r", {"a.py": "1\n", "b.py": "2\n"}, ["a.py", "b.py"])
+    (root / "a.py").write_text("changed\n")
+    (root / "new.py").write_text("new\n")
+    summary = transport.git_summary(root)
+    assert (len(summary.files), summary.modified, summary.untracked) == (3, 1, 1)
+    assert summary.render() == "syncing 3 files (1 modified, 1 untracked, ignoring .gitignore'd)"
+
+
+def test_the_patch_carries_untracked_files_without_touching_the_real_index(
+    tmp_path: Path,
+) -> None:
+    root = repo_with(tmp_path / "r", {"a.py": "old\n"}, ["a.py"])
+    (root / "a.py").write_text("new\n")
+    (root / "extra.py").write_text("brand new\n")
+    patch = transport.uncommitted_patch(root)
+    assert "brand new" in patch and "new\n" in patch
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=root, capture_output=True, text=True
+    )
+    assert staged.stdout.strip() == ""
+
+
+def test_rsync_excludes_reach_the_command_line(tmp_path: Path) -> None:
+    argv = transport.rsync_argv(tmp_path, "host:/dest", None, None, excludes=(".venv", "*.pyc"))
+    assert argv[:7] == [
+        "rsync",
+        "-a",
+        "--exclude",
+        ".venv",
+        "--exclude",
+        "*.pyc",
+        "--delete-after",
+    ]
 
 
 def test_make_transport_takes_a_per_pod_known_hosts_file(tmp_path: Path) -> None:

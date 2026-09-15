@@ -28,20 +28,69 @@ from gpuc.control.config import (
     config_dir,
     forget_host,
     load_desired,
+    load_registry,
     state_dir,
     state_lock,
+    write_desired,
 )
 from gpuc.control.providers.base import Pod, Provider, ProviderError
-from gpuc.control.provision import CEILING_MINUTES
+from gpuc.control.provision import CEILING_MINUTES, host_status
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
 
 DEFAULT_INTERVAL_S = 60.0
 STRAY_GRACE_MINUTES = CEILING_MINUTES
+LIVENESS_TIMEOUT_S = 20.0
+HEARTBEAT_FRESH_S = 120.0
+"""A heartbeat this old still counts as alive. The dispatcher beats every 5 s;
+the slack is for a host that was busy syncing, not for one that is gone."""
+
+HostLiveness = Callable[[DesiredHost, Settings], "Liveness"]
 
 Reporter = Callable[[str], None]
 
 SERVICE_NAME = "gpuc-reconcile.service"
 TIMER_NAME = "gpuc-reconcile.timer"
+
+
+@dataclass
+class Liveness:
+    """What one look at a host says: reachable, beating, busy."""
+
+    reachable: bool
+    heartbeat_age_s: float | None = None
+    running_jobs: int = 0
+
+    @property
+    def alive(self) -> bool:
+        if self.running_jobs:
+            return True
+        age = self.heartbeat_age_s
+        return age is not None and age < HEARTBEAT_FRESH_S
+
+    def describe(self) -> str:
+        if not self.reachable:
+            return "ssh did not answer"
+        if self.heartbeat_age_s is None:
+            return "reachable, but the dispatcher has never beaten"
+        return f"heartbeat {self.heartbeat_age_s:.0f}s old, {self.running_jobs} job(s) running"
+
+
+def probe_liveness(host: DesiredHost, settings: Settings) -> Liveness:
+    entry = load_registry().hosts.get(host.name)
+    if entry is None:
+        return Liveness(reachable=False)
+    # Short: this runs with the state lock held, and a wedged pod must not keep
+    # a concurrent `gpuc submit` waiting for its whole ssh timeout.
+    payload = host_status(entry, settings, timeout=LIVENESS_TIMEOUT_S)
+    if payload is None:
+        return Liveness(reachable=False)
+    age = payload.get("dispatcher_heartbeat_age_s")
+    running = sum(1 for job in payload.get("jobs", []) if job.get("status") == "running")
+    return Liveness(
+        reachable=True,
+        heartbeat_age_s=float(age) if isinstance(age, (int, float)) else None,
+        running_jobs=running,
+    )
 
 
 @dataclass
@@ -145,7 +194,11 @@ def _terminate(
 
 
 def reconcile_once(
-    settings: Settings, provider: Provider, report: Reporter = print
+    settings: Settings,
+    provider: Provider,
+    report: Reporter = print,
+    *,
+    liveness: HostLiveness = probe_liveness,
 ) -> ReconcileResult:
     result = ReconcileResult()
     with state_lock():
@@ -163,7 +216,7 @@ def reconcile_once(
             return result
 
         by_id = {pod.id: pod for pod in pods}
-        _reconcile_desired(desired, by_id, settings, provider, report, result)
+        _reconcile_desired(desired, by_id, settings, provider, report, result, liveness)
         _reap_strays(desired, pods, provider, report, result)
     return result
 
@@ -175,6 +228,7 @@ def _reconcile_desired(
     provider: Provider,
     report: Reporter,
     result: ReconcileResult,
+    liveness: HostLiveness,
 ) -> None:
     for host in desired:
         pod = by_id.get(host.pod_id)
@@ -192,7 +246,7 @@ def _reconcile_desired(
             continue
 
         age_h = _age_hours(pod, host)
-        if age_h is not None and age_h > host.ttl_hours:
+        if host.ttl_hours is not None and age_h is not None and age_h > host.ttl_hours:
             # Only forget a host whose pod is confirmed gone: while a terminate
             # is failing, the record is what keeps retrying it (and what still
             # tells `gpuc logs` where that host's jobs ran).
@@ -222,13 +276,80 @@ def _reconcile_desired(
                 result.forgotten.append(host.name)
             continue
 
+        if host.bootstrapped and _reap_if_silent(
+            host, pod, settings, provider, report, result, liveness
+        ):
+            continue
+
         report(
             f"{host.name} ({pod.id}): {pod.status}, ${pod.cost_usd_hr:.3f}/h, "
             f"{'' if host.bootstrapped else 'not yet bootstrapped, '}"
-            f"{'age unknown' if age_h is None else f'age {age_h:.1f} h'} of "
-            f"{host.ttl_hours:g} h TTL"
+            f"{'age unknown' if age_h is None else f'age {age_h:.1f} h'}, "
+            f"{'no TTL' if host.ttl_hours is None else f'{host.ttl_hours:g} h TTL'}"
         )
         result.kept.append(host.name)
+
+
+def _reap_if_silent(
+    host: DesiredHost,
+    pod: Pod,
+    settings: Settings,
+    provider: Provider,
+    report: Reporter,
+    result: ReconcileResult,
+    liveness: HostLiveness,
+) -> bool:
+    """Terminate a bootstrapped host that has stopped answering for too long.
+
+    This is what replaces the overall TTL. A pod whose dispatcher has died, or
+    which has stopped answering ssh entirely, cannot self-terminate on idle and
+    cannot be seen to be doing anything -- and it bills all the same. A job
+    running per the host's own state resets the clock, so a long training run is
+    never touched.
+    """
+    state = liveness(host, settings)
+    if state.alive:
+        _remember_seen(host, report)
+        return False
+    silent_for = _minutes_since(host.silent_since())
+    limit = settings.dead_dispatcher_minutes
+    if silent_for is None or silent_for < limit:
+        report(
+            f"{host.name} ({pod.id}): {state.describe()}; silent for "
+            f"{'unknown' if silent_for is None else f'{silent_for:.0f}'} min of the "
+            f"{limit:.0f} min limit"
+        )
+        return False
+    why = (
+        f"host {host.name} has been silent for {silent_for:.0f} min "
+        f"(limit {limit:.0f}); {state.describe()}, nothing is running, and the pod is still "
+        f"billing ${pod.cost_usd_hr:.3f}/h"
+    )
+    report(f"DEAD DISPATCHER: {why}")
+    if _terminate(provider, pod, why, report, result):
+        result.terminated.append(host.name)
+        _forget(host.name, report)
+        result.forgotten.append(host.name)
+        return True
+    return False
+
+
+def _remember_seen(host: DesiredHost, report: Reporter) -> None:
+    try:
+        write_desired(host.model_copy(update={"last_seen_at": _now_text()}))
+    except OSError as exc:
+        report(f"WARNING: could not record that {host.name} is alive: {exc}")
+
+
+def _now_text() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _minutes_since(stamp: str | None) -> float | None:
+    parsed = _parse(stamp)
+    if parsed is None:
+        return None
+    return (datetime.now(UTC) - parsed).total_seconds() / 60.0
 
 
 def _reap_strays(
@@ -279,12 +400,13 @@ def run_loop(
     report: Reporter = print,
     iterations: int | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    liveness: HostLiveness = probe_liveness,
 ) -> ReconcileResult:
     last = ReconcileResult()
     count = 0
     while iterations is None or count < iterations:
         count += 1
-        last = reconcile_once(settings, provider, report)
+        last = reconcile_once(settings, provider, report, liveness=liveness)
         report(last.render())
         if iterations is not None and count >= iterations:
             break

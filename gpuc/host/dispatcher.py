@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gpuc.host import cleanup, gpus, jobs, paths, queue, sync, terminate
+from gpuc.host import baseline, cleanup, gpus, jobs, paths, queue, scope, sync, terminate
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.runner import (
     boot_id,
@@ -282,6 +282,9 @@ def _child_env(package_root: Path) -> dict[str, str]:
     env = dict(os.environ)
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{package_root}{os.pathsep}{existing}" if existing else str(package_root)
+    # Probed once and handed down: creating a throwaway scope per phase to ask
+    # the same question again would be one exec per phase for one bit.
+    env[scope.ISOLATION_ENV] = scope.isolation()
     config = jobs.HostConfig()
     with contextlib.suppress(RuntimeError, OSError, ValueError):
         config = jobs.read_config()
@@ -408,7 +411,7 @@ class Dispatcher:
         except RuntimeError as exc:
             self.log(f"job {job_id} has an unreadable state.json ({exc}); treating as runner-died")
             state = None
-        self._kill_orphaned_group(job_id, state.pgid if state else None)
+        self._kill_orphaned_group(job_id, state.pgid if state else None, state)
         final = state or jobs.JobState()
         final.status = "failed"
         final.reason = "runner-died"
@@ -418,7 +421,13 @@ class Dispatcher:
         jobs.write_state(job_id, final)
         self.log(f"job {job_id} failed: runner died without writing final state")
 
-    def _kill_orphaned_group(self, job_id: str, pgid: int | None) -> None:
+    def _kill_orphaned_group(
+        self, job_id: str, pgid: int | None, state: jobs.JobState | None = None
+    ) -> None:
+        unit = state.cgroup_unit if state else None
+        if unit:
+            self.log(f"job {job_id}: stopping leftover scope {unit} before freeing its GPUs")
+            scope.stop_unit(unit)
         if not pgid or pgid <= 1 or pgid == os.getpgid(0):
             return
         if not process_group_alive(pgid):
@@ -468,10 +477,16 @@ class Dispatcher:
             except RuntimeError:
                 state = jobs.JobState()
             job_pgid = state.pgid if state.pgid and state.pgid != entry.pid else None
+            unit = state.cgroup_unit
             sent = self._cancel_sent.get(job_id)
             if sent is None:
                 self._cancel_sent[job_id] = now
-                if job_pgid:
+                if unit:
+                    # A cgroup stop reaps the whole tree, daemonised
+                    # grandchildren included; the group kill below cannot.
+                    self.log(f"cancelling job {job_id} (scope {unit})")
+                    scope.stop_unit(unit)
+                elif job_pgid:
                     self.log(f"cancelling job {job_id} (pgid {job_pgid})")
                     self._signal_group(job_pgid, signal.SIGTERM)
                 else:
@@ -481,6 +496,8 @@ class Dispatcher:
                     )
                 continue
             elapsed = now - sent
+            if unit and elapsed > grace:
+                scope.stop_unit(unit)
             if job_pgid and elapsed > grace:
                 self._signal_group(job_pgid, signal.SIGKILL)
             # The runner handles SIGTERM itself (final sync, final state), so it
@@ -603,6 +620,16 @@ class Dispatcher:
         now = self.deps.monotonic()
         if self._terminate_retry_at is not None and now < self._terminate_retry_at:
             return
+        # The TTL is a hard cap, so it is checked before anything that returns
+        # early on a busy host: the reaper used to be the only thing that
+        # enforced it, and it terminates a pod out from under a running job
+        # without a final sync.
+        if self._ttl_expired(config):
+            if self.running:
+                self._kill_for_ttl(config)
+                return
+            self.drain_and_terminate(f"ttl of {config.ttl_hours:g} h elapsed")
+            return
         if self.running:
             self._queue_empty_since = None
             return
@@ -614,12 +641,30 @@ class Dispatcher:
         idle_s = now - self._queue_empty_since
         if idle_s >= config.idle_minutes * 60.0:
             self.drain_and_terminate(f"idle for {idle_s / 60.0:.1f} min")
-            return
-        if self._ttl_expired(config):
-            self.drain_and_terminate(f"ttl of {config.ttl_hours} h elapsed")
+
+    def _kill_for_ttl(self, config: jobs.HostConfig) -> None:
+        """Stop the running jobs so their runners can sync before we terminate.
+
+        The runner owns the kill and the final sync, so the TTL asks rather than
+        signals: each job ends `failed: ttl` with its outputs uploaded, and the
+        next pass -- with nothing running -- drains and terminates.
+        """
+        for job_id in sorted(self.running):
+            if queue.kill_reason(job_id):
+                continue
+            queue.request_kill(job_id, "ttl")
+            self.log(
+                f"ttl of {config.ttl_hours:g} h elapsed with job {job_id} running: asked its "
+                f"runner to stop it (reason ttl) and sync before this host terminates"
+            )
 
     def _ttl_expired(self, config: jobs.HostConfig) -> bool:
-        if not config.created_at:
+        """Null `ttl_hours` -- the default -- never expires.
+
+        An overall TTL is opt-in precisely because the failure it causes (a
+        training run killed at hour 24) is worse than the one it prevents.
+        """
+        if config.ttl_hours is None or not config.created_at:
             return False
         try:
             created = datetime.fromisoformat(config.created_at)
@@ -740,6 +785,7 @@ class Dispatcher:
             runner=self.deps.command_runner,
             timeout=None,
             env=env,
+            baseline_map=baseline.read(job_id),
         )
 
     # -- retention -------------------------------------------------------

@@ -20,13 +20,17 @@ One uv project, Python >= 3.11, package `gpuc`, CLI entry point `gpuc`.
 
 ```
 gpuc/
+  _version.py    # __version__ and user_agent(); STDLIB ONLY, imported by both halves
   host/        # runs ON hosts. STDLIB ONLY. No imports outside stdlib.
     __main__.py   # `python -m gpuc.host <cmd>`; the same CLI as `gpuc host-*`
     paths.py      # ~/.gpuc layout
     jobs.py       # job id, spec/state read/write, atomic writes
-    queue.py      # enqueue, list, reorder, cancel markers
+    queue.py      # enqueue, list, reorder, cancel and kill markers
     dispatcher.py # lock+heartbeat, pick next runnable, launch runner, idle/TTL terminate
-    runner.py     # one job: env, CUDA_VISIBLE_DEVICES, preflight, watchdog, sync, exit code
+    runner.py     # one job: env, CUDA_VISIBLE_DEVICES, preflights, watchdog, sync, exit code
+    scope.py      # systemd --user scope probe/wrap/stop; the cgroup kill path
+    preflight.py  # sync preflight: prove `aws`/`hf` can write before the job runs
+    baseline.py   # what was already under `outputs:` before the job started
     cleanup.py    # `cleanup:` policy, workdir sizing, the `clean` sweep
     gpus.py       # nvidia-smi parsing, UUID<->index assertion, utilization sampling
     sync.py       # periodic upload loop (shells out to `aws` or `hf`; see Sync)
@@ -41,6 +45,7 @@ gpuc/
     providers/
       base.py     # Provider interface: offers(constraints), create, get, logs, terminate, list
       runpod.py   # v2 REST implementation
+    gpuinfo.py    # per-GPU name/VRAM for the registry and every listing
     reconcile.py  # desired state vs provider; ceiling; reaper; caps
     submit.py     # resolve target -> host -> enqueue; provision if needed
     s3index.py    # mirror of specs/state for `requeue` and `status --all`
@@ -60,11 +65,24 @@ out to binaries the bootstrap installs into `$HOME` (`aws` CLI v2 bundle,
 `hf` from `uv tool install huggingface_hub`), and a missing binary fails the
 *job's* sync step with a clear message, never the queue.
 
+## User agent
+
+One string, from `gpuc/_version.py`: `gpuc/<version> (+<repo url>; <email>)`.
+`gpuc.host` is stdlib-only, so it imports `gpuc._version` (which must stay
+stdlib-only, and which bootstrap's rsync must ship). It is sent by the RunPod
+provider and the host's self-terminate (urllib), the health check's download,
+bootstrap's `curl -A` for the uv installer, every control-side boto3 client
+(`botocore.config.Config(user_agent_extra=...)`), and `HF_HUB_USER_AGENT_ORIGIN`
+in every job's environment so `hf` carries it too. The `aws` CLI on a host is
+the exception: its User-Agent cannot be overridden, so S3 requests made by the
+CLI are anonymous to us. A job may override `HF_HUB_USER_AGENT_ORIGIN` in its
+own `env:`.
+
 ## On-host state: `~/.gpuc/`
 
 ```
 config.json          # {"host": "<name>", "gpus": ["GPU-uuid", ...], "provider": null | {"kind":"runpod","pod_id":..},
-                     #  "idle_minutes": 15, "ttl_hours": 24, "s3_prefix": "s3://bucket/gpuc/<host>",
+                     #  "idle_minutes": 15, "ttl_hours": null | N, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
                      #  "env": {"HF_HOME": ...}}      # host-wide, hand-set; see Persistent root
 secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
@@ -75,6 +93,7 @@ jobs/<jobid>/
   state.json         # {"status": queued|running|succeeded|failed|cancelled, "attempt": n,
                      #  "reason": str|null, "exit_code": int|null, "gpus": [...], "started_at", "ended_at",
                      #  "phase": setup|preflight|main|sync, "pid": int|null, "pgid": int|null,
+                     #  "isolation": "cgroup"|"pgid", "cgroup_unit": str|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null, "sync_error": str|null,
                      #  "util_recent": [float|null, ...], "util_sampled_at": str|null,
@@ -90,7 +109,11 @@ jobs/<jobid>/
                      # failed and the sample must not be read as 0%.
                      # pgid is the *job's* group, published by the runner when it spawns a phase.
                      # It is absent during the launch window; cancel is the marker alone until then.
-  workdir/           # rsynced code (git-tracked files only); removed per `cleanup:`
+  outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
+                     # checkout arrived with; those files are never uploaded as this
+                     # job's results and never satisfy `outputs:`
+  kill               # a kill request with its reason (`ttl`), written by the dispatcher
+  workdir/           # rsynced code (git-tracked + untracked, .gitignore obeyed); removed per `cleanup:`
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir
 dispatcher.lock      # fd flock held by the running dispatcher
@@ -115,7 +138,8 @@ All state writes are atomic (write temp in same dir, `os.replace`).
                                         # read from the submitter's env, delivered as ~/.gpuc/secrets/<jobid>.env (0600),
                                         # sourced into the job's environment by the runner
   "outputs": [{"path": "results", "s3": "s3://bucket/exp/{job_id}/results"},
-              {"path": "checkpoints", "hf": "org/repo", "hf_path": "{job_id}"}],
+              {"path": "checkpoints", "hf": "org/repo", "hf_path": "{job_id}",
+               "hf_create": false}],   # create the repo if the sync preflight finds it missing
   "sync_interval_s": 180,
   "priority": 50,
   "max_runtime_min": null,
@@ -148,19 +172,33 @@ queue's lexical order, not submission order below one second.
   once if GPUs allow; a `gpus: 0` job never waits.
 - Cancel: `queue.cancel(jobid)` writes `jobs/<id>/cancel`. The **runner**
   owns the kill: it checks the marker before each phase and on every poll, and
+  stops the phase's scope (`systemctl --user stop <unit>`) or, with no systemd,
   takes down the job's own process group (SIGTERM, 15 s, SIGKILL). The
-  dispatcher escalates only once `state.json` publishes a pgid that is not the
-  runner's own -- during the launch window the runner *is* the only member of
-  its group, and signalling it there would kill the one process that can still
-  finish the job cleanly. Queued jobs are cancelled by removing the marker and
-  setting state.
+  dispatcher escalates only once `state.json` publishes a `cgroup_unit`, or a
+  pgid that is not the runner's own -- during the launch window the runner *is*
+  the only member of its group, and signalling it there would kill the one
+  process that can still finish the job cleanly. Queued jobs are cancelled by
+  removing the marker and setting state.
+- Stop with a reason: `queue.request_kill(jobid, reason)` writes
+  `jobs/<id>/kill`. The runner kills the job the same way and ends it
+  `failed: <reason>` after a final sync. The TTL uses this; cancel stays its own
+  marker, because a TTL stop is not a cancellation anyone asked for.
+- Isolation: at startup the dispatcher probes `systemd-run --user --scope
+  --collect --quiet -- true` once and hands the answer to every runner it spawns
+  as `GPUC_ISOLATION`. See Process isolation.
 - Reorder: `queue.reorder(jobid, prio)` renames the marker.
 - Idle terminate (only when `config.provider` is set): if no running jobs
-  and the queue has been empty for `idle_minutes`, or `ttl_hours` has
-  elapsed since `config.created_at` and nothing is running: write
-  `draining`, run one final sync of every job's state and log to
-  `s3_prefix`, then call `terminate.self_terminate()`. On failure: remove
-  `draining`, log loudly, keep dispatching, retry every 10 minutes.
+  and the queue has been empty for `idle_minutes`: write `draining`, run one
+  final sync of every job's state and log to `s3_prefix`, then call
+  `terminate.self_terminate()`. On failure: remove `draining`, log loudly, keep
+  dispatching, retry every 10 minutes.
+- TTL (`ttl_hours`, **null by default**, an explicit opt-in hard cap): checked
+  before the idle logic, so a busy host cannot dodge it. Past the cap with a job
+  running, the dispatcher writes a `kill` marker with reason `ttl` for each
+  running job and waits: the runner kills it, syncs its outputs, and records
+  `failed: ttl`. With nothing running it drains and terminates as above. With
+  `ttl_hours` null nothing terminates on age at all -- see Auto-down and the
+  reaper.
 - Two consecutive `failed: low-util` jobs: stop dispatching, log, and (if
   ephemeral) drain and terminate.
 - Exit when the queue is empty, nothing is running, and the host is not
@@ -172,6 +210,15 @@ queue's lexical order, not submission order below one second.
    when `gpus: 0`), the spec `env`, and the secrets file. Assert via
    `nvidia-smi --query-gpu=index,uuid` that every assigned UUID is present
    on the host; fail the job otherwise.
+1b. Snapshot every declared `outputs:` path into `outputs_baseline.json`
+   (relative path, size, mtime) -- a checkout routinely ships committed files
+   where the outputs go. Before `setup`, because a setup step writing there
+   *is* this job's doing. Every upload, periodic and final, excludes files that
+   still match the baseline, and a path holding *only* baseline files counts as
+   no output at all (`failed: no-outputs`). Above 500 pre-existing files under
+   one path the exclusion is dropped with a loud warning in the log, because the
+   exclude list would no longer fit on a command line; `gpuc submit` warns about
+   pre-existing files before the job is queued.
 2. `phase=setup`: run `spec.setup` in `workdir` with `bash -eo pipefail`.
 3. `phase=preflight`: GPU preflight **inside the job's environment**. A named
    phase, not a step of `setup`, so `gpuc status` can tell "still installing
@@ -179,6 +226,17 @@ queue's lexical order, not submission order below one second.
    `uv run --no-sync python -c "<real op>"` (the `shared/gpu.py` probe:
    `is_available()` then a tensor add + `.item()`), and assert
    `device_count()` equals `gpus`. Failure -> `failed: gpu-preflight`.
+3b. **Sync preflight**, still before `main`, in the job's environment. If the
+   spec declares S3 outputs or the host has an `s3_prefix`, the `aws` binary
+   must resolve and a `.preflight` object must upload to every destination
+   prefix *and* to the host's `jobs/<id>/` mirror prefix. If the spec declares
+   HF outputs, `hf` must resolve, `hf auth whoami` must succeed with the job's
+   token, and a `.preflight` file must upload to each repo -- creating the repo
+   first when that output sets `hf_create: true`, and failing with a message
+   naming the flag when it does not exist and `hf_create` is unset. Failure ->
+   `failed: sync-preflight`, with the command and its error in `log.txt`, and no
+   final output sync (the preflight already proved it cannot work). A job with
+   no outputs on a host with no mirror checks nothing.
 4. Start the sync loop (background thread) for `outputs`, every
    `sync_interval_s`, skipping files modified in the last 10 s. Also upload
    `log.txt` and `state.json` to `s3_prefix/jobs/<id>/` on the same cadence.
@@ -187,6 +245,8 @@ queue's lexical order, not submission order below one second.
    host-level credential file is needed. The secrets file is unlinked after
    the final sync, never before it.
 5. `phase=main`: run `spec.command`, stdout+stderr appended to `log.txt`.
+   Each phase runs inside its own transient scope where one is available (see
+   Process isolation), and in its own process group where it is not.
    Start the low-util watchdog after `grace_min`: sample assigned GPUs'
    utilization every 30 s; if the rolling mean over `window_min` is below
    `floor_pct`, SIGTERM the process group, then SIGKILL after 15 s, status
@@ -205,6 +265,33 @@ queue's lexical order, not submission order below one second.
    `meta_synced_at`/`meta_synced_to` and puts `state.json` up once more, so the
    mirror includes the record of itself; `outputs_synced_at` is written in the
    final state write when the final output upload succeeded. See Retention.
+
+## Process isolation (cgroup scope, else process group)
+
+A grandchild that double-forks (`setsid`, `nohup`, a daemonising server) leaves
+the job's process group and survives `kill -- -PGID`, holding a GPU the
+dispatcher is about to hand to the next job. A process cannot leave its
+**cgroup** without privilege, so where a `systemd --user` session with cgroup
+delegation exists each phase runs as:
+
+```
+systemd-run --user --scope --collect --quiet -p TimeoutStopSec=15 \
+  --unit=gpuc-<jobid>-<phase>.scope -- bash -c 'base64 -d <<<"$1" | bash' _ <b64>
+```
+
+The script is base64-encoded on purpose: the words after `--` become a systemd
+`ExecStart`, where systemd does its own substitution (`$$` -> `$`, `$VAR` ->
+environment) and would silently corrupt any inline shell. The base64 alphabet
+has no `$`, and `$1` is digit-led, which systemd leaves alone.
+
+The kill path becomes `systemctl --user stop <unit>` (SIGTERM, then SIGKILL
+after `TimeoutStopSec`), with the existing process-group kill kept as a
+fallback, and the dispatcher's backstop uses the unit when `state.json` records
+one. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are in `state.json` and
+shown by `gpuc status`. The probe runs once per dispatcher and is passed to
+runners in `GPUC_ISOLATION`. On a host with no user systemd -- every RunPod pod,
+the shared box -- `pgid` is the mode and a daemonised grandchild still escapes;
+that is a documented hole, not a fixed one.
 
 ## Workdir cleanup
 
@@ -323,15 +410,18 @@ gpuc host add spar   --ssh user@host [--port N] --gpus GPU-uuid,.. # shared box
 gpuc host set <host> [--gpus ..] [--persistent-root R] [--gpuc-home PATH] [--cache-dir PATH] [--s3-prefix ..]
                      [--retention-days N]             # auto-purge horizon; '' clears it
                      [--idle-min N] [--ttl-hours N]   # edit one entry in place; only the flags given change
+                                                      # --ttl-hours -1 clears the cap (the default is none)
 gpuc host bootstrap <host>        # install uv + package, write config, run host preflight, start dispatcher
 gpuc host probe <host>            # print driver, GPUs+UUIDs, disk + $HOME's fs type, logind KillUserProcesses, systemd --user, uv cache size + whether it shares gpuc home's fs, network timing
 gpuc host clean <host> --uv-cache # `uv cache prune` on the host
 gpuc host list | remove <host>
 
-gpuc submit job.yaml --host <host>                                  # existing host
+gpuc submit job.yaml --host <host> [--no-git]                       # existing host
 gpuc submit job.yaml --runpod --gpu A40[,RTX4090] [--min-vram 24] [--max-price 0.60] [--cloud secure|community]
-                     [--cuda-min 12.8] [--idle-min 15] [--ttl-hours 24] [--reuse]   # provision or reuse a gpuc pod
-gpuc status [--host H] [--all] [--suspects]
+                     [--cuda-min 12.8] [--idle-min 15] [--ttl-hours N] [--reuse]    # provision or reuse a gpuc pod
+                     # --ttl-hours is optional and off by default; --runpod refuses a job whose
+                     # max_runtime_min would outlive a TTL that is set
+gpuc status [--host H] [--all] [--suspects] [--recent N] [--since 24h]
 gpuc logs <jobid> [-f]           # tail from the host over transport; S3 fallback with a note
 gpuc cancel <jobid>
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]
@@ -373,10 +463,18 @@ and any ssh failure matching `ControlPath too long|unix_listener` raises
 immediately even under `check=False`, because every polling loop here reads a
 non-zero ssh as "not up yet" and would otherwise wait out its whole ceiling.
 
-Code sync is `rsync` of `git ls-files` output from the submitter's directory
-(plus a `git diff` saved as `uncommitted.patch` in the job dir). `put_file`
-writes 0600 content via stdin (`cat > path && chmod 600 path`); secrets
-never touch argv.
+Code sync is `rsync` of `git -c core.quotePath=false ls-files -z --cached
+--others --exclude-standard` from the submitter's directory: tracked files *and*
+untracked ones git would keep, so a file written and not yet `git add`ed still
+reaches the host, while `.gitignore` keeps venvs and caches home. Files in the
+index but deleted on disk are dropped from the list rather than sent. `submit`
+prints one line: `syncing N files (M modified, K untracked, ignoring
+.gitignore'd)`. `uncommitted.patch` is `git diff HEAD` taken against a *copy* of
+the index with `git add -N` applied, so it carries untracked files too and never
+touches the user's staging. `--no-git` rsyncs a non-repo directory whole, minus
+`.venv, __pycache__, .git, *.pyc, node_modules, .uv-cache`, with a warning.
+`put_file` writes 0600 content via stdin (`cat > path && chmod 600 path`);
+secrets never touch argv.
 
 ## Bootstrap (any host, idempotent)
 
@@ -384,10 +482,18 @@ never touch argv.
    is missing; `uv python install 3.12` if no suitable interpreter.
 2. rsync the `gpuc` package to `~/.gpuc/pkg/`; install `aws` CLI v2 bundle
    into `~/.local/aws-cli` and `uv tool install huggingface_hub` (both
-   skipped if present; failures are warnings).
+   skipped if present; failures are warnings -- **except** that a host
+   registered with an `s3_prefix` whose `aws` CLI could not be installed fails
+   bootstrap outright: every job on it would end `failed: sync-preflight`).
 3. Write `~/.gpuc/config.json` from the host registry entry.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"`.
+6. Record what the host's cards are (`nvidia-smi --query-gpu=uuid,name,memory.total`)
+   and the driver version from the health report into `HostEntry.gpu_info` /
+   `driver_version`, so `gpuc host list` and `gpuc status` can name them. Best
+   effort: a host with no nvidia-smi simply lists UUIDs. `gpuc host probe`
+   records the same thing before a host is ever bootstrapped, and a RunPod host
+   falls back to its offer's GPU name and VRAM.
 
 ## Persistent root (a host whose `$HOME` is wiped on restart)
 
@@ -462,11 +568,22 @@ Recovery without a root is `gpuc host bootstrap`, then `gpuc status --host H
 
 Every 60 s under a lock: for each `desired/` host, `get` its pod; if
 missing or TERMINATED, mark the desired entry gone and note any jobs that
-were running there (for `requeue`). For every provider pod with our prefix
-not in `desired/`, or older than its TTL, terminate and log -- except that a
-prefixed pod with no `desired/` record is left alone until it is older than
+were running there (for `requeue`). A pod older than its TTL -- only when that
+host has one; the default is none -- is terminated and logged. For every
+provider pod with our prefix not in `desired/`, terminate and log -- except that
+a prefixed pod with no `desired/` record is left alone until it is older than
 the 15-minute provisioning ceiling, so a concurrent session that has created
 a pod but not yet written its record cannot have it reaped out from under it.
+
+**The dead-dispatcher rule**, which is what replaced the overall TTL: a
+bootstrapped desired host is asked for its status each pass. A fresh heartbeat
+or a running job records `last_seen_at` in its `desired/` record. A host that
+has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) --
+including one whose ssh never answers, since that never updates `last_seen_at`
+either -- is terminated with a loud report: it cannot idle-terminate itself, it
+is doing nothing we can see, and it is still billing. A long training run keeps
+its host alive indefinitely; the 15-minute pre-healthy ceiling and the stray-pod
+rule are unchanged.
 Never touch a pod without the prefix. If `desired/` is unreadable, do nothing
 and log an error (fail closed). `--install` writes a `systemd --user` service
 and timer but does not enable them, and prints the `systemctl` lines and the
@@ -482,12 +599,15 @@ An ephemeral host whose pod the provider reports as missing or TERMINATED is
 (`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
 those are the jobs a purge -- or a pod going away -- would take with them.
 
-Per host: kind, reachable?, dispatcher alive?, GPUs (owned/free), queue
-(id, name, prio), running (id, name, phase, minutes, last util), recent
-finished (id, status, reason). For ephemeral hosts also: pod status, $/h,
-age, provider util. `--suspects`: running jobs in `phase=main` past
-`grace_min` with mean util below floor over the last 10 min, and any pod
-older than TTL. Never kills anything.
+Per host: kind, reachable?, dispatcher alive?, GPUs (owned/free) with what
+they are (`2x NVIDIA A40 45 GB`, driver version) and one line per card saying
+`free` or `busy <jobid>`, queue (id, name, prio), running (id, name, phase,
+minutes, last util), recent finished (id, status, reason, and how long ago it
+ended). `--recent N` (default 5) and `--since 24h|7d|90m` choose how much of the
+finished list to show; `--all` shows the same age column for index-only jobs.
+For ephemeral hosts also: pod status, $/h, age, provider util. `--suspects`:
+running jobs in `phase=main` past `grace_min` with mean util below floor over
+the last 10 min, and any pod past a TTL it actually has. Never kills anything.
 
 ## Testing rules
 
@@ -495,7 +615,8 @@ older than TTL. Never kills anything.
 - Local GPU integration tests use tiny tensors (`torch.zeros(8)`), never
   more than ~100 MB VRAM; other people's jobs share the card.
 - RunPod integration: A40 only, `--max-price 0.60`, a job whose command
-  is under two minutes, `--idle-min 2`, `--ttl-hours 1`, and the test
+  is under two minutes, `--idle-min 2`, `--ttl-hours 1` (a TTL is opt-in, and a
+  test that creates a billable pod is exactly where opting in is right), and the test
   asserts teardown via `list()` and prints the final `GET /billing/pods`
   for the pod. Two pods named `subrep-*` belong to someone else: read them
   in `list()`, never act on them. Every test that creates a pod has a

@@ -28,7 +28,13 @@ class ScriptedTransport:
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
         raise AssertionError("not used")
 
-    def rsync(self, local_root: Path, remote_path: str, files: object = None) -> CommandResult:
+    def rsync(
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: object = None,
+        excludes: object = (),
+    ) -> CommandResult:
         raise AssertionError("not used")
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:

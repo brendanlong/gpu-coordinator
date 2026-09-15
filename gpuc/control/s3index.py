@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
 
+from gpuc._version import user_agent
 from gpuc.control.config import Settings, index_dir
 from gpuc.host.jobs import JobSpec
 
@@ -45,6 +46,19 @@ def spec_key(job_id: str) -> str:
 
 def index_key(job_id: str) -> str:
     return f"{INDEX_PREFIX}/{job_id}.json"
+
+
+def make_s3_client() -> S3Client:
+    """The one place boto3 is constructed, so every request carries our agent.
+
+    `user_agent_extra` appends to botocore's own string rather than replacing
+    it; AWS support reads the whole line, and the SDK half of it is the half
+    they ask for.
+    """
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client("s3", config=Config(user_agent_extra=user_agent()))
 
 
 def default_s3_prefix(settings: Settings, host: str) -> str | None:
@@ -111,9 +125,7 @@ class S3Index:
     @property
     def client(self) -> S3Client:
         if self._client is None:
-            import boto3
-
-            self._client = boto3.client("s3")
+            self._client = make_s3_client()
         return self._client
 
     def _put(self, key: str, body: str) -> str:

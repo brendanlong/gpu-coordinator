@@ -21,6 +21,8 @@ from gpuc.control.providers.base import Caps, ProviderError
 from gpuc.control.reconcile import (
     SERVICE_NAME,
     TIMER_NAME,
+    HostLiveness,
+    Liveness,
     install,
     reconcile_once,
     run_loop,
@@ -40,7 +42,7 @@ def desire(
     name: str,
     pod_id: str,
     *,
-    ttl_hours: float = 24.0,
+    ttl_hours: float | None = None,
     created_hours_ago: float = 0.5,
     ceiling_minutes: float = 15.0,
     bootstrapped: bool = True,
@@ -60,6 +62,14 @@ def desire(
     return host
 
 
+def alive(**overrides: object) -> HostLiveness:
+    """A host that answers: the reaper only reaps hosts that have gone quiet."""
+    state = Liveness(reachable=True, heartbeat_age_s=5.0, running_jobs=0)
+    for key, value in overrides.items():
+        setattr(state, key, value)
+    return lambda host, settings: state
+
+
 def provider_with(*pods: object, **kwargs: object) -> FakeProvider:
     provider = FakeProvider(**kwargs)  # type: ignore[arg-type]
     for pod in pods:
@@ -71,7 +81,7 @@ def test_healthy_host_is_left_alone(control_env: Path) -> None:
     pod = running_pod("gpuc-a-111", "pod1")
     provider = provider_with(pod)
     desire("gpuc-a-111", "pod1")
-    result = reconcile_once(Settings(), provider, lambda _: None)
+    result = reconcile_once(Settings(), provider, lambda _: None, liveness=alive())
     assert result.kept == ["gpuc-a-111"]
     assert provider.terminated == []
     assert desired_file("gpuc-a-111").exists()
@@ -132,7 +142,8 @@ def test_bootstrapped_host_past_its_ceiling_is_kept(control_env: Path) -> None:
     pod = running_pod("gpuc-a-111", "pod1", age_minutes=30)
     provider = provider_with(pod)
     desire("gpuc-a-111", "pod1", created_hours_ago=0.5, bootstrapped=True)
-    assert reconcile_once(Settings(), provider, lambda _: None).kept == ["gpuc-a-111"]
+    kept = reconcile_once(Settings(), provider, lambda _: None, liveness=alive()).kept
+    assert kept == ["gpuc-a-111"]
     assert provider.terminated == []
 
 
@@ -235,6 +246,7 @@ def test_run_loop_stops_after_the_requested_iterations(control_env: Path) -> Non
         report=lambda _: None,
         iterations=2,
         sleep=slept.append,
+        liveness=alive(),
     )
     assert slept == [60.0]
     assert result.kept == ["gpuc-a-111"]
@@ -310,3 +322,100 @@ def test_a_desired_record_naming_a_foreign_pod_is_refused_not_terminated(
     assert result.errors and "not ours" in result.errors[0]
     assert any("refusing to terminate" in line for line in reports)
     assert desired_file("gpuc-a-111").exists()
+
+
+# -- the dead-dispatcher safety net that replaced the overall TTL --------------
+
+
+def dead(**overrides: object) -> HostLiveness:
+    state = Liveness(reachable=False)
+    for key, value in overrides.items():
+        setattr(state, key, value)
+    return lambda host, settings: state
+
+
+def test_a_host_with_no_ttl_is_never_terminated_for_age(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 200))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=200)
+
+    result = reconcile_once(Settings(), provider, lambda _: None, liveness=alive())
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+
+
+def test_a_long_running_job_keeps_an_old_host_alive(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 50))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=50)
+    # The dispatcher is silent, but the host's own state says a job is running.
+    liveness = alive(heartbeat_age_s=None, running_jobs=1)
+
+    result = reconcile_once(Settings(), provider, lambda _: None, liveness=liveness)
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+
+
+def test_a_dead_dispatcher_past_the_limit_is_terminated_loudly(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0),
+        provider,
+        reports.append,
+        liveness=alive(heartbeat_age_s=4000.0),
+    )
+
+    assert result.terminated == ["gpuc-a-111"]
+    assert provider.terminated == ["pod1"]
+    assert any("DEAD DISPATCHER" in line for line in reports)
+    assert not desired_file("gpuc-a-111").exists()
+
+
+def test_an_unreachable_host_is_terminated_once_it_has_been_silent_long_enough(
+    control_env: Path,
+) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0), provider, reports.append, liveness=dead()
+    )
+
+    assert result.terminated == ["gpuc-a-111"]
+    assert any("ssh did not answer" in line for line in reports)
+
+
+def test_a_host_that_has_only_just_gone_quiet_is_left_alone(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=10))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=0.1)
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0), provider, lambda _: None, liveness=dead()
+    )
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+
+
+def test_a_healthy_pass_records_that_the_host_was_seen(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=10))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=1)
+
+    reconcile_once(Settings(), provider, lambda _: None, liveness=alive())
+
+    seen = DesiredHost.model_validate_json(desired_file("gpuc-a-111").read_text()).last_seen_at
+    assert seen is not None
+
+
+def test_a_never_bootstrapped_host_still_gets_the_ceiling_not_the_silence_rule(
+    control_env: Path,
+) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=1, bootstrapped=False)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append, liveness=dead())
+
+    assert result.terminated == ["gpuc-a-111"]
+    assert any("never bootstrapped by its ceiling" in line for line in reports)

@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.providers.base import DEFAULT_IMAGE, Caps, Offer
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.jobs import HostConfig
@@ -104,6 +105,12 @@ class Settings(BaseModel):
     ssh_key: str | None = None
     image: str = DEFAULT_IMAGE
     disk_gb: int = DEFAULT_DISK_GB
+    dead_dispatcher_minutes: float = 30.0
+    """How long an ephemeral host may be silent before the reaper terminates it.
+
+    With no overall TTL, this is what stops a pod nobody is watching: a
+    dispatcher that has not beaten -- or a pod that has not answered ssh -- for
+    this long, with nothing running, is billing for nothing."""
 
     @property
     def ssh_key_path(self) -> str | None:
@@ -136,6 +143,11 @@ max_total_usd_per_hour = 3.0
 # Private key for ssh and rsync to hosts and pods; its ".pub" is uploaded to
 # the RunPod account. Unset means ssh picks its own.
 # ssh_key = "~/.ssh/id_ed25519"
+
+# An ephemeral host whose dispatcher has not beaten (or whose ssh has not
+# answered) for this long, with nothing running, is terminated by
+# `gpuc reconcile`. There is no overall TTL unless you pass --ttl-hours.
+dead_dispatcher_minutes = 30.0
 
 # Defaults for `gpuc submit --runpod`; override per submit with --disk.
 image = "{DEFAULT_IMAGE}"
@@ -175,6 +187,12 @@ class HostEntry(BaseModel):
     ssh: str | None = None
     port: int = 22
     gpus: list[str] = Field(default_factory=list)
+    gpu_info: dict[str, GpuInfo] = Field(default_factory=dict)
+    """What each UUID is: name and VRAM, recorded by bootstrap and `host probe`.
+
+    Additive and best effort -- a host registered before this existed, or one
+    with no nvidia-smi, simply lists its UUIDs without names."""
+    driver_version: str | None = None
     pod_id: str | None = None
     python: str | None = None
     uv: str | None = None
@@ -192,7 +210,12 @@ class HostEntry(BaseModel):
     gets a cache next to gpuc home instead of copying every wheel. `--cache-dir`
     pins it by hand; an explicit `--env UV_CACHE_DIR=...` still wins."""
     idle_minutes: float = 15.0
-    ttl_hours: float = 24.0
+    ttl_hours: float | None = None
+    """Hard cap on this host's life, in hours; None (the default) never expires.
+
+    An opt-in cap, not a safety net: killing a training run at hour 24 is worse
+    than the idle timer taking a little longer. The reaper's safety net is
+    `Settings.dead_dispatcher_minutes` instead."""
     s3_prefix: str | None = None
     retention_days: float | None = None
     """Auto-purge horizon for this host, in days; None never auto-purges.
@@ -343,13 +366,22 @@ class DesiredHost(BaseModel):
     created_at: str
     ceiling_at: str
     idle_minutes: float = 15.0
-    ttl_hours: float = 24.0
+    ttl_hours: float | None = None
     image: str | None = None
     bootstrapped_at: str | None = None
+    last_seen_at: str | None = None
+    """When this host last proved it was alive: a fresh dispatcher heartbeat, or
+    a job running on it. The reaper terminates a pod that has not managed either
+    for `dead_dispatcher_minutes`, which is also how an unreachable pod is
+    caught -- an ssh that never answers never updates this."""
 
     @property
     def bootstrapped(self) -> bool:
         return self.bootstrapped_at is not None
+
+    def silent_since(self) -> str | None:
+        """The most recent moment we know this host was alive."""
+        return self.last_seen_at or self.bootstrapped_at or self.created_at
 
 
 def desired_file(name: str) -> Path:

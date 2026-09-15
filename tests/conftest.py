@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.config import HostEntry
-from gpuc.host import jobs, paths
+from gpuc.host import jobs, paths, scope
 from gpuc.host.jobs import HostConfig, JobSpec
 
 FAKE_GPUS = [
@@ -26,6 +26,10 @@ LOCAL_GPU_UUID = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 def gpuc_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     home = tmp_path / "gpuc-home"
     monkeypatch.setenv("GPUC_HOME", str(home))
+    # Pin the isolation mode: whether *this* machine can make systemd scopes is
+    # not something a unit test should depend on. The cgroup path has its own
+    # tests, which set this to `cgroup` themselves.
+    monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
     paths.ensure_layout()
     jobs.write_config(HostConfig(host="test-host", gpus=list(FAKE_GPUS)))
     yield home
@@ -138,6 +142,7 @@ def control_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
     monkeypatch.setenv("GPUC_CONFIG_DIR", str(root / "config"))
     monkeypatch.setenv("GPUC_STATE_DIR", str(root / "state"))
     monkeypatch.delenv("GPUC_HOME", raising=False)
+    monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
     (root / "config").mkdir(parents=True)
     (root / "state").mkdir(parents=True)
     yield root

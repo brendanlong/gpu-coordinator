@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings
+from gpuc.control.gpuinfo import rows as gpu_rows
+from gpuc.control.gpuinfo import summarize
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.transport import TransportError
@@ -49,6 +51,10 @@ class JobView:
     control side never sees the spec."""
     outputs_lost: bool = False
     """An ephemeral host's drain retried the upload to the end and gave up."""
+    isolation: str | None = None
+    """`cgroup` if this job's phases run in a systemd scope (a cancel reaps the
+    whole tree), `pgid` if only a process group (a daemonised grandchild
+    escapes). Shown on running jobs because it changes what a kill guarantees."""
 
     @property
     def minutes(self) -> float | None:
@@ -77,6 +83,41 @@ class JobView:
         if len(window) < SUSPECT_SAMPLES:
             return False
         return sum(window) / len(window) < SUSPECT_FLOOR_PCT
+
+
+DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
+
+
+def parse_duration(text: str) -> float:
+    """`24h`, `7d`, `90m`, `45s`, or a bare number of hours. Seconds out."""
+    raw = text.strip().lower()
+    if not raw:
+        raise ValueError("empty duration")
+    unit = DURATION_UNITS.get(raw[-1])
+    number = raw[:-1] if unit else raw
+    try:
+        value = float(number)
+    except ValueError as exc:
+        raise ValueError(
+            f"{text!r} is not a duration: use 30m, 24h, 7d, or a bare number of hours"
+        ) from exc
+    if value < 0:
+        raise ValueError(f"{text!r} is negative")
+    return value * (unit or 3600.0)
+
+
+def format_age(stamp: str | None, now: datetime | None = None) -> str:
+    """`3m ago`, `2d ago`: enough to tell last night's run from last month's."""
+    when = _parse(stamp)
+    if when is None:
+        return "age unknown"
+    seconds = ((now or datetime.now(UTC)) - when).total_seconds()
+    if seconds < 0:
+        return "just now"
+    for unit, size in (("d", 86400.0), ("h", 3600.0), ("m", 60.0)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit} ago"
+    return f"{int(seconds)}s ago"
 
 
 def _parse(stamp: str | None) -> datetime | None:
@@ -117,6 +158,13 @@ class HostView:
     def suspects(self) -> list[JobView]:
         return [job for job in self.running if job.suspect]
 
+    def gpu_holder(self, uuid: str) -> str | None:
+        """Which running job has this card, per the host's own state."""
+        for job in self.running:
+            if uuid in job.gpus:
+                return job.job_id
+        return None
+
     @property
     def outputs_at_risk(self) -> list[JobView]:
         """Finished jobs holding the only copy of what they produced."""
@@ -135,7 +183,7 @@ class HostView:
         which is not the same clock the reaper's TTL uses; a pod adopted or
         re-registered later would read as young here and be terminated there.
         """
-        if not self.entry.ephemeral:
+        if not self.entry.ephemeral or self.entry.ttl_hours is None:
             return False
         if self.pod is not None and self.pod.age is not None:
             return self.pod.age.total_seconds() / 3600.0 > self.entry.ttl_hours
@@ -169,6 +217,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             workdir_bytes=entry.get("workdir_bytes"),
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
+            isolation=entry.get("isolation"),
         )
         if view.status == "running":
             running.append(view)
@@ -239,7 +288,34 @@ def _fmt_minutes(job: JobView) -> str:
     return "--" if job.minutes is None else f"{job.minutes:.1f}m"
 
 
-def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool = False) -> str:
+def _gpu_lines(view: HostView) -> list[str]:
+    """One line per owned card: what it is, and who has it right now."""
+    lines: list[str] = []
+    for name, vram, uuid in gpu_rows(view.owned, view.entry.gpu_info):
+        holder = view.gpu_holder(uuid)
+        lines.append(
+            f"  gpu     {name} {vram}".rstrip()
+            + f"  {uuid}  {f'busy {holder}' if holder else 'free'}"
+        )
+    return lines
+
+
+def within(job: JobView, since_s: float | None, now: datetime | None = None) -> bool:
+    if since_s is None:
+        return True
+    ended = _parse(job.ended_at)
+    if ended is None:
+        return False
+    return ((now or datetime.now(UTC)) - ended).total_seconds() <= since_s
+
+
+def render(
+    view: HostView,
+    *,
+    recent: int = RECENT_FINISHED,
+    suspects_only: bool = False,
+    since_s: float | None = None,
+) -> str:
     entry = view.entry
     target = entry.ssh or "this machine"
     if not view.reachable:
@@ -264,13 +340,17 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
         if view.dispatcher_alive
         else "dispatcher DOWN (submit or bootstrap restarts it)"
     )
+    summary = summarize(view.owned, entry.gpu_info) if view.owned else "no GPUs"
+    driver = f", driver {entry.driver_version}" if entry.driver_version else ""
     header = (
         f"host {entry.name} [{entry.kind}] {target}  {dispatcher}  "
-        f"gpus {len(view.free)}/{len(view.owned)} free"
+        f"gpus {len(view.free)}/{len(view.owned)} free ({summary}{driver})"
     )
     if flags:
         header += "  " + " ".join(flags)
     lines = [header]
+    if not suspects_only:
+        lines += _gpu_lines(view)
     pod = pod_line(view.pod)
     if pod:
         lines.append(pod + ("  PAST TTL" if view.past_ttl else ""))
@@ -291,11 +371,13 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
         mark = "  running" if not job.suspect else "  running!"
         lines.append(
             f"{mark} {job.job_id} {job.name or '-'} phase={job.phase or '-'} "
-            f"{_fmt_minutes(job)} {_fmt_util(job)} gpus={len(job.gpus)}"
+            f"{_fmt_minutes(job)} {_fmt_util(job)} gpus={len(job.gpus)} "
+            f"iso={job.isolation or '?'}"
         )
     for job in view.queue:
         lines.append(f"  queued  {job.job_id} {job.name or '-'} prio={job.priority}")
-    for job in view.finished[:recent]:
+    finished = [job for job in view.finished if within(job, since_s)]
+    for job in finished[:recent]:
         detail = job.reason or (f"exit {job.exit_code}" if job.exit_code else "")
         flag = ""
         if job.outputs_lost:
@@ -304,7 +386,11 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
             flag = "  outputs not uploaded"
         lines.append(
             f"  done    {job.job_id} {job.name or '-'} {job.status}"
-            f"{f' ({detail})' if detail else ''}{flag}"
+            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
+        )
+    if since_s is not None and not finished and view.finished:
+        lines.append(
+            f"  done    none in the last {int(since_s // 60)} min ({len(view.finished)} older)"
         )
     at_risk = view.outputs_at_risk
     if at_risk:

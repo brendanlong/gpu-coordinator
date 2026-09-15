@@ -41,6 +41,7 @@ from gpuc.control.config import (
     utc_now,
     write_desired,
 )
+from gpuc.control.gpuinfo import GpuInfo, discover, summarize
 from gpuc.control.providers.base import (
     DEFAULT_IMAGE,
     CapsExceeded,
@@ -163,7 +164,7 @@ def entry_for(
     settings: Settings,
     *,
     idle_minutes: float,
-    ttl_hours: float,
+    ttl_hours: float | None,
     created_at: str,
 ) -> HostEntry:
     if pod.ssh_direct is None:
@@ -179,6 +180,17 @@ def entry_for(
         s3_prefix=default_s3_prefix(settings, name),
         created_at=created_at,
     )
+
+
+def gpu_info_for(transport: Transport, uuids: list[str], offer: Offer) -> dict[str, GpuInfo]:
+    """What the pod's cards are: nvidia-smi if it answers, else the offer.
+
+    A pod whose driver is still coming up would otherwise list its GPUs as
+    unknown forever, and the offer already says exactly what was bought.
+    """
+    discovered = discover(transport)
+    fallback = GpuInfo(name=offer.name, vram_mib=int(offer.vram_gb * 1024))
+    return {uuid: discovered.get(uuid) or fallback for uuid in uuids}
 
 
 def discover_gpu_uuids(transport: Transport) -> list[str]:
@@ -234,7 +246,7 @@ def provision(
     *,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
-    ttl_hours: float = 24.0,
+    ttl_hours: float | None = None,
     disk_gb: int = DEFAULT_DISK_GB,
     image: str = DEFAULT_IMAGE,
     provider: Provider,
@@ -321,7 +333,7 @@ def _try_offer(
     provider: Provider,
     name_hint: str,
     idle_minutes: float,
-    ttl_hours: float,
+    ttl_hours: float | None,
     disk_gb: int,
     image: str,
     cuda_min: str,
@@ -363,8 +375,11 @@ def _try_offer(
         transport = deps.transport_factory(entry, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
         deliver_s3_credentials(transport, entry, progress)
-        entry = entry.model_copy(update={"gpus": discover_gpu_uuids(transport)})
-        progress(f"host GPUs: {', '.join(entry.gpus)}")
+        uuids = discover_gpu_uuids(transport)
+        entry = entry.model_copy(
+            update={"gpus": uuids, "gpu_info": gpu_info_for(transport, uuids, offer)}
+        )
+        progress(f"host GPUs: {summarize(uuids, entry.gpu_info)} ({', '.join(uuids)})")
         with registry_transaction() as registry:
             registry.put(entry)
 
@@ -378,7 +393,8 @@ def _try_offer(
             write_desired(desired.model_copy(update={"bootstrapped_at": utc_now()}))
         progress(
             f"host {name} ready: dispatcher pid {result.dispatcher_pid}, "
-            f"idle terminate {idle_minutes:g} min, ttl {ttl_hours:g} h"
+            f"idle terminate {idle_minutes:g} min, "
+            f"ttl {'none' if ttl_hours is None else f'{ttl_hours:g} h'}"
         )
         return entry
     except BaseException as exc:
@@ -404,7 +420,7 @@ def _create_and_record(
     disk_gb: int,
     cuda_min: str,
     idle_minutes: float,
-    ttl_hours: float,
+    ttl_hours: float | None,
     progress: _Progress,
     deps: ProvisionDeps,
 ) -> tuple[Pod, str]:
@@ -593,10 +609,12 @@ def _tail(text: str, lines: int = 15) -> str:
     return "\n".join(f"  {line}" for line in text.strip().splitlines()[-lines:])
 
 
-def host_status(entry: HostEntry, settings: Settings | None = None) -> dict[str, Any] | None:
+def host_status(
+    entry: HostEntry, settings: Settings | None = None, *, timeout: float = 60.0
+) -> dict[str, Any] | None:
     """The host's own status document, or None if it cannot be reached."""
     try:
-        payload = open_session(entry, settings).host_json("status", timeout=60.0)
+        payload = open_session(entry, settings).host_json("status", timeout=timeout)
     except (RemoteError, TransportError, ConfigError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -680,7 +698,7 @@ def runpod_host(
     reuse: bool = True,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
-    ttl_hours: float = 24.0,
+    ttl_hours: float | None = None,
     disk_gb: int = DEFAULT_DISK_GB,
     image: str = DEFAULT_IMAGE,
     report: Reporter = print,

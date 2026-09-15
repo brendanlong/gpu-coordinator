@@ -8,6 +8,7 @@ to reproduce every failure the real flow has to survive.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -233,7 +234,13 @@ class FakeTransport:
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
         self.files[remote_path] = content if isinstance(content, str) else content.decode()
 
-    def rsync(self, local_root: Path, remote_path: str, files: Any = None) -> CommandResult:
+    def rsync(
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Any = None,
+        excludes: Sequence[str] = (),
+    ) -> CommandResult:
         return CommandResult(self.host, ["rsync"], 0, "", "")
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:

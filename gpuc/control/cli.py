@@ -29,6 +29,8 @@ from gpuc.control.config import (
     utc_now,
     write_config_template,
 )
+from gpuc.control.gpuinfo import rows as gpu_rows
+from gpuc.control.gpuinfo import summarize
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import Cloud, Constraints, Provider, ProviderError
 from gpuc.control.providers.runpod import RunPodProvider
@@ -45,7 +47,12 @@ from gpuc.control.submit import (
     submit_spec,
     validate,
 )
-from gpuc.control.transport import SshTransport, Transport, TransportError
+from gpuc.control.transport import (
+    NO_GIT_EXCLUDES,
+    SshTransport,
+    Transport,
+    TransportError,
+)
 from gpuc.host import jobs
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
@@ -157,7 +164,9 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     if args.idle_min is not None:
         changes["idle_minutes"] = args.idle_min
     if args.ttl_hours is not None:
-        changes["ttl_hours"] = args.ttl_hours
+        # argparse cannot express "given but empty" for a float flag, and a TTL
+        # that can be set but never unset is a trap.
+        changes["ttl_hours"] = None if args.ttl_hours < 0 else args.ttl_hours
     if not changes:
         raise CliError(
             "host set changes nothing: pass at least one of "
@@ -191,14 +200,17 @@ def cmd_host_list(_: argparse.Namespace) -> int:
         return 0
     for entry in registry.hosts.values():
         bootstrapped = entry.bootstrapped_at or "never bootstrapped"
+        summary = summarize(entry.gpus, entry.gpu_info) if entry.gpus else "no GPUs"
+        driver = f", driver {entry.driver_version}" if entry.driver_version else ""
         print(
             f"{entry.name:<16} {entry.kind:<7} {entry.ssh or 'this machine':<28} "
-            f"gpus={len(entry.gpus)} python={entry.python or '-'} bootstrapped={bootstrapped}"
+            f"gpus={len(entry.gpus)} ({summary}{driver}) python={entry.python or '-'} "
+            f"bootstrapped={bootstrapped}"
         )
         if entry.root:
             print(f"  persistent root {entry.root} (gpuc home {entry.remote_home})")
-        for uuid in entry.gpus:
-            print(f"  {uuid}")
+        for name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
+            print(f"  {name:<28} {vram:<7} {uuid}")
     return 0
 
 
@@ -254,7 +266,22 @@ def cmd_host_clean(args: argparse.Namespace) -> int:
 def cmd_host_probe(args: argparse.Namespace) -> int:
     settings = load_settings()
     entry = load_registry().require(args.name)
-    print(probe_host(entry, settings).render())
+    report = probe_host(entry, settings)
+    print(report.render())
+    # A probe is the one command that runs before bootstrap, so it is also the
+    # first chance to learn what the cards are.
+    if report.gpu_info:
+        with registry_transaction() as registry:
+            current = registry.hosts.get(args.name)
+            if current is not None:
+                registry.put(
+                    current.model_copy(
+                        update={
+                            "gpu_info": {**current.gpu_info, **report.gpu_info},
+                            "driver_version": report.driver_version or current.driver_version,
+                        }
+                    )
+                )
     return 0
 
 
@@ -336,21 +363,30 @@ def mirror_spec_first(model: JobSpecModel, job_id: str, settings: Settings) -> l
 
 def cmd_submit(args: argparse.Namespace) -> int:
     settings = load_settings()
+    use_git = not args.no_git
     if args.runpod:
         document = load_document(args.job_file)
         model = validate(document, str(args.job_file))
-        precheck_local(model, Path.cwd(), gpu_count=args.gpu_count)
+        precheck_local(
+            model,
+            Path.cwd(),
+            gpu_count=args.gpu_count,
+            use_git=use_git,
+            ttl_hours=args.ttl_hours,
+        )
         job_id = jobs.new_job_id()
         notes = mirror_spec_first(model, job_id, settings)
         entry = runpod_target(args, settings)
-        result = submit_spec(entry, model, settings, workdir=Path.cwd(), job_id=job_id)
+        result = submit_spec(
+            entry, model, settings, workdir=Path.cwd(), job_id=job_id, use_git=use_git
+        )
         result.notes.extend(notes)
         print(result.render())
         return 0
     if not args.host:
         raise CliError("submit needs --host <name> (see `gpuc host list`)")
     entry = load_registry().require(args.host)
-    result = submit_file(entry, args.job_file, settings, workdir=Path.cwd())
+    result = submit_file(entry, args.job_file, settings, workdir=Path.cwd(), use_git=use_git)
     print(result.render())
     return 0
 
@@ -364,6 +400,10 @@ def _hosts(registry: Registry, only: str | None) -> list[HostEntry]:
 def cmd_status(args: argparse.Namespace) -> int:
     settings = load_settings()
     registry = load_registry()
+    try:
+        since_s = status_mod.parse_duration(args.since) if args.since else None
+    except ValueError as exc:
+        raise CliError(f"--since: {exc}") from exc
     entries = _hosts(registry, args.host)
     if not entries:
         print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
@@ -377,7 +417,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     for entry in entries:
         view = status_mod.gather(entry, settings, provider=provider)
         seen.update(job.job_id for job in view.queue + view.running + view.finished)
-        print(status_mod.render(view, suspects_only=args.suspects))
+        print(
+            status_mod.render(
+                view, recent=args.recent, suspects_only=args.suspects, since_s=since_s
+            )
+        )
     if args.all and not args.suspects:
         _print_unhosted(settings, seen, args.host)
     return 0
@@ -426,7 +470,8 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
             else ""
         )
         print(
-            f"  {entry.job_id} {entry.name or '-'} host={entry.host} attempt={entry.attempt}{note}"
+            f"  {entry.job_id} {entry.name or '-'} host={entry.host} attempt={entry.attempt} "
+            f"submitted {status_mod.format_age(entry.submitted_at)}{note}"
         )
     print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")
 
@@ -602,8 +647,15 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         document.pop(key, None)
     attempt = (index.attempt if index else 1) + 1
     model = validate(document, f"spec for {args.job_id}")
+    use_git = not args.no_git
     if target is None:
-        precheck_local(model, Path.cwd(), gpu_count=args.gpu_count)
+        precheck_local(
+            model,
+            Path.cwd(),
+            gpu_count=args.gpu_count,
+            use_git=use_git,
+            ttl_hours=args.ttl_hours,
+        )
     entry = runpod_target(args, settings) if target is None else registry.require(target)
     result = submit_spec(
         entry,
@@ -611,6 +663,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         settings,
         workdir=Path.cwd(),
         attempt=attempt,
+        use_git=use_git,
     )
     print(result.render())
     print(f"  requeued from {args.job_id} (attempt {attempt}); workdir re-synced from {Path.cwd()}")
@@ -678,7 +731,13 @@ def build_parser() -> argparse.ArgumentParser:
         "and state are mirrored; omit to keep everything forever",
     )
     add.add_argument("--idle-min", type=float, default=15.0)
-    add.add_argument("--ttl-hours", type=float, default=24.0)
+    add.add_argument(
+        "--ttl-hours",
+        type=float,
+        default=None,
+        help="hard cap on the host's life; omit for none (the default). When set, the "
+        "dispatcher kills the running job with reason ttl, syncs, and terminates",
+    )
     add.set_defaults(func=cmd_host_add)
 
     edit = host.add_parser("set", help="change a registered host without remove/add")
@@ -700,7 +759,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--retention-days", help="auto-purge horizon in days; pass '' to keep everything"
     )
     edit.add_argument("--idle-min", type=float)
-    edit.add_argument("--ttl-hours", type=float)
+    edit.add_argument(
+        "--ttl-hours", type=float, help="hard cap in hours; -1 clears it (no TTL, the default)"
+    )
     edit.set_defaults(func=cmd_host_set)
 
     bootstrap = host.add_parser("bootstrap", help="install uv, the package and the dispatcher")
@@ -729,6 +790,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit = sub.add_parser("submit", help="submit a job file to a host")
     submit.add_argument("job_file")
     submit.add_argument("--host")
+    add_no_git_flag(submit)
     add_runpod_flags(submit)
     submit.set_defaults(func=cmd_submit)
 
@@ -736,6 +798,18 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--host")
     status.add_argument("--all", action="store_true", help="also list jobs only the index knows")
     status.add_argument("--suspects", action="store_true", help="billing but idle; never kills")
+    status.add_argument(
+        "--recent",
+        type=int,
+        default=status_mod.RECENT_FINISHED,
+        metavar="N",
+        help=f"how many finished jobs to show per host (default {status_mod.RECENT_FINISHED})",
+    )
+    status.add_argument(
+        "--since",
+        metavar="DURATION",
+        help="only finished jobs that ended within this long ago, e.g. 24h, 7d, 90m",
+    )
     status.set_defaults(func=cmd_status)
 
     clean = sub.add_parser("clean", help="remove finished jobs' workdirs on a host")
@@ -788,6 +862,7 @@ def build_parser() -> argparse.ArgumentParser:
     requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
     requeue.add_argument("job_id")
     requeue.add_argument("--host")
+    add_no_git_flag(requeue)
     add_runpod_flags(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
@@ -819,6 +894,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def add_no_git_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-git",
+        action="store_true",
+        help="the workdir is not a git repository: rsync all of it except "
+        f"{', '.join(NO_GIT_EXCLUDES)}",
+    )
+
+
 def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runpod", action="store_true", help="reuse or provision a RunPod pod")
     parser.add_argument("--gpu", help="comma-separated GPU names, cheapest match wins")
@@ -828,7 +912,13 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cloud", choices=sorted(CLOUDS), default="secure")
     parser.add_argument("--cuda-min", default=None, help="host CUDA floor, default 12.8")
     parser.add_argument("--idle-min", type=float, default=15.0)
-    parser.add_argument("--ttl-hours", type=float, default=24.0)
+    parser.add_argument(
+        "--ttl-hours",
+        type=float,
+        default=None,
+        help="hard cap on the pod's life; omit for none (the default), leaving --idle-min and "
+        "`gpuc reconcile` to stop it",
+    )
     parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
     parser.add_argument("--image", help="pod image; default from config")
     parser.add_argument("--no-reuse", action="store_true", help="always create a new pod")

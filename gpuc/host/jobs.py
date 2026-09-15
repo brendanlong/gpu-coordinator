@@ -130,6 +130,11 @@ class Output:
     s3: str | None = None
     hf: str | None = None
     hf_path: str | None = None
+    hf_create: bool = False
+    """Create the Hugging Face repo if the sync preflight finds it missing.
+
+    Off by default: a typo in a repo name should fail the job in seconds, not
+    quietly create `org/lego-s4-typo` and upload a run into it."""
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> Output:
@@ -138,6 +143,7 @@ class Output:
             s3=d.get("s3"),
             hf=d.get("hf"),
             hf_path=d.get("hf_path"),
+            hf_create=bool(d.get("hf_create", False)),
         )
 
 
@@ -202,6 +208,13 @@ class JobState:
     phase: Phase | None = None
     pid: int | None = None
     pgid: int | None = None
+    isolation: str | None = None
+    """`cgroup` when the phase runs in a transient systemd scope, `pgid` when it
+    is only a process group. A `pgid` job's daemonised grandchildren survive a
+    kill; a `cgroup` job's cannot."""
+    cgroup_unit: str | None = None
+    """The scope unit of the phase now running, which `systemctl --user stop`
+    reaps whole. Null between phases and on a `pgid` host."""
     runner_pid: int | None = None
     runner_boot_id: str | None = None
     runner_starttime: str | None = None
@@ -302,7 +315,12 @@ class HostConfig:
     gpus: list[str] = field(default_factory=list)
     provider: dict[str, Any] | None = None
     idle_minutes: float = 15.0
-    ttl_hours: float = 24.0
+    ttl_hours: float | None = None
+    """Hard cap on this host's life, in hours. Null (the default) never
+    terminates on age: the idle timer is what stops an ephemeral host, and a
+    wall clock that kills a running job at hour 24 is a worse failure than a
+    pod that idles for fifteen minutes. When set, the dispatcher kills the
+    running job with reason `ttl`, syncs, and terminates."""
     s3_prefix: str | None = None
     created_at: str | None = None
     retention_days: float | None = None
@@ -326,7 +344,7 @@ class HostConfig:
             gpus=[str(g) for g in (d.get("gpus") or [])],
             provider=d.get("provider"),
             idle_minutes=float(d.get("idle_minutes", 15.0)),
-            ttl_hours=float(d.get("ttl_hours", 24.0)),
+            ttl_hours=(None if d.get("ttl_hours") is None else float(d["ttl_hours"])),
             s3_prefix=d.get("s3_prefix"),
             created_at=d.get("created_at"),
             retention_days=(

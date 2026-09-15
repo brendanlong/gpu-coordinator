@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from gpuc.control.config import HostEntry, Settings, transport_for
+from gpuc.control.gpuinfo import GpuInfo, parse_smi
 from gpuc.control.transport import Transport
 
 SECTION_ORDER = [
@@ -126,6 +127,18 @@ class ProbeReport:
             if len(cells) >= 3 and cells[0].isdigit():
                 rows.append(cells)
         return rows
+
+    @property
+    def gpu_info(self) -> dict[str, GpuInfo]:
+        """The `gpus` section as the registry stores it, keyed by UUID."""
+        return parse_smi(
+            "\n".join(",".join(cells[1:]) for cells in self.gpu_rows if len(cells) > 2)
+        )
+
+    @property
+    def driver_version(self) -> str | None:
+        line = self.sections.get("driver", "").strip().splitlines()
+        return line[0].strip() if line and self.has_nvidia_smi else None
 
     @property
     def home_fs_type(self) -> str | None:
