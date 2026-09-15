@@ -118,6 +118,9 @@ def test_a_missing_config_leaves_the_dispatcher_env_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GPUC_HOME", str(tmp_path / "nothing-here"))
+    # The claim is that _child_env adds nothing of its own without a config,
+    # not that the ambient environment is empty: CI exports UV_CACHE_DIR.
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     assert "UV_CACHE_DIR" not in dispatcher._child_env(Path("/pkg"))
 
 

@@ -460,7 +460,7 @@ def render(
     if view.draining:
         flags.append("DRAINING")
     if view.paused:
-        flags.append(f"PAUSED (low-util); resume with `gpuc host resume {view.name}`")
+        flags.append(f"PAUSED (low-util); resume with `gpuc host resume {entry.name}`")
     dispatcher = (
         f"dispatcher {view.heartbeat_age_s:.0f}s ago"
         if view.dispatcher_alive

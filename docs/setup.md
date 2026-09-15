@@ -216,6 +216,9 @@ keeps the lock and finishes on its own (older) code; every new runner uses the
 new package, and whichever dispatcher takes over adopts the running jobs from
 their `state.json`. Only the dispatcher is ever replaced, never a runner.
 
+Before you push a change: `./check.sh` runs ruff, pyright and the test suite,
+which is exactly what CI runs on every pull request (`--fast` skips the sync).
+
 Two sessions on different builds are fine as long as both are recent: every file
 the two sides share is read with unknown keys ignored and a `null` for a
 non-optional field taken as that field's default.

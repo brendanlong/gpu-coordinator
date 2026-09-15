@@ -393,6 +393,7 @@ def test_a_failed_final_drain_sync_still_terminates(
     ten minutes -- with a fresh heartbeat -- for as long as the credentials
     stayed broken.
     """
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
     monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
     configure_pod(idle_minutes=0.0)
     terminated: list[str] = []
