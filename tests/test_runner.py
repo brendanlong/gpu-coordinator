@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -333,3 +335,128 @@ def test_build_env_exposes_job_paths(gpuc_home: Path) -> None:
     assert env["GPUC_JOB_ID"] == "j1"
     assert env["GPUC_EXPECTED_GPUS"] == "1"
     assert env["GPUC_OUTPUTS"] == str(paths.outputs_dir("j1"))
+
+
+def run_detached(job_id: str, home: Path) -> subprocess.Popen[bytes]:
+    """The runner as the dispatcher really starts it: its own session, so a
+    signal to it is not also a signal to the test process."""
+    env = dict(os.environ)
+    env["GPUC_HOME"] = str(home)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    return subprocess.Popen(
+        [sys.executable, "-m", "gpuc.host", "run", job_id],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def wait_for_job_pgid(job_id: str) -> int:
+    _wait_until(lambda: jobs.read_state(job_id).pgid is not None)
+    pgid = jobs.read_state(job_id).pgid
+    assert pgid is not None
+    return pgid
+
+
+def test_sigterm_kills_the_job_group_and_writes_failed_terminated(gpuc_home: Path) -> None:
+    job_id = prepare(command="sleep 300")
+    proc = run_detached(job_id, gpuc_home)
+    try:
+        pgid = wait_for_job_pgid(job_id)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=60) == runner.TERMINATED_EXIT_CODE
+        _wait_until(lambda: not runner.process_group_alive(pgid))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.exit_code) == ("failed", "terminated", 143)
+    assert state.ended_at and state.phase is None
+    assert "received SIGTERM" in log_of(job_id)
+
+
+def test_sigterm_after_a_cancel_marker_ends_the_job_as_cancelled(gpuc_home: Path) -> None:
+    job_id = prepare(command="sleep 300")
+    proc = run_detached(job_id, gpuc_home)
+    try:
+        wait_for_job_pgid(job_id)
+        queue.cancel(job_id)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=60) == runner.TERMINATED_EXIT_CODE
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("cancelled", "cancelled")
+
+
+def test_a_job_cancelled_during_the_launch_window_never_runs_its_command(
+    gpuc_home: Path,
+) -> None:
+    job_id = prepare(command="touch RAN")
+    queue.cancel(job_id)
+    assert runner.run_job(job_id, deps()) == runner.TERMINATED_EXIT_CODE
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("cancelled", "cancelled")
+    assert not (paths.workdir(job_id) / "RAN").exists()
+    assert "cancel marker present before phase=setup" in log_of(job_id)
+
+
+def test_the_secrets_file_is_removed_once_the_job_has_finished(gpuc_home: Path) -> None:
+    job_id = prepare(command='test -n "$HF_TOKEN"')
+    paths.job_env_file(job_id).write_text('HF_TOKEN="hf_abc"\n')
+    assert runner.run_job(job_id, deps()) == 0
+    assert not paths.job_env_file(job_id).exists()
+
+
+def test_a_failed_utilization_sample_is_recorded_as_unknown_not_as_idle(
+    gpuc_home: Path,
+) -> None:
+    calls: list[int] = []
+
+    def flaky(uuids: Sequence[str]) -> float:
+        calls.append(1)
+        if len(calls) == 1:
+            raise runner.gpus.GpuError("nvidia-smi reported utilization.gpu='[N/A]'")
+        return 90.0
+
+    job_id = prepare(
+        gpus=[FAKE_GPUS[0]],
+        command="sleep 0.6",
+        low_util={"enabled": True, "window_min": 0.001, "floor_pct": 50, "grace_min": 0.0},
+    )
+    assert runner.run_job(job_id, deps(sampler=flaky)) == 0
+    recent = jobs.read_state(job_id).util_recent
+    assert recent and recent[0] is None
+    assert "utilization sample failed" in log_of(job_id)
+
+
+def test_preflight_is_a_real_phase(gpuc_home: Path) -> None:
+    assert "preflight" in jobs.PHASES
+    job_id = prepare(gpus=[FAKE_GPUS[0]], command="true")
+    assert (
+        runner.run_job(
+            job_id,
+            deps(preflight=True, preflight_command=lambda: "echo gpu preflight ok"),
+        )
+        == 0
+    )
+    log = log_of(job_id)
+    assert "phase=preflight: echo gpu preflight ok" in log
+    assert log.index("phase=preflight") < log.index("phase=main")
+
+
+def test_a_missing_output_dir_fails_the_job_as_no_outputs_not_as_sync(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sync, "aws_binary", lambda: "/fake/aws")
+    monkeypatch.setattr(
+        sync, "run_command", lambda argv, timeout=None: sync.CommandResult(argv, 0, "")
+    )
+    job_id = prepare(
+        command="true", outputs=[{"path": "never-written", "s3": "s3://bucket/{job_id}"}]
+    )
+    assert runner.run_job(job_id, deps()) == 1
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "no-outputs")

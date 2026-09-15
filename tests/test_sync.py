@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -14,11 +15,13 @@ from tests.conftest import make_spec
 class RecordingRunner:
     def __init__(self, returncode: int = 0, output: str = "") -> None:
         self.calls: list[list[str]] = []
+        self.timeouts: list[float | None] = []
         self.returncode = returncode
         self.output = output
 
-    def __call__(self, argv: list[str], timeout: float) -> sync.CommandResult:
+    def __call__(self, argv: list[str], timeout: float | None) -> sync.CommandResult:
         self.calls.append(argv)
+        self.timeouts.append(timeout)
         return sync.CommandResult(argv, self.returncode, self.output)
 
 
@@ -145,3 +148,132 @@ def test_sync_loop_final_runs_one_pass_and_stops(gpuc_home: Path, fake_aws: str)
     loop.final()
     assert len(runner.calls) >= 1
     assert loop._thread is None
+
+
+def loop_for(job_id: str, runner: sync.CommandRunner, **overrides: object) -> sync.SyncLoop:
+    document: dict[str, object] = {
+        "job_id": job_id,
+        "sync_interval_s": 1,
+        "outputs": [{"path": "outputs", "s3": "s3://b/o"}],
+    }
+    document.update(overrides)
+    spec = make_spec(**document)
+    paths.ensure_job_layout(job_id)
+    jobs.write_spec(spec)
+    jobs.write_state(job_id, jobs.JobState())
+    paths.log_file(job_id).touch()
+    return sync.SyncLoop(spec, paths.workdir(job_id), None, runner=runner)
+
+
+def test_run_command_turns_a_missing_binary_into_a_sync_error() -> None:
+    with pytest.raises(sync.SyncError, match="not found"):
+        sync.run_command(["definitely-not-a-binary-xyz"])
+
+
+def test_run_command_turns_a_timeout_into_a_sync_error() -> None:
+    with pytest.raises(sync.SyncError, match="timed out"):
+        sync.run_command(["sleep", "30"], timeout=0.2)
+
+
+def test_the_exclude_list_is_capped_instead_of_building_a_huge_argv(
+    tmp_path: Path, fake_aws: str
+) -> None:
+    for index in range(sync.MAX_EXCLUDES + 1):
+        (tmp_path / f"shard-{index:04d}.bin").write_text("x")
+    runner = RecordingRunner()
+    with pytest.raises(sync.TooManyRecentFiles, match="skipping this sync tick"):
+        sync.sync_dir_to_s3(tmp_path, "s3://b/p", runner=runner)
+    assert runner.calls == []
+
+
+def test_a_capped_tick_is_skipped_with_a_log_line_and_is_not_an_error(
+    gpuc_home: Path, fake_aws: str
+) -> None:
+    job_id = jobs.new_job_id()
+    runner = RecordingRunner()
+    loop = loop_for(job_id, runner)
+    outputs = paths.workdir(job_id) / "outputs"
+    outputs.mkdir(parents=True)
+    for index in range(sync.MAX_EXCLUDES + 1):
+        (outputs / f"shard-{index:04d}.bin").write_text("x")
+    loop.start()
+    _wait_for(lambda: "skipping this sync tick" in paths.log_file(job_id).read_text())
+    loop.stop()
+    assert loop.last_error is None
+    assert jobs.read_state(job_id).sync_error is None
+
+
+def test_a_missing_output_dir_is_warned_about_on_a_periodic_tick(
+    gpuc_home: Path, fake_aws: str
+) -> None:
+    job_id = jobs.new_job_id()
+    loop = loop_for(job_id, RecordingRunner())
+    loop.start()
+    _wait_for(lambda: "does not exist" in paths.log_file(job_id).read_text())
+    loop.stop()
+    assert "WARNING" in paths.log_file(job_id).read_text()
+    assert loop.last_error is None
+
+
+def test_a_missing_output_dir_on_the_final_sync_is_its_own_error(
+    gpuc_home: Path, fake_aws: str
+) -> None:
+    job_id = jobs.new_job_id()
+    loop = loop_for(job_id, RecordingRunner())
+    with pytest.raises(sync.MissingOutput):
+        loop.final()
+
+
+def test_the_periodic_thread_survives_any_exception_and_records_it(
+    gpuc_home: Path, fake_aws: str
+) -> None:
+    def exploding(argv: list[str], timeout: float | None) -> sync.CommandResult:
+        raise KeyboardInterrupt("something unspeakable")
+
+    job_id = jobs.new_job_id()
+    loop = loop_for(job_id, exploding)
+    (paths.workdir(job_id) / "outputs").mkdir(parents=True)
+    loop.start()
+    _wait_for(lambda: jobs.read_state(job_id).sync_error is not None)
+    assert loop._thread is not None and loop._thread.is_alive()
+    loop.stop()
+    assert "something unspeakable" in (jobs.read_state(job_id).sync_error or "")
+
+
+def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: str) -> None:
+    overlaps: list[str] = []
+    inside = threading.Lock()
+
+    def slow(argv: list[str], timeout: float | None) -> sync.CommandResult:
+        if not inside.acquire(blocking=False):
+            overlaps.append(" ".join(argv))
+        else:
+            time.sleep(0.2)
+            inside.release()
+        return sync.CommandResult(argv, 0, "")
+
+    job_id = jobs.new_job_id()
+    loop = loop_for(job_id, slow)
+    (paths.workdir(job_id) / "outputs").mkdir(parents=True)
+    loop.start()
+    time.sleep(1.1)
+    loop.final()
+    assert overlaps == []
+
+
+def test_the_final_sync_has_no_wall_clock_timeout(gpuc_home: Path, fake_aws: str) -> None:
+    job_id = jobs.new_job_id()
+    runner = RecordingRunner()
+    loop = loop_for(job_id, runner)
+    (paths.workdir(job_id) / "outputs").mkdir(parents=True)
+    loop.final()
+    assert runner.timeouts == [None]
+
+
+def _wait_for(predicate, timeout: float = 20.0) -> None:  # type: ignore[no-untyped-def]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError("condition never became true")

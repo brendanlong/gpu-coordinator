@@ -93,3 +93,25 @@ def test_config_defaults_when_missing(gpuc_home: Path) -> None:
     assert not config.ephemeral
     jobs.write_config(HostConfig(host="pod", provider={"kind": "runpod", "pod_id": "p"}))
     assert jobs.read_config().ephemeral
+
+
+def test_the_layout_is_private_to_the_owner(gpuc_home: Path) -> None:
+    import stat
+
+    paths.ensure_layout()
+    assert stat.S_IMODE(paths.home().stat().st_mode) == 0o700
+    assert stat.S_IMODE(paths.secrets_dir().stat().st_mode) == 0o700
+
+
+def test_state_round_trips_the_new_identity_and_sync_fields(gpuc_home: Path) -> None:
+    state = jobs.JobState(
+        status="running",
+        runner_pid=7,
+        runner_boot_id="boot",
+        runner_starttime="123",
+        sync_error="s3 said no",
+        util_recent=[1.0, None],
+    )
+    jobs.write_state("j1", state)
+    assert jobs.read_state("j1") == state
+    assert jobs.PHASES == ("setup", "preflight", "main", "sync")

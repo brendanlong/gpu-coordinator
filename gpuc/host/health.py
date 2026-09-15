@@ -18,12 +18,13 @@ from typing import Any
 from gpuc.host import USER_AGENT, gpus, jobs, paths
 from gpuc.host.gpus import SmiRunner
 
-DEFAULT_DOWNLOAD_URL = (
-    "https://download.pytorch.org/whl/cpu/torch-2.5.1%2Bcpu-cp311-cp311-linux_x86_64.whl"
-)
+# A sized, stable endpoint rather than a pinned wheel: a wheel URL rots when the
+# version is yanked, and then every bootstrap fails a network check for a
+# reason that has nothing to do with the network.
+DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=50000000"
 DEFAULT_DOWNLOAD_BYTES = 50 * 1024 * 1024
 DEFAULT_MIN_MBPS = 1.0
-DEFAULT_MIN_FREE_GB = 20.0
+DEFAULT_MIN_FREE_GB = 5.0
 DEFAULT_DOWNLOAD_TIMEOUT_S = 120.0
 
 Downloader = Callable[[str, int, float], int]
@@ -36,6 +37,7 @@ class Check:
     ok: bool
     detail: str
     value: float | str | None = None
+    warn: bool = False
 
 
 def check_driver(smi: SmiRunner = gpus.run_nvidia_smi) -> Check:
@@ -61,12 +63,13 @@ def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:
     root.mkdir(parents=True, exist_ok=True)
     free_gb = shutil.disk_usage(root).free / 1e9
     ok = free_gb >= min_free_gb
-    return Check(
-        "disk",
-        ok,
-        f"{free_gb:.1f} GB free on the {root} volume (floor {min_free_gb:.0f} GB)",
-        round(free_gb, 1),
-    )
+    detail = f"{free_gb:.1f} GB free on the {root} volume (floor {min_free_gb:.1f} GB)"
+    if not ok:
+        detail += (
+            "; jobs sync outputs through this volume, so free space here or raise "
+            "--min-free-gb if you know the job is small"
+        )
+    return Check("disk", ok, detail, round(free_gb, 1))
 
 
 def http_download(url: str, max_bytes: int, timeout: float) -> int:
@@ -99,7 +102,16 @@ def check_download(
     try:
         read = downloader(url, max_bytes, timeout)
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        return Check("download", False, f"GET {url} failed: {exc}")
+        # A warning, not a failure: one unreachable measurement endpoint is not
+        # evidence that this host cannot reach S3 or Hugging Face, and failing
+        # bootstrap over it strands a pod we are already paying for.
+        return Check(
+            "download",
+            True,
+            f"could not measure throughput, GET {url} failed: {exc}",
+            None,
+            warn=True,
+        )
     elapsed = max(time.monotonic() - start, 1e-6)
     mbps = (read / 1e6) / elapsed
     if read == 0:
@@ -136,6 +148,7 @@ def run_checks(
         "host": config.host,
         "gpus": config.gpus,
         "ok": all(c.ok for c in checks),
+        "warnings": [c.detail for c in checks if c.warn],
         "checks": [asdict(c) for c in checks],
     }
 

@@ -63,7 +63,11 @@ jobs/<jobid>/
   spec.json          # the submitted JobSpec (immutable)
   state.json         # {"status": queued|running|succeeded|failed|cancelled, "attempt": n,
                      #  "reason": str|null, "exit_code": int|null, "gpus": [...], "started_at", "ended_at",
-                     #  "phase": setup|main|sync, "pid": int|null, "pgid": int|null}
+                     #  "phase": setup|preflight|main|sync, "pid": int|null, "pgid": int|null,
+                     #  "runner_pid": int|null, "runner_boot_id": str|null,
+                     #  "runner_starttime": str|null, "sync_error": str|null}
+                     # pgid is the *job's* group, published by the runner when it spawns a phase.
+                     # It is absent during the launch window; cancel is the marker alone until then.
   workdir/           # rsynced code (git-tracked files only)
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir

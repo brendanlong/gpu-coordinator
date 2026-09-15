@@ -16,7 +16,7 @@ from typing import Any
 
 import gpuc
 from gpuc.control.config import HostEntry, Settings, transport_for, utc_now
-from gpuc.control.remote import HostSession, resolve_home
+from gpuc.control.remote import HostSession, parse_last_json, resolve_home
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
@@ -207,13 +207,12 @@ def write_host_config(session: HostSession, entry: HostEntry) -> None:
 def run_health(session: HostSession, health_args: str = "") -> dict[str, Any]:
     args = f"health {health_args}".strip()
     result = session.host_cli(args, timeout=HEALTH_TIMEOUT_S, check=False)
-    try:
-        report: dict[str, Any] = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+    report = parse_last_json(result.stdout)
+    if not isinstance(report, dict):
         raise BootstrapError(
             f"host health on {session.entry.name} produced no JSON (exit {result.returncode}):\n"
-            f"{result.output.strip()[-1500:]}\n({exc})"
-        ) from exc
+            f"{result.output.strip()[-1500:]}"
+        )
     if not report.get("ok"):
         failed = [c for c in report.get("checks", []) if not c.get("ok")]
         summary = "\n".join(f"  - {c['name']}: {c['detail']}" for c in failed)
@@ -280,6 +279,9 @@ def bootstrap_host(
 
     health = run_health(session, health_args)
     report("health: " + "; ".join(f"{c['name']} ok" for c in health.get("checks", [])))
+    for warning in health.get("warnings", []):
+        warnings.append(warning)
+        report(f"WARNING: {warning}")
 
     pid = start_dispatcher(session)
     report(f"dispatcher running (pid {pid})")

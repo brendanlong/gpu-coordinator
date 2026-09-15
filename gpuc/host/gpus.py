@@ -44,13 +44,35 @@ def _query(fields: list[str], smi: SmiRunner, extra: list[str] | None = None) ->
     rows: list[list[str]] = []
     for line in smi(args).splitlines():
         line = line.strip()
-        if line:
-            rows.append([cell.strip() for cell in line.split(",")])
+        if not line:
+            continue
+        cells = [cell.strip() for cell in line.split(",")]
+        if len(cells) != len(fields):
+            raise GpuError(
+                f"nvidia-smi --query-gpu={','.join(fields)} returned {len(cells)} field(s) "
+                f"in {line!r}, expected {len(fields)}"
+            )
+        rows.append(cells)
     return rows
 
 
+def _as_int(cell: str, field: str) -> int:
+    """nvidia-smi prints `[N/A]` or `[Not Supported]` instead of failing."""
+    try:
+        return int(cell)
+    except ValueError as exc:
+        raise GpuError(f"nvidia-smi reported {field}={cell!r}, which is not a number") from exc
+
+
+def _as_float(cell: str, field: str) -> float:
+    try:
+        return float(cell)
+    except ValueError as exc:
+        raise GpuError(f"nvidia-smi reported {field}={cell!r}, which is not a number") from exc
+
+
 def list_gpus(smi: SmiRunner = run_nvidia_smi) -> list[Gpu]:
-    return [Gpu(int(index), uuid) for index, uuid in _query(["index", "uuid"], smi)]
+    return [Gpu(_as_int(index, "index"), uuid) for index, uuid in _query(["index", "uuid"], smi)]
 
 
 def driver_version(smi: SmiRunner = run_nvidia_smi) -> str:
@@ -79,7 +101,7 @@ def sample_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) ->
     out: dict[str, float] = {}
     for uuid, util in rows:
         if uuid in uuids:
-            out[uuid] = float(util)
+            out[uuid] = _as_float(util, f"utilization.gpu for {uuid}")
     return out
 
 

@@ -94,6 +94,9 @@ def ensure_layout() -> None:
     queue_dir().mkdir(parents=True, exist_ok=True)
     jobs_dir().mkdir(parents=True, exist_ok=True)
     secrets_dir().mkdir(parents=True, exist_ok=True)
+    # The whole tree, not just secrets/: job dirs hold a workdir and logs that
+    # other users of a shared box have no business reading.
+    home().chmod(0o700)
     secrets_dir().chmod(0o700)
 
 

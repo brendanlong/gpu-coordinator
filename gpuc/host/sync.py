@@ -7,23 +7,35 @@ itself never depends on either tool being present.
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+import traceback
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from gpuc.host import paths
+from gpuc.host import jobs, paths
 from gpuc.host.jobs import JobSpec, Output
 
 MIN_AGE_S = 10.0
 DEFAULT_TIMEOUT_S = 1800.0
+MAX_EXCLUDES = 200
 
 
 class SyncError(RuntimeError):
     pass
+
+
+class MissingOutput(SyncError):
+    """The output path the spec names is not there. Not the same failure as a
+    broken upload: nothing was produced, so `sync` would be a misleading reason."""
+
+
+class TooManyRecentFiles(SyncError):
+    """More files are in flight than we are willing to name on the command line."""
 
 
 @dataclass
@@ -33,11 +45,22 @@ class CommandResult:
     output: str
 
 
-CommandRunner = Callable[[list[str], float], CommandResult]
+CommandRunner = Callable[[list[str], "float | None"], CommandResult]
 
 
-def run_command(argv: list[str], timeout: float = DEFAULT_TIMEOUT_S) -> CommandResult:
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+def run_command(argv: list[str], timeout: float | None = DEFAULT_TIMEOUT_S) -> CommandResult:
+    """Never raises anything but SyncError: an upload tool that is missing,
+    wedged or killed must fail the job's sync step, not the runner."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise SyncError(
+            f"`{' '.join(argv)}` on host {_host_label()} timed out after {timeout}s"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise SyncError(f"`{argv[0]}` not found on host {_host_label()}: {exc}") from exc
+    except OSError as exc:
+        raise SyncError(f"`{' '.join(argv)}` on host {_host_label()} could not run: {exc}") from exc
     return CommandResult(argv, proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
 
 
@@ -93,7 +116,19 @@ def recently_modified(root: Path, min_age_s: float = MIN_AGE_S) -> list[str]:
     return sorted(out)
 
 
-def _exclude_args(flag: str, names: Iterable[str]) -> list[str]:
+def exclude_args(flag: str, root: Path, min_age_s: float) -> list[str]:
+    """`--exclude NAME` pairs for files still being written.
+
+    Capped: a job that writes thousands of small files in a tick would
+    otherwise build an argv megabytes long (and blow E2BIG). Skipping the tick
+    costs nothing -- the next one picks the files up.
+    """
+    names = recently_modified(root, min_age_s)
+    if len(names) > MAX_EXCLUDES:
+        raise TooManyRecentFiles(
+            f"{len(names)} files under {root} were modified in the last {min_age_s:g}s "
+            f"(cap {MAX_EXCLUDES}); skipping this sync tick"
+        )
     args: list[str] = []
     for name in names:
         args += [flag, name]
@@ -106,7 +141,7 @@ def sync_dir_to_s3(
     *,
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
-    timeout: float = DEFAULT_TIMEOUT_S,
+    timeout: float | None = DEFAULT_TIMEOUT_S,
 ) -> None:
     aws = aws_binary()
     if aws is None:
@@ -115,9 +150,9 @@ def sync_dir_to_s3(
             f"on host {_host_label()}; cannot upload {local} to {dest}"
         )
     if not local.exists():
-        raise SyncError(f"output path does not exist: {local}")
+        raise MissingOutput(f"output path does not exist: {local}")
     argv = [aws, "s3", "sync", str(local), dest.rstrip("/"), "--only-show-errors"]
-    argv += _exclude_args("--exclude", recently_modified(local, min_age_s))
+    argv += exclude_args("--exclude", local, min_age_s)
     result = runner(argv, timeout)
     if result.returncode != 0:
         _fail(result)
@@ -128,7 +163,7 @@ def copy_file_to_s3(
     dest: str,
     *,
     runner: CommandRunner = run_command,
-    timeout: float = 300.0,
+    timeout: float | None = 300.0,
 ) -> None:
     aws = aws_binary()
     if aws is None:
@@ -147,7 +182,7 @@ def upload_dir_to_hf(
     *,
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
-    timeout: float = DEFAULT_TIMEOUT_S,
+    timeout: float | None = DEFAULT_TIMEOUT_S,
 ) -> None:
     hf = hf_binary()
     if hf is None:
@@ -156,9 +191,9 @@ def upload_dir_to_hf(
             f"{_host_label()}; cannot upload {local} to {repo}:{path_in_repo}"
         )
     if not local.exists():
-        raise SyncError(f"output path does not exist: {local}")
+        raise MissingOutput(f"output path does not exist: {local}")
     argv = [hf, "upload", repo, str(local), path_in_repo]
-    argv += _exclude_args("--exclude", recently_modified(local, min_age_s))
+    argv += exclude_args("--exclude", local, min_age_s)
     result = runner(argv, timeout)
     if result.returncode != 0:
         _fail(result)
@@ -175,10 +210,17 @@ def sync_output(
     *,
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
+    timeout: float | None = DEFAULT_TIMEOUT_S,
 ) -> None:
     local = resolve_local(output, workdir, job_id)
     if output.s3:
-        sync_dir_to_s3(local, output.s3.format(job_id=job_id), min_age_s=min_age_s, runner=runner)
+        sync_dir_to_s3(
+            local,
+            output.s3.format(job_id=job_id),
+            min_age_s=min_age_s,
+            runner=runner,
+            timeout=timeout,
+        )
     if output.hf:
         upload_dir_to_hf(
             local,
@@ -186,6 +228,7 @@ def sync_output(
             (output.hf_path or job_id).format(job_id=job_id),
             min_age_s=min_age_s,
             runner=runner,
+            timeout=timeout,
         )
 
 
@@ -196,30 +239,46 @@ def sync_outputs(
     *,
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
+    timeout: float | None = DEFAULT_TIMEOUT_S,
 ) -> None:
-    errors: list[str] = []
+    errors: list[SyncError] = []
     for output in outputs:
         try:
-            sync_output(output, workdir, job_id, min_age_s=min_age_s, runner=runner)
+            sync_output(
+                output, workdir, job_id, min_age_s=min_age_s, runner=runner, timeout=timeout
+            )
         except SyncError as exc:
-            errors.append(str(exc))
-    if errors:
-        raise SyncError("; ".join(errors))
+            errors.append(exc)
+    if not errors:
+        return
+    # Keep the specific kind when every output agrees, so the runner can still
+    # tell "produced nothing" from "upload broke".
+    kind = type(errors[0]) if len({type(e) for e in errors}) == 1 else SyncError
+    raise kind("; ".join(str(e) for e in errors))
 
 
 def sync_job_meta(
-    job_id: str, s3_prefix: str | None, *, runner: CommandRunner = run_command
+    job_id: str,
+    s3_prefix: str | None,
+    *,
+    runner: CommandRunner = run_command,
+    timeout: float | None = 300.0,
 ) -> None:
     if not s3_prefix:
         return
     base = f"{s3_prefix.rstrip('/')}/jobs/{job_id}"
     for path in (paths.log_file(job_id), paths.state_file(job_id)):
         if path.exists():
-            copy_file_to_s3(path, f"{base}/{path.name}", runner=runner)
+            copy_file_to_s3(path, f"{base}/{path.name}", runner=runner, timeout=timeout)
 
 
 class SyncLoop:
-    """Background periodic sync; `final()` runs one last synchronous pass."""
+    """Background periodic sync; `final()` runs one last synchronous pass.
+
+    The final pass has no wall-clock timeout: it is the last chance to save a
+    run's outputs, and a 30-minute cap on a 200 GB checkpoint upload would
+    throw away exactly the work that is most expensive to recompute.
+    """
 
     def __init__(
         self,
@@ -237,25 +296,45 @@ class SyncLoop:
         self._min_age_s = min_age_s
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._tick_lock = threading.Lock()
         self.last_error: str | None = None
 
-    def _tick(self, min_age_s: float) -> None:
-        sync_outputs(
-            self._spec.outputs,
-            self._workdir,
-            self._spec.job_id,
-            min_age_s=min_age_s,
-            runner=self._runner,
-        )
-        sync_job_meta(self._spec.job_id, self._s3_prefix, runner=self._runner)
+    def _note(self, message: str) -> None:
+        try:
+            with paths.log_file(self._spec.job_id).open("a") as handle:
+                handle.write(f">>> sync: {message}\n")
+        except OSError:
+            pass
+
+    def _record_error(self, message: str) -> None:
+        self.last_error = message
+        self._note(message)
+        with contextlib.suppress(RuntimeError, OSError, KeyError):
+            jobs.update_state(self._spec.job_id, sync_error=message)
+
+    def _tick(self, min_age_s: float, timeout: float | None = DEFAULT_TIMEOUT_S) -> None:
+        with self._tick_lock:
+            sync_outputs(
+                self._spec.outputs,
+                self._workdir,
+                self._spec.job_id,
+                min_age_s=min_age_s,
+                runner=self._runner,
+                timeout=timeout,
+            )
+            sync_job_meta(self._spec.job_id, self._s3_prefix, runner=self._runner, timeout=timeout)
 
     def _loop(self) -> None:
         interval = max(1, self._spec.sync_interval_s)
         while not self._stop.wait(interval):
             try:
                 self._tick(self._min_age_s)
+            except (TooManyRecentFiles, MissingOutput) as exc:
+                self._note(f"WARNING: {exc}")
             except SyncError as exc:
-                self.last_error = str(exc)
+                self._record_error(str(exc))
+            except BaseException as exc:
+                self._record_error(f"periodic sync raised {exc!r}\n{traceback.format_exc()}")
 
     def start(self) -> None:
         if not self._spec.outputs and not self._s3_prefix:
@@ -264,12 +343,13 @@ class SyncLoop:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the loop and wait for any tick already in flight."""
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=30)
+            self._thread.join()
             self._thread = None
 
     def final(self) -> None:
         """Stop the loop and do one complete sync, including files just written."""
         self.stop()
-        self._tick(min_age_s=0.0)
+        self._tick(min_age_s=0.0, timeout=None)

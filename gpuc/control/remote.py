@@ -62,14 +62,47 @@ class HostSession:
 
     def host_json(self, args: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> Any:
         result = self.host_cli(args, timeout=timeout)
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
+        document = parse_last_json(result.stdout)
+        if document is _NO_JSON:
             raise RemoteError(
                 self.entry.name,
                 host_command(self.python, self.home, args),
-                f"expected JSON on stdout, got:\n{_tail(result.output)}\n({exc})",
-            ) from exc
+                f"expected JSON on stdout, got:\n{_tail(result.output)}",
+            )
+        return document
+
+
+_NO_JSON = object()
+
+
+def parse_last_json(text: str) -> Any:
+    """The last JSON document on stdout, or ``_NO_JSON``.
+
+    Hosts print things we do not control around our output -- a MOTD, an
+    activation notice, a warning from a shell rc file -- so the document we
+    want is the last one in the stream, not the whole stream. Every line that
+    could begin a document is tried with raw_decode, and the winner is the one
+    that *ends* last: inside a pretty-printed report every nested object also
+    starts a line, and the outermost one is the answer.
+    """
+    decoder = json.JSONDecoder()
+    best: tuple[int, int] | None = None
+    document: Any = _NO_JSON
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped[:1] in ("{", "["):
+            start = offset + len(line) - len(stripped)
+            try:
+                parsed, consumed = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                parsed, consumed = None, None
+            if consumed is not None:
+                candidate = (start + consumed, -start)
+                if best is None or candidate > best:
+                    best, document = candidate, parsed
+        offset += len(line)
+    return document
 
 
 def _tail(text: str, lines: int = 10) -> str:

@@ -15,8 +15,9 @@ import subprocess
 import sys
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO
 
 from gpuc.host import gpus, jobs, paths, queue, sync
@@ -27,6 +28,7 @@ KILL_GRACE_S = 15.0
 SAMPLE_INTERVAL_S = 30.0
 UTIL_SAMPLES_KEPT = 40  # 20 minutes at the default sample interval
 POLL_INTERVAL_S = 0.5
+TERMINATED_EXIT_CODE = 143  # 128 + SIGTERM, the shell convention
 
 UtilSampler = Callable[[Sequence[str]], float]
 
@@ -43,6 +45,89 @@ if count != expected:
 print(f"gpu preflight ok: torch {torch.__version__} cuda {torch.version.cuda} "
       f"devices {count} {torch.cuda.get_device_name(0)}")
 """
+
+
+# -- process facts ------------------------------------------------------------
+# A recorded pid alone proves nothing: pids are reused within a boot and reused
+# from 1 again after a reboot, so "is the process that wrote this file still
+# running?" needs the boot id and the process start time as well.
+
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def boot_id() -> str | None:
+    try:
+        return BOOT_ID_PATH.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def parse_starttime(stat: str) -> str | None:
+    """Field 22 of ``/proc/<pid>/stat``, as text.
+
+    Split after the last ``)``: the comm field is parenthesised and may itself
+    contain spaces and parentheses, which breaks a naive ``split()``.
+    """
+    _, sep, rest = stat.rpartition(")")
+    if not sep:
+        return None
+    fields = rest.split()
+    if len(fields) < 20:
+        return None
+    return fields[19]
+
+
+def starttime(pid: int) -> str | None:
+    try:
+        return parse_starttime(Path(f"/proc/{pid}/stat").read_text())
+    except OSError:
+        return None
+
+
+def cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.decode("utf-8", "replace").replace("\0", " ").strip()
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def is_gpuc_process(pid: int) -> bool:
+    return "gpuc.host" in cmdline(pid)
+
+
+def recorded_process_alive(
+    pid: int | None, recorded_boot_id: str | None = None, recorded_starttime: str | None = None
+) -> bool:
+    """Is the *same* process we recorded still running?"""
+    if not pid or not pid_alive(pid):
+        return False
+    current_boot = boot_id()
+    if recorded_boot_id and current_boot and recorded_boot_id != current_boot:
+        return False
+    current_start = starttime(pid)
+    return not (recorded_starttime and current_start and recorded_starttime != current_start)
+
+
+class _Terminated(BaseException):
+    """The runner itself was signalled. A BaseException so that no `except
+    Exception` in a phase can swallow the shutdown."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
 
 
 def process_group_alive(pgid: int) -> bool:
@@ -90,6 +175,10 @@ def kill_process_group(
         os.killpg(pgid, signal.SIGKILL)
 
 
+def preflight_command() -> str:
+    return f"uv run --no-sync python -c {_shell_quote(PREFLIGHT_SOURCE)}"
+
+
 @dataclass
 class RunnerDeps:
     smi: SmiRunner = gpus.run_nvidia_smi
@@ -101,6 +190,7 @@ class RunnerDeps:
     sample_interval_s: float = SAMPLE_INTERVAL_S
     kill_grace_s: float = KILL_GRACE_S
     preflight: bool = True
+    preflight_command: Callable[[], str] = preflight_command
 
     def util_sampler(self) -> UtilSampler:
         if self.sampler is not None:
@@ -158,6 +248,8 @@ class JobRunner:
         self.assigned: list[str] = list(self.state.gpus)
         self.config = jobs.read_config()
         self.kill_reason: str | None = None
+        self._current: subprocess.Popen[bytes] | None = None
+        self._terminating = False
 
     # -- logging ---------------------------------------------------------
     def _log(self, log: IO[bytes], message: str) -> None:
@@ -210,8 +302,11 @@ class JobRunner:
                 next_sample = t + deps.sample_interval_s
                 try:
                     util = sampler(self.assigned)
-                except gpus.GpuError as exc:
+                except (gpus.GpuError, ValueError) as exc:
+                    # A missing sample is not evidence of an idle GPU, so it is
+                    # recorded as unknown and never feeds the watchdog window.
                     self._log(log, f"utilization sample failed: {exc}")
+                    self._record_util(None)
                     continue
                 self._record_util(util)
                 if not watch_low_util or t < watch_from:
@@ -227,8 +322,9 @@ class JobRunner:
                     break
         return proc.wait()
 
-    def _record_util(self, util: float) -> None:
-        recent = [*jobs.read_state(self.job_id).util_recent, round(util, 1)][-UTIL_SAMPLES_KEPT:]
+    def _record_util(self, util: float | None) -> None:
+        sample = None if util is None else round(util, 1)
+        recent = [*jobs.read_state(self.job_id).util_recent, sample][-UTIL_SAMPLES_KEPT:]
         jobs.update_state(self.job_id, util_recent=recent, util_sampled_at=jobs.utc_now())
 
     def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
@@ -247,9 +343,42 @@ class JobRunner:
     ) -> int:
         self._log(log, f"phase={phase}: {command}")
         proc = self._spawn(command, env, log)
+        # Left set if _monitor raises: a terminating runner needs the handle to
+        # the group it must take down.
+        self._current = proc
         code = self._monitor(proc, phase, log, job_start)
+        self._current = None
         self._log(log, f"phase={phase} exited {code}")
         return code
+
+    # -- signals ---------------------------------------------------------
+    @contextlib.contextmanager
+    def _term_handlers(self) -> Iterator[None]:
+        """Turn SIGTERM/SIGINT into an exception on the main thread.
+
+        Without this the runner dies where it stands: the job's process group
+        survives holding a GPU the dispatcher is about to hand to someone else,
+        and the job is left `running` forever.
+        """
+
+        def handle(signum: int, _frame: object) -> None:
+            if self._terminating:
+                return
+            self._terminating = True
+            raise _Terminated(signum)
+
+        try:
+            previous = [
+                (sig, signal.signal(sig, handle)) for sig in (signal.SIGTERM, signal.SIGINT)
+            ]
+        except ValueError:
+            previous = []  # not the main thread; the caller owns the signals
+        try:
+            yield
+        finally:
+            for sig, handler in previous:
+                with contextlib.suppress(ValueError):
+                    signal.signal(sig, handler)
 
     # -- entry point -----------------------------------------------------
     def run(self) -> int:
@@ -262,48 +391,82 @@ class JobRunner:
             self.config.s3_prefix,
             runner=self.deps.command_runner,
         )
-        with paths.log_file(self.job_id).open("ab", buffering=0) as log:
-            jobs.update_state(
-                self.job_id,
-                status="running",
-                phase="setup",
-                started_at=self.state.started_at or jobs.utc_now(),
-                runner_pid=os.getpid(),
-            )
+        with paths.log_file(self.job_id).open("ab", buffering=0) as log, self._term_handlers():
             try:
-                gpus.assert_uuids_present(self.assigned, self.deps.smi)
-            except gpus.GpuError as exc:
-                self._log(log, f"GPU assertion failed: {exc}")
-                return self._finalize(1, "failed", "gpu-assert", sync_loop, log)
+                return self._run_phases(env, sync_loop, log, job_start)
+            except _Terminated as exc:
+                return self._finalize_terminated(exc, sync_loop, log)
 
-            self._log(
-                log,
-                f"job {self.job_id} on {self.config.host} "
-                f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES'] or '(none)'}",
-            )
+    def _run_phases(
+        self, env: dict[str, str], sync_loop: sync.SyncLoop, log: IO[bytes], job_start: float
+    ) -> int:
+        jobs.update_state(
+            self.job_id,
+            status="running",
+            phase="setup",
+            started_at=self.state.started_at or jobs.utc_now(),
+            runner_pid=os.getpid(),
+            runner_boot_id=boot_id(),
+            runner_starttime=starttime(os.getpid()),
+        )
+        try:
+            gpus.assert_uuids_present(self.assigned, self.deps.smi)
+        except gpus.GpuError as exc:
+            self._log(log, f"GPU assertion failed: {exc}")
+            return self._finalize(1, "failed", "gpu-assert", sync_loop, log)
 
-            if self.spec.setup:
-                code = self._run_phase("setup", self.spec.setup, env, log, job_start)
-                if code != 0 or self.kill_reason:
-                    return self._finalize(code, *self._classify(code, "setup"), sync_loop, log)
+        self._log(
+            log,
+            f"job {self.job_id} on {self.config.host} "
+            f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES'] or '(none)'}",
+        )
 
-            if self.assigned and self.deps.preflight:
-                code = self._run_phase(
-                    "preflight",
-                    f"uv run --no-sync python -c {_shell_quote(PREFLIGHT_SOURCE)}",
-                    env,
-                    log,
-                    job_start,
-                )
-                if code != 0 or self.kill_reason:
-                    return self._finalize(
-                        code, *self._classify(code, "gpu-preflight"), sync_loop, log
-                    )
+        cancelled = self._cancelled_before("setup", sync_loop, log)
+        if cancelled is not None:
+            return cancelled
 
-            sync_loop.start()
-            code = self._run_phase("main", self.spec.command, env, log, job_start)
-            status, reason = self._classify(code, None)
-            return self._finalize(code, status, reason, sync_loop, log)
+        if self.spec.setup:
+            code = self._run_phase("setup", self.spec.setup, env, log, job_start)
+            if code != 0 or self.kill_reason:
+                return self._finalize(code, *self._classify(code, "setup"), sync_loop, log)
+
+        if self.assigned and self.deps.preflight:
+            cancelled = self._cancelled_before("preflight", sync_loop, log)
+            if cancelled is not None:
+                return cancelled
+            code = self._run_phase("preflight", self.deps.preflight_command(), env, log, job_start)
+            if code != 0 or self.kill_reason:
+                return self._finalize(code, *self._classify(code, "gpu-preflight"), sync_loop, log)
+
+        cancelled = self._cancelled_before("main", sync_loop, log)
+        if cancelled is not None:
+            return cancelled
+
+        sync_loop.start()
+        code = self._run_phase("main", self.spec.command, env, log, job_start)
+        status, reason = self._classify(code, None)
+        return self._finalize(code, status, reason, sync_loop, log)
+
+    def _cancelled_before(self, phase: str, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int | None:
+        """A job cancelled during the launch window never starts a phase."""
+        if not queue.is_cancelled(self.job_id):
+            return None
+        self._log(log, f"cancel marker present before phase={phase}; not starting it")
+        return self._finalize(TERMINATED_EXIT_CODE, "cancelled", "cancelled", sync_loop, log)
+
+    def _finalize_terminated(
+        self, exc: _Terminated, sync_loop: sync.SyncLoop, log: IO[bytes]
+    ) -> int:
+        name = signal.Signals(exc.signum).name
+        self._log(log, f"runner received {name}; stopping the job")
+        proc = self._current
+        if proc is not None:
+            self._kill(proc, "terminated", log)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+        cancelled = queue.is_cancelled(self.job_id)
+        status, reason = ("cancelled", "cancelled") if cancelled else ("failed", "terminated")
+        return self._finalize(TERMINATED_EXIT_CODE, status, reason, sync_loop, log)
 
     def _classify(self, code: int, failure_reason: str | None) -> tuple[str, str | None]:
         if self.kill_reason == "cancelled":
@@ -323,14 +486,17 @@ class JobRunner:
         log: IO[bytes],
     ) -> int:
         jobs.update_state(self.job_id, phase="sync")
+        # The job's environment was captured before the first phase, so the
+        # secrets file has done its job and should not outlive it on disk.
+        paths.job_env_file(self.job_id).unlink(missing_ok=True)
         try:
             sync_loop.final()
+        except sync.MissingOutput as exc:
+            self._log(log, f"final sync found no outputs: {exc}")
+            status, reason, exit_code = self._blame(status, reason, exit_code, "no-outputs")
         except sync.SyncError as exc:
             self._log(log, f"final sync FAILED: {exc}")
-            if status == "succeeded":
-                status, reason, exit_code = "failed", "sync", 1
-            elif reason:
-                reason = f"{reason}+sync"
+            status, reason, exit_code = self._blame(status, reason, exit_code, "sync")
         if sync_loop.last_error and status == "succeeded":
             self._log(log, f"periodic sync had errors: {sync_loop.last_error}")
 
@@ -350,6 +516,14 @@ class JobRunner:
         except sync.SyncError as exc:
             self._log(log, f"final state upload failed: {exc}")
         return exit_code
+
+    @staticmethod
+    def _blame(
+        status: str, reason: str | None, exit_code: int, sync_reason: str
+    ) -> tuple[str, str | None, int]:
+        if status == "succeeded":
+            return "failed", sync_reason, 1
+        return status, f"{reason}+{sync_reason}" if reason else sync_reason, exit_code
 
 
 def _shell_quote(text: str) -> str:

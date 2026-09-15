@@ -100,14 +100,22 @@ class LocalTransport:
     def run(
         self, command: str, *, timeout: float = DEFAULT_TIMEOUT_S, check: bool = True
     ) -> CommandResult:
-        return _execute(self.host, ["bash", "-lc", command], timeout=timeout, check=check)
+        # Not a login shell: a profile that prints a banner (or edits PATH)
+        # would end up in the output we parse as JSON.
+        return _execute(self.host, ["bash", "-c", command], timeout=timeout, check=check)
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
         path = Path(remote_path).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         data = content.encode() if isinstance(content, str) else content
         tmp = path.parent / f".{path.name}.tmp"
-        tmp.write_bytes(data)
+        # Created with the final mode, never briefly world-readable: these are
+        # secrets files on boxes with other users.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
         tmp.chmod(mode)
         os.replace(tmp, path)
 
@@ -152,7 +160,9 @@ class SshTransport:
                 "StrictHostKeyChecking=accept-new",
             ]
         if self.control_dir is not None:
-            socket = self.control_dir / f"cm-{self.host}"
+            # %C is a hash of (host, port, user, jump): one socket per real
+            # connection, and short enough never to overrun sun_path.
+            socket = self.control_dir / "cm-%C"
             options += [
                 "-o",
                 "ControlMaster=auto",
@@ -167,7 +177,9 @@ class SshTransport:
         return options + self.extra_options
 
     def ssh_argv(self, command: str) -> list[str]:
-        return ["ssh", *self.ssh_options(), self.target, command]
+        # The remote login shell may be anything; bash -c makes the command we
+        # send mean the same thing everywhere, without sourcing a profile.
+        return ["ssh", *self.ssh_options(), self.target, f"bash -c {shlex.quote(command)}"]
 
     def _prepare(self) -> None:
         if self.control_dir is not None:
@@ -184,8 +196,11 @@ class SshTransport:
 
     def put_file_argv(self, remote_path: str, mode: int = 0o600) -> list[str]:
         quoted = shlex.quote(remote_path)
+        # umask first: `cat >` alone creates the file 0644, so a secret is
+        # world-readable for as long as it takes the chmod to land.
         return self.ssh_argv(
-            f"mkdir -p $(dirname {quoted}) && cat > {quoted} && chmod {mode:o} {quoted}"
+            f'mkdir -p "$(dirname {quoted})" && (umask 077 && cat > {quoted}) '
+            f"&& chmod {mode:o} {quoted}"
         )
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
@@ -235,8 +250,11 @@ def rsync_argv(
         argv += ["--delete-after"]
     else:
         # --files-from keeps `git ls-files` output off the command line, which
-        # otherwise blows the argv limit on a real repository.
-        argv += ["--files-from=-"]
+        # otherwise blows the argv limit on a real repository. NUL-separated so
+        # that a filename with a newline in it cannot split into two entries,
+        # and --ignore-missing-args so a file deleted between `git ls-files` and
+        # the transfer is skipped instead of failing the whole sync.
+        argv += ["--from0", "--files-from=-", "--ignore-missing-args"]
     argv += [f"{str(local_root).rstrip('/')}/", destination]
     return argv
 
@@ -244,17 +262,23 @@ def rsync_argv(
 def _files_stdin(files: Sequence[str] | None) -> bytes | None:
     if files is None:
         return None
-    return ("\n".join(files) + "\n").encode()
+    return "".join(f"{name}\0" for name in files).encode()
 
 
 def git_tracked_files(root: Path) -> list[str]:
-    argv = ["git", "-C", str(root), "ls-files"]
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+    # quotePath=false and -z: without both, a path with a space, a quote or a
+    # non-ASCII byte comes back C-quoted and rsync then looks for a file whose
+    # name contains literal backslashes.
+    argv = ["git", "-C", str(root), "-c", "core.quotePath=false", "ls-files", "-z"]
+    proc = subprocess.run(argv, capture_output=True, check=False)
+    stdout = proc.stdout.decode("utf-8", "replace")
     if proc.returncode != 0:
         raise TransportError(
-            CommandResult("local", argv, proc.returncode, proc.stdout, proc.stderr)
+            CommandResult(
+                "local", argv, proc.returncode, stdout, proc.stderr.decode("utf-8", "replace")
+            )
         )
-    return [line for line in proc.stdout.splitlines() if line]
+    return [name for name in stdout.split("\0") if name]
 
 
 def uncommitted_patch(root: Path) -> str:
@@ -271,16 +295,21 @@ def make_transport(
     port: int = 22,
     key: str | None = None,
     state_dir: Path | None = None,
+    known_hosts: Path | None = None,
     extra_options: Iterable[str] = (),
 ) -> Transport:
+    """``known_hosts`` overrides the shared file: provisioning gives each pod
+    its own, so a recycled RunPod address cannot collide with a pinned key."""
     if ssh is None:
         return LocalTransport(host=host)
+    if known_hosts is None and state_dir is not None:
+        known_hosts = state_dir / "known_hosts"
     return SshTransport(
         host=host,
         target=ssh,
         port=port,
         key=key,
         control_dir=None if state_dir is None else state_dir / "control",
-        known_hosts=None if state_dir is None else state_dir / "known_hosts",
+        known_hosts=known_hosts,
         extra_options=list(extra_options),
     )

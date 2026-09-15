@@ -47,3 +47,37 @@ def test_real_runner_reports_a_clear_error_when_binary_is_absent(
     with pytest.raises(gpus.GpuError) as excinfo:
         gpus.run_nvidia_smi(["--query-gpu=uuid", "--format=csv,noheader"])
     assert "nvidia-smi not found" in str(excinfo.value)
+
+
+def garbage_smi(value: str):  # type: ignore[no-untyped-def]
+    def run(args: list[str]) -> str:
+        fields = next(a for a in args if a.startswith("--query-gpu=")).split("=", 1)[1].split(",")
+        return (
+            ", ".join(value if f == "utilization.gpu" or f == "index" else "GPU-x" for f in fields)
+            + "\n"
+        )
+
+    return run
+
+
+@pytest.mark.parametrize("value", ["[N/A]", "[Not Supported]", "", "n/a"])
+def test_unparsable_utilization_is_a_gpu_error(value: str) -> None:
+    with pytest.raises(gpus.GpuError) as excinfo:
+        gpus.sample_utilization(["GPU-x"], garbage_smi(value))
+    assert "not a number" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["[N/A]", "garbage"])
+def test_an_unparsable_index_is_a_gpu_error(value: str) -> None:
+    with pytest.raises(gpus.GpuError, match="not a number"):
+        gpus.list_gpus(garbage_smi(value))
+
+
+def test_a_short_row_is_a_gpu_error_not_a_crash() -> None:
+    with pytest.raises(gpus.GpuError, match="expected 2"):
+        gpus.list_gpus(lambda args: "0\n")
+
+
+def test_mean_utilization_propagates_the_parse_error() -> None:
+    with pytest.raises(gpus.GpuError):
+        gpus.mean_utilization(["GPU-x"], garbage_smi("[N/A]"))

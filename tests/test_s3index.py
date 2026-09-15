@@ -80,3 +80,32 @@ def test_log_fallback_uri_matches_what_the_host_uploads() -> None:
 def test_no_bucket_means_no_mirror() -> None:
     assert default_s3_prefix(Settings(), "spar") is None
     assert S3Index.from_settings(Settings()) is None
+
+
+def test_list_index_follows_continuation_tokens() -> None:
+    client = FakeS3Client(page_size=2)
+    s3 = S3Index("bkt", client)
+    for index in range(7):
+        s3.put_index(IndexEntry(job_id=f"j{index}", host="spar"))
+    client.list_calls.clear()
+    entries = s3.list_index()
+    assert [e.job_id for e in entries] == [f"j{index}" for index in range(7)]
+    assert len(client.list_calls) == 4
+    assert client.list_calls[1]["Token"]
+
+
+def test_list_index_stops_at_the_limit() -> None:
+    client = FakeS3Client(page_size=2)
+    s3 = S3Index("bkt", client)
+    for index in range(7):
+        s3.put_index(IndexEntry(job_id=f"j{index}", host="spar"))
+    assert len(s3.list_index(limit=3)) == 3
+
+
+def test_a_list_failure_names_the_prefix() -> None:
+    class Broken(FakeS3Client):
+        def list_objects_v2(self, **_: object) -> dict[str, object]:
+            raise RuntimeError("AccessDenied")
+
+    with pytest.raises(S3IndexError, match="gpuc/index"):
+        S3Index("bkt", Broken()).list_index()

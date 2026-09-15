@@ -74,10 +74,38 @@ def test_download_check_treats_zero_bytes_as_a_dead_network() -> None:
     assert "0 bytes" in check.detail
 
 
-def test_download_check_catches_transport_errors() -> None:
+def test_a_download_error_is_a_warning_not_a_failed_host() -> None:
     check = health.check_download("http://x", downloader=failing_downloader)
-    assert not check.ok
+    assert check.ok and check.warn
+    assert "could not measure throughput" in check.detail
     assert "name resolution failed" in check.detail
+
+
+def test_a_download_error_leaves_the_report_green_but_warned(gpuc_home: Path) -> None:
+    report = health.run_checks(
+        smi=fake_smi(), downloader=failing_downloader, min_free_gb=0.0, url="http://x"
+    )
+    assert report["ok"]
+    assert report["warnings"] and "name resolution failed" in report["warnings"][0]
+
+
+def test_zero_bytes_is_still_fatal(gpuc_home: Path) -> None:
+    report = health.run_checks(
+        smi=fake_smi(), downloader=dead_downloader, min_free_gb=0.0, url="http://x"
+    )
+    assert not report["ok"]
+
+
+def test_the_default_download_url_is_a_stable_sized_endpoint() -> None:
+    assert health.DEFAULT_DOWNLOAD_URL == "https://speed.cloudflare.com/__down?bytes=50000000"
+    assert health.DEFAULT_MIN_FREE_GB == 5.0
+
+
+def test_the_disk_floor_message_says_what_to_do(gpuc_home: Path) -> None:
+    check = health.check_disk(min_free_gb=1e9)
+    assert not check.ok
+    assert "floor 1000000000.0 GB" in check.detail
+    assert "--min-free-gb" in check.detail
 
 
 def test_run_checks_emits_json_with_every_check(gpuc_home: Path) -> None:

@@ -9,19 +9,30 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+import traceback
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from gpuc.host import gpus, jobs, paths, queue, sync, terminate
 from gpuc.host.gpus import SmiRunner
-from gpuc.host.runner import kill_process_group, process_group_alive
+from gpuc.host.runner import (
+    boot_id,
+    cmdline,
+    is_gpuc_process,
+    pid_alive,
+    process_group_alive,
+    recorded_process_alive,
+    starttime,
+)
 from gpuc.host.terminate import TerminateCall
 
 HEARTBEAT_INTERVAL_S = 5.0
@@ -29,16 +40,57 @@ HEARTBEAT_STALE_S = 30.0
 LOOP_INTERVAL_S = 2.0
 KILL_GRACE_S = 15.0
 TERMINATE_RETRY_S = 600.0
+MAX_CONSECUTIVE_FAILURES = 20
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return pid_alive(pid)
+
+
+def log_line(message: str) -> None:
+    stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    with contextlib.suppress(OSError), paths.dispatcher_log().open("a") as handle:
+        handle.write(f"{stamp} {message}\n")
+
+
+@dataclass
+class LockBody:
+    """Who holds the lock, in enough detail to tell them apart from a pid that
+    was reused by an unrelated process (or by a process from an earlier boot)."""
+
+    pid: int | None = None
+    pgid: int | None = None
+    starttime: str | None = None
+    boot_id: str | None = None
+
+    def render(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True) + "\n"
+
+    @staticmethod
+    def parse(text: str) -> LockBody:
+        text = text.strip()
+        if not text:
+            return LockBody()
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            return LockBody()
+        if not isinstance(document, dict):
+            return LockBody()
+        return LockBody(
+            pid=_maybe_int(document.get("pid")),
+            pgid=_maybe_int(document.get("pgid")),
+            starttime=_maybe_str(document.get("starttime")),
+            boot_id=_maybe_str(document.get("boot_id")),
+        )
+
+
+def _maybe_int(value: object) -> int | None:
+    return int(value) if isinstance(value, int) else None
+
+
+def _maybe_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 class DispatcherLock:
@@ -56,6 +108,8 @@ class DispatcherLock:
         self._sleep = sleep
         self._fd: int | None = None
         self._last_beat = 0.0
+        self._beat_stop = threading.Event()
+        self._beat_thread: threading.Thread | None = None
         self.takeover_pgid: int | None = None
 
     @property
@@ -76,12 +130,11 @@ class DispatcherLock:
         age = self.heartbeat_age()
         return age is not None and age < self.stale_after_s
 
-    def _holder_pgid(self) -> int | None:
+    def holder(self) -> LockBody:
         try:
-            body = self.lock_path.read_text().strip()
+            return LockBody.parse(self.lock_path.read_text())
         except OSError:
-            return None
-        return int(body) if body.isdigit() else None
+            return LockBody()
 
     def acquire(self, takeover_wait_s: float = 10.0) -> bool:
         paths.ensure_layout()
@@ -92,10 +145,7 @@ class DispatcherLock:
         if self.holder_is_fresh():
             os.close(fd)
             return False
-        pgid = self._holder_pgid()
-        if pgid and pgid != os.getpgid(0):
-            self.takeover_pgid = pgid
-            kill_process_group(pgid, grace_s=5.0, sleep=self._sleep)
+        self._evict_stale_holder()
         deadline = self._now() + takeover_wait_s
         while self._now() < deadline:
             if self._try_flock(fd):
@@ -104,6 +154,40 @@ class DispatcherLock:
             self._sleep(0.25)
         os.close(fd)
         return False
+
+    def _evict_stale_holder(self) -> None:
+        """Kill the incumbent only when it is provably a wedged gpuc dispatcher.
+
+        A stale heartbeat on its own is not enough: the pid in the lock file may
+        belong to something else entirely by now, and killing a process group we
+        do not own would take out an innocent bystander's shell and its jobs.
+        """
+        body = self.holder()
+        if body.pid is None:
+            log_line("lock is held with a stale heartbeat but records no pid; killing nothing")
+            return
+        if not recorded_process_alive(body.pid, body.boot_id, body.starttime):
+            log_line(f"lock holder pid {body.pid} is gone; taking over")
+            return
+        if not is_gpuc_process(body.pid):
+            log_line(
+                f"pid {body.pid} holds the lock with a stale heartbeat but is not a gpuc "
+                f"dispatcher ({cmdline(body.pid)!r}); killing nothing"
+            )
+            return
+        pgid = body.pgid
+        if pgid != body.pid or pgid is None:
+            log_line(
+                f"lock holder pid {body.pid} records pgid {pgid}; only a process group "
+                f"led by the dispatcher itself is ever killed"
+            )
+            return
+        if pgid in (os.getpgid(0), os.getpid()):
+            return
+        self.takeover_pgid = pgid
+        log_line(f"heartbeat is stale; SIGKILLing wedged dispatcher process group {pgid}")
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
 
     def _try_flock(self, fd: int) -> bool:
         try:
@@ -114,9 +198,23 @@ class DispatcherLock:
 
     def _adopt(self, fd: int) -> None:
         self._fd = fd
+        pid = os.getpid()
+        pgid = os.getpgid(0)
+        if pgid != pid:
+            log_line(
+                f"dispatcher pid {pid} is not its own process group leader (pgid {pgid}); "
+                f"recording no pgid. Start it detached (`setsid nohup ... &`) so a takeover "
+                f"can clean it up."
+            )
+        body = LockBody(
+            pid=pid,
+            pgid=pgid if pgid == pid else None,
+            starttime=starttime(pid),
+            boot_id=boot_id(),
+        )
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, f"{os.getpgid(0)}\n".encode())
+        os.write(fd, body.render().encode())
         os.fsync(fd)
         self.beat(force=True)
 
@@ -129,7 +227,30 @@ class DispatcherLock:
         self.heartbeat_path.touch()
         os.utime(self.heartbeat_path, (now, now))
 
+    def start_heartbeat(self) -> None:
+        """Beat from a thread, so a long drain or final sync in the main loop
+        cannot make a healthy dispatcher look wedged to the next one."""
+        if self._beat_thread is not None:
+            return
+        self._beat_stop.clear()
+        self._beat_thread = threading.Thread(
+            target=self._beat_loop, name="gpuc-heartbeat", daemon=True
+        )
+        self._beat_thread.start()
+
+    def _beat_loop(self) -> None:
+        while not self._beat_stop.wait(self.heartbeat_interval_s):
+            with contextlib.suppress(OSError):
+                self.beat(force=True)
+
+    def stop_heartbeat(self) -> None:
+        self._beat_stop.set()
+        thread, self._beat_thread = self._beat_thread, None
+        if thread is not None:
+            thread.join(timeout=self.heartbeat_interval_s * 2)
+
     def release(self) -> None:
+        self.stop_heartbeat()
         if self._fd is None:
             return
         try:
@@ -216,6 +337,7 @@ class Dispatcher:
     _queue_empty_since: float | None = None
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
+    consecutive_failures: int = 0
     should_exit: bool = False
 
     @property
@@ -233,26 +355,52 @@ class Dispatcher:
         for job_id in jobs.list_job_ids():
             try:
                 state = jobs.read_state(job_id)
-            except RuntimeError:
+            except RuntimeError as exc:
+                self.log(f"job {job_id} has an unreadable state.json ({exc}); skipping")
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
-            if state.runner_pid and _pid_alive(state.runner_pid):
+            # A recorded pid means nothing across a reboot, and little after a
+            # pid rollover: the boot id and start time recorded at launch are
+            # what make "still running" a real answer.
+            if state.runner_pid and recorded_process_alive(
+                state.runner_pid, state.runner_boot_id, state.runner_starttime
+            ):
                 self.running[job_id] = _Running(job_id, state.runner_pid, list(state.gpus))
                 self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
             else:
                 self._mark_runner_died(job_id)
 
     def _mark_runner_died(self, job_id: str) -> None:
-        jobs.update_state(
-            job_id,
-            status="failed",
-            reason="runner-died",
-            exit_code=jobs.read_state(job_id).exit_code or 1,
-            ended_at=jobs.utc_now(),
-            phase=None,
-        )
+        """Fail the job, after making sure nothing of it is left on the GPUs.
+
+        The GPUs go back in the free pool the moment this returns, so a job
+        process that outlived its runner has to die first; otherwise it keeps
+        computing on a card the next job is about to be handed.
+        """
+        try:
+            state: jobs.JobState | None = jobs.read_state(job_id)
+        except RuntimeError as exc:
+            self.log(f"job {job_id} has an unreadable state.json ({exc}); treating as runner-died")
+            state = None
+        self._kill_orphaned_group(job_id, state.pgid if state else None)
+        final = state or jobs.JobState()
+        final.status = "failed"
+        final.reason = "runner-died"
+        final.exit_code = final.exit_code or 1
+        final.ended_at = jobs.utc_now()
+        final.phase = None
+        jobs.write_state(job_id, final)
         self.log(f"job {job_id} failed: runner died without writing final state")
+
+    def _kill_orphaned_group(self, job_id: str, pgid: int | None) -> None:
+        if not pgid or pgid <= 1 or pgid == os.getpgid(0):
+            return
+        if not process_group_alive(pgid):
+            return
+        self.log(f"job {job_id}: SIGKILLing orphaned process group {pgid} before freeing its GPUs")
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
 
     # -- loop pieces -----------------------------------------------------
     def reap(self) -> None:
@@ -261,7 +409,11 @@ class Dispatcher:
                 continue
             del self.running[job_id]
             self._cancel_sent.pop(job_id, None)
-            state = jobs.read_state(job_id)
+            try:
+                state = jobs.read_state(job_id)
+            except RuntimeError:
+                self._mark_runner_died(job_id)
+                continue
             if not state.finished:
                 self._mark_runner_died(job_id)
             else:
@@ -272,24 +424,53 @@ class Dispatcher:
                 )
 
     def handle_cancels(self) -> None:
+        """Escalate a cancel, without ever killing the runner's own group during
+        the launch window.
+
+        Between spawn and the first phase the runner *is* the only member of its
+        group, so signalling it there would kill the one process that can finish
+        the job cleanly. Until the job's own pgid appears in state.json the
+        cancel marker is the whole mechanism; the runner checks it before every
+        phase and ends as `cancelled`.
+        """
         now = self.deps.monotonic()
+        grace = self.deps.kill_grace_s
         for job_id, entry in list(self.running.items()):
             if not queue.is_cancelled(job_id):
                 continue
-            state = jobs.read_state(job_id)
+            try:
+                state = jobs.read_state(job_id)
+            except RuntimeError:
+                state = jobs.JobState()
+            job_pgid = state.pgid if state.pgid and state.pgid != entry.pid else None
             sent = self._cancel_sent.get(job_id)
             if sent is None:
                 self._cancel_sent[job_id] = now
-                self.log(f"cancelling job {job_id} (pgid {state.pgid})")
-                self._signal_group(state.pgid, signal.SIGTERM)
+                if job_pgid:
+                    self.log(f"cancelling job {job_id} (pgid {job_pgid})")
+                    self._signal_group(job_pgid, signal.SIGTERM)
+                else:
+                    self.log(
+                        f"cancelling job {job_id}: the runner has not published a job process "
+                        f"group yet, so the cancel marker alone stops it"
+                    )
                 continue
             elapsed = now - sent
-            if elapsed > self.deps.kill_grace_s:
-                self._signal_group(state.pgid, signal.SIGKILL)
-            # The runner does its own SIGTERM/SIGKILL and then finalises state;
-            # only if it is itself wedged do we take out its group too.
-            if elapsed > 2 * self.deps.kill_grace_s:
+            if job_pgid and elapsed > grace:
+                self._signal_group(job_pgid, signal.SIGKILL)
+            # The runner handles SIGTERM itself (final sync, final state), so it
+            # gets a signal of its own before we take out its group.
+            if elapsed > 2 * grace:
+                self._signal_pid(entry.pid, signal.SIGTERM)
+            if elapsed > 3 * grace and process_group_alive(entry.pid):
+                self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
                 self._signal_group(entry.pid, signal.SIGKILL)
+
+    def _signal_pid(self, pid: int, sig: int) -> None:
+        if pid <= 1 or not _pid_alive(pid):
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, sig)
 
     def _signal_group(self, pgid: int | None, sig: int) -> None:
         if not pgid or pgid <= 1 or not process_group_alive(pgid):
@@ -345,7 +526,16 @@ class Dispatcher:
                 started_at=jobs.utc_now(),
             )
             proc = self.deps.spawn_runner(job_id)
-            jobs.update_state(job_id, pid=proc.pid, pgid=proc.pid, runner_pid=proc.pid)
+            # pgid stays unset until the runner publishes the *job's* group: it
+            # is what `cancel` signals, and the runner's own group is not it.
+            jobs.update_state(
+                job_id,
+                pid=proc.pid,
+                pgid=None,
+                runner_pid=proc.pid,
+                runner_boot_id=boot_id(),
+                runner_starttime=starttime(proc.pid),
+            )
             self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
             self.log(
                 f"launched {job_id} (pid {proc.pid}) on {','.join(assigned) if assigned else 'cpu'}"
@@ -458,19 +648,49 @@ class Dispatcher:
         return not self.running and not queue.list_queued() and not self.config.ephemeral
 
     def run(self, lock: DispatcherLock) -> int:
-        self.adopt_orphans()
+        lock.start_heartbeat()
         self.log(f"dispatcher started (pid {os.getpid()}, pgid {os.getpgid(0)})")
+        code = 0
         try:
+            self._guard(self.adopt_orphans)
             while not self.should_exit:
                 lock.beat()
-                self.run_once()
-                if self.idle_and_not_ephemeral():
+                healthy = self._guard(self.run_once)
+                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    code = 1
+                    break
+                # "Nothing to do" is only trustworthy from an iteration that
+                # actually ran: a failing one knows nothing about the queue.
+                if healthy and self.idle_and_not_ephemeral():
                     break
                 self.deps.sleep(self.deps.interval_s)
         finally:
             lock.release()
         self.log("dispatcher exiting")
-        return 0
+        return code
+
+    def _guard(self, step: Callable[[], None]) -> bool:
+        """Run one loop step, returning whether it succeeded. A bug in one
+        iteration must not take the queue down, but an error that repeats
+        forever is not worth spinning on."""
+        try:
+            step()
+        except Exception:
+            self.consecutive_failures += 1
+            self.log(
+                f"{getattr(step, '__name__', step)} failed "
+                f"({self.consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): "
+                f"{traceback.format_exc()}"
+            )
+            if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                self.log(
+                    f"GIVING UP: {MAX_CONSECUTIVE_FAILURES} consecutive dispatcher failures. "
+                    f"No further jobs will be launched until a dispatcher is restarted; "
+                    f"running jobs are untouched. See the traceback above."
+                )
+            return False
+        self.consecutive_failures = 0
+        return True
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -487,6 +707,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     dispatcher = Dispatcher(deps=DispatcherDeps(interval_s=args.interval))
     if args.once:
+        lock.start_heartbeat()
         try:
             dispatcher.adopt_orphans()
             dispatcher.run_once()

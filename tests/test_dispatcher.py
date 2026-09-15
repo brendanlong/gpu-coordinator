@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -8,7 +10,9 @@ from typing import Any, cast
 
 import pytest
 
+from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import jobs, paths, queue, sync, terminate
+from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig
 from tests.conftest import FAKE_GPUS, make_spec
@@ -150,17 +154,23 @@ def test_cancel_signals_the_job_process_group_then_the_runner(
 
     signals: list[tuple[int | None, int]] = []
     monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
     queue.cancel(job_id)
     dispatcher.handle_cancels()
     assert signals == [(123456, 15)]
 
-    clock.advance(2.0)
+    clock.advance(1.5)
     dispatcher.handle_cancels()
     assert signals[-1] == (123456, 9)
 
-    clock.advance(2.0)
+    clock.advance(1.0)
     dispatcher.handle_cancels()
-    assert signals[-1] == (spawned[job_id].pid, 9)
+    assert signals[-1] == (spawned[job_id].pid, signal.SIGTERM)
+
+    clock.advance(1.0)
+    dispatcher.handle_cancels()
+    assert signals[-1] == (spawned[job_id].pid, signal.SIGKILL)
 
 
 def test_a_runner_that_dies_without_final_state_fails_the_job(gpuc_home: Path) -> None:
@@ -392,3 +402,143 @@ def test_a_job_with_an_unreadable_spec_is_dropped(gpuc_home: Path) -> None:
     assert spawned == {}
     assert jobs.read_state(job_id).reason == "bad-spec"
     assert queue.list_queued() == []
+
+
+def orphan_process_group() -> subprocess.Popen[bytes]:
+    """A job-like process in its own group, as the runner would have spawned."""
+    return subprocess.Popen(["sleep", "300"], start_new_session=True)
+
+
+def test_a_dead_runner_never_leaves_a_job_holding_a_card(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    orphan = orphan_process_group()
+    try:
+        jobs.update_state(job_id, pgid=orphan.pid)
+        spawned[job_id].returncode = -9
+        dispatcher.run_once()
+        assert orphan.wait(timeout=30) == -9
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+    assert jobs.read_state(job_id).reason == "runner-died"
+    assert dispatcher.free_gpus() == FAKE_GPUS
+    assert f"orphaned process group {orphan.pid}" in paths.dispatcher_log().read_text()
+
+
+def test_an_unreadable_state_for_a_running_job_is_runner_died_not_a_crash(
+    gpuc_home: Path,
+) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    spawned[job_id].returncode = 0
+    paths.state_file(job_id).write_text("{ truncated")
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "runner-died")
+    assert dispatcher.running == {}
+
+
+def test_run_once_failures_are_logged_and_eventually_give_up(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.host.dispatcher import MAX_CONSECUTIVE_FAILURES, DispatcherLock
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.sleep = lambda _seconds: None
+    attempts: list[int] = []
+
+    def explode() -> None:
+        attempts.append(1)
+        raise RuntimeError("the disk went away")
+
+    monkeypatch.setattr(dispatcher, "run_once", explode)
+    lock = DispatcherLock()
+    assert lock.acquire()
+    assert dispatcher.run(lock) == 1
+    assert len(attempts) == MAX_CONSECUTIVE_FAILURES
+    log = paths.dispatcher_log().read_text()
+    assert "the disk went away" in log
+    assert "GIVING UP" in log
+
+
+def test_an_occasional_failure_does_not_stop_the_loop(gpuc_home: Path) -> None:
+    dispatcher, _ = make_dispatcher()
+    calls: list[int] = []
+
+    def flaky() -> None:
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("transient")
+
+    assert not dispatcher._guard(flaky)
+    assert dispatcher.consecutive_failures == 1
+    assert not dispatcher._guard(flaky)
+    assert dispatcher._guard(flaky)
+    assert dispatcher.consecutive_failures == 0
+
+
+def test_an_orphan_from_a_previous_boot_is_not_adopted(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(
+        job_id,
+        status="running",
+        gpus=[FAKE_GPUS[0]],
+        runner_pid=os.getpid(),
+        runner_boot_id="0000-a-previous-boot",
+    )
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+    assert jobs.read_state(job_id).reason == "runner-died"
+
+
+def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(
+        job_id,
+        status="running",
+        gpus=[FAKE_GPUS[0]],
+        runner_pid=os.getpid(),
+        runner_boot_id=procinfo.boot_id(),
+        runner_starttime="1",
+    )
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+    assert jobs.read_state(job_id).reason == "runner-died"
+
+
+def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert state.pgid is None
+    assert state.runner_pid == spawned[job_id].pid
+    assert state.runner_boot_id == procinfo.boot_id()
+
+
+def test_cancel_in_the_launch_window_never_signals_the_runners_own_group(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    dispatcher, _ = make_dispatcher(clock=clock)
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+
+    signals: list[tuple[int | None, int]] = []
+    monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
+    queue.cancel(job_id)
+    dispatcher.handle_cancels()
+    assert signals == []
+    assert "has not published a job process group yet" in paths.dispatcher_log().read_text()
+
+    # The runner publishes the job's group, and only then is it signalled.
+    jobs.update_state(job_id, pgid=123456)
+    clock.advance(2.0)
+    dispatcher.handle_cancels()
+    assert signals == [(123456, signal.SIGKILL)]

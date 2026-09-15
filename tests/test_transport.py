@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import shutil
 import stat
 import subprocess
@@ -81,16 +82,17 @@ def test_ssh_options_pin_batch_mode_timeout_and_known_hosts(tmp_path: Path) -> N
     assert f"UserKnownHostsFile={tmp_path / 'known_hosts'}" in joined
     assert "StrictHostKeyChecking=accept-new" in joined
     assert "ControlMaster=auto" in joined
-    assert f"ControlPath={tmp_path / 'control' / 'cm-spar'}" in joined
+    assert f"ControlPath={tmp_path / 'control' / 'cm-%C'}" in joined
     assert "ControlPersist=60" in joined
     assert options[-2:] == ["-p", "2222"]
     assert "-i" in options and "/keys/id_ed25519" in options
 
 
-def test_ssh_argv_puts_the_command_last(tmp_path: Path) -> None:
+def test_ssh_argv_runs_a_non_login_bash_with_the_command_last(tmp_path: Path) -> None:
     argv = make_ssh(tmp_path).ssh_argv("uname -a")
     assert argv[0] == "ssh"
-    assert argv[-2:] == ["user@box", "uname -a"]
+    assert argv[-2] == "user@box"
+    assert argv[-1] == "bash -c 'uname -a'"
 
 
 def test_put_file_never_puts_the_secret_in_argv(tmp_path: Path) -> None:
@@ -112,9 +114,16 @@ def test_rsync_argv_for_a_file_list(tmp_path: Path) -> None:
     )
     assert argv[:2] == ["rsync", "-a"]
     assert "--files-from=-" in argv
+    assert "--from0" in argv
+    assert "--ignore-missing-args" in argv
     assert "--delete-after" not in argv
     assert argv[argv.index("-e") + 1].startswith("ssh ")
     assert argv[-1] == "user@box:~/.gpuc/jobs/j1/workdir"
+
+
+def test_the_file_list_is_nul_separated(tmp_path: Path) -> None:
+    assert transport._files_stdin(["a.py", "weird\nname.py"]) == b"a.py\0weird\nname.py\0"
+    assert transport._files_stdin(None) is None
 
 
 def test_rsync_argv_for_a_whole_directory(tmp_path: Path) -> None:
@@ -183,3 +192,73 @@ def test_ssh_transport_against_localhost(tmp_path: Path) -> None:
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     with pytest.raises(TransportError):
         ssh.run("exit 9")
+
+
+def test_put_file_creates_the_file_with_umask_077_and_quotes_the_dirname(tmp_path: Path) -> None:
+    command = make_ssh(tmp_path).put_file_argv("/home/u/.gpuc/secrets/j1.env")[-1]
+    assert "umask 077" in command
+    assert '"$(dirname' in command
+    assert command.index("umask 077") < command.index("chmod 600")
+
+
+def test_local_run_uses_a_non_login_shell() -> None:
+    result = LocalTransport().run("shopt -q login_shell && echo login || echo non-login")
+    assert "non-login" in result.stdout
+
+
+def test_rsync_ssh_command_quotes_a_key_path_with_a_space(tmp_path: Path) -> None:
+    key = tmp_path / "my keys" / "id_ed25519"
+    key.parent.mkdir()
+    key.touch()
+    ssh = SshTransport(host="spar", target="user@box", key=str(key))
+    command = ssh.rsync_ssh_command()
+    assert f"'{key}'" in command
+    assert shlex.split(command) == ["ssh", *ssh.ssh_options()]
+
+
+def test_rsync_actually_runs_a_remote_shell_whose_path_contains_a_space(tmp_path: Path) -> None:
+    """rsync splits -e itself, so the quoting has to survive *its* parser too."""
+    wrapper = tmp_path / "a dir with spaces" / "fake-ssh"
+    wrapper.parent.mkdir()
+    wrapper.write_text('#!/bin/bash\nshift\nexec "$@"\n')
+    wrapper.chmod(0o755)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "f.txt").write_text("payload")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    argv = transport.rsync_argv(src, f"fakehost:{dest}", ["f.txt"], shlex.join([str(wrapper)]))
+    transport._execute(
+        "spar", argv, timeout=60, check=True, stdin=transport._files_stdin(["f.txt"])
+    )
+    assert (dest / "f.txt").read_text() == "payload"
+
+
+def test_git_tracked_files_asks_for_nul_separated_unquoted_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = b"a.py\0dir/b with space.py\0"
+        stderr = b""
+
+    def fake_run(argv: list[str], **_: object) -> Result:
+        seen.append(argv)
+        return Result()
+
+    monkeypatch.setattr(transport.subprocess, "run", fake_run)
+    assert transport.git_tracked_files(Path("/repo")) == ["a.py", "dir/b with space.py"]
+    assert "core.quotePath=false" in seen[0]
+    assert seen[0][-2:] == ["ls-files", "-z"]
+
+
+def test_make_transport_takes_a_per_pod_known_hosts_file(tmp_path: Path) -> None:
+    per_pod = tmp_path / "pods" / "pod-1.known_hosts"
+    remote = transport.make_transport(
+        "pod-1", ssh="root@1.2.3.4", state_dir=tmp_path, known_hosts=per_pod
+    )
+    assert isinstance(remote, SshTransport)
+    assert remote.known_hosts == per_pod
+    assert remote.control_dir == tmp_path / "control"

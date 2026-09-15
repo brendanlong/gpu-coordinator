@@ -14,7 +14,8 @@ from typing import Any
 from gpuc.host import paths
 
 Status = str  # queued | running | succeeded | failed | cancelled
-Phase = str  # setup | preflight | main | sync
+Phase = str
+PHASES = ("setup", "preflight", "main", "sync")
 
 
 def new_job_id() -> str:
@@ -173,8 +174,11 @@ class JobState:
     pid: int | None = None
     pgid: int | None = None
     runner_pid: int | None = None
-    util_recent: list[float] = field(default_factory=list)
+    runner_boot_id: str | None = None
+    runner_starttime: str | None = None
+    util_recent: list[float | None] = field(default_factory=list)
     util_sampled_at: str | None = None
+    sync_error: str | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> JobState:

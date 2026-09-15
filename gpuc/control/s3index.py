@@ -147,17 +147,36 @@ class S3Index:
     def put_index(self, entry: IndexEntry) -> str:
         return self._put(index_key(entry.job_id), entry.model_dump_json(indent=2) + "\n")
 
+    def list_keys(self, prefix: str, limit: int) -> list[str]:
+        """Every key under `prefix`, following continuation tokens.
+
+        A single list_objects_v2 call returns at most 1000 keys, so an index
+        with more jobs than that silently lost its tail.
+        """
+        keys: list[str] = []
+        token: str | None = None
+        while len(keys) < limit:
+            request: dict[str, Any] = {
+                "Bucket": self.bucket,
+                "Prefix": prefix,
+                "MaxKeys": min(1000, limit - len(keys)),
+            }
+            if token:
+                request["ContinuationToken"] = token
+            try:
+                response = self.client.list_objects_v2(**request)
+            except Exception as exc:
+                raise S3IndexError(f"could not list s3://{self.bucket}/{prefix}: {exc}") from exc
+            keys += [key for item in response.get("Contents", []) if (key := item.get("Key"))]
+            token = response.get("NextContinuationToken")
+            if not response.get("IsTruncated") or not token:
+                break
+        return keys[:limit]
+
     def list_index(self, limit: int = 200) -> list[IndexEntry]:
-        try:
-            response = self.client.list_objects_v2(
-                Bucket=self.bucket, Prefix=f"{INDEX_PREFIX}/", MaxKeys=limit
-            )
-        except Exception as exc:
-            raise S3IndexError(f"could not list s3://{self.bucket}/{INDEX_PREFIX}/: {exc}") from exc
         entries: list[IndexEntry] = []
-        for item in response.get("Contents", []):
-            key = item.get("Key")
-            if not key or not key.endswith(".json"):
+        for key in self.list_keys(f"{INDEX_PREFIX}/", limit):
+            if not key.endswith(".json"):
                 continue
             try:
                 entries.append(IndexEntry.model_validate_json(self._get(key)))
