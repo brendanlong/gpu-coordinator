@@ -225,9 +225,17 @@ def run_health(session: HostSession, health_args: str = "") -> dict[str, Any]:
     return report
 
 
+# A pod's sshd hands out a PATH with neither of these, and the dispatcher's
+# environment is what every runner and every job command inherits. The
+# dispatcher re-applies this itself; setting it here means the very first
+# process in the chain already has it.
+REMOTE_PATH = 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
+
+
 def start_dispatcher(session: HostSession) -> int:
     command = (
-        f'GPUC_HOME="{session.home}" PYTHONPATH="{session.home}/pkg" "{session.python}" '
+        f'{REMOTE_PATH} GPUC_HOME="{session.home}" PYTHONPATH="{session.home}/pkg" '
+        f'"{session.python}" '
         f'-c "from gpuc.host import dispatcher; print(dispatcher.spawn_detached_dispatcher())"'
     )
     result = session.transport.run(command, check=False)

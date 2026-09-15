@@ -232,3 +232,39 @@ def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
     state = state_of(home, second)
     assert (state["status"], state["attempt"]) == ("succeeded", 2)
     assert "hello" in log_tail(home, second)
+
+
+def test_a_secret_never_reaches_the_log_or_gpuc_logs(
+    bootstrapped_home: Path,
+    workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The job may read its secret; nothing we write down may contain it."""
+    canary = "gpuc-canary-9f1c2b7e-do-not-log"
+    monkeypatch.setenv("WANDB_API_KEY", canary)
+    home = bootstrapped_home
+    job_id = submit(
+        workdir,
+        "name: secretive\n"
+        'command: test -n "$WANDB_API_KEY" && echo the job saw its secret\n'
+        "gpus: 0\n"
+        "secrets: [WANDB_API_KEY]\n",
+    )
+    capsys.readouterr()
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    assert state_of(home, job_id)["status"] == "succeeded"
+
+    assert main(["logs", job_id]) == 0
+    captured = capsys.readouterr()
+    assert "the job saw its secret" in captured.out
+    assert canary not in captured.out + captured.err
+
+    for path in (
+        home / "jobs" / job_id / "log.txt",
+        home / "jobs" / job_id / "state.json",
+        home / "jobs" / job_id / "spec.json",
+        home / "dispatcher.log",
+    ):
+        assert canary not in path.read_text(), path
+    assert not (home / "secrets" / f"{job_id}.env").exists()

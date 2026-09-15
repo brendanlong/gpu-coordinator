@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from gpuc.control import transport
-from gpuc.control.transport import LocalTransport, SshTransport, TransportError
+from gpuc.control.transport import LocalTransport, SshTransport, SshUnusable, TransportError
+
+# A real ControlPath has to fit in sun_path, so the fixtures use a short one;
+# pytest's own tmp_path is deliberately too long (see the control-path tests).
+SHORT_CONTROL_DIR = Path("/tmp/gpuc-test-cm")
 
 
 def ssh_localhost_works() -> bool:
@@ -35,7 +39,7 @@ def make_ssh(tmp_path: Path) -> SshTransport:
         target="user@box",
         port=2222,
         key="/keys/id_ed25519",
-        control_dir=tmp_path / "control",
+        control_dir=SHORT_CONTROL_DIR,
         known_hosts=tmp_path / "known_hosts",
     )
 
@@ -82,7 +86,7 @@ def test_ssh_options_pin_batch_mode_timeout_and_known_hosts(tmp_path: Path) -> N
     assert f"UserKnownHostsFile={tmp_path / 'known_hosts'}" in joined
     assert "StrictHostKeyChecking=accept-new" in joined
     assert "ControlMaster=auto" in joined
-    assert f"ControlPath={tmp_path / 'control' / 'cm-%C'}" in joined
+    assert f"ControlPath={SHORT_CONTROL_DIR / 'cm-%C'}" in joined
     assert "ControlPersist=60" in joined
     assert options[-2:] == ["-p", "2222"]
     assert "-i" in options and "/keys/id_ed25519" in options
@@ -168,7 +172,7 @@ def test_make_transport_picks_the_right_kind(tmp_path: Path) -> None:
     assert isinstance(transport.make_transport("local"), LocalTransport)
     remote = transport.make_transport("spar", ssh="u@h", port=2200, state_dir=tmp_path)
     assert isinstance(remote, SshTransport)
-    assert remote.control_dir == tmp_path / "control"
+    assert remote.control_dir == transport.control_socket_dir()
     assert remote.known_hosts == tmp_path / "known_hosts"
 
 
@@ -183,7 +187,7 @@ def test_ssh_transport_against_localhost(tmp_path: Path) -> None:
     ssh = SshTransport(
         host="localhost",
         target="localhost",
-        control_dir=tmp_path / "control",
+        control_dir=SHORT_CONTROL_DIR,
         known_hosts=tmp_path / "known_hosts",
     )
     assert "hello" in ssh.run("echo hello").stdout
@@ -261,4 +265,60 @@ def test_make_transport_takes_a_per_pod_known_hosts_file(tmp_path: Path) -> None
     )
     assert isinstance(remote, SshTransport)
     assert remote.known_hosts == per_pod
-    assert remote.control_dir == tmp_path / "control"
+    assert remote.control_dir == transport.control_socket_dir()
+
+
+def test_control_socket_dir_prefers_xdg_runtime_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
+    assert transport.control_socket_dir() == Path("/run/user/4242/gpuc")
+
+
+def test_control_socket_dir_falls_back_to_a_per_uid_tmp_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    import os
+
+    assert transport.control_socket_dir() == Path(f"/tmp/gpuc-{os.getuid()}")
+
+
+def test_the_control_socket_dir_is_0700(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    ssh = SshTransport(host="h", target="u@h", control_dir=transport.control_socket_dir())
+    ssh._prepare()
+    assert stat.S_IMODE((tmp_path / "gpuc").stat().st_mode) == 0o700
+
+
+def test_a_control_path_that_would_overrun_sun_path_fails_before_ssh_runs() -> None:
+    long_dir = Path("/tmp") / ("x" * 90)
+    with pytest.raises(SshUnusable) as excinfo:
+        transport.control_path(long_dir)
+    message = str(excinfo.value)
+    assert "ControlMaster socket path" in message
+    assert "XDG_RUNTIME_DIR" in message
+
+
+def test_the_real_control_path_fits_in_a_unix_socket() -> None:
+    path = transport.control_path(transport.control_socket_dir())
+    assert len(path.encode()) - len("%C") + transport.CONTROL_HASH_LEN < 100
+
+
+def test_an_ssh_socket_failure_raises_immediately_even_without_check(
+    tmp_path: Path,
+) -> None:
+    """The 15-minute silent retry loop: every poll treats non-zero as `not up
+    yet`, so this class of failure has to be an exception, not a return code."""
+    script = tmp_path / "fake-ssh"
+    script.write_text(
+        "#!/bin/bash\n"
+        'echo "unix_listener: path "/x" too long for Unix domain socket" >&2\nexit 255\n'
+    )
+    script.chmod(0o755)
+    with pytest.raises(SshUnusable) as excinfo:
+        transport._execute("pod-1", [str(script)], timeout=10, check=False)
+    assert "no retry can succeed" in str(excinfo.value)
+
+
+def test_an_ordinary_ssh_failure_still_honours_check_false(tmp_path: Path) -> None:
+    result = LocalTransport().run("echo connection refused >&2; exit 255", check=False)
+    assert result.returncode == 255

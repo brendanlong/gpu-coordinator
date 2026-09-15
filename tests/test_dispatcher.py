@@ -70,7 +70,7 @@ def make_dispatcher(
         spawn_runner=spawn,
         monotonic=clock or FakeClock(),
         terminate_call=terminate_call or (lambda pod, key: "{}"),
-        command_runner=lambda argv, timeout: sync.CommandResult(argv, 0, ""),
+        command_runner=lambda argv, timeout=None, env=None: sync.CommandResult(argv, 0, ""),
         utcnow=utcnow or (lambda: datetime.now(UTC)),
         kill_grace_s=1.0,
     )
@@ -269,7 +269,7 @@ def configure_pod(idle_minutes: float = 15.0, ttl_hours: float = 24.0, age_h: fl
 def test_idle_terminate_drains_syncs_and_calls_the_provider(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda: "/fake/aws")
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     monkeypatch.setenv("RUNPOD_POD_ID", "pod-1")
     configure_pod(idle_minutes=15.0)
@@ -372,7 +372,7 @@ def test_terminate_is_retried_after_ten_minutes(gpuc_home: Path) -> None:
 def test_a_failed_final_drain_sync_does_not_terminate(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda: None)
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
     configure_pod(idle_minutes=0.0)
     terminated: list[str] = []
     dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
@@ -542,3 +542,17 @@ def test_cancel_in_the_launch_window_never_signals_the_runners_own_group(
     clock.advance(2.0)
     dispatcher.handle_cancels()
     assert signals == [(123456, signal.SIGKILL)]
+
+
+def test_spawned_children_get_the_home_tool_dirs_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything a job runs inherits this PATH, and a pod's sshd does not
+    include ~/.local/bin, where uv lives."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".local/bin").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = host_dispatcher._child_env(tmp_path / "pkg")
+    assert env["PATH"].split(":")[0] == str(fake_home / ".local/bin")
+    assert env["PYTHONPATH"].startswith(str(tmp_path / "pkg"))

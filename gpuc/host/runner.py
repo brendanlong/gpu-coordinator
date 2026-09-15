@@ -228,6 +228,8 @@ class _Window:
 
 def build_env(spec: JobSpec, assigned: Sequence[str]) -> dict[str, str]:
     env = dict(os.environ)
+    # Before the spec's own env, so a job may still pin PATH explicitly.
+    env["PATH"] = paths.path_with_user_bins(env)
     env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
     env.update(spec.env)
     # Last, so a spec `env` typo cannot hand the job the wrong cards.
@@ -248,6 +250,7 @@ class JobRunner:
         self.assigned: list[str] = list(self.state.gpus)
         self.config = jobs.read_config()
         self.kill_reason: str | None = None
+        self.env: dict[str, str] = {}
         self._current: subprocess.Popen[bytes] | None = None
         self._terminating = False
 
@@ -385,11 +388,16 @@ class JobRunner:
         paths.ensure_job_layout(self.job_id)
         job_start = self.deps.now()
         env = build_env(self.spec, self.assigned)
+        # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
+        # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
+        # credential file anywhere on the host.
+        self.env = env
         sync_loop = sync.SyncLoop(
             self.spec,
             paths.workdir(self.job_id),
             self.config.s3_prefix,
             runner=self.deps.command_runner,
+            env=env,
         )
         with paths.log_file(self.job_id).open("ab", buffering=0) as log, self._term_handlers():
             try:
@@ -486,9 +494,6 @@ class JobRunner:
         log: IO[bytes],
     ) -> int:
         jobs.update_state(self.job_id, phase="sync")
-        # The job's environment was captured before the first phase, so the
-        # secrets file has done its job and should not outlive it on disk.
-        paths.job_env_file(self.job_id).unlink(missing_ok=True)
         try:
             sync_loop.final()
         except sync.MissingOutput as exc:
@@ -512,9 +517,18 @@ class JobRunner:
         )
         self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")
         try:
-            sync.sync_job_meta(self.job_id, self.config.s3_prefix, runner=self.deps.command_runner)
+            sync.sync_job_meta(
+                self.job_id,
+                self.config.s3_prefix,
+                runner=self.deps.command_runner,
+                env=self.env or None,
+            )
         except sync.SyncError as exc:
             self._log(log, f"final state upload failed: {exc}")
+        # Only now: the final sync and the state upload authenticate with the
+        # secrets this file holds, so removing it earlier would break exactly
+        # the upload that matters most.
+        paths.job_env_file(self.job_id).unlink(missing_ok=True)
         return exit_code
 
     @staticmethod

@@ -3,6 +3,12 @@
 These binaries are installed into $HOME by the bootstrap. A missing binary or a
 failed upload raises SyncError, which fails the *job's* sync step; the queue
 itself never depends on either tool being present.
+
+Every upload takes an explicit ``env``. The runner passes the job's own
+environment -- which includes its ``secrets:`` file -- so a job that declares
+``secrets: [AWS_ACCESS_KEY_ID, ...]`` can upload without any host-level
+credential file. ``env=None`` means "inherit this process's environment",
+which is what the dispatcher's drain path uses.
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ import subprocess
 import threading
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,14 +51,24 @@ class CommandResult:
     output: str
 
 
-CommandRunner = Callable[[list[str], "float | None"], CommandResult]
+Env = Mapping[str, str] | None
+CommandRunner = Callable[[list[str], "float | None", Env], CommandResult]
 
 
-def run_command(argv: list[str], timeout: float | None = DEFAULT_TIMEOUT_S) -> CommandResult:
+def run_command(
+    argv: list[str], timeout: float | None = DEFAULT_TIMEOUT_S, env: Env = None
+) -> CommandResult:
     """Never raises anything but SyncError: an upload tool that is missing,
     wedged or killed must fail the job's sync step, not the runner."""
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=None if env is None else dict(env),
+        )
     except subprocess.TimeoutExpired as exc:
         raise SyncError(
             f"`{' '.join(argv)}` on host {_host_label()} timed out after {timeout}s"
@@ -80,18 +96,18 @@ def _fail(result: CommandResult) -> None:
     )
 
 
-def aws_binary() -> str | None:
+def aws_binary(env: Env = None) -> str | None:
     bundled = Path.home() / ".local/aws-cli/v2/current/bin/aws"
     if bundled.exists():
         return str(bundled)
-    return shutil.which("aws")
+    return shutil.which("aws", path=None if env is None else env.get("PATH"))
 
 
-def hf_binary() -> str | None:
+def hf_binary(env: Env = None) -> str | None:
     bundled = Path.home() / ".local/bin/hf"
     if bundled.exists():
         return str(bundled)
-    return shutil.which("hf")
+    return shutil.which("hf", path=None if env is None else env.get("PATH"))
 
 
 def recently_modified(root: Path, min_age_s: float = MIN_AGE_S) -> list[str]:
@@ -142,8 +158,9 @@ def sync_dir_to_s3(
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
+    env: Env = None,
 ) -> None:
-    aws = aws_binary()
+    aws = aws_binary(env)
     if aws is None:
         raise SyncError(
             "`aws` CLI not found (looked in ~/.local/aws-cli/v2/current/bin/aws and PATH) "
@@ -153,7 +170,7 @@ def sync_dir_to_s3(
         raise MissingOutput(f"output path does not exist: {local}")
     argv = [aws, "s3", "sync", str(local), dest.rstrip("/"), "--only-show-errors"]
     argv += exclude_args("--exclude", local, min_age_s)
-    result = runner(argv, timeout)
+    result = runner(argv, timeout, env)
     if result.returncode != 0:
         _fail(result)
 
@@ -164,13 +181,14 @@ def copy_file_to_s3(
     *,
     runner: CommandRunner = run_command,
     timeout: float | None = 300.0,
+    env: Env = None,
 ) -> None:
-    aws = aws_binary()
+    aws = aws_binary(env)
     if aws is None:
         raise SyncError(
             f"`aws` CLI not found on host {_host_label()}; cannot upload {local} to {dest}"
         )
-    result = runner([aws, "s3", "cp", str(local), dest, "--only-show-errors"], timeout)
+    result = runner([aws, "s3", "cp", str(local), dest, "--only-show-errors"], timeout, env)
     if result.returncode != 0:
         _fail(result)
 
@@ -183,8 +201,9 @@ def upload_dir_to_hf(
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
+    env: Env = None,
 ) -> None:
-    hf = hf_binary()
+    hf = hf_binary(env)
     if hf is None:
         raise SyncError(
             "`hf` CLI not found (looked in ~/.local/bin/hf and PATH) on host "
@@ -194,7 +213,7 @@ def upload_dir_to_hf(
         raise MissingOutput(f"output path does not exist: {local}")
     argv = [hf, "upload", repo, str(local), path_in_repo]
     argv += exclude_args("--exclude", local, min_age_s)
-    result = runner(argv, timeout)
+    result = runner(argv, timeout, env)
     if result.returncode != 0:
         _fail(result)
 
@@ -211,6 +230,7 @@ def sync_output(
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
+    env: Env = None,
 ) -> None:
     local = resolve_local(output, workdir, job_id)
     if output.s3:
@@ -220,6 +240,7 @@ def sync_output(
             min_age_s=min_age_s,
             runner=runner,
             timeout=timeout,
+            env=env,
         )
     if output.hf:
         upload_dir_to_hf(
@@ -229,6 +250,7 @@ def sync_output(
             min_age_s=min_age_s,
             runner=runner,
             timeout=timeout,
+            env=env,
         )
 
 
@@ -240,12 +262,19 @@ def sync_outputs(
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
+    env: Env = None,
 ) -> None:
     errors: list[SyncError] = []
     for output in outputs:
         try:
             sync_output(
-                output, workdir, job_id, min_age_s=min_age_s, runner=runner, timeout=timeout
+                output,
+                workdir,
+                job_id,
+                min_age_s=min_age_s,
+                runner=runner,
+                timeout=timeout,
+                env=env,
             )
         except SyncError as exc:
             errors.append(exc)
@@ -263,13 +292,14 @@ def sync_job_meta(
     *,
     runner: CommandRunner = run_command,
     timeout: float | None = 300.0,
+    env: Env = None,
 ) -> None:
     if not s3_prefix:
         return
     base = f"{s3_prefix.rstrip('/')}/jobs/{job_id}"
     for path in (paths.log_file(job_id), paths.state_file(job_id)):
         if path.exists():
-            copy_file_to_s3(path, f"{base}/{path.name}", runner=runner, timeout=timeout)
+            copy_file_to_s3(path, f"{base}/{path.name}", runner=runner, timeout=timeout, env=env)
 
 
 class SyncLoop:
@@ -288,12 +318,16 @@ class SyncLoop:
         *,
         runner: CommandRunner = run_command,
         min_age_s: float = MIN_AGE_S,
+        env: Env = None,
     ) -> None:
         self._spec = spec
         self._workdir = workdir
         self._s3_prefix = s3_prefix
         self._runner = runner
         self._min_age_s = min_age_s
+        # The job's environment, secrets included: uploads authenticate as the
+        # job, not as whatever the dispatcher happened to inherit.
+        self._env = env
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
@@ -321,8 +355,15 @@ class SyncLoop:
                 min_age_s=min_age_s,
                 runner=self._runner,
                 timeout=timeout,
+                env=self._env,
             )
-            sync_job_meta(self._spec.job_id, self._s3_prefix, runner=self._runner, timeout=timeout)
+            sync_job_meta(
+                self._spec.job_id,
+                self._s3_prefix,
+                runner=self._runner,
+                timeout=timeout,
+                env=self._env,
+            )
 
     def _loop(self) -> None:
         interval = max(1, self._spec.sync_interval_s)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from gpuc.control.config import HostEntry
-from gpuc.control.status import HostView, JobView, job_views, render
+from gpuc.control.providers.base import Pod
+from gpuc.control.status import HostView, JobView, gather, job_views, render
 
 GPU = "GPU-a"
 
@@ -146,3 +147,48 @@ def test_null_utilization_samples_are_dropped() -> None:
     )
     assert running[0].util_recent == [90.0, 80.0]
     assert not running[0].suspect
+
+
+class _GoneProvider:
+    """A provider that knows nothing about the pod the registry still lists."""
+
+    def __init__(self, pod: Any = None) -> None:
+        self._pod = pod
+        self.asked: list[str] = []
+
+    def get(self, pod_id: str) -> Any:
+        self.asked.append(pod_id)
+        return self._pod
+
+
+def _runpod_entry() -> HostEntry:
+    return HostEntry(
+        name="gpuc-e2e-1", kind="runpod", ssh="root@1.2.3.4", port=22, pod_id="pod-1", gpus=[GPU]
+    )
+
+
+def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
+    def explode(*_: Any, **__: Any) -> Any:
+        raise AssertionError("status must not ssh to a pod that no longer exists")
+
+    view = gather(_runpod_entry(), session=cast(Any, explode), provider=cast(Any, _GoneProvider()))
+    assert view.pod_gone and not view.reachable
+    assert "missing" in (view.error or "")
+    text = render(view)
+    assert "POD GONE" in text
+    assert "gpuc reconcile --once" in text
+    assert "host probe" not in text
+
+
+def test_a_terminated_pod_reads_as_gone_too() -> None:
+    terminated = Pod(
+        id="pod-1",
+        name="gpuc-e2e-1",
+        status="TERMINATED",
+        cost_usd_hr=0.0,
+        gpu_name="A40",
+    )
+    view = gather(_runpod_entry(), provider=cast(Any, _GoneProvider(terminated)))
+    assert view.pod_gone
+    assert "TERMINATED" in render(view)
+    assert "gpuc reconcile --once" in (view.error or "")

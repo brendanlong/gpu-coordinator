@@ -128,7 +128,9 @@ def test_queued_jobs_reorder_and_cancel_while_the_card_is_busy(
 
     assert main(["status", "--host", "local"]) == 0
     queued = [line for line in capsys.readouterr().out.splitlines() if "queued" in line]
-    assert [first, second] == [line.split()[1] for line in queued]
+    # Set, not sequence: job ids are second-granular, so two submits inside one
+    # second tie-break on their random suffix, not on submission order.
+    assert {first, second} == {line.split()[1] for line in queued}
 
     assert main(["reorder", second, "--priority", "10"]) == 0
     capsys.readouterr()

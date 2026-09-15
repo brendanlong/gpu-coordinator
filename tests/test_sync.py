@@ -16,19 +16,23 @@ class RecordingRunner:
     def __init__(self, returncode: int = 0, output: str = "") -> None:
         self.calls: list[list[str]] = []
         self.timeouts: list[float | None] = []
+        self.envs: list[sync.Env] = []
         self.returncode = returncode
         self.output = output
 
-    def __call__(self, argv: list[str], timeout: float | None) -> sync.CommandResult:
+    def __call__(
+        self, argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
         self.calls.append(argv)
         self.timeouts.append(timeout)
+        self.envs.append(env)
         return sync.CommandResult(argv, self.returncode, self.output)
 
 
 @pytest.fixture
 def fake_aws(monkeypatch: pytest.MonkeyPatch) -> str:
-    monkeypatch.setattr(sync, "aws_binary", lambda: "/fake/aws")
-    monkeypatch.setattr(sync, "hf_binary", lambda: "/fake/hf")
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(sync, "hf_binary", lambda env=None: "/fake/hf")
     return "/fake/aws"
 
 
@@ -76,7 +80,7 @@ def test_sync_error_carries_command_and_output(tmp_path: Path, fake_aws: str) ->
 def test_missing_aws_binary_is_a_clear_sync_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda: None)
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
     with pytest.raises(sync.SyncError) as excinfo:
         sync.sync_dir_to_s3(tmp_path, "s3://bucket/p", runner=RecordingRunner())
     assert "`aws` CLI not found" in str(excinfo.value)
@@ -85,7 +89,7 @@ def test_missing_aws_binary_is_a_clear_sync_error(
 def test_missing_hf_binary_is_a_clear_sync_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "hf_binary", lambda: None)
+    monkeypatch.setattr(sync, "hf_binary", lambda env=None: None)
     with pytest.raises(sync.SyncError) as excinfo:
         sync.upload_dir_to_hf(tmp_path, "org/repo", "p", runner=RecordingRunner())
     assert "`hf` CLI not found" in str(excinfo.value)
@@ -227,7 +231,9 @@ def test_a_missing_output_dir_on_the_final_sync_is_its_own_error(
 def test_the_periodic_thread_survives_any_exception_and_records_it(
     gpuc_home: Path, fake_aws: str
 ) -> None:
-    def exploding(argv: list[str], timeout: float | None) -> sync.CommandResult:
+    def exploding(
+        argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
         raise KeyboardInterrupt("something unspeakable")
 
     job_id = jobs.new_job_id()
@@ -244,7 +250,9 @@ def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: str) ->
     overlaps: list[str] = []
     inside = threading.Lock()
 
-    def slow(argv: list[str], timeout: float | None) -> sync.CommandResult:
+    def slow(
+        argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
         if not inside.acquire(blocking=False):
             overlaps.append(" ".join(argv))
         else:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -19,11 +20,13 @@ from gpuc.control.config import (
     HostEntry,
     Registry,
     Settings,
+    config_file,
     load_registry,
     load_settings,
     registry_transaction,
     state_dir,
     utc_now,
+    write_config_template,
 )
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import Cloud, Constraints, Provider, ProviderError
@@ -160,9 +163,28 @@ def runpod_target(args: argparse.Namespace, settings: Settings) -> HostEntry:
         name_hint=args.name_hint,
         idle_minutes=args.idle_min,
         ttl_hours=args.ttl_hours,
-        disk_gb=args.disk,
+        disk_gb=args.disk if args.disk is not None else settings.disk_gb,
+        image=args.image or settings.image,
         health_args=args.health_args,
     )
+
+
+def cmd_config_init(args: argparse.Namespace) -> int:
+    path = write_config_template(force=args.force)
+    print(f"wrote {path}\nEvery key is commented with its default; edit what you need.")
+    return 0
+
+
+def cmd_config_show(_: argparse.Namespace) -> int:
+    path = config_file()
+    settings = load_settings()
+    print(f"config file: {path}{'' if path.exists() else ' (does not exist; using defaults)'}")
+    print(f"state dir:   {state_dir()}")
+    for name, value in settings.model_dump().items():
+        print(f"  {name} = {value!r}")
+    if settings.s3_bucket is None:
+        print("  note: no s3_bucket, so nothing is mirrored to S3")
+    return 0
 
 
 def mirror_spec_first(model: JobSpecModel, job_id: str, settings: Settings) -> list[str]:
@@ -484,6 +506,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-heartbeat", action="store_true", help="skip the per-pod dispatcher ssh check"
     )
     pods.set_defaults(func=cmd_pods)
+
+    config = sub.add_parser("config", help="show or create the settings file").add_subparsers(
+        dest="config_command", required=True
+    )
+    config_init = config.add_parser("init", help="write a commented config.toml")
+    config_init.add_argument("--force", action="store_true", help="overwrite an existing file")
+    config_init.set_defaults(func=cmd_config_init)
+    config.add_parser("show", help="print the effective settings").set_defaults(
+        func=cmd_config_show
+    )
     return parser
 
 
@@ -497,14 +529,42 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cuda-min", default=None, help="host CUDA floor, default 12.8")
     parser.add_argument("--idle-min", type=float, default=15.0)
     parser.add_argument("--ttl-hours", type=float, default=24.0)
-    parser.add_argument("--disk", type=int, default=50, help="container disk in GB")
+    parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
+    parser.add_argument("--image", help="pod image; default from config")
     parser.add_argument("--no-reuse", action="store_true", help="always create a new pod")
     parser.add_argument("--name-hint", default="job", help="goes into the pod name")
     parser.add_argument("--health-args", default="", help="extra flags for `gpuc.host health`")
 
 
+def wants_runpod(args: argparse.Namespace) -> bool:
+    if getattr(args, "install", False):
+        return False  # `reconcile --install` only writes unit files
+    return bool(getattr(args, "runpod", False)) or args.command in ("pods", "reconcile")
+
+
+def first_run_note() -> None:
+    """One line, once, on stderr: defaults are fine, but say where to change them."""
+    if not config_file().exists():
+        print(
+            f"note: no config file at {config_file()} (using defaults, no S3 mirror); "
+            f"run `gpuc config init` to create one",
+            file=sys.stderr,
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
+    if wants_runpod(args) and not os.environ.get("RUNPOD_API_KEY"):
+        # Before anything else: provisioning spends money, and finding out after
+        # the spec has been mirrored and a host picked helps nobody.
+        print(
+            "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
+            "`gpuc pods` or `gpuc reconcile`",
+            file=sys.stderr,
+        )
+        return 1
+    if args.command != "config":
+        first_run_note()
     try:
         return int(args.func(args))
     except (

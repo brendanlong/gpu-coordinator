@@ -113,7 +113,7 @@ def test_a_stale_assigned_uuid_fails_the_job_before_it_starts(gpuc_home: Path) -
 def test_failed_final_sync_turns_a_succeeded_job_into_failed_sync(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda: None)
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
     job_id = prepare(
         command="mkdir -p out && echo x > out/x",
         outputs=[{"path": "out", "s3": "s3://bucket/{job_id}"}],
@@ -127,7 +127,7 @@ def test_failed_final_sync_turns_a_succeeded_job_into_failed_sync(
 def test_failed_final_sync_does_not_mask_a_failed_job(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda: None)
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
     job_id = prepare(
         command="mkdir -p out && exit 7",
         outputs=[{"path": "out", "s3": "s3://bucket/{job_id}"}],
@@ -299,10 +299,12 @@ def test_runner_uses_the_s3_prefix_for_log_and_state(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     jobs.write_config(HostConfig(host="h", gpus=list(FAKE_GPUS), s3_prefix="s3://b/gpuc/h"))
-    monkeypatch.setattr(sync, "aws_binary", lambda: "/fake/aws")
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
     calls: list[list[str]] = []
 
-    def command_runner(argv: list[str], timeout: float) -> sync.CommandResult:
+    def command_runner(
+        argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
         calls.append(argv)
         return sync.CommandResult(argv, 0, "")
 
@@ -450,9 +452,9 @@ def test_preflight_is_a_real_phase(gpuc_home: Path) -> None:
 def test_a_missing_output_dir_fails_the_job_as_no_outputs_not_as_sync(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda: "/fake/aws")
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
     monkeypatch.setattr(
-        sync, "run_command", lambda argv, timeout=None: sync.CommandResult(argv, 0, "")
+        sync, "run_command", lambda argv, timeout=None, env=None: sync.CommandResult(argv, 0, "")
     )
     job_id = prepare(
         command="true", outputs=[{"path": "never-written", "s3": "s3://bucket/{job_id}"}]
@@ -460,3 +462,98 @@ def test_a_missing_output_dir_fails_the_job_as_no_outputs_not_as_sync(
     assert runner.run_job(job_id, deps()) == 1
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("failed", "no-outputs")
+
+
+# -- PATH, secrets and the sync environment ------------------------------------
+
+
+def test_build_env_puts_the_home_tool_dirs_in_front_of_path(
+    gpuc_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pod's sshd PATH has no ~/.local/bin, so `uv run --no-sync` -- which
+    the runner's own GPU preflight uses -- would not resolve."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".local/bin").mkdir(parents=True)
+    (fake_home / ".cargo/bin").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = runner.build_env(make_spec(), [])
+    assert env["PATH"].split(os.pathsep)[:2] == [
+        str(fake_home / ".local/bin"),
+        str(fake_home / ".cargo/bin"),
+    ]
+    assert env["PATH"].endswith("/usr/bin:/bin")
+
+
+def test_path_with_user_bins_skips_missing_dirs_and_never_duplicates(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".local/bin").mkdir(parents=True)
+    environ = {"HOME": str(tmp_path), "PATH": f"{tmp_path / '.local/bin'}:/usr/bin"}
+    assert paths.path_with_user_bins(environ) == f"{tmp_path / '.local/bin'}:/usr/bin"
+    assert paths.path_with_user_bins({"HOME": str(tmp_path), "PATH": "/usr/bin"}) == (
+        f"{tmp_path / '.local/bin'}:/usr/bin"
+    )
+
+
+def test_a_jobs_secrets_reach_the_sync_loop(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`secrets: [AWS_ACCESS_KEY_ID]` must be enough: no ~/.aws on the host."""
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
+    seen: list[sync.Env] = []
+
+    def command_runner(
+        argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
+        seen.append(env)
+        return sync.CommandResult(argv, 0, "")
+
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+        secrets=["AWS_ACCESS_KEY_ID"],
+    )
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIAFROMTHEJOB\n")
+    assert runner.run_job(job_id, deps(command_runner=command_runner)) == 0
+    assert seen, "the sync loop never ran a command"
+    assert all(env is not None and env["AWS_ACCESS_KEY_ID"] == "AKIAFROMTHEJOB" for env in seen)
+
+
+def test_the_secrets_file_outlives_the_job_until_the_final_sync_is_done(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlinking it before the final sync would break exactly the upload that
+    matters most: the one carrying the finished run's outputs."""
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
+    present_during_sync: list[bool] = []
+
+    def command_runner(
+        argv: list[str], timeout: float | None = None, env: sync.Env = None
+    ) -> sync.CommandResult:
+        present_during_sync.append(paths.job_env_file(job_id).exists())
+        return sync.CommandResult(argv, 0, "")
+
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+        secrets=["AWS_ACCESS_KEY_ID"],
+    )
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIAFROMTHEJOB\n")
+    assert runner.run_job(job_id, deps(command_runner=command_runner)) == 0
+    assert all(present_during_sync)
+    assert not paths.job_env_file(job_id).exists()
+
+
+def test_no_secret_value_is_ever_written_to_a_log(gpuc_home: Path) -> None:
+    secret = "gpuc-canary-must-not-appear-0123456789"
+    job_id = prepare(command="echo the job ran", env={"HARMLESS": "1"}, secrets=["WANDB_API_KEY"])
+    paths.job_env_file(job_id).write_text(f"WANDB_API_KEY={secret}\n")
+    assert runner.run_job(job_id, deps()) == 0
+    assert secret not in log_of(job_id)
+    assert secret not in paths.state_file(job_id).read_text()
+    dispatcher_log = paths.dispatcher_log()
+    if dispatcher_log.exists():
+        assert secret not in dispatcher_log.read_text()

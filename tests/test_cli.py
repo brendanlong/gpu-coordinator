@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from gpuc.control import reconcile as reconcile_mod
 from gpuc.control.cli import main
-from gpuc.control.config import HostEntry, Settings, load_registry
+from gpuc.control.config import HostEntry, Settings, config_file, load_registry, load_settings
 from gpuc.control.providers.base import Constraints
 from gpuc.control.submit import SubmitResult
 from tests.fakeprovider import FakeProvider, running_pod
@@ -213,3 +214,105 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 0
     assert seen == {"gpu_names": ["A40"], "attempt": 2}
+
+
+# -- first-run experience -------------------------------------------------------
+
+
+def test_config_init_writes_a_commented_file_that_reloads_to_the_defaults(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["config", "init"]) == 0
+    path = config_file()
+    text = path.read_text()
+    for key in (
+        "s3_bucket",
+        "runpod_pod_prefix",
+        "max_pods",
+        "max_total_usd_per_hour",
+        "ssh_key",
+        "image",
+        "disk_gb",
+    ):
+        assert key in text
+    assert load_settings() == Settings()
+    assert str(path) in capsys.readouterr().out
+
+
+def test_config_init_refuses_to_clobber_without_force(control_env: Path) -> None:
+    assert main(["config", "init"]) == 0
+    config_file().write_text("max_pods = 9\n")
+    assert main(["config", "init"]) == 1
+    assert load_settings().max_pods == 9
+    assert main(["config", "init", "--force"]) == 0
+    assert load_settings().max_pods == 3
+
+
+def test_config_show_works_without_a_config_file(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "does not exist; using defaults" in out
+    assert "no s3_bucket" in out
+
+
+def test_commands_work_with_no_config_file_and_say_how_to_make_one(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert not config_file().exists()
+    assert main(["host", "list"]) == 0
+    captured = capsys.readouterr()
+    assert "gpuc config init" in captured.err
+    assert captured.err.count("gpuc config init") == 1
+    assert "no hosts registered" in captured.out
+
+
+def test_no_note_once_a_config_file_exists(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["config", "init"])
+    capsys.readouterr()
+    assert main(["host", "list"]) == 0
+    assert "gpuc config init" not in capsys.readouterr().err
+
+
+def test_runpod_commands_fail_fast_without_an_api_key(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before the spec is mirrored, before a host is picked, before any spend."""
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    for argv in (
+        ["submit", "job.yaml", "--runpod", "--gpu", "A40"],
+        ["pods"],
+        ["reconcile", "--once"],
+    ):
+        assert main(argv) == 1
+        err = capsys.readouterr().err
+        assert err.strip().splitlines() == [
+            "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
+            "`gpuc pods` or `gpuc reconcile`"
+        ]
+
+
+def test_a_non_runpod_command_does_not_need_the_api_key(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    assert main(["host", "list"]) == 0
+
+
+def test_reconcile_install_does_not_need_the_api_key(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Writing unit files is setup, not a provider call."""
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    # systemd_dir() is $HOME-relative, so it has to be redirected explicitly or
+    # the test would install units into the developer's real session.
+    units = tmp_path / "systemd"
+    monkeypatch.setattr(reconcile_mod, "systemd_dir", lambda: units)
+    assert main(["reconcile", "--install"]) == 0
+    assert {p.name for p in units.iterdir()} == {
+        "gpuc-reconcile.service",
+        "gpuc-reconcile.timer",
+    }

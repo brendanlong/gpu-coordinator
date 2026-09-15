@@ -16,6 +16,7 @@ from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.transport import TransportError
 
 HEARTBEAT_STALE_S = 30.0
+DEAD_POD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
 SUSPECT_FLOOR_PCT = 5.0
 SUSPECT_SAMPLES = 20  # 10 minutes of main-phase samples at the 30 s runner cadence
 RECENT_FINISHED = 5
@@ -81,6 +82,7 @@ class HostView:
     reachable: bool = False
     error: str | None = None
     heartbeat_age_s: float | None = None
+    pod_gone: bool = False
     draining: bool = False
     paused: bool = False
     owned: list[str] = field(default_factory=list)
@@ -156,8 +158,19 @@ def gather(
     if provider is not None and entry.kind == "runpod" and entry.pod_id:
         try:
             view.pod = provider.get(entry.pod_id)
+            view.pod_gone = view.pod is None or view.pod.status in DEAD_POD_STATUSES
         except ProviderError as exc:
             view.error = f"could not read pod {entry.pod_id}: {exc}"
+    if view.pod_gone:
+        # The pod is gone but the registry still lists it. SSH would hang and
+        # then print a stack about a refused connection, which tells nobody
+        # anything: say what happened and what removes the entry.
+        status = "missing" if view.pod is None else view.pod.status
+        view.error = (
+            f"pod {entry.pod_id} is {status}; the registry entry is stale. "
+            f"Run `gpuc reconcile --once` to forget it."
+        )
+        return view
     try:
         session = session or open_session(entry, settings)
         payload = session.host_json("status", timeout=60.0)
@@ -196,14 +209,16 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
     entry = view.entry
     target = entry.ssh or "this machine"
     if not view.reachable:
+        state = "POD GONE" if view.pod_gone else "UNREACHABLE"
         lines = [
-            f"host {entry.name} [{entry.kind}] {target}: UNREACHABLE",
+            f"host {entry.name} [{entry.kind}] {target}: {state}",
             f"  {view.error}",
         ]
         pod = pod_line(view.pod)
         if pod:
             lines.append(pod)
-        lines.append(f"  try: gpuc host probe {entry.name}")
+        if not view.pod_gone:
+            lines.append(f"  try: gpuc host probe {entry.name}")
         return "\n".join(lines)
     flags = []
     if view.draining:

@@ -7,7 +7,17 @@ bootstrap that sets GPUC_HOME) can redirect the whole tree at any time.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
+
+USER_BIN_DIRS = (".local/bin", ".cargo/bin")
+"""Where `uv` (and anything `uv tool install` puts down) lands in $HOME.
+
+A pod's sshd hands out a PATH that has neither, so `uv run` -- which the
+runner's own GPU preflight uses before the job's first command -- is not found
+and every job fails identically. Both the dispatcher and the runner put these
+in front of whatever PATH they inherited.
+"""
 
 
 def home() -> Path:
@@ -19,6 +29,20 @@ def home() -> Path:
 
 def config_file() -> Path:
     return home() / "config.json"
+
+
+def path_with_user_bins(environ: Mapping[str, str] | None = None) -> str:
+    """``PATH`` with the $HOME tool directories in front, without duplicates."""
+    environ = os.environ if environ is None else environ
+    current = environ.get("PATH", os.defpath)
+    entries = current.split(os.pathsep)
+    user_home = Path(environ.get("HOME") or Path.home())
+    prefix = [
+        str(user_home / name)
+        for name in USER_BIN_DIRS
+        if (user_home / name).is_dir() and str(user_home / name) not in entries
+    ]
+    return os.pathsep.join([*prefix, *entries]) if prefix else current
 
 
 def secrets_dir() -> Path:

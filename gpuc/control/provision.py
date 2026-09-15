@@ -49,7 +49,7 @@ from gpuc.control.providers.base import (
 )
 from gpuc.control.remote import RemoteError, open_session
 from gpuc.control.s3index import default_s3_prefix
-from gpuc.control.transport import Transport, TransportError
+from gpuc.control.transport import SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
 DEFAULT_DISK_GB = 50
@@ -63,7 +63,7 @@ AWS_KEY_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN
 DEAD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
 
 SSH_MISCONFIGURED = re.compile(
-    r"ControlPath too long|Bad configuration option|no such identity file|"
+    r"ControlPath too long|unix_listener|Bad configuration option|no such identity file|"
     r"WARNING: UNPROTECTED PRIVATE KEY",
     re.IGNORECASE,
 )
@@ -195,10 +195,12 @@ def deliver_s3_credentials(
 ) -> bool:
     """Give the *host* S3 credentials, not just each job.
 
-    The dispatcher mirrors every job's log and state to ``s3_prefix`` on its own
-    account, and a job's ``secrets:`` file only ever reaches that job's own
-    processes. Written from stdin at 0600, never via argv and never in the pod
-    env (``GET /pods`` returns the env to any holder of an account key).
+    Still needed even though the runner now hands each job's own ``secrets:``
+    to its sync loop: the dispatcher's drain path mirrors every job's log.txt
+    and state.json to ``s3_prefix`` after the jobs (and their secrets files)
+    are gone, and it has only its own environment to do it with. Written from
+    stdin at 0600, never via argv and never in the pod env (``GET /pods``
+    returns the env to any holder of an account key).
     """
     environ = environ if environ is not None else dict(os.environ)
     if not entry.s3_prefix:
@@ -472,6 +474,12 @@ def _wait_for_ssh(
                 progress(f"ssh answered after {attempts} attempt(s)")
                 return
             last = result.output.strip().splitlines()[-1] if result.output.strip() else "no output"
+        except SshUnusable as exc:
+            # Never retried: the socket path cannot get shorter while we wait.
+            raise ProvisionError(
+                f"ssh to {transport.host} cannot work as configured, so waiting would only "
+                f"burn the pod's clock: {exc}"
+            ) from exc
         except TransportError as exc:
             last = str(exc).splitlines()[-1]
         if SSH_MISCONFIGURED.search(last):

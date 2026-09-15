@@ -185,3 +185,10 @@ def test_bootstrap_is_idempotent(control_env: Path) -> None:
     assert any("astral.sh/uv" in e for e in first)
     assert not any("astral.sh/uv" in e for e in host.events)
     assert not any("awscli-exe" in e for e in host.events)
+
+
+def test_the_dispatcher_is_started_with_the_home_tool_dirs_on_path(control_env: Path) -> None:
+    host = ScriptedHost()
+    bootstrap_host(entry(), transport=host, report=lambda _: None)
+    command = next(e for e in host.events if "spawn_detached_dispatcher" in e)
+    assert command.startswith('PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"')

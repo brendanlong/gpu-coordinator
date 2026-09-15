@@ -260,11 +260,23 @@ class DispatcherLock:
             self._fd = None
 
 
-def default_spawn_runner(job_id: str) -> subprocess.Popen[bytes]:
-    package_root = Path(__file__).resolve().parents[2]
+def _child_env(package_root: Path) -> dict[str, str]:
+    """The environment every dispatcher-spawned process gets.
+
+    PYTHONPATH so the rsynced package is importable, and PATH so `uv` is
+    findable: a pod's sshd PATH has no ~/.local/bin, and the dispatcher's own
+    environment is what the runner (and through it every job) inherits.
+    """
     env = dict(os.environ)
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{package_root}{os.pathsep}{existing}" if existing else str(package_root)
+    env["PATH"] = paths.path_with_user_bins(env)
+    return env
+
+
+def default_spawn_runner(job_id: str) -> subprocess.Popen[bytes]:
+    package_root = Path(__file__).resolve().parents[2]
+    env = _child_env(package_root)
     log = paths.dispatcher_log().open("ab", buffering=0)
     try:
         return subprocess.Popen(
@@ -287,9 +299,7 @@ def spawn_detached_dispatcher() -> int:
     heartbeat is fresh, so enqueue can fire this unconditionally.
     """
     package_root = Path(__file__).resolve().parents[2]
-    env = dict(os.environ)
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = f"{package_root}{os.pathsep}{existing}" if existing else str(package_root)
+    env = _child_env(package_root)
     paths.ensure_layout()
     with paths.dispatcher_log().open("ab", buffering=0) as log:
         proc = subprocess.Popen(

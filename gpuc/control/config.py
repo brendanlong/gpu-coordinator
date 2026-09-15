@@ -18,13 +18,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from gpuc.control.providers.base import Caps, Offer
+from gpuc.control.providers.base import DEFAULT_IMAGE, Caps, Offer
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.jobs import HostConfig
 
 HostKind = Literal["local", "ssh", "runpod"]
 
 DEFAULT_POD_PREFIX = "gpuc-"
+DEFAULT_DISK_GB = 50
 
 
 class ConfigError(RuntimeError):
@@ -90,11 +91,19 @@ def ensure_state_dir() -> Path:
 
 
 class Settings(BaseModel):
+    """Every key has a working default: gpuc runs with no config file at all.
+
+    Without ``s3_bucket`` there is simply no S3 mirror, so specs, logs and
+    state live only on the host they ran on.
+    """
+
     s3_bucket: str | None = None
     runpod_pod_prefix: str = DEFAULT_POD_PREFIX
     max_pods: int = 3
     max_total_usd_per_hour: float = 3.0
     ssh_key: str | None = None
+    image: str = DEFAULT_IMAGE
+    disk_gb: int = DEFAULT_DISK_GB
 
     @property
     def ssh_key_path(self) -> str | None:
@@ -106,6 +115,44 @@ class Settings(BaseModel):
             max_pods=self.max_pods,
             max_total_usd_per_hour=self.max_total_usd_per_hour,
         )
+
+
+CONFIG_TEMPLATE = f"""\
+# gpu-coordinator settings. Every key here is optional; the values shown are
+# the defaults. Delete this file to go back to all of them.
+
+# Where specs, logs and job state are mirrored. Unset means no S3 mirror at
+# all, which also means `gpuc requeue` and `gpuc logs` after a pod is gone
+# cannot work.
+# s3_bucket = "my-experiments"
+
+# Only pods whose name starts with this are ever read, reaped or terminated.
+runpod_pod_prefix = "{DEFAULT_POD_PREFIX}"
+
+# Refuse to create a pod that would push us past either cap.
+max_pods = 3
+max_total_usd_per_hour = 3.0
+
+# Private key for ssh and rsync to hosts and pods; its ".pub" is uploaded to
+# the RunPod account. Unset means ssh picks its own.
+# ssh_key = "~/.ssh/id_ed25519"
+
+# Defaults for `gpuc submit --runpod`; override per submit with --disk.
+image = "{DEFAULT_IMAGE}"
+disk_gb = {DEFAULT_DISK_GB}
+"""
+
+
+def write_config_template(*, force: bool = False) -> Path:
+    """Write a commented config.toml. Never clobbers an existing one silently."""
+    path = config_file()
+    if path.exists() and not force:
+        raise ConfigError(f"{path} already exists. Edit it, or pass --force to overwrite it.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    tmp.write_text(CONFIG_TEMPLATE)
+    os.replace(tmp, path)
+    return path
 
 
 def load_settings() -> Settings:

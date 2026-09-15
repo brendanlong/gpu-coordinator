@@ -45,10 +45,6 @@ PROVISION_TIMEOUT_S = 900.0
 JOB_TIMEOUT_S = 1500.0
 IDLE_TIMEOUT_S = 900.0
 
-# The RunPod image's sshd hands out a PATH without ~/.local/bin, and the
-# runner's own GPU preflight runs `uv run` before any of the job's own commands.
-POD_PATH = "/root/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
-
 PYPROJECT = """\
 [project]
 name = "gpuc-e2e"
@@ -75,8 +71,6 @@ name: gpuc-e2e
 setup: uv sync
 command: mkdir -p results && uv run --no-sync python -c '{PROBE}' | tee results/gpu.txt
 gpus: 1
-env:
-  PATH: "{POD_PATH}"
 secrets: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]
 outputs:
   - path: results
@@ -118,7 +112,11 @@ class RecordingProvider(RunPodProvider):
 
 @pytest.fixture
 def aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The job's `secrets:` and the pod's log mirror both read these from our env."""
+    """The job's `secrets:` and the pod's log mirror both read these from our env.
+
+    The job's own S3 output needs nothing but the `secrets:` line above: the
+    runner hands its secrets to the sync loop.
+    """
     if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
         return
     parser = configparser.ConfigParser()

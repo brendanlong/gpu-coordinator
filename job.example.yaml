@@ -1,0 +1,44 @@
+# A complete gpuc job spec. Submit with:
+#   gpuc submit job.example.yaml --host local
+#   gpuc submit job.example.yaml --runpod --gpu A40 --max-price 0.60
+#
+# Only `command` is required. Paths in `outputs` are relative to the workdir,
+# which is an rsync of this repository's git-tracked files.
+
+name: lego-s4                                   # a label, not an identifier
+command: uv run python -m experiments.lego.train --k-max 6
+setup: uv sync --frozen                         # optional; runs first, phase=setup
+gpus: 1                                         # 0..N of the host's owned GPUs
+
+env:                                            # plain environment, stored in the spec
+  REQUIRE_CUDA: "1"
+
+# Read from *your* shell at submit time and delivered to the host as
+# ~/.gpuc/secrets/<job_id>.env (0600). Never in argv, never in the pod's env,
+# never in a log. The runner puts them in the job's environment and in the
+# environment its upload commands run with, so these are all S3 and HF need.
+secrets:
+  - AWS_ACCESS_KEY_ID
+  - AWS_SECRET_ACCESS_KEY
+  - HF_TOKEN
+  - WANDB_API_KEY
+
+outputs:
+  - path: results                               # relative to the workdir
+    s3: s3://my-bucket/lego/{job_id}/results
+  - path: checkpoints
+    hf: my-org/lego-checkpoints
+    hf_path: "{job_id}"
+
+sync_interval_s: 180                            # background upload cadence
+priority: 50                                    # 0 (first) .. 99 (last)
+max_runtime_min: 600                            # null for no limit
+
+low_util:                                       # kill a job that is not using the GPU
+  enabled: true
+  window_min: 25                                # rolling mean over this window
+  floor_pct: 5                                  # below this is "idle"
+  grace_min: 10                                 # no killing before this much of phase=main
+
+requires:
+  cuda_min: "12.8"                              # informs provisioning only

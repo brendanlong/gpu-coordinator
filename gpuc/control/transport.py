@@ -8,6 +8,7 @@ output, because "it failed" on a remote host is otherwise undebuggable.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 from collections.abc import Iterable, Sequence
@@ -17,6 +18,17 @@ from typing import Protocol
 
 DEFAULT_TIMEOUT_S = 120.0
 CONNECT_TIMEOUT_S = 15
+
+# sun_path is 108 bytes; ssh expands %C to 40 hex characters. 100 leaves room
+# for the ".<pid>" suffix ssh appends while the master is being set up.
+CONTROL_PATH_MAX = 100
+CONTROL_HASH_LEN = 40
+
+SSH_SOCKET_FATAL = re.compile(r"ControlPath too long|unix_listener", re.IGNORECASE)
+"""ssh could not bind its ControlMaster socket. No amount of waiting fixes a
+path that does not fit in sun_path, and a caller that retries anyway spends its
+whole budget in silence -- which is exactly how one provisioning run burnt a
+15-minute ceiling on nothing."""
 
 
 @dataclass
@@ -38,12 +50,55 @@ class CommandResult:
 
 
 class TransportError(RuntimeError):
-    def __init__(self, result: CommandResult) -> None:
-        tail = "\n".join(result.output.strip().splitlines()[-10:])
-        super().__init__(
-            f"`{shlex.join(result.argv)}` on host {result.host} exited {result.returncode}\n{tail}"
-        )
+    def __init__(self, result: CommandResult | None = None, message: str | None = None) -> None:
+        if message is None:
+            if result is None:
+                raise ValueError("TransportError needs a result or a message")
+            tail = "\n".join(result.output.strip().splitlines()[-10:])
+            message = (
+                f"`{shlex.join(result.argv)}` on host {result.host} "
+                f"exited {result.returncode}\n{tail}"
+            )
+        super().__init__(message)
         self.result = result
+
+
+class SshUnusable(TransportError):
+    """A local ssh misconfiguration that retrying cannot fix.
+
+    Raised even when the caller passed ``check=False``: every polling loop in
+    this codebase treats a non-zero ssh as "not up yet", and this class of
+    failure is never that.
+    """
+
+
+def control_socket_dir() -> Path:
+    """Where ControlMaster sockets live: a short, per-user, private directory.
+
+    Deliberately *not* the state dir. A unix socket path must fit in sun_path,
+    and ``$XDG_DATA_HOME/gpu-coordinator/control/cm-<40 hex>`` under a long
+    ``$HOME`` (or a pytest tmp dir) does not.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / "gpuc"
+    return Path(f"/tmp/gpuc-{os.getuid()}")
+
+
+def control_path(directory: Path) -> str:
+    """The ``ControlPath`` template, checked against sun_path before ssh runs."""
+    template = f"{directory}/cm-%C"
+    expanded = len(template.encode()) - len("%C") + CONTROL_HASH_LEN
+    if expanded >= CONTROL_PATH_MAX:
+        raise SshUnusable(
+            message=(
+                f"the ControlMaster socket path would be {expanded} bytes "
+                f"({template}), over the {CONTROL_PATH_MAX}-byte limit a unix socket can "
+                f"hold.\nSet XDG_RUNTIME_DIR to a short directory (or unset it so gpuc uses "
+                f"/tmp/gpuc-{os.getuid()}) and try again."
+            )
+        )
+    return template
 
 
 class Transport(Protocol):
@@ -90,6 +145,14 @@ def _execute(
         proc.stdout.decode("utf-8", "replace"),
         proc.stderr.decode("utf-8", "replace"),
     )
+    if result.returncode != 0 and SSH_SOCKET_FATAL.search(result.stderr):
+        tail = "\n".join(result.stderr.strip().splitlines()[-5:])
+        raise SshUnusable(
+            result,
+            f"ssh to host {host} cannot create its ControlMaster socket, so no retry can "
+            f"succeed:\n{tail}\nThe socket lives under {control_socket_dir()}; check that it "
+            f"exists, is writable, and that its path is short.",
+        )
     return result.check() if check else result
 
 
@@ -161,13 +224,12 @@ class SshTransport:
             ]
         if self.control_dir is not None:
             # %C is a hash of (host, port, user, jump): one socket per real
-            # connection, and short enough never to overrun sun_path.
-            socket = self.control_dir / "cm-%C"
+            # connection, and a fixed 40 characters whatever the host is called.
             options += [
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                f"ControlPath={socket}",
+                f"ControlPath={control_path(self.control_dir)}",
                 "-o",
                 "ControlPersist=60",
             ]
@@ -184,6 +246,8 @@ class SshTransport:
     def _prepare(self) -> None:
         if self.control_dir is not None:
             self.control_dir.mkdir(parents=True, exist_ok=True)
+            # 0700: the socket is a live authenticated channel to the host.
+            self.control_dir.chmod(0o700)
         if self.known_hosts is not None:
             self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
             self.known_hosts.touch(exist_ok=True)
@@ -299,7 +363,11 @@ def make_transport(
     extra_options: Iterable[str] = (),
 ) -> Transport:
     """``known_hosts`` overrides the shared file: provisioning gives each pod
-    its own, so a recycled RunPod address cannot collide with a pinned key."""
+    its own, so a recycled RunPod address cannot collide with a pinned key.
+
+    ``state_dir`` is only the known_hosts location; the ControlMaster socket
+    always goes in the short runtime directory (see ``control_socket_dir``).
+    """
     if ssh is None:
         return LocalTransport(host=host)
     if known_hosts is None and state_dir is not None:
@@ -309,7 +377,7 @@ def make_transport(
         target=ssh,
         port=port,
         key=key,
-        control_dir=None if state_dir is None else state_dir / "control",
+        control_dir=control_socket_dir(),
         known_hosts=known_hosts,
         extra_options=list(extra_options),
     )
