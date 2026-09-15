@@ -17,6 +17,9 @@ gpuc version     # this build's commit, and each host's package commit
 gpuc status      # registered hosts, their queues, and what is running
 ```
 
+`gpuc skill` prints this file, and `gpuc skill --install [DIR]` writes a copy
+to `DIR/.claude/skills/gpuc/SKILL.md`.
+
 If `gpuc` is not on PATH, run it as `uv run gpuc` from a checkout. A host marked
 `OLDER: re-bootstrap` needs nothing from you: `gpuc submit` and `gpuc requeue`
 re-sync the package and restart that host's dispatcher before enqueueing (pass

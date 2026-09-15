@@ -41,6 +41,8 @@ gpuc version
 
 Or from a checkout, with no install at all: `uv run gpuc ...`.
 
+`gpuc skill --install` drops the agent guide into a project.
+
 ## Settings
 
 `gpuc` runs with no config file: every key has a working default, and without

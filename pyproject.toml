@@ -30,6 +30,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["gpuc"]
 
+# The agent guide lives at skills/gpuc/SKILL.md because the docs link to it there;
+# `gpuc skill` needs it inside the package for anyone who installed the wheel and
+# has no checkout to read it from.
+[tool.hatch.build.targets.wheel.force-include]
+"skills/gpuc/SKILL.md" = "gpuc/SKILL.md"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

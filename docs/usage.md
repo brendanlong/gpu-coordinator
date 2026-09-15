@@ -130,6 +130,12 @@ index says it ran on.
 index is tried first, then every registered host is asked whether it knows the
 id. An unknown job or host is exit 4.
 
+**`gpuc skill`** — prints the agent guide ([`skills/gpuc/SKILL.md`](../skills/gpuc/SKILL.md))
+to stdout, so an agent can read it with `!gpuc skill` without knowing where the
+repo is. `--install [DIR]` writes it to `DIR/.claude/skills/gpuc/SKILL.md`
+instead (`DIR` defaults to the current directory) and refuses to overwrite an
+existing copy without `--force`.
+
 **`gpuc clean`**, **`gpuc pods`**, **`gpuc reconcile`** and the host commands
 have their own sections below and in [setup.md](setup.md). `gpuc version` prints
 this build, its commit, and each bootstrapped host's package commit, marking the

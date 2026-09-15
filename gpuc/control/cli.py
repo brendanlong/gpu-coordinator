@@ -52,6 +52,7 @@ from gpuc.control.s3index import (
     S3ObjectMissing,
     job_log_uri,
 )
+from gpuc.control.skill import SkillError, install_skill, read_skill
 from gpuc.control.submit import (
     JobSpecModel,
     SubmitError,
@@ -1006,6 +1007,19 @@ def cmd_version(_: argparse.Namespace) -> int:
     return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
 
 
+def cmd_skill(args: argparse.Namespace) -> int:
+    """Print the agent guide, or drop a copy into a project.
+
+    Printing is the point: an agent can pipe `gpuc skill` into its own context
+    without being told where the file lives, or which checkout it is in.
+    """
+    if args.install is None:
+        sys.stdout.write(read_skill())
+        return EXIT_OK
+    print(f"wrote {install_skill(Path(args.install), force=args.force)}")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gpuc", description="GPU job coordinator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1150,6 +1164,17 @@ def build_parser() -> argparse.ArgumentParser:
         "(local state unreadable) as unknown, never as nothing running",
     )
     status.set_defaults(func=cmd_status)
+
+    skill = sub.add_parser("skill", help="print the agent guide, or install it into a project")
+    skill.add_argument(
+        "--install",
+        nargs="?",
+        const=".",
+        metavar="DIR",
+        help="write it to DIR/.claude/skills/gpuc/SKILL.md instead of printing (DIR defaults to .)",
+    )
+    skill.add_argument("--force", action="store_true", help="overwrite an existing installed copy")
+    skill.set_defaults(func=cmd_skill)
 
     sub.add_parser(
         "version", help="version, installed commit, and each host's package commit"
@@ -1384,7 +1409,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    if args.command != "config":
+    if args.command not in ("config", "skill"):
         first_run_note()
     try:
         return int(args.func(args))
@@ -1404,6 +1429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ProviderError,
         RemoteError,
         S3IndexError,
+        SkillError,
         TransportError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
