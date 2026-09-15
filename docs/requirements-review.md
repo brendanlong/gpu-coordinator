@@ -12,19 +12,20 @@ draft of this document.
 
 ## Verdict
 
-Every requirement is buildable, with one exception that must be stated
-honestly: **a guaranteed teardown is not achievable.** Neither RunPod nor Vast
-offers a pod TTL or idle-stop (verified against the v2 spec; the only
-`idleTimeout` is serverless-only). Anything that runs on the pod cannot fire
-in the catalog's most expensive incident, where the container never starts.
-So auto-down is layered and off-host, and the design has to name the residual
-exposure rather than claim to eliminate it. Everything else on the list is
-feasible. Three requirements pull against each other and need a decision
-(auto-down vs. no surviving launcher; "no daemon" vs. automatic
-re-provisioning; incremental HF upload vs. files that get rewritten). Two are
-risky as phrased (automatic kill-and-move during a job; "logs not local").
-About fifteen things are missing, most of them the interlocks the failure
-catalog says were the actual cost.
+Every requirement is buildable. One is best effort rather than guaranteed:
+neither RunPod nor Vast offers a pod TTL or idle-stop (verified against the
+v2 spec; the only `idleTimeout` is serverless-only), and anything that runs
+on the pod cannot fire when the container never starts. Decision
+(2026-09-14): auto-down is **best effort**. The local side owns the host
+until it has proven healthy, the host owns itself after that, and the
+residual exposure is named rather than hidden.
+
+Two other tensions need a decision ("no daemon" vs. automatic
+re-provisioning; incremental HF upload vs. files that get rewritten). Two
+requirements are risky as phrased ("logs not local", and automatic
+kill-and-move, which is now scoped: re-place only before any job has run,
+and never on low utilization). About fifteen things are missing, most of
+them the interlocks the failure catalog says were the actual cost.
 
 ## 1. Requirement-by-requirement
 
@@ -85,46 +86,45 @@ post-provision timed download (section 1.5).
 
 ### 1.2 Auto-down after the last queued job ends
 
-Feasible as a layered best effort, not as a guarantee. The layers, from
-inside out, and what each one cannot cover:
+Best effort, by decision. The ownership split that makes it simple:
 
-1. **On-host idle terminate.** The dispatcher (section 1.3) terminates its own
-   pod once the queue has been empty for N minutes **and** the final
-   S3 flush of the last job's status and outputs has been confirmed. Covers
-   the normal case. Cannot fire if the container never started, if the host
-   has no network, or if the terminate call is rejected.
-2. **On-host staleness rule (the actual dead-man switch).** The local
-   reconciler writes a heartbeat to the host (a file over SSH, or an object
-   the host polls). If the heartbeat is stale beyond T and the queue is
-   idle, the host terminates itself. If a job is running, it keeps going
-   (a local reboot must not kill a healthy job); the hard TTL bounds that.
-3. **Hard TTL**, set at creation and enforced by the dispatcher refusing to
-   start jobs past it and terminating when idle past it. Same blind spots
-   as layer 1.
-4. **Local reaper** in the reconciler: list provider pods carrying our name
-   prefix, terminate any not in desired state or past TTL. This is the
-   **only** layer that covers a pod stuck in PROVISIONING or crash-looping
-   in STARTING. It also gets the ~15-minute provisioning ceiling (section
-   1.5). It fails if the desktop is down.
-5. **Off-host reaper.** Because layer 4 is the only cover for the worst
-   case, it needs a second home that is not the desktop: a scheduled GitHub
-   Actions job or a cloud routine holding the RunPod key, running the same
-   list-and-compare every 15 minutes against the desired-state object in S3.
-   The wiki already uses Actions as an uptime prober.
+**Before the host has proven healthy, the local reconciler owns it.** A new
+pod must reach RUNNING, answer SSH on its direct port, and pass the on-host
+preflight (driver op, network download, disk) within a few minutes. The
+reconciler polls for that; if it does not happen by the ceiling (about
+15 minutes from create, matching the final policy in the 2026-07-24
+journal) or a broken-host signature appears in the pod log, the reconciler
+terminates and re-places. This is the only layer that covers a pod stuck in
+PROVISIONING or crash-looping in STARTING, and it needs nothing on the pod.
+The on-host preflight itself is run by the dispatcher on first start; on
+failure the dispatcher writes `unhealthy` to S3 and terminates its own pod,
+and the reconciler re-places either way.
 
-Residual exposure after all five: a pod stuck pre-RUNNING while both the
-desktop and the off-host job are unavailable, bounded by whichever comes back
-first. Say so in the README.
+**After the host has proven healthy, the host owns itself.** The dispatcher
+terminates its own pod once the queue has been empty for N minutes and the
+last job's status and outputs have been flushed to S3. A hard TTL, also
+enforced by the dispatcher, bounds a stuck job. The low-utilization watchdog
+(section 1.5) is the third host-side trigger. None of this depends on the
+desktop being up, which is the property the requirement is really asking
+for: a local reboot must neither kill a healthy job nor leak a pod.
 
-Two failure paths the first draft got wrong:
+**Residual exposure:** a pod that passed health checks and then lost its
+network or had its container die cannot terminate itself, and the local
+reaper (list pods with our prefix, compare to desired state, terminate
+strays past TTL) only covers that while the desktop is up. Acceptable; an
+off-host copy of the reaper (a scheduled GitHub Actions job holding the key)
+is cheap to add later if this ever bites.
+
+Two failure paths to handle explicitly:
 
 - **Terminate can fail.** The pod-scoped `RUNPOD_API_KEY` is reported to
   return 403 on terminate. If the on-host terminate fails, the dispatcher
   must clear its `draining` marker and go back to accepting work, and the
   reconciler must alert. Otherwise the host refuses jobs and bills forever
-  with an empty queue.
-- **Draining plus re-provision can double-bill.** The local side must only
-  provision a replacement after the provider reports the old pod
+  with an empty queue. Test on day one whether the pod-scoped key works; if
+  not, an account key has to reach the pod over SSH after boot (section 2.2).
+- **Draining plus re-provision can double-bill.** The local side only
+  provisions a replacement after the provider reports the old pod
   `TERMINATED` (or after the reaper has issued the terminate itself), never
   on the strength of a `draining` marker.
 
@@ -132,11 +132,11 @@ If an account-level key has to sit on the pod for self-terminate, its blast
 radius is every pod in the account, including the two `subrep-*` A40 pods
 another session is running right now. The v2 spec exposes no per-pod scoping.
 Mitigations: hard-code the pod's own id into the terminate path, prefer the
-pod-scoped key if a first-day test shows it works, and treat this as the one
-place where the never-touch-others rule rests on code rather than on
-permissions. Also note `GET /v2/pods` returns the pod's full `env`, so any
-key placed there at create time is readable by any holder of an account key
-and persists in the pod record (section 2.2).
+pod-scoped key if it works, and treat this as the one place where the
+never-touch-others rule rests on code rather than on permissions. Also note
+`GET /v2/pods` returns the pod's full `env`, so any key placed there at
+create time is readable by any holder of an account key and persists in the
+pod record (section 2.2).
 
 ### 1.3 Per-host user-level queue, local and over SSH, GPU subset by UUID
 
@@ -224,13 +224,13 @@ policy from the 2026-07-24 journal (its last section, which supersedes the
 
 So the automation is:
 
-- **Provision phase:** destroy and re-place automatically on a hard
+- **Provision phase (local reconciler):** destroy and re-place on a hard
   signature in the pod logs (`card[0-9]`, `device nodes`, `OCI runtime`,
   `runc create`, `failed to create shim`), on a provision log with no new
-  lines for 15 minutes, or on the ~15-minute ceiling without RUNNING plus
-  a reachable direct SSH port.
-- **Preflight phase (host up, before any job):** destroy and re-place on a
-  failed check. Checks: a real GPU op in the torch the job will use
+  lines for 15 minutes, or on the ceiling without RUNNING plus a reachable
+  direct SSH port.
+- **Preflight phase (host dispatcher, first start):** destroy and re-place on
+  a failed check. Checks: a real GPU op in the torch the job will use
   (`shared/gpu.py`, ported as-is); `device_count()` equals the assignment;
   timed ~100 MB downloads from S3 and from HF with a generous floor (the
   dead-network signature is 0 bytes in 10 s, not "slow"); a timed disk
@@ -238,9 +238,28 @@ So the automation is:
   working volume; `HF_HOME` on the large volume.
 - **Job phase:** the same preflight runs again **inside the job's venv**
   (a sub-venv CPU torch passes a host-level check; the catalog is explicit).
-  A failure here fails the job and marks the host suspect. Mid-job stalls
-  are flagged in `status` (section 2.11), not killed. The hard TTL is the
-  only mid-job automatic action.
+  A failure here is a code or environment problem, so it **fails the job and
+  leaves the host alone**.
+- **Low-utilization watchdog (host side, per job):** the dispatcher samples
+  `nvidia-smi` utilization on the job's assigned UUIDs every ~30 s. Once the
+  job's own setup has finished (the runner knows when it hands off to the
+  user command) plus a grace period for model loading, if the rolling mean
+  over a long window stays below a floor, the watchdog kills the job with
+  status `failed: low-util`, and normal idle terminate follows if the queue
+  is empty. Defaults should be conservative and per-job overridable: a
+  20 to 30 minute window and a floor around 5%. Some jobs are legitimately
+  bursty, so the spec needs an opt-out. To stop a broken commit draining a
+  whole queue one job at a time, two consecutive low-util failures on a
+  host pause its queue and terminate it.
+
+**Low-util does not re-provision.** After a passed health check the likely
+cause is the code (a CPU-torch sub-venv, a data-loader bottleneck, a hung
+download inside the job), and re-placing would replay the same job on a
+fresh host and burn the same money again. The right outcome is: job marked
+failed with the reason, host terminated, nothing requeued, loud entry in
+`status`. Re-placement is reserved for failures that happen before any job
+has run, where the host is the only variable. On SPAR and local the
+watchdog behaves identically except that "terminate host" is a no-op.
 
 Every timer must exceed the slowest legitimate phase: a cold `uv sync` with
 a torch download is 5 to 10 minutes on a healthy host.
@@ -358,6 +377,9 @@ produced which output.
 ### 2.4 Cost interlocks
 
 - Hard TTL per host; max runtime per job; max $/hour per provision request.
+- The local reaper is the safety net for hosts that never proved healthy
+  and for strays past TTL while the desktop is up; it is not the primary
+  teardown path (section 1.2).
 - **Account-wide caps**, because several sessions provision independently:
   max concurrent pods with our prefix and max total $/hour, checked against
   `GET /v2/pods` (with `includeClusterPods=true`) before every create.
@@ -458,11 +480,11 @@ first under a cap:
    and heartbeat, UUID assignment, preflight, periodic sync, exit-code
    discipline. Test on the local GPU.
 3. Same package over SSH on SPAR.
-4. Provider interface plus RunPod driver, reconciler, the five teardown
-   layers, account caps. First test: register an SSH key, provision the
+4. Provider interface plus RunPod driver, reconciler, the pre-healthy
+   ceiling, on-host idle terminate and TTL, local reaper, account caps. First test: register an SSH key, provision the
    cheapest available GPU with `startSsh` and `22/tcp`, confirm
    `ssh.direct`, run a 1-minute job, verify teardown against `GET /v2/pods`,
    with a $1 cap. Second test: whether the pod-scoped key can terminate its
    own pod.
-5. Only then: health-check-driven re-placement, HF upload, off-host reaper,
-   Vast.
+5. Only then: the low-utilization watchdog, HF upload, an off-host reaper if
+   ever needed, Vast.
