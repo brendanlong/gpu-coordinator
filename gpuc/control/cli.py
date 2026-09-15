@@ -280,8 +280,8 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
         f"host {result.host} ready: {result.files} package files at {result.home}/pkg "
         f"({version_mod.short(result.pkg_commit)}), dispatcher pid {result.dispatcher_pid}"
     )
-    for warning in result.warnings:
-        print(f"WARNING: {warning}")
+    if result.warnings:
+        print(f"{len(result.warnings)} warning(s) above")
     return 0
 
 

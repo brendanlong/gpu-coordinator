@@ -20,10 +20,13 @@ from typing import Any
 from gpuc.host import USER_AGENT, cleanup, gpus, jobs, paths
 from gpuc.host.gpus import SmiRunner
 
-# A sized, stable endpoint rather than a pinned wheel: a wheel URL rots when the
-# version is yanked, and then every bootstrap fails a network check for a
-# reason that has nothing to do with the network.
-DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=50000000"
+# The uv release tarball: ~19 MB, served by GitHub without per-IP rate limits,
+# and a URL that survives releases. speed.cloudflare.com returned 429 after a
+# day of bootstraps from one machine, and a pinned wheel URL rots when the
+# version is yanked.
+DEFAULT_DOWNLOAD_URL = (
+    "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz"
+)
 DEFAULT_DOWNLOAD_BYTES = 50 * 1024 * 1024
 DEFAULT_MIN_MBPS = 1.0
 DEFAULT_MIN_FREE_GB = 5.0

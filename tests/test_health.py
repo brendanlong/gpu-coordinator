@@ -97,7 +97,7 @@ def test_zero_bytes_is_still_fatal(gpuc_home: Path) -> None:
 
 
 def test_the_default_download_url_is_a_stable_sized_endpoint() -> None:
-    assert health.DEFAULT_DOWNLOAD_URL == "https://speed.cloudflare.com/__down?bytes=50000000"
+    assert health.DEFAULT_DOWNLOAD_URL.startswith("https://github.com/astral-sh/uv/releases/latest/")
     assert health.DEFAULT_MIN_FREE_GB == 5.0
 
 
