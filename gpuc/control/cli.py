@@ -15,6 +15,7 @@ from gpuc.control import pods as pods_mod
 from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import status as status_mod
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host
+from gpuc.control.clean import CleanError, clean_host, prune_uv_cache
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
@@ -78,6 +79,7 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         gpuc_home=args.gpuc_home,
         persistent_root=args.persistent_root,
         env=_env_dict(args.env),
+        cache_dir=args.cache_dir,
         s3_prefix=args.s3_prefix,
         idle_minutes=args.idle_min,
         ttl_hours=args.ttl_hours,
@@ -109,6 +111,7 @@ _SET_FIELDS = (
     "persistent_root",
     "gpuc_home",
     "env",
+    "cache_dir",
     "s3_prefix",
     "idle_min",
     "ttl_hours",
@@ -123,6 +126,7 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     for flag, field in (
         ("persistent_root", "persistent_root"),
         ("gpuc_home", "gpuc_home"),
+        ("cache_dir", "cache_dir"),
         ("s3_prefix", "s3_prefix"),
     ):
         value = getattr(args, flag)
@@ -192,6 +196,28 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
     )
     for warning in result.warnings:
         print(f"WARNING: {warning}")
+    return 0
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    entry = load_registry().require(args.host)
+    report = clean_host(
+        entry,
+        settings,
+        all_finished=args.all_finished,
+        older_than_days=args.older_than,
+        dry_run=args.dry_run,
+    )
+    print(report.render())
+    return 1 if report.errors else 0
+
+
+def cmd_host_clean(args: argparse.Namespace) -> int:
+    if not args.uv_cache:
+        raise CliError("host clean needs --uv-cache (job workdirs are `gpuc clean --host H`)")
+    entry = load_registry().require(args.name)
+    print(prune_uv_cache(entry, load_settings()))
     return 0
 
 
@@ -542,6 +568,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="extra environment for every job on this host; repeatable",
     )
+    add.add_argument(
+        "--cache-dir",
+        help="uv cache for this host (UV_CACHE_DIR); bootstrap picks one on gpuc home's "
+        "filesystem when they differ",
+    )
     add.add_argument("--s3-prefix", help="s3://bucket/prefix for log and state mirroring")
     add.add_argument("--idle-min", type=float, default=15.0)
     add.add_argument("--ttl-hours", type=float, default=24.0)
@@ -557,6 +588,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="KEY=VALUE",
         help="replace this host's job environment; repeatable, '' for none",
+    )
+    edit.add_argument(
+        "--cache-dir", help="pin UV_CACHE_DIR for this host; pass '' to let bootstrap decide"
     )
     edit.add_argument("--s3-prefix", help="pass '' to stop mirroring")
     edit.add_argument("--idle-min", type=float)
@@ -574,6 +608,13 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("name")
     probe.set_defaults(func=cmd_host_probe)
 
+    host_clean = host.add_parser("clean", help="prune the host's uv cache")
+    host_clean.add_argument("name")
+    host_clean.add_argument(
+        "--uv-cache", action="store_true", help="run `uv cache prune` on the host"
+    )
+    host_clean.set_defaults(func=cmd_host_clean)
+
     host.add_parser("list", help="list registered hosts").set_defaults(func=cmd_host_list)
     remove = host.add_parser("remove", help="forget a host")
     remove.add_argument("name")
@@ -590,6 +631,18 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--all", action="store_true", help="also list jobs only the index knows")
     status.add_argument("--suspects", action="store_true", help="billing but idle; never kills")
     status.set_defaults(func=cmd_status)
+
+    clean = sub.add_parser("clean", help="remove finished jobs' workdirs on a host")
+    clean.add_argument("--host", required=True)
+    selection = clean.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "--all-finished", action="store_true", help="every succeeded, failed or cancelled job"
+    )
+    selection.add_argument(
+        "--older-than", type=float, metavar="DAYS", help="only jobs that ended over DAYS ago"
+    )
+    clean.add_argument("--dry-run", action="store_true", help="list what would go, delete nothing")
+    clean.set_defaults(func=cmd_clean)
 
     logs = sub.add_parser("logs", help="tail a job log from its host")
     logs.add_argument("job_id")
@@ -692,6 +745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except (
+        CleanError,
         CliError,
         ConfigError,
         SubmitError,

@@ -49,7 +49,7 @@ class HostSession:
 
     @property
     def env(self) -> dict[str, str]:
-        return dict(self.entry.env)
+        return self.entry.job_env()
 
     def job_dir(self, job_id: str) -> str:
         return f"{self.home}/jobs/{job_id}"

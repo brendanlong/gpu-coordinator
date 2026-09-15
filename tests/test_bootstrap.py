@@ -39,6 +39,9 @@ class ScriptedHost:
     hf_present: bool = True
     health: dict[str, object] = field(default_factory=lambda: dict(HEALTH_OK))
     hf_install_fails: bool = False
+    uv_cache: str = "/home/u/.cache/uv"
+    cache_dev: str = "66"
+    home_dev: str = "66"
     events: list[str] = field(default_factory=list)
     puts: dict[str, tuple[str, int]] = field(default_factory=dict)
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
@@ -61,6 +64,10 @@ class ScriptedHost:
             return 0, ""
         if ".local/bin/hf" in command and "-x" in command:
             return 0, "/home/u/.local/bin/hf\n" if self.hf_present else ""
+        if "cache dir" in command:
+            return 0, (
+                f"cache={self.uv_cache}\ncache_dev={self.cache_dev}\nhome_dev={self.home_dev}\n"
+            )
         if "tool install huggingface_hub" in command:
             if self.hf_install_fails:
                 return 1, "no network"

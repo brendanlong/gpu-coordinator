@@ -7,15 +7,17 @@ about (a host whose network or driver is dead) hangs rather than errors.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
-from gpuc.host import USER_AGENT, gpus, jobs, paths
+from gpuc.host import USER_AGENT, cleanup, gpus, jobs, paths
 from gpuc.host.gpus import SmiRunner
 
 # A sized, stable endpoint rather than a pinned wheel: a wheel URL rots when the
@@ -70,6 +72,68 @@ def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:
             "--min-free-gb if you know the job is small"
         )
     return Check("disk", ok, detail, round(free_gb, 1))
+
+
+def uv_cache_dir(config: jobs.HostConfig | None = None) -> Path:
+    """Where uv will cache wheels for this host's jobs.
+
+    The host config's `env` first, because that is what the dispatcher exports
+    to every job; then this process's own environment; then uv's default.
+    """
+    configured = (config.env.get("UV_CACHE_DIR") if config else None) or os.environ.get(
+        "UV_CACHE_DIR"
+    )
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".cache/uv"
+
+
+def _nearest_existing(path: Path) -> Path:
+    for candidate in [path, *path.parents]:
+        if candidate.exists():
+            return candidate
+    return Path("/")
+
+
+def same_filesystem(left: Path, right: Path) -> bool | None:
+    """Do these two paths live on one filesystem? None when it cannot be read.
+
+    Compared at the nearest existing ancestor, because the interesting case is
+    a cache directory that has not been created yet.
+    """
+    try:
+        return _nearest_existing(left).stat().st_dev == _nearest_existing(right).stat().st_dev
+    except OSError:
+        return None
+
+
+def check_uv_cache(config: jobs.HostConfig | None = None) -> Check:
+    """Report the uv cache's size and whether uv can link out of it into a venv.
+
+    Always a warning, never a failure: uv falls back to copying when the cache
+    and the venv are on different filesystems, so this costs a full ~6.5 GB
+    torch venv per job in disk and minutes in wall clock, but nothing breaks.
+    """
+    cache = uv_cache_dir(config)
+    home = paths.home()
+    shared = same_filesystem(cache, home)
+    size = cleanup.dir_size(cache) if cache.is_dir() else 0
+    where = f"{cache} holds {cleanup.human_bytes(size)}" if cache.is_dir() else f"{cache} is empty"
+    if shared is True:
+        return Check("uv_cache", True, f"{where}, on the same filesystem as {home}", size)
+    if shared is None:
+        return Check("uv_cache", True, f"{where}; could not compare filesystems", size, warn=True)
+    return Check(
+        "uv_cache",
+        True,
+        f"{where}, on a DIFFERENT filesystem from gpuc home {home}, so uv cannot "
+        f"hardlink or reflink into a job's venv and copies every wheel instead. "
+        f"Set a cache on gpuc home's volume: "
+        f"gpuc host set {config.host if config else '<host>'} "
+        f"--cache-dir {home.parent}/.cache/uv && gpuc host bootstrap ...",
+        size,
+        warn=True,
+    )
 
 
 def http_download(url: str, max_bytes: int, timeout: float) -> int:
@@ -142,6 +206,7 @@ def run_checks(
         check_driver(smi) if config.gpus else Check("driver", True, "no GPUs owned", None),
         check_gpu_uuids(config.gpus, smi),
         check_disk(min_free_gb),
+        check_uv_cache(config),
         check_download(url, min_mbps=min_mbps, timeout=download_timeout, downloader=downloader),
     ]
     return {

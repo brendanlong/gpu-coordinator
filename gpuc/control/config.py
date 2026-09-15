@@ -183,6 +183,14 @@ class HostEntry(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     """Extra environment for every job on this host, set by hand with
     `gpuc host add|set --env K=V`. Nothing populates it automatically."""
+    cache_dir: str | None = None
+    """uv's cache for this host, surfaced to jobs as `UV_CACHE_DIR`.
+
+    Unlike `env`, bootstrap *does* populate this: uv materialises a venv by
+    reflinking or hardlinking out of its cache, which only works within one
+    filesystem, so a host whose gpuc home is on a different volume from `$HOME`
+    gets a cache next to gpuc home instead of copying every wheel. `--cache-dir`
+    pins it by hand; an explicit `--env UV_CACHE_DIR=...` still wins."""
     idle_minutes: float = 15.0
     ttl_hours: float = 24.0
     s3_prefix: str | None = None
@@ -219,6 +227,18 @@ class HostEntry(BaseModel):
             return None
         return {"kind": "runpod", "pod_id": self.pod_id}
 
+    def job_env(self) -> dict[str, str]:
+        """The host env as jobs see it: `env`, plus `cache_dir` as a default.
+
+        One source of truth for the dispatcher's config.json, bootstrap's own
+        uv calls and every `HostSession` invocation, so they cannot disagree
+        about which uv cache this host uses.
+        """
+        env = dict(self.env)
+        if self.cache_dir:
+            env.setdefault("UV_CACHE_DIR", self.cache_dir)
+        return env
+
     def host_config(self) -> HostConfig:
         return HostConfig(
             host=self.name,
@@ -228,7 +248,7 @@ class HostEntry(BaseModel):
             ttl_hours=self.ttl_hours,
             s3_prefix=self.s3_prefix,
             created_at=self.created_at,
-            env=dict(self.env),
+            env=self.job_env(),
         )
 
 

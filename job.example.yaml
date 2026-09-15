@@ -42,3 +42,11 @@ low_util:                                       # kill a job that is not using t
 
 requires:
   cuda_min: "12.8"                              # informs provisioning only
+
+# When the runner deletes workdir/ (the code *and* the venv it builds there --
+# a torch venv is ~6.5 GB). Applied after the final sync, so `outputs` are
+# already uploaded; spec.json, state.json and log.txt always stay.
+#   on_success  remove it if the job succeeded, keep it to inspect if not
+#   always      remove it whatever happened
+#   never       keep it; clear it later with `gpuc clean --host H --all-finished`
+cleanup: on_success

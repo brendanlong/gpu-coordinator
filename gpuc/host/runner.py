@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
 
-from gpuc.host import gpus, jobs, paths, queue, sync
+from gpuc.host import cleanup, gpus, jobs, paths, queue, sync
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.jobs import JobSpec
 
@@ -521,6 +521,10 @@ class JobRunner:
             pgid=None,
         )
         self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")
+        # After the final state write, and only then: the outputs the sync just
+        # uploaded live *inside* the workdir, so anything earlier would delete
+        # the run's results on the way past.
+        jobs.update_state(self.job_id, workdir_removed=self._cleanup_workdir(status, log))
         try:
             sync.sync_job_meta(
                 self.job_id,
@@ -535,6 +539,27 @@ class JobRunner:
         # the upload that matters most.
         paths.job_env_file(self.job_id).unlink(missing_ok=True)
         return exit_code
+
+    def _cleanup_workdir(self, status: str, log: IO[bytes]) -> bool:
+        """Apply the spec's `cleanup:` policy to `workdir/`, and nothing else.
+
+        A failure to delete is logged and nothing more: the job's own outcome
+        has already been decided and uploaded, and turning a green run red over
+        leftover disk would be the wrong trade.
+        """
+        if not cleanup.should_remove(self.spec.cleanup, status):
+            return False
+        try:
+            freed = cleanup.remove_workdir(self.job_id)
+        except OSError as exc:
+            self._log(log, f"could not remove workdir (cleanup={self.spec.cleanup}): {exc}")
+            return False
+        self._log(
+            log,
+            f"removed workdir (cleanup={self.spec.cleanup}), freeing "
+            f"{cleanup.human_bytes(freed)}; spec.json, state.json and log.txt are kept",
+        )
+        return True
 
     @staticmethod
     def _blame(

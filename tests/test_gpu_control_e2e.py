@@ -16,6 +16,7 @@ from gpuc.control.cli import main
 from tests.conftest import LOCAL_GPU_UUID, requires_gpu
 from tests.test_control_e2e import (
     HEALTH_ARGS,
+    SHARED_UV_CACHE,
     _stop_dispatcher,
     finished,
     log_tail,
@@ -57,7 +58,22 @@ def torch_workdir(tmp_path: Path, torch_project: Path) -> Path:
 @pytest.fixture
 def gpu_host(control_env: Path, tmp_path: Path) -> Iterator[Path]:
     home = tmp_path / "gpuc-home"
-    assert main(["host", "add", "local", "--gpus", LOCAL_GPU_UUID, "--gpuc-home", str(home)]) == 0
+    assert (
+        main(
+            [
+                "host",
+                "add",
+                "local",
+                "--gpus",
+                LOCAL_GPU_UUID,
+                "--gpuc-home",
+                str(home),
+                "--cache-dir",
+                SHARED_UV_CACHE,
+            ]
+        )
+        == 0
+    )
     assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
     yield home
     _stop_dispatcher(home)

@@ -86,7 +86,7 @@ def test_a_download_error_leaves_the_report_green_but_warned(gpuc_home: Path) ->
         smi=fake_smi(), downloader=failing_downloader, min_free_gb=0.0, url="http://x"
     )
     assert report["ok"]
-    assert report["warnings"] and "name resolution failed" in report["warnings"][0]
+    assert any("name resolution failed" in w for w in report["warnings"])
 
 
 def test_zero_bytes_is_still_fatal(gpuc_home: Path) -> None:
@@ -118,6 +118,7 @@ def test_run_checks_emits_json_with_every_check(gpuc_home: Path) -> None:
         "driver",
         "gpu_uuids",
         "disk",
+        "uv_cache",
         "download",
     ]
     json.dumps(report)

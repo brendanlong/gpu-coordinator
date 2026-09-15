@@ -209,3 +209,69 @@ def test_ttl_is_measured_from_the_pod_createdat_not_the_registry() -> None:
     )
     assert fresh_registration.past_ttl
     assert "PAST TTL" in render(fresh_registration)
+
+
+# -- leftover workdirs --------------------------------------------------------
+
+GIB = 1 << 30
+
+
+def with_workdir_bytes(*sizes: int) -> HostView:
+    jobs = [
+        {
+            "job_id": f"j-done-{i}",
+            "status": "succeeded",
+            "ended_at": minutes_ago(60 + i),
+            "workdir_bytes": size,
+        }
+        for i, size in enumerate(sizes)
+    ]
+    return view(jobs=[*payload()["jobs"], *jobs])
+
+
+def test_finished_workdirs_over_a_gigabyte_are_called_out() -> None:
+    rendered = render(with_workdir_bytes(4 * GIB, 3 * GIB))
+    assert "7.0 GiB still in 2 finished job workdir(s)" in rendered
+    assert "gpuc clean --host spar --all-finished" in rendered
+
+
+def test_a_small_leftover_is_not_worth_a_line() -> None:
+    rendered = render(with_workdir_bytes(20 * 1024 * 1024))
+    assert "gpuc clean" not in rendered
+
+
+def test_a_running_job_never_counts_towards_leftover_disk() -> None:
+    host_view = view(
+        jobs=[
+            {
+                "job_id": "j-big",
+                "status": "running",
+                "phase": "main",
+                "gpus": [GPU],
+                "started_at": minutes_ago(5),
+                "workdir_bytes": 40 * GIB,
+            }
+        ]
+    )
+    assert host_view.leftover_bytes == 0
+    assert "gpuc clean" not in render(host_view)
+
+
+def test_workdir_bytes_survives_the_host_payload() -> None:
+    _, _, finished = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j",
+                    "status": "succeeded",
+                    "ended_at": minutes_ago(1),
+                    "workdir_bytes": 123,
+                }
+            ]
+        )
+    )
+    assert finished[0].workdir_bytes == 123
+
+
+def test_a_host_that_never_reports_sizes_is_fine() -> None:
+    assert view().leftover_bytes == 0

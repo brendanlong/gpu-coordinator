@@ -76,10 +76,23 @@ def workdir(tmp_path: Path) -> Path:
     return root
 
 
+SHARED_UV_CACHE = str(Path.home() / ".cache/uv")
+"""Pin the tests to this machine's real uv cache.
+
+A temp gpuc home is on /tmp, so bootstrap's rule would otherwise give each test
+a fresh cache there and re-download torch into a tmpfs. `--cache-dir` is the
+documented way to opt out of the rule, and exercising it here keeps that path
+covered.
+"""
+
+
 @pytest.fixture
 def bootstrapped_home(control_env: Path, tmp_path: Path) -> Iterator[Path]:
     home = tmp_path / "gpuc-home"
-    assert main(["host", "add", "local", "--gpuc-home", str(home)]) == 0
+    assert (
+        main(["host", "add", "local", "--gpuc-home", str(home), "--cache-dir", SHARED_UV_CACHE])
+        == 0
+    )
     assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
     yield home
     _stop_dispatcher(home)
@@ -157,13 +170,14 @@ def test_submit_runs_a_job_and_logs_and_status_find_it(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = bootstrapped_home
-    job_id = submit(workdir, "name: hi\ncommand: cat hello.txt\ngpus: 0\n")
+    job_id = submit(workdir, "name: hi\ncommand: cat hello.txt\ngpus: 0\ncleanup: never\n")
     capsys.readouterr()
 
     wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
     state = state_of(home, job_id)
     assert (state["status"], state["exit_code"], state["attempt"]) == ("succeeded", 0, 1)
     assert (home / "jobs" / job_id / "workdir" / "hello.txt").exists()
+    assert state["workdir_removed"] is False
 
     assert main(["logs", job_id]) == 0
     assert "hello" in capsys.readouterr().out
@@ -268,3 +282,131 @@ def test_a_secret_never_reaches_the_log_or_gpuc_logs(
     ):
         assert canary not in path.read_text(), path
     assert not (home / "secrets" / f"{job_id}.env").exists()
+
+
+# -- gpuc clean ---------------------------------------------------------------
+
+
+def big_file_job(home: Path, workdir: Path, *, cleanup: str = "never") -> str:
+    """A job that leaves something measurable in its workdir."""
+    job_id = submit(
+        workdir,
+        f"name: bulky\ncommand: dd if=/dev/zero of=blob.bin bs=1M count=4 2>/dev/null\n"
+        f"gpus: 0\ncleanup: {cleanup}\n",
+    )
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    return job_id
+
+
+def test_the_default_policy_removes_a_succeeded_workdir(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = submit(workdir, 'name: ok\ncommand: "true"\ngpus: 0\n')
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    capsys.readouterr()
+
+    state = state_of(home, job_id)
+    assert state["status"] == "succeeded"
+    assert state["workdir_removed"] is True
+    assert not (home / "jobs" / job_id / "workdir").exists()
+    for name in ("spec.json", "state.json", "log.txt"):
+        assert (home / "jobs" / job_id / name).exists(), name
+
+
+def test_the_default_policy_keeps_a_failed_workdir(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = submit(workdir, "name: bad\ncommand: exit 9\ngpus: 0\n")
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    capsys.readouterr()
+
+    assert state_of(home, job_id)["workdir_removed"] is False
+    assert (home / "jobs" / job_id / "workdir" / "hello.txt").exists()
+
+
+def test_clean_dry_run_then_real(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = big_file_job(home, workdir)
+    blob = home / "jobs" / job_id / "workdir" / "blob.bin"
+    assert blob.exists()
+    capsys.readouterr()
+
+    assert main(["clean", "--host", "local", "--all-finished", "--dry-run"]) == 0
+    dry = capsys.readouterr().out
+    assert job_id in dry
+    assert "dry run, nothing was deleted" in dry
+    assert "MiB" in dry
+    assert blob.exists(), "a dry run must delete nothing"
+
+    assert main(["clean", "--host", "local", "--all-finished"]) == 0
+    real = capsys.readouterr().out
+    assert job_id in real and "freed" in real
+    assert not (home / "jobs" / job_id / "workdir").exists()
+    assert state_of(home, job_id)["workdir_removed"] is True
+    assert (home / "jobs" / job_id / "log.txt").exists()
+
+
+def test_clean_leaves_a_running_job_alone(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    running = submit(workdir, "name: sleepy\ncommand: sleep 300\ngpus: 0\ncleanup: never\n")
+    wait_for_main_phase(home, running)
+    done = big_file_job(home, workdir)
+    capsys.readouterr()
+
+    assert main(["clean", "--host", "local", "--all-finished"]) == 0
+    out = capsys.readouterr().out
+    assert done in out
+    assert (home / "jobs" / running / "workdir").exists()
+    assert state_of(home, running)["status"] == "running"
+
+    assert main(["cancel", running]) == 0
+
+
+def test_status_mentions_leftover_workdirs_and_clean_clears_it(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = submit(
+        workdir,
+        "name: hog\ncommand: dd if=/dev/zero of=blob.bin bs=1M count=1100 2>/dev/null\n"
+        "gpus: 0\ncleanup: never\n",
+    )
+    wait_until(lambda: finished(home, job_id), 300, f"job {job_id} to finish")
+    capsys.readouterr()
+
+    assert main(["status", "--host", "local"]) == 0
+    assert "gpuc clean --host local --all-finished" in capsys.readouterr().out
+
+    assert main(["clean", "--host", "local", "--all-finished"]) == 0
+    capsys.readouterr()
+    assert main(["status", "--host", "local"]) == 0
+    assert "gpuc clean" not in capsys.readouterr().out
+
+
+def test_clean_removes_a_leftover_staged_spec(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = submit(workdir, 'name: ok\ncommand: "true"\ngpus: 0\n')
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    staged = home / "incoming" / f"{job_id}.json"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text("{}\n")
+    capsys.readouterr()
+
+    assert main(["clean", "--host", "local", "--all-finished"]) == 0
+    assert "leftover staged spec" in capsys.readouterr().out
+    assert not staged.exists()
+
+
+def test_clean_needs_a_selection(
+    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        main(["clean", "--host", "local"])

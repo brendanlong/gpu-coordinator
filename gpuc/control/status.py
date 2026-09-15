@@ -14,12 +14,16 @@ from gpuc.control.config import HostEntry, Settings
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.transport import TransportError
+from gpuc.host.cleanup import human_bytes
 
 HEARTBEAT_STALE_S = 30.0
 DEAD_POD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
 SUSPECT_FLOOR_PCT = 5.0
 SUSPECT_SAMPLES = 20  # 10 minutes of main-phase samples at the 30 s runner cadence
 RECENT_FINISHED = 5
+LEFTOVER_FLOOR_BYTES = 1 << 30
+"""Only mention finished jobs' workdirs once they add up to something worth a
+command. A job dir under a gigabyte is noise next to a 6.5 GB torch venv."""
 
 
 @dataclass
@@ -36,6 +40,9 @@ class JobView:
     started_at: str | None = None
     ended_at: str | None = None
     util_recent: list[float] = field(default_factory=list)
+    workdir_bytes: int | None = None
+    """Disk still held by this job's `workdir/`; the host only measures it for
+    finished jobs."""
 
     @property
     def minutes(self) -> float | None:
@@ -105,6 +112,11 @@ class HostView:
         return [job for job in self.running if job.suspect]
 
     @property
+    def leftover_bytes(self) -> int:
+        """Disk held by workdirs of jobs that are over: reclaimable by `gpuc clean`."""
+        return sum(job.workdir_bytes or 0 for job in self.finished)
+
+    @property
     def past_ttl(self) -> bool:
         """Age from the provider's own createdAt when we have it.
 
@@ -143,6 +155,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             # A sample is null when nvidia-smi failed; drop it rather than
             # counting a missing reading as 0% and calling the job a suspect.
             util_recent=[float(u) for u in entry.get("util_recent") or [] if u is not None],
+            workdir_bytes=entry.get("workdir_bytes"),
         )
         if view.status == "running":
             running.append(view)
@@ -274,6 +287,13 @@ def render(view: HostView, *, recent: int = RECENT_FINISHED, suspects_only: bool
         lines.append(
             f"  done    {job.job_id} {job.name or '-'} {job.status}"
             f"{f' ({detail})' if detail else ''}"
+        )
+    leftover = view.leftover_bytes
+    if leftover > LEFTOVER_FLOOR_BYTES:
+        held = [job for job in view.finished if (job.workdir_bytes or 0) > 0]
+        lines.append(
+            f"  disk    {human_bytes(leftover)} still in {len(held)} finished job workdir(s); "
+            f"free it with: gpuc clean --host {entry.name} --all-finished"
         )
     if len(lines) == 1:
         lines.append("  idle; nothing queued, running or finished")

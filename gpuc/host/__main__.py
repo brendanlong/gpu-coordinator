@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from gpuc.host import dispatcher, health, jobs, paths, queue, runner
+from gpuc.host import cleanup, dispatcher, health, jobs, paths, queue, runner
 from gpuc.host.jobs import JobSpec
 
 
@@ -62,7 +62,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             state = jobs.read_state(job_id)
         except (RuntimeError, FileNotFoundError):
             continue
-        entries.append({"job_id": job_id, "name": _name(job_id), **state.to_dict()})
+        entry = {"job_id": job_id, "name": _name(job_id), **state.to_dict()}
+        # Only for finished jobs: a running job's workdir is being written to,
+        # its size is meaningless, and walking a live venv on every `gpuc
+        # status` would be pure cost.
+        entry["workdir_bytes"] = cleanup.workdir_size(job_id) if state.finished else None
+        entries.append(entry)
     heartbeat = dispatcher.DispatcherLock().heartbeat_age()
     print(
         json.dumps(
@@ -100,6 +105,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     return runner.run_job(args.job_id)
 
 
+def cmd_clean(args: argparse.Namespace) -> int:
+    result = cleanup.clean(
+        all_finished=args.all_finished,
+        older_than_days=args.older_than,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(result.to_dict(), indent=2))
+    return 1 if result.errors else 0
+
+
 def cmd_resume(_: argparse.Namespace) -> int:
     paths.paused_file().unlink(missing_ok=True)
     dispatcher.spawn_detached_dispatcher()
@@ -133,6 +148,13 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run one job in the foreground (used by the dispatcher)")
     run.add_argument("job_id")
     run.set_defaults(func=cmd_run)
+
+    clean = sub.add_parser("clean", help="remove finished jobs' workdirs")
+    selection = clean.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--all-finished", action="store_true")
+    selection.add_argument("--older-than", type=float, metavar="DAYS")
+    clean.add_argument("--dry-run", action="store_true")
+    clean.set_defaults(func=cmd_clean)
 
     sub.add_parser("resume", help="clear a low-util pause and restart dispatching").set_defaults(
         func=cmd_resume

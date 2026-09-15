@@ -15,7 +15,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -73,6 +73,9 @@ class JobSpecModel(BaseModel):
     max_runtime_min: float | None = None
     low_util: LowUtilModel = Field(default_factory=LowUtilModel)
     requires: dict[str, Any] = Field(default_factory=dict)
+    cleanup: Literal["on_success", "always", "never"] = jobs.DEFAULT_CLEANUP
+    """When the runner deletes the job's `workdir/`. The default keeps a failed
+    or cancelled one so it can be inspected."""
 
     @field_validator("command")
     @classmethod

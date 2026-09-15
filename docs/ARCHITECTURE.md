@@ -27,6 +27,7 @@ gpuc/
     queue.py      # enqueue, list, reorder, cancel markers
     dispatcher.py # lock+heartbeat, pick next runnable, launch runner, idle/TTL terminate
     runner.py     # one job: env, CUDA_VISIBLE_DEVICES, preflight, watchdog, sync, exit code
+    cleanup.py    # `cleanup:` policy, workdir sizing, the `clean` sweep
     gpus.py       # nvidia-smi parsing, UUID<->index assertion, utilization sampling
     sync.py       # periodic upload loop (shells out to `aws` or `hf`; see Sync)
     health.py     # host preflight: driver, UUIDs, disk, network download timing
@@ -36,6 +37,7 @@ gpuc/
     config.py     # ~/.local/share/gpu-coordinator/ layout, hosts registry
     transport.py  # LocalTransport / SshTransport: run, rsync, put_file(0600), tail
     bootstrap.py  # install uv + this package on a host, write config, run host preflight
+    clean.py      # `gpuc clean` / `gpuc host clean --uv-cache` over the transport
     providers/
       base.py     # Provider interface: offers(constraints), create, get, logs, terminate, list
       runpod.py   # v2 REST implementation
@@ -74,12 +76,13 @@ jobs/<jobid>/
                      #  "phase": setup|preflight|main|sync, "pid": int|null, "pgid": int|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null, "sync_error": str|null,
-                     #  "util_recent": [float|null, ...], "util_sampled_at": str|null}
+                     #  "util_recent": [float|null, ...], "util_sampled_at": str|null,
+                     #  "workdir_removed": bool}
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and the sample must not be read as 0%.
                      # pgid is the *job's* group, published by the runner when it spawns a phase.
                      # It is absent during the launch window; cancel is the marker alone until then.
-  workdir/           # rsynced code (git-tracked files only)
+  workdir/           # rsynced code (git-tracked files only); removed per `cleanup:`
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir
 dispatcher.lock      # fd flock held by the running dispatcher
@@ -110,6 +113,7 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "max_runtime_min": null,
   "low_util": {"enabled": true, "window_min": 25, "floor_pct": 5, "grace_min": 10},
   "requires": {"cuda_min": "12.8"},     # informs provisioning only
+  "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
   "attempt": 1                          # set by `gpuc requeue`, not by the submitter
 }
 ```
@@ -184,6 +188,74 @@ queue's lexical order, not submission order below one second.
    one final sync; a failed final sync makes a succeeded job `failed: sync`,
    and an output path that was never written makes it `failed: no-outputs`.
    Write final state. Exit code of the runner = job exit code.
+7. Apply `spec.cleanup` to `workdir/` -- after the final sync and the final
+   state write, never before: `outputs:` paths resolve *inside* the workdir, so
+   any earlier removal would delete the run's results on the way past. Record
+   `workdir_removed` in `state.json`, then upload state and log. A removal that
+   fails is logged and nothing more: the job's outcome is already decided, and
+   leftover disk is not worth turning a green run red.
+
+## Workdir cleanup
+
+`workdir/` is the only part of a job dir that is recreatable (`gpuc requeue`
+re-syncs it from git) and usually the largest -- a torch venv is ~6.5 GB. It is
+the only thing gpuc deletes; `spec.json`, `state.json` and `log.txt` always
+stay, so `logs` and `status` keep working on a cleaned job.
+
+| `cleanup:` | succeeded | failed | cancelled |
+| --- | --- | --- | --- |
+| `on_success` (default) | removed | kept | kept |
+| `always` | removed | removed | removed |
+| `never` | kept | kept | kept |
+
+No policy ever removes the workdir of a job that is not finished.
+
+`python -m gpuc.host clean (--all-finished | --older-than DAYS) [--dry-run]`
+is the after-the-fact sweep, driven by `gpuc clean --host H`. It prints JSON:
+per-job `bytes` (du-style allocated blocks, deduplicated by inode within the
+tree), what was skipped and why, and the staged specs it removed. It fails
+closed everywhere: a running or queued job, a job whose `state.json` is missing
+or unreadable, and (under `--older-than`) a job with no parseable `ended_at`
+are all skipped. It also removes `incoming/<id>.json` staged specs whose job
+has finished, or which name no job at all and are over an hour old -- the
+window in which that file is load-bearing is one SSH round trip.
+
+The host's `status` reports `workdir_bytes` per *finished* job (a live job's
+workdir is still being written to, and walking it on every status call would be
+pure cost). `gpuc status` prints one line per host once those exceed 1 GiB.
+
+## The shared uv cache
+
+uv caches wheels under `~/.cache/uv` and materialises a venv by reflinking or
+hardlinking out of it, so the second job needing the same torch build costs
+seconds and almost no disk. Both mechanisms work only *within one filesystem*,
+and `UV_LINK_MODE=copy` disables them outright. Two rules follow:
+
+- Nothing in the job path sets `UV_LINK_MODE`, and neither the dispatcher nor
+  the runner sets `UV_CACHE_DIR` unless `HostConfig.env` does.
+- `gpuc host bootstrap` compares the filesystem of gpuc home with that of `uv
+  cache dir`. If they differ it sets `HostEntry.cache_dir` (surfaced to jobs as
+  `UV_CACHE_DIR` via `HostConfig.env`) to `<parent of gpuc home>/.cache/uv` --
+  beside gpuc home, not inside it, so `clean` and an `rm -rf` of gpuc home
+  cannot take the cache with them. An explicit `--cache-dir` or an `--env
+  UV_CACHE_DIR=...` is never overridden, and an unreadable comparison changes
+  nothing.
+
+The case that matters is a pod with `--persistent-root /workspace/$USER`: gpuc
+home on the network volume, `~/.cache` on the container's overlay. Without the
+rule uv copies every wheel into every venv, at the venv's full size, onto the
+slowest disk the host has. Measured on the `spar` box, where gpuc home and the
+cache *are* one filesystem, a 6.5 GB torch venv's large `.so` files have
+`nlink=1` but `filefrag` reports identical physical extents flagged `shared`:
+uv used reflinks, so `du` reads 6.5 GB while the venv costs essentially nothing
+beyond the cache. `du` cannot see this, which is why the check compares
+filesystems rather than sizes.
+
+`gpuc host probe` and the health check both report the cache's size and whether
+it shares a filesystem with gpuc home; the health check is warn-only, because a
+split cache costs disk and time, not correctness. `gpuc host clean <host>
+--uv-cache` runs `uv cache prune` (not `clean`, which would throw away exactly
+the wheels the next job wants to link).
 
 ## Control side: `gpuc` CLI
 
@@ -193,10 +265,12 @@ gpuc host add spar   --ssh user@host [--port N] --gpus GPU-uuid,.. # shared box
                      [--gpuc-home PATH]           # override ~/.gpuc on the host (tests, odd layouts)
                      [--persistent-root R]        # gpuc home moves to R/gpuc; see Persistent root
                      [--env K=V]                  # extra environment for every job on this host
-gpuc host set <host> [--gpus ..] [--persistent-root R] [--gpuc-home PATH] [--s3-prefix ..]
+                     [--cache-dir PATH]           # pin UV_CACHE_DIR; else bootstrap picks one
+gpuc host set <host> [--gpus ..] [--persistent-root R] [--gpuc-home PATH] [--cache-dir PATH] [--s3-prefix ..]
                      [--idle-min N] [--ttl-hours N]   # edit one entry in place; only the flags given change
 gpuc host bootstrap <host>        # install uv + package, write config, run host preflight, start dispatcher
-gpuc host probe <host>            # print driver, GPUs+UUIDs, disk + $HOME's fs type, logind KillUserProcesses, systemd --user, network timing
+gpuc host probe <host>            # print driver, GPUs+UUIDs, disk + $HOME's fs type, logind KillUserProcesses, systemd --user, uv cache size + whether it shares gpuc home's fs, network timing
+gpuc host clean <host> --uv-cache # `uv cache prune` on the host
 gpuc host list | remove <host>
 
 gpuc submit job.yaml --host <host>                                  # existing host
@@ -205,6 +279,7 @@ gpuc submit job.yaml --runpod --gpu A40[,RTX4090] [--min-vram 24] [--max-price 0
 gpuc status [--host H] [--all] [--suspects]
 gpuc logs <jobid> [-f]           # tail from the host over transport; S3 fallback with a note
 gpuc cancel <jobid>
+gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]
 gpuc reorder <jobid> --priority N
 gpuc requeue <jobid> [--host H | --runpod ...]   # resubmit from the S3 spec, new attempt
 gpuc reconcile [--once]          # the loop; installable as a systemd --user service via `gpuc reconcile --install`
@@ -262,11 +337,13 @@ never touch argv.
 
 `gpuc host add|set <name> --persistent-root R` moves `GPUC_HOME` to `R/gpuc`,
 and nothing else: the queue, specs, state, logs and workdirs are the state that
-cannot be reinstalled. uv, its cache and managed Pythons, `uv tool` installs
-and the `aws` bundle stay in `$HOME` on every host -- bootstrap reinstalls them
-in seconds, and these shared volumes are much slower than a container's local
-disk, so a venv or a cache on one is a bad trade. Bootstrap creates `R` 0700 if
-it creates it and leaves an existing `R`'s mode alone; everything inside is
+cannot be reinstalled. uv, its managed Pythons, `uv tool` installs and the
+`aws` bundle stay in `$HOME` on every host -- bootstrap reinstalls them in
+seconds, and these shared volumes are much slower than a container's local
+disk. uv's *cache* is the exception: the venv lives in a workdir under gpuc
+home regardless, so keeping the cache on the other volume does not save the
+slow disk any writes -- it only stops uv linking. See The shared uv cache.
+Bootstrap creates `R` 0700 if it creates it and leaves an existing `R`'s mode alone; everything inside is
 gpuc home, which `paths.ensure_layout` already makes 0700. Without a root
 nothing changes.
 
@@ -275,6 +352,8 @@ nothing changes.
 *before* the job's own `env` -- by the dispatcher to every child it spawns, and
 by the runner -- and to every `HostSession` invocation of the on-host package.
 `UV_INSTALL_DIR`/`UV_TOOL_BIN_DIR` in it are also prepended to `PATH`.
+`HostEntry.cache_dir` is the one key bootstrap fills in itself; it reaches
+`HostConfig.env` as `UV_CACHE_DIR` and an explicit `env` entry always wins.
 
 `gpuc host probe` reports `$HOME`'s filesystem type (`df -T`, `stat -f`
 fallback) and suggests `--persistent-root` when it is an overlay (or, if the

@@ -78,11 +78,12 @@ def _first_line(text: str) -> str:
 def env_prefix(entry: HostEntry) -> str:
     """``K="v" `` assignments for a remote command, or ``""`` for most hosts.
 
-    This is the host's own `HostEntry.env`, set by hand; it reaches the host's
-    config.json too, but bootstrap's own uv and interpreter calls happen before
-    anything reads that file.
+    This is the host's own env (`HostEntry.env` plus its `cache_dir`); it
+    reaches the host's config.json too, but bootstrap's own uv and interpreter
+    calls happen before anything reads that file, and `uv tool install` should
+    already be using the cache this host is going to use.
     """
-    return "".join(f'{key}="{value}" ' for key, value in sorted(entry.env.items()))
+    return "".join(f'{key}="{value}" ' for key, value in sorted(entry.job_env().items()))
 
 
 def remote_path(entry: HostEntry) -> str:
@@ -248,6 +249,79 @@ def ensure_hf_cli(transport: Transport, uv: str, entry: HostEntry, report: Repor
     return None
 
 
+def cache_dir_beside(home: str) -> str:
+    """A uv cache on gpuc home's own filesystem: `<parent of gpuc home>/.cache/uv`.
+
+    Beside rather than inside, so `gpuc clean` and a hand-`rm` of gpuc home
+    cannot take the cache with them -- the cache is exactly the thing worth
+    keeping across jobs.
+    """
+    parent = home.rstrip("/").rpartition("/")[0]
+    if not parent:
+        return f"{home.rstrip('/')}/uv-cache"
+    return f"{parent}/.cache/uv"
+
+
+UV_CACHE_PROBE = """\
+set -e
+home={home}
+mkdir -p "$home" 2>/dev/null || true
+cache=$({env}{uv} cache dir 2>/dev/null || true)
+[ -n "$cache" ] || cache="$HOME/.cache/uv"
+mkdir -p "$cache" 2>/dev/null || true
+echo "cache=$cache"
+echo "cache_dev=$(stat -c %d "$cache" 2>/dev/null || echo unknown)"
+echo "home_dev=$(stat -c %d "$home" 2>/dev/null || echo unknown)"
+"""
+
+
+def resolve_cache_dir(
+    transport: Transport, entry: HostEntry, uv: str, home: str, report: Reporter
+) -> str | None:
+    """Decide this host's `UV_CACHE_DIR`. `None` means uv's default is right.
+
+    uv builds a venv by reflinking or hardlinking wheels out of `~/.cache/uv`,
+    and both only work inside a single filesystem; across one it silently falls
+    back to copying. On a host whose gpuc home is on a network volume and whose
+    `$HOME` is a container's overlay (a RunPod pod with `--persistent-root
+    /workspace/...`) that costs the full size of every venv -- ~6.5 GB for
+    torch -- written to the slowest disk the host has, on every single job.
+
+    The rule is one comparison and nothing cleverer: if gpuc home and uv's
+    cache are on different filesystems, move the cache next to gpuc home. An
+    explicit `--cache-dir` or `--env UV_CACHE_DIR=...` is never overridden.
+    """
+    pinned = entry.env.get("UV_CACHE_DIR") or entry.cache_dir
+    if pinned:
+        report(f"uv cache: {pinned} (set for this host; left alone)")
+        return entry.cache_dir
+    script = UV_CACHE_PROBE.format(
+        home=shlex.quote(home), env=env_prefix(entry), uv=shlex.quote(uv)
+    )
+    result = transport.run(script, check=False)
+    if result.returncode != 0:
+        report(f"WARNING: could not read the uv cache location on {entry.name}; leaving it default")
+        return None
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if line.count("=") >= 1)
+    cache, cache_dev, home_dev = (
+        values.get("cache", ""),
+        values.get("cache_dev", "unknown"),
+        values.get("home_dev", "unknown"),
+    )
+    if "unknown" in (cache_dev, home_dev) or not cache:
+        report(f"uv cache: {cache or 'unknown'} (could not compare filesystems; left alone)")
+        return None
+    if cache_dev == home_dev:
+        report(f"uv cache: {cache}, same filesystem as {home}; uv will link wheels into venvs")
+        return None
+    target = cache_dir_beside(home)
+    report(
+        f"uv cache: {cache} is on a different filesystem from gpuc home {home}, so uv would "
+        f"copy every wheel into every venv. Setting UV_CACHE_DIR={target} for this host."
+    )
+    return target
+
+
 def write_host_config(session: HostSession, entry: HostEntry) -> None:
     session.transport.run(
         f'{env_prefix(entry)}GPUC_HOME="{session.home}" PYTHONPATH="{session.home}/pkg" '
@@ -333,6 +407,12 @@ def bootstrap_host(
     home = resolve_home(transport, entry)
     files = sync_package(transport, home, report)
 
+    # Before `uv tool install`, so that call already populates the cache this
+    # host will actually use.
+    cache_dir = resolve_cache_dir(transport, entry, uv, home, report)
+    if cache_dir != entry.cache_dir:
+        entry = entry.model_copy(update={"cache_dir": cache_dir})
+
     for warning in (
         ensure_aws_cli(transport, report),
         ensure_hf_cli(transport, uv, entry, report),
@@ -354,7 +434,14 @@ def bootstrap_host(
     pid = start_dispatcher(session)
     report(f"dispatcher running (pid {pid})")
 
-    updated = entry.model_copy(update={"uv": uv, "python": python, "bootstrapped_at": utc_now()})
+    updated = entry.model_copy(
+        update={
+            "uv": uv,
+            "python": python,
+            "cache_dir": cache_dir,
+            "bootstrapped_at": utc_now(),
+        }
+    )
     return updated, BootstrapResult(
         host=entry.name,
         uv=uv,

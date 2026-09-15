@@ -16,6 +16,28 @@ from gpuc.host import paths
 Status = str  # queued | running | succeeded | failed | cancelled
 Phase = str
 PHASES = ("setup", "preflight", "main", "sync")
+FINISHED_STATUSES = ("succeeded", "failed", "cancelled")
+
+ON_SUCCESS = "on_success"
+ALWAYS = "always"
+NEVER = "never"
+CLEANUP_POLICIES = (ON_SUCCESS, ALWAYS, NEVER)
+DEFAULT_CLEANUP = ON_SUCCESS
+
+
+def normalize_cleanup(value: object, *, origin: str = "cleanup") -> str:
+    """Validate a `cleanup:` value.
+
+    A typo has to fail loudly here: the two ways of being wrong are keeping
+    6.5 GB per job forever and deleting a failed run's workdir before anyone
+    could look at it, and neither should be reachable by misspelling a word.
+    """
+    if value is None:
+        return DEFAULT_CLEANUP
+    text = str(value)
+    if text not in CLEANUP_POLICIES:
+        raise ValueError(f"{origin} must be one of {', '.join(CLEANUP_POLICIES)}, got {text!r}")
+    return text
 
 
 def new_job_id() -> str:
@@ -134,6 +156,12 @@ class JobSpec:
     max_runtime_min: float | None = None
     low_util: LowUtil = field(default_factory=LowUtil)
     requires: dict[str, Any] = field(default_factory=dict)
+    cleanup: str = DEFAULT_CLEANUP
+    """`on_success` | `always` | `never`: when the runner deletes `workdir/`.
+
+    The default keeps a failed or cancelled workdir so it can be inspected, and
+    reclaims the (usually venv-dominated) space of a run that worked.
+    """
     attempt: int = 1
 
     @staticmethod
@@ -154,6 +182,7 @@ class JobSpec:
             ),
             low_util=LowUtil.from_dict(d.get("low_util")),
             requires=dict(d.get("requires") or {}),
+            cleanup=normalize_cleanup(d.get("cleanup")),
             attempt=int(d.get("attempt", 1)),
         )
 
@@ -179,6 +208,10 @@ class JobState:
     util_recent: list[float | None] = field(default_factory=list)
     util_sampled_at: str | None = None
     sync_error: str | None = None
+    workdir_removed: bool = False
+    """Whether `workdir/` has been deleted, by the job's `cleanup:` policy or by
+    `gpuc clean`. Recorded so `status` and `logs` can say "gone on purpose"
+    rather than leaving an empty job dir to look like data loss."""
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> JobState:
@@ -194,7 +227,7 @@ class JobState:
 
     @property
     def finished(self) -> bool:
-        return self.status in ("succeeded", "failed", "cancelled")
+        return self.status in FINISHED_STATUSES
 
 
 def write_spec(spec: JobSpec) -> None:

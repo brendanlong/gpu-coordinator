@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from gpuc.control.probe import PROBE_SCRIPT, parse_probe
+from gpuc.control.probe import parse_probe, probe_script
+
+PROBE_SCRIPT = probe_script("$HOME/.gpuc")
 
 SAMPLE = """===system===
 Linux 6.8.0 x86_64
@@ -46,7 +48,10 @@ no python3 and no curl: cannot time a download
 
 
 def test_probe_script_is_posix_sh_with_no_gpuc_dependency() -> None:
-    assert "gpuc" not in PROBE_SCRIPT.replace("gpuc host bootstrap", "")
+    # The gpuc home *path* appears (the uv-cache check compares filesystems
+    # with it), but nothing in the script runs gpuc code: probe has to work on
+    # a host where nothing is installed yet.
+    assert "-m gpuc" not in PROBE_SCRIPT
     assert "bash" not in PROBE_SCRIPT
     assert "python3 -" in PROBE_SCRIPT
 
