@@ -10,9 +10,10 @@ installing and registering hosts is [setup.md](setup.md).
 
 ## Goals
 
-One submit path for three kinds of host: the local desktop (1 GPU), a shared
-SSH box with no sudo (a subset of its GPUs), and ephemeral RunPod pods. Not
-finicky, not buggy, and never leaks a paid pod in the normal path.
+One submit path for three kinds of host: this machine (the cards you give it),
+a box reached over SSH with no sudo there (a subset of its GPUs), and ephemeral
+RunPod pods. Not finicky, not buggy, and never leaks a paid pod in the normal
+path.
 
 Non-goals for the prototype: Vast, multi-node, spot, a web UI, S3 as the
 authoritative queue (host is authoritative, S3 is the mirror; `gpuc requeue`
@@ -398,7 +399,7 @@ and `UV_LINK_MODE=copy` disables them outright. Two rules follow:
 The case that matters is a pod with `--persistent-root /workspace/$USER`: gpuc
 home on the network volume, `~/.cache` on the container's overlay. Without the
 rule uv copies every wheel into every venv, at the venv's full size, onto the
-slowest disk the host has. Measured on the `spar` box, where gpuc home and the
+slowest disk the host has. Measured on an ssh host where gpuc home and the
 cache *are* one filesystem, a 6.5 GB torch venv's large `.so` files have
 `nlink=1` but `filefrag` reports identical physical extents flagged `shared`:
 uv used reflinks, so `du` reads 6.5 GB while the venv costs essentially nothing

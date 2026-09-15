@@ -148,9 +148,9 @@ def named_registry() -> Registry:
     """The registry, for a command that was given a host or job name to find.
 
     A registry that could not be parsed is exit 3 (unknown), not exit 4 (does
-    not exist): "no host named spar" would be a lie when the file holding spar
-    is the thing that is broken. Listing commands do not use this -- they can
-    honestly show what parsed.
+    not exist): "no host named gpubox" would be a lie when the file holding
+    gpubox is the thing that is broken. Listing commands do not use this --
+    they can honestly show what parsed.
     """
     read = read_registry()
     for error in read.errors:
@@ -762,7 +762,7 @@ def cmd_ssh(args: argparse.Namespace) -> int:
     """A shell on a host (or in a job's workdir), with gpuc's own ssh options."""
     command = list(args.command or [])
     # argparse.REMAINDER swallows flags that follow the target, and typing
-    # `gpuc ssh spar --print` is the obvious thing to do.
+    # `gpuc ssh myhost --print` is the obvious thing to do.
     if command and command[0] == "--print":
         args.print_only, command = True, command[1:]
     if command and command[0] == "--":

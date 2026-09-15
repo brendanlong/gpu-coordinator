@@ -186,13 +186,13 @@ failure class #5:
 The dispatcher lives as long as the queue does. What is true is that no
 process's death loses state, and whoever enqueues next restarts it.
 
-Cancel semantics vary by host. On brendan-desktop as `claude`,
+Cancel semantics vary by host. On the local desktop
 `systemd-run --user --scope` works (verified), so cancel can kill a whole
 cgroup and catch double-forked children. RunPod containers have no systemd,
-and the SPAR box is unknown. **Process-group kill is the baseline**; cgroup
-kill is an upgrade where available.
+and an arbitrary ssh box is unknown. **Process-group kill is the baseline**;
+cgroup kill is an upgrade where available.
 
-Two things to probe on the SPAR box before designing around it:
+Two things to probe on an ssh host before designing around it:
 
 - Whether detached processes survive SSH logout (`KillUserProcesses` in
   logind; the default is `no`, but admins flip it).
@@ -267,7 +267,7 @@ download inside the job), and re-placing would replay the same job on a
 fresh host and burn the same money again. The right outcome is: job marked
 failed with the reason, host terminated, nothing requeued, loud entry in
 `status`. Re-placement is reserved for failures that happen before any job
-has run, where the host is the only variable. On SPAR and local the
+has run, where the host is the only variable. On ssh and local hosts the
 watchdog behaves identically except that "terminate host" is a no-op.
 
 Every timer must exceed the slowest legitimate phase: a cold `uv sync` with
@@ -284,8 +284,8 @@ Feasible, and the two halves do not conflict as long as the image carries
 **only system-level things**. On RunPod use
 `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (or the cu130 sibling): it
 gives sshd honoring `PUBLIC_KEY`, rsync, and the CUDA toolkit. Its bundled
-torch is irrelevant since `uv sync` installs the project's own. On SPAR and
-local there is no container and the same runner runs bare. Anything
+torch is irrelevant since `uv sync` installs the project's own. On ssh and
+local hosts there is no container and the same runner runs bare. Anything
 project-specific baked into the image would make the three targets diverge,
 which is the layer-split failure the catalog warns about.
 
@@ -313,8 +313,8 @@ Feasible. Details that matter:
 
 - S3: periodic sync of an output directory. The `aws` CLI v2 is a
   self-contained bundle that installs into `$HOME` without sudo, so it is
-  usable on SPAR; `boto3` has no `sync`, so choosing it means writing the
-  size-and-mtime diff. Either is fine; pick one and say so.
+  usable on a host with no sudo; `boto3` has no `sync`, so choosing it
+  means writing the size-and-mtime diff. Either is fine; pick one and say so.
 - HF: `huggingface_hub.CommitScheduler` uploads a folder every N minutes.
   It is **append-only by contract**: overwriting or deleting files "can
   corrupt the repository", each push is a git commit, and the docs
@@ -340,8 +340,8 @@ stateful controller**, and if authority is placed correctly:
 - **For ephemeral hosts, S3 is authoritative** for the job queue and job
   status, because the host will be destroyed. The host holds a working copy
   and flushes status changes before acting on them (in particular before
-  self-terminating). For SPAR and local, the host is authoritative and S3 is
-  the mirror.
+  self-terminating). For ssh and local hosts, the host is authoritative and
+  S3 is the mirror.
 - The local CLI is stateless: it rebuilds its view from S3 plus SSH.
 - The reconciler (provision, reaper, heartbeat) runs as a `systemd --user`
   unit under `claude`, which has linger enabled (verified). It loops: read
@@ -369,7 +369,8 @@ an index file, not in the path.
 - **Not in pod `env` at create time either**: it is returned by
   `GET /v2/pods` and persists in the pod record. Push credentials over SSH
   after boot, as a mode-0600 file written from stdin. `SendEnv` does not
-  work on SPAR because `AcceptEnv` needs an sshd config change.
+  work on a box whose sshd you do not administer, because `AcceptEnv` needs
+  an sshd config change.
 - Write-test S3 and HF at enqueue time locally and again in preflight on the
   host. A missing credential fails before the expensive work, never at the
   final upload.
@@ -459,8 +460,9 @@ kill, on suspects and on any pod older than its TTL.
 
 ### 2.12 Shared-box citizenship
 
-Pinning UUIDs is not enough on SPAR. Cap dataloader workers and thread
-counts explicitly (a `os.cpu_count()`-sized loader is antisocial there),
+Pinning UUIDs is not enough on a box you share with other people. Cap
+dataloader workers and thread counts explicitly (a `os.cpu_count()`-sized
+loader is antisocial there),
 respect the disk quota, and have the probe and preflight detect another
 user's process on an "owned" card before assigning it.
 
@@ -484,11 +486,11 @@ health checks, and offer a per-job "clean HF model cache after" flag.
 Same as the scoping journal, with the money-safety work last and exercised
 first under a cap:
 
-1. Host probe script; run it on the SPAR box and locally.
+1. Host probe script; run it on an ssh host and locally.
 2. On-host queue core (stdlib only) and runner venv: dispatcher with fd lock
    and heartbeat, UUID assignment, preflight, periodic sync, exit-code
    discipline. Test on the local GPU.
-3. Same package over SSH on SPAR.
+3. Same package over SSH on a shared box.
 4. Provider interface plus RunPod driver, reconciler, the pre-healthy
    ceiling, on-host idle terminate and TTL, local reaper, account caps. First test: register an SSH key, provision the
    cheapest available GPU with `startSsh` and `22/tcp`, confirm
