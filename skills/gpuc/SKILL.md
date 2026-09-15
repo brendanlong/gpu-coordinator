@@ -1,6 +1,6 @@
 ---
 name: gpuc
-description: Run GPU jobs with gpu-coordinator (gpuc) on the local desktop, the SPAR shared box, or a RunPod pod. Use when asked to train, evaluate, or run anything on a GPU, to check on or cancel a GPU job, or to read its logs.
+description: Run GPU jobs with gpu-coordinator (gpuc) on this machine, a box you reach over ssh, or a RunPod pod. Use when asked to train, evaluate, or run anything on a GPU, to check on or cancel a GPU job, or to read its logs.
 ---
 
 # Running GPU jobs with gpuc
@@ -28,14 +28,19 @@ is `docs/setup.md` in the repo, not this guide.
 
 ## Pick a host
 
-| host | when | notes |
-|---|---|---|
-| `local` | anything that fits in 8 GB VRAM | free, shared with the desktop; one GPU |
-| `spar` | up to 2× A40 48 GB, no cost | shared box; only the two cards assigned to us (by nvidia-smi index) are ever used; home is wiped on restart |
-| `--runpod` | needs more, or both are busy | costs money; provisions the cheapest matching pod, idles down after 15 min |
+`gpuc host list` is the list that matters: every registered host with its kind
+and its cards, each as `[index] name vram uuid`. Which of them are busy is
+`gpuc status`.
 
-Prefer `local`, then `spar`, then RunPod. Check `gpuc status` first: a busy host
-queues your job behind the running one, which is usually fine.
+| kind | when | notes |
+|---|---|---|
+| `local` | the job fits on this machine's own cards | free, and shared with everything else using that GPU |
+| `ssh` | a bigger or shared box already registered | free to you; only the cards registered to that host are ever used, and some such boxes wipe `$HOME` on restart |
+| `--runpod` | nothing registered is big enough, or they are all busy | costs money; provisions the cheapest matching pod, idles down after 15 min |
+
+Prefer a host you already have over a pod you pay for, and check `gpuc status`
+first: a busy host queues your job behind the running one, which is usually
+fine.
 
 ## Write a job spec
 
@@ -55,9 +60,9 @@ env:
 secrets: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, HF_TOKEN, WANDB_API_KEY]
 outputs:
   - path: results                  # relative to the workdir
-    s3: s3://brendanlong-experiments/<experiment>/{job_id}/results
+    s3: s3://<your-bucket>/<experiment>/{job_id}/results
   - path: checkpoints
-    hf: brendanlong/<repo>
+    hf: <org>/<repo>
     hf_path: "{job_id}"
 sync_interval_s: 180               # upload cadence while running, and at the end; minimum 10
 priority: 50                       # 0 first, 99 last
@@ -84,14 +89,16 @@ Rules that avoid the classic failures:
 - Pass `--device cuda` explicitly and keep `REQUIRE_CUDA=1`. The runner runs a
   real GPU op inside the job's venv before `main`; a CPU-only torch fails the
   job as `gpu-preflight` rather than crawling for hours.
-- Torch builds: cu128 works on every host we use (local driver 580, SPAR driver
-  535, RunPod filtered to CUDA ≥ 12.8). cu130 does not work on SPAR.
+- Match the torch build to the host's driver, which `gpuc host probe <host>`
+  prints: a cu13x wheel needs a newer driver than a cu128 one, and an older
+  shared box is usually the binding constraint. cu128 is the safe default; a
+  `--runpod` pod is filtered to CUDA >= 12.8 (`--cuda-min` to change it).
 
 ## Submit, watch, finish
 
 ```bash
 gpuc submit job.yaml --host local
-gpuc submit job.yaml --host spar
+gpuc submit job.yaml --host <host>                              # any name from `gpuc host list`
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu A40,RTX4090 --cloud any
 
 gpuc status                      # every host: queue, running job + phase, recent results
@@ -108,8 +115,8 @@ gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc 
 gpuc ssh <host|jobid> --print    # just print the ssh line, to copy
 gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
 gpuc reorder <jobid> --priority 10          # queued jobs only
-gpuc requeue <jobid> --host spar # re-run from the mirrored spec, attempt+1; needs s3_bucket set,
-                                 # and re-syncs the workdir from your current directory
+gpuc requeue <jobid> --host <host>  # re-run from the mirrored spec, attempt+1; needs s3_bucket
+                                    # set, and re-syncs the workdir from your current directory
 gpuc pods                        # RunPod: every pod we own, cost, age, util, wanted?
 ```
 
@@ -189,9 +196,11 @@ Rules, and they are not optional:
 - `gpuc clean --host <host> --all-finished` removes finished jobs' workdirs
   (venvs). Records and logs stay until `--purge`, which only removes jobs whose
   log, state and outputs are confirmed mirrored.
-- After a SPAR restart: re-copy the SSH key if needed, then `gpuc host bootstrap
-  spar`, then `gpuc status --host spar --all` and `gpuc requeue` whatever was in
-  flight.
+- After a host restarts with its `$HOME` wiped (`dispatcher DOWN`, or ssh
+  failing outright): re-copy the SSH key if needed, then `gpuc host bootstrap
+  <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` whatever
+  was in flight. A host with a `--persistent-root` keeps its queue, so only
+  jobs that were running need resubmitting.
 
 Full reference in the repo: `README.md`, `docs/setup.md` (install, hosts,
 credentials), `docs/usage.md` (every command and failure mode),

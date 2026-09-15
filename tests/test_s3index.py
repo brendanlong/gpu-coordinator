@@ -26,7 +26,7 @@ def spec(job_id: str = "20260101-000000-abc123") -> JobSpec:
 
 def test_local_index_round_trips(control_env: Path) -> None:
     index = LocalIndex()
-    entry = IndexEntry(job_id="j1", host="spar", name="t", attempt=3)
+    entry = IndexEntry(job_id="j1", host="gpubox", name="t", attempt=3)
     index.record(entry)
     assert index.get("j1") == entry
     assert index.get("missing") is None
@@ -35,7 +35,7 @@ def test_local_index_round_trips(control_env: Path) -> None:
 
 def test_local_index_ignores_a_corrupt_file(control_env: Path) -> None:
     index = LocalIndex()
-    index.record(IndexEntry(job_id="j1", host="spar"))
+    index.record(IndexEntry(job_id="j1", host="gpubox"))
     (index.directory / "j2.json").write_text("{not json")
     assert [e.job_id for e in index.list()] == ["j1"]
 
@@ -51,7 +51,7 @@ def test_s3_spec_round_trips_for_requeue() -> None:
 
 def test_s3_index_lists_entries_for_status_all() -> None:
     s3 = S3Index("bkt", FakeS3Client())
-    s3.put_index(IndexEntry(job_id="b", host="spar"))
+    s3.put_index(IndexEntry(job_id="b", host="gpubox"))
     s3.put_index(IndexEntry(job_id="a", host="local"))
     assert [e.job_id for e in s3.list_index()] == ["a", "b"]
 
@@ -75,17 +75,17 @@ def test_missing_key_is_an_error_not_an_empty_spec() -> None:
 
 
 def test_log_fallback_uri_matches_what_the_host_uploads() -> None:
-    prefix = default_s3_prefix(Settings(s3_bucket="bkt"), "spar")
-    assert prefix == "s3://bkt/gpuc/spar"
-    assert job_log_uri(prefix or "", "j1") == "s3://bkt/gpuc/spar/jobs/j1/log.txt"
-    assert split_uri("s3://bkt/gpuc/spar/jobs/j1/log.txt") == (
+    prefix = default_s3_prefix(Settings(s3_bucket="bkt"), "gpubox")
+    assert prefix == "s3://bkt/gpuc/gpubox"
+    assert job_log_uri(prefix or "", "j1") == "s3://bkt/gpuc/gpubox/jobs/j1/log.txt"
+    assert split_uri("s3://bkt/gpuc/gpubox/jobs/j1/log.txt") == (
         "bkt",
-        "gpuc/spar/jobs/j1/log.txt",
+        "gpuc/gpubox/jobs/j1/log.txt",
     )
 
 
 def test_no_bucket_means_no_mirror() -> None:
-    assert default_s3_prefix(Settings(), "spar") is None
+    assert default_s3_prefix(Settings(), "gpubox") is None
     assert S3Index.from_settings(Settings()) is None
 
 
@@ -93,7 +93,7 @@ def test_list_index_follows_continuation_tokens() -> None:
     client = FakeS3Client(page_size=2)
     s3 = S3Index("bkt", client)
     for index in range(7):
-        s3.put_index(IndexEntry(job_id=f"j{index}", host="spar"))
+        s3.put_index(IndexEntry(job_id=f"j{index}", host="gpubox"))
     client.list_calls.clear()
     entries = s3.list_index()
     assert [e.job_id for e in entries] == [f"j{index}" for index in range(7)]
@@ -105,7 +105,7 @@ def test_list_index_stops_at_the_limit() -> None:
     client = FakeS3Client(page_size=2)
     s3 = S3Index("bkt", client)
     for index in range(7):
-        s3.put_index(IndexEntry(job_id=f"j{index}", host="spar"))
+        s3.put_index(IndexEntry(job_id=f"j{index}", host="gpubox"))
     assert len(s3.list_index(limit=3)) == 3
 
 

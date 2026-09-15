@@ -324,7 +324,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
   "schema_version": 1,
   "hosts": [
     {
-      "name": "spar",
+      "name": "gpubox",
       "kind": "ssh",
       "reachable": true,
       "pkg_commit": "8f1c2d0a9b34",
@@ -388,9 +388,9 @@ No policy ever touches a job that is not finished. `spec.json`, `state.json` and
 **After the fact: `gpuc clean --host H`.**
 
 ```sh
-gpuc clean --host spar --all-finished --dry-run   # what would go, and how big
-gpuc clean --host spar --all-finished             # every succeeded/failed/cancelled job
-gpuc clean --host spar --older-than 7             # only jobs that ended over 7 days ago
+gpuc clean --host gpubox --all-finished --dry-run   # what would go, and how big
+gpuc clean --host gpubox --all-finished             # every succeeded/failed/cancelled job
+gpuc clean --host gpubox --older-than 7             # only jobs that ended over 7 days ago
 ```
 
 |  | `clean` | `clean --purge` |

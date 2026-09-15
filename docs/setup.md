@@ -106,13 +106,13 @@ in seconds if it cannot write the repo.
 ## Registering hosts
 
 ```sh
-gpuc host add local --gpus 0                            # this machine
-gpuc host add spar --ssh me@spar --port 22 --gpus 2,3   # a shared box
-gpuc host probe spar        # driver, every card as `[index] uuid name`, disk, $HOME's filesystem,
-                            # systemd --user, uv cache, network speed. Needs the host registered,
-                            # so add it first (with no --gpus if you do not know them yet) and
-                            # `gpuc host set spar --gpus …` once you can read them off
-gpuc host bootstrap spar    # idempotent; run it again after any `host set`
+gpuc host add local --gpus 0                               # this machine
+gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach over ssh
+gpuc host probe gpubox       # driver, every card as `[index] uuid name`, disk, $HOME's filesystem,
+                             # systemd --user, uv cache, network speed. Needs the host registered,
+                             # so add it first (with no --gpus if you do not know them yet) and
+                             # `gpuc host set gpubox --gpus …` once you can read them off
+gpuc host bootstrap gpubox   # idempotent; run it again after any `host set`
 ```
 
 RunPod hosts are never added by hand: `gpuc submit --runpod ...` creates the
@@ -150,9 +150,9 @@ in seconds and these shared volumes are much slower than local disk. `R` is
 created 0700 if gpuc creates it; an existing `R` keeps its mode.
 
 ```sh
-gpuc host add spar --ssh spar --persistent-root /mnt/ssd-2/$USER --gpus GPU-aaa,GPU-bbb
-gpuc host set spar --persistent-root /mnt/ssd-2/$USER      # or move an existing host
-gpuc host bootstrap spar
+gpuc host add gpubox --ssh gpubox --persistent-root /mnt/ssd-2/$USER --gpus GPU-aaa,GPU-bbb
+gpuc host set gpubox --persistent-root /mnt/ssd-2/$USER      # or move an existing host
+gpuc host bootstrap gpubox
 ```
 
 **Runbook: the host restarted and came back empty.** The symptom is

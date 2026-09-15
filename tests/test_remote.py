@@ -16,7 +16,7 @@ MOTD = """Welcome to Ubuntu 24.04!
 
 
 class ScriptedTransport:
-    host = "spar"
+    host = "gpubox"
 
     def __init__(self, stdout: str, returncode: int = 0) -> None:
         self.stdout = stdout
@@ -42,13 +42,13 @@ class ScriptedTransport:
 
 
 def session(stdout: str, returncode: int = 0) -> HostSession:
-    entry = HostEntry(name="spar", kind="ssh", ssh="u@h")
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="u@h")
     transport: Transport = cast("Transport", ScriptedTransport(stdout, returncode))
     return HostSession(entry, transport, "/home/u/.gpuc", "python3")
 
 
 def test_the_last_json_line_wins_over_shell_noise() -> None:
-    assert parse_last_json(MOTD + '{"host": "spar"}\n') == {"host": "spar"}
+    assert parse_last_json(MOTD + '{"host": "gpubox"}\n') == {"host": "gpubox"}
 
 
 def test_a_pretty_printed_document_still_parses() -> None:
@@ -78,7 +78,7 @@ def test_host_command_pins_gpuc_home_and_pythonpath() -> None:
 
 
 def test_a_pretty_printed_report_is_not_mistaken_for_its_last_nested_object() -> None:
-    report = {"host": "spar", "ok": True, "checks": [{"name": "driver"}, {"name": "disk"}]}
+    report = {"host": "gpubox", "ok": True, "checks": [{"name": "driver"}, {"name": "disk"}]}
     document = parse_last_json(MOTD + json.dumps(report, indent=2) + "\n")
     assert document == report
 

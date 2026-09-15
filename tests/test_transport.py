@@ -42,7 +42,7 @@ def ssh_localhost() -> None:
 
 def make_ssh(tmp_path: Path) -> SshTransport:
     return SshTransport(
-        host="spar",
+        host="gpubox",
         target="user@box",
         port=2222,
         key="/keys/id_ed25519",
@@ -177,7 +177,7 @@ def test_git_tracked_files_lists_the_repo() -> None:
 
 def test_make_transport_picks_the_right_kind(tmp_path: Path) -> None:
     assert isinstance(transport.make_transport("local"), LocalTransport)
-    remote = transport.make_transport("spar", ssh="u@h", port=2200, state_dir=tmp_path)
+    remote = transport.make_transport("gpubox", ssh="u@h", port=2200, state_dir=tmp_path)
     assert isinstance(remote, SshTransport)
     assert remote.control_dir == transport.control_socket_dir()
     assert remote.known_hosts == tmp_path / "known_hosts"
@@ -220,7 +220,7 @@ def test_rsync_ssh_command_quotes_a_key_path_with_a_space(tmp_path: Path) -> Non
     key = tmp_path / "my keys" / "id_ed25519"
     key.parent.mkdir()
     key.touch()
-    ssh = SshTransport(host="spar", target="user@box", key=str(key))
+    ssh = SshTransport(host="gpubox", target="user@box", key=str(key))
     command = ssh.rsync_ssh_command()
     assert f"'{key}'" in command
     assert shlex.split(command) == ["ssh", *ssh.ssh_options()]
@@ -239,7 +239,7 @@ def test_rsync_actually_runs_a_remote_shell_whose_path_contains_a_space(tmp_path
     dest.mkdir()
     argv = transport.rsync_argv(src, f"fakehost:{dest}", ["f.txt"], shlex.join([str(wrapper)]))
     transport._execute(
-        "spar", argv, timeout=60, check=True, stdin=transport._files_stdin(["f.txt"])
+        "gpubox", argv, timeout=60, check=True, stdin=transport._files_stdin(["f.txt"])
     )
     assert (dest / "f.txt").read_text() == "payload"
 

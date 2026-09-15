@@ -51,9 +51,9 @@ def test_rows_keep_the_hosts_own_order() -> None:
 
 def entry_with_cards() -> HostEntry:
     return HostEntry(
-        name="spar",
+        name="gpubox",
         kind="ssh",
-        ssh="spar_cluster",
+        ssh="gpubox-ssh",
         gpus=[A40, A40_TWO],
         gpu_info=parse_smi(SMI_OUTPUT),
         driver_version="580.65.06",

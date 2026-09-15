@@ -30,7 +30,7 @@ REMOTE_HOME = "/home/u/.gpuc"
 
 @dataclass
 class FakeHost:
-    host: str = "spar"
+    host: str = "gpubox"
     commands: list[str] = field(default_factory=list)
     puts: dict[str, tuple[str, int]] = field(default_factory=dict)
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
@@ -63,7 +63,7 @@ class FakeHost:
 
 
 def session(host: FakeHost) -> HostSession:
-    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", gpus=["GPU-a"], python="/usr/bin/py")
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["GPU-a"], python="/usr/bin/py")
     return HostSession(entry, host, REMOTE_HOME, "/usr/bin/py")
 
 
@@ -153,7 +153,7 @@ def test_secrets_render_as_an_env_file_the_host_can_parse(tmp_path: Path) -> Non
 def test_submit_expands_job_id_in_output_destinations(control_env: Path, repo: Path) -> None:
     host = FakeHost()
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(
             job_document(
                 outputs=[
@@ -181,7 +181,7 @@ def test_submit_ships_tracked_and_untracked_files_but_not_ignored_ones(
     host = FakeHost()
     lines: list[str] = []
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document()),
         Settings(),
         workdir=repo,
@@ -207,7 +207,7 @@ def test_a_file_deleted_but_still_in_the_index_is_not_sent(control_env: Path, re
     (repo / "src" / "train.py").unlink()
     host = FakeHost()
     submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document()),
         Settings(),
         workdir=repo,
@@ -228,7 +228,7 @@ def test_no_git_syncs_everything_except_the_default_excludes(
     host = FakeHost()
     lines: list[str] = []
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document()),
         Settings(),
         workdir=plain,
@@ -250,7 +250,7 @@ def test_a_non_repo_without_no_git_says_how_to_fix_it(control_env: Path, tmp_pat
     plain.mkdir()
     with pytest.raises(SubmitError) as caught:
         submit_spec(
-            HostEntry(name="spar", gpus=["GPU-a"]),
+            HostEntry(name="gpubox", gpus=["GPU-a"]),
             validate(job_document()),
             Settings(),
             workdir=plain,
@@ -264,7 +264,7 @@ def test_a_non_repo_without_no_git_says_how_to_fix_it(control_env: Path, tmp_pat
 def test_submit_delivers_secrets_0600_and_never_on_argv(control_env: Path, repo: Path) -> None:
     host = FakeHost()
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document(secrets=["HF_TOKEN"])),
         Settings(),
         workdir=repo,
@@ -281,7 +281,7 @@ def test_submit_delivers_secrets_0600_and_never_on_argv(control_env: Path, repo:
 def test_submit_enqueues_over_stdin_and_records_the_index(control_env: Path, repo: Path) -> None:
     host = FakeHost()
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document(name="lego")),
         Settings(),
         workdir=repo,
@@ -295,7 +295,7 @@ def test_submit_enqueues_over_stdin_and_records_the_index(control_env: Path, rep
     assert f'PYTHONPATH="{REMOTE_HOME}/pkg"' in enqueue
     index = LocalIndex().get(result.job_id)
     assert index is not None
-    assert (index.host, index.name, index.attempt) == ("spar", "lego", 1)
+    assert (index.host, index.name, index.attempt) == ("gpubox", "lego", 1)
     assert "s3_bucket is unset" in " ".join(result.notes)
 
 
@@ -305,7 +305,7 @@ def test_submit_mirrors_the_spec_to_s3_when_a_bucket_is_configured(
     client = FakeS3Client()
     host = FakeHost()
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document()),
         Settings(s3_bucket="bkt"),
         workdir=repo,
@@ -326,7 +326,7 @@ def test_a_spec_already_mirrored_is_not_put_again(control_env: Path, repo: Path)
     uri back in; the second PUT was the same object over the wire twice."""
     client = FakeS3Client()
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document()),
         Settings(s3_bucket="bkt"),
         workdir=repo,
@@ -345,7 +345,7 @@ def test_a_job_bigger_than_the_host_is_refused_early(control_env: Path, repo: Pa
     host = FakeHost()
     with pytest.raises(SubmitError) as exc:
         submit_spec(
-            HostEntry(name="spar", gpus=["GPU-a"]),
+            HostEntry(name="gpubox", gpus=["GPU-a"]),
             validate(job_document(gpus=4)),
             Settings(),
             workdir=repo,
@@ -353,7 +353,7 @@ def test_a_job_bigger_than_the_host_is_refused_early(control_env: Path, repo: Pa
             environ={},
             report=lambda _: None,
         )
-    assert "host spar owns 1" in str(exc.value)
+    assert "host gpubox owns 1" in str(exc.value)
     assert host.rsyncs == []
 
 
@@ -362,7 +362,7 @@ def test_submitting_from_a_non_repository_says_what_to_do(
 ) -> None:
     with pytest.raises(SubmitError, match="git init"):
         submit_spec(
-            HostEntry(name="spar", gpus=["GPU-a"]),
+            HostEntry(name="gpubox", gpus=["GPU-a"]),
             validate(job_document(gpus=0)),
             Settings(),
             workdir=tmp_path,
@@ -375,7 +375,7 @@ def test_submitting_from_a_non_repository_says_what_to_do(
 def test_submit_file_reads_yaml(control_env: Path, repo: Path) -> None:
     (repo / "job.yaml").write_text("name: t\ncommand: echo hi\ngpus: 0\n")
     result = submit_file(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         repo / "job.yaml",
         Settings(),
         workdir=repo,
@@ -383,7 +383,7 @@ def test_submit_file_reads_yaml(control_env: Path, repo: Path) -> None:
         environ={},
         report=lambda _: None,
     )
-    assert result.host == "spar"
+    assert result.host == "gpubox"
     assert result.attempt == 1
 
 
@@ -410,7 +410,7 @@ def test_submit_warns_about_files_already_under_an_output_path(
     (repo / "results" / "report-elephant.md").write_text("from the last run\n")
     lines: list[str] = []
     result = submit_spec(
-        HostEntry(name="spar", gpus=["GPU-a"]),
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
         validate(job_document(outputs=[{"path": "results", "s3": "s3://b/{job_id}"}])),
         Settings(),
         workdir=repo,

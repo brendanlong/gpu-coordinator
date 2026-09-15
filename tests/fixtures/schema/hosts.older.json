@@ -18,10 +18,10 @@
       "created_at": "2026-09-01T07:42:34+00:00",
       "bootstrapped_at": "2026-09-01T07:43:46+00:00"
     },
-    "spar": {
-      "name": "spar",
+    "gpubox": {
+      "name": "gpubox",
       "kind": "ssh",
-      "ssh": "spar_cluster",
+      "ssh": "gpubox-ssh",
       "port": 22,
       "gpus": ["GPU-80646905-50a9-afc1-4375-43ca475b15e4"],
       "pod_id": null,
@@ -29,7 +29,7 @@
       "uv": "/home/brendan/.local/bin/uv",
       "idle_minutes": 15.0,
       "ttl_hours": 24.0,
-      "s3_prefix": "s3://brendanlong-experiments/gpuc/spar",
+      "s3_prefix": "s3://brendanlong-experiments/gpuc/gpubox",
       "created_at": "2026-09-01T17:57:50+00:00",
       "bootstrapped_at": "2026-09-01T20:43:35+00:00"
     }

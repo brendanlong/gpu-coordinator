@@ -43,25 +43,25 @@ def test_bad_config_says_which_file_to_fix(control_env: Path) -> None:
 
 
 def test_registry_round_trips(control_env: Path) -> None:
-    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", port=2222, gpus=["GPU-a", "GPU-b"])
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", port=2222, gpus=["GPU-a", "GPU-b"])
     registry = Registry()
     registry.put(entry)
     save_registry(registry)
-    assert load_registry().require("spar") == entry
+    assert load_registry().require("gpubox") == entry
 
 
 def test_unknown_host_error_lists_the_known_ones(control_env: Path) -> None:
     with registry_transaction() as registry:
         registry.put(HostEntry(name="local"))
     with pytest.raises(ConfigError) as exc:
-        load_registry().require("spar")
+        load_registry().require("gpubox")
     assert "Known hosts: local" in str(exc.value)
     assert "gpuc host add" in str(exc.value)
 
 
 def test_transport_kind_follows_the_entry(control_env: Path) -> None:
     assert isinstance(transport_for(HostEntry(name="local")), LocalTransport)
-    ssh = transport_for(HostEntry(name="spar", kind="ssh", ssh="me@box", port=2222))
+    ssh = transport_for(HostEntry(name="gpubox", kind="ssh", ssh="me@box", port=2222))
     assert isinstance(ssh, SshTransport)
     assert ssh.port == 2222
     assert ssh.known_hosts == config.state_dir() / "known_hosts"

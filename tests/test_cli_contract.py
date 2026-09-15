@@ -132,7 +132,7 @@ def test_a_missing_registry_is_simply_no_hosts(control_env: Path) -> None:
 def test_status_is_zero_even_when_every_host_is_unreachable(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "spar", "--ssh", "me@nowhere.invalid", "--gpus", GPU])
+    main(["host", "add", "gpubox", "--ssh", "me@nowhere.invalid", "--gpus", GPU])
 
     def unreachable(entry: HostEntry, *args: object, **kwargs: object) -> HostView:
         return HostView(entry=entry, reachable=False, error="ssh: could not resolve hostname")
@@ -302,7 +302,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
 def test_status_json_says_unreachable_rather_than_empty(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "spar", "--ssh", "me@box", "--gpus", GPU])
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
     capsys.readouterr()
     monkeypatch.setattr(
         status_mod,
@@ -391,13 +391,13 @@ def test_version_prints_the_version_the_commit_and_each_host(
 ) -> None:
     from gpuc.control import version as version_mod
 
-    main(["host", "add", "spar", "--ssh", "me@box"])
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
     with_commit = (
         load_registry()
-        .require("spar")
+        .require("gpubox")
         .model_copy(update={"pkg_commit": "b" * 40, "bootstrapped_at": "2026-09-15T20:00:00+00:00"})
     )
-    write_hosts({"hosts": {"spar": json.loads(with_commit.model_dump_json())}})
+    write_hosts({"hosts": {"gpubox": json.loads(with_commit.model_dump_json())}})
     capsys.readouterr()
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     monkeypatch.setattr(version_mod, "installed_commit", lambda: "a" * 40)
@@ -416,11 +416,11 @@ def test_a_host_on_another_commit_gets_one_warning_line(
     from gpuc.control import version as version_mod
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
-    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", pkg_commit="b" * 40)
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="b" * 40)
     warning = status_mod.stale_warning(entry)
     assert warning is not None
-    assert "host spar runs an older gpuc" in warning
-    assert "gpuc host bootstrap spar" in warning
+    assert "host gpubox runs an older gpuc" in warning
+    assert "gpuc host bootstrap gpubox" in warning
     assert status_mod.render(HostView(entry=entry, reachable=True)).count("WARNING") == 1
 
 
