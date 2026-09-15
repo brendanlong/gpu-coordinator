@@ -1,0 +1,120 @@
+{
+  "hosts": {
+    "local": {
+      "name": "local",
+      "kind": "local",
+      "ssh": null,
+      "port": 22,
+      "gpus": [
+        "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+      ],
+      "gpu_info": {
+        "GPU-2a4bad3b-9fe3-7031-914d-384254e92908": {
+          "name": "NVIDIA GeForce RTX 3060 Ti",
+          "vram_mib": 8192
+        }
+      },
+      "driver_version": "580.173.02",
+      "pod_id": null,
+      "python": "/home/claude/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13",
+      "uv": "/home/claude/.local/bin/uv",
+      "gpuc_home": null,
+      "persistent_root": null,
+      "env": {},
+      "cache_dir": null,
+      "idle_minutes": 15.0,
+      "ttl_hours": 24.0,
+      "s3_prefix": "s3://brendanlong-experiments/gpuc/local",
+      "retention_days": 14.0,
+      "created_at": "2026-09-15T07:42:34+00:00",
+      "bootstrapped_at": "2026-09-15T20:43:46+00:00"
+    },
+    "spar": {
+      "name": "spar",
+      "kind": "ssh",
+      "ssh": "spar_cluster",
+      "port": 22,
+      "gpus": [
+        "GPU-80646905-50a9-afc1-4375-43ca475b15e4",
+        "GPU-83123e65-fe58-7831-6b21-1814b07c25f7"
+      ],
+      "gpu_info": {
+        "GPU-2bab55e1-c49c-1518-76fa-c082c295ab69": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        },
+        "GPU-713b5365-3fd5-7c31-ca15-0a1e4ccad113": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        },
+        "GPU-80646905-50a9-afc1-4375-43ca475b15e4": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        },
+        "GPU-83123e65-fe58-7831-6b21-1814b07c25f7": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        },
+        "GPU-ab5576e5-bddf-80d8-3619-71528fe06aef": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        },
+        "GPU-cfe5d6b6-f5e1-42ea-c1c0-b43f53747248": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        },
+        "GPU-e02e5a6a-6016-5b1f-3166-b9c66ab0e5b1": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        },
+        "GPU-2241fe72-e2cf-b51a-a7d9-71ab902cd011": {
+          "name": "NVIDIA A40",
+          "vram_mib": 49140
+        }
+      },
+      "driver_version": "535.309.01",
+      "pod_id": null,
+      "python": "/home/brendan/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12",
+      "uv": "/home/brendan/.local/bin/uv",
+      "gpuc_home": null,
+      "persistent_root": null,
+      "env": {},
+      "cache_dir": null,
+      "idle_minutes": 15.0,
+      "ttl_hours": 24.0,
+      "s3_prefix": "s3://brendanlong-experiments/gpuc/spar",
+      "retention_days": 14.0,
+      "created_at": "2026-09-15T17:57:50+00:00",
+      "bootstrapped_at": "2026-09-15T20:43:35+00:00"
+    },
+    "gpuc-job-8c9212": {
+      "name": "gpuc-job-8c9212",
+      "kind": "runpod",
+      "ssh": "root@203.0.113.10",
+      "port": 22129,
+      "gpus": [
+        "GPU-8421adce-c502-7f9b-8b9b-5c3c104446ff"
+      ],
+      "gpu_info": {
+        "GPU-8421adce-c502-7f9b-8b9b-5c3c104446ff": {
+          "name": "NVIDIA A40",
+          "vram_mib": 46068
+        }
+      },
+      "driver_version": "580.159.03",
+      "pod_id": "podxxxxxxxxxxxx",
+      "python": "/usr/local/bin/python",
+      "uv": "/usr/bin/uv",
+      "gpuc_home": null,
+      "persistent_root": null,
+      "env": {},
+      "cache_dir": null,
+      "idle_minutes": 15.0,
+      "ttl_hours": null,
+      "s3_prefix": "s3://brendanlong-experiments/gpuc/gpuc-job-8c9212",
+      "retention_days": null,
+      "created_at": "2026-09-15T21:10:02+00:00",
+      "bootstrapped_at": "2026-09-15T21:10:36+00:00"
+    }
+  }
+}

@@ -1,0 +1,715 @@
+"""Runs exactly one job: environment, preflight, watchdogs, sync, exit code.
+
+Exit-code discipline (measured in the shell implementation this replaces):
+the job's exit code is captured before *any* cleanup, and a failed final sync
+turns an otherwise-green job into `failed: sync` so lost outputs are never
+silent.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import IO
+
+from gpuc._version import user_agent
+from gpuc.host import baseline, cleanup, gpus, jobs, paths, preflight, queue, scope, sync
+from gpuc.host.gpus import SmiRunner
+from gpuc.host.jobs import JobSpec
+
+KILL_GRACE_S = 15.0
+SAMPLE_INTERVAL_S = 30.0
+UTIL_SAMPLES_KEPT = 40  # 20 minutes at the default sample interval
+POLL_INTERVAL_S = 0.5
+TERMINATED_EXIT_CODE = 143  # 128 + SIGTERM, the shell convention
+
+UtilSampler = Callable[[Sequence[str]], float]
+
+PREFLIGHT_SOURCE = """
+import os, sys, torch
+expected = int(os.environ["GPUC_EXPECTED_GPUS"])
+if not torch.cuda.is_available():
+    sys.exit(f"CUDA not available (torch {torch.__version__}, build {torch.version.cuda})")
+probe = torch.zeros(8, device="cuda")
+_ = (probe + 1.0).sum().item()
+count = torch.cuda.device_count()
+if count != expected:
+    sys.exit(f"device_count()=={count}, expected {expected}")
+print(f"gpu preflight ok: torch {torch.__version__} cuda {torch.version.cuda} "
+      f"devices {count} {torch.cuda.get_device_name(0)}")
+"""
+
+
+# -- process facts ------------------------------------------------------------
+# A recorded pid alone proves nothing: pids are reused within a boot and reused
+# from 1 again after a reboot, so "is the process that wrote this file still
+# running?" needs the boot id and the process start time as well.
+
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def boot_id() -> str | None:
+    try:
+        return BOOT_ID_PATH.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def parse_starttime(stat: str) -> str | None:
+    """Field 22 of ``/proc/<pid>/stat``, as text.
+
+    Split after the last ``)``: the comm field is parenthesised and may itself
+    contain spaces and parentheses, which breaks a naive ``split()``.
+    """
+    _, sep, rest = stat.rpartition(")")
+    if not sep:
+        return None
+    fields = rest.split()
+    if len(fields) < 20:
+        return None
+    return fields[19]
+
+
+def starttime(pid: int) -> str | None:
+    try:
+        return parse_starttime(Path(f"/proc/{pid}/stat").read_text())
+    except OSError:
+        return None
+
+
+def cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.decode("utf-8", "replace").replace("\0", " ").strip()
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def is_gpuc_process(pid: int) -> bool:
+    return "gpuc.host" in cmdline(pid)
+
+
+def recorded_process_alive(
+    pid: int | None, recorded_boot_id: str | None = None, recorded_starttime: str | None = None
+) -> bool:
+    """Is the *same* process we recorded still running?"""
+    if not pid or not pid_alive(pid):
+        return False
+    current_boot = boot_id()
+    if recorded_boot_id and current_boot and recorded_boot_id != current_boot:
+        return False
+    current_start = starttime(pid)
+    return not (recorded_starttime and current_start and recorded_starttime != current_start)
+
+
+class _Terminated(BaseException):
+    """The runner itself was signalled. A BaseException so that no `except
+    Exception` in a phase can swallow the shutdown."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def kill_process_group(
+    pgid: int,
+    *,
+    grace_s: float = KILL_GRACE_S,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+    reap: Callable[[], object] | None = None,
+) -> None:
+    """SIGTERM the whole group, then SIGKILL it after `grace_s`.
+
+    The group, not the pid: jobs routinely spawn helper processes (dataloader
+    workers, a `sleep` in a shell wrapper) that would otherwise survive and
+    hold the GPU.
+
+    `reap` must wait() our own direct child if we have one: an unreaped zombie
+    is still a member of its process group, so without it every kill would burn
+    the whole grace period before the group looked empty.
+    """
+    if pgid <= 1:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = now() + grace_s
+    while now() < deadline:
+        if reap is not None:
+            reap()
+        if not process_group_alive(pgid):
+            return
+        sleep(0.25)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def preflight_command() -> str:
+    return f"uv run --no-sync python -c {_shell_quote(PREFLIGHT_SOURCE)}"
+
+
+@dataclass
+class RunnerDeps:
+    smi: SmiRunner = gpus.run_nvidia_smi
+    sampler: UtilSampler | None = None
+    command_runner: sync.CommandRunner = sync.run_command
+    sleep: Callable[[float], None] = time.sleep
+    now: Callable[[], float] = time.monotonic
+    poll_interval_s: float = POLL_INTERVAL_S
+    sample_interval_s: float = SAMPLE_INTERVAL_S
+    kill_grace_s: float = KILL_GRACE_S
+    preflight: bool = True
+    preflight_command: Callable[[], str] = preflight_command
+    sync_preflight: bool = True
+    isolation: str | None = None
+    """`cgroup`, `pgid`, or None to ask `scope.isolation()` at job start."""
+
+    def util_sampler(self) -> UtilSampler:
+        if self.sampler is not None:
+            return self.sampler
+        return lambda uuids: gpus.mean_utilization(uuids, self.smi)
+
+
+@dataclass
+class _Window:
+    """Rolling mean over the trailing `window_s`, with a separate record of how
+    long we have been sampling: the retained samples always span *less* than
+    the window, so they cannot themselves tell us the window is covered."""
+
+    window_s: float
+    samples: deque[tuple[float, float]] = field(default_factory=deque)
+    first_t: float | None = None
+
+    def add(self, t: float, value: float) -> None:
+        if self.first_t is None:
+            self.first_t = t
+        self.samples.append((t, value))
+        while len(self.samples) > 1 and t - self.samples[0][0] > self.window_s:
+            self.samples.popleft()
+
+    def full(self, t: float) -> bool:
+        return (
+            self.first_t is not None
+            and len(self.samples) >= 2
+            and (t - self.first_t) >= self.window_s
+        )
+
+    def mean(self) -> float:
+        return sum(v for _, v in self.samples) / len(self.samples)
+
+
+def build_env(
+    spec: JobSpec, assigned: Sequence[str], config: jobs.HostConfig | None = None
+) -> dict[str, str]:
+    env = dict(os.environ)
+    # The host's own env and PATH go first, so a job may still pin either
+    # explicitly. The dispatcher normally passes these down already; doing it
+    # here too means a runner started by hand, or by a dispatcher from before a
+    # `gpuc host set`, still gets them.
+    (config or jobs.read_config()).apply_env(env)
+    env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
+    env.update(spec.env)
+    # Last, so a spec `env` typo cannot hand the job the wrong cards.
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned)
+    env["GPUC_JOB_ID"] = spec.job_id
+    env["GPUC_JOB_DIR"] = str(paths.job_dir(spec.job_id))
+    env["GPUC_OUTPUTS"] = str(paths.outputs_dir(spec.job_id))
+    env["GPUC_EXPECTED_GPUS"] = str(len(assigned))
+    # `hf` puts this in its own User-Agent, so a Hub-side question about our
+    # traffic has something to point at. A job may still override it.
+    env.setdefault("HF_HUB_USER_AGENT_ORIGIN", user_agent())
+    return env
+
+
+class JobRunner:
+    def __init__(self, job_id: str, deps: RunnerDeps | None = None) -> None:
+        self.job_id = job_id
+        self.deps = deps or RunnerDeps()
+        self.spec = jobs.read_spec(job_id)
+        self.state = jobs.read_state(job_id)
+        self.assigned: list[str] = list(self.state.gpus)
+        self.config = jobs.read_config()
+        self.kill_reason: str | None = None
+        self.env: dict[str, str] = {}
+        self.isolation: str = self.deps.isolation or scope.isolation()
+        self._current: subprocess.Popen[bytes] | None = None
+        self._current_unit: str | None = None
+        self._terminating = False
+        self._finalizing = False
+        """Set for the whole of `_finalize`, which must run exactly once.
+
+        The dispatcher escalates a cancel to a SIGTERM at the runner itself
+        after 30 s, and that lands squarely in the final sync of a long upload.
+        Without this, the signal unwound `_finalize`, `run()` caught it, and
+        finalize ran again -- rewriting a job that had already been recorded as
+        `succeeded` into `failed: terminated` and uploading every output a
+        second time."""
+
+    # -- logging ---------------------------------------------------------
+    def _log(self, log: IO[bytes], message: str) -> None:
+        log.write(f">>> {message}\n".encode())
+        log.flush()
+
+    # -- phases ----------------------------------------------------------
+    def _spawn(
+        self, phase: str, command: str, env: dict[str, str], log: IO[bytes]
+    ) -> subprocess.Popen[bytes]:
+        unit = scope.unit_name(self.job_id, phase) if self.isolation == scope.CGROUP else None
+        self._current_unit = unit
+        return subprocess.Popen(
+            scope.phase_argv(command, unit),
+            cwd=str(paths.workdir(self.job_id)),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _monitor(
+        self, proc: subprocess.Popen[bytes], phase: str, log: IO[bytes], job_start: float
+    ) -> int:
+        deps = self.deps
+        pgid = proc.pid
+        jobs.update_state(
+            self.job_id,
+            phase=phase,
+            pid=proc.pid,
+            pgid=pgid,
+            isolation=self.isolation,
+            cgroup_unit=self._current_unit,
+        )
+        sampler = deps.util_sampler()
+        low_util = self.spec.low_util
+        record_util = phase == "main" and bool(self.assigned)
+        watch_low_util = record_util and low_util.enabled
+        window = _Window(low_util.window_min * 60.0)
+        phase_start = deps.now()
+        # Sampling starts immediately so `gpuc status --suspects` has data, but
+        # the kill window only opens after grace_min: setup-like work at the top
+        # of main (model download, compile) is legitimately at 0% util.
+        next_sample = phase_start + deps.sample_interval_s
+        watch_from = phase_start + low_util.grace_min * 60.0
+        max_runtime_s = (
+            None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
+        )
+
+        while proc.poll() is None:
+            deps.sleep(deps.poll_interval_s)
+            t = deps.now()
+            if queue.is_cancelled(self.job_id):
+                self._kill(proc, "cancelled", log)
+                break
+            requested = queue.kill_reason(self.job_id)
+            if requested:
+                self._kill(proc, requested, log)
+                break
+            if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
+                self._kill(proc, "timeout", log)
+                break
+            if record_util and t >= next_sample:
+                next_sample = t + deps.sample_interval_s
+                try:
+                    util = sampler(self.assigned)
+                except (gpus.GpuError, ValueError) as exc:
+                    # A missing sample is not evidence of an idle GPU, so it is
+                    # recorded as unknown and never feeds the watchdog window.
+                    self._log(log, f"utilization sample failed: {exc}")
+                    self._record_util(None)
+                    continue
+                self._record_util(util)
+                if not watch_low_util or t < watch_from:
+                    continue
+                window.add(t, util)
+                if window.full(t) and window.mean() < low_util.floor_pct:
+                    self._log(
+                        log,
+                        f"low-util watchdog: mean {window.mean():.1f}% over "
+                        f"{low_util.window_min:g} min is below {low_util.floor_pct:g}%",
+                    )
+                    self._kill(proc, "low-util", log)
+                    break
+        return proc.wait()
+
+    def _record_util(self, util: float | None) -> None:
+        sample = None if util is None else round(util, 1)
+        recent = [*jobs.read_state(self.job_id).util_recent, sample][-UTIL_SAMPLES_KEPT:]
+        jobs.update_state(self.job_id, util_recent=recent, util_sampled_at=jobs.utc_now())
+
+    def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
+        self.kill_reason = reason
+        unit = self._current_unit
+        if unit is not None:
+            self._log(log, f"stopping scope {unit}: {reason}")
+            if not scope.stop_unit(unit):
+                self._log(log, f"systemctl --user stop {unit} failed; falling back to the group")
+        else:
+            self._log(log, f"killing process group {proc.pid}: {reason}")
+        # Always, scope or not: the group kill is the fallback, and against a
+        # cgroup that is already empty it costs one ProcessLookupError.
+        kill_process_group(
+            proc.pid,
+            grace_s=self.deps.kill_grace_s,
+            sleep=self.deps.sleep,
+            now=self.deps.now,
+            reap=proc.poll,
+        )
+
+    def _run_phase(
+        self, phase: str, command: str, env: dict[str, str], log: IO[bytes], job_start: float
+    ) -> int:
+        self._log(log, f"phase={phase}: {command}")
+        proc = self._spawn(phase, command, env, log)
+        # Left set if _monitor raises: a terminating runner needs the handle to
+        # the group (and the scope) it must take down.
+        self._current = proc
+        code = self._monitor(proc, phase, log, job_start)
+        self._current = None
+        jobs.update_state(self.job_id, cgroup_unit=None)
+        self._current_unit = None
+        self._log(log, f"phase={phase} exited {code}")
+        return code
+
+    # -- signals ---------------------------------------------------------
+    @contextlib.contextmanager
+    def _term_handlers(self) -> Iterator[None]:
+        """Turn SIGTERM/SIGINT into an exception on the main thread.
+
+        Without this the runner dies where it stands: the job's process group
+        survives holding a GPU the dispatcher is about to hand to someone else,
+        and the job is left `running` forever.
+        """
+
+        def handle(signum: int, _frame: object) -> None:
+            if self._finalizing or self._terminating:
+                return
+            self._terminating = True
+            raise _Terminated(signum)
+
+        try:
+            previous = [
+                (sig, signal.signal(sig, handle)) for sig in (signal.SIGTERM, signal.SIGINT)
+            ]
+        except ValueError:
+            previous = []  # not the main thread; the caller owns the signals
+        try:
+            yield
+        finally:
+            for sig, handler in previous:
+                with contextlib.suppress(ValueError):
+                    signal.signal(sig, handler)
+
+    # -- entry point -----------------------------------------------------
+    def run(self) -> int:
+        paths.ensure_job_layout(self.job_id)
+        job_start = self.deps.now()
+        env = build_env(self.spec, self.assigned, self.config)
+        # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
+        # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
+        # credential file anywhere on the host.
+        self.env = env
+        sync_loop = sync.SyncLoop(
+            self.spec,
+            paths.workdir(self.job_id),
+            self.config.s3_prefix,
+            runner=self.deps.command_runner,
+            env=env,
+        )
+        with paths.log_file(self.job_id).open("ab", buffering=0) as log, self._term_handlers():
+            try:
+                return self._run_phases(env, sync_loop, log, job_start)
+            except _Terminated as exc:
+                return self._finalize_terminated(exc, sync_loop, log)
+
+    def _run_phases(
+        self, env: dict[str, str], sync_loop: sync.SyncLoop, log: IO[bytes], job_start: float
+    ) -> int:
+        jobs.update_state(
+            self.job_id,
+            status="running",
+            phase="setup",
+            started_at=self.state.started_at or jobs.utc_now(),
+            isolation=self.isolation,
+            runner_pid=os.getpid(),
+            runner_boot_id=boot_id(),
+            runner_starttime=starttime(os.getpid()),
+        )
+        try:
+            gpus.assert_uuids_present(self.assigned, self.deps.smi)
+        except gpus.GpuError as exc:
+            self._log(log, f"GPU assertion failed: {exc}")
+            return self._finalize(1, "failed", "gpu-assert", sync_loop, log)
+
+        self._log(
+            log,
+            f"job {self.job_id} on {self.config.host} "
+            f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES'] or '(none)'}",
+        )
+
+        self._capture_output_baseline(log)
+
+        cancelled = self._cancelled_before("setup", sync_loop, log)
+        if cancelled is not None:
+            return cancelled
+
+        if self.spec.setup:
+            code = self._run_phase("setup", self.spec.setup, env, log, job_start)
+            if code != 0 or self.kill_reason:
+                return self._finalize(code, *self._classify(code, "setup"), sync_loop, log)
+
+        if self.assigned and self.deps.preflight:
+            cancelled = self._cancelled_before("preflight", sync_loop, log)
+            if cancelled is not None:
+                return cancelled
+            code = self._run_phase("preflight", self.deps.preflight_command(), env, log, job_start)
+            if code != 0 or self.kill_reason:
+                return self._finalize(code, *self._classify(code, "gpu-preflight"), sync_loop, log)
+
+        if self._sync_preflight(log) is not None:
+            return self._finalize(
+                1, "failed", "sync-preflight", sync_loop, log, skip_output_sync=True
+            )
+
+        cancelled = self._cancelled_before("main", sync_loop, log)
+        if cancelled is not None:
+            return cancelled
+
+        sync_loop.start()
+        code = self._run_phase("main", self.spec.command, env, log, job_start)
+        status, reason = self._classify(code, None)
+        return self._finalize(code, status, reason, sync_loop, log)
+
+    def _capture_output_baseline(self, log: IO[bytes]) -> None:
+        """Record what the checkout already had where the outputs go.
+
+        Before `setup`, because a setup step may legitimately write into an
+        output path and that *is* this job's doing.
+        """
+        if not self.spec.outputs:
+            return
+        found = baseline.capture(self.spec, paths.workdir(self.job_id), self.job_id)
+        for line in baseline.describe(found):
+            self._log(log, f"outputs baseline: {line}")
+        for path, entries in sorted(found.items()):
+            if baseline.too_many(entries):
+                self._log(
+                    log,
+                    f"WARNING: {path} already holds more than {baseline.MAX_TRACKED} files, too "
+                    f"many to exclude one by one, so pre-existing files there WILL be uploaded. "
+                    f"Point `outputs:` at a directory this job creates.",
+                )
+
+    def _sync_preflight(self, log: IO[bytes]) -> str | None:
+        """Prove the uploads work before the job spends hours producing outputs.
+
+        The alternative is finding out at the final sync, when the only copy of
+        a checkpoint is on a host that may be about to go away.
+        """
+        if not self.deps.sync_preflight:
+            return None
+        jobs.update_state(self.job_id, phase="preflight")
+        try:
+            destinations = preflight.run(
+                self.spec,
+                self.config,
+                runner=self.deps.command_runner,
+                env=self.env or None,
+            )
+        except preflight.PreflightFailed as exc:
+            self._log(log, f"sync preflight FAILED: {exc}")
+            return str(exc)
+        self._log(log, preflight.describe(destinations))
+        return None
+
+    def _cancelled_before(self, phase: str, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int | None:
+        """A job cancelled during the launch window never starts a phase."""
+        if not queue.is_cancelled(self.job_id):
+            return None
+        self._log(log, f"cancel marker present before phase={phase}; not starting it")
+        return self._finalize(TERMINATED_EXIT_CODE, "cancelled", "cancelled", sync_loop, log)
+
+    def _finalize_terminated(
+        self, exc: _Terminated, sync_loop: sync.SyncLoop, log: IO[bytes]
+    ) -> int:
+        if self._finalizing:
+            # Belt and braces with the signal handler: whatever `_finalize`
+            # decided is this job's outcome, so report that rather than
+            # finalizing a second time.
+            try:
+                return jobs.read_state(self.job_id).exit_code or 0
+            except RuntimeError:
+                return TERMINATED_EXIT_CODE
+        name = signal.Signals(exc.signum).name
+        self._log(log, f"runner received {name}; stopping the job")
+        proc = self._current
+        if proc is not None:
+            self._kill(proc, "terminated", log)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+        cancelled = queue.is_cancelled(self.job_id)
+        status, reason = ("cancelled", "cancelled") if cancelled else ("failed", "terminated")
+        return self._finalize(TERMINATED_EXIT_CODE, status, reason, sync_loop, log)
+
+    def _classify(self, code: int, failure_reason: str | None) -> tuple[str, str | None]:
+        if self.kill_reason == "cancelled":
+            return "cancelled", "cancelled"
+        if self.kill_reason:
+            return "failed", self.kill_reason
+        if code == 0:
+            return "succeeded", None
+        return "failed", failure_reason or f"exit {code}"
+
+    def _finalize(
+        self,
+        exit_code: int,
+        status: str,
+        reason: str | None,
+        sync_loop: sync.SyncLoop,
+        log: IO[bytes],
+        skip_output_sync: bool = False,
+    ) -> int:
+        self._finalizing = True
+        jobs.update_state(self.job_id, phase="sync")
+        if skip_output_sync:
+            # The preflight already proved these uploads cannot work, and the
+            # job never ran, so a second failure would only add a confusing
+            # `+no-outputs` to a reason that is already exact.
+            self._log(log, "skipping the final output sync after a failed sync preflight")
+        else:
+            try:
+                sync_loop.final()
+            except sync.MissingOutput as exc:
+                self._log(log, f"final sync found no outputs: {exc}")
+                status, reason, exit_code = self._blame(status, reason, exit_code, "no-outputs")
+            except sync.SyncError as exc:
+                self._log(log, f"final sync FAILED: {exc}")
+                status, reason, exit_code = self._blame(status, reason, exit_code, "sync")
+            if sync_loop.last_error and status == "succeeded":
+                self._log(log, f"periodic sync had errors: {sync_loop.last_error}")
+
+        jobs.update_state(
+            self.job_id,
+            status=status,
+            reason=reason,
+            exit_code=exit_code,
+            ended_at=jobs.utc_now(),
+            phase=None,
+            pid=None,
+            pgid=None,
+            cgroup_unit=None,
+            outputs_synced_at=sync_loop.outputs_synced_at,
+        )
+        self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")
+        # After the final state write, and only then: the outputs the sync just
+        # uploaded live *inside* the workdir, so anything earlier would delete
+        # the run's results on the way past.
+        jobs.update_state(self.job_id, workdir_removed=self._cleanup_workdir(status, log))
+        try:
+            warning = sync.final_meta_sync(
+                self.job_id,
+                self.config.s3_prefix,
+                runner=self.deps.command_runner,
+                env=self.env or None,
+            )
+            if warning:
+                self._log(log, f"WARNING: {warning}")
+        except sync.SyncError as exc:
+            # meta_synced_at stays null, so `purge` will refuse to delete this
+            # job dir: the only copy of the log lives here.
+            self._log(log, f"final state upload failed: {exc}")
+        # Only now: the final sync and the state upload authenticate with the
+        # secrets this file holds, so removing it earlier would break exactly
+        # the upload that matters most. On an ephemeral host with outputs still
+        # unconfirmed it stays: the drain gets one more go at uploading them,
+        # and the file dies with the pod in minutes either way.
+        if self._keep_secrets_for_drain(sync_loop):
+            self._log(
+                log,
+                "outputs are not confirmed uploaded; keeping this job's secrets file so the "
+                "host's drain can retry the upload before the pod goes away",
+            )
+        else:
+            paths.job_env_file(self.job_id).unlink(missing_ok=True)
+        return exit_code
+
+    def _keep_secrets_for_drain(self, sync_loop: sync.SyncLoop) -> bool:
+        return bool(
+            self.config.ephemeral and self.spec.outputs and sync_loop.outputs_synced_at is None
+        )
+
+    def _cleanup_workdir(self, status: str, log: IO[bytes]) -> bool:
+        """Apply the spec's `cleanup:` policy to `workdir/`, and nothing else.
+
+        A failure to delete is logged and nothing more: the job's own outcome
+        has already been decided and uploaded, and turning a green run red over
+        leftover disk would be the wrong trade.
+        """
+        if not cleanup.should_remove(self.spec.cleanup, status):
+            return False
+        try:
+            freed = cleanup.remove_workdir(self.job_id)
+        except OSError as exc:
+            self._log(log, f"could not remove workdir (cleanup={self.spec.cleanup}): {exc}")
+            return False
+        self._log(
+            log,
+            f"removed workdir (cleanup={self.spec.cleanup}), freeing "
+            f"{cleanup.human_bytes(freed)}; spec.json, state.json and log.txt are kept",
+        )
+        return True
+
+    @staticmethod
+    def _blame(
+        status: str, reason: str | None, exit_code: int, sync_reason: str
+    ) -> tuple[str, str | None, int]:
+        if status == "succeeded":
+            return "failed", sync_reason, 1
+        return status, f"{reason}+{sync_reason}" if reason else sync_reason, exit_code
+
+
+def _shell_quote(text: str) -> str:
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def run_job(job_id: str, deps: RunnerDeps | None = None) -> int:
+    return JobRunner(job_id, deps).run()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(argv) if argv is not None else sys.argv[1:]
+    if len(args) != 1:
+        print("usage: python -m gpuc.host run <job-id>", file=sys.stderr)
+        return 2
+    return run_job(args[0])
