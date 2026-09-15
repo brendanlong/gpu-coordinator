@@ -30,6 +30,7 @@ from gpuc.control.config import (
     DesiredHost,
     HostEntry,
     Settings,
+    config_file,
     forget_host,
     load_registry,
     pod_known_hosts_file,
@@ -127,7 +128,16 @@ class _Progress:
 
 def public_key_path(settings: Settings) -> Path:
     if settings.ssh_key:
-        return Path(settings.ssh_key_path or "").with_suffix(".pub")
+        # Appended, not `with_suffix`: a key called `my.key` has a public half
+        # called `my.key.pub`, and `with_suffix` would ask for `my.pub`.
+        candidate = Path(f"{settings.ssh_key_path or ''}.pub")
+        if not candidate.exists():
+            raise ProvisionError(
+                f"ssh_key is {settings.ssh_key} in {config_file()}, but its public half "
+                f"{candidate} does not exist.\nRunPod needs the public key to authorise the "
+                f"pod; create it with `ssh-keygen -y -f {settings.ssh_key_path} > {candidate}`."
+            )
+        return candidate
     for name in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"):
         candidate = Path.home() / ".ssh" / name
         if candidate.exists():
@@ -477,20 +487,31 @@ def _create_and_record(
 
 def _terminate_now(
     provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str
-) -> None:
+) -> bool:
+    """True only when the provider confirmed the pod is gone."""
     progress(f"terminating {name} ({pod_id}): {reason}")
     try:
         provider.terminate(pod_id)
-        progress(f"{name} terminated and confirmed gone")
     except ProviderError as exc:
         progress(
             f"WARNING: could not terminate {name} ({pod_id}): {exc}\n"
             f"  It may still be billing. Run `gpuc pods`, then `gpuc reconcile --once`."
         )
+        return False
+    progress(f"{name} terminated and confirmed gone")
+    return True
 
 
 def _abandon(provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str) -> None:
-    _terminate_now(provider, name, pod_id, progress, reason)
+    if not _terminate_now(provider, name, pod_id, progress, reason):
+        # A pod that is still billing must stay visible. `desired/<name>.json`
+        # is the only record that makes the reaper retry the terminate, so
+        # removing it here would leak the pod for good.
+        progress(
+            f"keeping the desired/ record and registry entry for {name} so "
+            f"`gpuc reconcile` retries the terminate of {pod_id}"
+        )
+        return
     remove_desired(name)
     pod_known_hosts_file(name).unlink(missing_ok=True)
     try:

@@ -9,10 +9,11 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from gpuc.host import cleanup, dispatcher, health, jobs, paths, queue, runner
+from gpuc.host import cleanup, dispatcher, gpus, health, jobs, paths, queue, runner
 from gpuc.host.jobs import JobSpec
 
 
@@ -46,11 +47,37 @@ def cmd_list(_: argparse.Namespace) -> int:
     return 0
 
 
-def _name(job_id: str) -> str:
+def _spec(job_id: str) -> JobSpec | None:
     try:
-        return jobs.read_spec(job_id).name
-    except (RuntimeError, FileNotFoundError):
-        return ""
+        return jobs.read_spec(job_id)
+    except (RuntimeError, FileNotFoundError, ValueError):
+        return None
+
+
+def _name(job_id: str) -> str:
+    spec = _spec(job_id)
+    return spec.name if spec else ""
+
+
+def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
+    """What `config.gpus` resolves to on this host right now.
+
+    The control side cannot work this out: `gpus` may name cards by index, and
+    only the host knows what its driver is calling them today.
+    """
+    try:
+        indices = {gpu.uuid: gpu.index for gpu in gpus.list_gpus()}
+    except gpus.GpuError:
+        indices = {}
+    try:
+        resolved, unavailable = gpus.resolve_owned(config.gpus)
+    except gpus.GpuError:
+        resolved, unavailable = [], list(config.gpus)
+    return {
+        "gpus": config.gpus,
+        "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in resolved],
+        "gpus_unavailable": unavailable,
+    }
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -62,7 +89,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             state = jobs.read_state(job_id)
         except (RuntimeError, FileNotFoundError):
             continue
-        entry = {"job_id": job_id, "name": _name(job_id), **state.to_dict()}
+        spec = _spec(job_id)
+        entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
+        # The watchdog rule this job is actually being judged by, so
+        # `gpuc status --suspects` names the jobs the host is about to kill
+        # rather than applying a constant of its own.
+        entry["low_util"] = asdict(spec.low_util) if spec else None
         # Only for finished jobs: a running job's workdir is being written to,
         # its size is meaningless, and walking a live venv on every `gpuc
         # status` would be pure cost.
@@ -73,12 +105,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             not cleanup.outputs_confirmed(job_id, state)[0] if state.finished else False
         )
         entries.append(entry)
-    heartbeat = dispatcher.DispatcherLock().heartbeat_age()
+    heartbeat = dispatcher.heartbeat_age()
     print(
         json.dumps(
             {
                 "host": config.host,
-                "gpus": config.gpus,
+                **_gpu_table(config),
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),
                 "paused": paths.paused_file().exists(),

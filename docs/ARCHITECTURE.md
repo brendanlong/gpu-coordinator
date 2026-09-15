@@ -81,7 +81,9 @@ own `env:`.
 ## On-host state: `~/.gpuc/`
 
 ```
-config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uuid", ...],
+config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uuid" | "<index>", ...],
+                     #                              # what this host owns, as it was registered;
+                     #                              # see GPU ownership
                      #  "provider": null | {"kind":"runpod","pod_id":..},
                      #  "idle_minutes": 15, "ttl_hours": null | N, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
@@ -167,8 +169,9 @@ queue's lexical order, not submission order below one second.
   heartbeat is younger than 30 s, exit 0 silently. If held and the heartbeat
   is stale, kill the holder's process group (pgid recorded in the lock file
   body), then take over.
-- Loop every 2 s: read `queue/` in lexical order; for each entry whose
-  `spec.gpus` fits the free owned UUIDs, assign UUIDs, remove the queue
+- Loop every 2 s: resolve `config.gpus` to UUIDs (see GPU ownership), then read
+  `queue/` in lexical order; for each entry whose `spec.gpus` fits the free
+  owned UUIDs, assign UUIDs, remove the queue
   marker, set state running, spawn the runner in its own process group
   (`start_new_session=True`), record pid/pgid. Multiple jobs may run at
   once if GPUs allow; a `gpus: 0` job never waits.
@@ -190,19 +193,26 @@ queue's lexical order, not submission order below one second.
   as `GPUC_ISOLATION`. See Process isolation.
 - Reorder: `queue.reorder(jobid, prio)` renames the marker.
 - Idle terminate (only when `config.provider` is set): if no running jobs
-  and the queue has been empty for `idle_minutes`: write `draining`, run one
-  final sync of every job's state and log to `s3_prefix`, then call
-  `terminate.self_terminate()`. On failure: remove `draining`, log loudly, keep
-  dispatching, retry every 10 minutes.
+  and the queue has been empty for `idle_minutes`: write `draining`, retry any
+  unconfirmed outputs, run one final sync of every job's state and log to
+  `s3_prefix`, then call `terminate.self_terminate()`. Only a failed
+  *terminate* stops the shutdown: remove `draining`, log loudly, keep
+  dispatching, retry every 10 minutes. A failed final sync is logged and the
+  host terminates anyway -- the state is already on disk here, and a bucket we
+  cannot reach is not a reason to keep a paid pod billing forever.
 - TTL (`ttl_hours`, **null by default**, an explicit opt-in hard cap): checked
   before the idle logic, so a busy host cannot dodge it. Past the cap with a job
   running, the dispatcher writes a `kill` marker with reason `ttl` for each
   running job and waits: the runner kills it, syncs its outputs, and records
-  `failed: ttl`. With nothing running it drains and terminates as above. With
-  `ttl_hours` null nothing terminates on age at all -- see Auto-down and the
-  reaper.
+  `failed: ttl`. A runner that has not acted on the marker after `kill_grace_s`
+  is escalated exactly like a cancel (scope stop, job group SIGKILL, then the
+  runner itself), so a wedged runner cannot keep a TTL'd pod alive. With nothing
+  running it drains and terminates as above. With `ttl_hours` null nothing
+  terminates on age at all -- see Auto-down and the reaper.
 - Two consecutive `failed: low-util` jobs: stop dispatching, log, and (if
-  ephemeral) drain and terminate.
+  ephemeral) drain and terminate -- but never out from under another job. With
+  anything still running it writes a `kill` marker with reason `low-util-pause`
+  for each, exactly as the TTL does, and drains on a later pass.
 - Exit when the queue is empty, nothing is running, and the host is not
   ephemeral. Ephemeral hosts keep the dispatcher alive until terminate.
 
@@ -403,8 +413,8 @@ the wheels the next job wants to link).
 ## Control side: `gpuc` CLI
 
 ```
-gpuc host add local  --gpus GPU-uuid[,..]                          # this machine
-gpuc host add spar   --ssh user@host [--port N] --gpus GPU-uuid,.. # shared box
+gpuc host add local  --gpus GPU-uuid|index[,..]                    # this machine
+gpuc host add spar   --ssh user@host [--port N] --gpus 2,3         # shared box; see GPU ownership
                      [--gpuc-home PATH]           # override ~/.gpuc on the host (tests, odd layouts)
                      [--persistent-root R]        # gpuc home moves to R/gpuc; see Persistent root
                      [--env K=V]                  # extra environment for every job on this host
@@ -418,7 +428,9 @@ gpuc host probe <host>            # print driver, GPUs+UUIDs, disk + $HOME's fs 
 gpuc host clean <host> --uv-cache # `uv cache prune` on the host
 gpuc host list | remove <host>
 
-gpuc submit job.yaml --host <host> [--no-git]                       # existing host
+gpuc submit job.yaml --host <host> [--no-git] [--no-bootstrap]      # existing host; submit
+                     # re-syncs the package and restarts the dispatcher first when the host's
+                     # recorded pkg_commit is not this build's (an unrecorded one counts as older)
 gpuc submit job.yaml --runpod --gpu A40[,RTX4090] [--min-vram 24] [--max-price 0.60] [--cloud secure|community]
                      [--cuda-min 12.8] [--idle-min 15] [--ttl-hours N] [--reuse]    # provision or reuse a gpuc pod
                      # --ttl-hours is optional and off by default; --runpod refuses a job whose
@@ -427,10 +439,14 @@ gpuc status [--host H] [--all] [--suspects] [--recent N] [--since 24h] [--json]
 gpuc logs <jobid> [-f]           # tail from the host over transport; S3 fallback with a note
 gpuc ssh <host|jobid> [--print] [-- CMD ...]   # interactive shell with the transport's own ssh
                                  # options (key, port, known_hosts, ControlMaster); a job id lands
-                                 # in its workdir, falling back to the job dir; `local` execs $SHELL
+                                 # in its workdir, falling back to the job dir -- for the shell,
+                                 # `-- CMD` and --print alike. The words after `--` are joined and
+                                 # run by a login bash there (so pipes work) and gpuc exits with
+                                 # that command's code; `local` execs $SHELL
 gpuc cancel <jobid>
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]
-gpuc clean --host H --purge [--older-than DAYS] [--verify] [--force] [--dry-run]
+gpuc clean --host H --purge [--older-than DAYS | --all-finished --yes] [--verify] [--force] [--dry-run]
+                                 # --all-finished with --purge is a horizon of 0, so it needs --yes
 gpuc reorder <jobid> --priority N
 gpuc requeue <jobid> [--host H | --runpod ...]   # resubmit from the S3 spec, new attempt
 gpuc reconcile [--once]          # the loop; installable as a systemd --user service via `gpuc reconcile --install`
@@ -523,7 +539,7 @@ untracked ones git would keep, so a file written and not yet `git add`ed still
 reaches the host, while `.gitignore` keeps venvs and caches home. Files in the
 index but deleted on disk are dropped from the list rather than sent. `submit`
 prints one line: `syncing N files (M modified, K untracked, ignoring
-.gitignore'd)`. `uncommitted.patch` is `git diff HEAD` taken against a *copy* of
+.gitignore'd)`. `uncommitted.patch` is `git diff HEAD -- .` taken against a *copy* of
 the index with `git add -N` applied, so it carries untracked files too and never
 touches the user's staging. `--no-git` rsyncs a non-repo directory whole, minus
 `.venv, __pycache__, .git, *.pyc, node_modules, .uv-cache`, with a warning.
@@ -549,12 +565,35 @@ secrets never touch argv.
    is never blocked by running jobs: the package and config are replaced, an
    already-alive dispatcher keeps the lock until it exits, and whichever
    dispatcher takes over adopts the running jobs from their `state.json`.
-6. Record what the host's cards are (`nvidia-smi --query-gpu=uuid,name,memory.total`)
+6. Record what the host's cards are (`nvidia-smi --query-gpu=index,uuid,name,memory.total`)
    and the driver version from the health report into `HostEntry.gpu_info` /
    `driver_version`, so `gpuc host list` and `gpuc status` can name them. Best
    effort: a host with no nvidia-smi simply lists UUIDs. `gpuc host probe`
    records the same thing before a host is ever bootstrapped, and a RunPod host
    falls back to its offer's GPU name and VRAM.
+
+## GPU ownership: indices in, UUIDs out
+
+`--gpus` takes nvidia-smi indices (`--gpus 2,3`), UUIDs
+(`--gpus GPU-8064...`), or a mix, and the registry and `config.json` store
+exactly what was given. Indices because that is how a share of a shared box is
+agreed and read off `nvidia-smi`; stored verbatim because resolving them at
+registration would freeze one boot's numbering into a file nobody looks at
+again.
+
+Everything downstream is UUIDs. The dispatcher re-runs
+`nvidia-smi --query-gpu=index,uuid --format=csv,noheader` each pass, maps the
+owned indices to whatever the driver is calling those cards now, and assigns,
+accounts for and pins jobs by UUID -- `CUDA_VISIBLE_DEVICES` is never an index.
+A renumbered box therefore moves a job to the right card rather than silently
+handing it someone else's; an owned entry that resolves to nothing is logged,
+treated as unavailable (jobs wait, they do not fail), and reported by
+`gpuc status` and the health check's `gpu_uuids`. Owning UUIDs only costs no
+lookup at all: that mapping is the identity, and the host is not asked.
+
+`gpuc status` and `gpuc host list` show `[index] name vram uuid` per owned
+card -- the index from the host for `status`, and from the last probe for the
+offline listing.
 
 ## Persistent root (a host whose `$HOME` is wiped on restart)
 
@@ -603,8 +642,10 @@ Recovery without a root is `gpuc host bootstrap`, then `gpuc status --host H
   and a timeout). `terminate(id)`: `POST /pods/{id}/action {"action":"terminate"}`
   then poll `get` until `TERMINATED` or 404. `list()`:
   `GET /pods?includeClusterPods=true`.
-- Caps: before create, count pods with our prefix and sum their `cost`;
-  refuse if `max_pods` or `max_total_usd_per_hour` would be exceeded.
+- Caps: count pods with our prefix and sum their `cost`; refuse if `max_pods`
+  or `max_total_usd_per_hour` would be exceeded. Checked once, in the
+  provisioning flow with the state lock held -- unlocked, two concurrent
+  sessions would both read "one pod running" and both create.
 
 ## Provisioning flow (`gpuc submit --runpod`)
 
@@ -620,14 +661,23 @@ Recovery without a root is `gpuc host bootstrap`, then `gpuc status --host H
    starts the dispatcher); deliver the RunPod key as
    `~/.gpuc/secrets/runpod` (0600) for self-terminate. Enqueue. On any
    broken-host signature in `logs`, or the 15-minute ceiling, or a health
-   failure: `terminate`, wait for TERMINATED, try the next offer.
+   failure: `terminate`, wait for TERMINATED, try the next offer. The
+   `desired/` record is removed only once the terminate is *confirmed*; a
+   terminate that failed leaves the record (and the registry entry) in place,
+   because it is the only thing that makes the reaper retry a pod that is
+   still billing.
 4. Day-one test to run before relying on it: does the pod-scoped
    `RUNPOD_API_KEY` inside the pod terminate its own pod? If yes, do not
    deliver an account key at all.
 
 ## Reconcile loop
 
-Every 60 s under a lock: for each `desired/` host, `get` its pod; if
+Every 60 s: the state lock is taken to *read* `desired/` and then for each
+local mutation, never across the provider and ssh calls in between -- a
+terminate polls for up to five minutes and a concurrent `gpuc submit --runpod`
+gives up on the lock after two, and a create that cannot write its `desired/`
+record is a leaked, billing pod. Each mutation re-reads the record it is about
+to change. For each `desired/` host, `get` its pod; if
 missing or TERMINATED, mark the desired entry gone and note any jobs that
 were running there (for `requeue`). A pod older than its TTL -- only when that
 host has one; the default is none -- is terminated and logged. For every
@@ -670,8 +720,10 @@ For ephemeral hosts also: pod status, $/h, age, `provider util` -- labelled,
 because it is the provider's reading for the whole pod while a job's
 `util N% (host)` is this host's nvidia-smi sampler over that job's cards; in
 `--json` they are the host's `provider_util` and the job's `util`. `--suspects`:
-running jobs in `phase=main` past `grace_min` with mean util below floor over
-the last 10 min, and any pod past a TTL it actually has. Never kills anything.
+running jobs in `phase=main` whose mean util over their own `low_util.window_min`
+is below their own `floor_pct` once `grace_min` has passed, plus any pod past a
+TTL it actually has. A job with `low_util.enabled: false` is never a suspect --
+nothing is coming for it. Never kills anything.
 
 ## Testing rules
 

@@ -51,6 +51,18 @@ def test_uuid_check_fails_when_an_owned_uuid_is_absent() -> None:
     assert "GPU-gone" in check.detail
 
 
+def test_uuid_check_resolves_owned_indices_and_names_the_ones_that_are_gone() -> None:
+    """A host may own its share of a box by index, and the index that no longer
+    exists is exactly the failure this check is for."""
+    ok = health.check_gpu_uuids(["0", "1"], fake_smi())
+    assert ok.ok and ok.value == 2
+
+    check = health.check_gpu_uuids(["0", "7"], fake_smi())
+    assert not check.ok
+    assert "7" in check.detail
+    assert f"0={FAKE_GPUS[0]}" in check.detail
+
+
 def test_disk_check_measures_the_gpuc_volume(gpuc_home: Path) -> None:
     assert health.check_disk(min_free_gb=0.0).ok
     failing = health.check_disk(min_free_gb=1e9)
@@ -97,7 +109,9 @@ def test_zero_bytes_is_still_fatal(gpuc_home: Path) -> None:
 
 
 def test_the_default_download_url_is_a_stable_sized_endpoint() -> None:
-    assert health.DEFAULT_DOWNLOAD_URL.startswith("https://github.com/astral-sh/uv/releases/latest/")
+    assert health.DEFAULT_DOWNLOAD_URL.startswith(
+        "https://github.com/astral-sh/uv/releases/latest/"
+    )
     assert health.DEFAULT_MIN_FREE_GB == 5.0
 
 

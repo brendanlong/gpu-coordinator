@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import tomllib
 import types
 import typing
@@ -494,6 +495,11 @@ def save_registry(registry: Registry, keep: dict[str, Any] | None = None) -> Non
     os.replace(tmp, path)
 
 
+LOCK_POLL_S = 0.05
+"""How often a blocked `state_lock` retries. Short enough to be invisible next
+to the ssh round trip the lock protects, long enough not to spin."""
+
+
 @contextmanager
 def state_lock(timeout_s: float = 30.0) -> Iterator[None]:
     """Serialise registry read-modify-write across concurrent agent sessions."""
@@ -511,7 +517,10 @@ def state_lock(timeout_s: float = 30.0) -> Iterator[None]:
                         f"another gpuc process has held {lock_file()} for more than "
                         f"{timeout_s:.0f}s. Wait for it, or delete the file if nothing is running."
                     ) from exc
-                os.sched_yield()
+                # Waits here are measured in seconds (a provision holds the lock
+                # across a create), so sleeping is free; spinning on sched_yield
+                # burns a core for the whole wait and slows the holder down.
+                time.sleep(LOCK_POLL_S)
         yield
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)

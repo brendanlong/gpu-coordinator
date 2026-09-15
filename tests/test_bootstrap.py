@@ -79,8 +79,8 @@ class ScriptedHost:
             return 0, "4242\n"
         if command.startswith("printf %s"):
             return 0, "/home/u/.gpuc"
-        if "nvidia-smi --query-gpu=uuid" in command:
-            return 0, "GPU-a, NVIDIA A40, 46068\n"
+        if "nvidia-smi --query-gpu=index,uuid" in command:
+            return 0, "0, GPU-a, NVIDIA A40, 46068\n"
         return 0, ""
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
@@ -145,6 +145,36 @@ def test_a_bare_host_installs_uv_python_aws_and_hf(control_env: Path) -> None:
     assert any("awscli-exe-linux" in e for e in host.events)
     assert any("tool install huggingface_hub" in e for e in host.events)
     assert result.warnings == []
+
+
+def test_the_shipped_package_replaces_the_one_on_the_host(control_env: Path) -> None:
+    """A module deleted upstream must not survive on the host.
+
+    rsync of a file list only ever adds, so without this the host keeps
+    importing a module this build no longer has.
+    """
+    host = ScriptedHost()
+    bootstrap_host(entry(), transport=host, report=lambda _: None)
+    assert host.index_of('rm -rf "/home/u/.gpuc/pkg/gpuc"') < host.index_of(
+        "rsync /home/u/.gpuc/pkg"
+    )
+
+
+def test_resync_package_ships_the_code_without_the_health_check(control_env: Path) -> None:
+    """What `gpuc submit` runs for a host on an older commit: the package and
+    the dispatcher, not the ten-minute half of bootstrap."""
+    from gpuc.control.bootstrap import resync_package
+
+    host = ScriptedHost()
+    updated = resync_package(
+        entry(python="/home/u/.local/python3.12"), transport=host, report=lambda _: None
+    )
+    assert any("rsync /home/u/.gpuc/pkg" in e for e in host.events)
+    assert any("spawn_detached_dispatcher" in e for e in host.events)
+    assert not any("gpuc.host health" in e for e in host.events)
+    assert not any("astral.sh/uv" in e for e in host.events)
+    assert "/home/u/.gpuc/config.json" in host.puts
+    assert updated.pkg_commit
 
 
 def test_the_package_and_config_land_before_health_runs(control_env: Path) -> None:

@@ -276,6 +276,79 @@ def test_health_failure_terminates_and_forgets(control_env: Path, ssh_key: Path)
     assert list(desired_dir().glob("*.json")) == []
 
 
+def test_a_failed_terminate_keeps_the_desired_record(control_env: Path, ssh_key: Path) -> None:
+    """A pod that is still billing must stay visible to the reaper.
+
+    Removing `desired/<host>.json` after a terminate that failed is how a pod
+    becomes invisible to `gpuc reconcile` and bills until someone notices it in
+    the RunPod console.
+    """
+    from gpuc.control.bootstrap import BootstrapError
+
+    def failing_bootstrap(entry: HostEntry, *args: object, **kwargs: object):
+        raise BootstrapError("health failed")
+
+    provider = FakeProvider([make_offer()])
+    original = provider.terminate
+
+    def refuse(pod_id: str) -> None:
+        raise ProviderError("502 Bad Gateway")
+
+    provider.terminate = refuse  # type: ignore[method-assign]
+    reports: list[str] = []
+    with pytest.raises(ProvisionError):
+        provision(
+            CONSTRAINTS,
+            Settings(),
+            provider=provider,
+            report=reports.append,
+            deps=ProvisionDeps(
+                sleep=lambda _: None,
+                bootstrap=failing_bootstrap,  # type: ignore[arg-type]
+                transport_factory=lambda entry, settings: FakeTransport(),
+                poll_interval_s=0.0,
+                log_check_interval_s=0.0,
+            ),
+        )
+    desired = [p.name for p in desired_dir().glob("*.json")]
+    assert desired and desired[0].startswith("gpuc-")
+    assert load_registry().hosts  # still known, so `gpuc logs` can find its jobs
+    assert any("reconcile" in line for line in reports)
+
+    # ...and once the terminate does work, the record goes.
+    provider.terminate = original  # type: ignore[method-assign]
+    with pytest.raises(ProvisionError):
+        provision(
+            CONSTRAINTS,
+            Settings(),
+            provider=provider,
+            report=lambda _: None,
+            deps=ProvisionDeps(
+                sleep=lambda _: None,
+                bootstrap=failing_bootstrap,  # type: ignore[arg-type]
+                transport_factory=lambda entry, settings: FakeTransport(),
+                poll_interval_s=0.0,
+                log_check_interval_s=0.0,
+            ),
+        )
+    assert provider.terminated == ["pod2"]
+    assert sorted(p.name for p in desired_dir().glob("*.json")) == desired
+
+
+def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_path: Path) -> None:
+    """`my.key` has a public half called `my.key.pub`, not `my.pub`."""
+    from gpuc.control.provision import public_key_path
+
+    key = tmp_path / "my.key"
+    key.write_text("private\n")
+    (tmp_path / "my.key.pub").write_text("ssh-ed25519 AAAA test\n")
+    assert public_key_path(Settings(ssh_key=str(key))) == tmp_path / "my.key.pub"
+
+    (tmp_path / "my.key.pub").unlink()
+    with pytest.raises(ProvisionError, match="public half"):
+        public_key_path(Settings(ssh_key=str(key)))
+
+
 def test_caps_refusal_never_creates(control_env: Path, ssh_key: Path) -> None:
     provider = FakeProvider(
         [make_offer()],

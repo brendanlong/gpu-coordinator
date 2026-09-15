@@ -131,9 +131,7 @@ class ProbeReport:
     @property
     def gpu_info(self) -> dict[str, GpuInfo]:
         """The `gpus` section as the registry stores it, keyed by UUID."""
-        return parse_smi(
-            "\n".join(",".join(cells[1:]) for cells in self.gpu_rows if len(cells) > 2)
-        )
+        return parse_smi("\n".join(",".join(cells) for cells in self.gpu_rows if len(cells) > 2))
 
     @property
     def driver_version(self) -> str | None:

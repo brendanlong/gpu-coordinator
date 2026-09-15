@@ -437,7 +437,6 @@ def test_a_failed_utilization_sample_is_recorded_as_unknown_not_as_idle(
 
 
 def test_preflight_is_a_real_phase(gpuc_home: Path) -> None:
-    assert "preflight" in jobs.PHASES
     job_id = prepare(gpus=[FAKE_GPUS[0]], command="true")
     assert (
         runner.run_job(
@@ -679,3 +678,27 @@ def test_a_shared_host_still_removes_the_secrets_file(
     paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
     runner.run_job(job_id, deps(command_runner=command_runner))
     assert not paths.job_env_file(job_id).exists()
+
+
+def test_a_sigterm_during_the_final_sync_does_not_rerun_finalize(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher escalates a cancel to the runner after 30 s, and that
+    lands in the middle of a long final upload. It used to unwind `_finalize`,
+    which `run()` caught and finalized again: a job already recorded as
+    `succeeded` was rewritten as `failed: terminated` and every output was
+    uploaded a second time.
+    """
+    job_id = prepare(command="true")
+    calls: list[str] = []
+
+    def final(_self: sync.SyncLoop) -> None:
+        calls.append("final")
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)
+
+    monkeypatch.setattr(sync.SyncLoop, "final", final)
+    assert runner.run_job(job_id, deps()) == 0
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.exit_code) == ("succeeded", None, 0)
+    assert calls == ["final"]

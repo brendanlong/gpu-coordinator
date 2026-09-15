@@ -54,13 +54,27 @@ def check_driver(smi: SmiRunner = gpus.run_nvidia_smi) -> Check:
 
 
 def check_gpu_uuids(owned: Sequence[str], smi: SmiRunner = gpus.run_nvidia_smi) -> Check:
+    """Every entry in `config.gpus` -- index or UUID -- names a card that is here.
+
+    An index that does not resolve is the failure this exists to catch early: a
+    shared box renumbered, or the agreement moved, and the host would otherwise
+    just quietly have fewer cards to hand out than anyone thinks.
+    """
     if not owned:
         return Check("gpu_uuids", True, "no GPUs owned by this host", 0)
     try:
-        gpus.assert_uuids_present(owned, smi)
+        resolved, missing = gpus.resolve_owned(owned, smi)
+        gpus.assert_uuids_present(resolved, smi)
     except gpus.GpuError as exc:
         return Check("gpu_uuids", False, str(exc))
-    return Check("gpu_uuids", True, f"{len(owned)} owned UUID(s) present", len(owned))
+    if missing:
+        return Check(
+            "gpu_uuids",
+            False,
+            f"config.gpus entries not present on this host: {', '.join(missing)}; "
+            f"nvidia-smi reports {gpus.describe_table(smi)}",
+        )
+    return Check("gpu_uuids", True, f"{len(resolved)} owned GPU(s) present", len(resolved))
 
 
 def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:

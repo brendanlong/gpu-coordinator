@@ -238,3 +238,29 @@ def test_the_lock_body_reads_a_pid_however_it_was_written() -> None:
     assert LockBody.parse('{"pid": null, "starttime": null}').pid is None
     assert LockBody.parse("[]").pid is None
     assert LockBody.parse("not json").pid is None
+
+
+def test_job_state_coerces_the_types_it_acts_on() -> None:
+    """A pgid as a string used to reach `os.killpg` and crash every pass."""
+    state = JobState.from_dict(
+        {
+            "status": 7,
+            "pid": "1234",
+            "pgid": 1234.0,
+            "runner_pid": "99",
+            "exit_code": "0",
+            "attempt": "2",
+            "gpus": ["GPU-1", 2],
+            "util_recent": [1, "2.5", None, "junk"],
+            "workdir_removed": 1,
+            "reason": 5,
+        }
+    )
+    assert (state.pid, state.pgid, state.runner_pid) == (1234, 1234, 99)
+    assert state.exit_code == 0
+    assert state.attempt == 2
+    assert state.status == "7" and state.reason == "5"
+    assert state.gpus == ["GPU-1", "2"]
+    assert state.util_recent == [1.0, 2.5, None, None]
+    assert state.workdir_removed is True
+    assert JobState.from_dict({"pid": "not a pid", "pgid": []}).pid is None

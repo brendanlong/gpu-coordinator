@@ -53,12 +53,12 @@ OUTPUT_RETRY_INTERVAL_S = 60.0
 OUTPUT_RETRY_BUDGET_S = 300.0
 
 
-def _pid_alive(pid: int) -> bool:
-    return pid_alive(pid)
+def log_line(message: str, now: datetime | None = None) -> None:
+    """Append one stamped line to the dispatcher log.
 
-
-def log_line(message: str) -> None:
-    stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    Never raises: a log we cannot write is not a reason to lose a job.
+    """
+    stamp = (now or datetime.now(UTC)).isoformat(timespec="seconds")
     with contextlib.suppress(OSError), paths.dispatcher_log().open("a") as handle:
         handle.write(f"{stamp} {message}\n")
 
@@ -118,6 +118,18 @@ def _maybe_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def heartbeat_age(now: Callable[[], float] = time.time) -> float | None:
+    """Seconds since a dispatcher last beat, or None if none ever has.
+
+    A plain function: the age of a file is not something a caller should have
+    to build (and half-initialise) a lock object to ask about.
+    """
+    try:
+        return now() - paths.heartbeat_file().stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
 class DispatcherLock:
     def __init__(
         self,
@@ -146,10 +158,7 @@ class DispatcherLock:
         return paths.heartbeat_file()
 
     def heartbeat_age(self) -> float | None:
-        try:
-            return self._now() - self.heartbeat_path.stat().st_mtime
-        except FileNotFoundError:
-            return None
+        return heartbeat_age(self._now)
 
     def holder_is_fresh(self) -> bool:
         age = self.heartbeat_age()
@@ -223,6 +232,11 @@ class DispatcherLock:
 
     def _adopt(self, fd: int) -> None:
         self._fd = fd
+        # Beat *before* the body: between writing our pid and our first beat, a
+        # second dispatcher racing for this lock would read a fresh pid next to
+        # a stale heartbeat, conclude we were wedged, and SIGKILL the process
+        # that just won.
+        self.beat(force=True)
         pid = os.getpid()
         pgid = os.getpgid(0)
         if pgid != pid:
@@ -241,7 +255,6 @@ class DispatcherLock:
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, body.render().encode())
         os.fsync(fd)
-        self.beat(force=True)
 
     def beat(self, force: bool = False) -> None:
         now = self._now()
@@ -369,7 +382,7 @@ class _Running:
     def poll(self) -> int | None:
         if self.popen is not None:
             return self.popen.poll()
-        return None if _pid_alive(self.pid) else -1
+        return None if pid_alive(self.pid) else -1
 
 
 @dataclass
@@ -380,17 +393,30 @@ class Dispatcher:
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
     _last_purge_at: float | None = None
+    _kill_sent: dict[str, float] = field(default_factory=dict)
+    _kill_escalated: set[str] = field(default_factory=set)
+    _pause_drain_pending: bool = False
+    _config: jobs.HostConfig | None = None
+    _owned: list[str] | None = None
+    _unavailable: tuple[str, ...] = ()
     consecutive_failures: int = 0
     should_exit: bool = False
 
     @property
     def config(self) -> jobs.HostConfig:
-        return jobs.read_config()
+        """The host config, read once per loop pass.
+
+        One pass asks for it a dozen times (free GPUs, the TTL, the idle timer,
+        the drain); re-reading and re-parsing the file each time bought nothing
+        but syscalls, and a mid-pass change is not something any of those
+        decisions should straddle.
+        """
+        if self._config is None:
+            self._config = jobs.read_config()
+        return self._config
 
     def log(self, message: str) -> None:
-        stamp = self.deps.utcnow().isoformat(timespec="seconds")
-        with paths.dispatcher_log().open("a") as handle:
-            handle.write(f"{stamp} {message}\n")
+        log_line(message, self.deps.utcnow())
 
     # -- startup ---------------------------------------------------------
     def adopt_orphans(self) -> None:
@@ -458,6 +484,8 @@ class Dispatcher:
                 continue
             del self.running[job_id]
             self._cancel_sent.pop(job_id, None)
+            self._kill_sent.pop(job_id, None)
+            self._kill_escalated.discard(job_id)
             try:
                 state = jobs.read_state(job_id)
             except RuntimeError:
@@ -487,20 +515,16 @@ class Dispatcher:
         for job_id, entry in list(self.running.items()):
             if not queue.is_cancelled(job_id):
                 continue
-            try:
-                state = jobs.read_state(job_id)
-            except RuntimeError:
-                state = jobs.JobState()
-            job_pgid = state.pgid if state.pgid and state.pgid != entry.pid else None
-            unit = state.cgroup_unit
             sent = self._cancel_sent.get(job_id)
             if sent is None:
                 self._cancel_sent[job_id] = now
-                if unit:
+                state = self._state_or_empty(job_id)
+                job_pgid = self._job_pgid(state, entry)
+                if state.cgroup_unit:
                     # A cgroup stop reaps the whole tree, daemonised
                     # grandchildren included; the group kill below cannot.
-                    self.log(f"cancelling job {job_id} (scope {unit})")
-                    scope.stop_unit(unit)
+                    self.log(f"cancelling job {job_id} (scope {state.cgroup_unit})")
+                    scope.stop_unit(state.cgroup_unit)
                 elif job_pgid:
                     self.log(f"cancelling job {job_id} (pgid {job_pgid})")
                     self._signal_group(job_pgid, signal.SIGTERM)
@@ -510,21 +534,67 @@ class Dispatcher:
                         f"group yet, so the cancel marker alone stops it"
                     )
                 continue
+            self._escalate(job_id, entry, now - sent, grace)
+
+    def escalate_kills(self) -> None:
+        """Make a kill *request* stick when the runner never acts on it.
+
+        A TTL (or a low-util pause) asks the runner to stop its job and sync,
+        which is right when the runner is healthy and is nothing at all when it
+        is wedged: the marker sits there, the job keeps running, and an
+        ephemeral host that should have died hours ago keeps billing with a
+        fresh heartbeat. So the ask gets the same ladder a cancel gets.
+        """
+        now = self.deps.monotonic()
+        grace = self.deps.kill_grace_s
+        for job_id, entry in list(self.running.items()):
+            sent = self._kill_sent.get(job_id)
+            # A cancelled job already has an escalation, and one owner is enough.
+            if sent is None or queue.is_cancelled(job_id):
+                continue
             elapsed = now - sent
-            if unit and elapsed > grace:
-                scope.stop_unit(unit)
-            if job_pgid and elapsed > grace:
-                self._signal_group(job_pgid, signal.SIGKILL)
-            # The runner handles SIGTERM itself (final sync, final state), so it
-            # gets a signal of its own before we take out its group.
-            if elapsed > 2 * grace:
-                self._signal_pid(entry.pid, signal.SIGTERM)
-            if elapsed > 3 * grace and process_group_alive(entry.pid):
-                self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
-                self._signal_group(entry.pid, signal.SIGKILL)
+            if elapsed <= grace:
+                continue
+            if job_id not in self._kill_escalated:
+                self._kill_escalated.add(job_id)
+                self.log(
+                    f"job {job_id}: its runner has not stopped it {elapsed:.0f}s after the "
+                    f"{queue.kill_reason(job_id) or 'kill'} request; escalating"
+                )
+            self._escalate(job_id, entry, elapsed, grace)
+
+    def _escalate(self, job_id: str, entry: _Running, elapsed: float, grace: float) -> None:
+        """The kill ladder: the job's scope and group first, the runner last.
+
+        The runner handles SIGTERM itself (final sync, final state), so it gets
+        a signal of its own -- and the time to use it -- before its group goes.
+        """
+        state = self._state_or_empty(job_id)
+        job_pgid = self._job_pgid(state, entry)
+        if state.cgroup_unit and elapsed > grace:
+            scope.stop_unit(state.cgroup_unit)
+        if job_pgid and elapsed > grace:
+            self._signal_group(job_pgid, signal.SIGKILL)
+        if elapsed > 2 * grace:
+            self._signal_pid(entry.pid, signal.SIGTERM)
+        if elapsed > 3 * grace and process_group_alive(entry.pid):
+            self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
+            self._signal_group(entry.pid, signal.SIGKILL)
+
+    @staticmethod
+    def _state_or_empty(job_id: str) -> jobs.JobState:
+        try:
+            return jobs.read_state(job_id)
+        except RuntimeError:
+            return jobs.JobState()
+
+    @staticmethod
+    def _job_pgid(state: jobs.JobState, entry: _Running) -> int | None:
+        """The *job's* process group, never the runner's own."""
+        return state.pgid if state.pgid and state.pgid != entry.pid else None
 
     def _signal_pid(self, pid: int, sig: int) -> None:
-        if pid <= 1 or not _pid_alive(pid):
+        if pid <= 1 or not pid_alive(pid):
             return
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, sig)
@@ -535,13 +605,36 @@ class Dispatcher:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, sig)
 
+    def owned_gpus(self) -> list[str]:
+        """The UUIDs of the cards this host owns *and* can see, this pass.
+
+        `config.gpus` may name cards by nvidia-smi index, which only means
+        anything against the host's current numbering, so the list is resolved
+        here rather than trusted. Everything downstream -- assignment, free/busy
+        accounting, `CUDA_VISIBLE_DEVICES` -- is UUIDs.
+        """
+        if self._owned is None:
+            self._owned, missing = gpus.resolve_owned(self.config.gpus, self.deps.smi)
+            if tuple(missing) != self._unavailable:
+                self._unavailable = tuple(missing)
+                if missing:
+                    self.log(
+                        f"config.gpus lists {', '.join(missing)}, which nvidia-smi does not "
+                        f"report on this host ({gpus.describe_table(self.deps.smi)}); those "
+                        f"cards are not being handed out"
+                    )
+        return self._owned
+
     def free_gpus(self) -> list[str]:
         busy = {uuid for entry in self.running.values() for uuid in entry.gpus}
-        return [uuid for uuid in self.config.gpus if uuid not in busy]
+        return [uuid for uuid in self.owned_gpus() if uuid not in busy]
 
     def launch_ready(self) -> None:
         if self.paused() or paths.draining_file().exists():
             return
+        # The *configured* count, not the resolved one: a card that is missing
+        # this minute makes a job wait, but it must not permanently fail a job
+        # the host is perfectly well configured to run.
         owned = self.config.gpus
         free = self.free_gpus()
         for entry in queue.list_queued():
@@ -582,7 +675,23 @@ class Dispatcher:
                 phase="setup",
                 started_at=jobs.utc_now(),
             )
-            proc = self.deps.spawn_runner(job_id)
+            try:
+                proc = self.deps.spawn_runner(job_id)
+            except OSError as exc:
+                # The state said `running` a line ago; leaving it there would
+                # leave a job nothing is running, with no runner pid to notice
+                # the absence of, holding its GPUs against every later pass.
+                self.log(f"job {job_id}: could not spawn a runner ({exc})")
+                jobs.update_state(
+                    job_id,
+                    status="failed",
+                    reason="spawn-failed",
+                    exit_code=1,
+                    ended_at=jobs.utc_now(),
+                    phase=None,
+                )
+                free = [*assigned, *free]
+                continue
             # pgid stays unset until the runner publishes the *job's* group: it
             # is what `cancel` signals, and the runner's own group is not it.
             jobs.update_state(
@@ -618,15 +727,29 @@ class Dispatcher:
         )
 
     def check_pause(self) -> None:
-        if self.paused() or not self.recent_low_util_failures():
+        """Pause on two consecutive low-util failures, and on an ephemeral host
+        go away afterwards -- but never out from under a job that is still
+        running. Draining there terminated the pod with the other jobs' runners
+        still working: no kill marker, no final sync, outputs gone with the pod.
+        Like the TTL, we ask; the drain happens on a later pass with nothing
+        left running.
+        """
+        if not self.paused():
+            if not self.recent_low_util_failures():
+                return
+            jobs.atomic_write_text(
+                paths.paused_file(),
+                "two consecutive jobs failed with reason low-util; queue paused\n",
+            )
+            self.log("PAUSED: two consecutive low-util failures; not dispatching further jobs")
+            self._pause_drain_pending = self.config.ephemeral
+        if not self._pause_drain_pending:
             return
-        jobs.atomic_write_text(
-            paths.paused_file(),
-            "two consecutive jobs failed with reason low-util; queue paused\n",
-        )
-        self.log("PAUSED: two consecutive low-util failures; not dispatching further jobs")
-        if self.config.ephemeral:
-            self.drain_and_terminate("two consecutive low-util failures")
+        if self.running:
+            self._request_kills("low-util-pause", "the queue paused on low utilization")
+            return
+        self._pause_drain_pending = False
+        self.drain_and_terminate("two consecutive low-util failures")
 
     def maybe_terminate(self) -> None:
         config = self.config
@@ -641,7 +764,7 @@ class Dispatcher:
         # without a final sync.
         if self._ttl_expired(config):
             if self.running:
-                self._kill_for_ttl(config)
+                self._request_kills("ttl", f"the ttl of {config.ttl_hours:g} h elapsed")
                 return
             self.drain_and_terminate(f"ttl of {config.ttl_hours:g} h elapsed")
             return
@@ -657,20 +780,26 @@ class Dispatcher:
         if idle_s >= config.idle_minutes * 60.0:
             self.drain_and_terminate(f"idle for {idle_s / 60.0:.1f} min")
 
-    def _kill_for_ttl(self, config: jobs.HostConfig) -> None:
+    def _request_kills(self, reason: str, why: str) -> None:
         """Stop the running jobs so their runners can sync before we terminate.
 
-        The runner owns the kill and the final sync, so the TTL asks rather than
-        signals: each job ends `failed: ttl` with its outputs uploaded, and the
-        next pass -- with nothing running -- drains and terminates.
+        The runner owns the kill and the final sync, so this asks rather than
+        signals: each job ends `failed: <reason>` with its outputs uploaded, and
+        the next pass -- with nothing running -- drains and terminates. When the
+        ask goes unanswered `escalate_kills` stops being polite.
         """
+        now = self.deps.monotonic()
         for job_id in sorted(self.running):
             if queue.kill_reason(job_id):
+                # A marker from before this dispatcher took over still needs a
+                # clock, or nothing would ever escalate it.
+                self._kill_sent.setdefault(job_id, now)
                 continue
-            queue.request_kill(job_id, "ttl")
+            queue.request_kill(job_id, reason)
+            self._kill_sent[job_id] = now
             self.log(
-                f"ttl of {config.ttl_hours:g} h elapsed with job {job_id} running: asked its "
-                f"runner to stop it (reason ttl) and sync before this host terminates"
+                f"{why} with job {job_id} running: asked its runner to stop it "
+                f"(reason {reason}) and sync before this host terminates"
             )
 
     def _ttl_expired(self, config: jobs.HostConfig) -> bool:
@@ -694,11 +823,16 @@ class Dispatcher:
         config = self.config
         self.log(f"draining: {why}")
         jobs.atomic_write_text(paths.draining_file(), f"{why}\n")
-        self._guard(self._drain_retry_outputs)
+        self._guard(lambda: self.retry_unconfirmed_outputs(config), "drain: output retry")
+        # Mirroring state is best-effort, and terminating is not: a bucket we
+        # cannot reach is not a reason to keep a paid pod alive. Treated as a
+        # terminate failure it kept the host up, retrying every ten minutes
+        # with a fresh heartbeat -- for as long as the credentials stayed
+        # broken, which is forever.
+        self._guard(lambda: self._final_sync_all(config), "drain: final state mirror")
         try:
-            self._final_sync_all(config)
             terminate.self_terminate(config, terminate_call=self.deps.terminate_call)
-        except (terminate.TerminateError, sync.SyncError) as exc:
+        except terminate.TerminateError as exc:
             paths.draining_file().unlink(missing_ok=True)
             self._terminate_retry_at = self.deps.monotonic() + TERMINATE_RETRY_S
             self.log(
@@ -728,9 +862,6 @@ class Dispatcher:
             raise sync.SyncError("; ".join(errors))
 
     # -- outputs the pod would otherwise take with it --------------------
-    def _drain_retry_outputs(self) -> None:
-        self.retry_unconfirmed_outputs(self.config)
-
     def unconfirmed_output_jobs(self) -> list[str]:
         """Finished jobs whose `outputs:` are still only on this host."""
         pending: list[str] = []
@@ -740,6 +871,11 @@ class Dispatcher:
             except (RuntimeError, OSError):
                 continue
             if not state.finished:
+                continue
+            # A job that failed its sync preflight proved these uploads cannot
+            # work *before* it ran, and produced nothing. Retrying it three
+            # times here only burns the budget the jobs with real outputs need.
+            if (state.reason or "").startswith("sync-preflight"):
                 continue
             if not cleanup.outputs_confirmed(job_id, state)[0]:
                 pending.append(job_id)
@@ -762,7 +898,10 @@ class Dispatcher:
         for attempt in range(1, OUTPUT_RETRY_ATTEMPTS + 1):
             for job_id in list(pending):
                 try:
-                    self._upload_outputs(job_id, config)
+                    # Bounded by what is left of the budget: an upload with no
+                    # timeout at all can hang on a half-open socket for hours,
+                    # and every one of them is billed.
+                    self._upload_outputs(job_id, config, max(1.0, deadline - self.deps.monotonic()))
                 except (sync.SyncError, RuntimeError, OSError) as exc:
                     last_error[job_id] = str(exc)
                     continue
@@ -782,7 +921,7 @@ class Dispatcher:
             with contextlib.suppress(RuntimeError, OSError, KeyError):
                 jobs.update_state(job_id, outputs_lost=True, sync_error=error)
 
-    def _upload_outputs(self, job_id: str, config: jobs.HostConfig) -> None:
+    def _upload_outputs(self, job_id: str, config: jobs.HostConfig, timeout: float) -> None:
         spec = jobs.read_spec(job_id)
         # The job's own secrets file if the runner left it (it does exactly for
         # this case on an ephemeral host); otherwise our own environment, which
@@ -798,7 +937,7 @@ class Dispatcher:
             job_id,
             min_age_s=0.0,
             runner=self.deps.command_runner,
-            timeout=None,
+            timeout=timeout,
             env=env,
             baseline_map=baseline.read(job_id),
         )
@@ -830,8 +969,11 @@ class Dispatcher:
 
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
+        self._config = jobs.read_config()
+        self._owned = None
         self.reap()
         self.handle_cancels()
+        self.escalate_kills()
         self.check_pause()
         self.launch_ready()
         self.maybe_purge()
@@ -862,7 +1004,7 @@ class Dispatcher:
         self.log("dispatcher exiting")
         return code
 
-    def _guard(self, step: Callable[[], None]) -> bool:
+    def _guard(self, step: Callable[[], None], label: str | None = None) -> bool:
         """Run one loop step, returning whether it succeeded. A bug in one
         iteration must not take the queue down, but an error that repeats
         forever is not worth spinning on."""
@@ -871,7 +1013,7 @@ class Dispatcher:
         except Exception:
             self.consecutive_failures += 1
             self.log(
-                f"{getattr(step, '__name__', step)} failed "
+                f"{label or getattr(step, '__name__', step)} failed "
                 f"({self.consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): "
                 f"{traceback.format_exc()}"
             )

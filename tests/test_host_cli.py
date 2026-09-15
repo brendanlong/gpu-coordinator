@@ -7,7 +7,8 @@ import pytest
 
 from gpuc.host import __main__ as cli
 from gpuc.host import dispatcher, jobs, paths, queue
-from tests.conftest import make_spec
+from gpuc.host.jobs import HostConfig
+from tests.conftest import FAKE_GPUS, make_spec
 
 
 def run(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, object]:
@@ -122,3 +123,22 @@ def test_health_is_routed_to_health(
     code = cli.main(["health", "--min-free-gb", "0", "--download-url", "http://x"])
     assert code == 0
     assert json.loads(capsys.readouterr().out)["ok"]
+
+
+def test_status_resolves_the_owned_gpus_and_reports_each_jobs_watchdog(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control side cannot do either: `gpus` may name cards by index, and it
+    never sees the spec the low-util rule lives in."""
+    monkeypatch.setattr(cli.gpus, "list_gpus", lambda *_: [cli.gpus.Gpu(3, FAKE_GPUS[0])])
+    monkeypatch.setattr(cli.gpus, "resolve_owned", lambda owned, *_: ([FAKE_GPUS[0]], ["9"]))
+    jobs.write_config(HostConfig(host="test-host", gpus=["3", "9"]))
+    job_id = queue.enqueue(make_spec(low_util={"enabled": False, "floor_pct": 20.0}))
+
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    assert status["gpus"] == ["3", "9"]
+    assert status["gpus_resolved"] == [{"index": 3, "uuid": FAKE_GPUS[0]}]
+    assert status["gpus_unavailable"] == ["9"]
+    low_util = status["jobs"][0]["low_util"]
+    assert (job_id, low_util["enabled"], low_util["floor_pct"]) == (job_id, False, 20.0)

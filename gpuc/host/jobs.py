@@ -20,9 +20,6 @@ from before the field existed is version 1 by definition. It exists so a future
 incompatible change has something to branch on -- the readers here are
 deliberately tolerant enough that it has not had to."""
 
-Status = str  # queued | running | succeeded | failed | cancelled
-Phase = str
-PHASES = ("setup", "preflight", "main", "sync")
 FINISHED_STATUSES = ("succeeded", "failed", "cancelled")
 
 ON_SUCCESS = "on_success"
@@ -130,6 +127,22 @@ def as_int(d: Any, key: str, default: int) -> int:
         return default
 
 
+def as_opt_int(d: Any, key: str) -> int | None:
+    """An int field whose `null` is a real value ("no pid recorded").
+
+    A pid that arrives as `"1234"` is the bug this exists to make unreachable:
+    `os.killpg` on a string raises, and the dispatcher would then fail to clean
+    up the very job whose state file is odd.
+    """
+    value = as_opt_float(d, key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (OverflowError, ValueError):
+        return None
+
+
 def as_str(d: Any, key: str, default: str = "") -> str:
     value = fields_of(d).get(key)
     return default if value is None else str(value)
@@ -148,6 +161,14 @@ def as_bool(d: Any, key: str, default: bool = False) -> bool:
 def as_str_list(d: Any, key: str) -> list[str]:
     value = fields_of(d).get(key)
     return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def as_opt_float_list(d: Any, key: str) -> list[float | None]:
+    """A list of samples where `null` means "we could not read one"."""
+    value = fields_of(d).get(key)
+    if not isinstance(value, list):
+        return []
+    return [as_opt_float({key: item}, key) for item in value]
 
 
 def as_str_dict(d: Any, key: str) -> dict[str, str]:
@@ -276,14 +297,16 @@ class JobSpec:
 
 @dataclass
 class JobState:
-    status: Status = "queued"
+    status: str = "queued"
+    """queued | running | succeeded | failed | cancelled."""
     attempt: int = 1
     reason: str | None = None
     exit_code: int | None = None
     gpus: list[str] = field(default_factory=list)
     started_at: str | None = None
     ended_at: str | None = None
-    phase: Phase | None = None
+    phase: str | None = None
+    """setup | preflight | main | sync, or null between phases."""
     pid: int | None = None
     pgid: int | None = None
     isolation: str | None = None
@@ -331,14 +354,39 @@ class JobState:
     def from_dict(d: Any) -> JobState:
         """Unknown keys are dropped and a null leaves the field at its default:
         every field here is additive, and a state file written by another build
-        must still tell this one whether the job is running."""
+        must still tell this one whether the job is running.
+
+        Coerced field by field, like every other reader here. Copying the raw
+        JSON in put a `"1234"` where a pid belongs, and the dispatcher then
+        crashed in `os.killpg` on every pass -- a state file is the one input
+        that can be written by another build, or by hand.
+        """
         fields = fields_of(d)
-        state = JobState()
-        for key in JobState.__dataclass_fields__:
-            value = fields.get(key)
-            if value is not None:
-                setattr(state, key, value)
-        return state
+        return JobState(
+            status=as_str(fields, "status", "queued") or "queued",
+            attempt=as_int(fields, "attempt", 1),
+            reason=as_opt_str(fields, "reason"),
+            exit_code=as_opt_int(fields, "exit_code"),
+            gpus=as_str_list(fields, "gpus"),
+            started_at=as_opt_str(fields, "started_at"),
+            ended_at=as_opt_str(fields, "ended_at"),
+            phase=as_opt_str(fields, "phase"),
+            pid=as_opt_int(fields, "pid"),
+            pgid=as_opt_int(fields, "pgid"),
+            isolation=as_opt_str(fields, "isolation"),
+            cgroup_unit=as_opt_str(fields, "cgroup_unit"),
+            runner_pid=as_opt_int(fields, "runner_pid"),
+            runner_boot_id=as_opt_str(fields, "runner_boot_id"),
+            runner_starttime=as_opt_str(fields, "runner_starttime"),
+            util_recent=as_opt_float_list(fields, "util_recent"),
+            util_sampled_at=as_opt_str(fields, "util_sampled_at"),
+            sync_error=as_opt_str(fields, "sync_error"),
+            workdir_removed=as_bool(fields, "workdir_removed"),
+            meta_synced_at=as_opt_str(fields, "meta_synced_at"),
+            meta_synced_to=as_opt_str(fields, "meta_synced_to"),
+            outputs_synced_at=as_opt_str(fields, "outputs_synced_at"),
+            outputs_lost=as_bool(fields, "outputs_lost"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

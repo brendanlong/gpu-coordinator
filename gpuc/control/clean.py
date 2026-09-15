@@ -24,6 +24,16 @@ class CleanError(RuntimeError):
     pass
 
 
+class CleanUsageError(CleanError):
+    """The flags cannot be honoured: the command line is wrong, not the host.
+
+    Exit 2, the same as argparse's, so a script can tell "I asked for something
+    impossible" from "the clean ran and something failed".
+    """
+
+    exit_code = 2
+
+
 @dataclass
 class CleanReport:
     host: str
@@ -96,6 +106,43 @@ def _purged_line(job: dict[str, Any], *, dry_run: bool) -> str:
     )
 
 
+PURGE_EVERYTHING_NOTE = "purging every finished job (horizon 0), however recently it ended"
+
+
+def check_flags(
+    *,
+    all_finished: bool = False,
+    older_than_days: float | None = None,
+    dry_run: bool = False,
+    purge: bool = False,
+    force: bool = False,
+    verify: bool = False,
+    yes: bool = False,
+) -> None:
+    """The one place `gpuc clean`'s flag combinations are judged.
+
+    The CLI delegates here rather than repeating it, because the two copies had
+    drifted to different exit codes for the same mistake.
+    """
+    if (force or verify) and not purge:
+        raise CleanUsageError("--force and --verify only mean something with --purge")
+    if not purge and not all_finished and older_than_days is None:
+        raise CleanUsageError(
+            f"clean needs --all-finished, --older-than DAYS, or --purge "
+            f"(which defaults to --older-than {DEFAULT_RETENTION_DAYS:g})"
+        )
+    if purge and all_finished and not (yes or dry_run):
+        # --all-finished means an age horizon of 0, so this deletes the job dir
+        # of something that ended a minute ago -- log, state and all. Worth
+        # typing one more word for.
+        raise CleanUsageError(
+            "--purge --all-finished deletes the whole job dir of every finished job, "
+            "however recently it ended (age horizon 0).\n"
+            "Add --yes to confirm, --dry-run to see the list first, or pick a horizon "
+            "with --older-than DAYS."
+        )
+
+
 def clean_host(
     entry: HostEntry,
     settings: Settings | None = None,
@@ -107,15 +154,21 @@ def clean_host(
     purge: bool = False,
     force: bool = False,
     verify: bool = False,
+    yes: bool = False,
     s3_client: Any | None = None,
 ) -> CleanReport:
-    if not purge and not all_finished and older_than_days is None:
-        raise CleanError("clean needs --all-finished or --older-than DAYS")
-    if verify and not purge:
-        raise CleanError("--verify only means anything with --purge")
+    check_flags(
+        all_finished=all_finished,
+        older_than_days=older_than_days,
+        dry_run=dry_run,
+        purge=purge,
+        force=force,
+        verify=verify,
+        yes=yes,
+    )
     session = session or open_session(entry, settings)
     if purge:
-        return purge_host(
+        report = purge_host(
             entry,
             settings,
             session=session,
@@ -126,6 +179,9 @@ def clean_host(
             verify=verify,
             s3_client=s3_client,
         )
+        if all_finished:
+            report.notes.insert(0, PURGE_EVERYTHING_NOTE)
+        return report
     args = ["clean"]
     if all_finished:
         args.append("--all-finished")

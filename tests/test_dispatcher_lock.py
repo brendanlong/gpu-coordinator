@@ -239,3 +239,25 @@ def test_release_lets_the_next_dispatcher_in(gpuc_home: Path) -> None:
     second = DispatcherLock()
     assert second.acquire()
     second.release()
+
+
+def test_the_heartbeat_is_fresh_before_the_lock_body_is_written(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second dispatcher must never see our pid next to a stale heartbeat.
+
+    It reads the body to decide who to evict, so in the window between writing
+    the body and the first beat it would have found a fresh pid with an ancient
+    (or missing) heartbeat and SIGKILLed the dispatcher that had just won.
+    """
+    ages: list[float | None] = []
+    render = LockBody.render
+    monkeypatch.setattr(
+        LockBody,
+        "render",
+        lambda self: (ages.append(dispatcher.heartbeat_age()), render(self))[1],
+    )
+    lock = DispatcherLock()
+    assert lock.acquire()
+    lock.release()
+    assert ages and ages[0] is not None and ages[0] < 5

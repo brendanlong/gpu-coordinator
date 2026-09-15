@@ -30,6 +30,28 @@ class S3IndexError(RuntimeError):
     pass
 
 
+class S3ObjectMissing(S3IndexError):
+    """The object is not there, as opposed to S3 refusing to answer.
+
+    The difference is the exit code: a spec nobody ever mirrored is "no such
+    job", while a timeout or a denied request is a failure of the command.
+    """
+
+
+MISSING_CODES = ("NoSuchKey", "404")
+
+
+def _is_missing(exc: Exception) -> bool:
+    """Is this a 404? boto3 builds its error classes at runtime, so the code is
+    read off the response the exception carries, with its text as the fallback."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        code = error.get("Code") if isinstance(error, dict) else None
+        return str(code) in MISSING_CODES
+    return any(code in str(exc) for code in MISSING_CODES)
+
+
 class IndexEntry(TolerantModel):
     """One job, as the index remembers it. Tolerant like the registry: this
     file is read by whichever session is doing the recovery, not necessarily
@@ -149,6 +171,8 @@ class S3Index:
             response = self.client.get_object(Bucket=self.bucket, Key=key)
             return response["Body"].read().decode("utf-8", "replace")
         except Exception as exc:
+            if _is_missing(exc):
+                raise S3ObjectMissing(f"no object at s3://{self.bucket}/{key}") from exc
             raise S3IndexError(f"could not read s3://{self.bucket}/{key}: {exc}") from exc
 
     def put_spec(self, spec: JobSpec) -> str:

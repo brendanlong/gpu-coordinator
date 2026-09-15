@@ -314,10 +314,31 @@ def test_submit_mirrors_the_spec_to_s3_when_a_bucket_is_configured(
         s3=S3Index("bkt", client),
         report=lambda _: None,
     )
-    assert result.spec_uri == f"s3://bkt/{spec_key(result.job_id)}"
     spec = json.loads(client.objects[f"bkt/{spec_key(result.job_id)}"])
     assert spec["command"] == "python train.py"
     assert result.notes == []
+    index = LocalIndex().get(result.job_id)
+    assert index is not None and index.spec_uri == f"s3://bkt/{spec_key(result.job_id)}"
+
+
+def test_a_spec_already_mirrored_is_not_put_again(control_env: Path, repo: Path) -> None:
+    """`submit --runpod` mirrors the spec before it buys a pod and passes the
+    uri back in; the second PUT was the same object over the wire twice."""
+    client = FakeS3Client()
+    result = submit_spec(
+        HostEntry(name="spar", gpus=["GPU-a"]),
+        validate(job_document()),
+        Settings(s3_bucket="bkt"),
+        workdir=repo,
+        session=session(FakeHost()),
+        environ={},
+        s3=S3Index("bkt", client),
+        spec_uri="s3://bkt/mirrored-earlier.json",
+        report=lambda _: None,
+    )
+    assert f"bkt/{spec_key(result.job_id)}" not in client.objects
+    index = LocalIndex().get(result.job_id)
+    assert index is not None and index.spec_uri == "s3://bkt/mirrored-earlier.json"
 
 
 def test_a_job_bigger_than_the_host_is_refused_early(control_env: Path, repo: Path) -> None:

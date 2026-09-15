@@ -149,16 +149,21 @@ def test_terminated_pods_do_not_count_against_caps() -> None:
     check_caps(Caps(max_pods=2, max_total_usd_per_hour=1.0), pods, 0.49)
 
 
-def test_create_checks_caps_and_requires_our_prefix() -> None:
+def test_create_requires_our_prefix_and_leaves_caps_to_the_locked_check() -> None:
+    """Caps are enforced by `provision._create_and_record`, under the state lock.
+
+    That is the only place the check means anything when two sessions share the
+    account; a second, unlocked `GET /pods` here just cost an extra call that
+    two racing creates would both pass anyway.
+    """
     provider = RecordedRunPod(
         pods=[{"id": "x", "name": "gpuc-a", "status": "RUNNING", "cost": 0.49}]
     )
     provider.caps = Caps(max_pods=1)
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
-    with pytest.raises(CapsExceeded):
-        provider.create(offer, "gpuc-b")
     with pytest.raises(ProviderError, match="must start with"):
         provider.create(offer, "scratch-pod")
+    assert not any(path == "/pods" for _, path, _ in provider.requests)
 
 
 @pytest.mark.runpod

@@ -79,19 +79,39 @@ def interactive_argv(
     return ["bash", "-lc", login_command(directory, fallback)]
 
 
-def command_argv(transport: Transport, directory: str, command: str) -> list[str]:
+def shell_command(directory: str, command: str, fallback: str | None = None) -> str:
+    """One command line, in `directory`, through a login shell.
+
+    A command *line*, not an argv: `gpuc ssh <job> -- 'ls | wc -l'` has to mean
+    the pipeline, and exec'ing the words directly would look for a program
+    called `|`. Login, because this is the hand version of what the job itself
+    gets -- a pod's sshd hands out a PATH with neither uv nor the aws CLI on
+    it. The same workdir and the same fallback as the interactive session, so
+    the two never land in different places.
+    """
+    return f"{quoted_cd(directory, fallback)} && exec {DEFAULT_SHELL} -lc {shlex.quote(command)}"
+
+
+def command_argv(
+    transport: Transport, directory: str, command: str, fallback: str | None = None
+) -> list[str]:
     """The argv for one non-interactive command, for `--print` to show."""
-    remote = f"{quoted_cd(directory)} && {command}"
+    remote = shell_command(directory, command, fallback)
     if isinstance(transport, SshTransport):
         return transport.ssh_argv(remote)
     return ["bash", "-c", remote]
 
 
 def run_command(
-    transport: Transport, directory: str, command: str, *, timeout: float = 3600.0
+    transport: Transport,
+    directory: str,
+    command: str,
+    fallback: str | None = None,
+    *,
+    timeout: float = 3600.0,
 ) -> CommandResult:
     """Run one command in `directory` on the host, whatever it exits."""
-    return transport.run(f"{quoted_cd(directory)} && {command}", timeout=timeout, check=False)
+    return transport.run(shell_command(directory, command, fallback), timeout=timeout, check=False)
 
 
 def local_directory(directory: str, fallback: str | None = None) -> str:

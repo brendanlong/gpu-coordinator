@@ -316,6 +316,31 @@ def test_the_patch_carries_untracked_files_without_touching_the_real_index(
     assert staged.stdout.strip() == ""
 
 
+def test_the_patch_is_only_the_directory_being_submitted(tmp_path: Path) -> None:
+    """A submit from a subdirectory syncs that subdirectory, so the patch that
+    goes with it must not carry the rest of the repository."""
+    root = repo_with(
+        tmp_path / "r", {"sub/a.py": "old\n", "elsewhere.py": "old\n"}, ["sub/a.py", "elsewhere.py"]
+    )
+    (root / "sub/a.py").write_text("changed here\n")
+    (root / "elsewhere.py").write_text("changed there\n")
+    patch = transport.uncommitted_patch(root / "sub")
+    assert "changed here" in patch
+    assert "changed there" not in patch
+
+
+def test_the_patch_includes_staged_changes(tmp_path: Path) -> None:
+    root = repo_with(tmp_path / "r", {"a.py": "old\n"}, ["a.py"])
+    (root / "a.py").write_text("staged\n")
+    subprocess.run(["git", "add", "a.py"], cwd=root, check=True, capture_output=True)
+    assert "staged" in transport.uncommitted_patch(root)
+
+
+def test_both_transports_build_the_same_tail(tmp_path: Path) -> None:
+    assert transport.tail_command("/a b/log.txt", 20) == "tail -n 20 '/a b/log.txt'"
+    assert transport.tail_command("/log.txt", 5, follow=True) == "tail -f -n 5 /log.txt"
+
+
 def test_rsync_excludes_reach_the_command_line(tmp_path: Path) -> None:
     argv = transport.rsync_argv(tmp_path, "host:/dest", None, None, excludes=(".venv", "*.pyc"))
     assert argv[:7] == [

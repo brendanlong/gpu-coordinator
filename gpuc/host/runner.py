@@ -267,6 +267,15 @@ class JobRunner:
         self._current: subprocess.Popen[bytes] | None = None
         self._current_unit: str | None = None
         self._terminating = False
+        self._finalizing = False
+        """Set for the whole of `_finalize`, which must run exactly once.
+
+        The dispatcher escalates a cancel to a SIGTERM at the runner itself
+        after 30 s, and that lands squarely in the final sync of a long upload.
+        Without this, the signal unwound `_finalize`, `run()` caught it, and
+        finalize ran again -- rewriting a job that had already been recorded as
+        `succeeded` into `failed: terminated` and uploading every output a
+        second time."""
 
     # -- logging ---------------------------------------------------------
     def _log(self, log: IO[bytes], message: str) -> None:
@@ -404,7 +413,7 @@ class JobRunner:
         """
 
         def handle(signum: int, _frame: object) -> None:
-            if self._terminating:
+            if self._finalizing or self._terminating:
                 return
             self._terminating = True
             raise _Terminated(signum)
@@ -488,8 +497,7 @@ class JobRunner:
             if code != 0 or self.kill_reason:
                 return self._finalize(code, *self._classify(code, "gpu-preflight"), sync_loop, log)
 
-        failure = self._sync_preflight(log)
-        if failure is not None:
+        if self._sync_preflight(log) is not None:
             return self._finalize(
                 1, "failed", "sync-preflight", sync_loop, log, skip_output_sync=True
             )
@@ -555,6 +563,14 @@ class JobRunner:
     def _finalize_terminated(
         self, exc: _Terminated, sync_loop: sync.SyncLoop, log: IO[bytes]
     ) -> int:
+        if self._finalizing:
+            # Belt and braces with the signal handler: whatever `_finalize`
+            # decided is this job's outcome, so report that rather than
+            # finalizing a second time.
+            try:
+                return jobs.read_state(self.job_id).exit_code or 0
+            except RuntimeError:
+                return TERMINATED_EXIT_CODE
         name = signal.Signals(exc.signum).name
         self._log(log, f"runner received {name}; stopping the job")
         proc = self._current
@@ -584,6 +600,7 @@ class JobRunner:
         log: IO[bytes],
         skip_output_sync: bool = False,
     ) -> int:
+        self._finalizing = True
         jobs.update_state(self.job_id, phase="sync")
         if skip_output_sync:
             # The preflight already proved these uploads cannot work, and the

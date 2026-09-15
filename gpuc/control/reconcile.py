@@ -23,12 +23,12 @@ from gpuc.control.bootstrap import package_root
 from gpuc.control.config import (
     ConfigError,
     DesiredHost,
-    DesiredUnreadable,
     Settings,
     config_dir,
     forget_host,
     load_desired,
     load_registry,
+    read_desired,
     state_dir,
     state_lock,
     write_desired,
@@ -79,8 +79,8 @@ def probe_liveness(host: DesiredHost, settings: Settings) -> Liveness:
     entry = load_registry().hosts.get(host.name)
     if entry is None:
         return Liveness(reachable=False)
-    # Short: this runs with the state lock held, and a wedged pod must not keep
-    # a concurrent `gpuc submit` waiting for its whole ssh timeout.
+    # Short even though the lock is not held here: a pass that stalls on one
+    # wedged pod is a pass that does not reach the next one, which is billing.
     payload = host_status(entry, settings, timeout=LIVENESS_TIMEOUT_S)
     if payload is None:
         return Liveness(reachable=False)
@@ -150,9 +150,15 @@ def _describe_lost_jobs(host: str, settings: Settings) -> str:
 
 
 def _forget(name: str, report: Reporter) -> None:
-    """Drop every local trace of a host. The caller already holds the state lock."""
+    """Drop every local trace of a host, taking the state lock for just that.
+
+    The lock is per mutation, never held across the provider and ssh calls that
+    decide *whether* to mutate: a terminate polls for up to five minutes, and a
+    concurrent `gpuc submit --runpod` gives up on the lock after two.
+    """
     try:
-        forget_host(name)
+        with state_lock():
+            forget_host(name)
     except ConfigError as exc:
         report(f"WARNING: could not remove host {name} from the registry: {exc}")
 
@@ -201,23 +207,30 @@ def reconcile_once(
     liveness: HostLiveness = probe_liveness,
 ) -> ReconcileResult:
     result = ReconcileResult()
-    with state_lock():
-        try:
+    try:
+        # The lock covers only the read: `desired/` is a directory of files, and
+        # a half-listed one would look like "these pods are nobody's".
+        with state_lock():
             desired = load_desired()
-        except DesiredUnreadable as exc:
-            report(f"ERROR: {exc}")
-            result.errors.append(str(exc))
-            return result
-        try:
-            pods = provider.list_ours()
-        except ProviderError as exc:
-            report(f"ERROR: could not list pods: {exc}")
-            result.errors.append(str(exc))
-            return result
+    except ConfigError as exc:  # DesiredUnreadable, or the lock itself timing out
+        report(f"ERROR: {exc}")
+        result.errors.append(str(exc))
+        return result
+    try:
+        pods = provider.list_ours()
+    except ProviderError as exc:
+        report(f"ERROR: could not list pods: {exc}")
+        result.errors.append(str(exc))
+        return result
 
-        by_id = {pod.id: pod for pod in pods}
-        _reconcile_desired(desired, by_id, settings, provider, report, result, liveness)
-        _reap_strays(desired, pods, provider, report, result)
+    # From here on nothing holds the lock: every ssh probe and every terminate
+    # (which polls for up to five minutes) happens outside it, and each local
+    # mutation takes it for itself. Holding it across all of that starved the
+    # `gpuc submit --runpod` that was waiting to record a pod it had created --
+    # and a create that cannot write desired/ is a leaked, billing pod.
+    by_id = {pod.id: pod for pod in pods}
+    _reconcile_desired(desired, by_id, settings, provider, report, result, liveness)
+    _reap_strays(desired, pods, provider, report, result)
     return result
 
 
@@ -335,9 +348,21 @@ def _reap_if_silent(
 
 
 def _remember_seen(host: DesiredHost, report: Reporter) -> None:
+    """Stamp `last_seen_at`, re-reading the record under the lock first.
+
+    The copy this pass started from was read minutes and several ssh calls ago;
+    a `gpuc submit --runpod` may have written `bootstrapped_at` in between, and
+    writing the stale copy back would undo it.
+    """
     try:
-        write_desired(host.model_copy(update={"last_seen_at": _now_text()}))
-    except OSError as exc:
+        with state_lock():
+            current = read_desired(host.name)
+            if current is None:
+                # Another session forgot this host while we were probing it.
+                # Writing the record back would resurrect a pod nothing owns.
+                return
+            write_desired(current.model_copy(update={"last_seen_at": _now_text()}))
+    except (ConfigError, OSError) as exc:
         report(f"WARNING: could not record that {host.name} is alive: {exc}")
 
 

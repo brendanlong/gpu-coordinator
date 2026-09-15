@@ -199,8 +199,7 @@ class LocalTransport:
         return _execute(self.host, argv, timeout=3600.0, check=True, stdin=_files_stdin(files))
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        flag = "-f" if follow else ""
-        return self.run(f"tail {flag} -n {lines} {shlex.quote(remote_path)}", check=False)
+        return self.run(tail_command(remote_path, lines, follow), check=False)
 
 
 @dataclass
@@ -311,12 +310,14 @@ class SshTransport:
         return _execute(self.host, argv, timeout=3600.0, check=True, stdin=_files_stdin(files))
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        flag = "-f " if follow else ""
         return self.run(
-            f"tail {flag}-n {lines} {shlex.quote(remote_path)}",
-            timeout=DEFAULT_TIMEOUT_S,
-            check=False,
+            tail_command(remote_path, lines, follow), timeout=DEFAULT_TIMEOUT_S, check=False
         )
+
+
+def tail_command(remote_path: str, lines: int = 200, follow: bool = False) -> str:
+    """The one `tail` line both transports (and `gpuc logs -f`) send."""
+    return f"tail {'-f ' if follow else ''}-n {lines} {shlex.quote(remote_path)}"
 
 
 def rsync_argv(
@@ -438,7 +439,10 @@ def uncommitted_patch(root: Path) -> str:
             shutil.copy2(real_index, index)
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         _git(root, ["add", "-N", "--", "."], env)
-        code, stdout, _ = _git(root, ["diff", "HEAD"], env)
+        # `-- .` because `root` may be a subdirectory of the repository: without
+        # it the patch carries every change in the repo, including files this
+        # job never syncs, while `git add -N` above only ever saw `.`.
+        code, stdout, _ = _git(root, ["diff", "HEAD", "--", "."], env)
     return stdout.decode("utf-8", "replace") if code == 0 else ""
 
 

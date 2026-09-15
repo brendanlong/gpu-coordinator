@@ -16,8 +16,9 @@ from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
 from gpuc.control import version as version_mod
-from gpuc.control.bootstrap import BootstrapError, bootstrap_host
+from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_package
 from gpuc.control.clean import CleanError, clean_host, prune_uv_cache
+from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
@@ -43,7 +44,14 @@ from gpuc.control.providers.base import Cloud, Constraints, Provider, ProviderEr
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.provision import ProvisionError, runpod_host
 from gpuc.control.remote import HostSession, RemoteError, open_session
-from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError, job_log_uri
+from gpuc.control.s3index import (
+    IndexEntry,
+    LocalIndex,
+    S3Index,
+    S3IndexError,
+    S3ObjectMissing,
+    job_log_uri,
+)
 from gpuc.control.submit import (
     JobSpecModel,
     SubmitError,
@@ -93,10 +101,37 @@ class NotFound(CliError):
     exit_code = EXIT_NOT_FOUND
 
 
-def _gpu_list(raw: str | None) -> list[str]:
+GPUS_HELP = (
+    "GPU UUIDs or nvidia-smi indices this host may use, comma-separated "
+    "(`--gpus 2,3` or `--gpus GPU-8064...,3`); indices are resolved to UUIDs on "
+    "the host at every dispatch pass, so jobs are always pinned by UUID"
+)
+
+
+def _comma_list(raw: str | None) -> list[str]:
+    """A comma- or space-separated flag value, as a list."""
     if not raw:
         return []
     return [part.strip() for part in raw.replace(" ", ",").split(",") if part.strip()]
+
+
+def _gpu_list(raw: str | None) -> list[str]:
+    """`--gpus`: UUIDs, nvidia-smi indices, or a mix, stored exactly as given.
+
+    Ownership of part of a shared box is an agreement in nvidia-smi numbering
+    ("you have 2 and 3"), so an index has to be sayable and has to stay what
+    was said -- resolving it here would freeze this morning's numbering into
+    the registry. The host redoes the mapping each pass; all this has to do is
+    refuse the third thing, which is always a typo.
+    """
+    owned = _comma_list(raw)
+    bad = [item for item in owned if not item.isdigit() and not item.startswith("GPU-")]
+    if bad:
+        raise UsageError(
+            f"--gpus wants nvidia-smi indices or GPU UUIDs, got {', '.join(repr(b) for b in bad)}."
+            f"\nRun `gpuc host probe <name>` to see this host's index and UUID for each card."
+        )
+    return owned
 
 
 def _env_dict(pairs: Sequence[str] | None) -> dict[str, str]:
@@ -139,7 +174,7 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         s3_prefix=args.s3_prefix,
         retention_days=_retention(args.retention_days),
         idle_minutes=args.idle_min,
-        ttl_hours=args.ttl_hours,
+        ttl_hours=_ttl_hours(args.ttl_hours),
         created_at=utc_now(),
     )
     with registry_transaction() as registry:
@@ -151,6 +186,23 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         f"next: gpuc host bootstrap {entry.name}"
     )
     return 0
+
+
+def _ttl_hours(raw: float | None) -> float | None:
+    """`--ttl-hours`: hours, or a negative sentinel meaning "no TTL at all".
+
+    A stored -1 would be a host that is *already* past its TTL, so the next
+    reaper pass terminates it -- the opposite of what anyone types it for, and
+    the same rule `gpuc host set` has always used for clearing one.
+    """
+    if raw is None or raw < 0:
+        return None
+    if raw == 0:
+        raise UsageError(
+            "--ttl-hours 0 would expire the host the moment it exists; "
+            "pass -1 (or omit it) for no TTL"
+        )
+    return raw
 
 
 def _retention(raw: str | None) -> float | None:
@@ -214,7 +266,7 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     if args.ttl_hours is not None:
         # argparse cannot express "given but empty" for a float flag, and a TTL
         # that can be set but never unset is a trap.
-        changes["ttl_hours"] = None if args.ttl_hours < 0 else args.ttl_hours
+        changes["ttl_hours"] = _ttl_hours(args.ttl_hours)
     if not changes:
         raise UsageError(
             "host set changes nothing: pass at least one of "
@@ -265,8 +317,8 @@ def cmd_host_list(_: argparse.Namespace) -> int:
             print(f"  WARNING {stale}")
         if entry.root:
             print(f"  persistent root {entry.root} (gpuc home {entry.remote_home})")
-        for name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
-            print(f"  {name:<28} {vram:<7} {uuid}")
+        for index, name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
+            print(f"  [{index}] {name:<28} {vram:<7} {uuid}")
     return 0
 
 
@@ -287,16 +339,19 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
 
 def cmd_clean(args: argparse.Namespace) -> int:
     settings = load_settings()
+    # Checked before the host lookup so a wrong command line answers in the
+    # same way whether or not the host exists. `clean` owns the rule; keeping a
+    # second copy here is what let the two disagree about the exit code.
+    check_clean_flags(
+        all_finished=args.all_finished,
+        older_than_days=args.older_than,
+        dry_run=args.dry_run,
+        purge=args.purge,
+        force=args.force,
+        verify=args.verify,
+        yes=args.yes,
+    )
     entry = named_registry().require(args.host)
-    if (args.force or args.verify) and not args.purge:
-        raise UsageError("--force and --verify only mean something with --purge")
-    if not args.purge and not args.all_finished and args.older_than is None:
-        # argparse cannot express "required unless --purge", and --purge has a
-        # default horizon of its own.
-        raise UsageError(
-            f"gpuc clean: pass --all-finished, --older-than DAYS, or --purge "
-            f"(which defaults to --older-than {DEFAULT_RETENTION_DAYS:g})"
-        )
     report = clean_host(
         entry,
         settings,
@@ -306,6 +361,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         purge=args.purge,
         force=args.force,
         verify=args.verify,
+        yes=args.yes,
     )
     print(report.render())
     return 1 if report.errors else 0
@@ -353,7 +409,7 @@ def make_provider(settings: Settings) -> Provider:
 
 
 def constraints_from(args: argparse.Namespace) -> Constraints:
-    names = _gpu_list(args.gpu)
+    names = _comma_list(args.gpu)
     if not names:
         raise UsageError(
             "--runpod needs --gpu <name>[,<name>] (for example --gpu A40,RTX4090).\n"
@@ -402,23 +458,71 @@ def cmd_config_show(_: argparse.Namespace) -> int:
     return 0
 
 
-def mirror_spec_first(model: JobSpecModel, job_id: str, settings: Settings) -> list[str]:
-    """Put the spec in S3 before spending any money, so a lost pod is still requeueable."""
+def mirror_spec_first(
+    model: JobSpecModel, job_id: str, settings: Settings
+) -> tuple[str | None, list[str]]:
+    """Put the spec in S3 before spending any money, so a lost pod is still requeueable.
+
+    Returns the uri it landed at, so the submit that follows does not PUT the
+    same object a second time.
+    """
     s3 = S3Index.from_settings(settings)
     if s3 is None:
-        return [
+        return None, [
             "s3_bucket is unset, so the spec was not mirrored before provisioning; "
             "`gpuc requeue` will need the job file again"
         ]
     try:
-        s3.put_spec(expand_job_id(model.to_spec(job_id)))
+        return s3.put_spec(expand_job_id(model.to_spec(job_id))), []
     except S3IndexError as exc:
-        return [f"could not mirror the spec to S3 before provisioning: {exc}"]
-    return []
+        return None, [f"could not mirror the spec to S3 before provisioning: {exc}"]
+
+
+def check_runpod_args(args: argparse.Namespace) -> None:
+    """Judge the provisioning flags once, before anything is bought or written."""
+    if getattr(args, "runpod", False) and args.host:
+        raise UsageError(
+            f"--runpod creates a pod and --host {args.host} names a host that already "
+            f"exists, so they cannot be combined. Drop one."
+        )
+    args.ttl_hours = _ttl_hours(args.ttl_hours)
+
+
+def ensure_package_current(
+    entry: HostEntry, settings: Settings, *, bootstrap: bool = True
+) -> HostEntry:
+    """Re-ship the package when the host is not running this build.
+
+    A host on an older commit dispatches the job with code that does not match
+    the spec this machine just wrote, and that mismatch is invisible until a
+    job fails strangely. An *unrecorded* commit counts as older, because the
+    hosts with nothing recorded were bootstrapped by the oldest builds of all.
+    Only the package and the dispatcher: uv, the interpreter and health cannot
+    have gone stale, and the job is waiting.
+    """
+    if not bootstrap or not entry.python:
+        return entry
+    local = version_mod.local_commit()
+    if not version_mod.needs_package_sync(local, entry.pkg_commit):
+        return entry
+    print(
+        f"host {entry.name} has gpuc {version_mod.short(entry.pkg_commit)} and this machine "
+        f"has {version_mod.short(local)}: re-syncing the package and restarting the "
+        f"dispatcher before enqueueing"
+    )
+    updated = resync_package(entry, settings, report=_quiet)
+    with registry_transaction() as registry:
+        registry.put(updated)
+    return updated
+
+
+def _quiet(_: str) -> None:
+    """Swallow a step's progress: the caller has already said what it is doing."""
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
     settings = load_settings()
+    check_runpod_args(args)
     use_git = not args.no_git
     if args.runpod:
         document = load_document(args.job_file)
@@ -431,10 +535,17 @@ def cmd_submit(args: argparse.Namespace) -> int:
             ttl_hours=args.ttl_hours,
         )
         job_id = jobs.new_job_id()
-        notes = mirror_spec_first(model, job_id, settings)
+        spec_uri, notes = mirror_spec_first(model, job_id, settings)
         entry = runpod_target(args, settings)
+        entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap)
         result = submit_spec(
-            entry, model, settings, workdir=Path.cwd(), job_id=job_id, use_git=use_git
+            entry,
+            model,
+            settings,
+            workdir=Path.cwd(),
+            job_id=job_id,
+            spec_uri=spec_uri,
+            use_git=use_git,
         )
         result.notes.extend(notes)
         print(result.render())
@@ -442,6 +553,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if not args.host:
         raise UsageError("submit needs --host <name> (see `gpuc host list`)")
     entry = named_registry().require(args.host)
+    entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap)
     result = submit_file(entry, args.job_file, settings, workdir=Path.cwd(), use_git=use_git)
     print(result.render())
     return 0
@@ -652,11 +764,14 @@ def cmd_ssh(args: argparse.Namespace) -> int:
     transport = transport_for(entry, load_settings())
     local = entry.kind == "local"
     if command:
-        joined = shlex.join(command)
+        # Joined with spaces and handed to a shell, which is what `ssh host CMD`
+        # has always done and what anyone typing `-- 'ls | wc -l'` expects.
+        # shlex.join would quote the pipe back into a filename.
+        joined = " ".join(command)
         if args.print_only:
-            print(ssh_mod.print_line(ssh_mod.command_argv(transport, directory, joined)))
+            print(ssh_mod.print_line(ssh_mod.command_argv(transport, directory, joined, fallback)))
             return EXIT_OK
-        result = ssh_mod.run_command(transport, directory, joined)
+        result = ssh_mod.run_command(transport, directory, joined, fallback)
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
         return result.returncode
@@ -779,6 +894,7 @@ def _logs_from_s3(
 
 def cmd_requeue(args: argparse.Namespace) -> int:
     settings = load_settings()
+    check_runpod_args(args)
     registry = named_registry()
     index = LocalIndex().get(args.job_id)
     target = args.host or (None if args.runpod else (index.host if index else None))
@@ -792,7 +908,16 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             "requeue reads the spec from S3, but s3_bucket is unset in "
             "~/.config/gpu-coordinator/config.toml. Re-submit the job file instead."
         )
-    document = s3.get_spec(args.job_id)
+    try:
+        document = s3.get_spec(args.job_id)
+    except S3ObjectMissing as exc:
+        # A job id nobody ever mirrored a spec for does not exist as far as
+        # requeue is concerned: exit 4, like every other unknown name.
+        raise NotFound(
+            f"no mirrored spec for job {args.job_id}.\n"
+            f"Check the id with `gpuc status --all`; only jobs submitted with s3_bucket "
+            f"set can be requeued."
+        ) from exc
     for key in ("job_id", "attempt"):
         document.pop(key, None)
     attempt = (index.attempt if index else 1) + 1
@@ -807,6 +932,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             ttl_hours=args.ttl_hours,
         )
     entry = runpod_target(args, settings) if target is None else registry.require(target)
+    entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap)
     result = submit_spec(
         entry,
         model,
@@ -883,8 +1009,8 @@ def build_parser() -> argparse.ArgumentParser:
     add = host.add_parser("add", help="register a host")
     add.add_argument("name")
     add.add_argument("--ssh", help="user@host; omit for this machine")
-    add.add_argument("--port", type=int, default=22)
-    add.add_argument("--gpus", help="comma-separated GPU UUIDs this host may use")
+    add.add_argument("--port", type=int, default=22, help="ssh port (default 22)")
+    add.add_argument("--gpus", help=GPUS_HELP)
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
     add.add_argument(
         "--persistent-root",
@@ -908,19 +1034,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="auto-purge job dirs older than this, once the host has confirmed their log "
         "and state are mirrored; omit to keep everything forever",
     )
-    add.add_argument("--idle-min", type=float, default=15.0)
+    add.add_argument(
+        "--idle-min",
+        type=float,
+        default=15.0,
+        metavar="MINUTES",
+        help="how long an ephemeral host may sit with an empty queue before it terminates "
+        "itself (default 15); ignored for hosts that are not ephemeral",
+    )
     add.add_argument(
         "--ttl-hours",
         type=float,
         default=None,
-        help="hard cap on the host's life; omit for none (the default). When set, the "
-        "dispatcher kills the running job with reason ttl, syncs, and terminates",
+        help="hard cap on the host's life; omit or pass -1 for none (the default). When "
+        "set, the dispatcher kills the running job with reason ttl, syncs, and terminates",
     )
     add.set_defaults(func=cmd_host_add)
 
     edit = host.add_parser("set", help="change a registered host without remove/add")
     edit.add_argument("name")
-    edit.add_argument("--gpus", help="replace the GPU UUIDs; pass '' for none")
+    edit.add_argument("--gpus", help=f"replace what this host owns; pass '' for none. {GPUS_HELP}")
     edit.add_argument("--persistent-root", help="pass '' to go back to $HOME")
     edit.add_argument("--gpuc-home", help="pass '' for the default under the root or $HOME")
     edit.add_argument(
@@ -936,7 +1069,12 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument(
         "--retention-days", help="auto-purge horizon in days; pass '' to keep everything"
     )
-    edit.add_argument("--idle-min", type=float)
+    edit.add_argument(
+        "--idle-min",
+        type=float,
+        metavar="MINUTES",
+        help="idle minutes before an ephemeral host terminates itself",
+    )
     edit.add_argument(
         "--ttl-hours", type=float, help="hard cap in hours; -1 clears it (no TTL, the default)"
     )
@@ -967,13 +1105,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit = sub.add_parser("submit", help="submit a job file to a host")
     submit.add_argument("job_file")
-    submit.add_argument("--host")
+    submit.add_argument(
+        "--host", metavar="NAME", help="a registered host to submit to (see `gpuc host list`)"
+    )
     add_no_git_flag(submit)
+    add_bootstrap_flag(submit)
     add_runpod_flags(submit)
     submit.set_defaults(func=cmd_submit)
 
     status = sub.add_parser("status", help="per-host queue, running and recent jobs")
-    status.add_argument("--host")
+    status.add_argument(
+        "--host", metavar="NAME", help="only this host; omit for every registered host"
+    )
     status.add_argument("--all", action="store_true", help="also list jobs only the index knows")
     status.add_argument("--suspects", action="store_true", help="billing but idle; never kills")
     status.add_argument(
@@ -1001,10 +1144,13 @@ def build_parser() -> argparse.ArgumentParser:
     ).set_defaults(func=cmd_version)
 
     clean = sub.add_parser("clean", help="remove finished jobs' workdirs on a host")
-    clean.add_argument("--host", required=True)
+    clean.add_argument("--host", required=True, metavar="NAME", help="the host to reclaim disk on")
     selection = clean.add_mutually_exclusive_group()
     selection.add_argument(
-        "--all-finished", action="store_true", help="every succeeded, failed or cancelled job"
+        "--all-finished",
+        action="store_true",
+        help="every succeeded, failed or cancelled job, however recently it ended; with "
+        "--purge this is an age horizon of 0 and needs --yes (or --dry-run)",
     )
     selection.add_argument(
         "--older-than", type=float, metavar="DAYS", help="only jobs that ended over DAYS ago"
@@ -1026,19 +1172,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --purge: HEAD each job's mirrored log.txt in S3 before deleting it",
     )
+    clean.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm `--purge --all-finished`, which deletes the whole job dir of every "
+        "finished job with no age horizon at all",
+    )
     clean.add_argument("--dry-run", action="store_true", help="list what would go, delete nothing")
     clean.set_defaults(func=cmd_clean)
 
     logs = sub.add_parser("logs", help="tail a job log from its host")
     logs.add_argument("job_id")
-    logs.add_argument("-f", "--follow", action="store_true")
-    logs.add_argument("-n", "--lines", type=int, default=200)
-    logs.add_argument("--host")
+    logs.add_argument("-f", "--follow", action="store_true", help="stream the log as it is written")
+    logs.add_argument(
+        "-n", "--lines", type=int, default=200, metavar="N", help="lines of history (default 200)"
+    )
+    logs.add_argument(
+        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+    )
     logs.set_defaults(func=cmd_logs)
 
     ssh = sub.add_parser(
         "ssh",
         help="a shell on a host, or in a job's workdir; or one command there",
+        description="A host name lands in that host's gpuc home. A job id lands in that "
+        "job's workdir/, falling back to the job dir itself when the workdir has been "
+        "cleaned away (the log and state are still there).",
     )
     ssh.add_argument("target", help="a registered host name, or a job id")
     ssh.add_argument("--host", help="which host a job id is on, if it is ambiguous")
@@ -1051,25 +1210,41 @@ def build_parser() -> argparse.ArgumentParser:
     ssh.add_argument(
         "command",
         nargs=argparse.REMAINDER,
-        help="a command to run there (after `--`); omit for an interactive shell",
+        help="a command line to run there (after `--`), joined with spaces and interpreted "
+        "by a login bash on the host, so pipes and redirections work; gpuc exits with the "
+        "remote command's own exit code. Omit for an interactive shell",
     )
     ssh.set_defaults(func=cmd_ssh)
 
     cancel = sub.add_parser("cancel", help="cancel a queued or running job")
     cancel.add_argument("job_id")
-    cancel.add_argument("--host")
+    cancel.add_argument(
+        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+    )
     cancel.set_defaults(func=cmd_cancel)
 
     reorder = sub.add_parser("reorder", help="change a queued job's priority")
     reorder.add_argument("job_id")
-    reorder.add_argument("--priority", type=int, required=True)
-    reorder.add_argument("--host")
+    reorder.add_argument(
+        "--priority",
+        type=int,
+        required=True,
+        help="0-99; lower dispatches first (submit defaults to 50)",
+    )
+    reorder.add_argument(
+        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+    )
     reorder.set_defaults(func=cmd_reorder)
 
     requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
     requeue.add_argument("job_id")
-    requeue.add_argument("--host")
+    requeue.add_argument(
+        "--host",
+        metavar="NAME",
+        help="submit to this host instead of the one the job ran on; not with --runpod",
+    )
     add_no_git_flag(requeue)
+    add_bootstrap_flag(requeue)
     add_runpod_flags(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
@@ -1077,7 +1252,14 @@ def build_parser() -> argparse.ArgumentParser:
         "reconcile", help="terminate leaked or expired pods; --install for a systemd timer"
     )
     reconcile.add_argument("--once", action="store_true", help="one pass, then exit")
-    reconcile.add_argument("--interval", type=float, default=reconcile_mod.DEFAULT_INTERVAL_S)
+    reconcile.add_argument(
+        "--interval",
+        type=float,
+        default=reconcile_mod.DEFAULT_INTERVAL_S,
+        metavar="SECONDS",
+        help=f"seconds between passes of the loop, and of the installed timer "
+        f"(default {reconcile_mod.DEFAULT_INTERVAL_S:.0f})",
+    )
     reconcile.add_argument(
         "--install", action="store_true", help="write (but do not enable) systemd --user units"
     )
@@ -1101,6 +1283,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def add_bootstrap_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-bootstrap",
+        action="store_true",
+        help="enqueue even if the host's package is older than this machine's; without it, "
+        "a host on another commit (or none) gets the package re-synced and its dispatcher "
+        "restarted first",
+    )
+
+
 def add_no_git_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-git",
@@ -1113,18 +1305,38 @@ def add_no_git_flag(parser: argparse.ArgumentParser) -> None:
 def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runpod", action="store_true", help="reuse or provision a RunPod pod")
     parser.add_argument("--gpu", help="comma-separated GPU names, cheapest match wins")
-    parser.add_argument("--gpu-count", type=int, default=1)
-    parser.add_argument("--min-vram", type=int)
+    parser.add_argument(
+        "--gpu-count",
+        type=int,
+        default=1,
+        metavar="N",
+        help="GPUs on the pod (default 1); the spec's `gpus:` must fit in it",
+    )
+    parser.add_argument(
+        "--min-vram", type=int, metavar="GB", help="skip offers with less VRAM per GPU"
+    )
     parser.add_argument("--max-price", type=float, help="USD per hour, for the whole pod")
-    parser.add_argument("--cloud", choices=sorted(CLOUDS), default="secure")
+    parser.add_argument(
+        "--cloud",
+        choices=sorted(CLOUDS),
+        default="secure",
+        help="which RunPod tier to buy from; community is cheaper and less reliable "
+        "(default secure)",
+    )
     parser.add_argument("--cuda-min", default=None, help="host CUDA floor, default 12.8")
-    parser.add_argument("--idle-min", type=float, default=15.0)
+    parser.add_argument(
+        "--idle-min",
+        type=float,
+        default=15.0,
+        metavar="MINUTES",
+        help="terminate the pod once its queue has been empty this long (default 15)",
+    )
     parser.add_argument(
         "--ttl-hours",
         type=float,
         default=None,
-        help="hard cap on the pod's life; omit for none (the default), leaving --idle-min and "
-        "`gpuc reconcile` to stop it",
+        help="hard cap on the pod's life; omit or pass -1 for none (the default), leaving "
+        "--idle-min and `gpuc reconcile` to stop it",
     )
     parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
     parser.add_argument("--image", help="pod image; default from config")

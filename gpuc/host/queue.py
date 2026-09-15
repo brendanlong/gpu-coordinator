@@ -113,14 +113,3 @@ def kill_reason(job_id: str) -> str | None:
         return paths.kill_file(job_id).read_text().strip() or None
     except OSError:
         return None
-
-
-def running_job_ids() -> list[str]:
-    return [j for j in jobs.list_job_ids() if _status(j) == "running"]
-
-
-def _status(job_id: str) -> str | None:
-    try:
-        return jobs.read_state(job_id).status
-    except (RuntimeError, FileNotFoundError):
-        return None

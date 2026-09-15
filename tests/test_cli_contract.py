@@ -230,7 +230,13 @@ def test_status_json_is_one_document_with_the_promised_shape(
     assert host["reachable"] is True
     assert host["dispatcher"] == {"alive": True, "heartbeat_age_s": 3.0}
     assert host["gpus"] == [
-        {"uuid": GPU, "name": "", "vram_mib": None, "busy_job": "20260915-120000-abc123"}
+        {
+            "index": None,
+            "uuid": GPU,
+            "name": "",
+            "vram_mib": None,
+            "busy_job": "20260915-120000-abc123",
+        }
     ]
     assert host["queued"] == []
     job = host["running"][0]
@@ -304,6 +310,39 @@ def test_logs_has_no_json_flag() -> None:
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["logs", "20260101-000000-aaaaaa", "--json"])
     assert exit_info.value.code == EXIT_USAGE
+
+
+def test_every_option_says_what_it_does() -> None:
+    """`--help` is the only documentation most of these flags will ever get.
+
+    A bare `--gpu-count N` tells a reader nothing about whether it is the pod's
+    GPUs or the job's.
+    """
+    import argparse
+
+    from gpuc.control.cli import build_parser
+
+    def walk(parser: argparse.ArgumentParser, path: str) -> list[str]:
+        missing: list[str] = []
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for name, sub in action.choices.items():
+                    missing += walk(sub, f"{path} {name}")
+                continue
+            if action.option_strings and not action.help:
+                missing.append(f"{path} {action.option_strings[0]}")
+        return missing
+
+    assert walk(build_parser(), "gpuc") == []
+
+
+def test_ssh_help_says_where_it_lands_and_whose_exit_code_it_returns() -> None:
+    from gpuc.control.cli import build_parser
+
+    ssh = build_parser()._subparsers._group_actions[0].choices["ssh"]  # type: ignore[union-attr]
+    text = ssh.format_help()
+    assert "workdir" in text and "job dir" in text
+    assert "exit code" in text
 
 
 # -- version ------------------------------------------------------------------

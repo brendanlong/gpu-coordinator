@@ -83,7 +83,30 @@ def test_one_command_runs_in_that_directory_and_propagates_the_exit_code() -> No
     transport = cast("Transport", RecordingTransport(returncode=7))
     result = ssh_mod.run_command(transport, "$HOME/.gpuc", "ls -la")
     assert result.returncode == 7
-    assert cast("RecordingTransport", transport).commands == ['cd "$HOME/.gpuc" && ls -la']
+    assert cast("RecordingTransport", transport).commands == [
+        "cd \"$HOME/.gpuc\" && exec /bin/bash -lc 'ls -la'"
+    ]
+
+
+def test_a_command_is_a_command_line_not_an_argv() -> None:
+    """`gpuc ssh <job> -- 'ls | wc -l'` has to mean the pipeline."""
+    transport = cast("Transport", RecordingTransport())
+    ssh_mod.run_command(transport, "$HOME/.gpuc", "ls | wc -l")
+    command = cast("RecordingTransport", transport).commands[0]
+    assert command.endswith("exec /bin/bash -lc 'ls | wc -l'")
+
+
+def test_one_command_lands_where_the_interactive_session_would() -> None:
+    """The workdir fallback is not an interactive-only courtesy: a job whose
+    workdir was cleaned still has its job dir, and all three paths use it."""
+    workdir, job_dir = f"$HOME/.gpuc/jobs/{JOB}/workdir", f"$HOME/.gpuc/jobs/{JOB}"
+    transport = cast("Transport", RecordingTransport())
+    ssh_mod.run_command(transport, workdir, "ls", job_dir)
+    command = cast("RecordingTransport", transport).commands[0]
+    assert command.startswith(f'cd "{workdir}" 2>/dev/null || cd "{job_dir}" && ')
+    assert f'cd "{job_dir}"' in " ".join(
+        ssh_mod.command_argv(cast("Transport", RecordingTransport()), workdir, "ls", job_dir)
+    )
 
 
 def test_a_local_host_gets_a_shell_not_an_ssh(tmp_path: Path) -> None:
@@ -123,6 +146,8 @@ def test_a_command_on_the_local_host_really_runs(
     assert main(["ssh", "local", "--", "pwd"]) == EXIT_OK
     assert capsys.readouterr().out.strip() == str(home)
     assert main(["ssh", "local", "--", "exit", "3"]) == 3
+    # A shell line, not an argv: the exit code is still the remote command's.
+    assert main(["ssh", "local", "--", "ls | wc -l"]) == EXIT_OK
 
 
 def test_an_unknown_target_is_exit_four(

@@ -6,7 +6,6 @@ someone else and this command is the place that habit is most easily broken.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -19,6 +18,7 @@ from gpuc.control.config import (
 )
 from gpuc.control.providers.base import Pod, Provider, owned_pods
 from gpuc.control.provision import dispatcher_heartbeat_age
+from gpuc.control.reconcile import STRAY_GRACE_MINUTES
 
 COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "DESIRED", "HEARTBEAT")
 
@@ -79,7 +79,8 @@ def gather(
     view = PodsView()
     pods = provider.list()
     ours = owned_pods(pods, provider.caps.prefix)
-    others = [pod for pod in pods if pod not in ours]
+    ours_ids = {pod.id for pod in ours}
+    others = [pod for pod in pods if pod.id not in ours_ids]
     registry = registry if registry is not None else load_registry()
     try:
         desired_ids = {host.pod_id for host in load_desired()}
@@ -117,14 +118,11 @@ def render(view: PodsView) -> str:
     if stray:
         lines.append(
             f"DESIRED=NO on {', '.join(stray)}: nothing local wants these. "
-            f"`gpuc reconcile --once` terminates them."
+            f"`gpuc reconcile --once` terminates them once they are over "
+            f"{STRAY_GRACE_MINUTES:.0f} min old."
         )
     if view.others:
         names = ", ".join(f"{pod.name} ({pod.status})" for pod in view.others)
         lines.append(f"{len(view.others)} other pod(s) in the account, never touched: {names}")
     lines += [f"note: {note}" for note in view.notes]
     return "\n".join(lines)
-
-
-def report_pods(settings: Settings, provider: Provider, out: Callable[[str], None] = print) -> None:
-    out(render(gather(settings, provider)))

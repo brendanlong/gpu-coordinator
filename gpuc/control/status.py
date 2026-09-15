@@ -23,12 +23,49 @@ from gpuc.host.jobs import SCHEMA_VERSION
 
 HEARTBEAT_STALE_S = 30.0
 DEAD_POD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
-SUSPECT_FLOOR_PCT = 5.0
-SUSPECT_SAMPLES = 20  # 10 minutes of main-phase samples at the 30 s runner cadence
+UTIL_SAMPLE_INTERVAL_S = 30.0
+"""The runner's sampling cadence, which is what `util_recent` is measured in."""
+UTIL_SAMPLES_KEPT = 40
+"""How many samples the host keeps (20 min). A `window_min` longer than this is
+judged on what there is rather than never firing at all."""
 RECENT_FINISHED = 5
 LEFTOVER_FLOOR_BYTES = 1 << 30
 """Only mention finished jobs' workdirs once they add up to something worth a
 command. A job dir under a gigabyte is noise next to a 6.5 GB torch venv."""
+
+
+@dataclass
+class LowUtilView:
+    """A job's own low-util watchdog settings, as the host reports them.
+
+    The defaults are the spec's, so a host that does not report them yet is
+    judged by exactly the rule its watchdog is running.
+    """
+
+    enabled: bool = True
+    window_min: float = 25.0
+    floor_pct: float = 5.0
+    grace_min: float = 10.0
+
+    @staticmethod
+    def from_payload(raw: Any) -> LowUtilView:
+        if not isinstance(raw, dict):
+            return LowUtilView()
+        default = LowUtilView()
+
+        def number(key: str, fallback: float) -> float:
+            value = raw.get(key)
+            return float(value) if isinstance(value, (int, float)) else fallback
+
+        return LowUtilView(
+            enabled=bool(raw.get("enabled", True)),
+            window_min=number("window_min", default.window_min),
+            floor_pct=number("floor_pct", default.floor_pct),
+            grace_min=number("grace_min", default.grace_min),
+        )
+
+    def samples(self, minutes: float) -> int:
+        return max(1, round(minutes * 60.0 / UTIL_SAMPLE_INTERVAL_S))
 
 
 @dataclass
@@ -58,6 +95,10 @@ class JobView:
     """`cgroup` if this job's phases run in a systemd scope (a cancel reaps the
     whole tree), `pgid` if only a process group (a daemonised grandchild
     escapes). Shown on running jobs because it changes what a kill guarantees."""
+    low_util: LowUtilView = field(default_factory=LowUtilView)
+    """This job's own watchdog settings, so `--suspects` names the jobs the host
+    is actually about to kill -- and stays quiet about the ones that turned the
+    watchdog off on purpose."""
 
     @property
     def minutes(self) -> float | None:
@@ -75,17 +116,26 @@ class JobView:
 
     @property
     def suspect(self) -> bool:
-        """Billing, main phase, and utilization flat on the floor for 10 minutes.
+        """Billing, in `main`, and flat on this job's own low-util floor.
 
         Phase-aware by construction: the runner only records samples during
-        `main`, so setup, download and compile can never look suspicious.
+        `main`, so setup, download and compile can never look suspicious. The
+        thresholds are the job's, not a constant here, so a job that raised its
+        floor or turned the watchdog off is judged by what it asked for -- and
+        the ones this flags are the ones the host is about to kill.
         """
         if self.status != "running" or self.phase != "main" or not self.gpus:
             return False
-        window = self.util_recent[-SUSPECT_SAMPLES:]
-        if len(window) < SUSPECT_SAMPLES:
+        rule = self.low_util
+        if not rule.enabled:
             return False
-        return sum(window) / len(window) < SUSPECT_FLOOR_PCT
+        # grace_min of main phase has to have gone by before the host's own
+        # watchdog even starts watching, and its window is what it averages.
+        need = min(rule.samples(rule.grace_min + rule.window_min), UTIL_SAMPLES_KEPT)
+        window = self.util_recent[-min(rule.samples(rule.window_min), UTIL_SAMPLES_KEPT) :]
+        if len(self.util_recent) < need or not window:
+            return False
+        return sum(window) / len(window) < rule.floor_pct
 
 
 DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
@@ -123,6 +173,16 @@ def format_age(stamp: str | None, now: datetime | None = None) -> str:
     return f"{int(seconds)}s ago"
 
 
+def _as_float(value: Any) -> float | None:
+    """A number the host sent, or None for anything else (including a bool)."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _as_int(value: Any) -> int | None:
+    number = _as_float(value)
+    return None if number is None else int(number)
+
+
 def _parse(stamp: str | None) -> datetime | None:
     if not stamp:
         return None
@@ -143,6 +203,13 @@ class HostView:
     draining: bool = False
     paused: bool = False
     owned: list[str] = field(default_factory=list)
+    """The UUIDs this host owns, as the host itself resolved them: `config.gpus`
+    may name cards by nvidia-smi index, and only the host knows today's
+    numbering. Everything here -- free, busy, the per-card lines -- is UUIDs."""
+    indices: dict[str, int] = field(default_factory=dict)
+    """uuid -> the index the host is calling that card right now."""
+    unavailable: list[str] = field(default_factory=list)
+    """Owned entries the host could not resolve to a card it can see."""
     pod: Pod | None = None
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
@@ -197,11 +264,22 @@ class HostView:
 
 
 def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], list[JobView]]:
-    priorities = {e["job_id"]: e["priority"] for e in payload.get("queue", [])}
+    """Every field is treated as untrusted: this is another build's JSON.
+
+    A host on a different commit -- or a half-written state file -- must cost
+    one missing row, never a traceback out of `gpuc status` for every host.
+    """
+    priorities = {
+        e["job_id"]: _as_int(e.get("priority"))
+        for e in payload.get("queue") or []
+        if isinstance(e, dict) and isinstance(e.get("job_id"), str)
+    }
     queued: list[JobView] = []
     running: list[JobView] = []
     finished: list[JobView] = []
-    for entry in payload.get("jobs", []):
+    for entry in payload.get("jobs") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("job_id"), str):
+            continue
         view = JobView(
             job_id=entry["job_id"],
             name=entry.get("name", ""),
@@ -216,11 +294,14 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             ended_at=entry.get("ended_at"),
             # A sample is null when nvidia-smi failed; drop it rather than
             # counting a missing reading as 0% and calling the job a suspect.
-            util_recent=[float(u) for u in entry.get("util_recent") or [] if u is not None],
+            util_recent=[
+                float(u) for u in entry.get("util_recent") or [] if isinstance(u, (int, float))
+            ],
             workdir_bytes=entry.get("workdir_bytes"),
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
             isolation=entry.get("isolation"),
+            low_util=LowUtilView.from_payload(entry.get("low_util")),
         )
         if view.status == "running":
             running.append(view)
@@ -263,9 +344,16 @@ def gather(
     except (RemoteError, TransportError) as exc:
         view.error = str(exc).splitlines()[0]
         return view
+    if not isinstance(payload, dict):
+        view.error = f"host {entry.name} answered `status` with {type(payload).__name__}, not JSON"
+        return view
     view.reachable = True
-    view.owned = list(payload.get("gpus") or entry.gpus)
-    view.heartbeat_age_s = payload.get("dispatcher_heartbeat_age_s")
+    view.owned, view.indices = owned_gpus(payload, entry)
+    view.unavailable = [g for g in payload.get("gpus_unavailable") or [] if isinstance(g, str)]
+    # Validated like `reconcile.probe_liveness` does: a host on another build
+    # could answer with a string here, and formatting it would take out the
+    # whole `gpuc status`, not just this host's line.
+    view.heartbeat_age_s = _as_float(payload.get("dispatcher_heartbeat_age_s"))
     view.draining = bool(payload.get("draining"))
     view.paused = bool(payload.get("paused"))
     view.queue, view.running, view.finished = job_views(payload)
@@ -300,14 +388,40 @@ def _fmt_minutes(job: JobView) -> str:
     return "--" if job.minutes is None else f"{job.minutes:.1f}m"
 
 
+def owned_gpus(payload: dict[str, Any], entry: HostEntry) -> tuple[list[str], dict[str, int]]:
+    """The host's resolved cards, falling back to what it was configured with.
+
+    A host running a build from before the resolution existed reports only
+    `gpus`, which on that build could only ever have been UUIDs.
+    """
+    owned: list[str] = []
+    indices: dict[str, int] = {}
+    for row in payload.get("gpus_resolved") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("uuid"), str):
+            continue
+        uuid = row["uuid"]
+        owned.append(uuid)
+        index = _as_int(row.get("index"))
+        if index is not None:
+            indices[uuid] = index
+    if owned or payload.get("gpus_resolved") is not None:
+        return owned, indices
+    return [g for g in (payload.get("gpus") or entry.gpus) if isinstance(g, str)], indices
+
+
 def _gpu_lines(view: HostView) -> list[str]:
-    """One line per owned card: what it is, and who has it right now."""
+    """One line per owned card: which one it is, what it is, and who has it."""
     lines: list[str] = []
-    for name, vram, uuid in gpu_rows(view.owned, view.entry.gpu_info):
+    for index, name, vram, uuid in gpu_rows(view.owned, view.entry.gpu_info, view.indices):
         holder = view.gpu_holder(uuid)
         lines.append(
-            f"  gpu     {name} {vram}".rstrip()
+            f"  gpu     [{index}] {name} {vram}".rstrip()
             + f"  {uuid}  {f'busy {holder}' if holder else 'free'}"
+        )
+    for missing in view.unavailable:
+        lines.append(
+            f"  gpu     [{missing}] UNAVAILABLE  nvidia-smi does not report this card on the "
+            f"host, so nothing is dispatched to it"
         )
     return lines
 
@@ -369,6 +483,11 @@ def render(
     pod = pod_line(view.pod)
     if pod:
         lines.append(pod + ("  PAST TTL" if view.past_ttl else ""))
+    # Where the per-job body starts. The header, the gpu lines and the pod line
+    # are about the host, not about what is on it, so "nothing here" has to be
+    # measured from here -- a host with GPUs printed neither `idle` nor `no
+    # suspects` while this was compared against the whole list.
+    body_start = len(lines)
 
     if suspects_only:
         for job in view.suspects:
@@ -378,7 +497,7 @@ def render(
             )
         if view.past_ttl:
             lines.append(f"  SUSPECT pod for host {entry.name} is older than {entry.ttl_hours}h")
-        if len(lines) == 1:
+        if len(lines) == body_start:
             lines.append("  no suspects")
         return "\n".join(lines)
 
@@ -425,7 +544,7 @@ def render(
             f"  disk    {human_bytes(leftover)} still in {len(held)} finished job workdir(s); "
             f"free it with: gpuc clean --host {entry.name} --all-finished"
         )
-    if len(lines) == 1:
+    if len(lines) == body_start:
         lines.append("  idle; nothing queued, running or finished")
     return "\n".join(lines)
 
@@ -469,12 +588,14 @@ def gpu_json(view: HostView) -> list[dict[str, Any]]:
         info = view.entry.gpu_info.get(uuid) or GpuInfo()
         out.append(
             {
+                "index": view.indices.get(uuid, info.index),
                 "uuid": uuid,
                 "name": info.name,
                 "vram_mib": info.vram_mib,
                 "busy_job": view.gpu_holder(uuid),
             }
         )
+    out += [{"owned_as": item, "available": False} for item in view.unavailable]
     return out
 
 

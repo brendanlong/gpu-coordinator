@@ -48,6 +48,20 @@ over, it adopts the jobs that are already running from their `state.json` --
 it never re-launches or kills them. Only the dispatcher is ever replaced,
 never a runner.
 
+`gpuc submit` and `gpuc requeue` do the same package re-sync themselves when
+the host they are about to enqueue on is not on this commit -- including a host
+with no commit recorded at all, which means it was bootstrapped by a build old
+enough not to write one. They print one line when they do:
+
+```
+host spar has gpuc a1b2c3d4e5f6 and this machine has 9f8e7d6c5b4a: re-syncing the
+package and restarting the dispatcher before enqueueing
+```
+
+Only the package and the dispatcher, never the full health check -- uv and the
+interpreter cannot have gone stale, and the job is waiting. `--no-bootstrap`
+skips it and enqueues on whatever the host has.
+
 Two sessions on different builds are fine as long as both are recent: every
 file the two sides share (`hosts.json`, `~/.gpuc/config.json`, specs, state)
 is read with unknown keys ignored and a `null` for a non-optional field taken
@@ -74,10 +88,10 @@ without it they fail immediately with one line rather than part-way through.
 ## Commands
 
 ```
-gpuc host add <name> [--ssh user@host] [--port N] [--gpus UUID,..] [--gpuc-home PATH]
+gpuc host add <name> [--ssh user@host] [--port N] [--gpus UUID|INDEX,..] [--gpuc-home PATH]
                      [--persistent-root PATH] [--env K=V] [--cache-dir PATH]
                      [--s3-prefix s3://..] [--retention-days N] [--idle-min N] [--ttl-hours N]
-gpuc host set <name> [--gpus UUID,..] [--persistent-root PATH] [--gpuc-home PATH]
+gpuc host set <name> [--gpus UUID|INDEX,..] [--persistent-root PATH] [--gpuc-home PATH]
                      [--env K=V] [--cache-dir PATH] [--s3-prefix s3://..]
                      [--retention-days N] [--idle-min N] [--ttl-hours N]
 gpuc host bootstrap <name> [--health-args "..."]     # idempotent; also restarts the dispatcher
@@ -85,6 +99,7 @@ gpuc host probe <name>                               # driver, GPUs+UUIDs, disk+
 gpuc host clean <name> --uv-cache                    # `uv cache prune` on the host
 gpuc host list | gpuc host remove <name>             # remove forgets locally; the host is untouched
 gpuc submit <job.yaml|-> --host <name> [--no-git]    # or --runpod ... (flags below)
+           [--no-bootstrap]                          # skip the package re-sync for an older host
 gpuc status [--host H] [--all] [--suspects] [--json]  # --all adds jobs only the index knows
            [--recent N] [--since 24h|7d|90m]         # how much of the finished list to show
 gpuc version                                         # version, this commit, each host's commit
@@ -92,7 +107,8 @@ gpuc logs <job-id> [-f] [-n LINES] [--host H]        # host first, S3 mirror as 
 gpuc ssh <host|job-id> [--print] [-- CMD ...]        # a shell there, or one command; --print shows the line
 gpuc cancel <job-id> [--host H]
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]   # free finished workdirs
-gpuc clean --host H --purge [--older-than DAYS] [--verify] [--force] [--dry-run]  # whole job dirs
+gpuc clean --host H --purge [--older-than DAYS | --all-finished --yes] [--verify] [--force]
+                            [--dry-run]                               # whole job dirs
 gpuc reorder <job-id> --priority N [--host H]        # queued jobs only
 gpuc requeue <job-id> [--host H | --runpod ...] [--no-git]   # re-reads the spec from S3, attempt+1
 gpuc reconcile [--once] [--interval S] [--install]
@@ -103,11 +119,14 @@ gpuc config init [--force] | gpuc config show
 `gpuc ssh` is the hand-operated version of the transport: the key, port,
 `known_hosts` and ControlMaster socket gpuc uses are not in your `~/.ssh/config`,
 so `gpuc ssh spar` is the way to get a shell on a host gpuc can reach. A job id
-instead of a host name lands in that job's `workdir/` (its job dir if the
-workdir was cleaned). With a command after `--` it runs non-interactively and
-propagates the exit code; `--print` only prints the equivalent command line.
-`local` gets your own `$SHELL` in the directory, with no ssh at all. An unknown
-host or job is exit 4.
+instead of a host name lands in that job's `workdir/`, falling back to the job
+dir itself if the workdir was cleaned -- for the interactive shell, for `--
+CMD`, and for `--print` alike. The words after `--` are joined with spaces and
+run by a login `bash` in that directory, exactly as `ssh host CMD` does, so
+`gpuc ssh <job-id> -- 'ls | wc -l'` is a pipeline and not a filename; gpuc exits
+with the remote command's own exit code. `--print` only prints the equivalent
+command line. `local` gets your own `$SHELL` in the directory, with no ssh at
+all. An unknown host or job is exit 4.
 
 `--host` is optional on `logs`, `cancel` and `reorder`: the local job index is
 tried first, then every registered host is asked whether it knows the id.
@@ -187,11 +206,20 @@ would drop everything else about the entry. Only the flags you pass change;
 `--gpus ''` hands every card back. Nothing on the host changes until the next
 `gpuc host bootstrap <name>`.
 
+`--gpus` takes nvidia-smi indices, UUIDs, or a mix: `--gpus 2,3` is how a share
+of a shared box is usually agreed and is what you read off `nvidia-smi`, and it
+is stored exactly as you typed it. The host re-resolves the indices to UUIDs on
+every dispatch pass and pins jobs with `CUDA_VISIBLE_DEVICES=<uuid>`, so a
+driver that renumbers the cards moves your job to the right one instead of
+quietly handing it somebody else's. An owned card the host cannot see is
+reported by `gpuc status` as `UNAVAILABLE` and by `gpuc host bootstrap`'s
+`gpu_uuids` check; jobs wait for it rather than failing.
+
 ## Quick start: local
 
 ```sh
-nvidia-smi --query-gpu=index,uuid --format=csv     # pick the UUIDs to hand over
-gpuc host add local --gpus GPU-2a4bad3b-...
+nvidia-smi --query-gpu=index,uuid --format=csv     # pick the cards to hand over
+gpuc host add local --gpus GPU-2a4bad3b-...        # or --gpus 0
 gpuc host bootstrap local
 gpuc submit job.example.yaml --host local
 gpuc status
@@ -202,7 +230,7 @@ gpuc cancel <jobid>
 ## Quick start: a shared SSH box
 
 ```sh
-gpuc host add spar --ssh me@spar --port 22 --gpus GPU-aaa,GPU-bbb
+gpuc host add spar --ssh me@spar --port 22 --gpus 2,3   # or the two UUIDs
 gpuc host probe spar        # driver, every GPU as `[index] UUID name`, disk, systemd --user, network speed
                             # and whether $HOME is on an overlay (see below)
 gpuc host bootstrap spar
@@ -214,12 +242,12 @@ bootstrapped, so a registry of UUIDs is readable at a glance:
 
 ```
 spar   ssh   spar_cluster   gpus=2 (2x NVIDIA A40 45 GB, driver 580.65.06) python=... bootstrapped=...
-  NVIDIA A40                   45 GB   GPU-80646905-50a9-afc1-4375-43ca475b15e4
-  NVIDIA A40                   45 GB   GPU-83123e65-fe58-7831-6b21-1814b07c25f7
+  [0] NVIDIA A40                   45 GB   GPU-80646905-50a9-afc1-4375-43ca475b15e4
+  [1] NVIDIA A40                   45 GB   GPU-83123e65-fe58-7831-6b21-1814b07c25f7
 
 host spar [ssh] spar_cluster  dispatcher 2s ago  gpus 1/2 free (2x NVIDIA A40 45 GB, driver 580.65.06)
-  gpu     NVIDIA A40 45 GB  GPU-80646905-...  busy 20260915-195133-be2d4a
-  gpu     NVIDIA A40 45 GB  GPU-83123e65-...  free
+  gpu     [0] NVIDIA A40 45 GB  GPU-80646905-...  busy 20260915-195133-be2d4a
+  gpu     [1] NVIDIA A40 45 GB  GPU-83123e65-...  free
 ```
 
 Run `probe` **before** `host add` if you do not know the UUIDs: it prints every
@@ -367,8 +395,9 @@ enforces it — past the cap it stops the running job with reason `ttl`, lets th
 runner sync its outputs, then drains and terminates — and the reaper enforces it
 as a backstop from the provider's own `createdAt`. `gpuc submit --runpod`
 refuses a job whose `max_runtime_min` is longer than the TTL you asked for,
-rather than letting the TTL kill it halfway. `gpuc host set <host> --ttl-hours
--1` takes a cap back off.
+rather than letting the TTL kill it halfway. `--ttl-hours -1` means "no cap" --
+on `host add` and `host set` alike, since a stored `-1` would be a host that is
+already past its TTL and terminated on the next reaper pass.
 
 **What stops a forgotten pod instead.** `gpuc reconcile` terminates a
 bootstrapped pod whose dispatcher heartbeat has been dead — or whose ssh has not
@@ -525,7 +554,13 @@ gpuc clean --host spar --purge --dry-run              # default: ended over 7 da
 gpuc clean --host spar --purge --older-than 30        # a month instead
 gpuc clean --host spar --purge --older-than 30 --verify   # HEAD each mirrored log first
 gpuc clean --host spar --purge --older-than 0 --force     # delete unmirrored records too
+gpuc clean --host spar --purge --all-finished --yes       # every finished job, no age horizon
 ```
+
+`--purge --all-finished` is an age horizon of zero: it deletes the job dir of
+something that ended a minute ago, log and state included. It needs `--yes`
+(or `--dry-run`, which lists the candidates and deletes nothing), and says
+`purging every finished job (horizon 0)` when it runs.
 
 **The precondition: it must be backed up.** After a job's last upload, the
 runner writes `meta_synced_at` and `meta_synced_to` into `state.json` — set
@@ -657,9 +692,11 @@ dropped rather than sent. One line says what happened:
 syncing 43 files (2 modified, 1 untracked, ignoring .gitignore'd)
 ```
 
-`uncommitted.patch` in the job dir is `git diff HEAD` taken against a copy of
-the index with `git add -N` applied, so it contains your untracked files too and
-your real staging area is never touched.
+`uncommitted.patch` in the job dir is `git diff HEAD -- .` taken against a copy
+of the index with `git add -N` applied, so it contains your untracked files too
+and your real staging area is never touched. The `-- .` is what keeps a submit
+from a subdirectory of a repository to the changes that directory actually
+carries.
 
 For a directory that is not a repository at all, `--no-git` rsyncs all of it
 except `.venv`, `__pycache__`, `.git`, `*.pyc`, `node_modules` and `.uv-cache`,
@@ -686,7 +723,10 @@ so model downloads and compiles in `setup` can never look idle. After
 `grace_min` minutes of `main`, if the rolling mean over `window_min` is below
 `floor_pct`, the job's whole process group gets SIGTERM, then SIGKILL 15 s
 later, and the job is `failed: low-util`. `gpuc status --suspects` shows jobs
-that are heading that way and never kills anything.
+that are heading that way and never kills anything: it reads each job's own
+`low_util` settings, so a job that raised its floor or set `enabled: false` is
+judged by what it asked for -- and is never listed as a suspect for a kill that
+is not coming.
 
 `gpuc cancel` writes a marker the runner sees; the runner kills the job's
 process group (SIGTERM, 15 s, SIGKILL), runs the final sync, and records

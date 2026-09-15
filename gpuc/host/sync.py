@@ -81,11 +81,10 @@ def run_command(
 
 
 def _host_label() -> str:
-    from gpuc.host.jobs import read_config
-
+    """The host name for an error message, never a second failure."""
     try:
-        return read_config().host
-    except Exception:
+        return jobs.read_config().host
+    except (RuntimeError, OSError, ValueError):
         return "unknown-host"
 
 
@@ -145,10 +144,7 @@ def exclude_args(flag: str, root: Path, min_age_s: float) -> list[str]:
             f"{len(names)} files under {root} were modified in the last {min_age_s:g}s "
             f"(cap {MAX_EXCLUDES}); skipping this sync tick"
         )
-    args: list[str] = []
-    for name in names:
-        args += [flag, name]
-    return args
+    return _named_excludes(flag, names)
 
 
 def sync_dir_to_s3(
@@ -229,10 +225,6 @@ def _named_excludes(flag: str, names: Sequence[str]) -> list[str]:
     return args
 
 
-def resolve_local(output: Output, workdir: Path, job_id: str) -> Path:
-    return workdir / output.path.format(job_id=job_id)
-
-
 def sync_output(
     output: Output,
     workdir: Path,
@@ -244,7 +236,7 @@ def sync_output(
     env: Env = None,
     baseline_entries: baseline.Entries | None = None,
 ) -> None:
-    local = resolve_local(output, workdir, job_id)
+    local = workdir / output.path.format(job_id=job_id)
     entries = baseline_entries or {}
     # Files that were in the checkout and have not been touched are not this
     # job's output; uploading them would publish the last run's results under

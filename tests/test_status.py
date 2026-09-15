@@ -5,7 +5,15 @@ from typing import Any, cast
 
 from gpuc.control.config import HostEntry
 from gpuc.control.providers.base import Pod
-from gpuc.control.status import HostView, JobView, gather, host_json, job_views, render
+from gpuc.control.status import (
+    HostView,
+    JobView,
+    gather,
+    host_json,
+    job_views,
+    owned_gpus,
+    render,
+)
 
 GPU = "GPU-a"
 
@@ -65,6 +73,37 @@ def test_jobs_are_split_by_status_and_carry_the_queue_priority() -> None:
     assert finished[0].reason == "exit 17"
 
 
+def test_a_host_on_another_build_cannot_break_the_whole_status() -> None:
+    """Every field here is another build's JSON, so none of it is trusted.
+
+    One host answering with a string heartbeat used to raise out of `render`
+    and take every other host's status with it.
+    """
+    document = payload(
+        dispatcher_heartbeat_age_s="2.0",
+        queue=[{"job_id": "j-queued"}, {"priority": 3}, "nonsense"],
+        jobs=[
+            {"name": "no id at all", "status": "running"},
+            {
+                "job_id": "j-running",
+                "status": "running",
+                "phase": "main",
+                "gpus": [GPU],
+                "util_recent": [None, "90", 90.0],
+            },
+        ],
+    )
+    queued, running, finished = job_views(document)
+    assert (queued, finished) == ([], [])
+    assert [j.job_id for j in running] == ["j-running"]
+    assert running[0].priority is None
+    assert running[0].util_recent == [90.0]
+
+    host_view = HostView(entry=HostEntry(name="spar", kind="ssh", ssh="me@box"), reachable=True)
+    host_view.queue, host_view.running, host_view.finished = queued, running, finished
+    assert "dispatcher DOWN" in render(host_view)
+
+
 def test_free_gpus_exclude_the_ones_a_running_job_holds() -> None:
     assert view().free == ["GPU-b"]
 
@@ -73,17 +112,70 @@ def test_a_busy_job_is_not_a_suspect() -> None:
     assert view().suspects == []
 
 
-def test_ten_minutes_of_floor_utilization_in_main_is_a_suspect() -> None:
+def test_a_full_window_of_floor_utilization_in_main_is_a_suspect() -> None:
     idle = view()
-    idle.running[0].util_recent = [0.0] * 25
+    idle.running[0].util_recent = [0.0] * 40
     assert [j.job_id for j in idle.suspects] == ["j-running"]
     assert "SUSPECT j-running" in render(idle, suspects_only=True)
+
+
+def test_the_suspect_rule_is_the_jobs_own_low_util_settings() -> None:
+    """The host's watchdog is per job, so `--suspects` has to be too."""
+    off = view()
+    off.running[0].util_recent = [0.0] * 40
+    off.running[0].low_util.enabled = False
+    assert off.suspects == []
+
+    raised = view()
+    raised.running[0].util_recent = [30.0] * 40
+    assert raised.suspects == []
+    raised.running[0].low_util.floor_pct = 50.0
+    assert [j.job_id for j in raised.suspects] == ["j-running"]
+
+    short_window = view()
+    short_window.running[0].util_recent = [0.0] * 6
+    assert short_window.suspects == []
+    short_window.running[0].low_util.window_min = 1.0
+    short_window.running[0].low_util.grace_min = 1.0
+    assert [j.job_id for j in short_window.suspects] == ["j-running"]
+
+
+def test_low_util_settings_come_from_the_hosts_payload() -> None:
+    running = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j",
+                    "status": "running",
+                    "phase": "main",
+                    "gpus": [GPU],
+                    "util_recent": [0.0] * 40,
+                    "low_util": {"enabled": False},
+                }
+            ]
+        )
+    )[1]
+    assert running[0].low_util.enabled is False
+    assert running[0].suspect is False
+
+
+def test_the_idle_and_no_suspect_lines_survive_gpu_and_pod_lines() -> None:
+    """The "nothing here" lines are about the jobs, not about the host block.
+
+    A host with GPUs (every real host) printed neither, because the sentinel
+    compared against the whole rendered block rather than the job body.
+    """
+    empty = view(jobs=[], queue=[])
+    empty.pod = Pod(id="pod1", name="gpuc-x", status="RUNNING", cost_usd_hr=0.4)
+    assert "  gpu     " in render(empty)
+    assert "idle; nothing queued, running or finished" in render(empty)
+    assert "no suspects" in render(empty, suspects_only=True)
 
 
 def test_a_long_setup_phase_is_never_a_suspect() -> None:
     setup = view()
     setup.running[0].phase = "setup"
-    setup.running[0].util_recent = [0.0] * 25
+    setup.running[0].util_recent = [0.0] * 40
     assert setup.suspects == []
     assert "no suspects" in render(setup, suspects_only=True)
 
@@ -332,3 +424,34 @@ def test_a_lost_output_says_so_louder() -> None:
     view = HostView(entry=HostEntry(name="pod", kind="runpod"), reachable=True)
     view.queue, view.running, view.finished = job_views(document)
     assert "OUTPUTS LOST" in render(view)
+
+
+def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
+    """`config.gpus` may name cards by index, and only the host knows today's
+    numbering -- so free/busy, and the per-card lines, come from its answer."""
+    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", gpus=["0", "7"])
+    host_view = HostView(entry=entry, reachable=True, heartbeat_age_s=2.0)
+    host_view.owned, host_view.indices = owned_gpus(
+        payload(
+            gpus=["0", "7"],
+            gpus_resolved=[{"index": 0, "uuid": GPU}],
+            gpus_unavailable=["7"],
+        ),
+        entry,
+    )
+    host_view.unavailable = ["7"]
+    host_view.queue, host_view.running, host_view.finished = job_views(payload())
+
+    assert host_view.owned == [GPU]
+    assert host_view.free == []
+    text = render(host_view)
+    assert "gpu     [0] ?" in text and GPU in text
+    assert "gpu     [7] UNAVAILABLE" in text
+    assert host_json(host_view)["gpus"][-1] == {"owned_as": "7", "available": False}
+
+
+def test_a_host_from_before_the_resolved_table_still_reports_its_gpus() -> None:
+    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
+    owned, indices = owned_gpus(payload(), entry)
+    assert owned == [GPU, "GPU-b"]
+    assert indices == {}

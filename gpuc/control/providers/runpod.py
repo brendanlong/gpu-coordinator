@@ -23,7 +23,6 @@ from .base import (
     Provider,
     ProviderError,
     SshEndpoint,
-    check_caps,
     cuda_key,
 )
 
@@ -198,7 +197,10 @@ class RunPodProvider(Provider):
     ) -> Pod:
         if not name.startswith(self.caps.prefix):
             raise ProviderError(f"pod name {name!r} must start with {self.caps.prefix!r}")
-        check_caps(self.caps, self.list(), offer.price_usd_hr)
+        # Caps are checked by `provision._create_and_record` under the state
+        # lock, which is the only place the check means anything across
+        # concurrent sessions; a second unlocked check here is one more `GET
+        # /pods` that two racing creates would both pass anyway.
         gpu: dict[str, Any] = {"id": offer.gpu_id, "count": gpu_count}
         if cuda_min is not None:
             gpu["minCudaVersion"] = cuda_min

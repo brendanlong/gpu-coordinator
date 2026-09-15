@@ -82,6 +82,58 @@ def driver_version(smi: SmiRunner = run_nvidia_smi) -> str:
     return rows[0][0]
 
 
+def index_uuids(smi: SmiRunner = run_nvidia_smi) -> dict[str, str]:
+    """`{index: uuid}`, as nvidia-smi numbers this host's cards right now."""
+    return {str(gpu.index): gpu.uuid for gpu in list_gpus(smi)}
+
+
+def is_index(entry: str) -> bool:
+    """Is this owned entry an nvidia-smi index rather than a UUID?"""
+    return entry.isdigit()
+
+
+def resolve_owned(
+    owned: Sequence[str], smi: SmiRunner = run_nvidia_smi
+) -> tuple[list[str], list[str]]:
+    """Owned entries -> (the UUIDs that are on this host, the entries that are not).
+
+    Ownership on a shared box is an agreement written in nvidia-smi numbering
+    -- "you have 2 and 3" -- so an index has to be sayable, and it is stored
+    exactly as it was given. Everything downstream is UUIDs: an index names
+    whichever card the driver is calling 2 *this boot*, and a job pinned with
+    `CUDA_VISIBLE_DEVICES=2` after a renumber would quietly train on somebody
+    else's GPU. So the mapping is redone from the host each dispatch pass, and
+    an entry that does not resolve is simply not handed out.
+
+    Owning UUIDs only needs no lookup at all, and does not get one: that is
+    every pod and most boxes, and one nvidia-smi exec per pass for a mapping
+    that is the identity would be pure cost.
+    """
+    entries = list(owned)
+    if not entries or not any(is_index(entry) for entry in entries):
+        return entries, []
+    table = index_uuids(smi)
+    present = set(table.values())
+    resolved: list[str] = []
+    missing: list[str] = []
+    for entry in entries:
+        uuid = table.get(entry) if is_index(entry) else (entry if entry in present else None)
+        if uuid is None:
+            missing.append(entry)
+        elif uuid not in resolved:
+            resolved.append(uuid)
+    return resolved, missing
+
+
+def describe_table(smi: SmiRunner = run_nvidia_smi) -> str:
+    """`0=GPU-..., 1=GPU-...`, for an error that has to say what is here."""
+    try:
+        table = index_uuids(smi)
+    except GpuError as exc:
+        return f"(nvidia-smi could not be read: {exc})"
+    return ", ".join(f"{index}={uuid}" for index, uuid in sorted(table.items())) or "(no GPUs)"
+
+
 def assert_uuids_present(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> None:
     if not uuids:
         return
@@ -106,7 +158,19 @@ def sample_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) ->
 
 
 def mean_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> float:
+    """Mean `utilization.gpu` over `uuids`. No GPUs asked about means 0%.
+
+    Asking about GPUs and getting nothing back is a *failed sample*, not an idle
+    one: reporting 0% there feeds the low-util watchdog a floor-breaking value
+    every tick and kills a perfectly busy job. The runner catches this and
+    records the sample as unknown.
+    """
+    if not uuids:
+        return 0.0
     samples = sample_utilization(uuids, smi)
     if not samples:
-        return 0.0
+        raise GpuError(
+            f"nvidia-smi reported no utilization for any of {', '.join(uuids)}; "
+            f"treating this as a failed sample rather than 0% util"
+        )
     return sum(samples.values()) / len(samples)

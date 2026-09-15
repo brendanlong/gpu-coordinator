@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from gpuc.control.s3index import (
     LocalIndex,
     S3Index,
     S3IndexError,
+    S3ObjectMissing,
     default_s3_prefix,
     job_log_uri,
     split_uri,
@@ -63,8 +65,13 @@ def test_a_write_failure_says_what_to_check() -> None:
 
 
 def test_missing_key_is_an_error_not_an_empty_spec() -> None:
-    with pytest.raises(S3IndexError, match="NoSuchKey"):
+    # Its own class, so `gpuc requeue` can answer exit 4 (no such job) for a
+    # spec nobody ever mirrored, and exit 1 for an S3 that would not answer.
+    with pytest.raises(
+        S3ObjectMissing, match=re.escape("no object at s3://bkt/gpuc/specs/nope.json")
+    ):
         S3Index("bkt", FakeS3Client()).get_spec("nope")
+    assert issubclass(S3ObjectMissing, S3IndexError)
 
 
 def test_log_fallback_uri_matches_what_the_host_uploads() -> None:

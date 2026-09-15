@@ -74,6 +74,25 @@ def test_table_marks_undesired_pods_and_counts_the_rest(
     assert FOREIGN not in "\n".join(lines[:3])
 
 
+def test_two_pods_that_compare_equal_are_still_told_apart(control_env: Path) -> None:
+    """Ours and theirs are separated by pod id, not by object equality: two
+    pods with the same fields would otherwise hide each other from the table."""
+    fake = FakeProvider(existing=[running_pod(FOREIGN, "podF"), running_pod(FOREIGN, "podG")])
+    fake.adopt(running_pod("gpuc-e2e-aaa", "pod1"), PodScript(ssh_after_polls=0))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    view = pods_mod.gather(Settings(), fake, heartbeats=False)
+    assert [row.pod.id for row in view.rows] == ["pod1"]
+    assert [pod.id for pod in view.others] == ["podF", "podG"]
+
+
+def test_a_stray_pod_says_when_reconcile_will_take_it(
+    control_env: Path, provider: FakeProvider
+) -> None:
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
+    assert "terminates them once they are over 15 min old" in text
+
+
 def test_unreadable_desired_state_is_a_note_not_a_crash(
     control_env: Path, provider: FakeProvider
 ) -> None:

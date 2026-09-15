@@ -114,4 +114,3 @@ def test_state_round_trips_the_new_identity_and_sync_fields(gpuc_home: Path) -> 
     )
     jobs.write_state("j1", state)
     assert jobs.read_state("j1") == state
-    assert jobs.PHASES == ("setup", "preflight", "main", "sync")

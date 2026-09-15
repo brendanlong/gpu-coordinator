@@ -233,8 +233,6 @@ class SubmitResult:
     job_id: str
     host: str
     attempt: int
-    files: int
-    spec_uri: str | None = None
     notes: list[str] = field(default_factory=list)
 
     def render(self) -> str:
@@ -254,7 +252,11 @@ def preexisting_output_warnings(spec: JobSpec, workdir: Path) -> list[str]:
     """
     warnings: list[str] = []
     for output in spec.outputs:
-        root = workdir / output.path.format(job_id=spec.job_id)
+        # The raw `path`, exactly as the spec wrote it and as the host records
+        # its baseline: formatting `{job_id}` in here would ask about a
+        # directory this job has not created yet, and would raise on any other
+        # placeholder the path happens to contain.
+        root = workdir / output.path
         if not root.exists():
             continue
         count = sum(1 for path in root.rglob("*") if path.is_file()) if root.is_dir() else 1
@@ -274,11 +276,12 @@ def push_workdir(
     *,
     use_git: bool = True,
     report: Reporter = print,
-) -> int:
+) -> None:
     remote = f"{session.job_dir(job_id)}/workdir"
     session.transport.run(f'mkdir -p "{remote}"', check=True)
     if not use_git:
-        return _push_without_git(session, job_id, workdir, remote, report)
+        _push_without_git(session, job_id, workdir, remote, report)
+        return
     try:
         summary = git_summary(workdir)
     except TransportError as exc:
@@ -298,12 +301,11 @@ def push_workdir(
         f"{session.job_dir(job_id)}/source.json",
         0o644,
     )
-    return len(summary.files)
 
 
 def _push_without_git(
     session: HostSession, job_id: str, workdir: Path, remote: str, report: Reporter
-) -> int:
+) -> None:
     """`--no-git`: rsync the directory, minus the things that are always junk.
 
     Loud, because nothing here can tell a 40 GB dataset from a checkpoint
@@ -321,7 +323,6 @@ def _push_without_git(
         f"{session.job_dir(job_id)}/source.json",
         0o644,
     )
-    return sum(1 for path in workdir.rglob("*") if path.is_file())
 
 
 def enqueue_spec(session: HostSession, spec: JobSpec) -> dict[str, Any]:
@@ -348,6 +349,7 @@ def submit_spec(
     job_id: str | None = None,
     local_index: LocalIndex | None = None,
     s3: S3Index | None = None,
+    spec_uri: str | None = None,
     use_git: bool = True,
     report: Reporter = print,
 ) -> SubmitResult:
@@ -368,7 +370,7 @@ def submit_spec(
         notes.append(warning)
 
     session = session or open_session(entry, settings, transport)
-    files = push_workdir(session, spec.job_id, workdir, use_git=use_git, report=report)
+    push_workdir(session, spec.job_id, workdir, use_git=use_git, report=report)
     report(f"synced to {session.job_dir(spec.job_id)}/workdir")
 
     if secrets_body:
@@ -376,13 +378,14 @@ def submit_spec(
         report(f"delivered {len(spec.secrets)} secret(s) as {spec.job_id}.env (0600)")
 
     s3 = s3 if s3 is not None else S3Index.from_settings(settings)
-    spec_uri: str | None = None
     if s3 is None:
         notes.append(
             "s3_bucket is unset, so the spec was not mirrored and `gpuc requeue` "
             "will need --host with the workdir present locally"
         )
-    else:
+    elif spec_uri is None:
+        # `submit --runpod` mirrors the spec *before* it buys a pod, and passes
+        # the uri back in; the same object twice is a wasted round trip.
         try:
             spec_uri = s3.put_spec(spec)
         except S3IndexError as exc:
@@ -409,14 +412,7 @@ def submit_spec(
             "the host reported no dispatcher pid; run `gpuc host bootstrap` if the job stays queued"
         )
 
-    return SubmitResult(
-        job_id=spec.job_id,
-        host=entry.name,
-        attempt=attempt,
-        files=files,
-        spec_uri=spec_uri,
-        notes=notes,
-    )
+    return SubmitResult(job_id=spec.job_id, host=entry.name, attempt=attempt, notes=notes)
 
 
 def submit_file(

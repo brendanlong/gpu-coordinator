@@ -8,13 +8,16 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.config import (
+    ConfigError,
     DesiredHost,
     HostEntry,
     Settings,
     desired_dir,
     desired_file,
     load_registry,
+    read_desired,
     registry_transaction,
+    state_lock,
     write_desired,
 )
 from gpuc.control.providers.base import Caps, ProviderError
@@ -102,6 +105,59 @@ def test_terminated_pod_is_forgotten_with_its_jobs(control_env: Path) -> None:
     assert load_registry().hosts == {}
     assert any("20260915-1 (train)" in line for line in reports)
     assert any("gpuc requeue" in line for line in reports)
+
+
+def test_the_state_lock_is_not_held_across_probes_and_terminates(control_env: Path) -> None:
+    """A pass must not starve a concurrent `gpuc submit --runpod`.
+
+    The liveness probe waits up to 20 s per host and a terminate polls for up
+    to five minutes; submit gives up on the lock after 120 s, and a create that
+    cannot write `desired/` is a leaked, billing pod.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1"))
+    desire("gpuc-a-111", "pod1", created_hours_ago=2.0)
+    free: list[str] = []
+
+    def note_if_free(label: str) -> None:
+        try:
+            with state_lock(timeout_s=0.05):
+                free.append(label)
+        except ConfigError:
+            pass
+
+    terminate = provider.terminate
+
+    def watched(pod_id: str) -> None:
+        note_if_free("terminate")
+        terminate(pod_id)
+
+    provider.terminate = watched  # type: ignore[method-assign]
+
+    def probe(host: DesiredHost, settings: Settings) -> Liveness:
+        note_if_free("liveness")
+        return Liveness(reachable=False)
+
+    result = reconcile_once(Settings(), provider, lambda _: None, liveness=probe)
+    assert result.terminated == ["gpuc-a-111"]
+    assert free == ["liveness", "terminate"]
+
+
+def test_a_record_written_while_the_pass_was_probing_is_not_clobbered(control_env: Path) -> None:
+    """The copy this pass read is minutes and several ssh calls old."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1"))
+    desire("gpuc-a-111", "pod1")
+
+    def probe(host: DesiredHost, settings: Settings) -> Liveness:
+        current = read_desired("gpuc-a-111")
+        assert current is not None
+        write_desired(current.model_copy(update={"image": "written:by-another-session"}))
+        return Liveness(reachable=True, heartbeat_age_s=5.0)
+
+    reconcile_once(Settings(), provider, lambda _: None, liveness=probe)
+    current = read_desired("gpuc-a-111")
+    assert current is not None
+    assert current.image == "written:by-another-session"
+    assert current.last_seen_at
 
 
 def test_missing_pod_says_host_gone(control_env: Path) -> None:

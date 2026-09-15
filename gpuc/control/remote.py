@@ -44,10 +44,6 @@ class HostSession:
     python: str
 
     @property
-    def pkg_dir(self) -> str:
-        return f"{self.home}/pkg"
-
-    @property
     def env(self) -> dict[str, str]:
         return self.entry.job_env()
 

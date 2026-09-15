@@ -79,10 +79,9 @@ def phase_argv(command: str, unit: str | None) -> list[str]:
     any shell script written inline. The base64 alphabet has no `$`, and `$1`
     is digit-led, which systemd leaves alone.
     """
-    script = f"set -eo pipefail\n{command}\n"
     if unit is None:
         return ["bash", "-eo", "pipefail", "-c", command]
-    payload = base64.b64encode(script.encode()).decode()
+    payload = base64.b64encode(f"set -eo pipefail\n{command}\n".encode()).decode()
     return [
         "systemd-run",
         "--user",
@@ -104,7 +103,3 @@ def phase_argv(command: str, unit: str | None) -> list[str]:
 def stop_unit(unit: str, *, timeout: float = STOP_TIMEOUT_S + 15.0) -> bool:
     """cgroup-kill the whole tree. False means systemctl could not do it."""
     return _run(["systemctl", "--user", "stop", unit], timeout) == 0
-
-
-def unit_active(unit: str, *, timeout: float = 15.0) -> bool:
-    return _run(["systemctl", "--user", "is-active", "--quiet", unit], timeout) == 0

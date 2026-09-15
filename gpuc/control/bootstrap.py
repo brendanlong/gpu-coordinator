@@ -196,6 +196,11 @@ def sync_package(transport: Transport, home: str, report: Reporter) -> int:
             f"found no gpuc/*.py files to ship from {package_root()}; "
             f"run bootstrap from a checkout of the repository."
         )
+    # Removed first, not merged into: rsync of a file list only ever adds, so a
+    # module deleted upstream would stay on the host and keep being imported --
+    # this build's code calling last week's module is the hardest kind of wrong
+    # to see from here.
+    transport.run(f'rm -rf "{home}/pkg/gpuc"', check=True)
     transport.run(f'mkdir -p "{home}/pkg"', check=True)
     report(f"rsyncing {len(files)} package files to {home}/pkg")
     transport.rsync(package_root(), f"{home}/pkg", files)
@@ -401,6 +406,33 @@ def start_dispatcher(session: HostSession) -> int:
     return int(pid)
 
 
+def resync_package(
+    entry: HostEntry,
+    settings: Settings | None = None,
+    *,
+    transport: Transport | None = None,
+    report: Reporter = print,
+) -> HostEntry:
+    """Ship this build's package to a host and start the dispatcher again.
+
+    The half of bootstrap that goes stale. uv, the interpreter and the upload
+    CLIs cannot have changed since the host was bootstrapped, and health takes
+    minutes, so `gpuc submit` re-runs only this before it enqueues: a host
+    still running last week's package would otherwise dispatch the job with
+    code that no longer matches the spec this machine just wrote.
+
+    Returns the entry with the shipped commit recorded; the caller persists it.
+    """
+    transport = transport or transport_for(entry, settings)
+    home = resolve_home(transport, entry)
+    sync_package(transport, home, report)
+    updated = entry.model_copy(update={"pkg_commit": local_commit()})
+    session = HostSession(updated, transport, home, updated.python or "")
+    write_host_config(session, updated)
+    start_dispatcher(session)
+    return updated
+
+
 def bootstrap_host(
     entry: HostEntry,
     settings: Settings | None = None,
@@ -477,12 +509,12 @@ def bootstrap_host(
     gpu_info = discover(transport) or entry.gpu_info
     if entry.gpus:
         report(f"gpus: {summarize(entry.gpus, gpu_info)}")
+    # `cache_dir` and `pkg_commit` are already on `entry`: they are decided
+    # before the host's config.json is written, because that file carries them.
     updated = entry.model_copy(
         update={
             "uv": uv,
             "python": python,
-            "cache_dir": cache_dir,
-            "pkg_commit": commit,
             "gpu_info": gpu_info,
             "driver_version": driver_version(health) or entry.driver_version,
             "bootstrapped_at": utc_now(),

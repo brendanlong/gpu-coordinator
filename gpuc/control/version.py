@@ -15,7 +15,7 @@ from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
 
 import gpuc
-from gpuc._version import __version__
+from gpuc._version import __version__ as __version__
 
 DIST_NAME = "gpu-coordinator"
 SHORT = 12
@@ -101,6 +101,21 @@ def same_commit(local: str | None, host: str | None) -> bool:
     return local.startswith(host) or host.startswith(local)
 
 
+def needs_package_sync(local: str | None, host: str | None) -> bool:
+    """Should this host be shipped the package again before it runs anything?
+
+    Stricter than `same_commit` in one place that matters: a host with *no*
+    recorded commit counts as out of date. Those are the hosts bootstrapped by
+    a build old enough not to record one, so they are running the oldest code
+    of all -- treating "unknown" as "probably fine" is how a job ends up
+    dispatched by last month's runner. An unknown *local* commit is different:
+    nothing can be compared and nothing would be recorded, so it is left alone.
+    """
+    if not local:
+        return False
+    return not host or not same_commit(local, host)
+
+
 def stale_host_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
     if same_commit(local, host_commit):
         return None
@@ -108,7 +123,3 @@ def stale_host_warning(name: str, host_commit: str | None, local: str | None) ->
         f"host {name} runs an older gpuc ({short(host_commit)}, this machine has "
         f"{short(local)}); run gpuc host bootstrap {name}"
     )
-
-
-def describe(commit: str | None) -> str:
-    return f"gpuc {__version__} ({short(commit)})"

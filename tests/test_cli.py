@@ -124,7 +124,7 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
     def fake_submit_spec(entry: HostEntry, model: object, *args: object, **kwargs: object):
         seen["host"] = entry.name
         seen["job_id"] = kwargs["job_id"]
-        return SubmitResult(job_id=str(kwargs["job_id"]), host=entry.name, attempt=1, files=0)
+        return SubmitResult(job_id=str(kwargs["job_id"]), host=entry.name, attempt=1)
 
     monkeypatch.setattr("gpuc.control.cli.runpod_host", fake_runpod_host)
     monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit_spec)
@@ -225,7 +225,7 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
 
     def fake_submit_spec(entry: HostEntry, model: object, *args: object, **kwargs: object):
         seen["attempt"] = kwargs["attempt"]
-        return SubmitResult(job_id="new", host=entry.name, attempt=2, files=0)
+        return SubmitResult(job_id="new", host=entry.name, attempt=2)
 
     monkeypatch.setattr("gpuc.control.cli.runpod_host", fake_runpod_host)
     monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit_spec)
@@ -432,6 +432,24 @@ def test_verify_purges_only_the_jobs_whose_mirror_answers(control_env: Path) -> 
     assert "--only kept" in session.calls[1]
 
 
+def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path) -> None:
+    """`--purge --all-finished --yes` is allowed, and never silent about it."""
+    from gpuc.control.clean import clean_host
+
+    entry = HostEntry(name="spar", kind="ssh", ssh="me@spar", python="/usr/bin/python3")
+    session = StubSession([{"dry_run": False, "purged": [purged_entry("old")], "freed_bytes": 1}])
+    report = clean_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        purge=True,
+        all_finished=True,
+        yes=True,
+    )
+    assert "--older-than 0.0" in session.calls[0]
+    assert "purging every finished job (horizon 0)" in report.render()
+
+
 def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> None:
     client = FakeS3Client()
     entry = HostEntry(name="spar", kind="ssh", ssh="me@spar", python="/usr/bin/python3")
@@ -525,6 +543,119 @@ def test_a_negative_ttl_clears_the_cap(control_env: Path) -> None:
     assert load_registry().hosts["h"].ttl_hours is None
 
 
+def test_submit_reships_the_package_to_a_host_on_another_commit(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A host on older code dispatches the job with code that does not match
+    the spec this machine just wrote."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    main(["host", "add", "spar", "--ssh", "me@box", "--gpus", GPU])
+    _set_host(python="/py", pkg_commit="a" * 40)
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
+    resynced: list[str] = []
+
+    def fake_resync(entry: HostEntry, settings: object = None, **kwargs: object) -> HostEntry:
+        resynced.append(entry.name)
+        return entry.model_copy(update={"pkg_commit": "b" * 40})
+
+    monkeypatch.setattr("gpuc.control.cli.resync_package", fake_resync)
+    monkeypatch.setattr(
+        "gpuc.control.cli.submit_file",
+        lambda *a, **k: SubmitResult(job_id="j", host="spar", attempt=1),
+    )
+
+    assert main(["submit", str(job), "--host", "spar"]) == 0
+    out = capsys.readouterr().out
+    assert resynced == ["spar"]
+    assert sum("re-syncing the package" in line for line in out.splitlines()) == 1
+    assert load_registry().require("spar").pkg_commit == "b" * 40
+
+    # Now the host is on this build, so nothing is shipped.
+    resynced.clear()
+    assert main(["submit", str(job), "--host", "spar"]) == 0
+    assert resynced == []
+
+    # An unrecorded commit counts as different: those hosts are the oldest.
+    _set_host(pkg_commit=None)
+    assert main(["submit", str(job), "--host", "spar", "--no-bootstrap"]) == 0
+    assert resynced == []
+    assert main(["submit", str(job), "--host", "spar"]) == 0
+    assert resynced == ["spar"]
+
+
+def _set_host(**changes: object) -> None:
+    with registry_transaction() as registry:
+        registry.put(registry.require("spar").model_copy(update=changes))
+
+
+def test_a_negative_ttl_on_add_means_no_ttl_not_an_expired_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """-1 stored as a TTL is a host the next reaper pass terminates."""
+    assert main(["host", "add", "h", "--ssh", "me@box", "--ttl-hours", "-1"]) == 0
+    assert load_registry().hosts["h"].ttl_hours is None
+    assert main(["host", "add", "z", "--ssh", "me@box", "--ttl-hours", "0"]) == EXIT_USAGE
+    assert "would expire the host the moment it exists" in capsys.readouterr().err
+
+
+def test_runpod_and_host_together_are_a_usage_error(
+    control_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One picks a host that exists, the other buys one. Not both."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    main(["host", "add", "spar", "--ssh", "me@box", "--gpus", GPU])
+    assert main(["submit", str(job), "--runpod", "--gpu", "A40", "--host", "spar"]) == EXIT_USAGE
+    assert main(["requeue", "job-1", "--host", "spar", "--runpod", "--gpu", "A40"]) == EXIT_USAGE
+
+
+def test_requeue_of_an_unknown_job_is_exit_four(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
+    )
+    main(["host", "add", "spar", "--ssh", "me@box", "--gpus", GPU])
+    assert main(["requeue", "20260101-000000-nosuch", "--host", "spar"]) == EXIT_NOT_FOUND
+    assert "no mirrored spec for job" in capsys.readouterr().err
+
+
+def test_purging_every_finished_job_has_to_be_asked_for_twice(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--purge --all-finished` is an age horizon of 0: it deletes the job dir
+    of something that ended a minute ago, log and all."""
+    main(["host", "add", "spar", "--ssh", "me@box"])
+    assert main(["clean", "--host", "spar", "--purge", "--all-finished"]) == EXIT_USAGE
+    assert "Add --yes to confirm" in capsys.readouterr().err
+
+
 def test_status_filters_have_defaults() -> None:
     args = build_parser().parse_args(["status"])
     assert (args.recent, args.since) == (5, None)
+
+
+def test_host_add_takes_gpu_indices_and_stores_them_as_given(control_env: Path) -> None:
+    """Ownership of part of a shared box is an agreement in nvidia-smi
+    numbering, so resolving it here would freeze this boot's mapping into the
+    registry; the host redoes it every dispatch pass."""
+    assert main(["host", "add", "box", "--ssh", "me@box", "--gpus", f"2,3,{GPU}"]) == 0
+    assert load_registry().require("box").gpus == ["2", "3", GPU]
+
+
+def test_host_add_and_set_refuse_a_gpus_value_that_is_neither(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "box", "--gpus", "A40,2"]) == EXIT_USAGE
+    assert "gpuc host probe" in capsys.readouterr().err
+    assert load_registry().hosts == {}
+
+    assert main(["host", "add", "box", "--gpus", "2"]) == 0
+    assert main(["host", "set", "box", "--gpus", "GPU-a,nonsense"]) == EXIT_USAGE
+    assert load_registry().require("box").gpus == ["2"]

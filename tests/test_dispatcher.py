@@ -15,7 +15,7 @@ from gpuc.host import jobs, paths, queue, sync, terminate
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig
-from tests.conftest import FAKE_GPUS, make_spec
+from tests.conftest import FAKE_GPUS, fake_smi, make_spec
 
 
 class FakeRunnerProcess:
@@ -383,9 +383,16 @@ def test_terminate_is_retried_after_ten_minutes(
     assert dispatcher.should_exit
 
 
-def test_a_failed_final_drain_sync_does_not_terminate(
+def test_a_failed_final_drain_sync_still_terminates(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A mirror we cannot write is not a reason to keep a paid pod alive.
+
+    It used to be: the final sync shared a try with `self_terminate`, so a
+    SyncError read as "terminate failed" and the pod stayed up retrying every
+    ten minutes -- with a fresh heartbeat -- for as long as the credentials
+    stayed broken.
+    """
     monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
     configure_pod(idle_minutes=0.0)
     terminated: list[str] = []
@@ -393,10 +400,11 @@ def test_a_failed_final_drain_sync_does_not_terminate(
     queue.enqueue(make_spec(gpus=1))
     dispatcher.run_once()
     dispatcher.running.clear()
-    queue.list_queued()
     dispatcher.run_once()
-    assert terminated == []
-    assert not paths.draining_file().exists()
+    assert terminated == ["pod-1"]
+    assert paths.draining_file().exists()
+    assert dispatcher.should_exit
+    assert "final state mirror failed" in paths.dispatcher_log().read_text()
 
 
 def test_dispatcher_does_not_launch_while_draining(gpuc_home: Path) -> None:
@@ -783,3 +791,171 @@ def test_a_ttl_kill_is_only_asked_for_once(
     written = paths.kill_file(job_id).stat().st_mtime_ns
     dispatcher.run_once()
     assert paths.kill_file(job_id).stat().st_mtime_ns == written
+
+
+def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_running(
+    gpuc_home: Path,
+) -> None:
+    """State says `running` a line before the spawn, so a spawn that raises
+    used to leave a job nothing was running: no runner pid to miss, no ended_at,
+    and its GPUs handed back while `gpuc status` still showed it live."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, _ = make_dispatcher()
+
+    def refuse(_job_id: str) -> subprocess.Popen[bytes]:
+        raise OSError("fork: Resource temporarily unavailable")
+
+    dispatcher.deps.spawn_runner = refuse
+    dispatcher.run_once()
+
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.exit_code) == ("failed", "spawn-failed", 1)
+    assert state.ended_at and state.phase is None
+    assert dispatcher.running == {}
+    assert dispatcher.free_gpus() == FAKE_GPUS
+    assert "could not spawn a runner" in paths.dispatcher_log().read_text()
+
+
+def test_a_low_util_pause_stops_the_other_jobs_before_it_drains(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Draining while another job runs terminated the pod out from under its
+    runner: no kill marker, no final sync, and the outputs went with it."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    configure_pod(idle_minutes=600.0)
+    terminated: list[str] = []
+    dispatcher, spawned = make_dispatcher(
+        terminate_call=lambda pod, key: terminated.append(pod) or ""
+    )
+    long_job = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
+    dispatcher.run_once()
+    assert long_job in dispatcher.running
+
+    _finish_low_util(dispatcher, spawned)
+    _finish_low_util(dispatcher, spawned)
+
+    assert dispatcher.paused()
+    assert queue.kill_reason(long_job) == "low-util-pause"
+    assert terminated == []
+    assert not paths.draining_file().exists()
+
+    spawned[long_job].finish(status="failed", reason="low-util-pause")
+    dispatcher.run_once()
+    assert terminated == ["pod-1"]
+
+
+def test_a_ttl_kill_the_runner_ignores_is_escalated_then_the_pod_drains(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kill marker is an ask, and a wedged runner never answers it. Without
+    an escalation the TTL'd pod stayed up -- billing, heartbeat fresh -- with
+    the job it was told to stop still running."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    clock = FakeClock()
+    terminated: list[str] = []
+    dispatcher, spawned = make_dispatcher(
+        clock=clock, terminate_call=lambda pod, key: terminated.append(pod) or ""
+    )
+    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
+    dispatcher.run_once()
+    jobs.update_state(job_id, pgid=123456)
+
+    signals: list[tuple[int | None, int]] = []
+    monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
+
+    dispatcher.run_once()
+    assert queue.kill_reason(job_id) == "ttl"
+    assert signals == []
+
+    clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
+    dispatcher.run_once()
+    assert signals[-1] == (123456, signal.SIGKILL)
+
+    clock.advance(1.0)
+    dispatcher.run_once()
+    assert signals[-1] == (spawned[job_id].pid, signal.SIGTERM)
+
+    clock.advance(1.0)
+    dispatcher.run_once()
+    assert signals[-1] == (spawned[job_id].pid, signal.SIGKILL)
+    assert "escalating" in paths.dispatcher_log().read_text()
+
+    spawned[job_id].finish(status="failed", reason="ttl")
+    dispatcher.run_once()
+    assert terminated == ["pod-1"]
+
+
+def test_the_drain_bounds_each_upload_and_skips_sync_preflight_failures(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unbounded upload can hang a billing pod for hours, and a job that
+    failed its sync preflight proved before it ran that these uploads cannot
+    work -- retrying it three times only burns the budget."""
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=0.0)
+    pending = job_with_pending_outputs()
+    hopeless = job_with_pending_outputs()
+    jobs.update_state(hopeless, status="failed", reason="sync-preflight", exit_code=1)
+
+    calls: list[tuple[list[str], float | None]] = []
+
+    def record(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        calls.append((argv, timeout))
+        return sync.CommandResult(argv, 0, "")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.command_runner = record
+    dispatcher.drain_and_terminate("test")
+
+    uploads = [(argv, timeout) for argv, timeout in calls if "s3://bucket/" in " ".join(argv)]
+    assert uploads, "the pending job's outputs should have been retried"
+    assert all(
+        timeout is not None and 0 < timeout <= host_dispatcher.OUTPUT_RETRY_BUDGET_S
+        for _argv, timeout in uploads
+    )
+    assert not any(hopeless in " ".join(argv) for argv, _timeout in uploads)
+    assert jobs.read_state(pending).outputs_synced_at is not None
+    assert jobs.read_state(hopeless).outputs_lost is False
+
+
+# -- a host may own its share of a box by nvidia-smi index ---------------------
+
+
+def configure_indices(owned: list[str]) -> None:
+    jobs.write_config(HostConfig(host="test-host", gpus=owned))
+
+
+def test_gpus_owned_by_index_are_dispatched_as_uuids(gpuc_home: Path) -> None:
+    """Ownership of a shared box is an agreement in nvidia-smi numbering, but a
+    job is always pinned to a UUID: an index is only a name for whichever card
+    the driver is calling 1 today."""
+    configure_indices(["1"])
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi()
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+
+    assert jobs.read_state(job_id).gpus == [FAKE_GPUS[1]]
+    assert dispatcher.owned_gpus() == [FAKE_GPUS[1]]
+    assert dispatcher.free_gpus() == []
+
+
+def test_an_owned_index_the_host_cannot_see_is_not_handed_out(gpuc_home: Path) -> None:
+    configure_indices(["0", "7"])
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi()
+    first = queue.enqueue(make_spec(gpus=1, priority=10))
+    waiting = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher.run_once()
+
+    assert jobs.read_state(first).gpus == [FAKE_GPUS[0]]
+    # Still queued, not failed: the host is configured for two cards and one of
+    # them may well come back; only a spec bigger than the whole host fails.
+    assert jobs.read_state(waiting).status == "queued"
+    assert "does not report" in paths.dispatcher_log().read_text()

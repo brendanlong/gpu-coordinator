@@ -81,3 +81,42 @@ def test_a_short_row_is_a_gpu_error_not_a_crash() -> None:
 def test_mean_utilization_propagates_the_parse_error() -> None:
     with pytest.raises(gpus.GpuError):
         gpus.mean_utilization(["GPU-x"], garbage_smi("[N/A]"))
+
+
+def test_no_samples_for_real_gpus_is_an_error_not_zero_percent() -> None:
+    """0% is a claim about an idle card; "nvidia-smi said nothing" is not.
+
+    Returning 0.0 here fed the low-util watchdog a floor-breaking sample every
+    tick and killed jobs that were perfectly busy.
+    """
+    with pytest.raises(gpus.GpuError, match="failed sample"):
+        gpus.mean_utilization(["GPU-x"], lambda args: "")
+
+
+def test_uuid_ownership_resolves_to_itself_without_asking_nvidia_smi() -> None:
+    """Every pod, and most boxes, own UUIDs: an exec per dispatch pass to look
+    up the identity mapping would be pure cost."""
+
+    def refuse(_args: list[str]) -> str:
+        raise AssertionError("nvidia-smi should not be run for UUID ownership")
+
+    assert gpus.resolve_owned(["GPU-a", "GPU-b"], refuse) == (["GPU-a", "GPU-b"], [])
+    assert gpus.resolve_owned([], refuse) == ([], [])
+
+
+def test_owned_indices_resolve_to_the_uuids_the_driver_reports_now() -> None:
+    smi = fake_smi(["GPU-zero", "GPU-one", "GPU-two"])
+    assert gpus.resolve_owned(["1", "2"], smi) == (["GPU-one", "GPU-two"], [])
+    # A mix, and the same card named twice, is still each card once.
+    assert gpus.resolve_owned(["0", "GPU-zero", "GPU-two"], smi) == (
+        ["GPU-zero", "GPU-two"],
+        [],
+    )
+
+
+def test_an_owned_entry_the_host_cannot_see_is_reported_unavailable() -> None:
+    """A renumbered shared box must cost the cards that moved, not the rest."""
+    smi = fake_smi(["GPU-zero", "GPU-one"])
+    assert gpus.resolve_owned(["0", "7", "GPU-gone"], smi) == (["GPU-zero"], ["7", "GPU-gone"])
+    assert gpus.index_uuids(smi) == {"0": "GPU-zero", "1": "GPU-one"}
+    assert "0=GPU-zero" in gpus.describe_table(smi)
