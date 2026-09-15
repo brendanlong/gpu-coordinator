@@ -5,7 +5,7 @@ from typing import Any, cast
 
 from gpuc.control.config import HostEntry
 from gpuc.control.providers.base import Pod
-from gpuc.control.status import HostView, JobView, gather, job_views, render
+from gpuc.control.status import HostView, JobView, gather, host_json, job_views, render
 
 GPU = "GPU-a"
 
@@ -129,6 +129,27 @@ def test_an_ephemeral_host_past_its_ttl_is_a_suspect() -> None:
     )
     assert old.past_ttl
     assert "older than 1.0h" in render(old, suspects_only=True)
+
+
+def test_the_two_utilizations_say_where_they_came_from() -> None:
+    """The provider's number and the host sampler's legitimately differ; an
+    unlabelled pair of percentages reads as a bug."""
+    pod_view = view()
+    pod_view.entry = HostEntry(name="pod", kind="runpod", pod_id="p1", gpus=[GPU, "GPU-b"])
+    pod_view.pod = Pod(
+        id="p1",
+        name="gpuc-pod",
+        status="RUNNING",
+        cost_usd_hr=0.4,
+        gpu_name="NVIDIA A40",
+        gpu_utils=[71],
+    )
+    text = render(pod_view)
+    assert "provider util 71%" in text
+    assert "util 90% (host)" in text
+    assert host_json(pod_view)["provider_util"] == [71]
+    assert host_json(pod_view)["running"][0]["util"] == 90.0
+    assert host_json(view())["provider_util"] is None
 
 
 def test_null_utilization_samples_are_dropped() -> None:

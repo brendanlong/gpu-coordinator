@@ -6,17 +6,20 @@ only fills in jobs whose host is gone. Never kills anything.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from gpuc.control import version
 from gpuc.control.config import HostEntry, Settings
+from gpuc.control.gpuinfo import GpuInfo, summarize
 from gpuc.control.gpuinfo import rows as gpu_rows
-from gpuc.control.gpuinfo import summarize
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.transport import TransportError
 from gpuc.host.cleanup import human_bytes
+from gpuc.host.jobs import SCHEMA_VERSION
 
 HEARTBEAT_STALE_S = 30.0
 DEAD_POD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
@@ -270,18 +273,27 @@ def gather(
 
 
 def pod_line(pod: Pod | None) -> str | None:
+    """The provider's own view of the pod.
+
+    Its utilization is labelled `provider util` because it is not the number on
+    the running line: that one is the host's nvidia-smi sampler, averaged over
+    the job's own cards. The two legitimately differ -- different sampler,
+    different instant, and a pod may hold cards this host does not own -- and
+    an unlabelled pair of percentages reads as a bug.
+    """
     if pod is None:
         return None
     age = "age ?" if pod.age is None else f"age {pod.age.total_seconds() / 60.0:.0f}m"
     util = ",".join(f"{u}%" for u in pod.gpu_utils) if pod.gpu_utils else "--"
     return (
         f"  pod     {pod.id} {pod.status} {pod.gpu_name or '?'} "
-        f"${pod.cost_usd_hr:.3f}/h cuda {pod.cuda_version or '?'} {age} util {util}"
+        f"${pod.cost_usd_hr:.3f}/h cuda {pod.cuda_version or '?'} {age} provider util {util}"
     )
 
 
 def _fmt_util(job: JobView) -> str:
-    return "util --" if job.last_util is None else f"util {job.last_util:.0f}%"
+    """`(host)` names the source: the host's sampler, not the provider's."""
+    return "util -- (host)" if job.last_util is None else f"util {job.last_util:.0f}% (host)"
 
 
 def _fmt_minutes(job: JobView) -> str:
@@ -349,6 +361,9 @@ def render(
     if flags:
         header += "  " + " ".join(flags)
     lines = [header]
+    stale = stale_warning(entry)
+    if stale:
+        lines.append(f"  WARNING {stale}")
     if not suspects_only:
         lines += _gpu_lines(view)
     pod = pod_line(view.pod)
@@ -413,3 +428,101 @@ def render(
     if len(lines) == 1:
         lines.append("  idle; nothing queued, running or finished")
     return "\n".join(lines)
+
+
+def stale_warning(entry: HostEntry) -> str | None:
+    """One line when this host's package is not the build running here.
+
+    Two sessions of the same user on different commits, writing one shared
+    registry and one on-host config, is what turned a field becoming optional
+    into an hour of broken CLI. The cheap half of noticing is free: bootstrap
+    already recorded the commit it shipped.
+    """
+    return version.stale_host_warning(entry.name, entry.pkg_commit, version.local_commit())
+
+
+def job_json(job: JobView) -> dict[str, Any]:
+    """The text view's fields, named the same, with nothing rendered.
+
+    `running` is the list automation should key on. It is the host's own
+    answer, so an empty list here means the host said "nothing is running" --
+    never "we could not ask", which is `reachable: false` and an `errors` entry.
+    """
+    return {
+        "job_id": job.job_id,
+        "name": job.name,
+        "status": job.status,
+        "reason": job.reason,
+        "phase": job.phase,
+        "elapsed_s": None if job.minutes is None else round(job.minutes * 60.0, 1),
+        "util": job.last_util,
+        "gpus": list(job.gpus),
+        "iso": job.isolation,
+        "ended_at": job.ended_at,
+        "outputs_pending": job.outputs_pending,
+    }
+
+
+def gpu_json(view: HostView) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for uuid in view.owned:
+        info = view.entry.gpu_info.get(uuid) or GpuInfo()
+        out.append(
+            {
+                "uuid": uuid,
+                "name": info.name,
+                "vram_mib": info.vram_mib,
+                "busy_job": view.gpu_holder(uuid),
+            }
+        )
+    return out
+
+
+def host_json(
+    view: HostView, *, recent: int = RECENT_FINISHED, since_s: float | None = None
+) -> dict[str, Any]:
+    """`provider_util` is the provider's per-GPU reading for an ephemeral host's
+    pod (null for every other host); each job's `util` is the host's own
+    sampler. They are two different measurements and are named as such."""
+    entry = view.entry
+    errors = [view.error] if view.error else []
+    stale = stale_warning(entry)
+    if stale:
+        errors.append(stale)
+    finished = [job for job in view.finished if within(job, since_s)][:recent]
+    return {
+        "name": entry.name,
+        "kind": entry.kind,
+        "reachable": view.reachable,
+        "pkg_commit": entry.pkg_commit,
+        "dispatcher": {
+            "alive": view.dispatcher_alive,
+            "heartbeat_age_s": view.heartbeat_age_s,
+        },
+        "provider_util": list(view.pod.gpu_utils) if view.pod is not None else None,
+        "gpus": gpu_json(view),
+        "queued": [job_json(job) for job in view.queue],
+        "running": [job_json(job) for job in view.running],
+        "finished": [job_json(job) for job in finished],
+        "errors": errors,
+    }
+
+
+def document(
+    views: Sequence[HostView],
+    *,
+    errors: Sequence[str] = (),
+    recent: int = RECENT_FINISHED,
+    since_s: float | None = None,
+) -> dict[str, Any]:
+    """The whole of `gpuc status --json`: one object, always this shape.
+
+    Top-level `errors` are the ones that belong to no host -- an unreadable
+    registry, a skipped entry -- and they are the reason exit 3 exists: a
+    consumer that sees them must not read `hosts` as the whole truth.
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "hosts": [host_json(view, recent=recent, since_s=since_s) for view in views],
+        "errors": list(errors),
+    }

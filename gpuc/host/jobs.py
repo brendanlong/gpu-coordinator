@@ -13,6 +13,13 @@ from typing import Any
 
 from gpuc.host import paths
 
+SCHEMA_VERSION = 1
+"""The shape of the JSON files two builds of gpuc share (`~/.gpuc/config.json`
+and the control side's `hosts.json`). Written always, accepted missing: a file
+from before the field existed is version 1 by definition. It exists so a future
+incompatible change has something to branch on -- the readers here are
+deliberately tolerant enough that it has not had to."""
+
 Status = str  # queued | running | succeeded | failed | cancelled
 Phase = str
 PHASES = ("setup", "preflight", "main", "sync")
@@ -83,6 +90,71 @@ def read_json(path: Path, attempts: int = 5) -> Any:
     raise RuntimeError(f"could not read {path}: {last}")
 
 
+def fields_of(d: Any) -> dict[str, Any]:
+    """The mapping, or an empty one. A file that holds a list or `null` has
+    nothing to say about any field, and every field here has a default."""
+    return d if isinstance(d, dict) else {}
+
+
+def as_float(d: Any, key: str, default: float) -> float:
+    """`float(None)` is the bug this exists to make unreachable.
+
+    A field another build made optional arrives as an explicit `null`; a
+    hand-edited file arrives as a string. Neither may take the dispatcher down
+    -- it crashed 20 times on one `"ttl_hours": null` and gave up -- so an
+    unusable value means the default, which is what the field meant before the
+    key existed at all.
+    """
+    value = fields_of(d).get(key)
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return float(value)  # pyright: ignore[reportArgumentType]
+    except (TypeError, ValueError):
+        return default
+
+
+def as_opt_float(d: Any, key: str) -> float | None:
+    """The same, for a field whose `null` is a real value ("no cap at all")."""
+    if fields_of(d).get(key) is None:
+        return None
+    parsed = as_float(d, key, float("nan"))
+    return None if parsed != parsed else parsed
+
+
+def as_int(d: Any, key: str, default: int) -> int:
+    value = as_float(d, key, float(default))
+    try:
+        return int(value)
+    except (OverflowError, ValueError):
+        return default
+
+
+def as_str(d: Any, key: str, default: str = "") -> str:
+    value = fields_of(d).get(key)
+    return default if value is None else str(value)
+
+
+def as_opt_str(d: Any, key: str) -> str | None:
+    value = fields_of(d).get(key)
+    return None if value is None else str(value)
+
+
+def as_bool(d: Any, key: str, default: bool = False) -> bool:
+    value = fields_of(d).get(key)
+    return default if value is None else bool(value)
+
+
+def as_str_list(d: Any, key: str) -> list[str]:
+    value = fields_of(d).get(key)
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def as_str_dict(d: Any, key: str) -> dict[str, str]:
+    value = fields_of(d).get(key)
+    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
     """Parse `KEY=value` / `export KEY=value` lines (secrets files, RunPod's
     /etc/rp_environment). Not a shell: no expansion, no continuations."""
@@ -113,14 +185,12 @@ class LowUtil:
     grace_min: float = 10.0
 
     @staticmethod
-    def from_dict(d: dict[str, Any] | None) -> LowUtil:
-        if not d:
-            return LowUtil()
+    def from_dict(d: Any) -> LowUtil:
         return LowUtil(
-            enabled=bool(d.get("enabled", True)),
-            window_min=float(d.get("window_min", 25.0)),
-            floor_pct=float(d.get("floor_pct", 5.0)),
-            grace_min=float(d.get("grace_min", 10.0)),
+            enabled=as_bool(d, "enabled", True),
+            window_min=as_float(d, "window_min", 25.0),
+            floor_pct=as_float(d, "floor_pct", 5.0),
+            grace_min=as_float(d, "grace_min", 10.0),
         )
 
 
@@ -137,13 +207,13 @@ class Output:
     quietly create `org/lego-s4-typo` and upload a run into it."""
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> Output:
+    def from_dict(d: Any) -> Output:
         return Output(
-            path=str(d["path"]),
-            s3=d.get("s3"),
-            hf=d.get("hf"),
-            hf_path=d.get("hf_path"),
-            hf_create=bool(d.get("hf_create", False)),
+            path=as_str(d, "path"),
+            s3=as_opt_str(d, "s3"),
+            hf=as_opt_str(d, "hf"),
+            hf_path=as_opt_str(d, "hf_path"),
+            hf_create=as_bool(d, "hf_create"),
         )
 
 
@@ -171,25 +241,33 @@ class JobSpec:
     attempt: int = 1
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> JobSpec:
+    def from_dict(d: Any) -> JobSpec:
+        """Unknown keys are ignored and a null means the default -- except for
+        `command`, which has no default that could be right: a spec with
+        nothing to run is a mistake to report, not one to paper over."""
+        fields = fields_of(d)
+        command = as_str(fields, "command")
+        if not command:
+            raise ValueError("a job spec needs a `command`")
+        outputs = fields.get("outputs")
         return JobSpec(
-            job_id=str(d.get("job_id") or new_job_id()),
-            command=str(d["command"]),
-            name=str(d.get("name", "")),
-            setup=d.get("setup"),
-            gpus=int(d.get("gpus", 1)),
-            env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
-            secrets=[str(s) for s in (d.get("secrets") or [])],
-            outputs=[Output.from_dict(o) for o in (d.get("outputs") or [])],
-            sync_interval_s=int(d.get("sync_interval_s", 180)),
-            priority=int(d.get("priority", 50)),
-            max_runtime_min=(
-                None if d.get("max_runtime_min") is None else float(d["max_runtime_min"])
-            ),
-            low_util=LowUtil.from_dict(d.get("low_util")),
-            requires=dict(d.get("requires") or {}),
-            cleanup=normalize_cleanup(d.get("cleanup")),
-            attempt=int(d.get("attempt", 1)),
+            job_id=as_str(fields, "job_id") or new_job_id(),
+            command=command,
+            name=as_str(fields, "name"),
+            setup=as_opt_str(fields, "setup"),
+            gpus=as_int(fields, "gpus", 1),
+            env=as_str_dict(fields, "env"),
+            secrets=as_str_list(fields, "secrets"),
+            outputs=[Output.from_dict(o) for o in (outputs if isinstance(outputs, list) else [])],
+            sync_interval_s=as_int(fields, "sync_interval_s", 180),
+            priority=as_int(fields, "priority", 50),
+            max_runtime_min=as_opt_float(fields, "max_runtime_min"),
+            low_util=LowUtil.from_dict(fields.get("low_util")),
+            requires=dict(fields.get("requires") or {})
+            if isinstance(fields.get("requires"), dict)
+            else {},
+            cleanup=normalize_cleanup(fields.get("cleanup")),
+            attempt=as_int(fields, "attempt", 1),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -250,10 +328,14 @@ class JobState:
     fixes it afterwards except re-running the job."""
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> JobState:
-        known = {f: d.get(f) for f in JobState.__dataclass_fields__}
+    def from_dict(d: Any) -> JobState:
+        """Unknown keys are dropped and a null leaves the field at its default:
+        every field here is additive, and a state file written by another build
+        must still tell this one whether the job is running."""
+        fields = fields_of(d)
         state = JobState()
-        for key, value in known.items():
+        for key in JobState.__dataclass_fields__:
+            value = fields.get(key)
             if value is not None:
                 setattr(state, key, value)
         return state
@@ -311,6 +393,7 @@ keeps one source of truth: the config.
 
 @dataclass
 class HostConfig:
+    schema_version: int = SCHEMA_VERSION
     host: str = "local"
     gpus: list[str] = field(default_factory=list)
     provider: dict[str, Any] | None = None
@@ -336,21 +419,30 @@ class HostConfig:
     somewhere other than this host's defaults -- an `HF_HOME` on a big volume,
     say. Nothing populates it automatically.
     """
+    pkg_commit: str | None = None
+    """The gpuc commit bootstrap shipped to this host, for `gpuc version` and
+    the `status` warning that a host is running an older build than this one."""
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> HostConfig:
+    def from_dict(d: Any) -> HostConfig:
+        """The reader that took the dispatcher down. Nothing here may raise on
+        a config.json written by a different build of gpuc: an unknown key is
+        ignored, and a null for a field that is not nullable means its default.
+        """
+        fields = fields_of(d)
+        provider = fields.get("provider")
         return HostConfig(
-            host=str(d.get("host", "local")),
-            gpus=[str(g) for g in (d.get("gpus") or [])],
-            provider=d.get("provider"),
-            idle_minutes=float(d.get("idle_minutes", 15.0)),
-            ttl_hours=(None if d.get("ttl_hours") is None else float(d["ttl_hours"])),
-            s3_prefix=d.get("s3_prefix"),
-            created_at=d.get("created_at"),
-            retention_days=(
-                None if d.get("retention_days") is None else float(d["retention_days"])
-            ),
-            env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
+            schema_version=as_int(fields, "schema_version", SCHEMA_VERSION),
+            host=as_str(fields, "host", "local") or "local",
+            gpus=as_str_list(fields, "gpus"),
+            provider=provider if isinstance(provider, dict) else None,
+            idle_minutes=as_float(fields, "idle_minutes", 15.0),
+            ttl_hours=as_opt_float(fields, "ttl_hours"),
+            s3_prefix=as_opt_str(fields, "s3_prefix"),
+            created_at=as_opt_str(fields, "created_at"),
+            retention_days=as_opt_float(fields, "retention_days"),
+            env=as_str_dict(fields, "env"),
+            pkg_commit=as_opt_str(fields, "pkg_commit"),
         )
 
     def to_dict(self) -> dict[str, Any]:

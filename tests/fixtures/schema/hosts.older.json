@@ -1,0 +1,37 @@
+{
+  "hosts": {
+    "local": {
+      "name": "local",
+      "kind": "local",
+      "ssh": null,
+      "port": 22,
+      "gpus": ["GPU-2a4bad3b-9fe3-7031-914d-384254e92908"],
+      "pod_id": null,
+      "python": "/home/brendan/.local/share/uv/python/cpython-3.13/bin/python3.13",
+      "uv": "/home/brendan/.local/bin/uv",
+      "gpuc_home": null,
+      "persistent_root": null,
+      "env": {},
+      "idle_minutes": 15.0,
+      "ttl_hours": 24.0,
+      "s3_prefix": null,
+      "created_at": "2026-09-01T07:42:34+00:00",
+      "bootstrapped_at": "2026-09-01T07:43:46+00:00"
+    },
+    "spar": {
+      "name": "spar",
+      "kind": "ssh",
+      "ssh": "spar_cluster",
+      "port": 22,
+      "gpus": ["GPU-80646905-50a9-afc1-4375-43ca475b15e4"],
+      "pod_id": null,
+      "python": "/home/brendan/.local/share/uv/python/cpython-3.12/bin/python3.12",
+      "uv": "/home/brendan/.local/bin/uv",
+      "idle_minutes": 15.0,
+      "ttl_hours": 24.0,
+      "s3_prefix": "s3://brendanlong-experiments/gpuc/spar",
+      "created_at": "2026-09-01T17:57:50+00:00",
+      "bootstrapped_at": "2026-09-01T20:43:35+00:00"
+    }
+  }
+}

@@ -24,6 +24,35 @@ Nothing has to be installed on a host by hand: `gpuc host bootstrap` installs
 uv, a Python, the `gpuc.host` package, and the `aws`/`hf` upload helpers into
 `$HOME` over ssh.
 
+## Upgrading (and why every host needs it too)
+
+`gpuc version` prints the version, the commit this `gpuc` was built from, and
+the commit each bootstrapped host was last given. A host's package is a copy,
+not a link: upgrading here does not upgrade them.
+
+```sh
+uv tool upgrade gpu-coordinator                                      # from the installed git URL
+uv tool install --reinstall "git+https://github.com/brendanlong/gpu-coordinator@<commit>"  # or pin one
+gpuc version                                                         # check what you now have
+gpuc host bootstrap <host>                                           # for every host `version` flags
+```
+
+`gpuc status` prints one line per host whose package is not this commit
+(`host X runs an older gpuc; run gpuc host bootstrap X`). Re-bootstrapping is
+safe at any time: **running jobs are not disturbed, and bootstrap is not
+blocked by them.** It rsyncs the package, rewrites `config.json`, runs the
+health check and starts a dispatcher. A dispatcher that is already alive keeps
+the lock and keeps running its own (older) code until it exits; every *new*
+runner it spawns already uses the new package. When a dispatcher does take
+over, it adopts the jobs that are already running from their `state.json` --
+it never re-launches or kills them. Only the dispatcher is ever replaced,
+never a runner.
+
+Two sessions on different builds are fine as long as both are recent: every
+file the two sides share (`hosts.json`, `~/.gpuc/config.json`, specs, state)
+is read with unknown keys ignored and a `null` for a non-optional field taken
+as that field's default, and both carry a `schema_version`.
+
 ## Configuration
 
 `gpuc` works with no config file at all (no S3 mirror, defaults for everything
@@ -56,9 +85,11 @@ gpuc host probe <name>                               # driver, GPUs+UUIDs, disk+
 gpuc host clean <name> --uv-cache                    # `uv cache prune` on the host
 gpuc host list | gpuc host remove <name>             # remove forgets locally; the host is untouched
 gpuc submit <job.yaml|-> --host <name> [--no-git]    # or --runpod ... (flags below)
-gpuc status [--host H] [--all] [--suspects]          # --all adds jobs only the index knows
+gpuc status [--host H] [--all] [--suspects] [--json]  # --all adds jobs only the index knows
            [--recent N] [--since 24h|7d|90m]         # how much of the finished list to show
+gpuc version                                         # version, this commit, each host's commit
 gpuc logs <job-id> [-f] [-n LINES] [--host H]        # host first, S3 mirror as a noted fallback
+gpuc ssh <host|job-id> [--print] [-- CMD ...]        # a shell there, or one command; --print shows the line
 gpuc cancel <job-id> [--host H]
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]   # free finished workdirs
 gpuc clean --host H --purge [--older-than DAYS] [--verify] [--force] [--dry-run]  # whole job dirs
@@ -69,9 +100,86 @@ gpuc pods [--no-heartbeat]                           # --no-heartbeat skips the 
 gpuc config init [--force] | gpuc config show
 ```
 
+`gpuc ssh` is the hand-operated version of the transport: the key, port,
+`known_hosts` and ControlMaster socket gpuc uses are not in your `~/.ssh/config`,
+so `gpuc ssh spar` is the way to get a shell on a host gpuc can reach. A job id
+instead of a host name lands in that job's `workdir/` (its job dir if the
+workdir was cleaned). With a command after `--` it runs non-interactively and
+propagates the exit code; `--print` only prints the equivalent command line.
+`local` gets your own `$SHELL` in the directory, with no ssh at all. An unknown
+host or job is exit 4.
+
 `--host` is optional on `logs`, `cancel` and `reorder`: the local job index is
 tried first, then every registered host is asked whether it knows the id.
 A job file of `-` is read from stdin.
+
+## Exit codes and `--json`
+
+| code | meaning |
+| --- | --- |
+| 0 | ok. **Includes** a host that is unreachable, has a dead dispatcher, or whose pod is gone: that is data about a host, reported per host, not a failure of the command |
+| 1 | the command failed (transport, provider, a refused submit) |
+| 2 | usage: a bad flag, a missing required one, a bad `--since` |
+| 3 | local state is unreadable (`hosts.json` or `config.toml`), so the answer is **unknown** |
+| 4 | the job or host named on the command line does not exist |
+
+A single unreadable host entry in `hosts.json` never reaches these: it is
+skipped with a warning on stderr, every other host still works, and the entry
+is written back untouched by the next `gpuc host add|set` (it is probably
+another session's host). Only a `hosts.json` that cannot be parsed at all is
+exit 3, and it prints the error, the path, and that a `.bak` was kept.
+
+```sh
+gpuc status --json | jq '.hosts[] | {name, reachable, running: (.running | length)}'
+```
+
+```json
+{
+  "schema_version": 1,
+  "hosts": [
+    {
+      "name": "spar",
+      "kind": "ssh",
+      "reachable": true,
+      "pkg_commit": "8f1c2d0a9b34",
+      "dispatcher": { "alive": true, "heartbeat_age_s": 2.0 },
+      "provider_util": null,
+      "gpus": [
+        { "uuid": "GPU-8064...", "name": "NVIDIA A40", "vram_mib": 49140,
+          "busy_job": "20260915-120000-abc123" }
+      ],
+      "queued": [],
+      "running": [
+        { "job_id": "20260915-120000-abc123", "name": "lego-s4", "status": "running",
+          "reason": null, "phase": "main", "elapsed_s": 4210.5, "util": 96.0,
+          "gpus": ["GPU-8064..."], "iso": "pgid", "ended_at": null,
+          "outputs_pending": false }
+      ],
+      "finished": [],
+      "errors": []
+    }
+  ],
+  "errors": []
+}
+```
+
+The job fields are exactly the text view's. A job's `util` is the **host's**
+nvidia-smi sampler over that job's own cards (the text view says
+`util 98% (host)`); a pod's `provider_util` is the **provider's** per-GPU
+reading for the whole pod (`provider util 71%`), and is null for any host that
+is not a pod. They are two different measurements and will differ.
+
+Rules for anything automated:
+
+- **Key on `hosts[].running`.** It is the host's own answer. An empty list
+  means the host said nothing is running.
+- **Treat exit 3 as "unknown", never as "nothing is running".** So is a
+  non-empty top-level `errors`, and so is `"reachable": false` for the host you
+  care about -- we could not ask it, which is not the same as an idle host.
+- Unknown keys will be added over time; ignore the ones you do not know.
+
+`gpuc logs` has no `--json`: a log is a byte stream, and wrapping it helps
+nobody.
 
 `gpuc host set` edits one registered host in place — handing over two more
 GPUs, or moving its state to a persistent root — without `remove`+`add`, which
@@ -645,6 +753,9 @@ what `gpuc clean --purge` requires before it deletes a job dir
 | a job is `OUTPUTS LOST` | an ephemeral host drained, retried the upload three times and gave up before terminating | the results are gone; `gpuc requeue <id>` re-runs it, and fix the credential or bucket first |
 | `--retention-days` never deletes anything | the dispatcher only lives while a non-ephemeral host has work, and it never purges an unmirrored job | check `gpuc status` for `not backed up`, and remember the sweep runs on the next submit |
 | `uv sync` re-downloads torch on every job | uv's cache is on a different filesystem from gpuc home, so it copies instead of linking | `gpuc host bootstrap <host>` (it sets `UV_CACHE_DIR` for you), or pin one with `--cache-dir` |
+| `gpuc` exits 3 and names `hosts.json` | the registry could not be parsed at all; a `.bak` copy was kept beside it | fix or delete the file (the `.bak` has the original), then re-add hosts with `gpuc host add`; nothing was written over |
+| a warning names one skipped host entry | that entry did not validate; every other host still works and the entry is left in the file | fix it by hand, or `gpuc host add <name> ...` to replace it |
+| `status` says `host X runs an older gpuc` | this machine was upgraded and the host's copy of the package was not | `gpuc host bootstrap X` — safe while jobs run; the new dispatcher adopts them |
 | `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc reconcile --once` |
 | `reconcile` reports `DEAD DISPATCHER` and terminates a pod | its dispatcher stopped beating (or ssh stopped answering) for `dead_dispatcher_minutes` with nothing running | expected: that pod could no longer stop itself. Raise `dead_dispatcher_minutes` if your hosts go quiet legitimately |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | `gpuc host bootstrap <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` what you still want ([runbook](#hosts-whose-home-directory-is-wiped-on-restart)) |

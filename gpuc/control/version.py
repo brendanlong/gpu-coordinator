@@ -1,0 +1,114 @@
+"""Which build of gpuc is this, and which one is on each host.
+
+`__version__` has not moved in the life of the project, so it cannot answer
+"is the thing in my PATH the thing the docs describe?". The commit can, and
+two sessions of the same user running different commits against one shared
+registry is exactly the failure this exists to make visible.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from functools import lru_cache
+from importlib.metadata import Distribution, PackageNotFoundError
+from pathlib import Path
+
+import gpuc
+from gpuc._version import __version__
+
+DIST_NAME = "gpu-coordinator"
+SHORT = 12
+
+
+def short(commit: str | None) -> str:
+    return commit[:SHORT] if commit else "unknown"
+
+
+def package_root() -> Path:
+    return Path(gpuc.__file__).resolve().parents[1]
+
+
+def installed_commit() -> str | None:
+    """The commit `uv tool install git+...` recorded for the installed dist.
+
+    pip and uv write `direct_url.json` beside the dist-info for anything
+    installed from a URL, and its `vcs_info.commit_id` is the resolved commit.
+    A dist installed from a local path (`uv tool install .`) has no commit
+    there, which is why the source checkout is the fallback.
+    """
+    try:
+        text = Distribution.from_name(DIST_NAME).read_text("direct_url.json")
+    except (PackageNotFoundError, OSError, ValueError):
+        return None
+    if not text:
+        return None
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    info = document.get("vcs_info") if isinstance(document, dict) else None
+    commit = info.get("commit_id") if isinstance(info, dict) else None
+    return str(commit) if commit else None
+
+
+def source_commit(root: Path | None = None) -> str | None:
+    """`git rev-parse HEAD` where the package lives, for a checkout or an
+    editable install. Never raises: git may not be there at all."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root or package_root()), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = result.stdout.strip()
+    return commit if result.returncode == 0 and commit else None
+
+
+@lru_cache(maxsize=1)
+def local_commit() -> str | None:
+    """The commit this `gpuc` is running, installed build first.
+
+    Cached: `status` asks once per host, and it cannot change under a process.
+    """
+    return installed_commit() or source_commit()
+
+
+def dirty(root: Path | None = None) -> bool:
+    """Whether the source checkout has uncommitted changes, so `version` can
+    say that the commit it printed is not the whole truth."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root or package_root()), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def same_commit(local: str | None, host: str | None) -> bool:
+    """Compare two commits that may be recorded at different lengths."""
+    if not local or not host:
+        return True  # nothing recorded is not evidence of a mismatch
+    return local.startswith(host) or host.startswith(local)
+
+
+def stale_host_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
+    if same_commit(local, host_commit):
+        return None
+    return (
+        f"host {name} runs an older gpuc ({short(host_commit)}, this machine has "
+        f"{short(local)}); run gpuc host bootstrap {name}"
+    )
+
+
+def describe(commit: str | None) -> str:
+    return f"gpuc {__version__} ({short(commit)})"

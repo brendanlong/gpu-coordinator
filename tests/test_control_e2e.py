@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.cli import main
+from gpuc.control.cli import EXIT_USAGE, main
 from gpuc.control.config import load_registry
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
@@ -408,8 +408,8 @@ def test_clean_removes_a_leftover_staged_spec(
 def test_clean_needs_a_selection(
     bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    with pytest.raises(SystemExit):
-        main(["clean", "--host", "local"])
+    assert main(["clean", "--host", "local"]) == EXIT_USAGE
+    assert "--all-finished" in capsys.readouterr().err
 
 
 # -- purge --------------------------------------------------------------------

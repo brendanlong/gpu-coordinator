@@ -37,13 +37,17 @@ class Constraints(BaseModel):
 
 
 class Offer(BaseModel):
-    gpu_id: str
-    name: str
-    vram_gb: int
-    price_usd_hr: float
-    cloud: Cloud
-    availability: Availability
-    cuda_versions: list[str]
+    """One catalog entry. Every field has a default so a `desired/<host>.json`
+    written by another build still parses: losing track of a billing pod is a
+    worse failure than an offer record we cannot reuse."""
+
+    gpu_id: str = ""
+    name: str = ""
+    vram_gb: int = 0
+    price_usd_hr: float = 0.0
+    cloud: Cloud = "SECURE"
+    availability: Availability = "NONE"
+    cuda_versions: list[str] = Field(default_factory=list)
 
     def matches_cuda_floor(self, cuda_min: str | None) -> bool:
         if cuda_min is None:

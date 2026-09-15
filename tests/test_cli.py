@@ -8,7 +8,7 @@ import pytest
 
 from gpuc.control import reconcile as reconcile_mod
 from gpuc.control.clean import purge_host
-from gpuc.control.cli import build_parser, main
+from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_USAGE, build_parser, main
 from gpuc.control.config import (
     HostEntry,
     Settings,
@@ -55,7 +55,7 @@ def test_host_list_and_remove(control_env: Path, capsys: pytest.CaptureFixture[s
 def test_commands_on_an_unknown_host_explain_themselves(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["host", "bootstrap", "nope"]) == 1
+    assert main(["host", "bootstrap", "nope"]) == EXIT_NOT_FOUND
     assert "no host named 'nope'" in capsys.readouterr().err
 
 
@@ -64,7 +64,7 @@ def test_submit_without_a_host_says_which_flag_is_missing(
 ) -> None:
     job = tmp_path / "job.yaml"
     job.write_text("command: true\n")
-    assert main(["submit", str(job)]) == 1
+    assert main(["submit", str(job)]) == EXIT_USAGE
     assert "--host" in capsys.readouterr().err
 
 
@@ -78,7 +78,7 @@ def test_status_with_no_hosts_is_not_an_error(
 def test_cancel_for_an_unknown_job_tells_you_where_to_look(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["cancel", "20260101-000000-aaaaaa"]) == 1
+    assert main(["cancel", "20260101-000000-aaaaaa"]) == EXIT_NOT_FOUND
     assert "no registered host knows job" in capsys.readouterr().err
 
 
@@ -99,7 +99,7 @@ def test_submit_runpod_without_a_gpu_name_says_which_flag_is_missing(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    assert main(["submit", str(job), "--runpod"]) == 1
+    assert main(["submit", str(job), "--runpod"]) == EXIT_USAGE
     assert "--gpu <name>" in capsys.readouterr().err
 
 
@@ -458,14 +458,16 @@ def test_verify_without_purge_is_refused(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     main(["host", "add", "spar", "--ssh", "me@box"])
-    assert main(["clean", "--host", "spar", "--verify", "--all-finished"]) == 1
+    assert main(["clean", "--host", "spar", "--verify", "--all-finished"]) == EXIT_USAGE
     assert "only mean something with --purge" in capsys.readouterr().err
 
 
-def test_clean_with_no_selection_and_no_purge_exits(control_env: Path) -> None:
+def test_clean_with_no_selection_and_no_purge_exits(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     main(["host", "add", "spar", "--ssh", "me@box"])
-    with pytest.raises(SystemExit):
-        main(["clean", "--host", "spar"])
+    assert main(["clean", "--host", "spar"]) == EXIT_USAGE
+    assert "--all-finished" in capsys.readouterr().err
 
 
 def test_retention_days_is_stored_and_cleared(control_env: Path) -> None:
@@ -479,7 +481,9 @@ def test_retention_days_is_stored_and_cleared(control_env: Path) -> None:
 def test_a_bad_retention_value_is_rejected(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["host", "add", "spar", "--ssh", "me@box", "--retention-days", "soon"]) == 1
+    assert (
+        main(["host", "add", "spar", "--ssh", "me@box", "--retention-days", "soon"]) == EXIT_USAGE
+    )
     assert "wants a number of days" in capsys.readouterr().err
 
 

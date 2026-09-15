@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, env_prefix, remote_path
-from gpuc.control.cli import main
+from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_USAGE, main
 from gpuc.control.config import HostEntry, load_registry
 from gpuc.control.remote import host_command
 from gpuc.host import dispatcher, health, jobs, paths, queue, runner
@@ -315,7 +315,7 @@ def test_host_add_records_env_pairs(control_env: Path) -> None:
 def test_a_malformed_env_pair_is_rejected(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["host", "add", "spar", "--ssh", "spar", "--env", "HF_HOME"]) == 1
+    assert main(["host", "add", "spar", "--ssh", "spar", "--env", "HF_HOME"]) == EXIT_USAGE
     assert "--env wants KEY=VALUE" in capsys.readouterr().err
 
 
@@ -368,14 +368,14 @@ def test_host_set_with_no_flags_says_so(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     main(["host", "add", "spar", "--ssh", "spar"])
-    assert main(["host", "set", "spar"]) == 1
+    assert main(["host", "set", "spar"]) == EXIT_USAGE
     assert "changes nothing" in capsys.readouterr().err
 
 
 def test_host_set_on_an_unknown_host_names_the_known_ones(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["host", "set", "nope", "--idle-min", "1"]) == 1
+    assert main(["host", "set", "nope", "--idle-min", "1"]) == EXIT_NOT_FOUND
     assert "no host named 'nope'" in capsys.readouterr().err
 
 

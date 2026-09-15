@@ -81,9 +81,11 @@ own `env:`.
 ## On-host state: `~/.gpuc/`
 
 ```
-config.json          # {"host": "<name>", "gpus": ["GPU-uuid", ...], "provider": null | {"kind":"runpod","pod_id":..},
+config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uuid", ...],
+                     #  "provider": null | {"kind":"runpod","pod_id":..},
                      #  "idle_minutes": 15, "ttl_hours": null | N, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
+                     #  "pkg_commit": null | "<sha>", # the commit bootstrap shipped to this host
                      #  "env": {"HF_HOME": ...}}      # host-wide, hand-set; see Persistent root
 secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
 incoming/<jobid>.json # a spec staged 0644 by `submit`, fed to `enqueue -` and deleted
@@ -421,8 +423,11 @@ gpuc submit job.yaml --runpod --gpu A40[,RTX4090] [--min-vram 24] [--max-price 0
                      [--cuda-min 12.8] [--idle-min 15] [--ttl-hours N] [--reuse]    # provision or reuse a gpuc pod
                      # --ttl-hours is optional and off by default; --runpod refuses a job whose
                      # max_runtime_min would outlive a TTL that is set
-gpuc status [--host H] [--all] [--suspects] [--recent N] [--since 24h]
+gpuc status [--host H] [--all] [--suspects] [--recent N] [--since 24h] [--json]
 gpuc logs <jobid> [-f]           # tail from the host over transport; S3 fallback with a note
+gpuc ssh <host|jobid> [--print] [-- CMD ...]   # interactive shell with the transport's own ssh
+                                 # options (key, port, known_hosts, ControlMaster); a job id lands
+                                 # in its workdir, falling back to the job dir; `local` execs $SHELL
 gpuc cancel <jobid>
 gpuc clean --host H (--all-finished | --older-than DAYS) [--dry-run]
 gpuc clean --host H --purge [--older-than DAYS] [--verify] [--force] [--dry-run]
@@ -444,6 +449,55 @@ Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`,
 Config file `~/.config/gpu-coordinator/config.toml`: `s3_bucket`,
 `runpod_pod_prefix = "gpuc-"`, `max_pods = 3`, `max_total_usd_per_hour = 3.0`,
 `ssh_key = "~/.ssh/id_ed25519"`, `image`, `disk_gb`.
+
+## Shared state is read tolerantly, always
+
+Two sessions of one user share `~/.local/share/gpu-coordinator/hosts.json`, and
+a host's `config.json` outlives the build that wrote it. So every reader of a
+file the two halves share obeys the same two rules, on both sides:
+
+- an unknown key is ignored (a newer writer may add fields);
+- an explicit `null` for a field that is **not** declared optional is dropped,
+  so the field's default applies. A `null` for a field that *is* optional is a
+  real value and round-trips unchanged: `ttl_hours: null` is "never expires",
+  `retention_days: null` is "never auto-purge", `s3_prefix: null` is "no
+  mirror".
+
+Control side that means `extra="ignore"`, a default on every field, and a
+`model_validator(mode="before")` that consults the annotation (`HostEntry`,
+`Registry`, `DesiredHost`, `Settings`, `IndexEntry`, `Offer`). Host side, with
+no pydantic, the same rules are spelled out in `jobs.from_dict` for
+`HostConfig`, `JobSpec`, `JobState` and the dispatcher's lock body: never
+`float(None)`, never a `KeyError`, an unusable value means the default.
+
+`hosts.json` and `config.json` both carry `schema_version` (1); readers accept
+it missing. `tests/fixtures/schema/` holds today's shape of each file plus a
+hand-written older and newer variant, and every one of them must parse.
+
+A host entry that still does not validate is **skipped, not fatal**: `gpuc`
+warns, works with the rest, and writes that entry back untouched on the next
+registry write -- it is very likely another session's host. Only a `hosts.json`
+that cannot be parsed at all stops anything, and then gpuc prints the error and
+the path, keeps a `.bak`, and refuses only the commands that would overwrite it.
+
+## Exit codes
+
+| code | meaning |
+| --- | --- |
+| 0 | ok, including an unreachable host or a dead dispatcher (reported per host) |
+| 1 | the command failed (transport, provider, refused submit) |
+| 2 | usage |
+| 3 | local state unreadable (registry or config): the answer is *unknown* |
+| 4 | the named job or host does not exist |
+
+`gpuc status` never exits non-zero because of one bad host entry or one
+unreachable host. `gpuc status --json` prints one document --
+`{"schema_version": 1, "hosts": [{name, kind, reachable, pkg_commit,
+dispatcher:{alive, heartbeat_age_s}, gpus:[{uuid, name, vram_mib, busy_job}],
+queued, running, finished, errors}], "errors": []}` -- whose job objects carry
+the text view's fields (`job_id, name, status, reason, phase, elapsed_s, util,
+gpus, iso, ended_at, outputs_pending`). Automation keys on `running` and treats
+exit 3 as unknown, never as "nothing running". `gpuc logs` has no `--json`.
 
 ## Transport
 
@@ -488,6 +542,13 @@ secrets never touch argv.
 3. Write `~/.gpuc/config.json` from the host registry entry.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"`.
+5b. Record the commit this build of gpuc came from (`direct_url.json` of the
+   installed dist, else `git rev-parse` of the checkout) as `HostEntry.pkg_commit`
+   and in the host's `config.json`. `gpuc host list` and `gpuc version` show it,
+   and `gpuc status` warns when a host's differs from this machine's. Bootstrap
+   is never blocked by running jobs: the package and config are replaced, an
+   already-alive dispatcher keeps the lock until it exits, and whichever
+   dispatcher takes over adopts the running jobs from their `state.json`.
 6. Record what the host's cards are (`nvidia-smi --query-gpu=uuid,name,memory.total`)
    and the driver version from the health report into `HostEntry.gpu_info` /
    `driver_version`, so `gpuc host list` and `gpuc status` can name them. Best
@@ -605,7 +666,10 @@ they are (`2x NVIDIA A40 45 GB`, driver version) and one line per card saying
 minutes, last util), recent finished (id, status, reason, and how long ago it
 ended). `--recent N` (default 5) and `--since 24h|7d|90m` choose how much of the
 finished list to show; `--all` shows the same age column for index-only jobs.
-For ephemeral hosts also: pod status, $/h, age, provider util. `--suspects`:
+For ephemeral hosts also: pod status, $/h, age, `provider util` -- labelled,
+because it is the provider's reading for the whole pod while a job's
+`util N% (host)` is this host's nvidia-smi sampler over that job's cards; in
+`--json` they are the host's `provider_util` and the job's `util`. `--suspects`:
 running jobs in `phase=main` past `grace_min` with mean util below floor over
 the last 10 min, and any pod past a TTL it actually has. Never kills anything.
 

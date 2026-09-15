@@ -1,0 +1,388 @@
+"""What `gpuc` promises automation: exit codes, `status --json`, and that one
+bad host entry never takes the CLI with it.
+
+The incident these come from: a registry another session could not validate
+made every subcommand fail, and a non-zero `gpuc status` was read as "0 jobs
+running". Both halves of that have to be impossible now.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from gpuc.control import status as status_mod
+from gpuc.control.cli import (
+    EXIT_LOCAL_STATE,
+    EXIT_NOT_FOUND,
+    EXIT_OK,
+    EXIT_USAGE,
+    main,
+)
+from gpuc.control.config import HostEntry, backup_path, hosts_file, load_registry, read_registry
+from gpuc.control.status import HostView, JobView
+
+GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+
+GOOD_ENTRY = {
+    "name": "good",
+    "kind": "local",
+    "gpus": [GPU],
+    "idle_minutes": 15.0,
+    "ttl_hours": None,
+}
+BAD_ENTRY = {"name": "bad", "kind": "a kind that does not exist", "port": "twenty-two"}
+
+
+def write_hosts(document: object) -> Path:
+    path = hosts_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document))
+    return path
+
+
+# -- a broken registry must not brick the CLI ---------------------------------
+
+
+def test_one_bad_host_entry_is_skipped_and_the_rest_still_work(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    read = read_registry()
+    assert set(read.registry.hosts) == {"good"}
+    assert read.unreadable is False
+    assert "skipping host 'bad'" in read.errors[0]
+    assert read.skipped["bad"] == BAD_ENTRY
+
+    assert main(["host", "list"]) == EXIT_OK
+    captured = capsys.readouterr()
+    assert "good" in captured.out
+    assert "skipping host 'bad'" in captured.err
+
+
+def test_a_write_puts_back_the_entry_this_build_could_not_read(control_env: Path) -> None:
+    """It is another session's host, not ours to delete on the next `host set`."""
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    assert main(["host", "set", "good", "--idle-min", "9"]) == EXIT_OK
+    document = json.loads(hosts_file().read_text())
+    assert document["hosts"]["bad"] == BAD_ENTRY
+    assert document["hosts"]["good"]["idle_minutes"] == 9.0
+    assert document["schema_version"] == 1
+
+
+def test_an_unparseable_registry_says_so_takes_a_bak_and_exits_three(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = hosts_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ this is not json")
+    assert main(["status"]) == EXIT_LOCAL_STATE
+    err = capsys.readouterr().err
+    assert str(path) in err
+    assert ".bak" in err
+    assert backup_path(path).read_text() == "{ this is not json"
+
+
+def test_status_does_not_call_an_unreadable_registry_an_empty_one(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_hosts(["not", "an", "object"])
+    assert main(["status"]) == EXIT_LOCAL_STATE
+    assert "this is not `no jobs running`" in capsys.readouterr().err
+
+
+def test_a_mutation_refuses_to_overwrite_a_registry_it_could_not_read(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = hosts_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ this is not json")
+    assert main(["host", "add", "local", "--gpus", GPU]) == EXIT_LOCAL_STATE
+    assert "Nothing was written" in capsys.readouterr().err
+    assert path.read_text() == "{ this is not json"
+
+
+def test_a_job_command_on_an_unreadable_registry_is_unknown_not_missing(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 3, not 4: "no host knows that job" would be a lie."""
+    path = hosts_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ this is not json")
+    assert main(["logs", "20260101-000000-aaaaaa"]) == EXIT_LOCAL_STATE
+    assert main(["cancel", "20260101-000000-aaaaaa"]) == EXIT_LOCAL_STATE
+    assert main(["host", "list"]) == EXIT_LOCAL_STATE
+    assert "not a readable host registry" in capsys.readouterr().err
+
+
+def test_a_missing_registry_is_simply_no_hosts(control_env: Path) -> None:
+    assert read_registry().unreadable is False
+    assert load_registry().hosts == {}
+    assert main(["status"]) == EXIT_OK
+
+
+# -- exit codes ---------------------------------------------------------------
+
+
+def test_status_is_zero_even_when_every_host_is_unreachable(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "spar", "--ssh", "me@nowhere.invalid", "--gpus", GPU])
+
+    def unreachable(entry: HostEntry, *args: object, **kwargs: object) -> HostView:
+        return HostView(entry=entry, reachable=False, error="ssh: could not resolve hostname")
+
+    monkeypatch.setattr(status_mod, "gather", unreachable)
+    assert main(["status"]) == EXIT_OK
+    assert "UNREACHABLE" in capsys.readouterr().out
+
+
+def test_status_reports_a_bad_entry_per_host_without_failing(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    monkeypatch.setattr(
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+    )
+    assert main(["status"]) == EXIT_OK
+    captured = capsys.readouterr()
+    assert "host good" in captured.out
+    assert "skipping host 'bad'" in captured.err
+
+
+def test_a_named_host_that_does_not_exist_is_four(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["status", "--host", "nope"]) == EXIT_NOT_FOUND
+    assert "no host named 'nope'" in capsys.readouterr().err
+
+
+def test_a_bad_duration_is_usage(control_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    assert main(["status", "--since", "soon"]) == EXIT_USAGE
+    assert "--since" in capsys.readouterr().err
+
+
+def test_an_unreadable_config_file_is_three(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (control_env / "config" / "config.toml").write_text("this is not = = toml\n")
+    assert main(["status"]) == EXIT_LOCAL_STATE
+    assert "not readable TOML" in capsys.readouterr().err
+
+
+# -- status --json ------------------------------------------------------------
+
+
+def running_view(entry: HostEntry) -> HostView:
+    return HostView(
+        entry=entry,
+        reachable=True,
+        heartbeat_age_s=3.0,
+        owned=[GPU],
+        running=[
+            JobView(
+                job_id="20260915-120000-abc123",
+                name="lego-s4",
+                status="running",
+                phase="main",
+                gpus=[GPU],
+                started_at="2026-09-15T12:00:00+00:00",
+                util_recent=[90.0, 95.0],
+                isolation="cgroup",
+            )
+        ],
+        finished=[
+            JobView(
+                job_id="20260915-100000-def456",
+                name="probe",
+                status="failed",
+                reason="low-util",
+                ended_at="2026-09-15T11:00:00+00:00",
+                outputs_pending=True,
+            )
+        ],
+    )
+
+
+def status_json(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    document = json.loads(capsys.readouterr().out)
+    assert isinstance(document, dict)
+    return document
+
+
+def test_status_json_is_one_document_with_the_promised_shape(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    capsys.readouterr()
+    monkeypatch.setattr(status_mod, "gather", lambda entry, *a, **k: running_view(entry))
+    assert main(["status", "--json"]) == EXIT_OK
+    document = status_json(capsys)
+    assert document["schema_version"] == 1
+    assert document["errors"] == []
+    host = document["hosts"][0]
+    assert host["name"] == "local"
+    assert host["kind"] == "local"
+    assert host["reachable"] is True
+    assert host["dispatcher"] == {"alive": True, "heartbeat_age_s": 3.0}
+    assert host["gpus"] == [
+        {"uuid": GPU, "name": "", "vram_mib": None, "busy_job": "20260915-120000-abc123"}
+    ]
+    assert host["queued"] == []
+    job = host["running"][0]
+    assert set(job) == {
+        "job_id",
+        "name",
+        "status",
+        "reason",
+        "phase",
+        "elapsed_s",
+        "util",
+        "gpus",
+        "iso",
+        "ended_at",
+        "outputs_pending",
+    }
+    assert job["util"] == 95.0
+    assert job["gpus"] == [GPU]
+    assert job["iso"] == "cgroup"
+    assert job["elapsed_s"] > 0
+    assert host["finished"][0]["reason"] == "low-util"
+    assert host["finished"][0]["outputs_pending"] is True
+
+
+def test_status_json_says_unreachable_rather_than_empty(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "spar", "--ssh", "me@box", "--gpus", GPU])
+    capsys.readouterr()
+    monkeypatch.setattr(
+        status_mod,
+        "gather",
+        lambda entry, *a, **k: HostView(entry=entry, reachable=False, error="ssh timed out"),
+    )
+    assert main(["status", "--json"]) == EXIT_OK
+    host = status_json(capsys)["hosts"][0]
+    assert host["reachable"] is False
+    assert host["running"] == []
+    assert host["errors"] == ["ssh timed out"]
+
+
+def test_status_json_on_an_unreadable_registry_is_exit_three_and_still_json(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = hosts_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ not json")
+    assert main(["status", "--json"]) == EXIT_LOCAL_STATE
+    document = status_json(capsys)
+    assert document["hosts"] == []
+    assert "could not be read" in document["errors"][-1]
+
+
+def test_status_json_carries_the_skipped_entry_as_a_top_level_error(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    monkeypatch.setattr(
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+    )
+    assert main(["status", "--json"]) == EXIT_OK
+    document = status_json(capsys)
+    assert [host["name"] for host in document["hosts"]] == ["good"]
+    assert "skipping host 'bad'" in document["errors"][0]
+
+
+def test_logs_has_no_json_flag() -> None:
+    """Deliberate: a log is a byte stream, and wrapping it in JSON helps nobody."""
+    from gpuc.control.cli import build_parser
+
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["logs", "20260101-000000-aaaaaa", "--json"])
+    assert exit_info.value.code == EXIT_USAGE
+
+
+# -- version ------------------------------------------------------------------
+
+
+def test_version_prints_the_version_the_commit_and_each_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control import version as version_mod
+
+    main(["host", "add", "spar", "--ssh", "me@box"])
+    with_commit = (
+        load_registry()
+        .require("spar")
+        .model_copy(update={"pkg_commit": "b" * 40, "bootstrapped_at": "2026-09-15T20:00:00+00:00"})
+    )
+    write_hosts({"hosts": {"spar": json.loads(with_commit.model_dump_json())}})
+    capsys.readouterr()
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    monkeypatch.setattr(version_mod, "installed_commit", lambda: "a" * 40)
+    assert main(["version"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert version_mod.__version__ in out
+    assert "a" * 12 in out
+    assert "b" * 12 in out
+    assert "OLDER" in out
+    assert "gpuc host bootstrap <host>" in out
+
+
+def test_a_host_on_another_commit_gets_one_warning_line(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control import version as version_mod
+
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    entry = HostEntry(name="spar", kind="ssh", ssh="me@box", pkg_commit="b" * 40)
+    warning = status_mod.stale_warning(entry)
+    assert warning is not None
+    assert "host spar runs an older gpuc" in warning
+    assert "gpuc host bootstrap spar" in warning
+    assert status_mod.render(HostView(entry=entry, reachable=True)).count("WARNING") == 1
+
+
+def test_a_host_on_the_same_commit_or_none_at_all_says_nothing(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control import version as version_mod
+
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    assert status_mod.stale_warning(HostEntry(name="s", pkg_commit="a" * 40)) is None
+    assert status_mod.stale_warning(HostEntry(name="s", pkg_commit=None)) is None
+
+
+def test_the_installed_commit_comes_from_direct_url_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from importlib.metadata import PathDistribution
+
+    from gpuc.control import version as version_mod
+
+    dist_info = tmp_path / "gpu_coordinator-0.1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "direct_url.json").write_text(
+        json.dumps(
+            {
+                "url": "https://github.com/brendanlong/gpu-coordinator",
+                "vcs_info": {"vcs": "git", "commit_id": "c" * 40},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        version_mod.Distribution, "from_name", staticmethod(lambda _: PathDistribution(dist_info))
+    )
+    assert version_mod.installed_commit() == "c" * 40
+
+
+def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_env: Path) -> None:
+    from gpuc.control import version as version_mod
+
+    entry = HostEntry(name="spar", pkg_commit=version_mod.local_commit())
+    assert entry.host_config().pkg_commit == entry.pkg_commit
+    assert entry.host_config().to_dict()["schema_version"] == 1

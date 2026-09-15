@@ -13,10 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from gpuc._version import user_agent
-from gpuc.control.config import Settings, index_dir
+from gpuc.control.config import Settings, TolerantModel, index_dir
 from gpuc.host.jobs import JobSpec
 
 if TYPE_CHECKING:
@@ -30,9 +30,13 @@ class S3IndexError(RuntimeError):
     pass
 
 
-class IndexEntry(BaseModel):
-    job_id: str
-    host: str
+class IndexEntry(TolerantModel):
+    """One job, as the index remembers it. Tolerant like the registry: this
+    file is read by whichever session is doing the recovery, not necessarily
+    the build that wrote it."""
+
+    job_id: str = ""
+    host: str = ""
     name: str = ""
     attempt: int = 1
     submitted_at: str = ""

@@ -12,11 +12,34 @@ registered once stay registered.
 ## Setup (once per machine)
 
 ```bash
-uv tool install "git+https://github.com/brendanlong/gpu-coordinator@main"
+uv tool install "git+https://github.com/brendanlong/gpu-coordinator@main"   # pin the branch
+gpuc version           # version, this build's commit, and each host's package commit
 gpuc status            # lists registered hosts; if empty, see "Hosts" below
 ```
 
+Run `gpuc version` before you trust anything here, and compare the commit it
+prints with the head of the branch these docs came from
+(`git ls-remote https://github.com/brendanlong/gpu-coordinator main`). If they
+differ, upgrade before reading further -- another session of this user may be
+running a different build against the same registry.
+
 If `gpuc` is not on PATH, run it as `uv run gpuc` from a checkout.
+
+## Upgrading
+
+```bash
+uv tool upgrade gpu-coordinator
+# or pin exactly:
+uv tool install --reinstall "git+https://github.com/brendanlong/gpu-coordinator@<commit>"
+gpuc version                       # confirm, and see which hosts are behind
+gpuc host bootstrap <host>         # for every host `gpuc version` or `gpuc status` flags
+```
+
+Each host has its own *copy* of the package, so upgrading here does not
+upgrade them; `gpuc status` says `host X runs an older gpuc` when they differ.
+Bootstrap is idempotent and is **not** blocked by running jobs: it never
+touches a runner, and a dispatcher that takes over adopts the jobs already
+running from their state. Bootstrap every host after an upgrade.
 
 ## Pick a host
 
@@ -83,8 +106,12 @@ gpuc submit job.yaml --host spar
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu A40,RTX4090 --cloud any
 
 gpuc status                      # every host: queue, running job + phase, recent results
+gpuc status --json               # the same, machine-readable (see "Exit codes" below)
 gpuc status --suspects           # billing pods with idle GPUs, jobs whose outputs did not upload
 gpuc logs <jobid> [-f]           # tails the host; falls back to the S3 copy
+gpuc ssh <host|jobid>            # a shell there (a job id lands in its workdir)
+gpuc ssh <host|jobid> -- ls -la  # one command, non-interactive, exit code propagated
+gpuc ssh <host|jobid> --print    # just print the ssh line, to copy
 gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
 gpuc reorder <jobid> --priority 10
 gpuc requeue <jobid> --host spar # re-run from the mirrored spec, new attempt
@@ -101,6 +128,56 @@ Never fire-and-forget. After submitting, confirm the job reaches phase
 `main` and that its first log lines look right, then check back on a
 timer. Do not kill a job on a wall-clock guess; `--suspects` shows the
 signals to judge from.
+
+## Exit codes and `--json` (read this before scripting anything)
+
+| code | meaning |
+| --- | --- |
+| 0 | ok — **including** a host that is unreachable or whose dispatcher is down; that is reported per host, not as a failure |
+| 1 | the command failed (transport, provider, refused submit) |
+| 2 | usage: a bad or missing flag |
+| 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
+| 4 | the job or host named does not exist |
+
+```bash
+gpuc status --json | jq -r '.hosts[] | "\(.name) reachable=\(.reachable) running=\(.running | length)"'
+gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, util}]'
+```
+
+```json
+{
+  "schema_version": 1,
+  "hosts": [
+    {
+      "name": "spar", "kind": "ssh", "reachable": true, "pkg_commit": "8f1c2d0a9b34",
+      "dispatcher": { "alive": true, "heartbeat_age_s": 2.0 }, "provider_util": null,
+      "gpus": [{ "uuid": "GPU-8064...", "name": "NVIDIA A40", "vram_mib": 49140,
+                 "busy_job": "20260915-120000-abc123" }],
+      "queued": [],
+      "running": [{ "job_id": "20260915-120000-abc123", "name": "lego-s4", "status": "running",
+                    "reason": null, "phase": "main", "elapsed_s": 4210.5, "util": 96.0,
+                    "gpus": ["GPU-8064..."], "iso": "pgid", "ended_at": null,
+                    "outputs_pending": false }],
+      "finished": [], "errors": []
+    }
+  ],
+  "errors": []
+}
+```
+
+Rules, and they are not optional:
+
+- **Key on the JSON `running` list**, never on scraped text and never on the
+  exit code alone.
+- **Exit 3 means "unknown", never "nothing is running".** Stop and say so;
+  something local is broken, and jobs may well be running. The same goes for a
+  non-empty top-level `errors`, and for `"reachable": false` on the host you
+  care about — we could not ask it.
+- A job's `util` is the host's own nvidia-smi sampler (shown as
+  `util 98% (host)`); a pod's `provider_util` is RunPod's reading for the whole
+  pod (`provider util 71%`). They differ legitimately; do not compare them.
+- Ignore keys you do not recognise; more will be added.
+- `gpuc logs` has no `--json`; it is a byte stream.
 
 ## RunPod specifics
 

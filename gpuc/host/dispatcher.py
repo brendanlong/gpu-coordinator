@@ -96,7 +96,22 @@ class LockBody:
 
 
 def _maybe_int(value: object) -> int | None:
-    return int(value) if isinstance(value, int) else None
+    """A pid from whatever the lock file holds, or None.
+
+    Tolerant on purpose: this file is written by whichever build of gpuc last
+    took the lock, and a pid we cannot read means "no known holder" -- which
+    the caller already handles -- not a crash on the way to taking over.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float | str):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _maybe_str(value: object) -> str | None:

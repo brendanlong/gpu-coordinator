@@ -8,20 +8,25 @@ Two directories, both XDG-overridable so tests never touch the real ones:
 from __future__ import annotations
 
 import fcntl
+import json
 import os
+import shutil
+import sys
 import tomllib
-from collections.abc import Iterator
+import types
+import typing
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.providers.base import DEFAULT_IMAGE, Caps, Offer
 from gpuc.control.transport import Transport, make_transport
-from gpuc.host.jobs import HostConfig
+from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
 HostKind = Literal["local", "ssh", "runpod"]
 
@@ -33,8 +38,63 @@ class ConfigError(RuntimeError):
     pass
 
 
+class LocalStateUnreadable(ConfigError):
+    """Local state could not be read at all, so we know nothing rather than nothing-is-there.
+
+    Its own class because the two are not the same answer: automation that
+    reads "no hosts" as "no jobs running" is exactly how a broken registry
+    turned into a wrong answer instead of an error.
+    """
+
+
+class HostNotFound(ConfigError):
+    """A named host is not in the registry (CLI exit 4, not a generic failure)."""
+
+
 class DesiredUnreadable(ConfigError):
     """The reaper's fail-closed signal: we cannot tell which pods are ours."""
+
+
+def _allows_none(annotation: Any) -> bool:
+    if annotation is None or annotation is type(None) or annotation is Any:
+        return True
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        return any(_allows_none(arg) for arg in typing.get_args(annotation))
+    return False
+
+
+class TolerantModel(BaseModel):
+    """Read shared state the way Postel would: every field optional, nulls inert.
+
+    Every model here parses a file that another version of gpuc -- an older
+    build still installed in a second session, a newer one from `uv tool
+    upgrade` -- may have written. Two rules make that safe in both directions:
+    an unknown key is ignored (a newer writer may add fields), and an explicit
+    `null` for a field that is not nullable is dropped so the field's default
+    applies (a newer writer may make a field optional). Without the second
+    rule, one `"ttl_hours": null` in the shared registry made every subcommand
+    of the other session -- including `status` and `logs` -- fail validation.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_means_default(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        document: dict[Any, Any] = data
+        drop = [
+            key
+            for key, value in document.items()
+            if value is None
+            and isinstance(key, str)
+            and key in cls.model_fields
+            and not _allows_none(cls.model_fields[key].annotation)
+        ]
+        if not drop:
+            return document
+        return {key: value for key, value in document.items() if key not in drop}
 
 
 def config_dir() -> Path:
@@ -91,7 +151,7 @@ def ensure_state_dir() -> Path:
     return directory
 
 
-class Settings(BaseModel):
+class Settings(TolerantModel):
     """Every key has a working default: gpuc runs with no config file at all.
 
     Without ``s3_bucket`` there is simply no S3 mirror, so specs, logs and
@@ -174,15 +234,17 @@ def load_settings() -> Settings:
     try:
         document = tomllib.loads(path.read_text())
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ConfigError(f"{path} is not readable TOML: {exc}\nFix or delete the file.") from exc
+        raise LocalStateUnreadable(
+            f"{path} is not readable TOML: {exc}\nFix or delete the file."
+        ) from exc
     try:
         return Settings.model_validate(document)
     except ValidationError as exc:
-        raise ConfigError(f"{path} has bad values:\n{exc}") from exc
+        raise LocalStateUnreadable(f"{path} has bad values:\n{exc}") from exc
 
 
-class HostEntry(BaseModel):
-    name: str
+class HostEntry(TolerantModel):
+    name: str = ""
     kind: HostKind = "local"
     ssh: str | None = None
     port: int = 22
@@ -225,6 +287,10 @@ class HostEntry(BaseModel):
     this and nothing will ever be deleted."""
     created_at: str | None = None
     bootstrapped_at: str | None = None
+    pkg_commit: str | None = None
+    """The gpuc commit bootstrap last shipped to this host, as `gpuc version`
+    and `gpuc host list` report it. Null means "bootstrapped before this was
+    recorded", which is not the same as "up to date"."""
 
     @property
     def root(self) -> str | None:
@@ -279,17 +345,21 @@ class HostEntry(BaseModel):
             created_at=self.created_at,
             retention_days=self.retention_days,
             env=self.job_env(),
+            pkg_commit=self.pkg_commit,
         )
 
 
-class Registry(BaseModel):
+class Registry(TolerantModel):
+    schema_version: int = SCHEMA_VERSION
+    """The shape of hosts.json. Written always, accepted missing: a registry
+    from before it existed is version 1 by definition."""
     hosts: dict[str, HostEntry] = Field(default_factory=dict)
 
     def require(self, name: str) -> HostEntry:
         entry = self.hosts.get(name)
         if entry is None:
             known = ", ".join(sorted(self.hosts)) or "(none)"
-            raise ConfigError(
+            raise HostNotFound(
                 f"no host named {name!r}. Known hosts: {known}.\n"
                 f"Add it with: gpuc host add {name} --ssh user@host --gpus GPU-uuid"
             )
@@ -299,24 +369,128 @@ class Registry(BaseModel):
         self.hosts[entry.name] = entry
 
 
-def load_registry() -> Registry:
+class RegistryRead(BaseModel):
+    """What one read of hosts.json produced, including what it could not read."""
+
+    registry: Registry = Field(default_factory=Registry)
+    errors: list[str] = Field(default_factory=list)
+    unreadable: bool = False
+    """The file itself could not be parsed, so `registry` is empty because we
+    know nothing -- not because there are no hosts. Commands say so and exit 3
+    rather than reporting an empty world."""
+    skipped: dict[str, Any] = Field(default_factory=dict)
+    """Host entries that did not validate, kept verbatim so a later write puts
+    them back: they are another session's hosts, not ours to delete."""
+
+
+def backup_path(path: Path) -> Path:
+    return path.with_name(path.name + ".bak")
+
+
+def _take_backup(path: Path) -> Path | None:
+    """Copy a file we cannot parse aside, before anything here rewrites it."""
+    target = backup_path(path)
+    try:
+        shutil.copy2(path, target)
+    except OSError:
+        return None
+    return target
+
+
+def read_registry() -> RegistryRead:
+    """Parse hosts.json as far as it parses. Never raises on content.
+
+    One unreadable host entry must not take the CLI with it: `status` and
+    `logs` on the other hosts are exactly what someone needs while they fix it.
+    So the file is parsed twice -- once as a document, then one host at a time
+    -- and only the entries that fail are dropped, each with a line saying so.
+    """
     path = hosts_file()
     if not path.exists():
-        return Registry()
+        return RegistryRead()
     try:
-        return Registry.model_validate_json(path.read_text())
-    except (OSError, ValidationError) as exc:
-        raise ConfigError(
-            f"{path} is not a readable host registry: {exc}\n"
-            f"Fix it by hand, or remove it and re-add your hosts with `gpuc host add`."
-        ) from exc
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        saved = _take_backup(path)
+        return RegistryRead(
+            unreadable=True,
+            errors=[
+                f"{path} is not a readable host registry: {exc}\n"
+                f"  a copy is kept at {saved or backup_path(path)} before anything rewrites it\n"
+                f"  fix it by hand, or remove it and re-add your hosts with `gpuc host add`"
+            ],
+        )
+    if not isinstance(document, dict):
+        saved = _take_backup(path)
+        return RegistryRead(
+            unreadable=True,
+            errors=[
+                f"{path} holds {type(document).__name__}, not a host registry object\n"
+                f"  a copy is kept at {saved or backup_path(path)} before anything rewrites it"
+            ],
+        )
+    hosts = document.get("hosts")
+    if not isinstance(hosts, dict):
+        saved = _take_backup(path)
+        return RegistryRead(
+            unreadable=True,
+            errors=[
+                f"{path} has no `hosts` object, so no host is known\n"
+                f"  a copy is kept at {saved or backup_path(path)} before anything rewrites it"
+            ],
+        )
+    registry = Registry.model_validate({**document, "hosts": {}})
+    errors: list[str] = []
+    skipped: dict[str, Any] = {}
+    for name, raw in sorted(hosts.items()):
+        try:
+            entry = HostEntry.model_validate(raw)
+        except ValidationError as exc:
+            skipped[str(name)] = raw
+            errors.append(
+                f"skipping host {name!r} in {path}: {exc}\n"
+                f"  every other host still works; fix that entry or re-add it with "
+                f"`gpuc host add {name} ...`"
+            )
+            continue
+        registry.hosts[str(name)] = (
+            entry if entry.name else entry.model_copy(update={"name": str(name)})
+        )
+    return RegistryRead(registry=registry, errors=errors, skipped=skipped)
 
 
-def save_registry(registry: Registry) -> None:
+def warn_stderr(message: str) -> None:
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def load_registry(warn: Callable[[str], None] = warn_stderr) -> Registry:
+    """The salvaged registry, with every problem reported and none of them fatal.
+
+    Callers that need to tell "nothing registered" from "nothing readable" use
+    `read_registry()` instead; everything else can work with what parsed.
+    """
+    read = read_registry()
+    for error in read.errors:
+        warn(error)
+    return read.registry
+
+
+def save_registry(registry: Registry, keep: dict[str, Any] | None = None) -> None:
+    """Write hosts.json, putting back any entry this build could not parse.
+
+    `keep` is what `read_registry` skipped. Those entries belong to whoever
+    wrote them -- very likely another session on a different build -- and
+    dropping them on the first `gpuc host set` would turn one bad entry into
+    someone else's missing host.
+    """
     ensure_state_dir()
     path = hosts_file()
+    document = registry.model_dump(mode="json")
+    hosts = document.setdefault("hosts", {})
+    for name, raw in (keep or {}).items():
+        hosts.setdefault(name, raw)
     tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
-    tmp.write_text(registry.model_dump_json(indent=2) + "\n")
+    tmp.write_text(json.dumps(document, indent=2) + "\n")
     os.replace(tmp, path)
 
 
@@ -346,13 +520,23 @@ def state_lock(timeout_s: float = 30.0) -> Iterator[None]:
 
 @contextmanager
 def registry_transaction() -> Iterator[Registry]:
+    """Read-modify-write under the lock. Refuses to write over a registry we
+    could not read at all, because that write would delete every host in it."""
     with state_lock():
-        registry = load_registry()
-        yield registry
-        save_registry(registry)
+        read = read_registry()
+        if read.unreadable:
+            raise LocalStateUnreadable(
+                "\n".join(read.errors)
+                + f"\nNothing was written: replacing {hosts_file()} would drop every host it "
+                f"still holds."
+            )
+        for error in read.errors:
+            warn_stderr(error)
+        yield read.registry
+        save_registry(read.registry, read.skipped)
 
 
-class DesiredHost(BaseModel):
+class DesiredHost(TolerantModel):
     """What we asked the provider for, written before the pod can be lost.
 
     This file is the only thing that distinguishes a pod we are waiting on from
@@ -360,11 +544,11 @@ class DesiredHost(BaseModel):
     removed only once the pod is gone.
     """
 
-    name: str
-    pod_id: str
-    offer: Offer
-    created_at: str
-    ceiling_at: str
+    name: str = ""
+    pod_id: str = ""
+    offer: Offer = Field(default_factory=Offer)
+    created_at: str = ""
+    ceiling_at: str = ""
     idle_minutes: float = 15.0
     ttl_hours: float | None = None
     image: str | None = None
@@ -421,9 +605,11 @@ def forget_host(name: str) -> None:
     """
     remove_desired(name)
     pod_known_hosts_file(name).unlink(missing_ok=True)
-    registry = load_registry()
-    if registry.hosts.pop(name, None) is not None:
-        save_registry(registry)
+    read = read_registry()
+    if read.unreadable:
+        return
+    if read.registry.hosts.pop(name, None) is not None:
+        save_registry(read.registry, read.skipped)
 
 
 def load_desired() -> list[DesiredHost]:

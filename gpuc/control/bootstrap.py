@@ -20,6 +20,7 @@ from gpuc.control.config import HostEntry, Settings, transport_for, utc_now
 from gpuc.control.gpuinfo import discover, summarize
 from gpuc.control.remote import HostSession, parse_last_json, resolve_home
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
+from gpuc.control.version import local_commit
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
@@ -44,6 +45,8 @@ class BootstrapResult:
     files: int
     health: dict[str, Any]
     dispatcher_pid: int
+    pkg_commit: str | None = None
+    """The gpuc commit this bootstrap shipped, as `gpuc version` reports it."""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -451,6 +454,13 @@ def bootstrap_host(
             warnings.append(warning)
             report(f"WARNING: {warning}")
 
+    # Recorded before the config is written, so the host's own config.json says
+    # which commit its package came from and `gpuc status` can notice when this
+    # machine has moved on and the host has not.
+    commit = local_commit()
+    if commit != entry.pkg_commit:
+        entry = entry.model_copy(update={"pkg_commit": commit})
+
     session = HostSession(entry, transport, home, python)
     write_host_config(session, entry)
     report(f"wrote {home}/config.json for host {entry.name} with {len(entry.gpus)} GPU(s)")
@@ -472,6 +482,7 @@ def bootstrap_host(
             "uv": uv,
             "python": python,
             "cache_dir": cache_dir,
+            "pkg_commit": commit,
             "gpu_info": gpu_info,
             "driver_version": driver_version(health) or entry.driver_version,
             "bootstrapped_at": utc_now(),
@@ -483,6 +494,7 @@ def bootstrap_host(
         python=python,
         home=home,
         files=files,
+        pkg_commit=commit,
         health=health,
         dispatcher_pid=pid,
         warnings=warnings,

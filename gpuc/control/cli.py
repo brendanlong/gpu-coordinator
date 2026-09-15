@@ -13,19 +13,26 @@ from pathlib import Path
 
 from gpuc.control import pods as pods_mod
 from gpuc.control import reconcile as reconcile_mod
+from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
+from gpuc.control import version as version_mod
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host
 from gpuc.control.clean import CleanError, clean_host, prune_uv_cache
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
+    HostNotFound,
+    LocalStateUnreadable,
     Registry,
+    RegistryRead,
     Settings,
     config_file,
-    load_registry,
+    hosts_file,
     load_settings,
+    read_registry,
     registry_transaction,
     state_dir,
+    transport_for,
     utc_now,
     write_config_template,
 )
@@ -56,9 +63,34 @@ from gpuc.control.transport import (
 from gpuc.host import jobs
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
+EXIT_OK = 0
+"""Everything the command was asked to do happened, including reporting that a
+host is unreachable: that is data about a host, not a failure of the command."""
+EXIT_ERROR = 1
+"""The command failed: a transport error, a provider error, a refused submit."""
+EXIT_USAGE = 2
+"""The command line itself was wrong (argparse uses this too)."""
+EXIT_LOCAL_STATE = 3
+"""Local state -- the registry or the config file -- could not be read, so the
+answer is unknown. Automation must not read this as `nothing is running`."""
+EXIT_NOT_FOUND = 4
+"""The named job or host does not exist."""
+
 
 class CliError(RuntimeError):
-    pass
+    exit_code = EXIT_ERROR
+
+
+class UsageError(CliError):
+    """The invocation was wrong, not the world."""
+
+    exit_code = EXIT_USAGE
+
+
+class NotFound(CliError):
+    """The job or host named on the command line does not exist."""
+
+    exit_code = EXIT_NOT_FOUND
 
 
 def _gpu_list(raw: str | None) -> list[str]:
@@ -72,9 +104,25 @@ def _env_dict(pairs: Sequence[str] | None) -> dict[str, str]:
     for pair in pairs or []:
         key, sep, value = pair.partition("=")
         if not sep or not key.strip():
-            raise CliError(f"--env wants KEY=VALUE, got {pair!r}")
+            raise UsageError(f"--env wants KEY=VALUE, got {pair!r}")
         env[key.strip()] = value
     return env
+
+
+def named_registry() -> Registry:
+    """The registry, for a command that was given a host or job name to find.
+
+    A registry that could not be parsed is exit 3 (unknown), not exit 4 (does
+    not exist): "no host named spar" would be a lie when the file holding spar
+    is the thing that is broken. Listing commands do not use this -- they can
+    honestly show what parsed.
+    """
+    read = read_registry()
+    for error in read.errors:
+        print(f"warning: {error}", file=sys.stderr)
+    if read.unreadable:
+        raise LocalStateUnreadable("\n".join(read.errors))
+    return read.registry
 
 
 def cmd_host_add(args: argparse.Namespace) -> int:
@@ -112,9 +160,9 @@ def _retention(raw: str | None) -> float | None:
     try:
         days = float(raw)
     except ValueError as exc:
-        raise CliError(f"--retention-days wants a number of days or '', got {raw!r}") from exc
+        raise UsageError(f"--retention-days wants a number of days or '', got {raw!r}") from exc
     if days < 0:
-        raise CliError("--retention-days cannot be negative")
+        raise UsageError("--retention-days cannot be negative")
     return days
 
 
@@ -168,7 +216,7 @@ def cmd_host_set(args: argparse.Namespace) -> int:
         # that can be set but never unset is a trap.
         changes["ttl_hours"] = None if args.ttl_hours < 0 else args.ttl_hours
     if not changes:
-        raise CliError(
+        raise UsageError(
             "host set changes nothing: pass at least one of "
             + ", ".join(f"--{f.replace('_', '-')}" for f in _SET_FIELDS)
         )
@@ -194,10 +242,15 @@ def cmd_host_remove(args: argparse.Namespace) -> int:
 
 
 def cmd_host_list(_: argparse.Namespace) -> int:
-    registry = load_registry()
+    read = read_registry()
+    for error in read.errors:
+        print(f"warning: {error}", file=sys.stderr)
+    registry = read.registry
     if not registry.hosts:
+        if read.unreadable:
+            return EXIT_LOCAL_STATE
         print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
-        return 0
+        return EXIT_OK
     for entry in registry.hosts.values():
         bootstrapped = entry.bootstrapped_at or "never bootstrapped"
         summary = summarize(entry.gpus, entry.gpu_info) if entry.gpus else "no GPUs"
@@ -205,8 +258,11 @@ def cmd_host_list(_: argparse.Namespace) -> int:
         print(
             f"{entry.name:<16} {entry.kind:<7} {entry.ssh or 'this machine':<28} "
             f"gpus={len(entry.gpus)} ({summary}{driver}) python={entry.python or '-'} "
-            f"bootstrapped={bootstrapped}"
+            f"pkg={version_mod.short(entry.pkg_commit)} bootstrapped={bootstrapped}"
         )
+        stale = status_mod.stale_warning(entry)
+        if stale:
+            print(f"  WARNING {stale}")
         if entry.root:
             print(f"  persistent root {entry.root} (gpuc home {entry.remote_home})")
         for name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
@@ -216,13 +272,13 @@ def cmd_host_list(_: argparse.Namespace) -> int:
 
 def cmd_host_bootstrap(args: argparse.Namespace) -> int:
     settings = load_settings()
-    entry = load_registry().require(args.name)
+    entry = named_registry().require(args.name)
     updated, result = bootstrap_host(entry, settings, health_args=args.health_args)
     with registry_transaction() as registry:
         registry.put(updated)
     print(
-        f"host {result.host} ready: {result.files} package files at {result.home}/pkg, "
-        f"dispatcher pid {result.dispatcher_pid}"
+        f"host {result.host} ready: {result.files} package files at {result.home}/pkg "
+        f"({version_mod.short(result.pkg_commit)}), dispatcher pid {result.dispatcher_pid}"
     )
     for warning in result.warnings:
         print(f"WARNING: {warning}")
@@ -231,13 +287,13 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
 
 def cmd_clean(args: argparse.Namespace) -> int:
     settings = load_settings()
-    entry = load_registry().require(args.host)
+    entry = named_registry().require(args.host)
     if (args.force or args.verify) and not args.purge:
-        raise CliError("--force and --verify only mean something with --purge")
+        raise UsageError("--force and --verify only mean something with --purge")
     if not args.purge and not args.all_finished and args.older_than is None:
         # argparse cannot express "required unless --purge", and --purge has a
         # default horizon of its own.
-        raise SystemExit(
+        raise UsageError(
             f"gpuc clean: pass --all-finished, --older-than DAYS, or --purge "
             f"(which defaults to --older-than {DEFAULT_RETENTION_DAYS:g})"
         )
@@ -257,15 +313,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 def cmd_host_clean(args: argparse.Namespace) -> int:
     if not args.uv_cache:
-        raise CliError("host clean needs --uv-cache (job workdirs are `gpuc clean --host H`)")
-    entry = load_registry().require(args.name)
+        raise UsageError("host clean needs --uv-cache (job workdirs are `gpuc clean --host H`)")
+    entry = named_registry().require(args.name)
     print(prune_uv_cache(entry, load_settings()))
     return 0
 
 
 def cmd_host_probe(args: argparse.Namespace) -> int:
     settings = load_settings()
-    entry = load_registry().require(args.name)
+    entry = named_registry().require(args.name)
     report = probe_host(entry, settings)
     print(report.render())
     # A probe is the one command that runs before bootstrap, so it is also the
@@ -299,7 +355,7 @@ def make_provider(settings: Settings) -> Provider:
 def constraints_from(args: argparse.Namespace) -> Constraints:
     names = _gpu_list(args.gpu)
     if not names:
-        raise CliError(
+        raise UsageError(
             "--runpod needs --gpu <name>[,<name>] (for example --gpu A40,RTX4090).\n"
             "Names are matched against the RunPod catalog, short or full."
         )
@@ -384,8 +440,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(result.render())
         return 0
     if not args.host:
-        raise CliError("submit needs --host <name> (see `gpuc host list`)")
-    entry = load_registry().require(args.host)
+        raise UsageError("submit needs --host <name> (see `gpuc host list`)")
+    entry = named_registry().require(args.host)
     result = submit_file(entry, args.job_file, settings, workdir=Path.cwd(), use_git=use_git)
     print(result.render())
     return 0
@@ -398,20 +454,38 @@ def _hosts(registry: Registry, only: str | None) -> list[HostEntry]:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    """Report on every host, and only fail for reasons that are not a host.
+
+    An unreachable host, a dead dispatcher and a pod that is gone are all
+    *answers*, printed per host with exit 0. The one non-zero case is exit 3:
+    the local registry could not be read, so "no jobs running" would be a
+    guess. Automation must treat that as unknown and never as idle.
+    """
     settings = load_settings()
-    registry = load_registry()
+    read = read_registry()
     try:
         since_s = status_mod.parse_duration(args.since) if args.since else None
     except ValueError as exc:
-        raise CliError(f"--since: {exc}") from exc
-    entries = _hosts(registry, args.host)
+        raise UsageError(f"--since: {exc}") from exc
+    entries = _hosts(read.registry, args.host) if not read.unreadable else []
+    if args.json:
+        return _status_json(args, settings, read, entries, since_s)
+    for error in read.errors:
+        print(f"warning: {error}", file=sys.stderr)
     if not entries:
+        if read.unreadable:
+            print(
+                f"cannot read {hosts_file()}, so no host status is known "
+                f"(this is not `no jobs running`)",
+                file=sys.stderr,
+            )
+            return EXIT_LOCAL_STATE
         print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
         # ...but `--all` still has something to say: the index remembers jobs
         # whose host has since been removed.
         if args.all and not args.suspects:
             _print_unhosted(settings, set(), args.host)
-        return 0
+        return EXIT_OK
     provider = _provider_for_status(entries, settings)
     seen: set[str] = set()
     for entry in entries:
@@ -424,7 +498,31 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     if args.all and not args.suspects:
         _print_unhosted(settings, seen, args.host)
-    return 0
+    return EXIT_OK
+
+
+def _status_json(
+    args: argparse.Namespace,
+    settings: Settings,
+    read: RegistryRead,
+    entries: list[HostEntry],
+    since_s: float | None,
+) -> int:
+    """One JSON document on stdout, whatever happened. Notes stay on stderr."""
+    provider = _provider_for_status(entries, settings) if entries else None
+    views = [status_mod.gather(entry, settings, provider=provider) for entry in entries]
+    errors = list(read.errors)
+    if read.unreadable:
+        errors.append(
+            f"{hosts_file()} could not be read, so `hosts` is empty because nothing is known"
+        )
+    print(
+        json.dumps(
+            status_mod.document(views, errors=errors, recent=args.recent, since_s=since_s),
+            indent=2,
+        )
+    )
+    return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
 
 
 def _provider_for_status(entries: list[HostEntry], settings: Settings) -> Provider | None:
@@ -519,21 +617,71 @@ def find_job_host(
             continue
         if payload.get("jobs"):
             return entry, index
-    raise CliError(
+    raise NotFound(
         f"no registered host knows job {job_id}.\n"
         f"Pass --host <name>, or check `gpuc host list` and `gpuc status --all`."
     )
 
 
+def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
+    """`(host, directory, fallback)` for a host name or a job id.
+
+    A registered host name wins over a job id: host names are ours and job ids
+    are timestamps, so they cannot collide, and looking the name up locally
+    keeps `gpuc ssh <host>` from asking every host whether it knows a job.
+    """
+    registry = named_registry()
+    entry = registry.hosts.get(args.target)
+    if entry is not None:
+        return entry, entry.remote_home, None
+    entry, _ = find_job_host(args.target, registry, args.host)
+    job_dir = f"{entry.remote_home}/jobs/{args.target}"
+    return entry, f"{job_dir}/workdir", job_dir
+
+
+def cmd_ssh(args: argparse.Namespace) -> int:
+    """A shell on a host (or in a job's workdir), with gpuc's own ssh options."""
+    command = list(args.command or [])
+    # argparse.REMAINDER swallows flags that follow the target, and typing
+    # `gpuc ssh spar --print` is the obvious thing to do.
+    if command and command[0] == "--print":
+        args.print_only, command = True, command[1:]
+    if command and command[0] == "--":
+        command = command[1:]
+    entry, directory, fallback = ssh_target(args)
+    transport = transport_for(entry, load_settings())
+    local = entry.kind == "local"
+    if command:
+        joined = shlex.join(command)
+        if args.print_only:
+            print(ssh_mod.print_line(ssh_mod.command_argv(transport, directory, joined)))
+            return EXIT_OK
+        result = ssh_mod.run_command(transport, directory, joined)
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+    if args.print_only:
+        print(ssh_mod.print_line(ssh_mod.interactive_argv(transport, directory, fallback)))
+        return EXIT_OK
+    print(f"# {entry.name}:{directory}", file=sys.stderr)
+    if local:
+        # No ssh to this machine: chdir and hand over the terminal directly.
+        os.chdir(ssh_mod.local_directory(directory, fallback))
+        shell = os.environ.get("SHELL", ssh_mod.DEFAULT_SHELL)
+        os.execvp(shell, [shell, "-l"])
+    argv = ssh_mod.interactive_argv(transport, directory, fallback)
+    os.execvp(argv[0], argv)
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
-    entry, _ = find_job_host(args.job_id, load_registry(), args.host)
+    entry, _ = find_job_host(args.job_id, named_registry(), args.host)
     payload = open_session(entry, load_settings()).host_json(f"cancel {shlex.quote(args.job_id)}")
     print(f"job {args.job_id} on host {entry.name}: {payload.get('status')}")
     return 0
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
-    entry, _ = find_job_host(args.job_id, load_registry(), args.host)
+    entry, _ = find_job_host(args.job_id, named_registry(), args.host)
     session = open_session(entry, load_settings())
     result = session.host_cli(f"reorder {shlex.quote(args.job_id)} {args.priority}", check=False)
     if result.returncode != 0:
@@ -554,7 +702,7 @@ def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str
 
 def cmd_logs(args: argparse.Namespace) -> int:
     settings = load_settings()
-    entry, index = find_job_host(args.job_id, load_registry(), args.host)
+    entry, index = find_job_host(args.job_id, named_registry(), args.host)
     remote = None
     purged = False
     try:
@@ -631,11 +779,13 @@ def _logs_from_s3(
 
 def cmd_requeue(args: argparse.Namespace) -> int:
     settings = load_settings()
-    registry = load_registry()
+    registry = named_registry()
     index = LocalIndex().get(args.job_id)
     target = args.host or (None if args.runpod else (index.host if index else None))
     if not target and not args.runpod:
-        raise CliError(f"requeue needs --host <name>: nothing local knows where {args.job_id} ran")
+        raise UsageError(
+            f"requeue needs --host <name>: nothing local knows where {args.job_id} ran"
+        )
     s3 = S3Index.from_settings(settings)
     if s3 is None:
         raise CliError(
@@ -693,6 +843,34 @@ def cmd_pods(args: argparse.Namespace) -> int:
     view = pods_mod.gather(settings, make_provider(settings), heartbeats=not args.no_heartbeat)
     print(pods_mod.render(view))
     return 0
+
+
+def cmd_version(_: argparse.Namespace) -> int:
+    """What is installed here, and what each host was last given.
+
+    The host commits are read from the registry, which bootstrap wrote -- no
+    ssh, so this stays a command you can run before anything else.
+    """
+    commit = version_mod.local_commit()
+    source = "installed" if version_mod.installed_commit() else "source checkout"
+    dirty = " (+uncommitted changes)" if version_mod.dirty() else ""
+    print(f"gpuc {version_mod.__version__}")
+    print(f"commit {version_mod.short(commit)} [{source}]{dirty}")
+    print(f"python {sys.version.split()[0]} at {sys.executable}")
+    read = read_registry()
+    for error in read.errors:
+        print(f"warning: {error}", file=sys.stderr)
+    hosts = [e for e in read.registry.hosts.values() if e.bootstrapped_at]
+    if not hosts:
+        print("hosts: none bootstrapped")
+        return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
+    print("hosts:")
+    for entry in hosts:
+        note = "" if version_mod.same_commit(commit, entry.pkg_commit) else "  OLDER: re-bootstrap"
+        print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{note}")
+    if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
+        print("upgrade a host with: gpuc host bootstrap <host> (running jobs are not disturbed)")
+    return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -810,7 +988,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DURATION",
         help="only finished jobs that ended within this long ago, e.g. 24h, 7d, 90m",
     )
+    status.add_argument(
+        "--json",
+        action="store_true",
+        help="one JSON document on stdout: key on hosts[].running, and treat exit 3 "
+        "(local state unreadable) as unknown, never as nothing running",
+    )
     status.set_defaults(func=cmd_status)
+
+    sub.add_parser(
+        "version", help="version, installed commit, and each host's package commit"
+    ).set_defaults(func=cmd_version)
 
     clean = sub.add_parser("clean", help="remove finished jobs' workdirs on a host")
     clean.add_argument("--host", required=True)
@@ -847,6 +1035,25 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("-n", "--lines", type=int, default=200)
     logs.add_argument("--host")
     logs.set_defaults(func=cmd_logs)
+
+    ssh = sub.add_parser(
+        "ssh",
+        help="a shell on a host, or in a job's workdir; or one command there",
+    )
+    ssh.add_argument("target", help="a registered host name, or a job id")
+    ssh.add_argument("--host", help="which host a job id is on, if it is ambiguous")
+    ssh.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_only",
+        help="print the equivalent command line instead of running it",
+    )
+    ssh.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="a command to run there (after `--`); omit for an interactive shell",
+    )
+    ssh.set_defaults(func=cmd_ssh)
 
     cancel = sub.add_parser("cancel", help="cancel a queued or running job")
     cancel.add_argument("job_id")
@@ -957,6 +1164,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         first_run_note()
     try:
         return int(args.func(args))
+    except LocalStateUnreadable as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_LOCAL_STATE
+    except HostNotFound as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
     except (
         CleanError,
         CliError,
@@ -970,10 +1183,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         TransportError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return getattr(exc, "exit_code", EXIT_ERROR)
     except json.JSONDecodeError as exc:
         print(f"error: a host returned malformed JSON: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":
