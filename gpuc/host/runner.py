@@ -25,6 +25,7 @@ from gpuc.host.jobs import JobSpec
 
 KILL_GRACE_S = 15.0
 SAMPLE_INTERVAL_S = 30.0
+UTIL_SAMPLES_KEPT = 40  # 20 minutes at the default sample interval
 POLL_INTERVAL_S = 0.5
 
 UtilSampler = Callable[[Sequence[str]], float]
@@ -183,10 +184,15 @@ class JobRunner:
         jobs.update_state(self.job_id, phase=phase, pid=proc.pid, pgid=pgid)
         sampler = deps.util_sampler()
         low_util = self.spec.low_util
-        watch_low_util = phase == "main" and low_util.enabled and bool(self.assigned)
+        record_util = phase == "main" and bool(self.assigned)
+        watch_low_util = record_util and low_util.enabled
         window = _Window(low_util.window_min * 60.0)
         phase_start = deps.now()
-        next_sample = phase_start + low_util.grace_min * 60.0
+        # Sampling starts immediately so `gpuc status --suspects` has data, but
+        # the kill window only opens after grace_min: setup-like work at the top
+        # of main (model download, compile) is legitimately at 0% util.
+        next_sample = phase_start + deps.sample_interval_s
+        watch_from = phase_start + low_util.grace_min * 60.0
         max_runtime_s = (
             None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
         )
@@ -200,12 +206,15 @@ class JobRunner:
             if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
                 self._kill(proc, "timeout", log)
                 break
-            if watch_low_util and t >= next_sample:
+            if record_util and t >= next_sample:
                 next_sample = t + deps.sample_interval_s
                 try:
                     util = sampler(self.assigned)
                 except gpus.GpuError as exc:
                     self._log(log, f"utilization sample failed: {exc}")
+                    continue
+                self._record_util(util)
+                if not watch_low_util or t < watch_from:
                     continue
                 window.add(t, util)
                 if window.full(t) and window.mean() < low_util.floor_pct:
@@ -217,6 +226,10 @@ class JobRunner:
                     self._kill(proc, "low-util", log)
                     break
         return proc.wait()
+
+    def _record_util(self, util: float) -> None:
+        recent = [*jobs.read_state(self.job_id).util_recent, round(util, 1)][-UTIL_SAMPLES_KEPT:]
+        jobs.update_state(self.job_id, util_recent=recent, util_sampled_at=jobs.utc_now())
 
     def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
         self.kill_reason = reason

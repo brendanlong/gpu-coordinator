@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import textwrap
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from gpuc.control.config import HostEntry
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec
 
@@ -98,6 +100,9 @@ def torch_project() -> Path:
     specified as `uv run --no-sync python -c ...` from the job's workdir, so a
     real GPU job needs a workdir that is a uv project.
     """
+    # Every job syncs its own venv under /tmp; copying ~3 GB of torch per job
+    # fills the shared tmpfs, so link the cache instead.
+    os.environ.setdefault("UV_LINK_MODE", "symlink")
     root = Path(os.environ.get("GPUC_TEST_TORCH_PROJECT", "/tmp/gpuc-test-torch-project"))
     root.mkdir(parents=True, exist_ok=True)
     (root / "pyproject.toml").write_text(
@@ -124,3 +129,26 @@ def torch_project() -> Path:
     if proc.returncode != 0:
         pytest.skip(f"could not build a torch project: {proc.stdout}\n{proc.stderr}")
     return root
+
+
+@pytest.fixture
+def control_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A control side whose config, state and on-host GPUC_HOME are all temporary."""
+    root = tmp_path / "control"
+    monkeypatch.setenv("GPUC_CONFIG_DIR", str(root / "config"))
+    monkeypatch.setenv("GPUC_STATE_DIR", str(root / "state"))
+    monkeypatch.delenv("GPUC_HOME", raising=False)
+    (root / "config").mkdir(parents=True)
+    (root / "state").mkdir(parents=True)
+    yield root
+
+
+def local_host_entry(name: str, home: Path, gpus: list[str] | None = None) -> HostEntry:
+    """A `local` host whose ~/.gpuc is redirected, so tests never touch the real one."""
+    return HostEntry(
+        name=name,
+        kind="local",
+        gpus=gpus or [],
+        gpuc_home=str(home),
+        python=sys.executable,
+    )

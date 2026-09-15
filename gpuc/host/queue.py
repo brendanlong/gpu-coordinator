@@ -33,7 +33,7 @@ def enqueue(spec: JobSpec) -> str:
     paths.ensure_layout()
     paths.ensure_job_layout(spec.job_id)
     jobs.write_spec(spec)
-    jobs.write_state(spec.job_id, JobState(status="queued"))
+    jobs.write_state(spec.job_id, JobState(status="queued", attempt=spec.attempt))
     paths.log_file(spec.job_id).touch()
     # Marker last: a job is only dispatchable once its spec and state exist.
     (paths.queue_dir() / marker_name(spec.priority, spec.job_id)).touch()

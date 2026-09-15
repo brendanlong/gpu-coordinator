@@ -1,0 +1,398 @@
+"""The `gpuc` command line. Thin: parse, call a module, print, map errors to 1."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import subprocess
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+from gpuc.control import status as status_mod
+from gpuc.control.bootstrap import BootstrapError, bootstrap_host
+from gpuc.control.config import (
+    ConfigError,
+    HostEntry,
+    Registry,
+    Settings,
+    load_registry,
+    load_settings,
+    registry_transaction,
+    state_dir,
+    utc_now,
+)
+from gpuc.control.probe import probe_host
+from gpuc.control.remote import RemoteError, open_session
+from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError, job_log_uri
+from gpuc.control.submit import SubmitError, submit_file, submit_spec, validate
+from gpuc.control.transport import SshTransport, Transport, TransportError
+
+NOT_IMPLEMENTED = "not implemented yet"
+
+
+class CliError(RuntimeError):
+    pass
+
+
+def _gpu_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [part.strip() for part in raw.replace(" ", ",").split(",") if part.strip()]
+
+
+def cmd_host_add(args: argparse.Namespace) -> int:
+    entry = HostEntry(
+        name=args.name,
+        kind="ssh" if args.ssh else "local",
+        ssh=args.ssh,
+        port=args.port,
+        gpus=_gpu_list(args.gpus),
+        gpuc_home=args.gpuc_home,
+        s3_prefix=args.s3_prefix,
+        idle_minutes=args.idle_min,
+        ttl_hours=args.ttl_hours,
+        created_at=utc_now(),
+    )
+    with registry_transaction() as registry:
+        registry.put(entry)
+    print(
+        f"added host {entry.name} [{entry.kind}] "
+        f"{entry.ssh or 'this machine'} with {len(entry.gpus)} GPU(s)\n"
+        f"next: gpuc host bootstrap {entry.name}"
+    )
+    return 0
+
+
+def cmd_host_remove(args: argparse.Namespace) -> int:
+    with registry_transaction() as registry:
+        registry.require(args.name)
+        del registry.hosts[args.name]
+    print(f"removed host {args.name} from {state_dir()}/hosts.json (nothing on the host changed)")
+    return 0
+
+
+def cmd_host_list(_: argparse.Namespace) -> int:
+    registry = load_registry()
+    if not registry.hosts:
+        print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        return 0
+    for entry in registry.hosts.values():
+        bootstrapped = entry.bootstrapped_at or "never bootstrapped"
+        print(
+            f"{entry.name:<16} {entry.kind:<7} {entry.ssh or 'this machine':<28} "
+            f"gpus={len(entry.gpus)} python={entry.python or '-'} bootstrapped={bootstrapped}"
+        )
+        for uuid in entry.gpus:
+            print(f"  {uuid}")
+    return 0
+
+
+def cmd_host_bootstrap(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    entry = load_registry().require(args.name)
+    updated, result = bootstrap_host(entry, settings, health_args=args.health_args)
+    with registry_transaction() as registry:
+        registry.put(updated)
+    print(
+        f"host {result.host} ready: {result.files} package files at {result.home}/pkg, "
+        f"dispatcher pid {result.dispatcher_pid}"
+    )
+    for warning in result.warnings:
+        print(f"WARNING: {warning}")
+    return 0
+
+
+def cmd_host_probe(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    entry = load_registry().require(args.name)
+    print(probe_host(entry, settings).render())
+    return 0
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    if args.runpod:
+        print(f"submit --runpod is {NOT_IMPLEMENTED}; submit to a registered host with --host")
+        return 1
+    if not args.host:
+        raise CliError("submit needs --host <name> (see `gpuc host list`)")
+    settings = load_settings()
+    entry = load_registry().require(args.host)
+    result = submit_file(entry, args.job_file, settings, workdir=Path.cwd())
+    print(result.render())
+    return 0
+
+
+def _hosts(registry: Registry, only: str | None) -> list[HostEntry]:
+    if only:
+        return [registry.require(only)]
+    return list(registry.hosts.values())
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    registry = load_registry()
+    entries = _hosts(registry, args.host)
+    if not entries:
+        print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        return 0
+    seen: set[str] = set()
+    for entry in entries:
+        view = status_mod.gather(entry, settings)
+        seen.update(job.job_id for job in view.queue + view.running + view.finished)
+        print(status_mod.render(view, suspects_only=args.suspects))
+    if args.all and not args.suspects:
+        _print_unhosted(settings, seen)
+    return 0
+
+
+def _print_unhosted(settings: Settings, seen: set[str]) -> None:
+    entries = {entry.job_id: entry for entry in LocalIndex().list()}
+    s3 = S3Index.from_settings(settings)
+    if s3 is not None:
+        try:
+            entries.update({e.job_id: e for e in s3.list_index()})
+        except S3IndexError as exc:
+            print(f"note: could not read the S3 index: {exc}")
+    elsewhere = [entry for job_id, entry in sorted(entries.items()) if job_id not in seen]
+    if not elsewhere:
+        return
+    print("jobs known only to the index (their host is gone or was never reachable):")
+    for entry in elsewhere:
+        print(f"  {entry.job_id} {entry.name or '-'} host={entry.host} attempt={entry.attempt}")
+
+
+def find_job_host(
+    job_id: str, registry: Registry, explicit: str | None
+) -> tuple[HostEntry, IndexEntry | None]:
+    index = LocalIndex().get(job_id)
+    if explicit:
+        return registry.require(explicit), index
+    if index is not None and index.host in registry.hosts:
+        return registry.hosts[index.host], index
+    for entry in registry.hosts.values():
+        try:
+            payload = open_session(entry).host_json(f"status {shlex.quote(job_id)}", timeout=60.0)
+        except (RemoteError, TransportError):
+            continue
+        if payload.get("jobs"):
+            return entry, index
+    raise CliError(
+        f"no registered host knows job {job_id}.\n"
+        f"Pass --host <name>, or check `gpuc host list` and `gpuc status --all`."
+    )
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    entry, _ = find_job_host(args.job_id, load_registry(), args.host)
+    payload = open_session(entry, load_settings()).host_json(f"cancel {shlex.quote(args.job_id)}")
+    print(f"job {args.job_id} on host {entry.name}: {payload.get('status')}")
+    return 0
+
+
+def cmd_reorder(args: argparse.Namespace) -> int:
+    entry, _ = find_job_host(args.job_id, load_registry(), args.host)
+    session = open_session(entry, load_settings())
+    result = session.host_cli(f"reorder {shlex.quote(args.job_id)} {args.priority}", check=False)
+    if result.returncode != 0:
+        raise CliError(
+            f"job {args.job_id} is not in host {entry.name}'s queue, so its priority cannot "
+            f"change (a running or finished job cannot be reordered)."
+        )
+    print(f"job {args.job_id} on host {entry.name} moved to priority {args.priority}")
+    return 0
+
+
+def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
+    command = f"tail -n {lines} -f {shlex.quote(remote_path)}"
+    if isinstance(transport, SshTransport):
+        return transport.ssh_argv(command)
+    return ["bash", "-lc", command]
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    entry, index = find_job_host(args.job_id, load_registry(), args.host)
+    remote = None
+    try:
+        session = open_session(entry, settings)
+        remote = f"{session.job_dir(args.job_id)}/log.txt"
+        if args.follow:
+            return _follow(session.transport, remote, args.lines)
+        result = session.transport.tail(remote, lines=args.lines)
+        if result.returncode == 0:
+            sys.stdout.write(result.stdout)
+            return 0
+        note = result.output.strip().splitlines()[-1:] or ["no log file on the host"]
+    except (RemoteError, TransportError) as exc:
+        note = [str(exc).splitlines()[0]]
+    print(f"note: could not read {remote or 'the host log'}: {note[0]}", file=sys.stderr)
+    return _logs_from_s3(args.job_id, entry, index, settings)
+
+
+def _follow(transport: Transport, remote: str, lines: int) -> int:
+    argv = _follow_argv(transport, remote, lines)
+    try:
+        return subprocess.call(argv)
+    except KeyboardInterrupt:
+        return 0
+
+
+def _logs_from_s3(
+    job_id: str, entry: HostEntry, index: IndexEntry | None, settings: Settings
+) -> int:
+    s3 = S3Index.from_settings(settings)
+    prefix = (index.s3_prefix if index else None) or entry.s3_prefix
+    if s3 is None or not prefix:
+        raise CliError(
+            f"no S3 mirror to fall back on for {job_id}.\n"
+            f"Set s3_bucket in ~/.config/gpu-coordinator/config.toml to keep logs after a "
+            f"host goes away."
+        )
+    uri = job_log_uri(prefix, job_id)
+    print(f"note: falling back to the S3 mirror at {uri}", file=sys.stderr)
+    sys.stdout.write(s3.get_uri(uri))
+    return 0
+
+
+def cmd_requeue(args: argparse.Namespace) -> int:
+    if args.runpod:
+        print(f"requeue --runpod is {NOT_IMPLEMENTED}; use --host <name>")
+        return 1
+    settings = load_settings()
+    registry = load_registry()
+    index = LocalIndex().get(args.job_id)
+    target = args.host or (index.host if index else None)
+    if not target:
+        raise CliError(f"requeue needs --host <name>: nothing local knows where {args.job_id} ran")
+    entry = registry.require(target)
+    s3 = S3Index.from_settings(settings)
+    if s3 is None:
+        raise CliError(
+            "requeue reads the spec from S3, but s3_bucket is unset in "
+            "~/.config/gpu-coordinator/config.toml. Re-submit the job file instead."
+        )
+    document = s3.get_spec(args.job_id)
+    for key in ("job_id", "attempt"):
+        document.pop(key, None)
+    attempt = (index.attempt if index else 1) + 1
+    result = submit_spec(
+        entry,
+        validate(document, f"spec for {args.job_id}"),
+        settings,
+        workdir=Path.cwd(),
+        attempt=attempt,
+    )
+    print(result.render())
+    print(f"  requeued from {args.job_id} (attempt {attempt}); workdir re-synced from {Path.cwd()}")
+    return 0
+
+
+def cmd_reconcile(_: argparse.Namespace) -> int:
+    print(f"reconcile is {NOT_IMPLEMENTED}")
+    return 1
+
+
+def cmd_pods(_: argparse.Namespace) -> int:
+    print(f"pods is {NOT_IMPLEMENTED}")
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="gpuc", description="GPU job coordinator")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    host = sub.add_parser("host", help="manage hosts").add_subparsers(
+        dest="host_command", required=True
+    )
+    add = host.add_parser("add", help="register a host")
+    add.add_argument("name")
+    add.add_argument("--ssh", help="user@host; omit for this machine")
+    add.add_argument("--port", type=int, default=22)
+    add.add_argument("--gpus", help="comma-separated GPU UUIDs this host may use")
+    add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
+    add.add_argument("--s3-prefix", help="s3://bucket/prefix for log and state mirroring")
+    add.add_argument("--idle-min", type=float, default=15.0)
+    add.add_argument("--ttl-hours", type=float, default=24.0)
+    add.set_defaults(func=cmd_host_add)
+
+    bootstrap = host.add_parser("bootstrap", help="install uv, the package and the dispatcher")
+    bootstrap.add_argument("name")
+    bootstrap.add_argument(
+        "--health-args", default="", help="extra flags for `gpuc.host health`, e.g. --min-mbps 0.1"
+    )
+    bootstrap.set_defaults(func=cmd_host_bootstrap)
+
+    probe = host.add_parser("probe", help="report what a host has, before bootstrap")
+    probe.add_argument("name")
+    probe.set_defaults(func=cmd_host_probe)
+
+    host.add_parser("list", help="list registered hosts").set_defaults(func=cmd_host_list)
+    remove = host.add_parser("remove", help="forget a host")
+    remove.add_argument("name")
+    remove.set_defaults(func=cmd_host_remove)
+
+    submit = sub.add_parser("submit", help="submit a job file to a host")
+    submit.add_argument("job_file")
+    submit.add_argument("--host")
+    submit.add_argument("--runpod", action="store_true")
+    submit.set_defaults(func=cmd_submit)
+
+    status = sub.add_parser("status", help="per-host queue, running and recent jobs")
+    status.add_argument("--host")
+    status.add_argument("--all", action="store_true", help="also list jobs only the index knows")
+    status.add_argument("--suspects", action="store_true", help="billing but idle; never kills")
+    status.set_defaults(func=cmd_status)
+
+    logs = sub.add_parser("logs", help="tail a job log from its host")
+    logs.add_argument("job_id")
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.add_argument("-n", "--lines", type=int, default=200)
+    logs.add_argument("--host")
+    logs.set_defaults(func=cmd_logs)
+
+    cancel = sub.add_parser("cancel", help="cancel a queued or running job")
+    cancel.add_argument("job_id")
+    cancel.add_argument("--host")
+    cancel.set_defaults(func=cmd_cancel)
+
+    reorder = sub.add_parser("reorder", help="change a queued job's priority")
+    reorder.add_argument("job_id")
+    reorder.add_argument("--priority", type=int, required=True)
+    reorder.add_argument("--host")
+    reorder.set_defaults(func=cmd_reorder)
+
+    requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
+    requeue.add_argument("job_id")
+    requeue.add_argument("--host")
+    requeue.add_argument("--runpod", action="store_true")
+    requeue.set_defaults(func=cmd_requeue)
+
+    sub.add_parser("reconcile", help=f"({NOT_IMPLEMENTED})").set_defaults(func=cmd_reconcile)
+    sub.add_parser("pods", help=f"({NOT_IMPLEMENTED})").set_defaults(func=cmd_pods)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    try:
+        return int(args.func(args))
+    except (
+        CliError,
+        ConfigError,
+        SubmitError,
+        BootstrapError,
+        RemoteError,
+        S3IndexError,
+        TransportError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"error: a host returned malformed JSON: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

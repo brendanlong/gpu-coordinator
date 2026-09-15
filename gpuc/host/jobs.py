@@ -133,6 +133,7 @@ class JobSpec:
     max_runtime_min: float | None = None
     low_util: LowUtil = field(default_factory=LowUtil)
     requires: dict[str, Any] = field(default_factory=dict)
+    attempt: int = 1
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> JobSpec:
@@ -152,6 +153,7 @@ class JobSpec:
             ),
             low_util=LowUtil.from_dict(d.get("low_util")),
             requires=dict(d.get("requires") or {}),
+            attempt=int(d.get("attempt", 1)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,6 +173,8 @@ class JobState:
     pid: int | None = None
     pgid: int | None = None
     runner_pid: int | None = None
+    util_recent: list[float] = field(default_factory=list)
+    util_sampled_at: str | None = None
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> JobState:

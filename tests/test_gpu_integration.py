@@ -124,8 +124,12 @@ def test_a_failing_gpu_job_propagates_its_exit_code(gpu_home: Path, torch_projec
     assert state.reason == "exit 17"
 
 
-def test_a_zero_gpu_job_runs_without_waiting_for_the_card(gpu_home: Path) -> None:
-    hog = queue.enqueue(spec_for("sleep 120", setup=None, gpus=1))
+def test_a_zero_gpu_job_runs_without_waiting_for_the_card(
+    gpu_home: Path, torch_project: Path
+) -> None:
+    # The hog keeps its torch project: without one it fails GPU preflight in a
+    # second or two, and then it is not holding the card the test needs held.
+    hog = enqueue_in_project(spec_for("sleep 120", gpus=1), torch_project)
     cpu_job = queue.enqueue(
         spec_for('echo "CVD=[$CUDA_VISIBLE_DEVICES]"; nproc', setup=None, gpus=0, priority=90)
     )
