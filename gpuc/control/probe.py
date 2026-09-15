@@ -16,6 +16,7 @@ SECTION_ORDER = [
     "driver",
     "gpus",
     "disk",
+    "home_fs",
     "killuserprocesses",
     "systemd_scope",
     "uv",
@@ -38,6 +39,9 @@ nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv,noheader 2>&1 \
   || echo "nvidia-smi not found"
 say disk
 df -Ph "$HOME" | tail -1
+say home_fs
+df -T "$HOME" 2>/dev/null | tail -1 || stat -f -c '%n %T' "$HOME" 2>/dev/null \
+  || echo "unknown unknown"
 say killuserprocesses
 kup=$(loginctl show-user "$(id -un)" -p KillUserProcesses 2>&1 | head -1)
 echo "${{kup:-unknown: no logind session for this user}}"
@@ -79,10 +83,16 @@ fi
 """
 
 
+OVERLAY_FS_TYPES = frozenset({"overlay", "overlayfs", "aufs"})
+"""Filesystem types that mean "this is a container's throwaway upper layer"."""
+
+
 @dataclass
 class ProbeReport:
     host: str
     sections: dict[str, str]
+    persistent_root: str | None = None
+    """The root this host is *already* registered with, if any."""
 
     @property
     def has_nvidia_smi(self) -> bool:
@@ -98,6 +108,17 @@ class ProbeReport:
             if len(cells) >= 3 and cells[0].isdigit():
                 rows.append(cells)
         return rows
+
+    @property
+    def home_fs_type(self) -> str | None:
+        """The filesystem type of ``$HOME``: field 2 of `df -T` (and of the
+        `stat -f` fallback, which prints ``<path> <type>``)."""
+        fields = self.sections.get("home_fs", "").split()
+        return fields[1] if len(fields) > 1 else None
+
+    @property
+    def home_is_overlay(self) -> bool:
+        return (self.home_fs_type or "").lower() in OVERLAY_FS_TYPES
 
     def render(self) -> str:
         lines = [f"host {self.host}"]
@@ -121,12 +142,32 @@ class ProbeReport:
                 "  note: logind kills user processes at logout; the dispatcher will not "
                 "survive your SSH session ending"
             )
+        if self.home_is_overlay:
+            overlay = (
+                f"  note: $HOME is on an {self.home_fs_type} filesystem, so it is a container's "
+                f"throwaway upper layer and is wiped on every restart.\n"
+            )
+            if self.persistent_root:
+                overlay += (
+                    f"        This host is registered with --persistent-root "
+                    f"{self.persistent_root}, so uv, the queue and every job dir are already "
+                    f"off it.\n        After a restart, recover with: "
+                    f"gpuc host bootstrap {self.host}"
+                )
+            else:
+                overlay += (
+                    f"        Point this host at a volume that survives:\n"
+                    f"        gpuc host set {self.host} --persistent-root /mnt/<volume>/$USER\n"
+                    f"        (then `gpuc host bootstrap {self.host}`; uv, the queue and every "
+                    f"job dir move there)"
+                )
+            lines.append(overlay)
         if self.sections.get("uv") == "not installed":
             lines.append(f"  note: uv is missing; `gpuc host bootstrap {self.host}` installs it")
         return "\n".join(lines)
 
 
-def parse_probe(host: str, output: str) -> ProbeReport:
+def parse_probe(host: str, output: str, persistent_root: str | None = None) -> ProbeReport:
     sections: dict[str, str] = {}
     current = "preamble"
     buffer: list[str] = []
@@ -139,7 +180,7 @@ def parse_probe(host: str, output: str) -> ProbeReport:
             continue
         buffer.append(line)
     sections[current] = "\n".join(buffer).strip()
-    return ProbeReport(host=host, sections=sections)
+    return ProbeReport(host=host, sections=sections, persistent_root=persistent_root)
 
 
 def probe_host(
@@ -147,4 +188,4 @@ def probe_host(
 ) -> ProbeReport:
     transport = transport or transport_for(entry, settings)
     result = transport.run(PROBE_SCRIPT, timeout=240.0, check=False)
-    return parse_probe(entry.name, result.output)
+    return parse_probe(entry.name, result.output, entry.root)

@@ -226,10 +226,15 @@ class _Window:
         return sum(v for _, v in self.samples) / len(self.samples)
 
 
-def build_env(spec: JobSpec, assigned: Sequence[str]) -> dict[str, str]:
+def build_env(
+    spec: JobSpec, assigned: Sequence[str], config: jobs.HostConfig | None = None
+) -> dict[str, str]:
     env = dict(os.environ)
-    # Before the spec's own env, so a job may still pin PATH explicitly.
-    env["PATH"] = paths.path_with_user_bins(env)
+    # The host's own env and PATH go first, so a job may still pin either
+    # explicitly. The dispatcher normally passes these down already; doing it
+    # here too means a runner started by hand, or by a dispatcher from before a
+    # `gpuc host set`, still gets them.
+    (config or jobs.read_config()).apply_env(env)
     env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
     env.update(spec.env)
     # Last, so a spec `env` typo cannot hand the job the wrong cards.
@@ -387,7 +392,7 @@ class JobRunner:
     def run(self) -> int:
         paths.ensure_job_layout(self.job_id)
         job_start = self.deps.now()
-        env = build_env(self.spec, self.assigned)
+        env = build_env(self.spec, self.assigned, self.config)
         # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
         # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
         # credential file anywhere on the host.

@@ -8,6 +8,7 @@ host whose login shell has a different `python` on PATH still runs our code.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,8 +25,15 @@ class RemoteError(RuntimeError):
         self.command = command
 
 
-def host_command(python: str, home: str, args: str) -> str:
-    return f'GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" "{python}" -m gpuc.host {args}'
+def host_command(python: str, home: str, args: str, env: Mapping[str, str] | None = None) -> str:
+    """One invocation of the on-host package, with its environment pinned.
+
+    ``env`` is the host's own `HostEntry.env`. Every host-package invocation
+    gets it, because `enqueue` spawns the dispatcher and the dispatcher's
+    environment is what every job on the host inherits.
+    """
+    assignments = "".join(f'{key}="{value}" ' for key, value in sorted((env or {}).items()))
+    return f'{assignments}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" "{python}" -m gpuc.host {args}'
 
 
 @dataclass
@@ -39,6 +47,10 @@ class HostSession:
     def pkg_dir(self) -> str:
         return f"{self.home}/pkg"
 
+    @property
+    def env(self) -> dict[str, str]:
+        return dict(self.entry.env)
+
     def job_dir(self, job_id: str) -> str:
         return f"{self.home}/jobs/{job_id}"
 
@@ -48,7 +60,7 @@ class HostSession:
     def host_cli(
         self, args: str, *, timeout: float = DEFAULT_TIMEOUT_S, check: bool = True
     ) -> CommandResult:
-        command = host_command(self.python, self.home, args)
+        command = host_command(self.python, self.home, args, self.env)
         result = self.transport.run(command, timeout=timeout, check=False)
         if check and result.returncode != 0:
             raise RemoteError(
@@ -66,7 +78,7 @@ class HostSession:
         if document is _NO_JSON:
             raise RemoteError(
                 self.entry.name,
-                host_command(self.python, self.home, args),
+                host_command(self.python, self.home, args, self.env),
                 f"expected JSON on stdout, got:\n{_tail(result.output)}",
             )
         return document

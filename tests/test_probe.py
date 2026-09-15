@@ -79,3 +79,60 @@ def test_a_host_with_nothing_still_renders() -> None:
     rendered = report.render()
     assert "only run gpus: 0 jobs" in rendered
     assert "cannot time a download" in rendered
+
+
+OVERLAY_HOME = """===system===
+Linux 5.15.0 x86_64
+user=brendan home=/home/brendan shell=/bin/zsh
+===disk===
+overlay  1.8T  1.5T  300G  84% /
+===home_fs===
+overlay overlay 1887436800 1572864000 314572800 84% /
+===uv===
+not installed
+"""
+
+DISK_HOME = """===home_fs===
+/dev/nvme0n1p2 ext4 1887436800 400000000 1400000000 23% /home
+"""
+
+
+def test_the_script_asks_df_for_the_filesystem_type() -> None:
+    assert 'df -T "$HOME"' in PROBE_SCRIPT
+    assert "stat -f" in PROBE_SCRIPT
+
+
+def test_an_overlay_home_is_detected_and_suggests_a_persistent_root() -> None:
+    report = parse_probe("spar", OVERLAY_HOME)
+    assert report.home_fs_type == "overlay"
+    assert report.home_is_overlay
+    rendered = report.render()
+    assert "wiped on every restart" in rendered
+    assert "gpuc host set spar --persistent-root /mnt/<volume>/$USER" in rendered
+
+
+def test_a_real_filesystem_gets_no_persistent_root_note() -> None:
+    report = parse_probe("desk", DISK_HOME)
+    assert report.home_fs_type == "ext4"
+    assert not report.home_is_overlay
+    assert "persistent-root" not in report.render()
+
+
+def test_the_stat_fallback_form_is_parsed_too() -> None:
+    report = parse_probe("spar", "===home_fs===\n/home/brendan overlayfs\n")
+    assert (report.home_fs_type, report.home_is_overlay) == ("overlayfs", True)
+
+
+def test_a_host_that_answered_nothing_is_not_called_an_overlay() -> None:
+    report = parse_probe("spar", SAMPLE)
+    assert report.home_fs_type is None
+    assert not report.home_is_overlay
+    assert "persistent-root" not in report.render()
+
+
+def test_a_host_that_already_has_a_root_is_told_how_to_recover_instead() -> None:
+    rendered = parse_probe("spar", OVERLAY_HOME, "/mnt/ssd-2/brendan").render()
+    assert "wiped on every restart" in rendered
+    assert "--persistent-root /mnt/ssd-2/brendan, so uv, the queue" in rendered
+    assert "recover with: gpuc host bootstrap spar" in rendered
+    assert "/mnt/<volume>" not in rendered

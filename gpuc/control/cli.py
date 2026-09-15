@@ -58,6 +58,16 @@ def _gpu_list(raw: str | None) -> list[str]:
     return [part.strip() for part in raw.replace(" ", ",").split(",") if part.strip()]
 
 
+def _env_dict(pairs: Sequence[str] | None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            raise CliError(f"--env wants KEY=VALUE, got {pair!r}")
+        env[key.strip()] = value
+    return env
+
+
 def cmd_host_add(args: argparse.Namespace) -> int:
     entry = HostEntry(
         name=args.name,
@@ -66,6 +76,8 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         port=args.port,
         gpus=_gpu_list(args.gpus),
         gpuc_home=args.gpuc_home,
+        persistent_root=args.persistent_root,
+        env=_env_dict(args.env),
         s3_prefix=args.s3_prefix,
         idle_minutes=args.idle_min,
         ttl_hours=args.ttl_hours,
@@ -76,7 +88,68 @@ def cmd_host_add(args: argparse.Namespace) -> int:
     print(
         f"added host {entry.name} [{entry.kind}] "
         f"{entry.ssh or 'this machine'} with {len(entry.gpus)} GPU(s)\n"
+        f"{_home_line(entry)}"
         f"next: gpuc host bootstrap {entry.name}"
+    )
+    return 0
+
+
+def _home_line(entry: HostEntry) -> str:
+    if entry.root is None:
+        return ""
+    return (
+        f"persistent root {entry.root}, so gpuc home (queue, specs, state, logs, "
+        f"workdirs) is {entry.remote_home}\n"
+    )
+
+
+# None means "not given, leave it alone"; an empty string means "clear it".
+_SET_FIELDS = (
+    "gpus",
+    "persistent_root",
+    "gpuc_home",
+    "env",
+    "s3_prefix",
+    "idle_min",
+    "ttl_hours",
+)
+
+
+def cmd_host_set(args: argparse.Namespace) -> int:
+    """Edit one registered host in place, without remove/add losing the rest."""
+    changes: dict[str, object] = {}
+    if args.gpus is not None:
+        changes["gpus"] = _gpu_list(args.gpus)
+    for flag, field in (
+        ("persistent_root", "persistent_root"),
+        ("gpuc_home", "gpuc_home"),
+        ("s3_prefix", "s3_prefix"),
+    ):
+        value = getattr(args, flag)
+        if value is not None:
+            changes[field] = value or None
+    if args.env is not None:
+        # The whole dict, not a merge: "set it to exactly this" is the only
+        # rule that can also express "set it to nothing" (`--env ''`).
+        changes["env"] = _env_dict([pair for pair in args.env if pair])
+    if args.idle_min is not None:
+        changes["idle_minutes"] = args.idle_min
+    if args.ttl_hours is not None:
+        changes["ttl_hours"] = args.ttl_hours
+    if not changes:
+        raise CliError(
+            "host set changes nothing: pass at least one of "
+            + ", ".join(f"--{f.replace('_', '-')}" for f in _SET_FIELDS)
+        )
+    with registry_transaction() as registry:
+        entry = registry.require(args.name)
+        updated = entry.model_copy(update=changes)
+        registry.put(updated)
+    print(
+        f"host {updated.name}: "
+        + ", ".join(f"{key}={value!r}" for key, value in sorted(changes.items()))
+        + f"\n{_home_line(updated)}"
+        + f"the host itself is unchanged until: gpuc host bootstrap {updated.name}"
     )
     return 0
 
@@ -100,6 +173,8 @@ def cmd_host_list(_: argparse.Namespace) -> int:
             f"{entry.name:<16} {entry.kind:<7} {entry.ssh or 'this machine':<28} "
             f"gpus={len(entry.gpus)} python={entry.python or '-'} bootstrapped={bootstrapped}"
         )
+        if entry.root:
+            print(f"  persistent root {entry.root} (gpuc home {entry.remote_home})")
         for uuid in entry.gpus:
             print(f"  {uuid}")
     return 0
@@ -236,6 +311,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     entries = _hosts(registry, args.host)
     if not entries:
         print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        # ...but `--all` still has something to say: the index remembers jobs
+        # whose host has since been removed.
+        if args.all and not args.suspects:
+            _print_unhosted(settings, set(), args.host)
         return 0
     provider = _provider_for_status(entries, settings)
     seen: set[str] = set()
@@ -244,7 +323,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         seen.update(job.job_id for job in view.queue + view.running + view.finished)
         print(status_mod.render(view, suspects_only=args.suspects))
     if args.all and not args.suspects:
-        _print_unhosted(settings, seen)
+        _print_unhosted(settings, seen, args.host)
     return 0
 
 
@@ -259,7 +338,14 @@ def _provider_for_status(entries: list[HostEntry], settings: Settings) -> Provid
         return None
 
 
-def _print_unhosted(settings: Settings, seen: set[str]) -> None:
+def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None) -> None:
+    """The index's view of jobs no host admitted to having.
+
+    After a host loses its state -- a container whose $HOME was wiped, a pod
+    that is gone -- this is the only list of what was on it, and `gpuc requeue
+    <id> --host <name>` is how each one comes back, so `--host H --all` narrows
+    it to the host being recovered.
+    """
     entries = {entry.job_id: entry for entry in LocalIndex().list()}
     s3 = S3Index.from_settings(settings)
     if s3 is not None:
@@ -267,12 +353,18 @@ def _print_unhosted(settings: Settings, seen: set[str]) -> None:
             entries.update({e.job_id: e for e in s3.list_index()})
         except S3IndexError as exc:
             print(f"note: could not read the S3 index: {exc}")
-    elsewhere = [entry for job_id, entry in sorted(entries.items()) if job_id not in seen]
+    elsewhere = [
+        entry
+        for job_id, entry in sorted(entries.items())
+        if job_id not in seen and (host is None or entry.host == host)
+    ]
     if not elsewhere:
         return
-    print("jobs known only to the index (their host is gone or was never reachable):")
+    scope = f" for host {host}" if host else ""
+    print(f"jobs known only to the index{scope} (their host is gone, or lost its state):")
     for entry in elsewhere:
         print(f"  {entry.job_id} {entry.name or '-'} host={entry.host} attempt={entry.attempt}")
+    print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")
 
 
 def find_job_host(
@@ -439,10 +531,37 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--port", type=int, default=22)
     add.add_argument("--gpus", help="comma-separated GPU UUIDs this host may use")
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
+    add.add_argument(
+        "--persistent-root",
+        help="a directory on a volume that survives restarts; gpuc home "
+        "(queue, specs, state, logs, workdirs) moves to PATH/gpuc",
+    )
+    add.add_argument(
+        "--env",
+        action="append",
+        metavar="KEY=VALUE",
+        help="extra environment for every job on this host; repeatable",
+    )
     add.add_argument("--s3-prefix", help="s3://bucket/prefix for log and state mirroring")
     add.add_argument("--idle-min", type=float, default=15.0)
     add.add_argument("--ttl-hours", type=float, default=24.0)
     add.set_defaults(func=cmd_host_add)
+
+    edit = host.add_parser("set", help="change a registered host without remove/add")
+    edit.add_argument("name")
+    edit.add_argument("--gpus", help="replace the GPU UUIDs; pass '' for none")
+    edit.add_argument("--persistent-root", help="pass '' to go back to $HOME")
+    edit.add_argument("--gpuc-home", help="pass '' for the default under the root or $HOME")
+    edit.add_argument(
+        "--env",
+        action="append",
+        metavar="KEY=VALUE",
+        help="replace this host's job environment; repeatable, '' for none",
+    )
+    edit.add_argument("--s3-prefix", help="pass '' to stop mirroring")
+    edit.add_argument("--idle-min", type=float)
+    edit.add_argument("--ttl-hours", type=float)
+    edit.set_defaults(func=cmd_host_set)
 
     bootstrap = host.add_parser("bootstrap", help="install uv, the package and the dispatcher")
     bootstrap.add_argument("name")

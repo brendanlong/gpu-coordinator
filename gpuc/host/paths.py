@@ -7,7 +7,7 @@ bootstrap that sets GPUC_HOME) can redirect the whole tree at any time.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 USER_BIN_DIRS = (".local/bin", ".cargo/bin")
@@ -31,13 +31,23 @@ def config_file() -> Path:
     return home() / "config.json"
 
 
-def path_with_user_bins(environ: Mapping[str, str] | None = None) -> str:
-    """``PATH`` with the $HOME tool directories in front, without duplicates."""
+def path_with_user_bins(environ: Mapping[str, str] | None = None, extra: Sequence[str] = ()) -> str:
+    """``PATH`` with ``extra`` then the $HOME tool dirs in front, no duplicates.
+
+    ``extra`` is for a host whose tools live off ``$HOME`` (see
+    ``jobs.HOST_ENV_BIN_KEYS``); those come first, because a host that names a
+    tool directory explicitly means it.
+
+    Unlike the $HOME entries, an ``extra`` directory is prepended even when it
+    does not exist yet: whatever is going to create it may not have run, and
+    the dispatcher must not need a second bootstrap to see it.
+    """
     environ = os.environ if environ is None else environ
     current = environ.get("PATH", os.defpath)
     entries = current.split(os.pathsep)
     user_home = Path(environ.get("HOME") or Path.home())
-    prefix = [
+    prefix = [d for d in extra if d and d not in entries]
+    prefix += [
         str(user_home / name)
         for name in USER_BIN_DIRS
         if (user_home / name).is_dir() and str(user_home / name) not in entries

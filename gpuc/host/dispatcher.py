@@ -263,15 +263,19 @@ class DispatcherLock:
 def _child_env(package_root: Path) -> dict[str, str]:
     """The environment every dispatcher-spawned process gets.
 
-    PYTHONPATH so the rsynced package is importable, and PATH so `uv` is
-    findable: a pod's sshd PATH has no ~/.local/bin, and the dispatcher's own
-    environment is what the runner (and through it every job) inherits.
+    PYTHONPATH so the rsynced package is importable, PATH so `uv` is findable
+    (a pod's sshd PATH has no ~/.local/bin), and the host config's own `env`,
+    which is how a host points a cache or a tool dir somewhere non-default.
+    The dispatcher's environment is what the runner -- and through it every
+    job -- inherits.
     """
     env = dict(os.environ)
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{package_root}{os.pathsep}{existing}" if existing else str(package_root)
-    env["PATH"] = paths.path_with_user_bins(env)
-    return env
+    config = jobs.HostConfig()
+    with contextlib.suppress(RuntimeError, OSError, ValueError):
+        config = jobs.read_config()
+    return config.apply_env(env)
 
 
 def default_spawn_runner(job_id: str) -> subprocess.Popen[bytes]:

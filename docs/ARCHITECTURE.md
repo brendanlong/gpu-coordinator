@@ -62,7 +62,8 @@ out to binaries the bootstrap installs into `$HOME` (`aws` CLI v2 bundle,
 
 ```
 config.json          # {"host": "<name>", "gpus": ["GPU-uuid", ...], "provider": null | {"kind":"runpod","pod_id":..},
-                     #  "idle_minutes": 15, "ttl_hours": 24, "s3_prefix": "s3://bucket/gpuc/<host>"}
+                     #  "idle_minutes": 15, "ttl_hours": 24, "s3_prefix": "s3://bucket/gpuc/<host>",
+                     #  "env": {"HF_HOME": ...}}      # host-wide, hand-set; see Persistent root
 secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
 incoming/<jobid>.json # a spec staged 0644 by `submit`, fed to `enqueue -` and deleted
 queue/<prio>-<jobid> # empty marker files; lexical order is dispatch order. prio is 2 digits, default 50.
@@ -190,8 +191,12 @@ queue's lexical order, not submission order below one second.
 gpuc host add local  --gpus GPU-uuid[,..]                          # this machine
 gpuc host add spar   --ssh user@host [--port N] --gpus GPU-uuid,.. # shared box
                      [--gpuc-home PATH]           # override ~/.gpuc on the host (tests, odd layouts)
+                     [--persistent-root R]        # gpuc home moves to R/gpuc; see Persistent root
+                     [--env K=V]                  # extra environment for every job on this host
+gpuc host set <host> [--gpus ..] [--persistent-root R] [--gpuc-home PATH] [--s3-prefix ..]
+                     [--idle-min N] [--ttl-hours N]   # edit one entry in place; only the flags given change
 gpuc host bootstrap <host>        # install uv + package, write config, run host preflight, start dispatcher
-gpuc host probe <host>            # print driver, GPUs+UUIDs, disk, logind KillUserProcesses, systemd --user, network timing
+gpuc host probe <host>            # print driver, GPUs+UUIDs, disk + $HOME's fs type, logind KillUserProcesses, systemd --user, network timing
 gpuc host list | remove <host>
 
 gpuc submit job.yaml --host <host>                                  # existing host
@@ -252,6 +257,31 @@ never touch argv.
 3. Write `~/.gpuc/config.json` from the host registry entry.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"`.
+
+## Persistent root (a host whose `$HOME` is wiped on restart)
+
+`gpuc host add|set <name> --persistent-root R` moves `GPUC_HOME` to `R/gpuc`,
+and nothing else: the queue, specs, state, logs and workdirs are the state that
+cannot be reinstalled. uv, its cache and managed Pythons, `uv tool` installs
+and the `aws` bundle stay in `$HOME` on every host -- bootstrap reinstalls them
+in seconds, and these shared volumes are much slower than a container's local
+disk, so a venv or a cache on one is a bad trade. Bootstrap creates `R` 0700 if
+it creates it and leaves an existing `R`'s mode alone; everything inside is
+gpuc home, which `paths.ensure_layout` already makes 0700. Without a root
+nothing changes.
+
+`HostEntry.env` (`--env K=V`, nothing populates it automatically) is written to
+`config.json` as `HostConfig.env` and applied to every job's environment
+*before* the job's own `env` -- by the dispatcher to every child it spawns, and
+by the runner -- and to every `HostSession` invocation of the on-host package.
+`UV_INSTALL_DIR`/`UV_TOOL_BIN_DIR` in it are also prepended to `PATH`.
+
+`gpuc host probe` reports `$HOME`'s filesystem type (`df -T`, `stat -f`
+fallback) and suggests `--persistent-root` when it is an overlay (or, if the
+host already has one, how to recover after a restart). The health check's disk
+floor is measured on `paths.home()`, so it is `R`'s volume when a root is set.
+Recovery without a root is `gpuc host bootstrap`, then `gpuc status --host H
+--all` (the index's jobs, by host) and `gpuc requeue <id> --host H`.
 
 ## RunPod provider (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
 

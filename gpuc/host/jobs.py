@@ -230,6 +230,16 @@ def list_job_ids() -> list[str]:
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
+HOST_ENV_BIN_KEYS = ("UV_INSTALL_DIR", "UV_TOOL_BIN_DIR")
+"""Keys in ``HostConfig.env`` whose values are directories holding binaries.
+
+A host told to keep uv (or its tools) somewhere other than ``$HOME`` needs
+that directory on ``PATH`` too, or the runner's own ``uv run --no-sync``
+preflight cannot find it. Deriving the extra PATH entries from the env dict
+keeps one source of truth: the config.
+"""
+
+
 @dataclass
 class HostConfig:
     host: str = "local"
@@ -239,6 +249,13 @@ class HostConfig:
     ttl_hours: float = 24.0
     s3_prefix: str | None = None
     created_at: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    """Host-wide environment, applied to every job before the job's own `env`.
+
+    Hand-set per host (`gpuc host add|set --env K=V`) for the paths that belong
+    somewhere other than this host's defaults -- an `HF_HOME` on a big volume,
+    say. Nothing populates it automatically.
+    """
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> HostConfig:
@@ -250,6 +267,7 @@ class HostConfig:
             ttl_hours=float(d.get("ttl_hours", 24.0)),
             s3_prefix=d.get("s3_prefix"),
             created_at=d.get("created_at"),
+            env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -258,6 +276,25 @@ class HostConfig:
     @property
     def ephemeral(self) -> bool:
         return self.provider is not None
+
+    def bin_dirs(self) -> list[str]:
+        """Directories from `env` to put on PATH, in order, without duplicates."""
+        out: list[str] = []
+        for key in HOST_ENV_BIN_KEYS:
+            value = self.env.get(key)
+            if value and value not in out:
+                out.append(value)
+        return out
+
+    def apply_env(self, env: dict[str, str]) -> dict[str, str]:
+        """Merge the host env into ``env`` and re-front PATH with its bin dirs.
+
+        Mutates and returns ``env``. Callers apply this *before* a job's own
+        ``env``, so a job can still override any of it.
+        """
+        env.update(self.env)
+        env["PATH"] = paths.path_with_user_bins(env, extra=self.bin_dirs())
+        return env
 
 
 def read_config() -> HostConfig:

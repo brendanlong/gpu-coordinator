@@ -179,6 +179,10 @@ class HostEntry(BaseModel):
     python: str | None = None
     uv: str | None = None
     gpuc_home: str | None = None
+    persistent_root: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    """Extra environment for every job on this host, set by hand with
+    `gpuc host add|set --env K=V`. Nothing populates it automatically."""
     idle_minutes: float = 15.0
     ttl_hours: float = 24.0
     s3_prefix: str | None = None
@@ -186,9 +190,25 @@ class HostEntry(BaseModel):
     bootstrapped_at: str | None = None
 
     @property
+    def root(self) -> str | None:
+        """The persistent root, without a trailing slash."""
+        return self.persistent_root.rstrip("/") or "/" if self.persistent_root else None
+
+    @property
     def remote_home(self) -> str:
-        """The host's ``$GPUC_HOME``; unexpanded ``$HOME`` so the host resolves it."""
-        return self.gpuc_home or "$HOME/.gpuc"
+        """The host's ``$GPUC_HOME``; unexpanded ``$HOME`` so the host resolves it.
+
+        A persistent root moves it off ``$HOME``: on a host whose home is wiped
+        on restart, the queue, specs, state, logs and workdirs are the things
+        that cannot be reinstalled, so they go on the volume that survives.
+        Deliberately *only* those: uv, its caches and the aws bundle stay in
+        ``$HOME``, both because bootstrap can reinstall them in seconds and
+        because these shared volumes are much slower than the local disk.
+        """
+        if self.gpuc_home:
+            return self.gpuc_home
+        root = self.root
+        return f"{root}/gpuc" if root else "$HOME/.gpuc"
 
     @property
     def ephemeral(self) -> bool:
@@ -208,6 +228,7 @@ class HostEntry(BaseModel):
             ttl_hours=self.ttl_hours,
             s3_prefix=self.s3_prefix,
             created_at=self.created_at,
+            env=dict(self.env),
         )
 
 
