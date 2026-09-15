@@ -332,6 +332,20 @@ def remove_desired(name: str) -> None:
     desired_file(name).unlink(missing_ok=True)
 
 
+def forget_host(name: str) -> None:
+    """Drop every local trace of one host. The caller must hold the state lock.
+
+    Deliberately not a `registry_transaction`: both callers already hold the
+    lock, and flock is per open file description, so re-taking it in the same
+    process would deadlock until the timeout.
+    """
+    remove_desired(name)
+    pod_known_hosts_file(name).unlink(missing_ok=True)
+    registry = load_registry()
+    if registry.hosts.pop(name, None) is not None:
+        save_registry(registry)
+
+
 def load_desired() -> list[DesiredHost]:
     """Every desired host, or raise: a partial answer would reap live pods."""
     directory = desired_dir()

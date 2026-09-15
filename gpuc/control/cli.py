@@ -39,6 +39,7 @@ from gpuc.control.submit import (
     SubmitError,
     expand_job_id,
     load_document,
+    precheck_local,
     submit_file,
     submit_spec,
     validate,
@@ -207,6 +208,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if args.runpod:
         document = load_document(args.job_file)
         model = validate(document, str(args.job_file))
+        precheck_local(model, Path.cwd(), gpu_count=args.gpu_count)
         job_id = jobs.new_job_id()
         notes = mirror_spec_first(model, job_id, settings)
         entry = runpod_target(args, settings)
@@ -383,10 +385,13 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     for key in ("job_id", "attempt"):
         document.pop(key, None)
     attempt = (index.attempt if index else 1) + 1
+    model = validate(document, f"spec for {args.job_id}")
+    if target is None:
+        precheck_local(model, Path.cwd(), gpu_count=args.gpu_count)
     entry = runpod_target(args, settings) if target is None else registry.require(target)
     result = submit_spec(
         entry,
-        validate(document, f"spec for {args.job_id}"),
+        model,
         settings,
         workdir=Path.cwd(),
         attempt=attempt,

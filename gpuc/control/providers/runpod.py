@@ -155,7 +155,13 @@ class RunPodProvider(Provider):
             price = gpu["price"].get(tier)
             if price is None or price <= 0:
                 continue
-            if constraints.max_price_usd_hr is not None and price > constraints.max_price_usd_hr:
+            # --max-price caps the whole pod, so compare the pod's price, not
+            # one GPU's: at --gpu-count 4 the per-GPU figure is off by 4x.
+            total_price = price * constraints.gpu_count
+            if (
+                constraints.max_price_usd_hr is not None
+                and total_price > constraints.max_price_usd_hr
+            ):
                 continue
             if gpu["maxCount"].get(tier, 0) < constraints.gpu_count:
                 continue
@@ -167,7 +173,7 @@ class RunPodProvider(Provider):
                 gpu_id=gpu["id"],
                 name=gpu["name"],
                 vram_gb=gpu["memory"],
-                price_usd_hr=price * constraints.gpu_count,
+                price_usd_hr=total_price,
                 cloud=cloud,
                 availability=gpu["availability"],
                 cuda_versions=cuda_versions,

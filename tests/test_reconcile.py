@@ -216,6 +216,12 @@ def test_terminate_failure_is_loud_and_keeps_the_record(control_env: Path) -> No
 
     assert result.terminated == []
     assert any("still billing" in line for line in reports)
+    # A pod we could not terminate is still ours: keep the record so the next
+    # pass retries it, and make `gpuc reconcile --once` exit non-zero.
+    assert result.errors and "pod1" in result.errors[0]
+    assert result.forgotten == []
+    assert desired_file("gpuc-a-111").exists()
+    assert "gpuc-a-111" in load_registry().hosts
 
 
 def test_run_loop_stops_after_the_requested_iterations(control_env: Path) -> None:
@@ -259,3 +265,48 @@ def test_unit_files_are_absolute_and_not_enabled(
         SERVICE_NAME,
         TIMER_NAME,
     ]
+
+
+def test_a_stray_with_no_creation_time_is_left_alone(control_env: Path) -> None:
+    """Unknown age cannot be proved past the ceiling, so it cannot be proved a stray."""
+    stray = running_pod("gpuc-other-999", "podX").model_copy(update={"created_at": None})
+    provider = provider_with(stray)
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append)
+
+    assert provider.terminated == []
+    assert result.kept == ["gpuc-other-999"]
+    assert any("no creation time" in line for line in reports)
+
+
+def test_a_failed_stray_terminate_is_an_error(control_env: Path) -> None:
+    class Stubborn(FakeProvider):
+        def terminate(self, pod_id: str) -> None:
+            raise ProviderError("HTTP 500")
+
+    provider = Stubborn()
+    provider.adopt(running_pod("gpuc-other-999", "podX", age_minutes=600))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+
+    result = reconcile_once(Settings(), provider, lambda _: None)
+
+    assert result.terminated == [] and result.errors
+
+
+def test_a_desired_record_naming_a_foreign_pod_is_refused_not_terminated(
+    control_env: Path,
+) -> None:
+    """The never-touch-others rule rests on code here, so it is checked at the call."""
+    foreign = running_pod(FOREIGN, "podF", age_minutes=600)
+    provider = provider_with(foreign)
+    desire("gpuc-a-111", "podF", ttl_hours=1.0, created_hours_ago=10)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append)
+
+    assert provider.terminated == []
+    assert result.errors and "not ours" in result.errors[0]
+    assert any("refusing to terminate" in line for line in reports)
+    assert desired_file("gpuc-a-111").exists()

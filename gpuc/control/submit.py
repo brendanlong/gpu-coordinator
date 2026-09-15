@@ -155,6 +155,34 @@ def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -
     return "".join(f"{line}\n" for line in lines)
 
 
+def precheck_local(
+    model: JobSpecModel,
+    workdir: Path,
+    *,
+    gpu_count: int | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> None:
+    """Everything a submit can fail on without a host, checked before we buy one.
+
+    `submit --runpod` provisions first and enqueues second, so a missing secret
+    or a non-git workdir would otherwise be discovered by a pod that is already
+    billing and now has nothing to run.
+    """
+    if gpu_count is not None and model.gpus > gpu_count:
+        raise SubmitError(
+            f"the spec asks for {model.gpus} GPU(s) but this request would create a pod with "
+            f"{gpu_count}.\nRaise --gpu-count, or lower `gpus:` in the spec."
+        )
+    gather_secrets(model.secrets, environ)
+    try:
+        git_tracked_files(workdir)
+    except TransportError as exc:
+        raise SubmitError(
+            f"{workdir} is not a git repository, so there is nothing to sync: {exc}\n"
+            f"Run `git init && git add -A` there, or submit from your project directory."
+        ) from exc
+
+
 def git_source(workdir: Path) -> dict[str, str]:
     def git(*args: str) -> str:
         proc = subprocess.run(

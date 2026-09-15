@@ -290,7 +290,10 @@ def test_idle_terminate_drains_syncs_and_calls_the_provider(
     assert dispatcher.should_exit
 
 
-def test_a_running_job_resets_the_idle_timer(gpuc_home: Path) -> None:
+def test_a_running_job_resets_the_idle_timer(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=1.0)
     clock = FakeClock()
     terminated: list[str] = []
@@ -312,7 +315,10 @@ def test_a_running_job_resets_the_idle_timer(gpuc_home: Path) -> None:
     assert terminated == ["pod-1"]
 
 
-def test_ttl_terminates_an_old_but_idle_pod(gpuc_home: Path) -> None:
+def test_ttl_terminates_an_old_but_idle_pod(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
     terminated: list[str] = []
     dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
@@ -320,7 +326,10 @@ def test_ttl_terminates_an_old_but_idle_pod(gpuc_home: Path) -> None:
     assert terminated == ["pod-1"]
 
 
-def test_failed_terminate_removes_draining_and_keeps_dispatching(gpuc_home: Path) -> None:
+def test_failed_terminate_removes_draining_and_keeps_dispatching(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     clock = FakeClock()
     attempts: list[str] = []
@@ -345,7 +354,10 @@ def test_failed_terminate_removes_draining_and_keeps_dispatching(gpuc_home: Path
     assert "HTTP 500 from runpod" in log
 
 
-def test_terminate_is_retried_after_ten_minutes(gpuc_home: Path) -> None:
+def test_terminate_is_retried_after_ten_minutes(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     clock = FakeClock()
     attempts: list[str] = []

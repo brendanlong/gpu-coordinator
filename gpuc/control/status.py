@@ -106,8 +106,16 @@ class HostView:
 
     @property
     def past_ttl(self) -> bool:
-        if not self.entry.ephemeral or not self.entry.created_at:
+        """Age from the provider's own createdAt when we have it.
+
+        The registry's created_at is when *this* machine recorded the host,
+        which is not the same clock the reaper's TTL uses; a pod adopted or
+        re-registered later would read as young here and be terminated there.
+        """
+        if not self.entry.ephemeral:
             return False
+        if self.pod is not None and self.pod.age is not None:
+            return self.pod.age.total_seconds() / 3600.0 > self.entry.ttl_hours
         created = _parse(self.entry.created_at)
         if created is None:
             return False

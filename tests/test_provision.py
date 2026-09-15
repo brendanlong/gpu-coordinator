@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.config import (
+    ConfigError,
     DesiredHost,
     HostEntry,
     Settings,
@@ -16,10 +17,11 @@ from gpuc.control.config import (
     load_registry,
     read_desired,
     registry_transaction,
+    state_lock,
     utc_now,
     write_desired,
 )
-from gpuc.control.providers.base import Caps, Constraints, Pod
+from gpuc.control.providers.base import Caps, Constraints, Offer, Pod, ProviderError
 from gpuc.control.provision import (
     ProvisionDeps,
     ProvisionError,
@@ -355,6 +357,14 @@ def _register_reusable(pod: Pod, price: float = 0.49) -> HostEntry:
     return entry
 
 
+def status_of(age: float | None, **extra: object) -> Callable[..., dict[str, object] | None]:
+    """Stand in for the host's own `status` document over ssh."""
+    if age is None:
+        return lambda *a, **k: None
+    payload: dict[str, object] = {"dispatcher_heartbeat_age_s": age, **extra}
+    return lambda *a, **k: payload
+
+
 def test_reuse_picks_a_live_matching_host(
     control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -362,7 +372,7 @@ def test_reuse_picks_a_live_matching_host(
     provider = FakeProvider([make_offer()])
     provider.adopt(pod)
     entry = _register_reusable(pod)
-    monkeypatch.setattr("gpuc.control.provision.dispatcher_heartbeat_age", lambda *a: 3.0)
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(3.0))
 
     chosen = runpod_host(
         CONSTRAINTS, Settings(), provider=provider, report=lambda _: None, deps=deps()
@@ -378,7 +388,7 @@ def test_reuse_skips_a_stale_dispatcher(
     provider = FakeProvider([make_offer()])
     provider.adopt(pod)
     _register_reusable(pod)
-    monkeypatch.setattr("gpuc.control.provision.dispatcher_heartbeat_age", lambda *a: None)
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(None))
     reports: list[str] = []
     assert (
         pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
@@ -394,7 +404,7 @@ def test_reuse_skips_a_pod_that_is_too_expensive(
     provider = FakeProvider([make_offer()])
     provider.adopt(pod)
     _register_reusable(pod, price=2.50)
-    monkeypatch.setattr("gpuc.control.provision.dispatcher_heartbeat_age", lambda *a: 1.0)
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(1.0))
     assert (
         pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=lambda _: None)
         is None
@@ -408,7 +418,7 @@ def test_reuse_skips_a_pod_that_is_not_running(
     provider = FakeProvider([make_offer()])
     provider.adopt(pod, PodScript(ssh_after_polls=0, status_after_polls={1: "EXITED"}))
     _register_reusable(pod)
-    monkeypatch.setattr("gpuc.control.provision.dispatcher_heartbeat_age", lambda *a: 1.0)
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(1.0))
     assert (
         pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=lambda _: None)
         is None
@@ -422,7 +432,7 @@ def test_no_reuse_always_provisions(
     provider = FakeProvider([make_offer()])
     provider.adopt(pod)
     _register_reusable(pod)
-    monkeypatch.setattr("gpuc.control.provision.dispatcher_heartbeat_age", lambda *a: 1.0)
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(1.0))
     chosen = runpod_host(
         CONSTRAINTS,
         Settings(),
@@ -460,3 +470,192 @@ def test_s3_credentials_are_skipped_without_a_prefix(control_env: Path) -> None:
     entry = HostEntry(name="gpuc-x", kind="runpod")
     assert not deliver_s3_credentials(transport, entry, lambda m: None, {})  # type: ignore[arg-type]
     assert transport.files == {}
+
+
+class _LockWatchingProvider(FakeProvider):
+    """Records whether the state lock was held while `create` ran."""
+
+    lock_held_during_create: bool = False
+
+    def create(self, offer: Offer, name: str, **kwargs: object) -> Pod:
+        try:
+            with state_lock(timeout_s=0.2):
+                self.lock_held_during_create = False
+        except ConfigError:
+            self.lock_held_during_create = True
+        return super().create(offer, name, **kwargs)  # type: ignore[arg-type]
+
+
+def test_create_and_desired_write_happen_under_the_state_lock(
+    control_env: Path, ssh_key: Path
+) -> None:
+    """Caps are only account-wide if a second session cannot create in the gap."""
+    provider = _LockWatchingProvider([make_offer()])
+    run(provider)
+    assert provider.lock_held_during_create
+
+
+def test_a_failed_desired_write_gives_the_pod_back(
+    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No desired/ record means nothing local would ever reap it, so terminate now."""
+
+    def explode(_: DesiredHost) -> Path:
+        raise OSError("No space left on device")
+
+    provider = FakeProvider([make_offer()])
+    monkeypatch.setattr("gpuc.control.provision.write_desired", explode)
+    reports: list[str] = []
+    with pytest.raises(OSError):
+        run(provider, reports=reports)
+    assert provider.terminated == ["pod1"]
+    assert provider.live_names() == []
+    assert any("could not record desired state" in line for line in reports)
+
+
+def test_ctrl_c_during_bootstrap_terminates_the_pod(control_env: Path, ssh_key: Path) -> None:
+    """A KeyboardInterrupt is not a narrow provisioning error, and still owns a pod."""
+
+    def interrupted(*_: object, **__: object) -> tuple[HostEntry, object]:
+        raise KeyboardInterrupt
+
+    provider = FakeProvider([make_offer()])
+    with pytest.raises(KeyboardInterrupt):
+        provision(
+            CONSTRAINTS,
+            Settings(),
+            provider=provider,
+            report=lambda _: None,
+            deps=ProvisionDeps(
+                sleep=lambda _: None,
+                bootstrap=interrupted,  # type: ignore[arg-type]
+                transport_factory=lambda entry, settings: FakeTransport(),
+                poll_interval_s=0.0,
+                log_check_interval_s=0.0,
+            ),
+        )
+    assert provider.terminated == ["pod1"]
+    assert provider.live_names() == []
+    assert list(desired_dir().glob("*.json")) == []
+    assert load_registry().hosts == {}
+
+
+def test_a_transient_provider_error_while_polling_does_not_burn_the_pod(
+    control_env: Path, ssh_key: Path
+) -> None:
+    class Flaky(FakeProvider):
+        gets = 0
+
+        def get(self, pod_id: str) -> Pod | None:
+            self.gets += 1
+            if self.gets == 1:
+                raise ProviderError("GET /pods/pod1 -> HTTP 502: bad gateway")
+            return super().get(pod_id)
+
+    provider = Flaky([make_offer()], scripts=[PodScript(ssh_after_polls=2)])
+    reports: list[str] = []
+    entry = run(provider, reports=reports)
+    assert entry.pod_id == "pod1"
+    assert provider.terminated == []
+    assert any("provider read failed" in line for line in reports)
+
+
+def test_a_provider_that_never_answers_still_stops_at_the_ceiling(
+    control_env: Path, ssh_key: Path
+) -> None:
+    class Down(FakeProvider):
+        def get(self, pod_id: str) -> Pod | None:
+            raise ProviderError("GET /pods -> HTTP 500")
+
+    provider = Down([make_offer()])
+    with pytest.raises(ProvisionError) as error:
+        provision(
+            CONSTRAINTS,
+            Settings(),
+            provider=provider,
+            report=lambda _: None,
+            deps=deps(now=ticking()),
+        )
+    assert "ceiling" in str(error.value)
+    assert provider.terminated == ["pod1"]
+
+
+def test_reuse_skips_a_draining_host(
+    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A draining pod is terminating itself; a job enqueued there dies with it."""
+    pod = running_pod("gpuc-e2e-aaa", "pod9")
+    provider = FakeProvider([make_offer()])
+    provider.adopt(pod)
+    _register_reusable(pod)
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(2.0, draining=True))
+    reports: list[str] = []
+    assert (
+        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
+        is None
+    )
+    assert any("draining" in line for line in reports)
+
+
+def test_reuse_skips_a_paused_host(
+    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pod = running_pod("gpuc-e2e-aaa", "pod9")
+    provider = FakeProvider([make_offer()])
+    provider.adopt(pod)
+    _register_reusable(pod)
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(2.0, paused=True))
+    assert (
+        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=lambda _: None)
+        is None
+    )
+
+
+def test_reuse_skips_a_host_with_too_few_gpus(
+    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pod = running_pod("gpuc-e2e-aaa", "pod9")
+    provider = FakeProvider([make_offer()])
+    provider.adopt(pod)
+    _register_reusable(pod)  # one GPU
+    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(2.0))
+    wanted = CONSTRAINTS.model_copy(update={"gpu_count": 2})
+    reports: list[str] = []
+    assert pick_reusable_host(wanted, Settings(), provider=provider, report=reports.append) is None
+    assert any("owns 1 GPU(s)" in line for line in reports)
+
+
+def test_reuse_forgets_a_host_whose_pod_is_gone(
+    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry entry for a dead pod must be cleaned, not left to break submit."""
+    pod = running_pod("gpuc-e2e-aaa", "podGONE")
+    provider = FakeProvider([make_offer()])  # never adopted: the provider has no such pod
+    _register_reusable(pod)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "gpuc.control.provision.host_status", lambda *a, **k: calls.append("ssh") or None
+    )
+    reports: list[str] = []
+
+    assert (
+        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
+        is None
+    )
+    assert calls == []  # no ssh to an address the pod no longer owns
+    assert load_registry().hosts == {}
+    assert read_desired("gpuc-e2e-aaa") is None
+    assert any("forgetting" in line for line in reports)
+
+
+def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
+    control_env: Path, ssh_key: Path
+) -> None:
+    pod = running_pod("gpuc-e2e-aaa", "podGONE")
+    provider = FakeProvider([make_offer()])
+    _register_reusable(pod)
+    entry = runpod_host(
+        CONSTRAINTS, Settings(), provider=provider, report=lambda _: None, deps=deps()
+    )
+    assert entry.pod_id == "pod1"
+    assert sorted(load_registry().hosts) == [entry.name]

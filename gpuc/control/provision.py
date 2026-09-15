@@ -5,9 +5,11 @@ failure path here ends in `terminate` plus a wait for TERMINATED before the
 next offer is tried: a `draining` marker or an unreachable pod is never enough
 to justify a second create (that is how you double-bill).
 
-`desired/<host>.json` is written the instant `create` returns, before anything
-can go wrong, because it is the only record that separates a pod we are
-waiting on from a leaked one.
+`desired/<host>.json` is written the instant `create` returns, under the same
+state lock as the create itself, because it is the only record that separates
+a pod we are waiting on from a leaked one. If it cannot be written the pod is
+terminated immediately; if anything else goes wrong before the host is
+registered -- including a Ctrl-C -- the pod is terminated on the way out.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_host
 from gpuc.control.config import (
@@ -28,11 +30,13 @@ from gpuc.control.config import (
     DesiredHost,
     HostEntry,
     Settings,
+    forget_host,
     load_registry,
     pod_known_hosts_file,
     read_desired,
     registry_transaction,
     remove_desired,
+    state_lock,
     transport_for,
     utc_now,
     write_desired,
@@ -52,6 +56,7 @@ from gpuc.control.s3index import default_s3_prefix
 from gpuc.control.transport import SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
+CREATE_LOCK_TIMEOUT_S = 120.0
 DEFAULT_DISK_GB = 50
 DEFAULT_CUDA_MIN = "12.8"
 POLL_INTERVAL_S = 5.0
@@ -262,15 +267,6 @@ def provision(
     for offer in offers:
         label = f"{offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h"
         try:
-            check_caps(provider.caps, provider.list(), offer.price_usd_hr)
-        except CapsExceeded as exc:
-            # Offers are price-ascending, so a cap that this one trips, all trip.
-            raise ProvisionError(
-                f"account caps refuse a new pod at {label}: {exc}\n"
-                f"Terminate a pod (`gpuc pods`, `gpuc reconcile --once`) or raise max_pods / "
-                f"max_total_usd_per_hour in ~/.config/gpu-coordinator/config.toml."
-            ) from exc
-        try:
             return _try_offer(
                 offer,
                 constraints,
@@ -286,6 +282,13 @@ def provision(
                 progress=progress,
                 deps=deps,
             )
+        except CapsExceeded as exc:
+            # Offers are price-ascending, so a cap that this one trips, all trip.
+            raise ProvisionError(
+                f"account caps refuse a new pod at {label}: {exc}\n"
+                f"Terminate a pod (`gpuc pods`, `gpuc reconcile --once`) or raise max_pods / "
+                f"max_total_usd_per_hour in ~/.config/gpu-coordinator/config.toml."
+            ) from exc
         except (ProvisionError, ProviderError, BootstrapError, RemoteError, TransportError) as exc:
             first = str(exc).splitlines()[0]
             failures.append(f"  - {label}: {first}")
@@ -327,36 +330,18 @@ def _try_offer(
     deps: ProvisionDeps,
 ) -> HostEntry:
     name = pod_name(provider.caps.prefix, name_hint)
-    progress(
-        f"creating {name}: {offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
-        f"x{constraints.gpu_count}, disk {disk_gb}GB, cuda>={cuda_min}, image {image}"
-    )
-    pod = provider.create(
+    pod, created_at = _create_and_record(
         offer,
-        name,
+        constraints,
+        provider=provider,
+        name=name,
         image=image,
         disk_gb=disk_gb,
-        env={"HF_HUB_ENABLE_HF_TRANSFER": "0"},
         cuda_min=cuda_min,
-        gpu_count=constraints.gpu_count,
-    )
-    created_at = utc_now()
-    ceiling = datetime.now(UTC) + timedelta(minutes=deps.ceiling_minutes)
-    write_desired(
-        DesiredHost(
-            name=name,
-            pod_id=pod.id,
-            offer=offer,
-            created_at=created_at,
-            ceiling_at=ceiling.isoformat(timespec="seconds"),
-            idle_minutes=idle_minutes,
-            ttl_hours=ttl_hours,
-            image=image,
-        )
-    )
-    progress(
-        f"pod {pod.id} created ({pod.status}); desired state recorded, "
-        f"ceiling {deps.ceiling_minutes:.0f} min from now"
+        idle_minutes=idle_minutes,
+        ttl_hours=ttl_hours,
+        progress=progress,
+        deps=deps,
     )
 
     deadline = deps.now() + deps.ceiling_minutes * 60.0
@@ -396,12 +381,87 @@ def _try_offer(
             f"idle terminate {idle_minutes:g} min, ttl {ttl_hours:g} h"
         )
         return entry
-    except (ProvisionError, ProviderError, BootstrapError, RemoteError, TransportError) as exc:
-        _abandon(provider, name, pod.id, progress, str(exc).splitlines()[0])
+    except BaseException as exc:
+        # Everything from `create` to the last registry write owns a live pod, so
+        # *every* way out of here terminates first: a Ctrl-C, a full disk, or a
+        # bug none of the narrow except clauses name still costs money otherwise.
+        _abandon(provider, name, pod.id, progress, _first_line(exc))
         raise
 
 
-def _abandon(provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str) -> None:
+def _first_line(exc: BaseException) -> str:
+    lines = str(exc).strip().splitlines()
+    return lines[0] if lines else f"{type(exc).__name__} (interrupted)"
+
+
+def _create_and_record(
+    offer: Offer,
+    constraints: Constraints,
+    *,
+    provider: Provider,
+    name: str,
+    image: str,
+    disk_gb: int,
+    cuda_min: str,
+    idle_minutes: float,
+    ttl_hours: float,
+    progress: _Progress,
+    deps: ProvisionDeps,
+) -> tuple[Pod, str]:
+    """Check caps, create, and write `desired/` with the state lock held.
+
+    The lock is what makes the account caps mean anything across the several
+    local sessions that share this account (requirements-review 2.9): without
+    it two `gpuc submit --runpod` can both read "one pod running" and both
+    create. It also hides the create-to-record gap from the reaper, which takes
+    the same lock, so a pod is never visible as a stray it might reap.
+    """
+    with state_lock(timeout_s=CREATE_LOCK_TIMEOUT_S):
+        check_caps(provider.caps, provider.list(), offer.price_usd_hr)
+        progress(
+            f"creating {name}: {offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
+            f"x{constraints.gpu_count}, disk {disk_gb}GB, cuda>={cuda_min}, image {image}"
+        )
+        pod = provider.create(
+            offer,
+            name,
+            image=image,
+            disk_gb=disk_gb,
+            env={"HF_HUB_ENABLE_HF_TRANSFER": "0"},
+            cuda_min=cuda_min,
+            gpu_count=constraints.gpu_count,
+        )
+        created_at = utc_now()
+        ceiling = datetime.now(UTC) + timedelta(minutes=deps.ceiling_minutes)
+        try:
+            write_desired(
+                DesiredHost(
+                    name=name,
+                    pod_id=pod.id,
+                    offer=offer,
+                    created_at=created_at,
+                    ceiling_at=ceiling.isoformat(timespec="seconds"),
+                    idle_minutes=idle_minutes,
+                    ttl_hours=ttl_hours,
+                    image=image,
+                )
+            )
+        except BaseException as exc:
+            # No record means nothing local will ever reap this pod. Give it back
+            # now, from inside the lock (so no registry call re-enters it).
+            progress(f"could not record desired state for {name}: {_first_line(exc)}")
+            _terminate_now(provider, name, pod.id, progress, "its desired/ record was not written")
+            raise
+    progress(
+        f"pod {pod.id} created ({pod.status}); desired state recorded, "
+        f"ceiling {deps.ceiling_minutes:.0f} min from now"
+    )
+    return pod, created_at
+
+
+def _terminate_now(
+    provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str
+) -> None:
     progress(f"terminating {name} ({pod_id}): {reason}")
     try:
         provider.terminate(pod_id)
@@ -411,6 +471,10 @@ def _abandon(provider: Provider, name: str, pod_id: str, progress: _Progress, re
             f"WARNING: could not terminate {name} ({pod_id}): {exc}\n"
             f"  It may still be billing. Run `gpuc pods`, then `gpuc reconcile --once`."
         )
+
+
+def _abandon(provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str) -> None:
+    _terminate_now(provider, name, pod_id, progress, reason)
     remove_desired(name)
     pod_known_hosts_file(name).unlink(missing_ok=True)
     try:
@@ -427,7 +491,20 @@ def _wait_for_ssh_direct(
     last_state = ""
     next_log_check = deps.now() + deps.log_check_interval_s
     while True:
-        current = provider.get(pod.id)
+        try:
+            current = provider.get(pod.id)
+        except ProviderError as exc:
+            # A 5xx or a rate limit is not a placement failure: terminating a
+            # healthy pod over one bad response costs the create again. Keep
+            # polling; the ceiling is still the backstop.
+            if deps.now() >= deadline:
+                raise ProvisionError(
+                    f"pod {pod.id} could not be read from the provider inside the "
+                    f"{deps.ceiling_minutes:.0f} min ceiling: {_first_line(exc)}"
+                ) from exc
+            progress(f"pod {pod.id}: provider read failed, retrying: {_first_line(exc)}")
+            deps.sleep(deps.poll_interval_s)
+            continue
         if current is None:
             raise ProvisionError(f"pod {pod.id} vanished from the provider before it was ready")
         state = f"{current.status} ssh.direct={'yes' if current.ssh_direct else 'no'}"
@@ -516,12 +593,18 @@ def _tail(text: str, lines: int = 15) -> str:
     return "\n".join(f"  {line}" for line in text.strip().splitlines()[-lines:])
 
 
-def dispatcher_heartbeat_age(entry: HostEntry, settings: Settings) -> float | None:
+def host_status(entry: HostEntry, settings: Settings | None = None) -> dict[str, Any] | None:
+    """The host's own status document, or None if it cannot be reached."""
     try:
         payload = open_session(entry, settings).host_json("status", timeout=60.0)
     except (RemoteError, TransportError, ConfigError):
         return None
-    age = payload.get("dispatcher_heartbeat_age_s")
+    return payload if isinstance(payload, dict) else None
+
+
+def dispatcher_heartbeat_age(entry: HostEntry, settings: Settings) -> float | None:
+    payload = host_status(entry, settings)
+    age = payload.get("dispatcher_heartbeat_age_s") if payload else None
     return float(age) if isinstance(age, (int, float)) else None
 
 
@@ -533,7 +616,7 @@ def pick_reusable_host(
     report: Reporter = print,
 ) -> HostEntry | None:
     """An existing gpuc pod that is RUNNING, matches the constraints, and dispatches."""
-    for entry in load_registry().hosts.values():
+    for entry in list(load_registry().hosts.values()):
         if entry.kind != "runpod" or not entry.pod_id:
             continue
         desired = read_desired(entry.name)
@@ -547,16 +630,42 @@ def pick_reusable_host(
                 f"not match this request"
             )
             continue
-        pod = provider.get(entry.pod_id)
-        if pod is None or pod.status != "RUNNING":
-            report(f"reuse: skipping {entry.name}, its pod is {pod.status if pod else 'gone'}")
+        if len(entry.gpus) < constraints.gpu_count:
+            report(
+                f"reuse: skipping {entry.name}, it owns {len(entry.gpus)} GPU(s) and this "
+                f"request needs {constraints.gpu_count}"
+            )
             continue
-        age = dispatcher_heartbeat_age(entry, settings)
-        if age is None or age >= HEARTBEAT_FRESH_S:
+        pod = provider.get(entry.pod_id)
+        if pod is None or pod.status == "TERMINATED":
+            # The pod is gone for good, so the entry can only mislead `status`,
+            # `logs` and the next reuse pass. Drop it here rather than leaving
+            # submit to fail on an ssh to an address someone else now owns.
+            report(
+                f"reuse: forgetting {entry.name}, its pod "
+                f"{'is gone' if pod is None else 'is TERMINATED'}"
+            )
+            with state_lock():
+                forget_host(entry.name)
+            continue
+        if pod.status != "RUNNING":
+            report(f"reuse: skipping {entry.name}, its pod is {pod.status}")
+            continue
+        status = host_status(entry, settings)
+        age = status.get("dispatcher_heartbeat_age_s") if status else None
+        if not isinstance(age, (int, float)) or age >= HEARTBEAT_FRESH_S:
             report(
                 f"reuse: skipping {entry.name}, dispatcher heartbeat is "
-                f"{'unreachable' if age is None else f'{age:.0f}s old'}"
+                f"{'unreachable' if not isinstance(age, (int, float)) else f'{age:.0f}s old'}"
             )
+            continue
+        assert status is not None
+        if status.get("draining"):
+            # It is terminating itself; a job enqueued now dies with the pod.
+            report(f"reuse: skipping {entry.name}, it is draining (terminating itself)")
+            continue
+        if status.get("paused"):
+            report(f"reuse: skipping {entry.name}, its queue is paused after two low-util failures")
             continue
         report(f"reusing host {entry.name} ({pod.id}, heartbeat {age:.0f}s old)")
         return entry

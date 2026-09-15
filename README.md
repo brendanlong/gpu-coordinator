@@ -39,6 +39,30 @@ Keys: `s3_bucket`, `runpod_pod_prefix`, `max_pods`, `max_total_usd_per_hour`,
 
 `--runpod`, `gpuc pods` and `gpuc reconcile` need `RUNPOD_API_KEY` exported;
 without it they fail immediately with one line rather than part-way through.
+(`gpuc reconcile --install`, which only writes unit files, does not.)
+
+## Commands
+
+```
+gpuc host add <name> [--ssh user@host] [--port N] [--gpus UUID,..] [--gpuc-home PATH]
+                     [--s3-prefix s3://..] [--idle-min N] [--ttl-hours N]
+gpuc host bootstrap <name> [--health-args "..."]     # idempotent; also restarts the dispatcher
+gpuc host probe <name>                               # driver, GPUs+UUIDs, disk, systemd, network
+gpuc host list | gpuc host remove <name>             # remove forgets locally; the host is untouched
+gpuc submit <job.yaml|-> --host <name>               # or --runpod ... (flags below)
+gpuc status [--host H] [--all] [--suspects]          # --all adds jobs only the index knows
+gpuc logs <job-id> [-f] [-n LINES] [--host H]        # host first, S3 mirror as a noted fallback
+gpuc cancel <job-id> [--host H]
+gpuc reorder <job-id> --priority N [--host H]        # queued jobs only
+gpuc requeue <job-id> [--host H | --runpod ...]      # re-reads the spec from S3, attempt+1
+gpuc reconcile [--once] [--interval S] [--install]
+gpuc pods [--no-heartbeat]                           # --no-heartbeat skips the per-pod ssh check
+gpuc config init [--force] | gpuc config show
+```
+
+`--host` is optional on `logs`, `cancel` and `reorder`: the local job index is
+tried first, then every registered host is asked whether it knows the id.
+A job file of `-` is read from stdin.
 
 ## Quick start: local
 
@@ -76,11 +100,34 @@ gpuc reconcile --once       # terminate leaked or expired pods now
 gpuc reconcile --install    # write a systemd --user service + timer (it prints how to enable it)
 ```
 
-Provisioning mirrors the spec to S3 first, then walks the catalog offers
-cheapest-first, creates a pod, waits for a direct SSH endpoint, bootstraps it,
-runs the host health check, and enqueues. Any failure terminates the pod and
-tries the next offer. `--reuse` is the default: an existing gpuc pod that
-matches the constraints and whose dispatcher is alive gets the job instead.
+Flags for `--runpod` (the same set on `gpuc submit` and `gpuc requeue`):
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--gpu A40[,RTX4090]` | required with `--runpod` | catalog names, matched case-insensitively against both the short name (`A40`) and the catalog id (`NVIDIA A40`) |
+| `--gpu-count N` | `1` | GPUs in the pod |
+| `--min-vram GB` | none | per-GPU VRAM floor |
+| `--max-price USD` | none | **whole pod** per hour, so at `--gpu-count 2` it is compared against twice the per-GPU price |
+| `--cloud secure\|community\|any` | `secure` | `any` queries both tiers and sorts the merged list by price |
+| `--cuda-min X.Y` | `12.8` | host CUDA floor, passed to the catalog query and to `create` |
+| `--idle-min N` / `--ttl-hours N` | `15` / `24` | the pod's own auto-down timers |
+| `--disk GB` / `--image REF` | from `config.toml` | container disk and pod image |
+| `--no-reuse` | reuse is on | always create a new pod |
+| `--name-hint TEXT` | `job` | goes into the pod name after the prefix |
+| `--health-args "..."` | none | extra flags for the on-host health check, e.g. `--min-mbps 0.1` |
+
+Provisioning checks what it can locally first (spec validity, `secrets:`
+present in your shell, a git workdir, `gpus:` against `--gpu-count`), mirrors
+the spec to S3, then walks the catalog offers cheapest-first: create, wait for
+a direct SSH endpoint, bootstrap, host health check, enqueue. Any failure
+terminates that pod and tries the next offer; a cap that the cheapest offer
+trips aborts the whole submit instead, since every later offer costs more.
+
+Reuse is the default. An existing gpuc pod is used instead of a new one when
+its recorded offer still matches the request, it owns enough GPUs, the
+provider says the pod is `RUNNING`, its dispatcher heartbeat is under 30 s
+old, and it is neither draining nor paused. A registry entry whose pod the
+provider no longer has is forgotten on the spot rather than dialled.
 
 **Auto-down.** The pod terminates itself when the queue has been empty and
 nothing has run for `--idle-min`, or when `--ttl-hours` has elapsed with
@@ -91,11 +138,33 @@ What that does **not** guarantee: self-terminate needs the pod to still be
 reachable and the provider API to answer. If the pod wedges, loses network, or
 the API call fails, it keeps billing. `gpuc reconcile` is the backstop — it
 terminates pods with our prefix that no `desired/` record wants or that are
-past their TTL — and it only runs when you run it, so install the timer.
-`--install` writes the units but deliberately does not enable them; it prints
-the `systemctl --user` lines and where to put `RUNPOD_API_KEY` for the service.
-It never touches a pod without the configured prefix, and if `desired/` is
-unreadable it terminates nothing at all.
+past their TTL (TTL measured from the provider's own `createdAt`, not from
+when this machine first heard of the pod) — and it only runs when you run it,
+so install the timer. `--install` writes the units but deliberately does not
+enable them; it prints the `systemctl --user` lines and where to put
+`RUNPOD_API_KEY` for the service.
+
+The reaper fails closed in every direction: it never touches a pod without the
+configured prefix, it terminates nothing at all if `desired/` is unreadable,
+it leaves a prefixed pod that has no `desired/` record alone until it is older
+than the 15-minute provisioning ceiling (another session may be mid-create),
+and it leaves one alone entirely if the provider does not report a creation
+time. A terminate that fails keeps its `desired/` record, is logged loudly,
+and makes `gpuc reconcile --once` exit non-zero.
+
+**Caps.** `max_pods` and `max_total_usd_per_hour` are account-wide: they are
+checked against the provider's pod list (every pod with our prefix, whoever
+created it), not against this machine's registry, immediately before `create`
+and with the local state lock held. So two `gpuc submit --runpod` in two
+shells on this machine cannot both slip past the caps. Two *different
+machines* sharing one account still can — the window is the length of one
+`create` call.
+
+**A pod is never created without a record of it.** `desired/<host>.json` is
+written under the same lock as the create, and every exit from provisioning
+between `create` and the final registry write — including Ctrl-C, a failed
+`desired/` write, and errors nothing thought to catch — terminates the pod
+before unwinding.
 
 ## The job spec
 

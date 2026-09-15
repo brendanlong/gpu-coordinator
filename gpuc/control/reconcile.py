@@ -26,11 +26,8 @@ from gpuc.control.config import (
     DesiredUnreadable,
     Settings,
     config_dir,
+    forget_host,
     load_desired,
-    load_registry,
-    pod_known_hosts_file,
-    remove_desired,
-    save_registry,
     state_dir,
     state_lock,
 )
@@ -105,26 +102,43 @@ def _describe_lost_jobs(host: str, settings: Settings) -> str:
 
 def _forget(name: str, report: Reporter) -> None:
     """Drop every local trace of a host. The caller already holds the state lock."""
-    remove_desired(name)
-    pod_known_hosts_file(name).unlink(missing_ok=True)
     try:
-        registry = load_registry()
-        if registry.hosts.pop(name, None) is not None:
-            save_registry(registry)
+        forget_host(name)
     except ConfigError as exc:
         report(f"WARNING: could not remove host {name} from the registry: {exc}")
 
 
-def _terminate(provider: Provider, pod_id: str, why: str, report: Reporter) -> bool:
+def _terminate(
+    provider: Provider, pod: Pod, why: str, report: Reporter, result: ReconcileResult
+) -> bool:
+    """The only terminate on the reaper's side, and the only prefix check it needs.
+
+    Desired records are local files: a hand-edited or stale one could name a
+    pod that is not ours, and "never touch someone else's pod" rests on code
+    here rather than on permissions, so it is checked at the call itself.
+    """
+    pod_id = pod.id
+    if not pod.name.startswith(provider.caps.prefix):
+        message = (
+            f"refusing to terminate {pod.name} ({pod_id}): it does not start with "
+            f"{provider.caps.prefix!r}, so it is not ours. Fix the desired/ record that names it."
+        )
+        report(f"ERROR: {message}")
+        result.errors.append(message)
+        return False
     report(f"terminating {pod_id}: {why}")
     try:
         provider.terminate(pod_id)
     except ProviderError as exc:
-        report(
-            f"ERROR: terminate of {pod_id} failed: {exc}\n"
+        message = (
+            f"terminate of {pod_id} failed: {exc}\n"
             f"  It is still billing. Retry with `gpuc reconcile --once`, or terminate it in "
             f"the RunPod console."
         )
+        report(f"ERROR: {message}")
+        # An error, not just a log line: `gpuc reconcile --once` must exit
+        # non-zero while a pod we wanted gone is still charging.
+        result.errors.append(message)
         return False
     report(f"terminated {pod_id} and confirmed it is gone")
     return True
@@ -179,28 +193,33 @@ def _reconcile_desired(
 
         age_h = _age_hours(pod, host)
         if age_h is not None and age_h > host.ttl_hours:
+            # Only forget a host whose pod is confirmed gone: while a terminate
+            # is failing, the record is what keeps retrying it (and what still
+            # tells `gpuc logs` where that host's jobs ran).
             if _terminate(
                 provider,
-                pod.id,
+                pod,
                 f"host {host.name} is {age_h:.1f} h old, past its {host.ttl_hours:g} h TTL",
                 report,
+                result,
             ):
                 result.terminated.append(host.name)
-            _forget(host.name, report)
-            result.forgotten.append(host.name)
+                _forget(host.name, report)
+                result.forgotten.append(host.name)
             continue
 
         ceiling = _parse(host.ceiling_at)
         if not host.bootstrapped and ceiling is not None and datetime.now(UTC) > ceiling:
             if _terminate(
                 provider,
-                pod.id,
+                pod,
                 f"host {host.name} never bootstrapped by its ceiling at {host.ceiling_at}",
                 report,
+                result,
             ):
                 result.terminated.append(host.name)
-            _forget(host.name, report)
-            result.forgotten.append(host.name)
+                _forget(host.name, report)
+                result.forgotten.append(host.name)
             continue
 
         report(
@@ -224,7 +243,17 @@ def _reap_strays(
         if pod.id in known or pod.status == "TERMINATED":
             continue
         age = pod.age
-        if age is not None and age.total_seconds() < STRAY_GRACE_MINUTES * 60.0:
+        if age is None:
+            # Cannot prove it is past the provisioning ceiling, so cannot prove
+            # it is not another session's pod mid-create. Fail closed and say so.
+            report(
+                f"{pod.name} ({pod.id}) has our prefix and no desired/ record, but the provider "
+                f"reports no creation time, so its age cannot be checked against the "
+                f"{STRAY_GRACE_MINUTES:.0f} min ceiling; leaving it alone. Check `gpuc pods`."
+            )
+            result.kept.append(pod.name)
+            continue
+        if age.total_seconds() < STRAY_GRACE_MINUTES * 60.0:
             report(
                 f"{pod.name} ({pod.id}) has our prefix but no desired/ record and is only "
                 f"{age.total_seconds() / 60.0:.0f} min old; leaving it for now in case another "
@@ -234,9 +263,10 @@ def _reap_strays(
             continue
         if _terminate(
             provider,
-            pod.id,
+            pod,
             f"{pod.name} has our prefix but no desired/ record (${pod.cost_usd_hr:.3f}/h)",
             report,
+            result,
         ):
             result.terminated.append(pod.name)
 

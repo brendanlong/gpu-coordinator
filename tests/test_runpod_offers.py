@@ -175,3 +175,15 @@ def test_live_a40_secure_offers() -> None:
     assert 0.1 < offer.price_usd_hr <= 0.60
     assert offer.availability != "NONE"
     assert offer.matches_cuda_floor("12.8")
+
+
+def test_max_price_caps_the_whole_pod_not_one_gpu() -> None:
+    """--max-price is documented as the pod's price; at --gpu-count 2 it is 2x."""
+    cheap = RecordedRunPod().offers(
+        Constraints(gpu_names=["A40"], gpu_count=2, max_price_usd_hr=1.20)
+    )
+    assert [o.price_usd_hr for o in cheap] == [pytest.approx(0.98)]
+    assert (
+        RecordedRunPod().offers(Constraints(gpu_names=["A40"], gpu_count=2, max_price_usd_hr=0.60))
+        == []
+    )

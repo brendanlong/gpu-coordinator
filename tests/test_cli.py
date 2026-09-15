@@ -81,8 +81,12 @@ def test_requeue_without_an_s3_bucket_explains_the_gap(
 
 
 def test_submit_runpod_without_a_gpu_name_says_which_flag_is_missing(
-    control_env: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    control_env: Path,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
     assert main(["submit", str(job), "--runpod"]) == 1
@@ -94,6 +98,7 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
 ) -> None:
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\ngpus: 1\n')
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     s3 = FakeS3Client()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
@@ -157,6 +162,7 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
 def test_reconcile_once_fails_closed_without_desired_state(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
     assert main(["reconcile", "--once"]) == 1
@@ -181,6 +187,7 @@ def test_reconcile_install_writes_units_without_enabling_them(
 def test_pods_lists_ours_and_counts_the_others(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider(existing=[running_pod("subrep-other", "podF")])
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
     monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
@@ -193,6 +200,7 @@ def test_pods_lists_ours_and_counts_the_others(
 def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     s3 = FakeS3Client()
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
@@ -316,3 +324,45 @@ def test_reconcile_install_does_not_need_the_api_key(
         "gpuc-reconcile.service",
         "gpuc-reconcile.timer",
     }
+
+
+def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
+    control_env: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec that cannot run on the pod we would buy must fail before we buy it."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\ngpus: 4\n')
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    created: list[object] = []
+    monkeypatch.setattr(
+        "gpuc.control.cli.runpod_host",
+        lambda *a, **k: created.append(a) or HostEntry(name="gpuc-x", kind="runpod"),
+    )
+
+    assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
+    assert "--gpu-count" in capsys.readouterr().err
+    assert created == []
+
+
+def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
+    control_env: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\ngpus: 1\nsecrets: ["GPUC_DEFINITELY_UNSET"]\n')
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    created: list[object] = []
+    monkeypatch.delenv("GPUC_DEFINITELY_UNSET", raising=False)
+    monkeypatch.setattr(
+        "gpuc.control.cli.runpod_host",
+        lambda *a, **k: created.append(a) or HostEntry(name="gpuc-x", kind="runpod"),
+    )
+
+    assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
+    assert "GPUC_DEFINITELY_UNSET" in capsys.readouterr().err
+    assert created == []
