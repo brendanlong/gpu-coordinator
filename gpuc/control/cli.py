@@ -363,10 +363,9 @@ def cmd_host_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_host_bootstrap(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    entry = named_registry().require(args.name)
-    updated, result = bootstrap_host(entry, settings, health_args=args.health_args)
+def bootstrap_and_record(entry: HostEntry, settings: Settings, health_args: str) -> None:
+    """Bootstrap one host, persist what it told us about itself, and say so."""
+    updated, result = bootstrap_host(entry, settings, health_args=health_args)
     with registry_transaction() as registry:
         registry.put(updated)
     print(
@@ -375,7 +374,86 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
     )
     if result.warnings:
         print(f"{len(result.warnings)} warning(s) above")
-    return 0
+
+
+def bootstrap_tally(total: int, done: int, failed: Sequence[HostEntry], skipped: int) -> str:
+    """The last word of a `--all` run: what worked, what did not, what was never read.
+
+    Counted rather than claimed, because the run this ends can be long enough
+    that nobody reads the middle of it: a host this build could not parse out
+    of the registry was never bootstrapped either, and saying "all of them"
+    over the top of that warning is how one gets missed for a month.
+    """
+    lines = [f"{done}/{total} host(s) bootstrapped"]
+    if failed:
+        lines.append(f"failed: {', '.join(entry.name for entry in failed)}")
+        if any(entry.ephemeral for entry in failed):
+            lines.append(
+                "an ephemeral host whose pod is already gone is forgotten by "
+                "`gpuc reconcile --once`"
+            )
+    if skipped:
+        lines.append(f"{skipped} host(s) in the registry could not be read (warnings above)")
+    return "\n".join(lines)
+
+
+def bootstrap_every_host(settings: Settings, health_args: str) -> int:
+    """`gpuc host bootstrap --all`: the upgrade loop, one command.
+
+    A host that fails does not stop the others: an ephemeral host whose pod is
+    already gone is the ordinary case, and the hosts that are still there are
+    the reason the flag exists. Each failure is named again in the tally and
+    the command exits 1, so nobody reads a wall of output as "all upgraded".
+    """
+    read = read_registry()
+    for error in read.errors:
+        print(f"warning: {error}", file=sys.stderr)
+    if read.unreadable:
+        raise LocalStateUnreadable("\n".join(read.errors))
+    hosts = list(read.registry.hosts.values())
+    if not hosts:
+        print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        return EXIT_OK
+    done = 0
+    failed: list[HostEntry] = []
+    for index, entry in enumerate(hosts, start=1):
+        if index > 1:
+            print()
+        print(f"== {entry.name} ({index}/{len(hosts)}) ==")
+        try:
+            bootstrap_and_record(entry, settings, health_args)
+            done += 1
+        except KeyboardInterrupt:
+            # Health alone allows five minutes a host, so this is a command
+            # somebody does give up on; what it got through is still true.
+            print(f"\ninterrupted during {entry.name}")
+            print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
+            return EXIT_ERROR
+        except LocalStateUnreadable:
+            # The registry stopped being readable mid-run, so the next host's
+            # write would be a guess: say how far this got, and exit 3.
+            print(f"\n{bootstrap_tally(len(hosts), done, failed, len(read.skipped))}")
+            raise
+        except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
+            print(f"error: host {entry.name}: {exc}", file=sys.stderr)
+            failed.append(entry)
+    print()
+    print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+def cmd_host_bootstrap(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    if args.all:
+        if args.name:
+            raise UsageError(
+                f"host bootstrap takes a host name or --all, not both (got {args.name!r})"
+            )
+        return bootstrap_every_host(settings, args.health_args)
+    if not args.name:
+        raise UsageError("host bootstrap wants a host name, or --all for every registered host")
+    bootstrap_and_record(named_registry().require(args.name), settings, args.health_args)
+    return EXIT_OK
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
@@ -1131,7 +1209,10 @@ def cmd_version(args: argparse.Namespace) -> int:
         note = "" if version_mod.same_commit(commit, entry.pkg_commit) else "  OLDER: re-bootstrap"
         print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{note}")
     if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
-        print("upgrade a host with: gpuc host bootstrap <host> (running jobs are not disturbed)")
+        print(
+            "upgrade a host with: gpuc host bootstrap <host> (or --all for every host; "
+            "running jobs are not disturbed)"
+        )
     return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
 
 
@@ -1264,7 +1345,13 @@ def build_parser() -> argparse.ArgumentParser:
     edit.set_defaults(func=cmd_host_set)
 
     bootstrap = host.add_parser("bootstrap", help="install uv, the package and the dispatcher")
-    bootstrap.add_argument("name")
+    bootstrap.add_argument("name", nargs="?", help="the host to bootstrap; omit it with --all")
+    bootstrap.add_argument(
+        "--all",
+        action="store_true",
+        help="bootstrap every registered host instead of one, in the order `host list` shows "
+        "them; a host that fails does not stop the rest, and the command exits 1 if any did",
+    )
     bootstrap.add_argument(
         "--health-args", default="", help="extra flags for `gpuc.host health`, e.g. --min-mbps 0.1"
     )

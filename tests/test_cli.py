@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from gpuc.control import reconcile as reconcile_mod
 from gpuc.control.clean import purge_host
-from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_USAGE, build_parser, main
+from gpuc.control.cli import (
+    EXIT_LOCAL_STATE,
+    EXIT_NOT_FOUND,
+    EXIT_USAGE,
+    build_parser,
+    main,
+)
 from gpuc.control.config import (
     HostEntry,
+    LocalStateUnreadable,
     Settings,
     config_file,
+    hosts_file,
     load_registry,
     load_settings,
     registry_transaction,
@@ -20,7 +28,7 @@ from gpuc.control.config import (
 from gpuc.control.providers.base import Constraints
 from gpuc.control.remote import HostSession
 from gpuc.control.submit import SubmitResult
-from tests.fakeprovider import FakeProvider, running_pod
+from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
 from tests.fakes3 import FakeS3Client
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -887,3 +895,133 @@ def test_host_list_json_reports_the_host_env_by_name_only(
     (host,) = document["hosts"]  # type: ignore[misc]
     assert host["env"] == {"HF_TOKEN": "<set>"}
     assert "hf_secret" not in json.dumps(document)
+
+
+def bootstrapping(
+    monkeypatch: pytest.MonkeyPatch, *, fail: dict[str, BaseException] | None = None
+) -> list[tuple[str, object]]:
+    """Record every (host, health_args) bootstrap was asked for; raise for the named hosts."""
+    attempted: list[tuple[str, object]] = []
+
+    def fake(entry: HostEntry, settings: Settings | None = None, **kwargs: Any):
+        attempted.append((entry.name, kwargs.get("health_args")))
+        error = (fail or {}).get(entry.name)
+        if error is not None:
+            raise error
+        return fake_bootstrap(entry, settings, **kwargs)
+
+    monkeypatch.setattr("gpuc.control.cli.bootstrap_host", fake)
+    return attempted
+
+
+def test_host_bootstrap_all_does_every_registered_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    attempted = bootstrapping(monkeypatch)
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all", "--health-args", "--min-mbps 0.1"]) == 0
+    # The registry reads back in name order, which is the order `host list` shows.
+    assert attempted == [("gpubox", "--min-mbps 0.1"), ("local", "--min-mbps 0.1")]
+    out = capsys.readouterr().out
+    assert "== gpubox (1/2) ==" in out
+    assert "== local (2/2) ==" in out
+    assert "2/2 host(s) bootstrapped" in out
+    registry = load_registry()
+    assert all(registry.require(name).bootstrapped_at for name in ("local", "gpubox"))
+
+
+def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One unreachable pod must not cost the upgrade of every other host."""
+    from gpuc.control.bootstrap import BootstrapError
+
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    main(["host", "add", "zbox", "--ssh", "me@zbox"])
+    with registry_transaction() as registry:
+        registry.put(HostEntry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+    attempted = bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all"]) == 1
+    assert [name for name, _ in attempted] == ["gpubox", "pod", "zbox"]
+    captured = capsys.readouterr()
+    assert "error: host pod: ssh to pod failed" in captured.err
+    assert "2/3 host(s) bootstrapped" in captured.out
+    assert "failed: pod" in captured.out
+    # The one failure that is somebody else's job to clean up says whose.
+    assert "gpuc reconcile --once" in captured.out
+    registry = load_registry()
+    assert all(registry.require(name).bootstrapped_at for name in ("gpubox", "zbox"))
+    assert registry.require("pod").bootstrapped_at is None
+
+
+def test_host_bootstrap_all_counts_the_hosts_it_could_not_read(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host this build cannot parse was not bootstrapped either: never say "all"."""
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    document = json.loads(hosts_file().read_text())
+    document["hosts"]["bad"] = {"name": "bad", "kind": "not a kind", "port": "twenty-two"}
+    hosts_file().write_text(json.dumps(document))
+    bootstrapping(monkeypatch)
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all"]) == 0
+    captured = capsys.readouterr()
+    assert "skipping host 'bad'" in captured.err
+    assert "1/1 host(s) bootstrapped" in captured.out
+    assert "1 host(s) in the registry could not be read" in captured.out
+
+
+def test_host_bootstrap_all_stops_when_the_registry_stops_being_readable(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 3, after saying how far it got: the next write would be a guess."""
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    main(["host", "add", "local", "--gpus", GPU])
+    attempted = bootstrapping(
+        monkeypatch, fail={"local": LocalStateUnreadable("hosts.json is not json")}
+    )
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all"]) == EXIT_LOCAL_STATE
+    assert [name for name, _ in attempted] == ["gpubox", "local"]
+    captured = capsys.readouterr()
+    assert "1/2 host(s) bootstrapped" in captured.out
+    assert "hosts.json is not json" in captured.err
+
+
+def test_host_bootstrap_all_interrupted_still_says_what_it_got_through(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Five minutes a host for health alone makes this one people do Ctrl-C."""
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    main(["host", "add", "local", "--gpus", GPU])
+    bootstrapping(monkeypatch, fail={"local": KeyboardInterrupt()})
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all"]) == 1
+    out = capsys.readouterr().out
+    assert "interrupted during local" in out
+    assert "1/2 host(s) bootstrapped" in out
+
+
+def test_host_bootstrap_all_with_no_hosts_is_not_an_error(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "bootstrap", "--all"]) == 0
+    assert "no hosts registered" in capsys.readouterr().out
+
+
+def test_host_bootstrap_wants_a_name_or_all_but_not_both(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    assert main(["host", "bootstrap"]) == EXIT_USAGE
+    assert "--all" in capsys.readouterr().err
+    assert main(["host", "bootstrap", "local", "--all"]) == EXIT_USAGE
+    assert "not both" in capsys.readouterr().err
