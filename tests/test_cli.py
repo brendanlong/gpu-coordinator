@@ -1338,6 +1338,22 @@ def test_preempt_with_a_priority_passes_it_on_and_re_mirrors_the_spec(
     assert S3Index("bucket", s3).get_spec("20260101-000000-aaaaaa")["priority"] == 90
 
 
+def test_preempt_reports_the_hosts_refusal_to_free_the_host_for_nothing(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host owns this judgement -- it is the only side that knows what is
+    in its queue -- so the control side's job is to carry the reason back."""
+    register_host(name="local", gpus=GPU)
+    refusal = "nothing else is queued on this host, so preempting job j would stop it"
+    monkeypatch.setattr(
+        "gpuc.control.actions.open_session",
+        lambda *a, **k: as_session(StubSession([{"job_id": "j", "error": refusal}])),
+    )
+    capsys.readouterr()
+    assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_ERROR
+    assert "nothing else is queued" in capsys.readouterr().err
+
+
 def test_preempt_reports_the_hosts_refusal(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

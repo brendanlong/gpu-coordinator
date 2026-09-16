@@ -352,6 +352,7 @@ def test_preempt_marks_a_running_job_and_starts_a_dispatcher(
     job_id = queue.enqueue(make_spec(priority=50))
     queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running")
+    queue.enqueue(make_spec(priority=10))  # the job that wants the GPUs
 
     code, payload = run(capsys, "preempt", job_id, "--priority", "70")
     assert code == 0 and isinstance(payload, dict)
@@ -371,3 +372,19 @@ def test_preempt_of_a_job_that_is_not_running_is_a_refusal_not_a_traceback(
 
     code, payload = run(capsys, "preempt", "no-such-job")
     assert code == 1 and isinstance(payload, dict) and "no such job" in str(payload["error"])
+
+
+def test_preempt_that_would_free_the_host_for_nothing_is_refused(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And without starting a dispatcher for it: nothing was asked of one."""
+    started: list[int] = []
+    monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: started.append(1) or 1)
+    job_id = queue.enqueue(make_spec())
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running")
+
+    code, payload = run(capsys, "preempt", job_id)
+    assert code == 1 and isinstance(payload, dict)
+    assert "nothing else is queued" in str(payload["error"])
+    assert (started, queue.kill_reason(job_id)) == ([], None)

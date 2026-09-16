@@ -1146,10 +1146,12 @@ def cmd_preempt(args: argparse.Namespace) -> int:
     """Stop a running job and put it back in its host's queue.
 
     The text output says which priority it comes back at, because that is what
-    decides whether this worked: dispatch order is `<priority>-<job id>`, so a
-    job waiting at a lower number takes the cards next, and one waiting at the
+    decides which job runs next: dispatch order is `<priority>-<job id>`, so a
+    job waiting at a lower number takes the cards, and one waiting at the
     *same* priority does not -- the preempted job was submitted first, so its
-    id sorts ahead and it takes its own cards straight back.
+    id sorts ahead and it takes its own cards straight back. The host refuses
+    outright when nothing at all would go first, rather than throw away what
+    the job has done to re-run the same job.
     """
     document = preempt_job(args.job_id, args.priority, args.host, load_settings())
     for text in document["warnings"]:
@@ -1722,8 +1724,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Frees a running job's GPUs for something more important without "
         "losing the job: its runner stops it and syncs whatever it produced, and the host "
         "queues it again under the same job id as its next attempt. It re-runs from the "
-        "start, from the workdir already on the host -- nothing is re-synced from here. "
-        "Use `gpuc requeue` instead to re-run a finished job, or to run it on another host.",
+        "start, in the workdir the stopped attempt left behind -- nothing is re-synced from "
+        "here -- so preempt a job that tolerates being re-run over its own leftovers. "
+        "Queue the job you want to run FIRST: this is refused unless something already "
+        "waiting would be dispatched ahead of the preempted job, since otherwise it would "
+        "only stop it and start it again. Use `gpuc requeue` to re-run a finished job, or "
+        "to run one on another host.",
     )
     preempt.add_argument("job_id")
     preempt.add_argument(

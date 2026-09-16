@@ -140,11 +140,13 @@ gpuc reorder <jobid> --priority 10          # queued jobs only; prints the new p
                                  # when the job is now expected to start
 gpuc preempt <jobid> --priority 60          # running jobs only: stop it and queue it again as
                                  # attempt+1 under the same id, so a more important job gets the
-                                 # GPUs. It RE-RUNS FROM THE START (same host, same workdir), so
-                                 # only preempt a job that is safe to re-run. It keeps its own
-                                 # priority: a job queued at a lower number goes first anyway, but
-                                 # one at the SAME priority loses the tie (older job id sorts
-                                 # first), so pass --priority to put the preempted job behind it
+                                 # GPUs. It RE-RUNS FROM THE START, in the same workdir the
+                                 # stopped attempt left behind, so only preempt a job that
+                                 # tolerates that. QUEUE THE OTHER JOB FIRST: this is refused
+                                 # (exit 1) unless something already waiting would be dispatched
+                                 # ahead of the preempted job. It keeps its own priority, and at
+                                 # the SAME priority it wins the tie (older job id sorts first),
+                                 # so --priority is how you put it behind the job that is waiting
 gpuc estimate <jobid> --minutes 150
                                  # set estimated_runtime_min on a queued or running job
                                  # (--clear removes it); a running job picks it up within a minute

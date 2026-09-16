@@ -134,7 +134,8 @@ jobs/<jobid>/
                      # job's results and never satisfy `outputs:`
   kill               # a kill request with its reason (`ttl`, `low-util-pause`, `preempted`)
   preempt            # this job is coming back: `gpuc preempt` wrote it beside the kill request,
-                     # and the dispatcher queues the job again once its runner has stopped it
+                     # and the dispatcher queues the job again once its runner has stopped it.
+                     # Removed by whichever of the two decides the job is not coming back
   workdir/           # rsynced code (git-tracked + untracked, .gitignore obeyed); removed per `cleanup:`
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir
@@ -213,18 +214,43 @@ queue's lexical order, not submission order below one second.
   `failed: <reason>` after a final sync. The TTL uses this; cancel stays its own
   marker, because a TTL stop is not a cancellation anyone asked for.
 - Preempt: `queue.preempt(jobid[, prio])` writes `jobs/<id>/preempt` and then a
-  `kill` marker with reason `preempted`; only a *running* job is accepted. The
-  runner stops the job and syncs exactly as it does for a TTL, and ends it
+  `kill` marker with reason `preempted`; only a *running* job is accepted, and
+  only when the host could actually run something else instead --
+  `refuse_if_nothing_else_can_run` refuses a paused or draining host, an empty
+  queue, and a queue whose every job sorts after `<prio>-<jobid>` (the
+  preempted job's id is older than anything queued while it ran, so it wins a
+  tie and would take its own cards straight back). Preempting costs the job
+  everything it has done, so "it would only re-run the same job" is a refusal,
+  not a surprise. The marker is written first and taken back off if the kill
+  write fails: a marker nothing will act on re-runs the job the next time it
+  fails for any reason at all.
+  The runner stops the job and syncs exactly as it does for a TTL, and ends it
   `failed: preempted` -- but keeps `workdir/` whatever `cleanup:` says and keeps
   `secrets/<jobid>.env`, because the next attempt is the same job id and nothing
-  delivers either a second time. The dispatcher then re-queues it in `reap`
-  (and in `adopt_orphans`, for one whose dispatcher died first):
-  `queue.requeue_preempted` removes both markers, writes a *fresh*
-  `state.json` -- `queued`, `attempt+1`, nothing of the stopped attempt -- and
-  writes a queue marker at the spec's priority. A job cancelled while it was
-  stopping, or one whose workdir is gone, is not re-queued. A kill marker the
-  dispatcher did not write gets a clock in `escalate_kills` the first pass it
-  sees one, so a runner that ignores a preempt is escalated like any other kill.
+  delivers either a second time. Both decisions read a snapshot of the marker
+  taken at the top of `_finalize`: from the final state write on, a dispatcher
+  is entitled to consume the marker, and a runner that asked again afterwards
+  would delete the very workdir the next attempt is about to run in. The
+  baseline is not re-taken either (`runner._capture_output_baseline`), so the
+  stopped attempt's results stay this job's outputs instead of becoming files
+  "the checkout arrived with".
+  The dispatcher re-queues it in `reap`, and in `adopt_orphans` for one whose
+  dispatcher died first -- there, a job that is finished but whose runner is
+  *still alive* is adopted rather than re-queued, so nothing is launched into a
+  workdir that runner is still writing to. `queue.requeue_preempted` clears the
+  `kill` marker, writes a *fresh* `state.json` (`queued`, `attempt+1`, nothing
+  of the stopped attempt), writes the queue marker at the spec's priority, and
+  removes the `preempt` marker **last**: interrupted, the job is queued and
+  still asking to be queued, which the next pass completes as the same attempt
+  rather than counting a second one. It does not go back if it is already back,
+  if the attempt ended for a reason of its own rather than because something
+  stopped it (`queue.STOPPED_BY_US`), if it was cancelled while stopping, if
+  its workdir is gone, or if the host is draining or past its TTL -- a host
+  that is going away must not queue a job nothing will run, and leaving it
+  finished is also what keeps it in the drain's unconfirmed-output retry.
+  A kill marker the dispatcher did not write gets a clock in `escalate_kills`
+  the first pass it sees one, so a runner that ignores a preempt is escalated
+  like any other kill.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.
@@ -455,7 +481,9 @@ after any outcome, `never` not at all (the table is in usage.md). No policy ever
 removes the workdir of a job that is not finished, and the removal happens after
 the final sync and the final state write, never before. A preempted job is the
 one exception to the policy: its workdir is what the next attempt re-runs from,
-and nothing on this side would rebuild it.
+and nothing on this side would rebuild it. That attempt therefore starts in a
+dirty tree -- whatever the stopped one wrote is still there -- which is the
+trade `gpuc preempt` makes and what its docs tell the submitter.
 
 `python -m gpuc.host clean (--all-finished | --older-than DAYS | --only IDS)
 [--dry-run]` is the after-the-fact sweep, driven by `gpuc clean --host H`. It prints JSON:

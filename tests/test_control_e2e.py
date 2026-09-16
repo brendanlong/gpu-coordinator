@@ -268,31 +268,24 @@ def test_a_running_job_can_be_cancelled(
     assert state_of(home, job_id)["status"] == "cancelled"
 
 
-def test_a_running_job_can_be_preempted_and_queued_again(
+def test_preempt_refuses_when_it_would_only_re_run_the_same_job(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The whole point of the command, end to end: the job lets go of the host
-    and comes back under the same id, with the workdir the next attempt re-runs
-    from still here."""
+    """Nothing is waiting, so this would stop the job and start it again --
+    losing everything it had done, to no end. (Where it *is* worth doing needs
+    a card to contend over: see the GPU end-to-end module.)"""
     home = bootstrapped_home
-    job_id = submit(workdir, "name: preemptible\ncommand: sleep 300\ngpus: 0\n")
+    job_id = submit(workdir, "name: lonely\ncommand: sleep 300\ngpus: 0\n")
     wait_until(
         lambda: state_of(home, job_id).get("status") == "running", 60, "the job to start running"
     )
     capsys.readouterr()
 
-    assert main(["preempt", job_id, "--priority", "60"]) == 0
-    assert "run from the start" in capsys.readouterr().out
-    wait_until(
-        lambda: state_of(home, job_id).get("attempt") == 2, 120, "the job to be queued again"
-    )
-    state = state_of(home, job_id)
-    assert state["status"] in ("queued", "running")
-    assert (home / "jobs" / job_id / "workdir" / "hello.txt").exists()
-    assert json.loads((home / "jobs" / job_id / "spec.json").read_text())["priority"] == 60
-    assert "queued again as attempt 2" in log_tail(home, job_id, lines=200)
+    assert main(["preempt", job_id]) == 1
+    assert "nothing else is queued" in capsys.readouterr().err
+    assert state_of(home, job_id)["status"] == "running"
+    assert not (home / "jobs" / job_id / "preempt").exists()
 
-    # The host is shared with every other test in this module: leave it idle.
     assert main(["cancel", job_id]) == 0
     wait_until(lambda: finished(home, job_id), 120, "the job to be cancelled")
 

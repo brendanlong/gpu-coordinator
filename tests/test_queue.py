@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -110,25 +111,39 @@ def running_job(**overrides: object) -> str:
     return job_id
 
 
+def waiting_job(priority: int = 1) -> str:
+    """Something queued that would take the preempted job's place.
+
+    Every preempt needs one: with nothing waiting, the command refuses rather
+    than stop a job and start it again.
+    """
+    return queue.enqueue(make_spec(priority=priority))
+
+
 def test_preempt_marks_the_job_and_asks_its_runner_to_stop(gpuc_home: Path) -> None:
+    waiting = waiting_job()
     job_id = running_job()
     assert queue.preempt(job_id) == "preempting"
     assert queue.is_preempted(job_id)
     assert queue.kill_reason(job_id) == "preempted"
     # Nothing here ends the job: the runner owns the kill and the final sync.
     assert jobs.read_state(job_id).status == "running"
-    assert queue.list_queued() == []
+    assert [e.job_id for e in queue.list_queued()] == [waiting]
 
 
 def test_preempt_can_lower_the_priority_it_comes_back_at(gpuc_home: Path) -> None:
+    waiting_job(priority=40)
     job_id = running_job(priority=50)
     queue.preempt(job_id, priority=80)
     assert jobs.read_spec(job_id).priority == 80
+    stopped(job_id)
     assert queue.requeue_preempted(job_id) == 2
-    assert queue.list_queued()[0].marker.name.startswith("80-")
+    assert queue.find_marker(job_id) is not None
+    assert queue.find_marker(job_id).name.startswith("80-")  # pyright: ignore[reportOptionalMemberAccess]
 
 
 def test_a_queued_or_finished_job_cannot_be_preempted(gpuc_home: Path) -> None:
+    waiting_job()
     queued = queue.enqueue(make_spec())
     with pytest.raises(ValueError, match="reorder"):
         queue.preempt(queued)
@@ -141,6 +156,7 @@ def test_a_queued_or_finished_job_cannot_be_preempted(gpuc_home: Path) -> None:
 
 
 def test_a_job_already_being_cancelled_is_not_coming_back(gpuc_home: Path) -> None:
+    waiting_job()
     job_id = running_job()
     queue.cancel(job_id)
     with pytest.raises(ValueError, match="cancelled"):
@@ -148,21 +164,117 @@ def test_a_job_already_being_cancelled_is_not_coming_back(gpuc_home: Path) -> No
     assert not queue.is_preempted(job_id)
 
 
+def test_an_out_of_range_priority_is_refused_before_anything_is_written(gpuc_home: Path) -> None:
+    """The queue marker clamps it; `spec.json` does not, and a spec saying
+    priority 500 is a job whose reported priority means nothing."""
+    waiting_job()
+    job_id = running_job(priority=50)
+    with pytest.raises(ValueError, match="0-99"):
+        queue.preempt(job_id, priority=500)
+    assert jobs.read_spec(job_id).priority == 50
+    assert not queue.is_preempted(job_id)
+
+
+# -- preempting must actually free the host for something ---------------------
+
+
+def test_preempt_refuses_when_nothing_else_is_queued(gpuc_home: Path) -> None:
+    """It would stop the job and start it again, losing everything it had done
+    for nothing at all."""
+    job_id = running_job()
+    with pytest.raises(ValueError, match="nothing else is queued"):
+        queue.preempt(job_id)
+    assert not queue.is_preempted(job_id)
+    assert queue.kill_reason(job_id) is None
+
+
+def test_preempt_refuses_when_it_would_beat_every_waiting_job_to_the_gpus(
+    gpuc_home: Path,
+) -> None:
+    """The tie nobody expects: at equal priority the marker is
+    `<priority>-<job id>`, and the preempted job was submitted first, so it
+    takes its own cards straight back and the waiting job waits again."""
+    job_id = running_job(priority=50)
+    later = queue.enqueue(make_spec(job_id="20991231-235959-ffffff", priority=50))
+    with pytest.raises(ValueError, match="wins a tie") as refused:
+        queue.preempt(job_id)
+    assert later in str(refused.value)
+    assert "--priority` above 50" in str(refused.value)
+    assert not queue.is_preempted(job_id)
+    # ...and the way out works, without the refusal having written the spec.
+    assert jobs.read_spec(job_id).priority == 50
+    assert queue.preempt(job_id, priority=51) == "preempting"
+
+
+def test_a_job_queued_ahead_of_it_is_what_makes_a_preempt_worth_it(gpuc_home: Path) -> None:
+    job_id = running_job(priority=50)
+    queue.enqueue(make_spec(priority=10))
+    assert queue.preempt(job_id) == "preempting"
+
+
+def test_a_cancelled_job_in_the_queue_does_not_count_as_something_waiting(
+    gpuc_home: Path,
+) -> None:
+    job_id = running_job(priority=50)
+    doomed = queue.enqueue(make_spec(priority=10))
+    paths.cancel_file(doomed).touch()
+    with pytest.raises(ValueError, match="nothing else is queued"):
+        queue.preempt(job_id)
+
+
+@pytest.mark.parametrize(("marker", "match"), [("paused", "paused"), ("draining", "draining")])
+def test_preempt_refuses_on_a_host_that_is_dispatching_nothing(
+    gpuc_home: Path, marker: str, match: str
+) -> None:
+    waiting_job()
+    job_id = running_job()
+    (paths.paused_file() if marker == "paused" else paths.draining_file()).touch()
+    with pytest.raises(ValueError, match=match):
+        queue.preempt(job_id)
+    assert not queue.is_preempted(job_id)
+
+
+def test_a_failed_kill_request_takes_the_marker_back_off(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker nothing will ever act on is a landmine: the job keeps running,
+    and whenever it eventually fails on its own the dispatcher re-runs it."""
+    waiting_job()
+    job_id = running_job()
+
+    def unwritable(*_: object, **__: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(queue.jobs, "atomic_write_text", unwritable)
+    with pytest.raises(OSError, match="read-only"):
+        queue.preempt(job_id)
+    assert not queue.is_preempted(job_id)
+
+
+# -- coming back --------------------------------------------------------------
+
+
+def stopped(job_id: str, reason: str = "preempted") -> None:
+    """The state the runner leaves behind when the kill lands."""
+    jobs.update_state(
+        job_id, status="failed", reason=reason, exit_code=143, ended_at=jobs.utc_now()
+    )
+
+
 def test_requeue_after_preempt_starts_the_job_over_as_the_next_attempt(gpuc_home: Path) -> None:
     """A queued job that still carried the stopped attempt's exit code, GPUs and
     end time would be a job that reads as finished to everything but the queue."""
+    waiting_job()
     job_id = running_job(priority=20)
     queue.preempt(job_id)
-    jobs.update_state(
-        job_id, status="failed", reason="preempted", exit_code=143, ended_at=jobs.utc_now()
-    )
+    stopped(job_id)
     assert queue.requeue_preempted(job_id) == 2
 
     state = jobs.read_state(job_id)
     assert (state.status, state.attempt) == ("queued", 2)
     assert (state.exit_code, state.ended_at, state.started_at, state.gpus) == (None, None, None, [])
     assert jobs.read_spec(job_id).attempt == 2
-    assert [e.job_id for e in queue.list_queued()] == [job_id]
+    assert queue.find_marker(job_id) is not None
     # The kill request was the stopped attempt's: left behind, the runner of
     # the new one would find it and stop that too.
     assert queue.kill_reason(job_id) is None
@@ -170,35 +282,105 @@ def test_requeue_after_preempt_starts_the_job_over_as_the_next_attempt(gpuc_home
     assert "queued again as attempt 2" in paths.log_file(job_id).read_text()
 
 
+def test_the_queue_marker_is_written_before_the_preempt_marker_is_removed(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interrupted the other way round, the job is neither queued nor asking to
+    be: it is simply gone, and only the dispatcher log remembers it."""
+    waiting_job()
+    job_id = running_job()
+    queue.preempt(job_id)
+    stopped(job_id)
+
+    real_touch = Path.touch
+    failed: list[str] = []
+
+    def fail_the_first_queue_marker(self: Path, *args: object, **kwargs: object) -> None:
+        if self.parent == paths.queue_dir() and not failed:
+            failed.append(self.name)
+            raise OSError("no space left on device")
+        real_touch(self, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    # Not `monkeypatch.undo()` afterwards: this test's `monkeypatch` is the one
+    # the `gpuc_home` fixture set GPUC_HOME with, so undoing it would point
+    # every path below at the developer's real ~/.gpuc.
+    monkeypatch.setattr(Path, "touch", fail_the_first_queue_marker)
+    with pytest.raises(OSError):
+        queue.requeue_preempted(job_id)
+    # Still asking to come back, so the next pass finishes the job off --
+    # as the *same* attempt, since that one was already counted.
+    assert queue.is_preempted(job_id)
+    assert queue.requeue_preempted(job_id) == 2
+    assert queue.find_marker(job_id) is not None
+    assert jobs.read_state(job_id).attempt == 2
+    assert not queue.is_preempted(job_id)
+
+
+def test_a_job_that_is_already_back_in_the_queue_is_not_queued_twice(gpuc_home: Path) -> None:
+    """The retry above must be a no-op once the job is really back, or a second
+    dispatcher pass bumps the attempt and leaves two markers behind."""
+    waiting_job()
+    job_id = running_job()
+    queue.preempt(job_id)
+    stopped(job_id)
+    assert queue.requeue_preempted(job_id) == 2
+    paths.preempt_file(job_id).touch()
+    assert queue.requeue_preempted(job_id) is None
+    assert jobs.read_state(job_id).attempt == 2
+    assert not queue.is_preempted(job_id)
+
+
 def test_a_job_cancelled_while_it_was_stopping_does_not_come_back(gpuc_home: Path) -> None:
+    waiting = waiting_job()
     job_id = running_job()
     queue.preempt(job_id)
     queue.cancel(job_id)
+    stopped(job_id)
     assert queue.requeue_preempted(job_id) is None
-    assert queue.list_queued() == []
+    assert [e.job_id for e in queue.list_queued()] == [waiting]
     assert not queue.is_preempted(job_id)
 
 
 def test_a_job_whose_workdir_is_gone_has_nothing_to_re_run(gpuc_home: Path) -> None:
     """Its code was rsynced here once, at submit, and `gpuc preempt` never goes
     near the machine that holds it."""
-    import shutil
-
+    waiting = waiting_job()
     job_id = running_job()
     queue.preempt(job_id)
+    stopped(job_id)
     shutil.rmtree(paths.workdir(job_id))
     assert queue.requeue_preempted(job_id) is None
-    assert queue.list_queued() == []
+    assert [e.job_id for e in queue.list_queued()] == [waiting]
 
 
-def test_a_job_that_finished_before_the_kill_reached_it_is_not_run_again(
-    gpuc_home: Path,
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [("succeeded", None), ("failed", "exit 1"), ("failed", "timeout"), ("failed", "low-util")],
+)
+def test_a_job_that_ended_on_its_own_before_the_kill_landed_is_not_re_run(
+    gpuc_home: Path, status: str, reason: str | None
 ) -> None:
-    """ "Put it back in the queue" was about the work still to do; the job did
-    it all in the seconds it took the kill to land."""
+    """It asked for nothing: the work is over, or it failed for a reason of its
+    own. Re-running it would be a retry nobody requested -- `gpuc requeue` is
+    the command that does that, deliberately."""
+    waiting_job()
     job_id = running_job()
     queue.preempt(job_id)
-    jobs.update_state(job_id, status="succeeded", exit_code=0, ended_at=jobs.utc_now())
+    jobs.update_state(job_id, status=status, reason=reason, ended_at=jobs.utc_now())
     assert queue.requeue_preempted(job_id) is None
-    assert queue.list_queued() == []
-    assert jobs.read_state(job_id).status == "succeeded"
+    assert queue.find_marker(job_id) is None
+    assert jobs.read_state(job_id).status == status
+    assert not queue.is_preempted(job_id)
+
+
+@pytest.mark.parametrize("reason", ["preempted", "preempted+sync", "runner-died", "terminated"])
+def test_every_way_the_stop_itself_can_end_the_attempt_comes_back(
+    gpuc_home: Path, reason: str
+) -> None:
+    """`preempted+sync` is a preempt whose final upload also failed, and the two
+    others are the escalation ladder taking the runner down."""
+    waiting_job()
+    job_id = running_job()
+    queue.preempt(job_id)
+    stopped(job_id, reason=reason)
+    assert queue.requeue_preempted(job_id) == 2

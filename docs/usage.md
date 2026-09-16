@@ -265,18 +265,42 @@ dispatched at once the marker is gone.
 **`gpuc preempt <job-id>`** — stop a *running* job and queue it again, so
 something more important can have its GPUs. Its runner stops it and syncs
 whatever it produced, exactly as a cancel does, and then the host queues the
-same job id again as its next attempt: it **re-runs from the start**, from the
-workdir already on the host, so a job that is not safe to re-run should not be
-preempted. Nothing is re-synced from here and the job never leaves its host.
+same job id again as its next attempt. Nothing is re-synced from here and the
+job never leaves its host; `gpuc requeue` is the command for a finished job, or
+for another host.
+
+It **starts over**: the attempt that was stopped keeps nothing but its log, and
+its `setup:` and `command:` run again from the top. What it does *not* get is a
+fresh workdir — that directory was rsynced from your checkout once, at submit,
+and it is still exactly as the stopped attempt left it, part-written
+checkpoints and all. So preempt a job that tolerates being re-run over its own
+leftovers, and not one whose `setup:` would trip over them. (The `outputs:`
+baseline is not re-taken, so anything the stopped attempt produced still counts
+as this job's output rather than as a file the checkout came with.)
+
 It comes back at its own priority unless `--priority N` changes it (recorded in
 the spec and its S3 mirror, like `gpuc reorder`). The job you are making room
 for takes the cards next if it is queued at a **lower** number — the ordinary
 case, and no flag is needed for it. At the **same** priority it does not:
 dispatch order is `<priority>-<job id>`, and the preempted job was submitted
-first, so its id sorts ahead and it takes its own cards straight back. Pass
-`--priority` there, and whenever the job you want to run is not queued yet.
-Queued and finished jobs are refused (exit 1): `gpuc reorder` moves a queued
-one, `gpuc requeue` re-runs a finished one.
+first, so its id sorts ahead and it takes its own cards straight back.
+
+**It only works when something can take its place.** Preempting costs the job
+everything it has done, so a preempt that would just re-run the same job is
+refused (exit 1) rather than quietly doing that: nothing else queued, nothing
+queued that sorts ahead of where this job would land (pass `--priority` above
+that job, and the refusal says which one), or a host that is paused or
+draining and so is dispatching nothing at all. **Queue the job you want to run
+first, then preempt.** Queued and finished jobs are refused too: `gpuc reorder`
+moves a queued one, `gpuc requeue` re-runs a finished one.
+
+The host decides the re-queue when the attempt actually stops, and there are
+four cases where it does not happen — the job finished, or failed for a reason
+of its own, in the seconds before the kill reached it (a re-run would be a
+retry nobody asked for); it was cancelled while it was stopping; its workdir is
+gone; or the host is draining or past its `--ttl-hours` and is about to stop
+existing. In all four the job stays finished, with `gpuc requeue` as the way to
+re-run it, and the dispatcher log says which case it was.
 
 **`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or
 running job's `estimated_runtime_min`; see [job length
@@ -489,10 +513,12 @@ window, when the runner is the only member of it.
 `gpuc preempt` uses the same machinery with one extra marker: the runner stops
 the job and records `failed: preempted` after its final sync, and the dispatcher
 then writes the job's state back to `queued` as the next attempt and puts a
-queue marker back. The workdir and the job's secrets file are kept whatever
-`cleanup:` says, because the next attempt is that same job id and nothing
-delivers either a second time. A job cancelled while it was stopping does not
-come back.
+queue marker back. So a preempted job is briefly visible as `failed:
+preempted` — that is the record of the attempt that was stopped, and anything
+polling `gpuc status --json` will see it for a second or two before the job
+reads as `queued` again. The workdir and the job's secrets file are kept
+whatever `cleanup:` says, because the next attempt is that same job id and
+nothing delivers either a second time.
 
 The low-util watchdog samples the assigned cards every 30 s **during phase
 `main` only**, so downloads and compiles in `setup` can never look idle. Once

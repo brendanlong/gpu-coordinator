@@ -428,35 +428,60 @@ class Dispatcher:
             except RuntimeError as exc:
                 self.log(f"job {job_id} has an unreadable state.json ({exc}); skipping")
                 continue
+            # A recorded pid means nothing across a reboot, and little after a
+            # pid rollover: the boot id and start time recorded at launch are
+            # what make "still running" a real answer.
+            alive = bool(state.runner_pid) and recorded_process_alive(
+                state.runner_pid, state.runner_boot_id, state.runner_starttime
+            )
             if state.finished:
-                # Its runner stopped it and nothing was left to put it back.
+                if queue.is_preempted(job_id) and alive:
+                    # Finished, preempted, and its runner is *still there*: it
+                    # is in its final sync, writing to the workdir and to
+                    # state.json. Queueing the job now would launch the next
+                    # attempt into that same workdir. Adopt the runner instead
+                    # and let `reap` do it when the runner is really gone.
+                    self.running[job_id] = _Running(
+                        job_id, state.runner_pid or 0, self._held_gpus(job_id, state)
+                    )
+                    self.log(f"job {job_id} was preempted and is still syncing; waiting for it")
+                    continue
+                # Otherwise its runner is gone and nothing was left to put it
+                # back: that is this dispatcher's job now.
                 self.requeue_if_preempted(job_id)
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
-            # A recorded pid means nothing across a reboot, and little after a
-            # pid rollover: the boot id and start time recorded at launch are
-            # what make "still running" a real answer.
-            if state.runner_pid and recorded_process_alive(
-                state.runner_pid, state.runner_boot_id, state.runner_starttime
-            ):
-                # Through the resolver: a job launched before assignments were
-                # resolved host-side has indices in its state, and busy/free
-                # accounting is in UUIDs. An index adopted as-is would match
-                # nothing owned, so the card would read free and be handed out
-                # a second time while the job is still training on it.
-                try:
-                    held, _ = gpus.resolve_owned(state.gpus, self.deps.smi)
-                except gpus.GpuError as exc:
-                    # Adoption runs once, at startup: a job left unadopted here
-                    # is never picked up, so an unreadable nvidia-smi must cost
-                    # the resolution, not the adoption.
-                    self.log(f"could not resolve the GPUs of {job_id} ({exc}); adopting as given")
-                    held = list(state.gpus)
-                self.running[job_id] = _Running(job_id, state.runner_pid, held)
+            if alive:
+                self.running[job_id] = _Running(
+                    job_id, state.runner_pid or 0, self._held_gpus(job_id, state)
+                )
                 self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
             else:
                 self._mark_runner_died(job_id)
+                # A job stopped by `gpuc preempt` whose runner then died still
+                # asked to come back, and `reap` will never see this one: it
+                # belongs to a dispatcher that is gone.
+                self.requeue_if_preempted(job_id)
+
+    def _held_gpus(self, job_id: str, state: jobs.JobState) -> list[str]:
+        """The cards an adopted job is holding, as UUIDs.
+
+        Through the resolver: a job launched before assignments were resolved
+        host-side has indices in its state, and busy/free accounting is in
+        UUIDs. An index adopted as-is would match nothing owned, so the card
+        would read free and be handed out a second time while the job is still
+        training on it.
+        """
+        try:
+            held, _ = gpus.resolve_owned(state.gpus, self.deps.smi)
+        except gpus.GpuError as exc:
+            # Adoption runs once, at startup: a job left unadopted here is
+            # never picked up, so an unreadable nvidia-smi must cost the
+            # resolution, not the adoption.
+            self.log(f"could not resolve the GPUs of {job_id} ({exc}); adopting as given")
+            held = list(state.gpus)
+        return held
 
     def _mark_runner_died(self, job_id: str) -> None:
         """Fail the job, after making sure nothing of it is left on the GPUs.
@@ -530,6 +555,20 @@ class Dispatcher:
         """
         if not queue.is_preempted(job_id):
             return
+        going = self._going_away()
+        if going is not None:
+            # The job would be queued onto a host that is about to stop
+            # existing, where nothing would run it and the drain would not even
+            # count its outputs as unconfirmed (that list is finished jobs).
+            # Left finished, it keeps its record, its `preempted` reason and
+            # its place in the drain's last upload attempt.
+            paths.preempt_file(job_id).unlink(missing_ok=True)
+            self.log(
+                f"job {job_id} was preempted, but this host is {going}, so it is not going "
+                f"back in the queue: it stays {self._state_or_empty(job_id).status} and "
+                f"`gpuc requeue` is what re-runs it"
+            )
+            return
         try:
             attempt = queue.requeue_preempted(job_id)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -546,6 +585,19 @@ class Dispatcher:
             )
             return
         self.log(f"job {job_id} was preempted; queued again as attempt {attempt}")
+
+    def _going_away(self) -> str | None:
+        """Why this host will not be running anything else, or None.
+
+        The TTL is a hard cap, so a host past it must not start a fresh attempt
+        of anything -- least of all one this dispatcher would launch itself,
+        seconds before the same pass drains and terminates.
+        """
+        if paths.draining_file().exists():
+            return "draining"
+        if self.config.ephemeral and self._ttl_expired(self.config):
+            return f"past its ttl of {self.config.ttl_hours:g} h"
+        return None
 
     def handle_cancels(self) -> None:
         """Escalate a cancel, without ever killing the runner's own group during
@@ -915,14 +967,18 @@ class Dispatcher:
 
     # -- outputs the pod would otherwise take with it --------------------
     def unconfirmed_output_jobs(self) -> list[str]:
-        """Finished jobs whose `outputs:` are still only on this host."""
+        """Jobs whose `outputs:` are still only on this host."""
         pending: list[str] = []
         for job_id in jobs.list_job_ids():
             try:
                 state = jobs.read_state(job_id)
             except (RuntimeError, OSError):
                 continue
-            if not state.finished:
+            if state.status == "running":
+                # Still being written to; the runner owns those files. Every
+                # other status is fair game -- including `queued`, which is
+                # what a preempted job is while still holding the outputs the
+                # stopped attempt produced.
                 continue
             # A job that failed its sync preflight proved these uploads cannot
             # work *before* it ran, and produced nothing. Retrying it three
@@ -944,7 +1000,7 @@ class Dispatcher:
         pending = self.unconfirmed_output_jobs()
         if not pending:
             return
-        self.log(f"drain: {len(pending)} finished job(s) have unconfirmed outputs; retrying")
+        self.log(f"drain: {len(pending)} job(s) have unconfirmed outputs; retrying")
         deadline = self.deps.monotonic() + OUTPUT_RETRY_BUDGET_S
         last_error: dict[str, str] = {}
         for attempt in range(1, OUTPUT_RETRY_ATTEMPTS + 1):

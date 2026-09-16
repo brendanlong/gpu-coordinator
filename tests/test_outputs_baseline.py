@@ -138,3 +138,29 @@ def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, aws: None) -> N
     final = recorder.uploads()[-1]
     assert "--exclude" in final and "report-elephant.md" in final
     assert "late.txt" not in final
+
+
+def test_a_preempted_re_run_keeps_the_baseline_the_first_attempt_took(
+    gpuc_home: Path, aws: None
+) -> None:
+    """Re-scanned at the start of attempt 2, the files attempt 1 produced would
+    be recorded as files the *checkout* arrived with -- so this attempt would
+    never upload them, and one that died before rewriting them would report
+    `no-outputs` with its results sitting right there."""
+    job_id, results = prepare(gpuc_home, "true")
+    recorder = Recorder()
+    deps = RunnerDeps(command_runner=recorder, preflight=False, poll_interval_s=0.02)
+    runner.run_job(job_id, deps)
+    first = baseline.read(job_id)
+    assert "report-elephant.md" in first["results"]
+
+    # ...and then a preempted attempt leaves a checkpoint of its own behind.
+    (results / "ckpt-100.bin").write_text("weights\n")
+    jobs.update_state(job_id, status="running", attempt=2, ended_at=None)
+    runner.run_job(job_id, deps)
+
+    assert baseline.read(job_id) == first
+    assert "ckpt-100.bin" not in baseline.read(job_id)["results"]
+    assert "ckpt-100.bin" not in recorder.excluded()
+    log = paths.log_file(job_id).read_text()
+    assert "keeping the one taken before the first attempt" in log
