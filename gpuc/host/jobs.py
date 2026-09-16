@@ -277,6 +277,14 @@ class JobSpec:
     name: str = ""
     setup: str | None = None
     gpus: int = 1
+    use_shared: bool = False
+    """May this job be dispatched to the host's `shared_gpus` -- cards gpuc
+    does not own and may only borrow while nobody else is on them?
+
+    Off by default, because a shared card is somebody else's and taking one is
+    a decision about a box, not about a job. A job that opts in is dispatched
+    to owned cards first and borrows only what it could not get there; see the
+    dispatcher's `launch_ready`."""
     env: dict[str, str] = field(default_factory=dict)
     secrets: list[str] = field(default_factory=list)
     outputs: list[Output] = field(default_factory=list)
@@ -322,6 +330,7 @@ class JobSpec:
             name=as_str(fields, "name"),
             setup=as_opt_str(fields, "setup"),
             gpus=as_int(fields, "gpus", 1),
+            use_shared=as_bool(fields, "use_shared"),
             env=as_str_dict(fields, "env"),
             secrets=as_str_list(fields, "secrets"),
             outputs=[Output.from_dict(o) for o in (outputs if isinstance(outputs, list) else [])],
@@ -544,6 +553,15 @@ class HostConfig:
     schema_version: int = SCHEMA_VERSION
     host: str = "local"
     gpus: list[str] = field(default_factory=list)
+    shared_gpus: list[str] = field(default_factory=list)
+    """Cards on this box that gpuc may *borrow*, spelled like `gpus`.
+
+    Not ours: somebody else owns them, and the only time we may run on one is
+    while nothing at all is. So a job reaches them only if it asked to
+    (`use_shared`), only after the owned cards are full, and only while
+    nvidia-smi says the card holds no memory and is doing no work. Nothing
+    here is counted as capacity for a job that did not ask.
+    """
     provider: dict[str, Any] | None = None
     idle_minutes: float = 15.0
     ttl_hours: float | None = None
@@ -596,6 +614,7 @@ class HostConfig:
             schema_version=as_int(fields, "schema_version", SCHEMA_VERSION),
             host=as_str(fields, "host", "local") or "local",
             gpus=as_str_list(fields, "gpus"),
+            shared_gpus=as_str_list(fields, "shared_gpus"),
             provider=provider if isinstance(provider, dict) else None,
             idle_minutes=as_float(fields, "idle_minutes", 15.0),
             ttl_hours=as_opt_float(fields, "ttl_hours"),
@@ -613,6 +632,33 @@ class HostConfig:
     @property
     def ephemeral(self) -> bool:
         return self.provider is not None
+
+    def shared_entries(self) -> list[str]:
+        """`shared_gpus`, minus anything spelled identically in `gpus`.
+
+        Owning a card beats borrowing it, which is how `Dispatcher.shared_gpus`
+        resolves the same collision once nvidia-smi has said which entries are
+        the same card. This is the counting version and can only catch the
+        identical spelling; `gpuc host add|set` and the host's own `gpu_uuids`
+        check refuse the rest, so what is left here is a hand-edited file.
+        """
+        owned = set(self.gpus)
+        return [entry for entry in self.shared_gpus if entry not in owned]
+
+    def may_borrow(self, spec: JobSpec) -> bool:
+        """May this job be given one of this host's shared cards?
+
+        About the job, not about what the cards are doing this second --
+        whether one is free is the dispatcher's question, asked only once this
+        has said yes. And fixed for the life of a queued job: nothing changes
+        a spec's `use_shared` after submit, which is what lets the dispatcher
+        *fail* a job this says no to rather than leaving it to wait forever.
+        """
+        return spec.use_shared and bool(self.shared_gpus)
+
+    def borrowable(self, spec: JobSpec) -> list[str]:
+        """The shared entries this job may reach, for counting capacity."""
+        return self.shared_entries() if self.may_borrow(spec) else []
 
     def bin_dirs(self) -> list[str]:
         """Directories from `env` to put on PATH, in order, without duplicates."""

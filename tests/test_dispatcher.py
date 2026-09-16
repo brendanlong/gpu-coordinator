@@ -1287,3 +1287,234 @@ def test_a_preempted_job_whose_runner_died_before_the_dispatcher_did_comes_back(
     state = jobs.read_state(job_id)
     assert (state.status, state.attempt) == ("queued", 2)
     assert not queue.is_preempted(job_id)
+
+
+# -- shared GPUs: cards we borrow rather than own ------------------------------
+
+SHARED_GPUS = [
+    "GPU-00000000-0000-0000-0000-000000000003",
+    "GPU-00000000-0000-0000-0000-000000000004",
+]
+ALL_GPUS = [*FAKE_GPUS, *SHARED_GPUS]
+
+
+def shared_host(
+    *,
+    owned: list[str] | None = None,
+    shared: list[str] | None = None,
+    utilization: dict[str, float] | None = None,
+    memory_used: dict[str, float] | None = None,
+) -> tuple[Dispatcher, dict[str, FakeRunnerProcess]]:
+    """A dispatcher on a box of four cards, two of which are somebody else's."""
+    jobs.write_config(
+        HostConfig(
+            host="test-host",
+            gpus=list(FAKE_GPUS if owned is None else owned),
+            shared_gpus=list(SHARED_GPUS if shared is None else shared),
+        )
+    )
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.deps.smi = fake_smi(ALL_GPUS, utilization=utilization, memory_used=memory_used)
+    return dispatcher, spawned
+
+
+def enqueue_in_order(*specs: dict[str, Any]) -> list[str]:
+    """Queue these jobs in exactly this order, whatever their priorities say.
+
+    Dispatch order is the marker name `<priority>-<job id>`, and a real job id
+    carries a random suffix -- so two jobs queued in the same second at the
+    same priority sort unpredictably, and a test about which card a *particular*
+    job gets would pass or fail on that coin flip.
+    """
+    return [
+        queue.enqueue(make_spec(job_id=f"20260101-000000-{index:06d}", **spec))
+        for index, spec in enumerate(specs)
+    ]
+
+
+def filling_the_owned_cards(priority: int = 50) -> list[dict[str, Any]]:
+    """One single-card job per owned card, to make a borrower the only way on.
+
+    `priority` because dispatch order is priority first: a test about a job at
+    priority 20 has to queue these ahead of it, or the job under test simply
+    takes an owned card and proves nothing."""
+    return [{"gpus": 1, "priority": priority} for _ in FAKE_GPUS]
+
+
+def test_a_job_that_did_not_ask_never_touches_a_shared_card(gpuc_home: Path) -> None:
+    """Taking somebody else's GPU is a decision about a box, not about a job,
+    so it is off unless the spec said so."""
+    dispatcher, _ = shared_host()
+    *holding, waiting = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1})
+    dispatcher.run_once()
+
+    assert all(jobs.read_state(job_id).status == "running" for job_id in holding)
+    assert jobs.read_state(waiting).status == "queued"
+    assert [e.job_id for e in queue.list_queued()] == [waiting]
+
+
+def test_a_job_that_asked_borrows_an_idle_shared_card(gpuc_home: Path) -> None:
+    dispatcher, _ = shared_host()
+    *_, borrower = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
+    dispatcher.run_once()
+
+    assert jobs.read_state(borrower).status == "running"
+    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
+
+
+def test_owned_cards_are_always_taken_before_borrowed_ones(gpuc_home: Path) -> None:
+    """A shared card is held for the shortest time that runs the job, so a
+    borrower uses every free card of ours first and borrows only the shortfall."""
+    dispatcher, _ = shared_host()
+    _, borrower = enqueue_in_order({"gpus": 1}, {"gpus": 2, "use_shared": True})
+    dispatcher.run_once()
+
+    assert jobs.read_state(borrower).gpus == [FAKE_GPUS[1], SHARED_GPUS[0]]
+
+
+def test_a_job_bigger_than_the_host_owns_waits_for_the_shared_cards(gpuc_home: Path) -> None:
+    """The second thing shared cards are for: four cards on a host that owns
+    two, once the other two go quiet -- rather than a job that can never run."""
+    dispatcher, _ = shared_host(memory_used={SHARED_GPUS[1]: 4096.0})
+    (job_id,) = enqueue_in_order({"gpus": 4, "use_shared": True})
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "queued"
+
+    dispatcher.deps.smi = fake_smi(ALL_GPUS)
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "running"
+    assert jobs.read_state(job_id).gpus == ALL_GPUS
+
+
+def test_a_shared_card_somebody_else_is_on_is_not_borrowed(gpuc_home: Path) -> None:
+    dispatcher, _ = shared_host(
+        memory_used={SHARED_GPUS[0]: 1024.0}, utilization={SHARED_GPUS[1]: 55.0}
+    )
+    *_, borrower = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
+    dispatcher.run_once()
+
+    assert jobs.read_state(borrower).status == "queued"
+    assert "is in use" in paths.dispatcher_log().read_text()
+
+
+def test_two_borrowers_in_one_pass_do_not_get_the_same_card(gpuc_home: Path) -> None:
+    dispatcher, _ = shared_host()
+    *_, first, second = enqueue_in_order(
+        *filling_the_owned_cards(),
+        {"gpus": 1, "use_shared": True},
+        {"gpus": 1, "use_shared": True},
+    )
+    dispatcher.run_once()
+
+    assert jobs.read_state(first).gpus == [SHARED_GPUS[0]]
+    assert jobs.read_state(second).gpus == [SHARED_GPUS[1]]
+
+
+def test_a_borrowed_card_is_busy_until_its_job_ends(gpuc_home: Path) -> None:
+    dispatcher, spawned = shared_host(owned=[])
+    (first,) = enqueue_in_order({"gpus": 1, "use_shared": True})
+    dispatcher.run_once()
+    assert jobs.read_state(first).gpus == [SHARED_GPUS[0]]
+
+    # nvidia-smi now reports our own job's memory on that card. It must not be
+    # read as "somebody else has it" *or* as free: it is simply already ours.
+    dispatcher.deps.smi = fake_smi(ALL_GPUS, memory_used={SHARED_GPUS[0]: 8192.0})
+    second = queue.enqueue(make_spec(gpus=1, use_shared=True))
+    dispatcher.run_once()
+    assert jobs.read_state(second).gpus == [SHARED_GPUS[1]]
+
+    spawned[first].finish()
+    dispatcher.deps.smi = fake_smi(ALL_GPUS)
+    dispatcher.run_once()
+    assert dispatcher.borrowable_gpus() == [SHARED_GPUS[0]]
+
+
+def test_a_job_too_big_even_with_shared_cards_fails_with_what_would_help(
+    gpuc_home: Path,
+) -> None:
+    """Two ways not to fit on a 2-owned, 2-shared host, and the reason has to
+    name which -- otherwise `needs 5 GPUs, host owns 2` sends somebody looking
+    for a bigger host when `use_shared: true` was the answer."""
+    dispatcher, _ = shared_host()
+    asked, did_not_ask = enqueue_in_order(
+        {"gpus": 5, "use_shared": True},
+        {"gpus": 3},
+    )
+    dispatcher.run_once()
+
+    assert all(jobs.read_state(job).status == "failed" for job in (asked, did_not_ask))
+    assert "may borrow 2 shared" in (jobs.read_state(asked).reason or "")
+    assert "use_shared: true" in (jobs.read_state(did_not_ask).reason or "")
+
+
+def test_a_job_the_host_could_run_is_never_dropped_from_the_queue(gpuc_home: Path) -> None:
+    """The dispatcher's "this can never run here" is a deletion, so it may only
+    read what is fixed for a queued job's life. The card counts are configured
+    rather than resolved, and `use_shared` cannot change after submit -- so a
+    job that fits on paper waits however long the borrowing takes."""
+    dispatcher, _ = shared_host(memory_used={SHARED_GPUS[1]: 4096.0})
+    (job_id,) = enqueue_in_order({"gpus": 4, "use_shared": True})
+    for _ in range(3):
+        dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "queued"
+    assert [e.job_id for e in queue.list_queued()] == [job_id]
+
+    # Moving it later in the queue moves it; it does not end it.
+    queue.reorder(job_id, 99)
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "queued"
+
+    dispatcher.deps.smi = fake_smi(ALL_GPUS)
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).gpus == ALL_GPUS
+
+
+def test_a_card_listed_as_both_owned_and_shared_is_only_owned(gpuc_home: Path) -> None:
+    """Owning it is the stronger claim: it is handed out freely, rather than
+    handed out freely *and* second-guessed as somebody else's."""
+    dispatcher, _ = shared_host(shared=[FAKE_GPUS[1], SHARED_GPUS[0]])
+
+    assert dispatcher.shared_gpus() == [SHARED_GPUS[0]]
+    (job_id,) = enqueue_in_order({"gpus": 3, "use_shared": True})
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).gpus == [*FAKE_GPUS, SHARED_GPUS[0]]
+
+
+def test_shared_cards_may_be_named_by_index(gpuc_home: Path) -> None:
+    dispatcher, _ = shared_host(owned=["0"], shared=["2", "3"])
+    assert dispatcher.shared_gpus() == SHARED_GPUS
+
+    (job_id,) = enqueue_in_order({"gpus": 2, "use_shared": True})
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).gpus == [FAKE_GPUS[0], SHARED_GPUS[0]]
+
+
+def test_a_shared_entry_that_names_no_card_is_logged_and_skipped(gpuc_home: Path) -> None:
+    """The same rule owned entries get: jobs wait, they are not failed, and the
+    log says the card is not being handed out."""
+    dispatcher, _ = shared_host(shared=["9"])
+    assert dispatcher.shared_gpus() == []
+    assert "config.shared_gpus lists 9" in paths.dispatcher_log().read_text()
+
+
+def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) -> None:
+    """The preflight would be an nvidia-smi exec every two seconds if it were
+    taken unconditionally, and most passes have nothing that could use it."""
+    asked: list[list[str]] = []
+    dispatcher, _ = shared_host()
+    inner = dispatcher.deps.smi
+
+    def counting(args: list[str]) -> str:
+        asked.append(args)
+        return inner(args)
+
+    dispatcher.deps.smi = counting
+    enqueue_in_order({"gpus": 1})
+    dispatcher.run_once()
+    assert not any("memory.used" in " ".join(args) for args in asked)
+
+    # Two borrowers, one pass: one sample, judged the same way for both.
+    enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
+    queue.enqueue(make_spec(gpus=1, use_shared=True))
+    dispatcher.run_once()
+    assert sum("memory.used" in " ".join(args) for args in asked) == 1

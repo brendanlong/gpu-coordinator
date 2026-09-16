@@ -139,3 +139,54 @@ def test_an_owned_entry_the_host_cannot_see_is_reported_unavailable() -> None:
     assert gpus.resolve_owned(["0", "7", "GPU-gone"], smi) == (["GPU-zero"], ["7", "GPU-gone"])
     assert gpus.index_uuids(smi) == {"0": "GPU-zero", "1": "GPU-one"}
     assert "0=GPU-zero" in gpus.describe_table(smi)
+
+
+# -- shared GPUs: is anybody else on this card? --------------------------------
+
+
+def test_a_card_with_no_memory_and_no_work_is_unused() -> None:
+    unused, in_use = gpus.unused_gpus(FAKE_GPUS, fake_smi())
+    assert unused == FAKE_GPUS
+    assert in_use == {}
+
+
+def test_memory_alone_is_enough_to_call_a_card_in_use() -> None:
+    """Somebody's CUDA context holds hundreds of MiB between steps, so the
+    card at 0% util is still theirs. Memory is the half that decides."""
+    smi = fake_smi(memory_used={FAKE_GPUS[0]: 512.0})
+    unused, in_use = gpus.unused_gpus(FAKE_GPUS, smi)
+    assert unused == [FAKE_GPUS[1]]
+    assert "512 MiB" in in_use[FAKE_GPUS[0]]
+    assert "0% util" in in_use[FAKE_GPUS[0]]
+
+
+def test_utilization_alone_is_enough_too() -> None:
+    smi = fake_smi(utilization={FAKE_GPUS[1]: 37.0})
+    unused, in_use = gpus.unused_gpus(FAKE_GPUS, smi)
+    assert unused == [FAKE_GPUS[0]]
+    assert "37% util" in in_use[FAKE_GPUS[1]]
+
+
+def test_a_reading_that_cannot_be_read_counts_as_in_use() -> None:
+    """This decides whether to run on somebody else's GPU, so every way of not
+    knowing has to count against: `[N/A]`, a card nvidia-smi skipped, and
+    nvidia-smi failing outright."""
+
+    def unsupported(args: list[str]) -> str:
+        return f"{FAKE_GPUS[0]}, [N/A], [Not Supported]\n"
+
+    unused, in_use = gpus.unused_gpus(FAKE_GPUS, unsupported)
+    assert unused == []
+    assert in_use[FAKE_GPUS[0]] == "? MiB, ?% util"
+    assert "nothing about it" in in_use[FAKE_GPUS[1]]
+
+    def broken(args: list[str]) -> str:
+        raise gpus.GpuError("nvidia-smi exited 9")
+
+    unused, in_use = gpus.unused_gpus(FAKE_GPUS, broken)
+    assert unused == []
+    assert all("nvidia-smi exited 9" in why for why in in_use.values())
+
+
+def test_asking_about_no_cards_is_not_an_error() -> None:
+    assert gpus.unused_gpus([], fake_smi()) == ([], {})

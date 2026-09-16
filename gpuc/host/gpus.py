@@ -1,4 +1,5 @@
-"""nvidia-smi parsing: UUID/index mapping and utilization sampling.
+"""nvidia-smi parsing: UUID/index mapping, utilization sampling, and who is
+using a card we do not own.
 
 Every entry point takes an injectable ``smi`` callable so tests run on hosts
 with no GPU, and so the dispatcher can share one fake in integration tests.
@@ -69,6 +70,14 @@ def _as_float(cell: str, field: str) -> float:
         return float(cell)
     except ValueError as exc:
         raise GpuError(f"nvidia-smi reported {field}={cell!r}, which is not a number") from exc
+
+
+def _maybe_float(cell: str) -> float | None:
+    """`[N/A]` and `[Not Supported]` as None, for a reading that may be absent."""
+    try:
+        return float(cell)
+    except ValueError:
+        return None
 
 
 def list_gpus(smi: SmiRunner = run_nvidia_smi) -> list[Gpu]:
@@ -203,3 +212,96 @@ def mean_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> f
             f"treating this as a failed sample rather than 0% util"
         )
     return sum(samples.values()) / len(samples)
+
+
+@dataclass(frozen=True)
+class Usage:
+    """What somebody -- anybody -- is doing with one card right now.
+
+    Both readings are optional because nvidia-smi answers `[N/A]` or
+    `[Not Supported]` on some cards and in some containers, and an absent
+    reading is the one thing that must never be read as an idle one.
+    """
+
+    uuid: str
+    memory_mib: float | None
+    utilization_pct: float | None
+
+    @property
+    def unused(self) -> bool:
+        """Nothing at all is on this card: no memory held, no work running.
+
+        Memory is the stronger half. A CUDA context costs hundreds of MiB the
+        moment it is created and holds them between steps, so a card at 0%
+        util *and* 0 MiB has no process on it -- while util alone dips to zero
+        between epochs of somebody else's training run.
+
+        A None is not zero: see the dataclass docstring.
+        """
+        return self.memory_mib == 0.0 and self.utilization_pct == 0.0
+
+    def describe(self) -> str:
+        memory = "?" if self.memory_mib is None else f"{self.memory_mib:.0f}"
+        util = "?" if self.utilization_pct is None else f"{self.utilization_pct:.0f}"
+        return f"{memory} MiB, {util}% util"
+
+
+def sample_usage(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> dict[str, Usage]:
+    """Memory held and utilization, per card. Cards nvidia-smi skipped are absent."""
+    if not uuids:
+        return {}
+    wanted = set(uuids)
+    rows = _query(["uuid", "memory.used", "utilization.gpu"], smi, extra=["-i", ",".join(uuids)])
+    return {
+        uuid: Usage(uuid, _maybe_float(memory), _maybe_float(util))
+        for uuid, memory, util in rows
+        if uuid in wanted
+    }
+
+
+def usage_or_nothing(
+    uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
+) -> tuple[dict[str, Usage], str | None]:
+    """Every reading nvidia-smi gives for `uuids`, and why there are none.
+
+    The one place "nvidia-smi would not answer" turns into "we know nothing
+    about these cards". Both the dispatcher, which decides whether to borrow
+    one, and the `status` payload, which reports whether it would, have to
+    reach the same verdict forever; this is what makes that structural rather
+    than a rule written down twice.
+    """
+    if not uuids:
+        return {}, None
+    try:
+        return sample_usage(uuids, smi), None
+    except GpuError as exc:
+        return {}, str(exc)
+
+
+def unused_gpus(
+    uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
+) -> tuple[list[str], dict[str, str]]:
+    """Split `uuids` into the cards nobody is using and the rest, with a reason.
+
+    For shared cards, which gpuc may only take while their real owner is not on
+    them. Every way of not knowing -- nvidia-smi failing, a card it did not
+    answer about, a reading it would not give -- lands in the second half: this
+    decides whether to run a job on somebody else's GPU, so the absence of
+    evidence has to count against.
+    """
+    samples, failure = usage_or_nothing(uuids, smi)
+    unused: list[str] = []
+    in_use: dict[str, str] = {}
+    for uuid in uuids:
+        usage = samples.get(uuid)
+        if usage is None:
+            in_use[uuid] = (
+                f"could not be read ({failure})"
+                if failure
+                else "nvidia-smi reported nothing about it"
+            )
+        elif usage.unused:
+            unused.append(uuid)
+        else:
+            in_use[uuid] = usage.describe()
+    return unused, in_use

@@ -11,6 +11,15 @@ command: uv run python -m experiments.lego.train --k-max 6
 setup: uv sync --frozen                         # optional; runs first, phase=setup
 gpus: 1                                         # 0..N of the host's owned GPUs
 
+# Some boxes have cards gpuc owns outright and cards it only borrows -- see
+# `gpuc host set <name> --shared-gpus`. Off by default, because a shared card
+# is somebody else's. Turned on (here or with `gpuc submit --use-shared`), this
+# job is dispatched to the owned cards first and borrows only the shortfall,
+# and only while nvidia-smi says the borrowed card holds no memory and is doing
+# no work. That is what lets a `gpus: 4` job run on a host that owns 2 and
+# shares 2 -- it waits for the other two to go quiet.
+use_shared: false
+
 env:                                            # plain environment, stored in the spec
   REQUIRE_CUDA: "1"
 

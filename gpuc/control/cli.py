@@ -101,6 +101,7 @@ from gpuc.control.submit import (
     submit_file,
     submit_spec,
     validate,
+    with_overrides,
 )
 from gpuc.control.transport import (
     NO_GIT_EXCLUDES,
@@ -130,6 +131,13 @@ GPUS_HELP = (
     "the host at every dispatch pass, so jobs are always pinned by UUID"
 )
 
+SHARED_GPUS_HELP = (
+    "cards on this box that gpuc may borrow but does not own, spelled like "
+    "--gpus and never overlapping it. Only a job with `use_shared: true` is "
+    "dispatched to one, only once the owned cards are full, and only while "
+    "nvidia-smi says the card holds no memory and is doing no work"
+)
+
 
 def _comma_list(raw: str | None) -> list[str]:
     """A comma- or space-separated flag value, as a list."""
@@ -138,7 +146,7 @@ def _comma_list(raw: str | None) -> list[str]:
     return [part.strip() for part in raw.replace(" ", ",").split(",") if part.strip()]
 
 
-def _gpu_list(raw: str | None) -> list[str]:
+def _gpu_list(raw: str | None, flag: str = "--gpus") -> list[str]:
     """`--gpus`: UUIDs, nvidia-smi indices, or a mix, stored exactly as given.
 
     Ownership of part of a shared box is an agreement in nvidia-smi numbering
@@ -151,7 +159,7 @@ def _gpu_list(raw: str | None) -> list[str]:
     bad = [item for item in owned if not item.isdigit() and not item.startswith("GPU-")]
     if bad:
         raise UsageError(
-            f"--gpus wants nvidia-smi indices or GPU UUIDs, got {', '.join(repr(b) for b in bad)}."
+            f"{flag} wants nvidia-smi indices or GPU UUIDs, got {', '.join(repr(b) for b in bad)}."
             f"\nRun `gpuc host probe <name>` to see this host's index and UUID for each card."
         )
     return owned
@@ -177,6 +185,8 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     if args.gpus is not None:
         fields["gpus"] = _gpu_list(args.gpus)
+    if args.shared_gpus is not None:
+        fields["shared_gpus"] = _gpu_list(args.shared_gpus, "--shared-gpus")
     if args.env is not None:
         # The whole dict, not a merge: "set it to exactly this" is the only
         # rule that can also express "set it to nothing" (`--env ''`).
@@ -438,6 +448,7 @@ _ADDRESS_FIELDS = ("persistent_root", "gpuc_home")
 
 _SET_FIELDS = (
     "gpus",
+    "shared_gpus",
     "persistent_root",
     "gpuc_home",
     "env",
@@ -549,6 +560,8 @@ def cmd_host_list(args: argparse.Namespace) -> int:
             print(f"  NOTE {stale}")
         for index, name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
             print(f"  gpu     [{index}] {name:<28} {vram:<7} {uuid}")
+        for index, name, vram, uuid in gpu_rows(entry.config.shared_gpus, entry.gpu_info):
+            print(f"  shared  [{index}] {name:<28} {vram:<7} {uuid}")
         # Everything above and here is the cache: what the host said the last
         # time anything on this machine asked it. The host owns all of it, so
         # it is labelled with its age rather than printed as current.
@@ -946,8 +959,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
     check_runpod_args(args)
     use_git = not args.no_git
     report = reporter(args)
+    # None, not False, for a flag that was not passed: a spec that says
+    # `use_shared: true` keeps saying it when nobody typed --use-shared.
+    overrides = {"use_shared": True if args.use_shared else None}
     if args.runpod:
-        document = load_document(args.job_file)
+        document = with_overrides(load_document(args.job_file), **overrides)
         model = validate(document, str(args.job_file))
         precheck_local(
             model,
@@ -980,7 +996,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
     entry = named_registry().require(args.host)
     entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap, report=report)
     result = submit_file(
-        entry, args.job_file, settings, workdir=Path.cwd(), use_git=use_git, report=report
+        entry,
+        args.job_file,
+        settings,
+        overrides,
+        workdir=Path.cwd(),
+        use_git=use_git,
+        report=report,
     )
     return _queued(result, args, entry, settings)
 
@@ -1494,6 +1516,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"required for a host with no config of its own; on a host that has one this "
         f"reassigns its cards, and a list that overlaps the host's is refused. {GPUS_HELP}",
     )
+    add.add_argument("--shared-gpus", help=SHARED_GPUS_HELP)
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
     add.add_argument(
         "--persistent-root",
@@ -1554,6 +1577,10 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument(
         "--gpus",
         help=f"replace what this host owns, on the host itself; pass '' for none. {GPUS_HELP}",
+    )
+    edit.add_argument(
+        "--shared-gpus",
+        help=f"replace what this host may borrow; pass '' for none. {SHARED_GPUS_HELP}",
     )
     edit.add_argument("--persistent-root", help="pass '' to go back to $HOME")
     edit.add_argument("--gpuc-home", help="pass '' for the default under the root or $HOME")
@@ -1633,6 +1660,14 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("job_file")
     submit.add_argument(
         "--host", metavar="NAME", help="a registered host to submit to (see `gpuc host list`)"
+    )
+    submit.add_argument(
+        "--use-shared",
+        action="store_true",
+        help="let this job run on the host's shared GPUs (`gpuc host set <name> "
+        "--shared-gpus`) as well as the ones it owns: cards gpuc does not own and takes "
+        "only while nvidia-smi says nobody else is on them. Same as `use_shared: true` "
+        "in the spec",
     )
     add_no_git_flag(submit)
     add_bootstrap_flag(submit)

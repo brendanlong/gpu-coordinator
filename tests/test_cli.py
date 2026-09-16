@@ -30,6 +30,7 @@ from gpuc.control.config import (
 )
 from gpuc.control.providers.base import Constraints
 from gpuc.control.remote import HostSession, RemoteError
+from gpuc.control.status import placement_unknown
 from gpuc.control.submit import SubmitResult
 from tests.conftest import host_entry, register_host
 from tests.fakehost import FakeHost
@@ -116,6 +117,38 @@ def test_host_add_refuses_a_gpu_list_that_overlaps_the_hosts_own(
     # A disjoint list is a deliberate reassignment, and goes through.
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "2,3"]) == 0
     assert fake_host.config["gpus"] == ["2", "3"]
+
+
+def test_host_set_writes_the_shared_cards(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == 0
+    capsys.readouterr()
+    assert main(["host", "set", "gpubox", "--shared-gpus", "1"]) == 0
+    assert fake_host.config is not None and fake_host.config["shared_gpus"] == ["1"]
+    assert "shared_gpus" in capsys.readouterr().out
+    # Clearable, which is the point of taking it as a string.
+    assert main(["host", "set", "gpubox", "--shared-gpus", ""]) == 0
+    assert fake_host.config["shared_gpus"] == []
+
+
+def test_a_card_cannot_be_both_owned_and_shared(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The two lists say opposite things about a card, and the refusal fires
+    where it was typed -- in either spelling, and against what the host already
+    holds rather than only against the flags in one command."""
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == 0
+    assert main(["host", "set", "gpubox", "--shared-gpus", "GPU-a"]) == EXIT_ERROR
+    assert "both --gpus and --shared-gpus" in capsys.readouterr().err
+    assert fake_host.config is not None and fake_host.config["shared_gpus"] == []
+
+    assert main(["host", "set", "gpubox", "--gpus", "0", "--shared-gpus", "0,1"]) == EXIT_ERROR
+    assert "both --gpus and --shared-gpus" in capsys.readouterr().err
+    assert fake_host.config["shared_gpus"] == []
+    # Disjoint is the ordinary case and goes through.
+    assert main(["host", "set", "gpubox", "--shared-gpus", "1"]) == 0
+    assert fake_host.config["shared_gpus"] == ["1"]
 
 
 def test_the_gpu_overlap_refusal_sees_through_index_and_uuid_spellings(
@@ -249,6 +282,29 @@ def test_submit_without_a_host_says_which_flag_is_missing(
     job.write_text("command: true\n")
     assert main(["submit", str(job)]) == EXIT_USAGE
     assert "--host" in capsys.readouterr().err
+
+
+def test_use_shared_is_an_override_of_the_spec_and_only_when_it_is_passed(
+    control_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flag that was not typed is not an opinion: a spec that already says
+    `use_shared: true` must keep saying it."""
+    seen: list[dict[str, Any]] = []
+
+    def capture(entry: Any, job_file: Any, settings: Any, overrides: Any = None, **_: Any) -> Any:
+        seen.append(dict(overrides or {}))
+        return SubmitResult(job_id="j", host="gpubox", attempt=1)
+
+    monkeypatch.setattr("gpuc.control.cli.submit_file", capture)
+    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
+    monkeypatch.setattr("gpuc.control.cli.queue_placement", lambda *a, **k: placement_unknown())
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert main(["submit", str(job), "--host", "gpubox", "--use-shared"]) == 0
+    assert seen == [{"use_shared": None}, {"use_shared": True}]
 
 
 def test_status_with_no_hosts_is_not_an_error(
@@ -1719,6 +1775,7 @@ def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
             "vram_mib": 46068,
             "index": 0,
             "assigned": False,
+            "shared": False,
         }
     ]
     assert any("uv is missing" in note for note in document["notes"])  # type: ignore[union-attr]
@@ -2019,3 +2076,18 @@ def test_host_add_pod_says_what_watching_an_unbootstrapped_pod_means(
     assert "nothing has bootstrapped this pod" in out
     assert "terminates it in 30 min" in out
     assert "gpuc host bootstrap rented" in out
+
+
+def test_an_existing_gpu_overlap_does_not_block_every_other_host_set(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    """A host already in that state -- hand-edited, or written by a build
+    without the check -- must still be reachable by a command about something
+    else entirely."""
+    fake_host.put_file(
+        '{"host": "gpubox", "gpus": ["0"], "shared_gpus": ["0", "1"]}',
+        "/home/u/.gpuc/config.json",
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert main(["host", "set", "gpubox", "--idle-min", "30"]) == 0
+    assert fake_host.config is not None and fake_host.config["idle_minutes"] == 30.0

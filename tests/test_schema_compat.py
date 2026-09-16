@@ -359,3 +359,20 @@ def test_job_state_coerces_the_types_it_acts_on() -> None:
     assert state.util_recent == [1.0, 2.5, None, None]
     assert state.workdir_removed is True
     assert JobState.from_dict({"pid": "not a pid", "pgid": []}).pid is None
+
+
+def test_a_config_from_before_shared_gpus_borrows_nothing() -> None:
+    """The key is additive, and its absence is not "share the whole box": a
+    host whose config predates it must never start taking somebody else's card.
+    A null means the same, from a build that made it optional again."""
+    older = HostConfig.from_dict(load("config.older.json"))
+    assert older.shared_gpus == []
+
+    explicit_null = HostConfig.from_dict({"gpus": ["0"], "shared_gpus": None})
+    assert explicit_null.shared_gpus == []
+
+
+def test_a_spec_from_before_use_shared_does_not_borrow_either() -> None:
+    spec = JobSpec.from_dict({"command": "true", "gpus": 1})
+    assert spec.use_shared is False
+    assert JobSpec.from_dict({"command": "true", "use_shared": None}).use_shared is False

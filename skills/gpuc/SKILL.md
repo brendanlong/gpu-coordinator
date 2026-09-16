@@ -62,6 +62,7 @@ name: lego-s4                      # label only
 setup: uv sync --frozen            # phase "setup"; venv is cached across jobs on the host
 command: uv run --no-sync python -m experiments.lego.train --k-max 6 --device cuda
 gpus: 1                            # 0 never waits for a GPU
+use_shared: false                  # also use cards the host borrows rather than owns
 env:
   REQUIRE_CUDA: "1"
   PYTHONUNBUFFERED: "1"
@@ -93,6 +94,12 @@ Rules that avoid the classic failures:
 - Point `outputs:` at a directory the job creates. Files that were already there
   in the checkout are never uploaded as your results, and a path holding only
   those counts as `no-outputs`.
+- `use_shared: true` (or `gpuc submit --use-shared`) lets the job onto a host's
+  **shared** cards: ones gpuc does not own and takes only while nvidia-smi says
+  nobody else is on them. It is how a `gpus: 4` job runs on a host that owns two
+  and shares two, and how a queue drains onto idle cards you do not own. Owned
+  cards are always used first. A host with none configured ignores it, and
+  `gpuc status` shows shared cards on their own `shared` lines.
 - Write results incrementally (per checkpoint, per sweep point). The periodic
   sync bounds what a killed host can lose to one interval.
 - Write files atomically (temp name, then rename), so a sync never uploads a
@@ -191,11 +198,13 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 
 The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
 `name, kind, reachable, pkg_commit, dispatcher{alive, heartbeat_age_s},
-provider_util, gpus, queued, running, finished, errors`; each job in those three
+provider_util, gpus, shared_gpus, queued, running, finished, errors`; each job in those three
 lists has `job_id, name, status, reason, phase, priority, elapsed_s, util,
 progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
-gpus_requested, starts_in_s, starts_at, iso, ended_at, outputs_pending`
-(`starts_*` are null unless the job is queued).
+gpus_requested, use_shared, starts_in_s, starts_at, iso, ended_at,
+outputs_pending` (`starts_*` are null unless the job is queued). Each entry in
+`shared_gpus` adds `memory_mib`, `utilization_pct` and `unused` — the host's own
+verdict on whether gpuc would borrow that card right now.
 
 `priority` (0-99, **lower runs first**) is the field that explains queue order,
 and it is on running jobs too. `queued` is already in dispatch order, so

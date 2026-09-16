@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+import pytest
+
 from gpuc.control.config import HostEntry
 from gpuc.control.providers.base import Pod
 from gpuc.control.status import (
@@ -12,6 +14,7 @@ from gpuc.control.status import (
     host_json,
     host_warnings,
     job_views,
+    no_start_reason,
     owned_gpus,
     queue_note,
     queue_placement,
@@ -967,3 +970,218 @@ def test_a_queued_job_whose_turn_cannot_be_dated_says_why() -> None:
 
     view.queue = [waiting("j-next", gpus_requested=None)]
     assert "does not report how many cards" in str(queue_note(queue_placement(view, "j-next")))
+
+
+# -- shared GPUs --------------------------------------------------------------
+
+SHARED = "GPU-shared"
+
+
+def shared_payload(**overrides: Any) -> dict[str, Any]:
+    document = payload(**overrides)
+    document.setdefault(
+        "shared_gpus_resolved",
+        [
+            {
+                "index": 4,
+                "uuid": SHARED,
+                "memory_mib": 0.0,
+                "utilization_pct": 0.0,
+                "unused": True,
+            }
+        ],
+    )
+    document.setdefault("shared_gpus_unavailable", [])
+    return document
+
+
+def shared_view(**overrides: Any) -> HostView:
+    entry = host_entry(
+        name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"], shared_gpus=[SHARED]
+    )
+    return gather(entry, session=cast(Any, _ScriptedSession(shared_payload(**overrides))))
+
+
+def test_gather_reads_the_shared_cards_and_what_is_on_them() -> None:
+    got = shared_view()
+    assert [card.uuid for card in got.shared] == [SHARED]
+    assert got.shared[0].unused and got.shared[0].index == 4
+    assert [card.uuid for card in got.borrowable] == [SHARED]
+
+
+def test_a_shared_card_somebody_else_is_on_is_rendered_with_their_numbers() -> None:
+    """The question this block gets asked is "there is a card there, why is my
+    job queued", and the answer is whose it is right now."""
+    got = shared_view(
+        shared_gpus_resolved=[
+            {
+                "index": 4,
+                "uuid": SHARED,
+                "memory_mib": 21504.0,
+                "utilization_pct": 98.0,
+                "unused": False,
+            }
+        ]
+    )
+    rendered = render(got)
+    assert "shared  [4] IN USE" in rendered
+    assert "(somebody else: 21504 MiB, 98% util)" in rendered
+    assert got.borrowable == []
+
+
+def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_not_in_use() -> None:
+    got = shared_view(
+        jobs=[
+            {
+                "job_id": "j-running",
+                "name": "train",
+                "status": "running",
+                "phase": "main",
+                "gpus": [SHARED],
+                "started_at": minutes_ago(5),
+            }
+        ],
+        shared_gpus_resolved=[
+            {
+                "index": 4,
+                "uuid": SHARED,
+                "memory_mib": 8192.0,
+                "utilization_pct": 90.0,
+                "unused": False,
+            }
+        ],
+    )
+    assert "shared  [4] busy" in render(got)
+    assert got.borrowable == []
+
+
+def test_a_shared_entry_the_host_cannot_see_says_so() -> None:
+    got = shared_view(shared_gpus_resolved=[], shared_gpus_unavailable=["7"])
+    assert "shared  [7] UNAVAILABLE" in render(got)
+    assert got.shared_unavailable == ["7"]
+
+
+def test_a_host_on_an_older_build_simply_has_no_shared_cards() -> None:
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU])
+    got = gather(entry, session=cast(Any, _ScriptedSession(payload())))
+    assert got.shared == []
+    assert "shared" not in render(got)
+
+
+def test_the_json_carries_the_shared_cards_and_their_verdict() -> None:
+    document = host_json(shared_view())
+    assert document["shared_gpus"] == [
+        {
+            "index": 4,
+            "uuid": SHARED,
+            "name": "",
+            "vram_mib": None,
+            "busy_job": None,
+            "memory_mib": 0.0,
+            "utilization_pct": 0.0,
+            "unused": True,
+        }
+    ]
+
+
+def test_a_job_waiting_for_a_shared_card_is_told_that_and_not_called_impossible() -> None:
+    """The host owns two cards and the job wants three: without the shared one
+    that reads "it will never be dispatched", which would be a lie."""
+    got = shared_view()
+    job = waiting("j-queued", gpus_requested=3, use_shared=True)
+    got.queue = [job]
+    reason = no_start_reason(got, job)
+    assert "needs 1 shared card(s)" in reason
+    assert "not something this host can predict" in reason
+
+
+def test_a_job_that_cannot_fit_even_with_shared_cards_is_still_called_impossible() -> None:
+    got = shared_view()
+    job = waiting("j-queued", gpus_requested=9, use_shared=True)
+    got.queue = [job]
+    assert "the host has 3 (shared included)" in no_start_reason(got, job)
+
+
+def test_a_job_that_did_not_ask_is_not_credited_with_the_shared_card() -> None:
+    got = shared_view()
+    job = waiting("j-queued", gpus_requested=3)
+    got.queue = [job]
+    assert "the host has 2, so it will never be dispatched" in no_start_reason(got, job)
+
+
+def busy_owned(eta_minutes: float) -> list[dict[str, Any]]:
+    """Both owned cards held by one job that says when it will be done."""
+    return [
+        {
+            "job_id": "j-running",
+            "name": "train",
+            "status": "running",
+            "phase": "main",
+            "gpus": [GPU, "GPU-b"],
+            "started_at": minutes_ago(1),
+            "eta": (datetime.now(UTC) + timedelta(minutes=eta_minutes)).isoformat(),
+        }
+    ]
+
+
+def test_a_borrowing_job_is_not_told_it_waits_for_the_owned_cards() -> None:
+    """The bug this is for: a one-card borrower on a host whose own cards are
+    six hours from free was told `starts in ~6h`, when the dispatcher's very
+    next pass hands it the idle shared card."""
+    got = shared_view(jobs=busy_owned(360.0))
+    got.queue = [waiting("j-queued", gpus_requested=1, use_shared=True)]
+    assert queue_start_estimates(got) == {"j-queued": 0.0}
+    assert queue_note(queue_placement(got, "j-queued")) is not None
+
+
+def test_a_job_that_did_not_ask_still_waits_for_the_owned_cards() -> None:
+    got = shared_view(jobs=busy_owned(360.0))
+    got.queue = [waiting("j-queued", gpus_requested=1)]
+    assert queue_start_estimates(got)["j-queued"] == pytest.approx(360.0 * 60.0, abs=1.0)
+
+
+def test_a_shared_card_somebody_else_holds_is_not_scheduled_onto_at_all() -> None:
+    """When they will stop is the one thing this host cannot know, so the card
+    is left out rather than given a release time."""
+    got = shared_view(
+        jobs=busy_owned(360.0),
+        shared_gpus_resolved=[
+            {
+                "index": 4,
+                "uuid": SHARED,
+                "memory_mib": 21504.0,
+                "utilization_pct": 98.0,
+                "unused": False,
+            }
+        ],
+    )
+    got.queue = [waiting("j-queued", gpus_requested=1, use_shared=True)]
+    assert queue_start_estimates(got)["j-queued"] == pytest.approx(360.0 * 60.0, abs=1.0)
+
+
+def test_there_is_only_one_shared_card_to_go_round() -> None:
+    """A borrowed card is a card, not a loophole: the second borrower waits for
+    the owned ones exactly as it would have without any sharing at all."""
+    got = shared_view(jobs=busy_owned(360.0))
+    got.queue = [
+        waiting("j-first", gpus_requested=1, use_shared=True),
+        waiting("j-second", gpus_requested=1, use_shared=True, priority=60),
+    ]
+    starts = queue_start_estimates(got)
+    assert starts["j-first"] == 0.0
+    assert starts["j-second"] == pytest.approx(360.0 * 60.0, abs=1.0)
+
+
+def test_a_host_that_only_borrows_does_not_read_as_having_no_gpus() -> None:
+    got = shared_view()
+    got.owned = []
+    assert "shared 1/1 free, none owned" in render(got)
+
+
+def test_a_shared_card_the_host_cannot_see_still_counts_against_never() -> None:
+    """The host makes a job wait for a card that is missing this minute; it
+    does not fail it. `it will never be dispatched` may not disagree."""
+    got = shared_view(shared_gpus_resolved=[], shared_gpus_unavailable=["7"])
+    job = waiting("j-queued", gpus_requested=3, use_shared=True)
+    got.queue = [job]
+    assert "never be dispatched" not in no_start_reason(got, job)

@@ -399,6 +399,9 @@ class Dispatcher:
     _config: jobs.HostConfig | None = None
     _owned: list[str] | None = None
     _unavailable: tuple[str, ...] = ()
+    _shared: list[str] | None = None
+    _shared_unavailable: tuple[str, ...] = ()
+    _shared_in_use: tuple[str, ...] = ()
     consecutive_failures: int = 0
     should_exit: bool = False
 
@@ -728,18 +731,93 @@ class Dispatcher:
                     )
         return self._owned
 
+    def shared_gpus(self) -> list[str]:
+        """The UUIDs of the cards this host may *borrow*, this pass.
+
+        Resolved exactly as `owned_gpus` is -- a shared card is named by
+        nvidia-smi index or UUID like any other -- and then minus anything this
+        host owns outright. A card listed in both is a configuration mistake
+        somebody will make, and owning it is the stronger claim: it would
+        otherwise be handed out freely as owned and then have its usage
+        second-guessed as shared.
+        """
+        if self._shared is None:
+            owned = set(self.owned_gpus())
+            resolved, missing = gpus.resolve_owned(self.config.shared_gpus, self.deps.smi)
+            if tuple(missing) != self._shared_unavailable:
+                self._shared_unavailable = tuple(missing)
+                if missing:
+                    self.log(
+                        f"config.shared_gpus lists {', '.join(missing)}, which nvidia-smi does "
+                        f"not report on this host ({gpus.describe_table(self.deps.smi)}); those "
+                        f"cards are not being borrowed"
+                    )
+            self._shared = [uuid for uuid in resolved if uuid not in owned]
+        return self._shared
+
+    def _busy_gpus(self) -> set[str]:
+        return {uuid for entry in self.running.values() for uuid in entry.gpus}
+
     def free_gpus(self) -> list[str]:
-        busy = {uuid for entry in self.running.values() for uuid in entry.gpus}
+        busy = self._busy_gpus()
         return [uuid for uuid in self.owned_gpus() if uuid not in busy]
+
+    def borrowable_gpus(self) -> list[str]:
+        """Shared cards nothing of ours holds *and* nobody else is using either.
+
+        The nvidia-smi read is the whole of the preflight, and it is the one
+        thing standing between a borrowed card and somebody else's training
+        run, so it is taken here rather than inferred from anything cached.
+        `launch_ready` asks once per pass and only when a job actually needs to
+        borrow: every job is then judged against one reading, which is also
+        what stops two of them being handed the same card.
+        """
+        busy = self._busy_gpus()
+        unused, in_use = gpus.unused_gpus(
+            [uuid for uuid in self.shared_gpus() if uuid not in busy], self.deps.smi
+        )
+        # Logged when the *set* changes, not when the numbers do: this is
+        # sampled every pass a job is waiting, and somebody else's job moves a
+        # utilization figure twice a second.
+        if tuple(sorted(in_use)) != self._shared_in_use:
+            self._shared_in_use = tuple(sorted(in_use))
+            for uuid, why in sorted(in_use.items()):
+                self.log(f"shared GPU {uuid} is in use ({why}), so it is not being borrowed")
+            if unused:
+                self.log(f"shared GPU(s) free to borrow: {', '.join(unused)}")
+        return unused
+
+    def _capacity_failure(self, spec: jobs.JobSpec) -> str | None:
+        """Why this host can *never* run this job, or None if it could.
+
+        This is a deletion: the caller unlinks the queue marker and writes the
+        job `failed`. So everything it reads has to be fixed for the life of a
+        queued job -- the *configured* card counts, which a card that is
+        missing this minute does not change (that makes a job wait, it must
+        not fail one the host is perfectly well set up to run), and
+        `use_shared`, which nothing changes after submit.
+        """
+        config = self.config
+        shared = config.borrowable(spec)
+        if spec.gpus <= len(config.gpus) + len(shared):
+            return None
+        have = f"host owns {len(config.gpus)}"
+        if shared:
+            have += f" and may borrow {len(shared)} shared"
+        elif config.shared_gpus:
+            have += (
+                f" and shares {len(config.shared_gpus)} this job did not ask for "
+                f"(`use_shared: true` would let it)"
+            )
+        return f"needs {spec.gpus} GPUs, {have}"
 
     def launch_ready(self) -> None:
         if self.paused() or paths.draining_file().exists():
             return
-        # The *configured* count, not the resolved one: a card that is missing
-        # this minute makes a job wait, but it must not permanently fail a job
-        # the host is perfectly well configured to run.
-        owned = self.config.gpus
         free = self.free_gpus()
+        # Sampled at most once per pass, and only if a job actually needs it:
+        # see `borrowable_gpus`.
+        borrowable: list[str] | None = None
         for entry in queue.list_queued():
             job_id = entry.job_id
             if queue.is_cancelled(job_id):
@@ -757,19 +835,30 @@ class Dispatcher:
                     job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
                 )
                 continue
-            if spec.gpus > len(owned):
+            too_big = self._capacity_failure(spec)
+            if too_big is not None:
                 entry.marker.unlink(missing_ok=True)
                 jobs.update_state(
                     job_id,
                     status="failed",
-                    reason=f"needs {spec.gpus} GPUs, host owns {len(owned)}",
+                    reason=too_big,
                     exit_code=1,
                     ended_at=jobs.utc_now(),
                 )
                 continue
-            if spec.gpus > len(free):
-                continue
-            assigned, free = free[: spec.gpus], free[spec.gpus :]
+            # Owned cards first, always: a job borrows only the shortfall, so a
+            # shared card is held for the shortest time that runs the job.
+            owned_part, shared_part = free[: spec.gpus], []
+            if len(owned_part) < spec.gpus:
+                if not self.config.may_borrow(spec):
+                    continue
+                if borrowable is None:
+                    borrowable = self.borrowable_gpus()
+                need = spec.gpus - len(owned_part)
+                if need > len(borrowable):
+                    continue
+                shared_part, borrowable = borrowable[:need], borrowable[need:]
+            assigned, free = [*owned_part, *shared_part], free[len(owned_part) :]
             entry.marker.unlink(missing_ok=True)
             jobs.update_state(
                 job_id,
@@ -793,7 +882,9 @@ class Dispatcher:
                     ended_at=jobs.utc_now(),
                     phase=None,
                 )
-                free = [*assigned, *free]
+                free = [*owned_part, *free]
+                if borrowable is not None:
+                    borrowable = [*shared_part, *borrowable]
                 continue
             # pgid stays unset until the runner publishes the *job's* group: it
             # is what `cancel` signals, and the runner's own group is not it.
@@ -806,8 +897,10 @@ class Dispatcher:
                 runner_starttime=starttime(proc.pid),
             )
             self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
+            borrowed = f", borrowing {','.join(shared_part)}" if shared_part else ""
             self.log(
-                f"launched {job_id} (pid {proc.pid}) on {','.join(assigned) if assigned else 'cpu'}"
+                f"launched {job_id} (pid {proc.pid}) on "
+                f"{','.join(assigned) if assigned else 'cpu'}{borrowed}"
             )
 
     # -- pause / terminate ----------------------------------------------
@@ -1105,6 +1198,7 @@ class Dispatcher:
     def run_once(self) -> None:
         self._config = jobs.read_config()
         self._owned = None
+        self._shared = None
         self.reap()
         self.handle_cancels()
         self.escalate_kills()

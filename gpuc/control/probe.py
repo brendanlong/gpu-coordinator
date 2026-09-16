@@ -124,6 +124,9 @@ class ProbeReport:
     nvidia-smi lists every card in the box, and on a shared box most of them
     are somebody else's. A probe that does not say which is which invites
     reading the whole list as yours."""
+    shared: list[str] = field(default_factory=list)
+    """This host's `--shared-gpus`, the same way: cards it may borrow while
+    nobody else is on them, which are neither ours nor none of our business."""
 
     @property
     def has_nvidia_smi(self) -> bool:
@@ -153,6 +156,15 @@ class ProbeReport:
     def owned_rows(self) -> list[list[str]]:
         return [cells for cells in self.gpu_rows if self.owns(cells)]
 
+    def shares(self, cells: Sequence[str]) -> bool:
+        """Is this row one of the cards we borrow? Matched exactly as `owns` is."""
+        shared = set(self.shared)
+        return cells[1] in shared or cells[0] in shared
+
+    @property
+    def shared_rows(self) -> list[list[str]]:
+        return [cells for cells in self.gpu_rows if self.shares(cells)]
+
     @property
     def owned_missing(self) -> list[str]:
         """`--gpus` entries no card on this host answers to: a typo, a card
@@ -161,6 +173,14 @@ class ProbeReport:
             return []
         seen = {cell for cells in self.gpu_rows for cell in cells[:2]}
         return [item for item in self.owned if item not in seen]
+
+    @property
+    def shared_missing(self) -> list[str]:
+        """`--shared-gpus` entries no card on this host answers to."""
+        if not self.has_nvidia_smi:
+            return []
+        seen = {cell for cells in self.gpu_rows for cell in cells[:2]}
+        return [item for item in self.shared if item not in seen]
 
     @property
     def gpu_info(self) -> dict[str, GpuInfo]:
@@ -247,15 +267,20 @@ class ProbeReport:
             return ["  gpus:", f"    {self.sections.get('gpus', '').strip() or '(no output)'}"]
         # Nothing of ours to show is not a reason to show nothing: a host whose
         # assignment matches no card needs the whole list more than anybody.
-        everything = all_gpus or not owned
-        partly = 0 < len(owned) < len(rows)
+        ours = owned + [cells for cells in self.shared_rows if not self.owns(cells)]
+        everything = all_gpus or not ours
+        partly = 0 < len(ours) < len(rows)
         hidden = " (--all-gpus lists the rest)" if partly and not everything else ""
-        header = f"  gpus: {len(owned)} of {len(rows)} assigned to {self.host}{hidden}"
-        lines = [header if self.owned else "  gpus:"]
-        for cells in rows if everything else owned:
+        borrowed = f", {len(ours) - len(owned)} shared" if len(ours) > len(owned) else ""
+        header = f"  gpus: {len(owned)} of {len(rows)} assigned to {self.host}{borrowed}{hidden}"
+        lines = [header if self.owned or self.shared else "  gpus:"]
+        for cells in rows if everything else ours:
             index, uuid, name = cells[0], cells[1], cells[2]
             memory = f"  {cells[3]}" if len(cells) > 3 else ""
-            mine = "  (assigned)" if everything and partly and self.owns(cells) else ""
+            if self.owns(cells):
+                mine = "  (assigned)" if everything and partly else ""
+            else:
+                mine = "  (shared)" if self.shares(cells) else ""
             lines.append(f"    [{index}] {uuid}  {name}{memory}{mine}")
         return lines
 
@@ -295,11 +320,20 @@ class ProbeReport:
                 f"        assign some with `gpuc host set {self.host} --gpus <list>`, "
                 f"from the indices or UUIDs above"
             )
-        elif owned and len(owned) < len(rows):
+        elif owned and len(owned) + len(self.shared_rows) < len(rows):
+            spare = len(rows) - len(owned) - len(self.shared_rows)
             notes.append(
-                f"{len(rows) - len(owned)} of this host's {len(rows)} GPUs are not assigned to "
-                f"{self.host}, so gpuc will never\n        use them; "
-                f"`gpuc host set {self.host} --gpus <list>` changes the assignment"
+                f"{spare} of this host's {len(rows)} GPUs are neither assigned to "
+                f"{self.host} nor shared\n        with it, so gpuc will never use them; "
+                f"`gpuc host set {self.host} --gpus <list>` changes the assignment, "
+                f"and\n        `--shared-gpus <list>` lets gpuc borrow one while nobody "
+                f"else is on it"
+            )
+        if self.shared_missing:
+            notes.append(
+                f"shared but not present on this host: {', '.join(self.shared_missing)}.\n"
+                f"        `gpuc host bootstrap {self.host}` fails its gpu_uuids check on this "
+                f"too: `gpuc host set {self.host} --shared-gpus <list>`"
             )
         if self.owned_missing:
             notes.append(
@@ -345,6 +379,7 @@ class ProbeReport:
         has is listed whatever `--all-gpus` said, each flagged `assigned` or not.
         """
         assigned = {cells[1] for cells in self.owned_rows}
+        shared = {cells[1] for cells in self.shared_rows} - assigned
         return {
             "host": self.host,
             "sections": dict(self.sections),
@@ -355,11 +390,14 @@ class ProbeReport:
                     "uuid": uuid,
                     **info.model_dump(mode="json"),
                     "assigned": uuid in assigned,
+                    "shared": uuid in shared,
                 }
                 for uuid, info in self.gpu_info.items()
             ],
             "assigned_gpus": list(self.owned),
             "assigned_missing": self.owned_missing,
+            "shared_gpus": list(self.shared),
+            "shared_missing": self.shared_missing,
             "home_fs_type": self.home_fs_type,
             "home_is_overlay": self.home_is_overlay,
             "persistent_root": self.persistent_root,
@@ -376,6 +414,7 @@ def parse_probe(
     output: str,
     persistent_root: str | None = None,
     owned: Sequence[str] | None = None,
+    shared: Sequence[str] | None = None,
 ) -> ProbeReport:
     sections: dict[str, str] = {}
     current = "preamble"
@@ -390,7 +429,11 @@ def parse_probe(
         buffer.append(line)
     sections[current] = "\n".join(buffer).strip()
     return ProbeReport(
-        host=host, sections=sections, persistent_root=persistent_root, owned=list(owned or [])
+        host=host,
+        sections=sections,
+        persistent_root=persistent_root,
+        owned=list(owned or []),
+        shared=list(shared or []),
     )
 
 
@@ -399,4 +442,4 @@ def probe_host(
 ) -> ProbeReport:
     transport = transport or transport_for(entry, settings)
     result = transport.run(probe_script(entry.remote_home), timeout=240.0, check=False)
-    return parse_probe(entry.name, result.output, entry.root, entry.gpus)
+    return parse_probe(entry.name, result.output, entry.root, entry.gpus, entry.config.shared_gpus)

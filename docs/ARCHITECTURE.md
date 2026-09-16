@@ -92,6 +92,8 @@ requests are anonymous to us.
 config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uuid" | "<index>", ...],
                      #                              # what this host owns, as it was registered;
                      #                              # see GPU ownership
+                     #  "shared_gpus": ["<index>" | "GPU-uuid", ...],  # cards it may borrow while
+                     #                              # nobody else is on them; see Shared GPUs
                      #  "provider": null | {"kind":"runpod","pod_id":..},
                      #  "idle_minutes": 15, "ttl_hours": null | N, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
@@ -158,6 +160,8 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "command": "uv run python -m experiments.lego.train --k-max 6",
   "setup": "uv sync --frozen",          # optional; runs before command, phase=setup
   "gpus": 1,                            # 0..N owned GPUs
+  "use_shared": false,                  # may this job also be dispatched to `shared_gpus`?
+                                        # see Shared GPUs
   "env": {"REQUIRE_CUDA": "1"},
   "secrets": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "HF_TOKEN", "WANDB_API_KEY"],
                                         # read from the submitter's env, delivered as ~/.gpuc/secrets/<jobid>.env (0600),
@@ -200,7 +204,9 @@ queue's lexical order, not submission order below one second.
   owned UUIDs, assign UUIDs, remove the queue
   marker, set state running, spawn the runner in its own process group
   (`start_new_session=True`), record pid/pgid. Multiple jobs may run at
-  once if GPUs allow; a `gpus: 0` job never waits.
+  once if GPUs allow; a `gpus: 0` job never waits. A job that asked to
+  (`use_shared`) and does not fit in the free owned cards makes up the
+  shortfall from the shared ones that are idle right now -- see Shared GPUs.
 - Cancel: `queue.cancel(jobid)` writes `jobs/<id>/cancel`. The **runner**
   owns the kill: it checks the marker before each phase and on every poll, and
   stops the phase's scope (`systemctl --user stop <unit>`) or, with no systemd,
@@ -901,6 +907,9 @@ treated as unavailable (jobs wait, they do not fail), and reported by
 `gpuc status` and the health check's `gpu_uuids`. Owning UUIDs only costs no
 lookup at all: that mapping is the identity, and the host is not asked.
 
+Shared entries (`--shared-gpus`) go through exactly the same resolution, and
+are checked for overlap with the owned ones -- see Shared GPUs.
+
 `gpuc host list` shows `[index] name vram uuid` per owned card, from the last
 probe; `gpuc status` shows `[index] free|busy name vram` from the host itself
 and names each running job's cards on the job's own line (`gpu=2,3`), because a
@@ -913,6 +922,72 @@ index against the numbering `nvidia-smi` gave *in that same probe*, records
 `gpu_info` for every card either way (so a later `--gpus 5` resolves offline),
 and notes the two assignments `check_gpu_uuids` would later refuse to bootstrap:
 an entry no card answered to, and two entries folding onto one card.
+
+## Shared GPUs: cards we borrow rather than own
+
+Some boxes hand us a few cards outright and leave the rest to other people.
+`config.gpus` is the first kind and `config.shared_gpus` is the second, spelled
+the same way (index or UUID) and resolved the same way each pass. The
+difference is the whole feature: an owned card is handed out whenever it is
+free, and a shared card is only ever *borrowed* -- for one job, and only while
+nobody else is on it.
+
+Two gates, both of which have to pass:
+
+1. **The job asked.** `use_shared: true` in the spec, or `gpuc submit
+   --use-shared`. Off by default, because taking somebody else's card is a
+   decision about a box and not about a job; a job that did not ask is never
+   dispatched to one, and shared cards are not counted as capacity for it.
+   It is also *fixed*: nothing changes a queued job's `use_shared`, which is
+   what lets the dispatcher fail a job that cannot fit rather than leaving it
+   to wait forever.
+2. **Nobody else is on the card.** `nvidia-smi --query-gpu=memory.used,
+   utilization.gpu` reports 0 MiB *and* 0% for it, right now. Memory is the
+   stronger half -- a CUDA context holds hundreds of MiB between steps, so
+   0 MiB means no process, while util alone dips to zero between epochs of
+   somebody else's run. Every way of not knowing (nvidia-smi failing, a card it
+   did not answer about, a `[N/A]` reading) counts as *in use*: this decides
+   whether to run on somebody else's GPU, so absence of evidence has to count
+   against.
+
+Owned cards first, always. A job takes every free owned card it can use and
+borrows only the shortfall, so a shared card is held for the shortest time that
+runs the job. That one rule covers both things shared cards are for: a
+one-card job borrows when the owned cards are all busy (the queue drains
+faster), and a four-card job on a host that owns two and shares two waits until
+both of the shared ones go quiet and then runs across all four.
+
+The preflight sample is taken once per dispatch pass and only when a job
+actually needs to borrow -- so a host with nothing queued that wants a shared
+card runs no extra `nvidia-smi` -- and every job in that pass is judged against
+the one reading, which is also what stops two of them being handed one card.
+
+`gpuc status`'s start-time estimate models the shared cards that are idle
+*right now*, and only for the jobs allowed onto them, so a borrower whose turn
+is the next dispatch pass is told `starts now` rather than being made to wait
+for an owned card it will not want. A card somebody else is on is left out of
+the model entirely: when they will stop is the one thing this host cannot know,
+so a job waiting for one has no start time and is told why.
+
+What this deliberately does not do: **yield**. Once a job is running on a
+borrowed card it keeps it until it ends. Someone else starting a job on that
+card is a collision gpuc does not detect and does not resolve; `gpuc preempt`
+is the manual way out.
+
+There is no per-host floor on which jobs may borrow, and the absence is on
+purpose. A version of this had `shared_min_priority`, and it was both less than
+it looked and more dangerous than it looked. Less, because borrowing is not a
+reservation: a job that clears any floor still holds its borrowed card until it
+ends, so the floor never protects an important job from a trivial one -- it only
+decides which trivial jobs wait. More, because a per-host floor *moves* under
+jobs that are already queued, and the dispatcher's "this can never run here" is
+a deletion; `gpuc reorder <job> --priority 99` would have ended the job it was
+asked to move. `use_shared` does neither: it is per-job, it is explicit, and it
+is fixed at submit.
+
+A card in both lists is refused -- by `gpuc host add|set`, where it was typed,
+and by the host's own `gpu_uuids` health check at bootstrap. Should one reach a
+dispatcher anyway, owning it wins.
 
 ## Persistent root (a host whose `$HOME` is wiped on restart)
 
