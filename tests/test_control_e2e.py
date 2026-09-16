@@ -328,7 +328,13 @@ def test_a_secret_never_reaches_the_log_or_gpuc_logs(
         home / "dispatcher.log",
     ):
         assert canary not in path.read_text(), path
-    assert not (home / "secrets" / f"{job_id}.env").exists()
+    # The runner unlinks the secrets file *after* it writes the final state, so
+    # `finished()` above does not mean it is gone yet.
+    wait_until(
+        lambda: not (home / "secrets" / f"{job_id}.env").exists(),
+        30,
+        f"the secrets file for {job_id} to be removed",
+    )
 
 
 # -- gpuc clean ---------------------------------------------------------------
