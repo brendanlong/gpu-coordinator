@@ -68,14 +68,25 @@ class HostSession:
             )
         return result
 
-    def host_json(self, args: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> Any:
-        result = self.host_cli(args, timeout=timeout)
+    def host_json(
+        self, args: str, *, timeout: float = DEFAULT_TIMEOUT_S, check: bool = True
+    ) -> Any:
+        """The JSON document a host subcommand printed.
+
+        `check=False` for the subcommands whose document *is* the report of a
+        failure -- `clean` and `purge` exit 1 with a populated `errors` and a
+        full account of what they did and did not delete, and raising on the
+        exit code would throw that account away. A host that printed no
+        document at all is still an error either way.
+        """
+        result = self.host_cli(args, timeout=timeout, check=check)
         document = parse_last_json(result.stdout)
         if document is _NO_JSON:
+            exited = f"exited {result.returncode} and " if result.returncode else ""
             raise RemoteError(
                 self.entry.name,
                 host_command(self.python, self.home, args, self.env),
-                f"expected JSON on stdout, got:\n{_tail(result.output)}",
+                f"{exited}expected JSON on stdout, got:\n{_tail(result.output)}",
             )
         return document
 

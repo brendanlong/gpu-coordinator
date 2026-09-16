@@ -441,6 +441,41 @@ def test_purge_removes_a_mirrored_job_whole(
     assert not (home / "jobs" / job_id).exists()
 
 
+def test_purge_only_takes_one_job_and_leaves_the_rest_of_the_host_alone(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    go = big_file_job(home, workdir)
+    keep = big_file_job(home, workdir)
+    mark_mirrored(home, go)
+    mark_mirrored(home, keep)
+    capsys.readouterr()
+
+    # No --yes: naming the id is the confirmation.
+    assert main(["clean", "--host", "local", "--purge", "--only", go]) == 0
+    assert "PURGED" in capsys.readouterr().out
+    assert not (home / "jobs" / go).exists()
+    # Not even the venv of the job that was not named.
+    assert (home / "jobs" / keep / "workdir" / "blob.bin").exists()
+
+
+def test_a_typo_in_only_refuses_the_whole_selection_and_still_reports(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host exits 1 here, and its report is the answer -- not a transport error."""
+    home = bootstrapped_home
+    job_id = big_file_job(home, workdir)
+    mark_mirrored(home, job_id)
+    capsys.readouterr()
+
+    selection = f"{job_id},20260101-000000-typo11"
+    assert main(["clean", "--host", "local", "--purge", "--only", selection, "--json"]) == 1
+    document = json.loads(capsys.readouterr().out)
+    assert document["purged"] == []
+    assert any("20260101-000000-typo11" in error for error in document["errors"])
+    assert (home / "jobs" / job_id / "log.txt").exists()
+
+
 def test_logs_and_status_after_a_purge(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

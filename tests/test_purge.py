@@ -371,9 +371,11 @@ def test_host_cli_purge_sweep_only_scopes_the_sweep(
     assert paths.workdir(keep).is_dir()
 
 
-def test_host_cli_purge_reports_a_job_id_it_has_never_heard_of(
+def test_host_cli_purge_refuses_a_selection_holding_a_job_id_it_does_not_know(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """One typo in a pair is a mistyped id far more often than a deliberate
+    pair, and the half this would delete does not come back."""
     job_id = make_job()
     selection = f"{job_id},20260101-000000-typo11"
     assert (
@@ -383,6 +385,29 @@ def test_host_cli_purge_reports_a_job_id_it_has_never_heard_of(
         == 1
     )
     payload = json.loads(capsys.readouterr().out)
-    # Named once, though both flags carried it, and the real job still went.
-    assert payload["errors"] == ["20260101-000000-typo11: no job with that id on this host"]
-    assert [c["job_id"] for c in payload["purged"]] == [job_id]
+    # Named once, though both flags carried it.
+    assert payload["errors"] == [
+        "20260101-000000-typo11: no job with that id on this host",
+        "refused the whole selection: nothing was removed",
+    ]
+    assert payload["purged"] == []
+    assert paths.state_file(job_id).exists()
+    assert paths.workdir(job_id).is_dir()
+
+
+def test_naming_a_running_job_neither_purges_it_nor_takes_its_workdir(gpuc_home: Path) -> None:
+    job_id = make_job(status="running")
+    result = cleanup.purge(older_than_days=0.0, force=True, only=[job_id], sweep_only=[job_id])
+    assert result.purged == [] and result.removed == []
+    assert [s.why for s in result.purge_skipped] == ["status running"]
+    assert paths.workdir(job_id).is_dir()
+
+
+def test_purging_a_named_job_does_not_need_a_usable_ended_at(gpuc_home: Path) -> None:
+    """The stuck job somebody names is often one whose state write was cut
+    short; a bare `clean --only` would still reclaim its workdir."""
+    job_id = make_job()
+    jobs.update_state(job_id, ended_at=None)
+    result = cleanup.purge(older_than_days=7.0, only=[job_id], sweep_only=[job_id])
+    assert [c.job_id for c in result.purged] == [job_id]
+    assert not paths.job_dir(job_id).exists()

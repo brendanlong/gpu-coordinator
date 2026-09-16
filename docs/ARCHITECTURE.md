@@ -431,15 +431,31 @@ which is what reclaims the jobs the purge refused; `--only` narrows what may be
 *purged* and `--sweep-only` narrows that sweep. The purge removes the whole
 `jobs/<id>/` plus that job's queue marker, staged spec and `secrets/<id>.env`.
 
-`gpuc clean --host H --only ID[,ID...]` is the user-facing form of both: an age
-horizon of 0 for exactly those jobs, sent as `--only` *and* `--sweep-only`, so
-purging one job does not reclaim every other finished job's venv on the way
-past. The two host flags stay separate because `--verify` needs them to differ:
-it purges the ids whose mirrored `log.txt` answered and sweeps the ids the user
-asked about, which is how a named job that failed verification still gets its
-workdir back. A named id no job dir matches is an error on the host's report
-(exit 1), never a silent no-op, and the control side refuses an empty `--only`
-before it can become one.
+`gpuc clean --host H --only ID[,ID...]` is the user-facing form of both, sent
+as `--only` *and* `--sweep-only`, so purging one job does not reclaim every
+other finished job's venv on the way past. The two host flags stay separate
+because `--verify` needs them to differ: it purges the ids whose mirrored
+`log.txt` answered and sweeps the ids the user asked about, which is how a named
+job that failed verification still gets its workdir back.
+
+Naming ids *replaces* the age gate rather than tightening it: a named job is
+purged and swept whatever `--older-than` says and even if its `state.json`
+records no usable `ended_at`, which is the shape a job whose state write was cut
+short has -- exactly the stuck kind somebody names. The preconditions are
+untouched: a named job with no confirmed mirror or unconfirmed outputs still
+needs `--force`, and a running or queued one is never touched at all.
+
+A named id no job dir matches is a typo, and a typo in a delete is not
+half-honoured: the host reports it, removes nothing at all, and exits 1. That
+exit code is why `clean` and `purge` are the two subcommands the control side
+reads with `host_json(check=False)` -- their document *is* the report of the
+failure, and raising on the exit code would throw away the account of what did
+and did not go. The control side refuses an empty `--only` before it can become
+"none of them".
+
+`--only` needs a host package that knows `--sweep-only`; an older one rejects
+the command line in argparse, before any subcommand runs, so nothing is deleted
+and the error says to re-run `gpuc host bootstrap`.
 
 `HostConfig.retention_days` (registry `HostEntry.retention_days`, `gpuc host
 add|set --retention-days N`, null by default) makes the dispatcher purge, never

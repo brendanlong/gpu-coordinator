@@ -469,13 +469,18 @@ def purge_candidates(
             skipped.append(Skipped(job_id, f"status {state.status}"))
             continue
         ended = _parse(state.ended_at)
-        if ended is None:
-            skipped.append(Skipped(job_id, "finished but records no usable ended_at"))
-            continue
-        age_days = (moment - ended).total_seconds() / 86400.0
-        if age_days < older_than_days:
-            skipped.append(Skipped(job_id, f"only {age_days:.1f} days old"))
-            continue
+        age_days = None if ended is None else (moment - ended).total_seconds() / 86400.0
+        # The age gate is how an unnamed job is chosen, so naming ids replaces
+        # it rather than adding to it -- including for a job whose `ended_at`
+        # never got written, which is exactly the stuck kind somebody names.
+        # The preconditions below are not waived by naming anything.
+        if wanted is None:
+            if age_days is None:
+                skipped.append(Skipped(job_id, "finished but records no usable ended_at"))
+                continue
+            if age_days < older_than_days:
+                skipped.append(Skipped(job_id, f"only {age_days:.1f} days old"))
+                continue
         reasons: list[str] = []
         if not state.meta_synced_at:
             reasons.append(_not_backed_up(prefix))
@@ -554,7 +559,17 @@ def purge(
             continue
         result.purged.append(candidate)
     purged_ids = {candidate.job_id for candidate in result.purged}
-    sweep = clean(older_than_days=older_than_days, dry_run=dry_run, now=now, only=sweep_only)
+    # Named ids replace the age gate here too, or `--purge --only X` would
+    # reclaim less than a bare `clean --only X` does for a job whose state
+    # never recorded when it ended.
+    named = sweep_only is not None
+    sweep = clean(
+        all_finished=named,
+        older_than_days=None if named else older_than_days,
+        dry_run=dry_run,
+        now=now,
+        only=sweep_only,
+    )
     # In a dry run the purged dirs are still there, so the sweep sees their
     # workdirs too; counting both would report the same bytes twice.
     result.removed = [c for c in sweep.removed if c.job_id not in purged_ids]

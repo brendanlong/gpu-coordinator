@@ -331,15 +331,25 @@ def test_host_cli_clean_only_empty_means_none(
     assert (paths.workdir(job_id) / "blob.bin").exists()
 
 
-def test_host_cli_clean_reports_a_job_id_it_has_never_heard_of(
+def test_host_cli_clean_refuses_a_selection_holding_a_job_id_it_does_not_know(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = finished_job("succeeded")
     assert host_cli.main(["clean", "--only", f"{job_id},20260101-000000-typo11"]) == 1
     payload = json.loads(capsys.readouterr().out)
-    assert payload["errors"] == ["20260101-000000-typo11: no job with that id on this host"]
-    # The typo does not stop the job that does exist from being cleaned.
-    assert [c["job_id"] for c in payload["removed"]] == [job_id]
+    assert payload["errors"] == [
+        "20260101-000000-typo11: no job with that id on this host",
+        "refused the whole selection: nothing was removed",
+    ]
+    assert payload["removed"] == []
+    assert (paths.workdir(job_id) / "blob.bin").exists()
+
+
+def test_host_cli_clean_only_ignores_a_job_with_no_usable_ended_at(gpuc_home: Path) -> None:
+    job_id = finished_job("failed")
+    jobs.update_state(job_id, ended_at=None)
+    assert host_cli.main(["clean", "--only", job_id]) == 0
+    assert not paths.workdir(job_id).exists()
 
 
 def test_host_cli_clean_only_says_when_a_named_workdir_is_already_gone(

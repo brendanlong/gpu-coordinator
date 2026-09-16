@@ -253,7 +253,7 @@ def clean_host(
         args.append("--dry-run")
     # A workdir walk over many jobs is minutes of stat() on a slow volume, and
     # the host CLI is doing the deleting too.
-    payload = session.host_json(" ".join(args), timeout=900.0)
+    payload = session.host_json(" ".join(args), timeout=900.0, check=False)
     return _report(entry.name, payload)
 
 
@@ -322,18 +322,21 @@ def purge_host(
     session = session or open_session(entry, settings)
     days = (
         0.0
-        if all_finished or only
+        if all_finished or only is not None
         else (DEFAULT_RETENTION_DAYS if older_than_days is None else older_than_days)
     )
     if not verify:
         payload = session.host_json(
             _purge_args(days, dry_run=dry_run, force=force, only=only, sweep_only=only),
             timeout=900.0,
+            check=False,
         )
         return _report(entry.name, payload, purge=True)
 
     preview = session.host_json(
-        _purge_args(days, dry_run=True, force=force, only=only, sweep_only=only), timeout=900.0
+        _purge_args(days, dry_run=True, force=force, only=only, sweep_only=only),
+        timeout=900.0,
+        check=False,
     )
     report = _report(entry.name, preview, purge=True)
     verified, unverified = verify_mirror(entry, report, settings, client=s3_client)
@@ -349,6 +352,14 @@ def purge_host(
         int(job.get("bytes") or 0) for job in report.removed
     )
     if dry_run:
+        if report.purge_skipped:
+            # The host sized its dry-run sweep over the dirs it expected to
+            # purge, so the workdirs of the jobs we are about to drop from that
+            # list are in neither total. The real run does reclaim them.
+            report.notes.append(
+                "the job dirs above stay, but the real run still reclaims their workdirs, "
+                "which this dry run has not sized"
+            )
         return report
     # `--only` with the verified ids -- possibly none of them, which the host
     # reads as "purge nothing", while the workdir sweep `--purge` implies still
@@ -356,6 +367,7 @@ def purge_host(
     payload = session.host_json(
         _purge_args(days, dry_run=False, force=force, only=sorted(keep), sweep_only=only),
         timeout=900.0,
+        check=False,
     )
     final = _report(entry.name, payload, purge=True)
     final.verified = verified

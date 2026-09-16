@@ -518,13 +518,20 @@ gpuc clean --host gpubox --only 20260101-120000-ab12,20260101-130000-cd34
 ```
 
 `--only ID[,ID...]` names the jobs itself, so it replaces `--all-finished` and
-`--older-than` rather than combining with them: an age horizon of 0 for exactly
-those jobs and no others. Naming ids is its own confirmation, so `--purge
---only` needs no `--yes`, and the workdir sweep `--purge` implies is scoped to
-the same ids — purging one job does not reclaim every other finished job's venv
-on the way past. An id no job dir on the host matches is reported and the
-command exits 1; an empty `--only` is a usage error (exit 2), never a silent
-"everything" or a silent no-op.
+`--older-than` rather than combining with them: exactly those jobs and no
+others, however recently they ended — and even if the job never recorded when it
+ended, which is the shape of a job whose state write was cut short. Naming ids
+is its own confirmation, so `--purge --only` needs no `--yes`, and the workdir
+sweep `--purge` implies is scoped to the same ids — purging one job does not
+reclaim every other finished job's venv on the way past. What naming a job does
+*not* waive is the preconditions: a named job with no confirmed mirror or
+unconfirmed outputs still needs `--force`, and a running or queued one is never
+touched.
+
+An id no job dir on the host matches is a typo, so the whole selection is
+refused: nothing is removed, the id is named, and the command exits 1. An empty
+`--only` is a usage error (exit 2), never a silent "everything" or a silent
+no-op.
 
 |  | `clean` | `clean --purge` |
 | --- | --- | --- |

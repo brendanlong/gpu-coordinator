@@ -381,9 +381,11 @@ class StubSession:
     def __init__(self, payloads: list[dict[str, object]]) -> None:
         self.payloads = payloads
         self.calls: list[str] = []
+        self.checked: list[bool] = []
 
-    def host_json(self, args: str, *, timeout: float = 0.0) -> object:
+    def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
         self.calls.append(args)
+        self.checked.append(check)
         return self.payloads.pop(0)
 
 
@@ -502,6 +504,9 @@ def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
     )
     assert session.calls == ["purge --older-than 0.0 --only a,b --sweep-only a,b"]
     assert "--only a,b" in report.render()
+    # A host that exits 1 has still said what it deleted; the report is the
+    # point of the call, so `clean` must not let the exit code discard it.
+    assert session.checked == [False]
 
 
 def test_only_without_purge_cleans_just_those_workdirs(control_env: Path) -> None:
@@ -536,6 +541,33 @@ def test_only_with_verify_purges_what_answered_and_sweeps_what_was_asked(
     assert "--only kept,gone --sweep-only kept,gone" in session.calls[0]
     # The job whose mirror never answered keeps its dir and still loses its venv.
     assert session.calls[1].endswith("--only kept --sweep-only kept,gone")
+
+
+def test_a_dry_run_says_the_workdirs_verification_dropped_will_still_go(
+    control_env: Path,
+) -> None:
+    """The host sized its sweep over the dirs it expected to purge, so the
+    workdirs of the jobs we then drop are in neither total."""
+    client = FakeS3Client()
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    session = StubSession([{"dry_run": True, "purged": [purged_entry("gone")]}])
+    report = purge_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        only=["gone"],
+        verify=True,
+        dry_run=True,
+        s3_client=client,
+    )
+    assert report.purged == []
+    assert any("still reclaims their workdirs" in note for note in report.notes)
+
+
+def test_purge_only_needs_no_yes(control_env: Path) -> None:
+    from gpuc.control.clean import check_flags
+
+    check_flags(purge=True, only=["a"])
 
 
 @pytest.mark.parametrize("extra", [["--all-finished"], ["--older-than", "7"]])
