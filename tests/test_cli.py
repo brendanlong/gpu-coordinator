@@ -25,6 +25,7 @@ from gpuc.control.config import (
     hosts_file,
     load_registry,
     load_settings,
+    read_desired,
     registry_transaction,
 )
 from gpuc.control.providers.base import Constraints
@@ -1836,3 +1837,71 @@ def test_host_bootstrap_wants_a_name_or_all_but_not_both(
     assert "--all" in capsys.readouterr().err
     assert main(["host", "bootstrap", "local", "--all"]) == EXIT_USAGE
     assert "not both" in capsys.readouterr().err
+
+
+# -- adopting a pod another machine rented -------------------------------------
+
+
+def adoptable(monkeypatch: pytest.MonkeyPatch, fake_host: FakeHost) -> FakeProvider:
+    """A pod on the account, set up by a machine this one knows nothing about."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    provider = FakeProvider()
+    provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    fake_host.put_file(
+        json.dumps(
+            {
+                "host": "gpuc-e2e-aaa",
+                "gpus": ["GPU-1111"],
+                "ttl_hours": 4.0,
+                "provider": {"kind": "runpod", "pod_id": "pod1", "created_at": "2026-09-15T12:00"},
+            }
+        ),
+        "/home/u/.gpuc/config.json",
+    )
+    return provider
+
+
+def test_host_add_pod_adopts_a_pod_another_machine_created(
+    control_env: Path,
+    fake_host: FakeHost,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its address comes from the provider, everything else from the pod."""
+    adoptable(monkeypatch, fake_host)
+    assert main(["host", "add", "rented", "--pod", "pod1"]) == 0
+
+    entry = load_registry().require("gpuc-e2e-aaa")
+    assert (entry.kind, entry.pod_id, entry.ssh, entry.port) == (
+        "runpod",
+        "pod1",
+        "root@1.2.3.4",
+        22000,
+    )
+    assert entry.gpus == ["GPU-1111"] and entry.ttl_hours == 4.0
+    out = capsys.readouterr().out
+    assert "adopted the config on the host" in out
+    # This machine now watches it too, without having created it.
+    assert "recorded it in desired/gpuc-e2e-aaa.json" in out
+    desired = read_desired("gpuc-e2e-aaa")
+    assert desired is not None and desired.pod_id == "pod1"
+
+
+def test_host_add_pod_refuses_a_pod_that_is_gone(
+    control_env: Path,
+    fake_host: FakeHost,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adoptable(monkeypatch, fake_host)
+    assert main(["host", "add", "rented", "--pod", "podX"]) == EXIT_ERROR
+    assert "nothing to add" in capsys.readouterr().err
+    assert load_registry().hosts == {}
+
+
+def test_host_add_pod_and_ssh_are_the_same_question_twice(
+    control_env: Path, fake_host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adoptable(monkeypatch, fake_host)
+    assert main(["host", "add", "rented", "--pod", "pod1", "--ssh", "me@box"]) == EXIT_USAGE

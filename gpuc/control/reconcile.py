@@ -1,18 +1,25 @@
 """The reaper: desired state versus what the provider is actually billing for.
 
+Every pod with our prefix is asked what it is before anything is done about it,
+because a `desired/<host>.json` record only exists on the machine that created
+the pod (see `rented`). A pod that holds a gpuc config is ours whoever bought
+it, and is judged by the same rules as a host this machine provisioned itself;
+the local `desired/` directory is a cache of those answers, and what keeps a
+pod that has stopped answering under watch.
+
 Fails closed in every direction. If `desired/` cannot be read we do nothing at
 all, because "no state" must never be read as "terminate everything with our
-prefix". Pods without our prefix are never even considered; other sessions'
-freshly created pods are given the provisioning ceiling before they count as
-strays, so a race between `create` and the desired-state write cannot cost
-someone else their pod.
+prefix". Pods without our prefix are never even considered; a pod this machine
+could not reach is reported and left alone, because "not my ssh key" and "dead"
+look identical from here; and a pod young enough to still be provisioning is
+given the ceiling, on whichever machine is creating it.
 """
 
 from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +28,7 @@ from typing import Any
 from gpuc.control.config import (
     ConfigError,
     DesiredHost,
+    HostEntry,
     Settings,
     config_dir,
     forget_host,
@@ -29,21 +37,27 @@ from gpuc.control.config import (
     read_desired,
     state_dir,
     state_lock,
+    transport_for,
     write_desired,
 )
 from gpuc.control.providers.base import Pod, Provider, ProviderError
-from gpuc.control.provision import CEILING_MINUTES, host_status
+from gpuc.control.provision import CEILING_MINUTES
+from gpuc.control.rented import (
+    Liveness,
+    PodAnswer,
+    address_for,
+    ask_pod,
+    pulse,
+    remember,
+)
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
 from gpuc.control.systemd import gpuc_command, systemd_dir, write_units
 
 DEFAULT_INTERVAL_S = 60.0
 STRAY_GRACE_MINUTES = CEILING_MINUTES
-LIVENESS_TIMEOUT_S = 20.0
-HEARTBEAT_FRESH_S = 120.0
-"""A heartbeat this old still counts as alive. The dispatcher beats every 5 s;
-the slack is for a host that was busy syncing, not for one that is gone."""
 
-HostLiveness = Callable[[DesiredHost, Settings], "Liveness"]
+HostLiveness = Callable[[DesiredHost, "HostEntry | None", Settings], Liveness]
+PodQuestion = Callable[[Pod, Settings], PodAnswer]
 
 Reporter = Callable[[str], None]
 
@@ -52,44 +66,29 @@ TIMER_NAME = "gpuc-reconcile.timer"
 
 
 @dataclass
-class Liveness:
-    """What one look at a host says: reachable, beating, busy."""
+class Rented:
+    """One pod we own: the record that judges it, and how to reach it."""
 
-    reachable: bool
-    heartbeat_age_s: float | None = None
-    running_jobs: int = 0
-
-    @property
-    def alive(self) -> bool:
-        if self.running_jobs:
-            return True
-        age = self.heartbeat_age_s
-        return age is not None and age < HEARTBEAT_FRESH_S
-
-    def describe(self) -> str:
-        if not self.reachable:
-            return "ssh did not answer"
-        if self.heartbeat_age_s is None:
-            return "reachable, but the dispatcher has never beaten"
-        return f"heartbeat {self.heartbeat_age_s:.0f}s old, {self.running_jobs} job(s) running"
+    desired: DesiredHost
+    entry: HostEntry | None
 
 
-def probe_liveness(host: DesiredHost, settings: Settings) -> Liveness:
-    entry = load_registry().hosts.get(host.name)
+def probe_liveness(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
+    """Whether this host is beating, asked of the host and nothing else.
+
+    `entry` is the address the pass resolved -- the registry's, or the one the
+    provider gives for the pod -- because the machine running the reaper may
+    never have registered this pod at all.
+    """
     if entry is None:
         return Liveness(reachable=False)
-    # Short even though the lock is not held here: a pass that stalls on one
-    # wedged pod is a pass that does not reach the next one, which is billing.
-    payload = host_status(entry, settings, timeout=LIVENESS_TIMEOUT_S)
-    if payload is None:
+    try:
+        transport = transport_for(entry, settings)
+    except ConfigError:
         return Liveness(reachable=False)
-    age = payload.get("dispatcher_heartbeat_age_s")
-    running = sum(1 for job in payload.get("jobs", []) if job.get("status") == "running")
-    return Liveness(
-        reachable=True,
-        heartbeat_age_s=float(age) if isinstance(age, (int, float)) else None,
-        running_jobs=running,
-    )
+    # `remote_home` unexpanded: the pulse script is run by the host's own
+    # shell, which resolves `$HOME` without costing a round trip to ask.
+    return pulse(transport, entry.remote_home)
 
 
 @dataclass
@@ -217,13 +216,14 @@ def reconcile_once(
     report: Reporter = print,
     *,
     liveness: HostLiveness = probe_liveness,
+    ask: PodQuestion = ask_pod,
 ) -> ReconcileResult:
     result = ReconcileResult()
     try:
         # The lock covers only the read: `desired/` is a directory of files, and
         # a half-listed one would look like "these pods are nobody's".
         with state_lock():
-            desired = load_desired()
+            cached = load_desired()
     except ConfigError as exc:  # DesiredUnreadable, or the lock itself timing out
         report(f"ERROR: {exc}")
         result.errors.append(str(exc))
@@ -241,13 +241,68 @@ def reconcile_once(
     # `gpuc submit --runpod` that was waiting to record a pod it had created --
     # and a create that cannot write desired/ is a leaked, billing pod.
     by_id = {pod.id: pod for pod in pods}
-    _reconcile_desired(desired, by_id, settings, provider, report, result, liveness)
-    _reap_strays(desired, pods, provider, report, result)
+    registry = load_registry().hosts
+    ours = [
+        Rented(host, _how_to_reach(host.name, by_id.get(host.pod_id), registry)) for host in cached
+    ]
+    known = {host.pod_id for host in cached}
+    adopted, unclaimed = _ask_the_rest(pods, known, settings, ask, report)
+    _reconcile_desired([*ours, *adopted], by_id, settings, provider, report, result, liveness)
+    _reap_strays(unclaimed, provider, report, result)
     return result
 
 
+def _how_to_reach(
+    name: str, pod: Pod | None, registry: Mapping[str, HostEntry]
+) -> HostEntry | None:
+    """This machine's address for a host, or the one the provider gives for its pod."""
+    entry = registry.get(name)
+    if entry is not None:
+        return entry
+    return address_for(name, pod) if pod is not None else None
+
+
+def _ask_the_rest(
+    pods: list[Pod],
+    known: set[str],
+    settings: Settings,
+    ask: PodQuestion,
+    report: Reporter,
+) -> tuple[list[Rented], list[PodAnswer]]:
+    """Ask every prefixed pod this machine has no record of what it is.
+
+    A pod that holds a gpuc config is ours -- the machine that created it is
+    not special, and may be switched off -- so it joins the desired hosts and
+    is judged by the same rules. Its answer is cached in `desired/`, which is
+    what keeps it under watch on a later pass that cannot reach it at all.
+    """
+    adopted: list[Rented] = []
+    unclaimed: list[PodAnswer] = []
+    for pod in pods:
+        if pod.id in known or pod.status == "TERMINATED":
+            continue
+        answer = ask(pod, settings)
+        if answer.desired is None:
+            unclaimed.append(answer)
+            continue
+        report(
+            f"{pod.name} ({pod.id}) has no desired/ record here, but {answer.detail}, so it is ours"
+        )
+        try:
+            if not remember(answer.desired):
+                report(
+                    f"WARNING: desired/{answer.desired.name}.json already names another pod, so "
+                    f"what {pod.name} said was not cached. Two pods answering to one host name "
+                    f"is a `host` somebody set by hand; check `gpuc pods`."
+                )
+        except (ConfigError, OSError) as exc:
+            report(f"WARNING: could not cache what {pod.name} said in desired/: {exc}")
+        adopted.append(Rented(answer.desired, answer.entry))
+    return adopted, unclaimed
+
+
 def _reconcile_desired(
-    desired: list[DesiredHost],
+    desired: list[Rented],
     by_id: dict[str, Pod],
     settings: Settings,
     provider: Provider,
@@ -255,7 +310,8 @@ def _reconcile_desired(
     result: ReconcileResult,
     liveness: HostLiveness,
 ) -> None:
-    for host in desired:
+    for rented in desired:
+        host = rented.desired
         pod = by_id.get(host.pod_id)
         if pod is None:
             try:
@@ -302,7 +358,7 @@ def _reconcile_desired(
             continue
 
         if host.bootstrapped and _reap_if_silent(
-            host, pod, settings, provider, report, result, liveness
+            rented, pod, settings, provider, report, result, liveness
         ):
             continue
 
@@ -316,7 +372,7 @@ def _reconcile_desired(
 
 
 def _reap_if_silent(
-    host: DesiredHost,
+    rented: Rented,
     pod: Pod,
     settings: Settings,
     provider: Provider,
@@ -332,7 +388,8 @@ def _reap_if_silent(
     running per the host's own state resets the clock, so a long training run is
     never touched.
     """
-    state = liveness(host, settings)
+    host = rented.desired
+    state = liveness(host, rented.entry, settings)
     if state.alive:
         _remember_seen(host, report)
         return False
@@ -390,39 +447,62 @@ def _minutes_since(stamp: str | None) -> float | None:
 
 
 def _reap_strays(
-    desired: list[DesiredHost],
-    pods: list[Pod],
+    unclaimed: list[PodAnswer],
     provider: Provider,
     report: Reporter,
     result: ReconcileResult,
 ) -> None:
-    known = {host.pod_id for host in desired}
-    for pod in pods:
-        if pod.id in known or pod.status == "TERMINATED":
-            continue
+    """Terminate the pods with our prefix that nothing claims -- and only those.
+
+    A stray has to be *shown* to be one. The pod itself is the record (see
+    `rented`), so a pod that answered and has no gpuc config on it is a create
+    that leaked, and a pod the provider never gave an ssh endpoint is one that
+    never came up: both bill for nothing. A pod that has an endpoint and did not
+    answer this machine is neither, because "wedged" and "this machine holds no
+    key for it" are the same silence -- and terminating on that is what took
+    someone's running job.
+
+    The ceiling still covers every case: another machine's `create` is a pod
+    with no config on it yet, for as long as its bootstrap takes.
+    """
+    for answer in unclaimed:
+        pod = answer.pod
         age = pod.age
         if age is None:
             # Cannot prove it is past the provisioning ceiling, so cannot prove
             # it is not another session's pod mid-create. Fail closed and say so.
             report(
-                f"{pod.name} ({pod.id}) has our prefix and no desired/ record, but the provider "
+                f"{pod.name} ({pod.id}) is unclaimed ({answer.detail}), but the provider "
                 f"reports no creation time, so its age cannot be checked against the "
                 f"{STRAY_GRACE_MINUTES:.0f} min ceiling; leaving it alone. Check `gpuc pods`."
             )
             result.kept.append(pod.name)
             continue
-        if age.total_seconds() < STRAY_GRACE_MINUTES * 60.0:
+        minutes = age.total_seconds() / 60.0
+        if minutes < STRAY_GRACE_MINUTES:
             report(
-                f"{pod.name} ({pod.id}) has our prefix but no desired/ record and is only "
-                f"{age.total_seconds() / 60.0:.0f} min old; leaving it for now in case another "
-                f"session is still provisioning it"
+                f"{pod.name} ({pod.id}) is unclaimed ({answer.detail}) and is only "
+                f"{minutes:.0f} min old; leaving it for now in case another session is still "
+                f"provisioning it"
+            )
+            result.kept.append(pod.name)
+            continue
+        if answer.verdict == "silent" and pod.ssh_direct is not None:
+            report(
+                f"{pod.name} ({pod.id}) has our prefix, is {minutes:.0f} min old and is billing "
+                f"${pod.cost_usd_hr:.3f}/h, but this machine could not ask it what it is "
+                f"({answer.detail}), and a pod this machine has no key for looks exactly like a "
+                f"dead one. Nothing was terminated.\n"
+                f"  Adopt it here with `gpuc host add <name> --pod {pod.id}`, or terminate it "
+                f"from the machine that created it (or the RunPod console)."
             )
             result.kept.append(pod.name)
             continue
         if _terminate(
             provider,
             pod,
-            f"{pod.name} has our prefix but no desired/ record (${pod.cost_usd_hr:.3f}/h)",
+            f"{pod.name} is {minutes:.0f} min old and nothing claims it: {answer.detail} "
+            f"(${pod.cost_usd_hr:.3f}/h)",
             report,
             result,
         ):
@@ -438,12 +518,13 @@ def run_loop(
     iterations: int | None = None,
     sleep: Callable[[float], None] = time.sleep,
     liveness: HostLiveness = probe_liveness,
+    ask: PodQuestion = ask_pod,
 ) -> ReconcileResult:
     last = ReconcileResult()
     count = 0
     while iterations is None or count < iterations:
         count += 1
-        last = reconcile_once(settings, provider, report, liveness=liveness)
+        last = reconcile_once(settings, provider, report, liveness=liveness, ask=ask)
         report(last.render())
         if iterations is not None and count >= iterations:
             break

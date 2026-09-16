@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -737,3 +738,25 @@ def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
     )
     assert entry.pod_id == "pod1"
     assert sorted(load_registry().hosts) == [entry.name]
+
+
+def test_the_pod_is_given_its_own_copy_of_the_desired_record(
+    control_env: Path, ssh_key: Path
+) -> None:
+    """`desired/` lives on this machine only; the pod carries the same record.
+
+    It is what lets a second machine -- the one running the reconcile timer --
+    tell this pod from a leak without ever having created it (`rented`).
+    """
+    provider = FakeProvider([make_offer()])
+    transport = FakeTransport()
+    entry = run(provider, transport)
+
+    document = json.loads(transport.files["/root/config.json"])
+    provider_block = document["provider"]
+    assert provider_block["kind"] == "runpod"
+    assert provider_block["pod_id"] == entry.pod_id
+    assert provider_block["offer"]["name"] == "A40"
+    desired = read_desired(entry.name)
+    assert desired is not None
+    assert provider_block["created_at"] == desired.created_at

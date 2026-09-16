@@ -392,3 +392,30 @@ def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_en
     assert host.config["schema_version"] == 1
     # Whoever registered the host first still owns when that was.
     assert host.config["created_at"] == "2020-01-01T00:00:00+00:00"
+
+
+def test_a_rented_pod_is_stamped_as_bootstrapped_in_its_own_config(control_env: Path) -> None:
+    """The stamp any other machine reconciles that pod by (`rented`).
+
+    Without it a second machine reads the pod as one that never came up and
+    terminates it at the provisioning ceiling.
+    """
+    bought = {"kind": "runpod", "pod_id": "pod1", "created_at": "2026-09-15T12:00:00+00:00"}
+    host = ScriptedHost(config={**CONFIG_ON_HOST, "provider": dict(bought)})
+    bootstrap_host(
+        entry(kind="runpod", pod_id="pod1", provider=dict(bought)),
+        transport=host,
+        report=lambda _: None,
+    )
+    assert host.config is not None
+    provider = host.config["provider"]
+    assert isinstance(provider, dict)
+    # Stamped, and nothing else about the pod's own record disturbed.
+    assert provider["bootstrapped_at"]
+    assert (provider["pod_id"], provider["created_at"]) == ("pod1", bought["created_at"])
+
+
+def test_a_host_nobody_rents_gets_no_provider_block(control_env: Path) -> None:
+    host = ScriptedHost(config=dict(CONFIG_ON_HOST))
+    bootstrap_host(entry(), transport=host, report=lambda _: None)
+    assert host.config is not None and host.config.get("provider") is None

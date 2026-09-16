@@ -352,6 +352,7 @@ export RUNPOD_API_KEY=...
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60
 gpuc pods                   # every pod with our prefix: cost, util, age, is it wanted?
 gpuc reconcile --once       # terminate leaked or expired pods now
+gpuc host add rented --pod <pod-id>   # drive a pod another machine rented
 ```
 
 The same flags work on `gpuc submit` and `gpuc requeue`:
@@ -396,6 +397,13 @@ not paused. A registered pod the provider no longer has is forgotten on the spot
 rather than dialled. Image, disk, `--idle-min` and `--ttl-hours` are *not*
 compared: a reused pod keeps the ones it was created with.
 
+**The pod is not tied to the machine that bought it.** What it is — its cards,
+its mirror, its TTL, and the record of what it was rented as — lives in its own
+`config.json`, so `gpuc host add <name> --pod <pod-id>` on a second machine
+registers it from the pod itself and needs nothing the first machine has. That
+is also how `gpuc reconcile` tells a pod from a leak wherever it runs
+([below](#reconcile)).
+
 **A pod is never created without a record of it.** `desired/<host>.json` is
 written under the same lock as the create, and every exit from provisioning
 between `create` and the final registry write — Ctrl-C included — terminates the
@@ -429,8 +437,25 @@ means no cap, on `submit`, `host add` and `host set` alike.
   stopped answering, since that never refreshes `last_seen_at` either;
 - a pod past a TTL its host actually has;
 - a pod that never bootstrapped by its 15-minute ceiling;
-- a pod with our prefix that no `desired/` record wants, **once it is over 15
-  minutes old** (the grace is there because another session may be mid-create).
+- a pod with our prefix that **answers ssh with no gpuc config on it**, or that
+  the provider never gave an ssh endpoint at all, **once it is over 15 minutes
+  old** (the grace is there because another session may be mid-create).
+
+**Which pods are "ours" is asked of the pods, not of this machine.**
+`desired/<host>.json` is written by whichever machine ran `gpuc submit
+--runpod`, so a pod carries the same record itself: its `config.json` holds the
+offer it was bought on, when it was created and when it was bootstrapped, under
+the `provider` block. Every pass asks each prefixed pod it has no record of what
+it is, and a pod holding a gpuc config is ours whoever created it — it is judged
+by the rules above, and its answer is cached in `desired/` here. So the timer
+can run on the desktop while the laptop that queued the job is switched off, and
+neither machine is special.
+
+A pod that has an ssh endpoint but does not answer *this* machine is reported
+and never terminated: "wedged" and "this machine holds no key for that pod" are
+the same silence from here. Adopt it with `gpuc host add <name> --pod <id>`
+(which reads the config the pod already has), or terminate it from the machine
+that created it.
 
 A pod with a job running per the host's own state is never touched by the
 dead-dispatcher rule, however old it is — but a TTL you set overrides that and
@@ -442,9 +467,10 @@ reconcile --once` exit non-zero.
 
 **`gpuc pods`** lists every pod in the account: ours (name, id, status, GPU,
 `$/h`, CUDA, age, util, `DESIRED`, heartbeat) with the hourly total, and other
-people's by name only, never touched. `DESIRED=NO` means nothing local wants it
-and the reaper will take it. `--no-heartbeat` skips the per-pod dispatcher ssh
-check, which is what makes the command slow when a pod is wedged.
+people's by name only, never touched. `DESIRED=NO` means nothing *here* wants it
+yet — `gpuc reconcile` asks each of those what it is before deciding.
+`--no-heartbeat` skips the per-pod dispatcher ssh check, which is what makes the
+command slow when a pod is wedged.
 
 ## How a job is killed
 

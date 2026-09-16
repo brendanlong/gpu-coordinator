@@ -179,9 +179,20 @@ A `config.json` that is there but does not parse stops all of this: it is a
 file the host is running on, so nothing replaces it, and the error says to fix
 or delete it.
 
-RunPod hosts are never added by hand: `gpuc submit --runpod ...` creates the
+RunPod pods are never *created* by hand: `gpuc submit --runpod ...` creates the
 pod, registers it as kind `runpod`, and bootstraps it
-([usage.md](usage.md#runpod)).
+([usage.md](usage.md#runpod)). A pod that already exists is adopted the same way
+any other host is, from any machine holding the API key:
+
+```sh
+gpuc pods                                  # the account's pods, with their ids
+gpuc host add rented --pod <pod-id>        # its address from the provider, its config from the pod
+```
+
+That is what makes a pod the laptop queued usable from the desktop: the pod owns
+its `config.json` — cards, mirror, TTL, and the record of what it was rented as —
+so nothing about the machine that created it matters afterwards. It is also
+recorded in `desired/` here, so this machine's `gpuc reconcile` watches it.
 
 The address is the top two rows; every other flag is the host's own config,
 which `host set` writes through to it.
@@ -189,6 +200,7 @@ which `host set` writes through to it.
 | flag (`host add`, and `host set` to change one) | default | meaning |
 | --- | --- | --- |
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
+| `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting instead of naming an ssh target; the provider says where it is. Needs `RUNPOD_API_KEY` |
 | `--gpus 2,3` or `--gpus GPU-8064…,3` | none | what this host may use: nvidia-smi **indices**, UUIDs, or a mix, stored exactly as typed. Indices are how a share of a shared box is agreed; the host re-resolves them to UUIDs on every dispatch pass and pins jobs with `CUDA_VISIBLE_DEVICES=<uuid>`, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is reported `UNAVAILABLE` and jobs wait for it |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
 | `--cache-dir PATH` | bootstrap decides | uv's cache for this host, which is `UV_CACHE_DIR` in its `env`. Bootstrap sets one on gpuc home's filesystem when they differ, because uv only reflinks or hardlinks a venv out of its cache within one filesystem — but only when the host's config names none, however it got there |
@@ -284,6 +296,15 @@ The service runs `gpuc reconcile --once` with `GPUC_CONFIG_DIR` and
 `GPUC_STATE_DIR` pinned to this user's directories and reads `RUNPOD_API_KEY`
 from that env file, which `--install` does not create. What it terminates, and
 what it refuses to touch, is in [usage.md](usage.md#reconcile).
+
+**On more than one machine is fine.** Each pass asks every pod with your prefix
+what it is, and a pod holding a gpuc config is left alone whichever machine
+created it — so the desktop can watch the pod the laptop queued, with the laptop
+shut. The machine running the timer does need an ssh key the pods accept
+(`ssh_key` in `config.toml`, registered on the account the first time it
+provisions anything): a pod it cannot ask is reported rather than terminated, so
+nothing is lost, but nothing watches that pod from there either. To drive it as
+well as watch it, adopt it: `gpuc host add <name> --pod <pod-id>`.
 
 ## Upgrading
 

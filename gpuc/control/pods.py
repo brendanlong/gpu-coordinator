@@ -154,8 +154,9 @@ def render(view: PodsView) -> str:
     ]
     if stray:
         lines.append(
-            f"DESIRED=NO on {', '.join(stray)}: nothing local wants these. "
-            f"`gpuc reconcile --once` terminates them once they are over "
+            f"DESIRED=NO on {', '.join(stray)}: nothing here wants these yet. "
+            f"`gpuc reconcile --once` asks each of them what it is, adopts the ones holding a "
+            f"gpuc config, and terminates the ones holding none once they are over "
             f"{STRAY_GRACE_MINUTES:.0f} min old."
         )
     if view.others:

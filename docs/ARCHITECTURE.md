@@ -945,16 +945,39 @@ record is a leaked, billing pod. Each mutation re-reads the record it is about
 to change. For each `desired/` host, `get` its pod; if
 missing or TERMINATED, mark the desired entry gone and note any jobs that
 were running there (for `requeue`). A pod older than its TTL -- only when that
-host has one; the default is none -- is terminated and logged. For every
-provider pod with our prefix not in `desired/`, terminate and log -- except that
-a prefixed pod with no `desired/` record is left alone until it is older than
-the 15-minute provisioning ceiling, so a concurrent session that has created
-a pod but not yet written its record cannot have it reaped out from under it.
+host has one; the default is none -- is terminated and logged.
+
+**The pod is the record** (`rented.py`). `desired/<host>.json` exists only on
+the machine that ran `gpuc submit --runpod`, so a reaper that trusts it alone
+terminates another machine's healthy pod at the ceiling. A pod therefore carries
+its own copy: `config.json` -- the file the host owns -- holds `offer`,
+`created_at` and `bootstrapped_at` under the `provider` block that already named
+its `kind` and `pod_id`. Every pass asks each prefixed pod it has no record of
+(one `cat config.json` over ssh), and a pod holding a gpuc config is *ours*
+whoever created it: it is judged by the rules above, and the answer is cached in
+this machine's `desired/`, which is what keeps it watched on a later pass that
+cannot reach it. So the timer is a watchdog role that any machine holding the
+API key can run, and none of them is special.
+
+A stray has to be *shown* to be one, and only three things are: a prefixed pod
+that answers ssh with no gpuc config on it, one the provider never gave an ssh
+endpoint, and (either way) only once it is past the 15-minute provisioning
+ceiling, which still covers another machine's create-to-bootstrap window. A pod
+that *has* an endpoint and does not answer this machine is reported and left
+alone: "wedged" and "this machine holds no key for that pod" are the same
+silence, and terminating on it is what took someone's running job. The machine
+that does hold the record still reaps it under the dead-dispatcher rule.
+`gpuc host add <name> --pod <id>` adopts such a pod through the same connect
+path as any other host.
 
 **The dead-dispatcher rule**, which is what replaced the overall TTL: a
-bootstrapped desired host is asked for its status each pass (a 20 s ssh
-timeout, so one wedged pod cannot stall the pass). A heartbeat under
-`reconcile.HEARTBEAT_FRESH_S = 120` s, or any job the host says is running,
+bootstrapped desired host is asked for its pulse each pass (a 20 s ssh
+timeout, so one wedged pod cannot stall the pass) -- the dispatcher heartbeat's
+mtime and a count of the jobs whose `state.json` says `running`, read with
+`stat` and `grep` rather than by running the host's package, because the machine
+reconciling a pod may never have bootstrapped it and knows no interpreter there.
+A heartbeat under
+`rented.HEARTBEAT_FRESH_S = 120` s, or any job the host says is running,
 counts as alive and records `last_seen_at` in its `desired/` record. That
 constant is the reaper's own and deliberately looser than the dispatcher's 30 s
 staleness or the 30 s freshness reuse demands: this one decides whether to

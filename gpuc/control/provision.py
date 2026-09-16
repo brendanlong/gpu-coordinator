@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from gpuc.control import rented
 from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_host
 from gpuc.control.config import (
     ConfigError,
@@ -186,15 +187,10 @@ def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
 
 def address_for(name: str, pod: Pod) -> HostEntry:
     """How to reach this pod, and nothing about what it is."""
-    if pod.ssh_direct is None:
+    address = rented.address_for(name, pod)
+    if address is None:
         raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
-    return HostEntry(
-        name=name,
-        kind="runpod",
-        ssh=f"{pod.ssh_direct.username}@{pod.ssh_direct.host}",
-        port=pod.ssh_direct.port,
-        pod_id=pod.id,
-    )
+    return address
 
 
 def initial_config(
@@ -205,12 +201,16 @@ def initial_config(
     idle_minutes: float,
     ttl_hours: float | None,
     created_at: str,
+    provider: dict[str, Any],
 ) -> dict[str, Any]:
     """What a pod we just bought is: the config `connect_host` gives it.
 
     A fresh pod has no `config.json`, so this is the one case where the machine
     that created a host also decides what it is. Everything after this reads
-    the host's copy, including the next machine to connect to it.
+    the host's copy, including the next machine to connect to it -- which is
+    why the `provider` block (`rented.pod_record`) is written here rather than
+    left in this machine's `desired/`: it is the pod's own copy of that record,
+    and it is what any other machine reconciles the pod from.
     """
     return {
         "gpus": gpus,
@@ -218,6 +218,7 @@ def initial_config(
         "ttl_hours": ttl_hours,
         "s3_prefix": default_s3_prefix(settings, name),
         "created_at": created_at,
+        "provider": provider,
     }
 
 
@@ -422,6 +423,7 @@ def _try_offer(
                 idle_minutes=idle_minutes,
                 ttl_hours=ttl_hours,
                 created_at=created_at,
+                provider=rented.pod_record(address, offer, created_at),
             ),
             transport=transport,
         ).entry

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from gpuc.control.config import (
     ConfigError,
     DesiredHost,
+    HostEntry,
     Settings,
     desired_dir,
     desired_file,
@@ -19,17 +21,19 @@ from gpuc.control.config import (
     state_lock,
     write_desired,
 )
-from gpuc.control.providers.base import Caps, ProviderError
+from gpuc.control.providers.base import Caps, Pod, ProviderError
 from gpuc.control.reconcile import (
     SERVICE_NAME,
     TIMER_NAME,
     HostLiveness,
     Liveness,
+    PodQuestion,
     install,
     reconcile_once,
     run_loop,
     unit_files,
 )
+from gpuc.control.rented import PodAnswer, Verdict, address_for, desired_from
 from gpuc.control.s3index import IndexEntry, LocalIndex
 from tests.conftest import host_entry
 from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
@@ -70,7 +74,30 @@ def alive(**overrides: object) -> HostLiveness:
     state = Liveness(reachable=True, heartbeat_age_s=5.0, running_jobs=0)
     for key, value in overrides.items():
         setattr(state, key, value)
-    return lambda host, settings: state
+    return lambda host, entry, settings: state
+
+
+def asked(verdict: Verdict = "empty", config: dict[str, Any] | None = None) -> PodQuestion:
+    """What every pod with no local record says when this pass asks it.
+
+    The default is the pod a stray really is: it answers, and there is no gpuc
+    config on it. `config` is the answer of a pod another machine set up.
+    """
+
+    def ask(pod: Pod, settings: Settings) -> PodAnswer:
+        if config is None:
+            return PodAnswer(
+                pod, verdict, "it has no config.json", entry=address_for(pod.name, pod)
+            )
+        return PodAnswer(
+            pod,
+            "ours",
+            "its config.json says so",
+            entry=address_for(pod.name, pod),
+            desired=desired_from(pod.id, config, name=pod.name),
+        )
+
+    return ask
 
 
 def provider_with(*pods: object, **kwargs: object) -> FakeProvider:
@@ -133,7 +160,7 @@ def test_the_state_lock_is_not_held_across_probes_and_terminates(control_env: Pa
 
     provider.terminate = watched  # type: ignore[method-assign]
 
-    def probe(host: DesiredHost, settings: Settings) -> Liveness:
+    def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
         note_if_free("liveness")
         return Liveness(reachable=False)
 
@@ -147,7 +174,7 @@ def test_a_record_written_while_the_pass_was_probing_is_not_clobbered(control_en
     provider = provider_with(running_pod("gpuc-a-111", "pod1"))
     desire("gpuc-a-111", "pod1")
 
-    def probe(host: DesiredHost, settings: Settings) -> Liveness:
+    def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
         current = read_desired("gpuc-a-111")
         assert current is not None
         write_desired(current.model_copy(update={"image": "written:by-another-session"}))
@@ -203,16 +230,17 @@ def test_bootstrapped_host_past_its_ceiling_is_kept(control_env: Path) -> None:
     assert provider.terminated == []
 
 
-def test_stray_pod_with_our_prefix_is_terminated(control_env: Path) -> None:
+def test_a_pod_with_no_gpuc_config_on_it_is_terminated(control_env: Path) -> None:
+    """The stray this machine can prove: it answered, and gpuc was never there."""
     provider = provider_with(running_pod("gpuc-leaked-999", "podX", age_minutes=120))
     desired_dir().mkdir(parents=True, exist_ok=True)
     reports: list[str] = []
 
-    result = reconcile_once(Settings(), provider, reports.append)
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
 
     assert provider.terminated == ["podX"]
     assert result.terminated == ["gpuc-leaked-999"]
-    assert any("no desired/ record" in line for line in reports)
+    assert any("nothing claims it" in line for line in reports)
 
 
 def test_a_young_stray_is_left_for_the_session_that_may_be_creating_it(
@@ -220,7 +248,7 @@ def test_a_young_stray_is_left_for_the_session_that_may_be_creating_it(
 ) -> None:
     provider = provider_with(running_pod("gpuc-new-999", "podX", age_minutes=2))
     desired_dir().mkdir(parents=True, exist_ok=True)
-    result = reconcile_once(Settings(), provider, lambda _: None)
+    result = reconcile_once(Settings(), provider, lambda _: None, ask=asked())
     assert provider.terminated == []
     assert result.kept == ["gpuc-new-999"]
 
@@ -229,7 +257,7 @@ def test_foreign_pods_are_never_touched(control_env: Path) -> None:
     provider = FakeProvider(existing=[running_pod(FOREIGN, "podF", age_minutes=600)])
     desired_dir().mkdir(parents=True, exist_ok=True)
     reports: list[str] = []
-    result = reconcile_once(Settings(), provider, reports.append)
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
     assert provider.terminated == []
     assert result.terminated == []
     assert not any(FOREIGN in line for line in reports)
@@ -239,7 +267,7 @@ def test_missing_desired_directory_does_nothing(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-leaked-999", "podX", age_minutes=600))
     reports: list[str] = []
 
-    result = reconcile_once(Settings(), provider, reports.append)
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
 
     assert provider.terminated == []
     assert result.errors and "does not exist" in result.errors[0]
@@ -251,7 +279,7 @@ def test_unreadable_desired_entry_does_nothing(control_env: Path) -> None:
     desire("gpuc-a-111", "pod1")
     desired_file("gpuc-a-111").write_text("{not json")
 
-    result = reconcile_once(Settings(), provider, lambda _: None)
+    result = reconcile_once(Settings(), provider, lambda _: None, ask=asked())
 
     assert provider.terminated == []
     assert result.errors and "Nothing was terminated" in result.errors[0]
@@ -342,7 +370,7 @@ def test_a_stray_with_no_creation_time_is_left_alone(control_env: Path) -> None:
     desired_dir().mkdir(parents=True, exist_ok=True)
     reports: list[str] = []
 
-    result = reconcile_once(Settings(), provider, reports.append)
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
 
     assert provider.terminated == []
     assert result.kept == ["gpuc-other-999"]
@@ -358,7 +386,7 @@ def test_a_failed_stray_terminate_is_an_error(control_env: Path) -> None:
     provider.adopt(running_pod("gpuc-other-999", "podX", age_minutes=600))
     desired_dir().mkdir(parents=True, exist_ok=True)
 
-    result = reconcile_once(Settings(), provider, lambda _: None)
+    result = reconcile_once(Settings(), provider, lambda _: None, ask=asked())
 
     assert result.terminated == [] and result.errors
 
@@ -387,7 +415,7 @@ def dead(**overrides: object) -> HostLiveness:
     state = Liveness(reachable=False)
     for key, value in overrides.items():
         setattr(state, key, value)
-    return lambda host, settings: state
+    return lambda host, entry, settings: state
 
 
 def test_a_host_with_no_ttl_is_never_terminated_for_age(control_env: Path) -> None:
@@ -475,3 +503,160 @@ def test_a_never_bootstrapped_host_still_gets_the_ceiling_not_the_silence_rule(
 
     assert result.terminated == ["gpuc-a-111"]
     assert any("never bootstrapped by its ceiling" in line for line in reports)
+
+
+# -- a pod created on another machine, reconciled from this one ----------------
+#
+# `desired/` is only ever written by the machine that ran `gpuc submit
+# --runpod`. Reconciling from a second machine used to read that as "a leak"
+# and terminate a healthy pod mid-job at the 15 min ceiling (issue #36).
+
+
+def pod_config(
+    name: str,
+    pod_id: str,
+    *,
+    ttl_hours: float | None = None,
+    created_hours_ago: float = 2.0,
+    bootstrapped: bool = True,
+) -> dict[str, Any]:
+    """The `config.json` a pod another machine provisioned is carrying."""
+    created = stamp(hours=-created_hours_ago)
+    provider: dict[str, Any] = {
+        "kind": "runpod",
+        "pod_id": pod_id,
+        "offer": make_offer().model_dump(mode="json"),
+        "created_at": created,
+    }
+    if bootstrapped:
+        provider["bootstrapped_at"] = created
+    return {
+        "host": name,
+        "gpus": ["GPU-1111"],
+        "ttl_hours": ttl_hours,
+        "created_at": created,
+        "provider": provider,
+    }
+
+
+def test_a_pod_another_machine_created_is_adopted_not_terminated(control_env: Path) -> None:
+    """The bug: past the ceiling, with no desired/ record here, and mid-job."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(),
+        provider,
+        reports.append,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod1")),
+    )
+
+    assert provider.terminated == []
+    assert result.kept == ["gpuc-a-111"]
+    assert any("so it is ours" in line for line in reports)
+    # Cached, so the next pass judges it even if the pod stops answering.
+    cached = read_desired("gpuc-a-111")
+    assert cached is not None
+    assert (cached.pod_id, cached.offer.name) == ("pod1", "A40")
+
+
+def test_an_adopted_pod_is_judged_by_the_ttl_it_carries(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=130))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(),
+        provider,
+        reports.append,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod1", ttl_hours=1.0, created_hours_ago=2.2)),
+    )
+
+    assert provider.terminated == ["pod1"]
+    assert result.terminated == ["gpuc-a-111"]
+    assert any("past its 1 h TTL" in line for line in reports)
+
+
+def test_an_adopted_pod_that_has_gone_silent_is_reaped_from_here(control_env: Path) -> None:
+    """The watchdog role: any machine running the timer reaps a dead pod."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0),
+        provider,
+        reports.append,
+        liveness=dead(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod1")),
+    )
+
+    assert result.terminated == ["gpuc-a-111"]
+    assert any("DEAD DISPATCHER" in line for line in reports)
+
+
+def test_a_pod_with_a_config_but_no_bootstrap_stamp_is_still_ours(control_env: Path) -> None:
+    """A pod set up by a build that did not record the stamp is not a stray.
+
+    Its record has no `bootstrapped_at` of its own, and reading that as "never
+    bootstrapped" would terminate it at the ceiling; the dead-dispatcher rule
+    is what judges it instead.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+
+    result = reconcile_once(
+        Settings(),
+        provider,
+        lambda _: None,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod1", bootstrapped=False)),
+    )
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+
+
+def test_a_pod_this_machine_cannot_ask_is_reported_not_terminated(control_env: Path) -> None:
+    """ "Wedged" and "this machine holds no key for it" are the same silence."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked("silent"))
+
+    assert provider.terminated == []
+    assert result.kept == ["gpuc-a-111"]
+    assert any("could not ask it what it is" in line for line in reports)
+    assert any("gpuc host add" in line for line in reports)
+
+
+def test_a_pod_that_never_got_an_ssh_endpoint_is_a_stray(control_env: Path) -> None:
+    """Nothing can have bootstrapped a pod with no door, so nothing is running."""
+    doorless = running_pod("gpuc-a-111", "pod1", age_minutes=120).model_copy(
+        update={"ssh_direct": None}
+    )
+    provider = provider_with(doorless)
+    desired_dir().mkdir(parents=True, exist_ok=True)
+
+    result = reconcile_once(Settings(), provider, lambda _: None, ask=asked("silent"))
+
+    assert provider.terminated == ["pod1"]
+    assert result.terminated == ["gpuc-a-111"]
+
+
+def test_a_pod_already_in_desired_is_never_asked(control_env: Path) -> None:
+    """One `cat config.json` per pod, and only for the pods nothing here wants."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1"))
+    desire("gpuc-a-111", "pod1")
+    asked_about: list[str] = []
+
+    def ask(pod: Pod, settings: Settings) -> PodAnswer:
+        asked_about.append(pod.id)
+        return PodAnswer(pod, "silent", "should not have been asked")
+
+    reconcile_once(Settings(), provider, lambda _: None, liveness=alive(), ask=ask)
+
+    assert asked_about == []
