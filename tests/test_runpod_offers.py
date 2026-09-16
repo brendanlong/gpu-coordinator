@@ -131,7 +131,7 @@ def test_cuda_min_is_forwarded_to_the_catalog_query() -> None:
 
 def test_caps_ignore_foreign_pods() -> None:
     caps = Caps(max_pods=2, max_total_usd_per_hour=3.0)
-    pods = [pod("subrep-p-head", 0.49), pod("subrep-d3-head", 0.49), pod("gpuc-a", 0.49)]
+    pods = [pod("other-p-head", 0.49), pod("other-d3-head", 0.49), pod("gpuc-a", 0.49)]
     assert [p.name for p in owned_pods(pods)] == ["gpuc-a"]
     check_caps(caps, pods, 0.49)
 

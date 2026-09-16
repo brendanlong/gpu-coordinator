@@ -184,13 +184,13 @@ def test_pods_lists_ours_and_counts_the_others(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    provider = FakeProvider(existing=[running_pod("subrep-other", "podF")])
+    provider = FakeProvider(existing=[running_pod("other-tenant", "podF")])
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
     monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
     assert main(["pods", "--no-heartbeat"]) == 0
     out = capsys.readouterr().out
     assert "gpuc-e2e-aaa" in out
-    assert "1 other pod(s) in the account, never touched: subrep-other (RUNNING)" in out
+    assert "1 other pod(s) in the account, never touched: other-tenant (RUNNING)" in out
 
 
 def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(

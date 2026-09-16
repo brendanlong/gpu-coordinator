@@ -34,7 +34,7 @@ from gpuc.control.reconcile import (
 from gpuc.control.s3index import IndexEntry, LocalIndex
 from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
 
-FOREIGN = "subrep-someone-else"
+FOREIGN = "other-someone-else"
 
 
 def stamp(**delta: float) -> str:

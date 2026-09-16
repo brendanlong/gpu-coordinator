@@ -138,8 +138,8 @@ Two failure paths to handle explicitly:
   on the strength of a `draining` marker.
 
 If an account-level key has to sit on the pod for self-terminate, its blast
-radius is every pod in the account, including the two `subrep-*` A40 pods
-another session is running right now. The v2 spec exposes no per-pod scoping.
+radius is every pod in the account, including any pod another session or
+another person is running. The v2 spec exposes no per-pod scoping.
 Mitigations: hard-code the pod's own id into the terminate path, prefer the
 pod-scoped key if it works, and treat this as the one place where the
 never-touch-others rule rests on code rather than on permissions. Also note
@@ -186,11 +186,11 @@ failure class #5:
 The dispatcher lives as long as the queue does. What is true is that no
 process's death loses state, and whoever enqueues next restarts it.
 
-Cancel semantics vary by host. On the local desktop
-`systemd-run --user --scope` works (verified), so cancel can kill a whole
-cgroup and catch double-forked children. RunPod containers have no systemd,
-and an arbitrary ssh box is unknown. **Process-group kill is the baseline**;
-cgroup kill is an upgrade where available.
+Cancel semantics vary by host. On the local desktop `systemd-run
+--user --scope` works (verified), so cancel can kill a whole cgroup and catch
+double-forked children. RunPod containers have no systemd, and an arbitrary
+ssh box is unknown. **Process-group kill is the baseline**; cgroup kill is an
+upgrade where available.
 
 Two things to probe on an ssh host before designing around it:
 
@@ -313,8 +313,8 @@ Feasible. Details that matter:
 
 - S3: periodic sync of an output directory. The `aws` CLI v2 is a
   self-contained bundle that installs into `$HOME` without sudo, so it is
-  usable on a host with no sudo; `boto3` has no `sync`, so choosing it
-  means writing the size-and-mtime diff. Either is fine; pick one and say so.
+  usable on a host you have no root on; `boto3` has no `sync`, so choosing
+  it means writing the size-and-mtime diff. Either is fine; pick one and say so.
 - HF: `huggingface_hub.CommitScheduler` uploads a folder every N minutes.
   It is **append-only by contract**: overwriting or deleting files "can
   corrupt the repository", each push is a git commit, and the docs
@@ -344,7 +344,7 @@ stateful controller**, and if authority is placed correctly:
   S3 is the mirror.
 - The local CLI is stateless: it rebuilds its view from S3 plus SSH.
 - The reconciler (provision, reaper, heartbeat) runs as a `systemd --user`
-  unit under `claude`, which has linger enabled (verified). It loops: read
+  unit under your own account, with linger enabled. It loops: read
   desired state, list provider pods, act on the difference. Every action is
   idempotent and safe to interrupt. It is single-instance under an fd lock
   with a heartbeat and staleness takeover, same rule as the dispatcher, so
@@ -462,9 +462,9 @@ kill, on suspects and on any pod older than its TTL.
 
 Pinning UUIDs is not enough on a box you share with other people. Cap
 dataloader workers and thread counts explicitly (a `os.cpu_count()`-sized
-loader is antisocial there),
-respect the disk quota, and have the probe and preflight detect another
-user's process on an "owned" card before assigning it.
+loader is antisocial there), respect the disk quota, and have the probe and
+preflight detect another user's process on an "owned" card before assigning
+it.
 
 ### 2.13 Disk hygiene between jobs
 

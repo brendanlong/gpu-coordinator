@@ -29,14 +29,15 @@ is `docs/setup.md` in the repo, not this guide.
 ## Pick a host
 
 `gpuc host list` is the list that matters: every registered host with its kind
-and its cards, each as `[index] name vram uuid`. Which of them are busy is
+and its cards, each as `[index] name vram uuid` — `?` for name and VRAM until
+that host has been probed or bootstrapped. Which of them are busy is
 `gpuc status`.
 
 | kind | when | notes |
 |---|---|---|
 | `local` | the job fits on this machine's own cards | free, and shared with everything else using that GPU |
 | `ssh` | a bigger or shared box already registered | free to you; only the cards registered to that host are ever used, and some such boxes wipe `$HOME` on restart |
-| `--runpod` | nothing registered is big enough, or they are all busy | costs money; provisions the cheapest matching pod, idles down after 15 min |
+| `runpod` (`--runpod`) | nothing registered is big enough, or they are all busy | costs money; provisions the cheapest matching pod, idles down after 15 min |
 
 Prefer a host you already have over a pod you pay for, and check `gpuc status`
 first: a busy host queues your job behind the running one, which is usually
@@ -60,9 +61,9 @@ env:
 secrets: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, HF_TOKEN, WANDB_API_KEY]
 outputs:
   - path: results                  # relative to the workdir
-    s3: s3://<your-bucket>/<experiment>/{job_id}/results
+    s3: s3://my-bucket/lego/{job_id}/results
   - path: checkpoints
-    hf: <org>/<repo>
+    hf: my-org/lego-checkpoints
     hf_path: "{job_id}"
 sync_interval_s: 180               # upload cadence while running, and at the end; minimum 10
 priority: 50                       # 0 first, 99 last
@@ -115,8 +116,9 @@ gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc 
 gpuc ssh <host|jobid> --print    # just print the ssh line, to copy
 gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
 gpuc reorder <jobid> --priority 10          # queued jobs only
-gpuc requeue <jobid> --host <host>  # re-run from the mirrored spec, attempt+1; needs s3_bucket
-                                    # set, and re-syncs the workdir from your current directory
+gpuc requeue <jobid> --host <host>
+                                 # re-run from the mirrored spec, attempt+1; needs s3_bucket set,
+                                 # and re-syncs the workdir from your current directory
 gpuc pods                        # RunPod: every pod we own, cost, age, util, wanted?
 ```
 
