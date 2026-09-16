@@ -700,9 +700,9 @@ What `status` prints, and every flag, is usage.md. The invariants:
   is under two minutes, `--idle-min 2`, `--ttl-hours 1` (a TTL is opt-in, and a
   test that creates a billable pod is exactly where opting in is right), and the test
   asserts teardown via `list()` and prints the final `GET /billing/pods`
-  for the pod. Two pods named `subrep-*` belong to someone else: read them
-  in `list()`, never act on them. Every test that creates a pod has a
-  `finally` that terminates it.
+  for the pod. A pod whose name lacks the `runpod_pod_prefix` belongs to
+  someone else: read it in `list()`, never act on it. Every test that creates
+  a pod has a `finally` that terminates it.
 
 ## Code conventions
 
