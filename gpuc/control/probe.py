@@ -221,7 +221,7 @@ class ProbeReport:
         """The `gpus` section: ours by default, the whole box with `--all-gpus`."""
         rows, owned = self.gpu_rows, self.owned_rows
         if not rows:
-            return ["  gpus:", f"    {self.sections.get('gpus', '').strip() or '(none)'}"]
+            return ["  gpus:", f"    {self.sections.get('gpus', '').strip() or '(no output)'}"]
         # Nothing of ours to show is not a reason to show nothing: a host whose
         # assignment matches no card needs the whole list more than anybody.
         everything = all_gpus or not owned
@@ -272,7 +272,7 @@ class ProbeReport:
                 f"        assign some with `gpuc host set {self.host} --gpus <list>`, "
                 f"from the indices or UUIDs above"
             )
-        elif len(owned) < len(rows):
+        elif owned and len(owned) < len(rows):
             notes.append(
                 f"{len(rows) - len(owned)} of this host's {len(rows)} GPUs are not assigned to "
                 f"{self.host}, so gpuc will never\n        use them; "
@@ -281,8 +281,15 @@ class ProbeReport:
         if self.owned_missing:
             notes.append(
                 f"assigned but not present on this host: {', '.join(self.owned_missing)}.\n"
-                f"        Jobs needing them wait forever; fix the list with "
-                f"`gpuc host set {self.host} --gpus <list>`"
+                f"        `gpuc host bootstrap {self.host}` fails its gpu_uuids check on this, so "
+                f"fix the\n        list first: `gpuc host set {self.host} --gpus <list>`"
+            )
+        doubled = len(self.owned) - len(self.owned_missing) - len(owned)
+        if doubled > 0:
+            notes.append(
+                f"{len(self.owned) - len(self.owned_missing)} of the assigned entries name only "
+                f"{len(owned)} card(s) -- an index and its own UUID\n        are one card. "
+                f"`gpuc host bootstrap {self.host}` fails rather than promise a card twice"
             )
         return notes
 

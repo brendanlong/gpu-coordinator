@@ -1363,7 +1363,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument(
         "--all-gpus",
         action="store_true",
-        help="list every GPU in the box, not just the ones assigned to this host",
+        help="list every GPU in the box, not just the ones assigned to this host "
+        "(text output; --json always carries them all)",
     )
     add_json_flag(probe)
     probe.set_defaults(func=cmd_host_probe)

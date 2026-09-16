@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from gpuc.control.probe import parse_probe, probe_script
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from gpuc.control.config import HostEntry
+from gpuc.control.probe import parse_probe, probe_host, probe_script
+from gpuc.control.transport import CommandResult
 
 PROBE_SCRIPT = probe_script("$HOME/.gpuc")
 
@@ -216,3 +222,58 @@ def test_the_persistent_root_note_says_what_actually_moves() -> None:
     assert "the queue and every job dir" in rendered
     assert "uv's cache follows only to stay on gpuc home's" in rendered
     assert "uv itself stays in $HOME" in rendered
+
+
+class OneAnswerTransport:
+    """Says the same thing to every command: the probe only asks once."""
+
+    host = "gpubox"
+
+    def __init__(self, output: str) -> None:
+        self.output = output
+
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
+        return CommandResult(self.host, ["ssh", command], 0, self.output, "")
+
+    def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None: ...
+
+    def rsync(
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Sequence[str] | None = None,
+        excludes: Sequence[str] = (),
+    ) -> CommandResult:
+        return CommandResult(self.host, ["rsync"], 0, "", "")
+
+    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
+        return CommandResult(self.host, ["tail"], 0, "", "")
+
+
+def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
+    """The seam every other test here stubs: the registry's `--gpus` reaches the report."""
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["1"])
+    report = probe_host(entry, transport=OneAnswerTransport(SAMPLE))
+    assert report.owned == ["1"]
+    assert [cells[1] for cells in report.owned_rows] == [A40]
+    assert TI not in report.render()
+
+
+def test_probe_host_carries_the_registered_persistent_root_too() -> None:
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", persistent_root="/mnt/ssd-2/me/")
+    report: Any = probe_host(entry, transport=OneAnswerTransport(OVERLAY_HOME))
+    assert report.persistent_root == "/mnt/ssd-2/me"
+    assert "recover with: gpuc host bootstrap gpubox" in report.render()
+
+
+def test_two_entries_naming_one_card_is_called_out() -> None:
+    """`gpuc host bootstrap` refuses this, so the probe has to be the one to say why."""
+    report = parse_probe("gpubox", SAMPLE, None, ["1", A40])
+    assert [cells[1] for cells in report.owned_rows] == [A40]
+    assert "2 of the assigned entries name only 1 card(s)" in report.render()
+
+
+def test_an_assignment_that_resolves_to_nothing_is_not_blamed_on_other_owners() -> None:
+    rendered = parse_probe("gpubox", SAMPLE, None, ["7", "9"]).render()
+    assert "assigned but not present on this host: 7, 9" in rendered
+    assert "are not assigned to gpubox" not in rendered

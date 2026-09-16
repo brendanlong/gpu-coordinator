@@ -139,7 +139,8 @@ probe` lists only those cards and says how many it hid (`2 of 8 assigned to
 gpubox`); `--all-gpus` shows the box as nvidia-smi sees it. Either way the probe
 records **every** card's name and VRAM, so `gpuc host set gpubox --gpus 5` names
 something the registry already knows. An assigned entry no card answers to is
-called out: jobs needing it would queue forever.
+called out, as are two entries naming one card: `gpuc host bootstrap` fails its
+`gpu_uuids` check on both, so the probe is where you want to find them.
 
 `gpuc host set` edits one entry in place — only the flags you pass — instead of
 `remove` + `add`, which would drop everything else about the host. **Nothing on
