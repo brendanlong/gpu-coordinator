@@ -113,6 +113,9 @@ def test_the_older_host_config_survives_the_null_that_crashed_the_dispatcher() -
     older = HostConfig.from_dict(load("config.older.json"))
     assert older.ttl_hours == 24.0
     assert older.retention_days is None
+    # A host whose config predates the key sweeps nothing until something
+    # rewrites that file: shipping a package may not start deleting on its own.
+    assert older.workdir_days is None
     assert older.schema_version == SCHEMA_VERSION  # missing means 1
 
     newer = HostConfig.from_dict(load("config.newer.json"))
@@ -204,7 +207,14 @@ def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -
     )
 
 
-OPTIONAL_CONFIG_FIELDS = ["ttl_hours", "retention_days", "s3_prefix", "provider", "pkg_commit"]
+OPTIONAL_CONFIG_FIELDS = [
+    "ttl_hours",
+    "retention_days",
+    "workdir_days",
+    "s3_prefix",
+    "provider",
+    "pkg_commit",
+]
 
 
 def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> None:
@@ -216,6 +226,7 @@ def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> N
         ttl_hours=24.0,
         s3_prefix="s3://bucket/gpuc/gpubox",
         retention_days=14.0,
+        workdir_days=1.0,
         provider={"kind": "runpod", "pod_id": "p"},
         pkg_commit="b" * 40,
     )

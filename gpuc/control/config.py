@@ -458,6 +458,10 @@ class HostEntry(TolerantModel):
         return self.config.retention_days
 
     @property
+    def workdir_days(self) -> float | None:
+        return self.config.workdir_days
+
+    @property
     def created_at(self) -> str | None:
         return self.config.created_at
 

@@ -27,6 +27,7 @@ from gpuc.control.config import (
 )
 from gpuc.control.remote import read_remote_config, resolve_home, write_remote_config
 from gpuc.control.transport import Transport
+from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import HostConfig
 
 
@@ -96,6 +97,11 @@ def connect_host(
             )
         patch.setdefault("host", address.name)
         patch.setdefault("created_at", utc_now())
+        # The one timer with a default, and only for a host being configured
+        # for the first time: an adopted config that says nothing about
+        # `workdir_days` is a host that has been getting along without the
+        # sweep, and meeting it is not the moment to start deleting there.
+        patch.setdefault("workdir_days", DEFAULT_WORKDIR_DAYS)
         provider = address.provider()
         if provider is not None:
             patch.setdefault("provider", provider)

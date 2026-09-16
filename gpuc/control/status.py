@@ -337,6 +337,18 @@ class HostView:
         return sum(job.workdir_bytes or 0 for job in self.finished)
 
     @property
+    def unmeasured_workdirs(self) -> int:
+        """Finished jobs whose workdir the host has not sized yet.
+
+        Null is not zero: a host only measures inside a live dispatcher, and a
+        non-ephemeral one lives only while there is work. Folding these into
+        `leftover_bytes` would make an idle host with sixty finished venvs
+        report that it is holding nothing at all -- which is the host the disk
+        line exists for.
+        """
+        return sum(1 for job in self.finished if job.workdir_bytes is None)
+
+    @property
     def past_ttl(self) -> bool:
         """Age from the provider's own createdAt when we have it.
 
@@ -397,7 +409,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
             progress_error=_as_str(entry.get("progress_error")),
-            workdir_bytes=entry.get("workdir_bytes"),
+            workdir_bytes=_as_int(entry.get("workdir_bytes")),
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
             isolation=entry.get("isolation"),
@@ -917,10 +929,13 @@ def render(
             f"before they are purged"
         )
     leftover = view.leftover_bytes
-    if leftover > LEFTOVER_FLOOR_BYTES:
+    unmeasured = view.unmeasured_workdirs
+    if leftover > LEFTOVER_FLOOR_BYTES or unmeasured:
         held = [job for job in view.finished if (job.workdir_bytes or 0) > 0]
+        pending = f", {unmeasured} not sized yet" if unmeasured else ""
         lines.append(
-            f"  disk    {human_bytes(leftover)} still in {len(held)} finished job workdir(s); "
+            f"  disk    {human_bytes(leftover)} still in {len(held)} finished job "
+            f"workdir(s){pending}; "
             f"free it with: gpuc clean --host {entry.name} --all-finished"
         )
     if len(lines) == body_start:

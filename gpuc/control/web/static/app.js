@@ -351,6 +351,7 @@ function hostHeader(host, entry) {
     entry && entry.s3_prefix ? el("span", { class: "mono" }, `mirror ${entry.s3_prefix}`) : null,
     entry && entry.persistent_root ? el("span", { class: "mono" }, `root ${entry.persistent_root}`) : null,
     entry && entry.retention_days !== null && entry.retention_days !== undefined ? el("span", {}, `retention ${entry.retention_days}d`) : null,
+    entry && entry.workdir_days !== null && entry.workdir_days !== undefined ? el("span", {}, `workdirs ${entry.workdir_days}d`) : null,
     host.kind === "runpod" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`, entry.ttl_hours !== null && entry.ttl_hours !== undefined ? `, ttl ${entry.ttl_hours}h` : "") : null,
   );
   const flags = el("div", { class: "flags" },

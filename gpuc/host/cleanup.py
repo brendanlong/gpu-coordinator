@@ -16,10 +16,13 @@ passes `--force` -- and then told, loudly, what it just did.
 
 from __future__ import annotations
 
+import array
 import contextlib
+import fcntl
 import os
 import shutil
 import stat
+import struct
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -27,6 +30,16 @@ from pathlib import Path
 
 from gpuc.host import baseline, jobs, paths, queue
 from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS
+
+DEFAULT_WORKDIR_DAYS = 1.0
+"""What a host with no config of its own is given for `workdir_days`.
+
+Here rather than on `HostConfig`, whose default stays null, because those are
+different questions: a host being configured for the first time should reclaim
+its venvs, and a host whose `config.json` predates the key should not start
+deleting because somebody shipped it a newer package. `connect_host` applies
+this one; nothing applies the other.
+"""
 
 DEFAULT_RETENTION_DAYS = 7.0
 """How old a finished job must be before `purge` will consider it.
@@ -69,17 +82,93 @@ def human_bytes(count: int) -> str:
     return f"{size:.1f} TiB"
 
 
-def dir_size(root: Path) -> int:
-    """Disk usage of `root` in bytes, counting allocated blocks the way `du` does.
+FS_IOC_FIEMAP = 0xC020660B
+FIEMAP_EXTENT_LAST = 0x0001
+FIEMAP_EXTENT_SHARED = 0x2000
+_FIEMAP_HEADER = 32
+"""struct fiemap: u64 start, u64 length, u32 flags, u32 mapped, u32 count, u32 pad."""
+_FIEMAP_EXTENT = 56
+"""struct fiemap_extent: u64 logical, physical, length, 2x reserved64, u32 flags, 3x pad."""
+_FIEMAP_BATCH = 128
 
-    `st_blocks`, not `st_size`: a venv is mostly files uv linked out of its
-    cache, and an inode reached twice inside this tree must only be counted
-    once. Blocks shared with something *outside* the tree (uv's reflinks) still
-    count, exactly as `du` counts them, so a reported figure is an upper bound
-    on what the filesystem actually gets back.
+
+def shared_extent_bytes(path: str) -> int:
+    """Bytes of `path` whose extents another file also references.
+
+    A reflink -- uv's `clone` link mode, and what it uses on a filesystem that
+    supports it -- shares extents without sharing an inode, so `st_nlink` is 1
+    and nothing about the file says its bytes are also the cache's. FIEMAP is
+    the only thing that does, and `FIEMAP_EXTENT_SHARED` is the flag for it.
+
+    Zero for a filesystem that cannot answer (ext4 has no reflinks to find,
+    tmpfs has no FIEMAP at all), for a file we may not open, and for anything
+    that goes wrong: every failure here means "assume it is all yours", which
+    over-reports what a delete frees rather than under-reporting it.
+
+    One open/ioctl/close per file, which is why this is asked once per finished
+    job and recorded in `state.json` rather than on every `status`: it triples
+    the walk (1.60 s against 0.54 s over a 15.00 GiB venv of 67520 files), and
+    a walk that happens once can afford to be exact. See `JobState.workdir_bytes`.
+    """
+    try:
+        # O_NOFOLLOW because the walk never follows one: a symlink's own
+        # st_blocks can be non-zero (ext4 stores a long target out of line), so
+        # without this the sweep opens whatever path a job happened to point at
+        # -- a device node, or a file on a hung mount that O_NONBLOCK will not
+        # save us from. The caller checks S_ISREG too; this is the backstop.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return 0
+    try:
+        shared = 0
+        start = 0
+        buf = array.array("b", bytes(_FIEMAP_HEADER + _FIEMAP_EXTENT * _FIEMAP_BATCH))
+        # Bounded rather than `while True`: a filesystem that keeps answering
+        # without ever setting LAST or advancing must not hang the sweep. A file
+        # past the cap is under-counted as shared, never over-counted.
+        for _ in range(64):
+            # Only the header needs resetting; `fm_mapped_extents` says how much
+            # of the rest the kernel wrote.
+            struct.pack_into("=QQIIII", buf, 0, start, 1 << 62, 0, 0, _FIEMAP_BATCH, 0)
+            try:
+                fcntl.ioctl(fd, FS_IOC_FIEMAP, buf, True)
+            except OSError:
+                return 0
+            mapped: int = struct.unpack_from("=I", buf, 20)[0]
+            if not mapped:
+                return shared
+            done = False
+            for index in range(mapped):
+                at = _FIEMAP_HEADER + index * _FIEMAP_EXTENT
+                logical, _physical, length = struct.unpack_from("=QQQ", buf, at)
+                flags: int = struct.unpack_from("=I", buf, at + 40)[0]
+                if flags & FIEMAP_EXTENT_SHARED:
+                    shared += length
+                if flags & FIEMAP_EXTENT_LAST:
+                    done = True
+                next_start = logical + length
+                if next_start <= start:
+                    done = True
+                start = next_start
+            if done:
+                return shared
+        return shared
+    finally:
+        os.close(fd)
+
+
+def _walk_size(root: Path, *, reclaimable_only: bool) -> int:
+    """Sum `st_blocks` under `root`, counting each inode once.
+
+    `st_blocks`, not `st_size`, so a sparse or compressed file is counted as it
+    actually sits on disk -- the same thing `du` counts.
+
+    `reclaimable_only` is what separates the two callers. See the wrappers.
     """
     total = 0
     seen: set[tuple[int, int]] = set()
+    # inode -> (blocks, links found in this tree, links the filesystem has)
+    shared: dict[tuple[int, int], tuple[int, int, int]] = {}
     stack = [root]
     while stack:
         current = stack.pop()
@@ -92,16 +181,99 @@ def dir_size(root: Path) -> int:
                 info = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
-            key = (info.st_dev, info.st_ino)
-            if key in seen:
-                continue
-            seen.add(key)
-            total += info.st_blocks * 512
+            # A directory's st_nlink counts its subdirectories, not other names
+            # for it -- nothing can hardlink one -- so it is never "shared".
             if entry.is_dir(follow_symlinks=False):
                 stack.append(Path(entry.path))
+                total += info.st_blocks * 512
+                continue
+            if info.st_nlink <= 1:
+                # One link is one path: this cannot be the same file twice.
+                blocks = info.st_blocks * 512
+                # Regular files only: a symlink has no extents worth asking
+                # about, and asking means opening what it points at.
+                if reclaimable_only and blocks and stat.S_ISREG(info.st_mode):
+                    blocks -= min(blocks, shared_extent_bytes(entry.path))
+                total += blocks
+                continue
+            key = (info.st_dev, info.st_ino)
+            if not reclaimable_only:
+                if key not in seen:
+                    seen.add(key)
+                    total += info.st_blocks * 512
+                continue
+            blocks, found, _ = shared.get(key, (info.st_blocks, 0, info.st_nlink))
+            shared[key] = (blocks, found + 1, info.st_nlink)
+    total += sum(blocks * 512 for blocks, found, nlink in shared.values() if found >= nlink)
     with contextlib.suppress(OSError):
         total += root.stat().st_blocks * 512
     return total
+
+
+def dir_size(root: Path) -> int:
+    """Disk usage of `root` in bytes, the way `du` counts it.
+
+    How much space this tree occupies, whoever else has a name for it. That is
+    the question to ask about the uv cache, whose whole job is to hold bytes
+    other trees link to.
+    """
+    return _walk_size(root, reclaimable_only=False)
+
+
+def reclaimable_bytes(root: Path) -> int:
+    """Bytes deleting `root` would actually give back to the filesystem.
+
+    Where this parts company with `du` is the bytes something outside the tree
+    also has. uv materialises a venv out of its wheel cache, so most of a
+    6.5 GB torch venv is bytes the cache still holds when the workdir goes.
+    Measured: 8.36 GiB by `du`, 0.13 GiB actually returned on one host; 15.00
+    GiB by `du`, 0.34 GiB returned on another. Reporting the `du` figure makes
+    every `status` disk line and every `clean` report an overstatement nobody
+    can act on.
+
+    uv shares two ways and this has to see both. **Hardlinks** (its `hardlink`
+    link mode) are exact and free: `st_nlink` comes with the `stat` the walk
+    already does, so a file counts only once every one of its links has been
+    found inside this tree, and only multiply-linked inodes are held in memory
+    until the end -- a single-link file cannot be reached twice, so it is
+    counted on sight and never remembered. **Reflinks** (its `clone` mode,
+    where the filesystem supports it) share extents *without* sharing an inode,
+    so `st_nlink` is 1 and nothing about the file says its bytes are also the
+    cache's; only FIEMAP can, at one ioctl per file.
+
+    That ioctl is the expensive part, and the reason this is measured once per
+    job rather than on demand: nothing cheaper is exact. The kernel will tell
+    you an extent is shared (FIEMAP) or who else references it (btrfs
+    `LOGICAL_INO`, a backref walk that costs *more*), and a filesystem-wide
+    scan (btrfs `TREE_SEARCH_V2`, XFS `GETFSMAP`) is O(extents on the device).
+    Only btrfs qgroups answer in O(1), and only per subvolume, with quotas on.
+    So: pay it once, exactly, and write the number down.
+
+    Which mode a host gets is the host's business, not ours -- the same uv
+    against the same cache hardlinks on one box and reflinks on the next -- so
+    a figure that saw only one of them would be right on one host and off by
+    fifteen gigabytes on another.
+
+    The error is one-sided per *file* -- anything unanswerable counts as yours
+    -- but the figure as a whole can still come out low, because
+    `FIEMAP_EXTENT_SHARED` means "shared with something", not "shared with
+    something outside this tree". Learning who the other referrer is costs a
+    backref walk per extent, which is more than the whole measurement. So:
+
+    - Sharing *within* the tree reads as sharing out of it. A workdir that
+      reflinks a dataset into a second copy of itself is told it frees neither.
+    - On a snapshotted filesystem (btrfs with snapper or timeshift), every
+      extent in every workdir is shared with the snapshot, and this reports
+      little more than the directories. That is arguably honest -- the delete
+      really does free nothing until the snapshot expires -- but it is not what
+      anyone reading a `clean` report expects.
+    - Two sibling workdirs holding the last two links to one file are each told
+      they free nothing, though deleting both would. `du` splits that pair the
+      same way when asked about them separately.
+    - A file both hardlinked wholly within this tree and reflinked out of it
+      counts in full: the hardlink branch does not go on to ask FIEMAP.
+    """
+    return _walk_size(root, reclaimable_only=True)
 
 
 def workdir_size(job_id: str) -> int | None:
@@ -109,15 +281,44 @@ def workdir_size(job_id: str) -> int | None:
     workdir = paths.workdir(job_id)
     if not workdir.is_dir():
         return None
-    return dir_size(workdir)
+    return reclaimable_bytes(workdir)
 
 
-def remove_workdir(job_id: str) -> int:
-    """Delete `jobs/<id>/workdir` and nothing else. Returns the bytes freed."""
+def record_workdir_size(job_id: str) -> int:
+    """Measure a finished job's workdir once and write the figure to its state.
+
+    The walk is exact and therefore not cheap, so it happens here -- at the
+    couple of moments something already knows this job is over -- rather than
+    on every `status`. A failure to record is not worth failing anything over:
+    the figure is a disk report, and a null one only means `status` says it
+    does not know yet.
+
+    The workdir is re-checked *after* the walk because the walk takes seconds
+    and `gpuc clean` is a different process. Without this, a clean landing in
+    that window is overwritten with the figure for a workdir that no longer
+    exists -- and `status` then advertises disk that `clean` cannot free,
+    because a job with no workdir is not a candidate for anything.
+    """
+    size = workdir_size(job_id)
+    if size is not None and not paths.workdir(job_id).is_dir():
+        size = None
+    recorded = 0 if size is None else size
+    with contextlib.suppress(RuntimeError, OSError, KeyError):
+        jobs.update_state(job_id, workdir_bytes=recorded)
+    return recorded
+
+
+def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
+    """Delete `jobs/<id>/workdir` and nothing else. Returns the bytes freed.
+
+    `measured` is a figure the caller already walked for, which `clean` always
+    has: measuring is now an ioctl per file, and doing it twice to delete once
+    is most of the cost of `gpuc clean --all-finished`.
+    """
     workdir = paths.workdir(job_id)
     if not workdir.is_dir():
         return 0
-    size = dir_size(workdir)
+    size = reclaimable_bytes(workdir) if measured is None else measured
     shutil.rmtree(workdir)
     return size
 
@@ -206,6 +407,7 @@ def candidates(
     older_than_days: float | None = None,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
+    automatic: bool = False,
 ) -> tuple[list[Candidate], list[Skipped]]:
     """Which finished jobs' workdirs may be removed, and why the rest may not.
 
@@ -213,6 +415,21 @@ def candidates(
     finished, and (under `--older-than`) a job whose end time cannot be read are
     all skipped. A workdir is only ever removed because its own `state.json`
     says the job is over.
+
+    `automatic` is the dispatcher sweeping on its own horizon rather than a
+    person typing a delete, and it adds the two guards that only make sense
+    when nobody is watching:
+
+    - a job whose spec says `cleanup: never`, which is the one way to ask for
+      a workdir to be kept and would otherwise mean "kept for a day";
+    - a job whose `outputs:` are not confirmed to be anywhere else. Those paths
+      live *inside* the workdir, so this is the difference between reclaiming a
+      venv and binning the only copy of a checkpoint -- the same precondition
+      `purge` fails closed on, and the one the `outputs not uploaded` warning in
+      `gpuc status` is pointing at.
+
+    A person can still take both with `gpuc clean --only <id>`, which is a
+    delete somebody typed with the id in front of them.
     """
     moment = now or datetime.now(UTC)
     wanted = None if only is None else set(only)
@@ -249,11 +466,26 @@ def candidates(
         elif not all_finished:
             skipped.append(Skipped(job_id, "no selection given"))
             continue
+        if automatic:
+            try:
+                policy = jobs.read_spec(job_id).cleanup
+            except (RuntimeError, FileNotFoundError, OSError, ValueError):
+                # An unreadable spec cannot say it wanted this kept, but it
+                # cannot say it did not either.
+                skipped.append(Skipped(job_id, "no readable spec.json"))
+                continue
+            if policy == jobs.NEVER:
+                skipped.append(Skipped(job_id, "cleanup: never"))
+                continue
+            confirmed, why = outputs_confirmed(job_id, state)
+            if not confirmed and why:
+                skipped.append(Skipped(job_id, why))
+                continue
         picked.append(
             Candidate(
                 job_id=job_id,
                 status=state.status,
-                bytes=dir_size(workdir),
+                bytes=reclaimable_bytes(workdir),
                 ended_at=state.ended_at,
                 age_days=age_days,
                 meta_synced_at=state.meta_synced_at,
@@ -305,9 +537,14 @@ def clean(
     dry_run: bool = False,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
+    automatic: bool = False,
 ) -> CleanResult:
     picked, skipped = candidates(
-        all_finished=all_finished, older_than_days=older_than_days, now=now, only=only
+        all_finished=all_finished,
+        older_than_days=older_than_days,
+        now=now,
+        only=only,
+        automatic=automatic,
     )
     result = CleanResult(dry_run=dry_run, skipped=skipped, s3_prefix=host_s3_prefix())
     for candidate in picked:
@@ -315,13 +552,13 @@ def clean(
             result.removed.append(candidate)
             continue
         try:
-            remove_workdir(candidate.job_id)
+            remove_workdir(candidate.job_id, measured=candidate.bytes)
         except OSError as exc:
             result.errors.append(f"{candidate.job_id}: could not remove workdir: {exc}")
             continue
         result.removed.append(candidate)
         try:
-            jobs.update_state(candidate.job_id, workdir_removed=True)
+            jobs.update_state(candidate.job_id, workdir_removed=True, workdir_bytes=0)
         except (RuntimeError, OSError, KeyError) as exc:
             result.errors.append(
                 f"{candidate.job_id}: workdir removed but state not updated: {exc}"
@@ -494,7 +731,7 @@ def purge_candidates(
             Candidate(
                 job_id=job_id,
                 status=state.status,
-                bytes=dir_size(paths.job_dir(job_id)),
+                bytes=reclaimable_bytes(paths.job_dir(job_id)),
                 ended_at=state.ended_at,
                 age_days=age_days,
                 meta_synced_at=state.meta_synced_at,
@@ -508,7 +745,7 @@ def purge_candidates(
 def remove_job_dir(job_id: str) -> int:
     """Delete `jobs/<id>/` and every stray trace of the job. Bytes freed."""
     directory = paths.job_dir(job_id)
-    size = dir_size(directory) if directory.is_dir() else 0
+    size = reclaimable_bytes(directory) if directory.is_dir() else 0
     if directory.is_dir():
         shutil.rmtree(directory)
     # A finished job has no business in the queue, but a marker left by a
@@ -529,6 +766,7 @@ def purge(
     now: datetime | None = None,
     only: Iterable[str] | None = None,
     sweep_only: Iterable[str] | None = None,
+    automatic: bool = False,
 ) -> CleanResult:
     """Remove whole job dirs, then run the ordinary workdir sweep over the rest.
 
@@ -569,6 +807,7 @@ def purge(
         dry_run=dry_run,
         now=now,
         only=sweep_only,
+        automatic=automatic,
     )
     # In a dry run the purged dirs are still there, so the sweep sees their
     # workdirs too; counting both would report the same bytes twice.

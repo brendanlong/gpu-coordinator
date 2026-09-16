@@ -113,6 +113,8 @@ jobs/<jobid>/
                      #  "progress_pct": float|null, "progress_at": str|null,
                      #  "progress_error": str|null, "eta": str|null,
                      #  "workdir_removed": bool,
+                     #  "workdir_bytes": int|null,  # what removing workdir/ would free;
+                     #                              # measured once when the job ended
                      #  "meta_synced_at": str|null, "meta_synced_to": str|null,
                      #  "outputs_synced_at": str|null, "outputs_lost": bool}
                      # meta_synced_* are written only after a *successful* final sync_job_meta
@@ -305,9 +307,17 @@ queue's lexical order, not submission order below one second.
 7. Apply `spec.cleanup` to `workdir/` -- after the final sync and the final
    state write, never before: `outputs:` paths resolve *inside* the workdir, so
    any earlier removal would delete the run's results on the way past. Record
-   `workdir_removed` in `state.json`, then upload state and log. A removal that
-   fails is logged and nothing more: the job's outcome is already decided, and
-   leftover disk is not worth turning a green run red. That last upload records
+   `workdir_removed` in `state.json`, and `workdir_bytes` with it -- what the
+   workdir would free if it is still there, zero if it is not. The runner is
+   the last thing standing in that tree and the job is over, so the figure will
+   not change; `status` reads it rather than walking every finished venv on
+   every call, which cost that command four seconds on a host holding sixty.
+   A job that ended before the field existed, or whose runner died before
+   writing it, has `null` there and is measured by the dispatcher's next
+   housekeeping pass. `gpuc clean` measures afresh instead of trusting it,
+   because it is about to delete what it is quoting. Then upload state and log.
+   A removal that fails is logged and nothing more: the job's outcome is
+   already decided, and leftover disk is not worth turning a green run red. That last upload records
    `meta_synced_at`/`meta_synced_to` and puts `state.json` up once more, so the
    mirror includes the record of itself; `outputs_synced_at` is written in the
    final state write when the final output upload succeeded. See Retention.
@@ -500,11 +510,37 @@ and did not go. The control side refuses an empty `--only` before it can become
 the command line in argparse, before any subcommand runs, so nothing is deleted
 and the error says to re-run `gpuc host bootstrap`.
 
+The dispatcher reclaims disk on two horizons, both once at startup and then at
+most once an hour, purge first. A non-ephemeral host's dispatcher only lives
+while there is work, so in practice both happen on the next submit.
+
 `HostConfig.retention_days` (`gpuc host add|set --retention-days N`, null by
-default) makes the dispatcher purge, never
-forced, once at startup and then at most once an hour. A non-ephemeral host's
-dispatcher only lives while there is work, so in practice that sweep happens on
-the next submit.
+default) is the purge: whole job dirs, never forced.
+
+`HostConfig.workdir_days` (`gpuc host add|set --workdir-days N`) is the
+ordinary `clean` sweep over finished jobs that ended that long ago. It takes
+`workdir/` and leaves `spec.json`, `state.json` and `log.txt`, so it has no
+mirror precondition and takes nothing a re-run cannot rebuild -- which is why
+it may be short where the purge may not.
+
+Its default is `cleanup.DEFAULT_WORKDIR_DAYS` (1), and it lives in
+`connect_host`, applied only to a host being configured for the first time --
+*not* on the `HostConfig` field, which stays null. Those are different
+questions: a host getting its first config should reclaim its venvs, and a host
+whose `config.json` predates the key should not start deleting because somebody
+shipped it a newer package. An adopted config that says nothing about
+`workdir_days` has been getting along without the sweep, and meeting it is not
+the moment to start.
+
+Both dispatcher passes go through `cleanup.clean(automatic=True)`, which adds
+the two refusals that only make sense for a delete nobody typed: a job whose
+spec says `cleanup: never`, and a job whose `outputs:` are not confirmed
+elsewhere -- `outputs:` resolve inside `workdir/`, so without that guard the
+sweep would bin precisely what `purge` fails closed on and `status` flags as
+`outputs not uploaded`. An unreadable `spec.json` is skipped for the same
+reason an unreadable `state.json` is. `gpuc clean --only <id>` waives both,
+because that is a person naming the job. With both horizons set the effective
+workdir horizon is the shorter, since each purge pass sweeps at its own.
 
 An ephemeral host's drain retries unconfirmed outputs before terminating --
 three attempts a minute apart, five minutes in total, with the job's secrets
@@ -522,6 +558,33 @@ anything. See usage.md.
 The host's `status` reports `workdir_bytes` per *finished* job (a live job's
 workdir is still being written to, and walking it on every status call would be
 pure cost). `gpuc status` prints one line per host once those exceed 1 GiB.
+
+Every byte figure a `clean`, `purge` or `status` reports is
+`cleanup.reclaimable_bytes`: what deleting the tree gives the filesystem back,
+not what `du` says it holds. They differ by the venv uv built out of its cache,
+which is most of a torch venv, and a number that counts bytes the cache keeps
+is one nobody can act on. Measured: 8.36 GiB of `du` returning 0.13 GiB on one
+host, 15.00 GiB returning 0.83 GiB on another.
+
+Both of uv's sharing modes count, because which one a host uses is the host's.
+Hardlinks fall out of `st_nlink`, which the walk's `stat` already carries.
+Reflinks share extents without sharing an inode, so they need `FIEMAP` and its
+`FIEMAP_EXTENT_SHARED` flag -- one ioctl per file, which triples the walk. That
+is affordable because the walk happens **once per job**, not once per `status`:
+the answer goes in `JobState.workdir_bytes` (see the runner's step 7) and
+readers read it. Nothing cheaper is exact -- `LOGICAL_INO` costs more per
+extent, a filesystem scan is O(extents on the device), and only btrfs qgroups
+answer in O(1), per subvolume, with quotas on -- so the trade is to pay it once
+and write the number down. Every way it can fail (no FIEMAP, no permission, an
+odd filesystem) means "assume it is all yours", so no *file* is ever
+under-counted. The figure as a whole still can be: `FIEMAP_EXTENT_SHARED` says
+"shared with something", not "shared with something outside this tree", and
+finding out which costs a backref walk per extent. On a filesystem where every
+extent is shared with a snapshot, a workdir reports close to nothing. See
+`reclaimable_bytes` for the full list of what that misses.
+
+`cleanup.dir_size` is the `du` twin and asks none of this; the uv cache's own
+size in `health` is the one question that wants it.
 
 ## The shared uv cache
 

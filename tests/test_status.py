@@ -366,7 +366,10 @@ def with_workdir_bytes(*sizes: int) -> HostView:
         }
         for i, size in enumerate(sizes)
     ]
-    return view(jobs=[*payload()["jobs"], *jobs])
+    # The base payload's own finished jobs have to say they were measured, or
+    # they are `not sized yet` and every one of these renders the disk line.
+    base = [{**job, "workdir_bytes": job.get("workdir_bytes", 0)} for job in payload()["jobs"]]
+    return view(jobs=[*base, *jobs])
 
 
 def test_finished_workdirs_over_a_gigabyte_are_called_out() -> None:
@@ -378,6 +381,28 @@ def test_finished_workdirs_over_a_gigabyte_are_called_out() -> None:
 def test_a_small_leftover_is_not_worth_a_line() -> None:
     rendered = render(with_workdir_bytes(20 * 1024 * 1024))
     assert "gpuc clean" not in rendered
+
+
+def test_a_workdir_the_host_has_not_sized_is_not_silently_zero() -> None:
+    """Null is not zero: an idle host measures nothing, and would look empty."""
+    unmeasured = view(
+        jobs=[
+            {
+                "job_id": "j-unsized",
+                "status": "succeeded",
+                "ended_at": minutes_ago(60),
+            }
+        ]
+    )
+    rendered = render(unmeasured)
+    assert "1 not sized yet" in rendered
+    assert "gpuc clean --host gpubox --all-finished" in rendered
+
+
+def test_a_running_job_is_never_called_unsized() -> None:
+    """Its workdir is still being written to, so nobody should be sizing it."""
+    running = view(jobs=[{"job_id": "j-running", "status": "running", "name": "r"}])
+    assert "not sized yet" not in render(running)
 
 
 def test_a_running_job_never_counts_towards_leftover_disk() -> None:

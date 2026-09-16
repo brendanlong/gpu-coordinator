@@ -139,10 +139,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         # its own business and never leaves the host.
         entry["outputs"] = [asdict(o) for o in spec.outputs] if spec else []
         entry["wandb"] = wandb_hints(spec.env) if spec else {}
-        # Only for finished jobs: a running job's workdir is being written to,
-        # its size is meaningless, and walking a live venv on every `gpuc
-        # status` would be pure cost.
-        entry["workdir_bytes"] = cleanup.workdir_size(job_id) if state.finished else None
+        # Read, never measured here: a running job's workdir is being written
+        # to and its size means nothing, and a finished one was measured when
+        # it finished. Walking them all on every call cost this command four
+        # seconds on a host holding sixty. Null means "not measured yet", which
+        # the dispatcher's housekeeping fixes within the hour.
+        entry["workdir_bytes"] = state.workdir_bytes if state.finished else None
         # "this job produced something that is still only here": the control
         # side cannot work it out, since it never sees the spec's `outputs:`.
         entry["outputs_pending"] = (

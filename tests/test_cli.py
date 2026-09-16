@@ -792,6 +792,48 @@ def test_a_bad_retention_value_is_rejected(
     assert "wants a number of days" in capsys.readouterr().err
 
 
+def test_a_host_getting_its_first_config_sweeps_workdirs_after_a_day(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", ""]) == 0
+    assert fake_host.config is not None and fake_host.config["workdir_days"] == 1.0
+    assert load_registry().require("gpubox").workdir_days == 1.0
+    # ...and it is the only horizon that is on without being asked for.
+    assert fake_host.config["retention_days"] is None
+
+
+def test_an_adopted_config_is_not_given_a_sweep_it_never_had(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    """A host that has been getting along without one: meeting it is not the
+    moment to start deleting there."""
+    fake_host.put_file('{"host": "gpubox", "gpus": ["0"]}', "/home/u/.gpuc/config.json")
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert fake_host.config is not None
+    assert fake_host.config.get("workdir_days") is None
+
+
+def test_workdir_days_is_stored_and_cleared(control_env: Path, fake_host: FakeHost) -> None:
+    add = ["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "", "--workdir-days", "3.5"]
+    assert main(add) == 0
+    assert fake_host.config is not None and fake_host.config["workdir_days"] == 3.5
+    assert main(["host", "set", "gpubox", "--workdir-days", "0"]) == 0
+    # Zero is a real horizon -- "reclaim it as soon as it finishes" -- and must
+    # not be confused with the empty string that turns the sweep off.
+    assert fake_host.config["workdir_days"] == 0.0
+    assert load_registry().require("gpubox").workdir_days == 0.0
+    assert main(["host", "set", "gpubox", "--workdir-days", ""]) == 0
+    assert fake_host.config["workdir_days"] is None
+    assert load_registry().require("gpubox").workdir_days is None
+
+
+def test_a_bad_workdir_days_value_is_rejected(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--workdir-days", "-1"]) == EXIT_USAGE
+    assert "--workdir-days cannot be negative" in capsys.readouterr().err
+
+
 def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:
     from gpuc.control.cli import _outputs_lost_ids
     from gpuc.control.s3index import IndexEntry, S3Index

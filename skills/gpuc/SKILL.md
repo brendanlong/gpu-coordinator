@@ -259,8 +259,16 @@ Rules, and they are not optional:
 
 ## Housekeeping
 
-- `gpuc clean --host <host> --all-finished` removes finished jobs' workdirs
-  (venvs). Records and logs stay until `--purge`, which only removes jobs whose
+- A host sweeps finished jobs' workdirs itself a day after they end
+  (`--workdir-days`, 1 on a host configured for the first time; `gpuc host set
+  <host> --workdir-days N` changes it and reaches the host at once). Logs,
+  state and specs are never swept. So a failed run is yours to inspect for a day, and `gpuc requeue`
+  rebuilds a workdir from git whenever it is gone.
+- That sweep refuses a job whose spec says `cleanup: never` and one whose
+  `outputs:` have not reached S3 or HF — so a workdir holding results that
+  never uploaded is never taken from under you. `gpuc status` names them.
+- `gpuc clean --host <host> --all-finished` does that sweep now, at any age.
+  Records and logs stay until `--purge`, which only removes jobs whose
   log, state and outputs are confirmed mirrored.
 - `gpuc clean --host <host> --only <job-id>[,<job-id>]` does the same for named
   jobs only, whatever their age, and touches no other job. Add `--purge` for

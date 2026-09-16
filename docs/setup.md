@@ -196,6 +196,7 @@ which `host set` writes through to it.
 | `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. Nothing populates it automatically. It replaces the whole set, except `UV_CACHE_DIR`, which is bootstrap's and `--cache-dir`'s |
 | `--s3-prefix s3://…` | none | this host's own log/state mirror |
 | `--retention-days N` | none | the host's dispatcher auto-purges job dirs older than this, but only ones whose log and state it has confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` goes back to keeping everything |
+| `--workdir-days N` | `1` on a host being configured for the first time | the host's dispatcher reclaims a finished job's `workdir/` — the checkout and the venv, never its log or state — once it ended this long ago. No mirror needed: `gpuc requeue` rebuilds a workdir from git, so this is the horizon worth having short. `''` keeps workdirs until you run `gpuc clean`. A host whose config already exists keeps whatever it says, including nothing |
 | `--idle-min N` | `15` | how long an ephemeral host may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |
 | `--ttl-hours N` | none | opt-in hard cap on the host's life; past it the dispatcher kills the running job with reason `ttl`, syncs, and terminates. `-1` means no TTL, on `host add` and `host set` alike (a stored `-1` would be a host already past its TTL). `0` is refused |
 
@@ -209,7 +210,7 @@ called out, as are two entries naming one card: `gpuc host bootstrap` fails its
 
 `gpuc host set` changes one field at a time, and where it writes depends on
 which field: `--gpus`, `--env`, `--cache-dir`, `--s3-prefix`,
-`--retention-days`, `--idle-min` and `--ttl-hours` are the **host's own**
+`--retention-days`, `--workdir-days`, `--idle-min` and `--ttl-hours` are the **host's own**
 config, so they are written through to its `config.json` immediately — the host
 has to answer, and every change is reported as `host <- …`. `--persistent-root`
 and `--gpuc-home` are *addresses*, kept here (`here <- …`) and applied to the

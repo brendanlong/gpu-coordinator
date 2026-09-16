@@ -42,9 +42,9 @@ KILL_GRACE_S = 15.0
 TERMINATE_RETRY_S = 600.0
 MAX_CONSECUTIVE_FAILURES = 20
 RETENTION_INTERVAL_S = 3600.0
-"""How often a dispatcher with `retention_days` set runs the purge.
+"""How often a dispatcher with `retention_days` or `workdir_days` set reclaims.
 
-Once at startup and then hourly: deleting week-old job dirs is not urgent, and
+Once at startup and then hourly: deleting day-old venvs is not urgent, and
 on a non-ephemeral host the dispatcher only lives while there is work, so the
 startup pass is the one that usually fires.
 """
@@ -392,7 +392,8 @@ class Dispatcher:
     _queue_empty_since: float | None = None
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
-    _last_purge_at: float | None = None
+    _last_reclaim_at: float | None = None
+    _to_measure: list[str] = field(default_factory=list)
     _kill_sent: dict[str, float] = field(default_factory=dict)
     _kill_escalated: set[str] = field(default_factory=set)
     _pause_drain_pending: bool = False
@@ -960,20 +961,41 @@ class Dispatcher:
         )
 
     # -- retention -------------------------------------------------------
-    def maybe_purge(self) -> None:
-        """Run the retention purge at startup, then at most once an hour.
+    def maybe_reclaim(self) -> None:
+        """Run the two retention horizons at startup, then at most once an hour.
 
-        Never forced: an automatic sweep that could delete the only copy of a
-        job's log is not something anyone should have to opt out of.
+        They are separate because they cost different things. `workdir_days`
+        reclaims only what `gpuc requeue` can rebuild from git, so it is short
+        by default and needs no mirror; `retention_days` deletes the record of
+        a run, so it is long, opt-in, and never forced -- an automatic sweep
+        that could bin the only copy of a job's log is not something anyone
+        should have to opt out of.
+
+        Both passes go through `automatic=True`, which is what keeps a sweep
+        nobody asked for off a job that said `cleanup: never` or whose
+        `outputs:` have not reached the mirror yet.
+
+        Purge first: it takes whole job dirs, and the workdir sweep afterwards
+        should not spend its report on dirs that are already gone. Drawing up
+        what still needs measuring comes last, for the same reason -- and
+        happens even with neither horizon set, because `status` reads those
+        figures either way. The measuring itself is paced by
+        `measure_one_workdir`, one per loop.
         """
-        days = self.config.retention_days
-        if days is None:
-            return
         now = self.deps.monotonic()
-        if self._last_purge_at is not None and now - self._last_purge_at < RETENTION_INTERVAL_S:
+        if self._last_reclaim_at is not None and now - self._last_reclaim_at < RETENTION_INTERVAL_S:
             return
-        self._last_purge_at = now
-        result = cleanup.purge(older_than_days=days, now=self.deps.utcnow())
+        self._last_reclaim_at = now
+        purge_days = self.config.retention_days
+        workdir_days = self.config.workdir_days
+        if purge_days is not None:
+            self._purge(purge_days)
+        if workdir_days is not None:
+            self._sweep_workdirs(workdir_days)
+        self._to_measure = self.find_workdirs_to_measure()
+
+    def _purge(self, days: float) -> None:
+        result = cleanup.purge(older_than_days=days, now=self.deps.utcnow(), automatic=True)
         if result.purged or result.removed:
             purged = ", ".join(c.job_id for c in result.purged) or "none"
             self.log(
@@ -984,6 +1006,65 @@ class Dispatcher:
         for error in result.errors:
             self.log(f"retention: {error}")
 
+    def find_workdirs_to_measure(self) -> list[str]:
+        """Finished jobs whose recorded `workdir_bytes` is missing or stale.
+
+        Missing is the runner's two gaps: a job that ended before the field
+        existed, and a runner that died before writing it. Stale is a job whose
+        workdir has since gone but whose figure did not follow it -- `status`
+        would advertise disk that `clean` cannot free, because a job with no
+        workdir is not a candidate for anything, so nothing else would ever
+        put it right.
+        """
+        wanted: list[str] = []
+        for job_id in jobs.list_job_ids():
+            try:
+                state = jobs.read_state(job_id)
+            except (RuntimeError, OSError):
+                continue
+            if not state.finished:
+                continue
+            recorded = state.workdir_bytes
+            never_measured = recorded is None
+            outlived_its_workdir = bool(recorded) and not paths.workdir(job_id).is_dir()
+            if never_measured or outlived_its_workdir:
+                wanted.append(job_id)
+        return wanted
+
+    def measure_one_workdir(self) -> None:
+        """Measure at most one workdir per pass, draining the list found hourly.
+
+        One per pass, not the whole list: measuring is an ioctl per file, and a
+        host coming up after an upgrade with sixty unmeasured venvs would spend
+        a minute and a half inside `run_once` -- during which nothing launches
+        a queued job on a free GPU and the cancel and TTL backstops do not run.
+        One at a time clears the same sixty in two minutes of loop iterations
+        and never holds the loop for longer than a single walk.
+        """
+        while self._to_measure:
+            job_id = self._to_measure.pop()
+            try:
+                state = jobs.read_state(job_id)
+            except (RuntimeError, OSError):
+                continue
+            # It may have been purged, or measured by its own runner, since the
+            # list was drawn up.
+            if not state.finished:
+                continue
+            cleanup.record_workdir_size(job_id)
+            return
+
+    def _sweep_workdirs(self, days: float) -> None:
+        result = cleanup.clean(older_than_days=days, now=self.deps.utcnow(), automatic=True)
+        if result.removed:
+            self.log(
+                f"workdirs ({days:g} days): removed {len(result.removed)} workdir(s), freeing "
+                f"{cleanup.human_bytes(result.freed_bytes)}; "
+                f"{', '.join(c.job_id for c in result.removed)}"
+            )
+        for error in result.errors:
+            self.log(f"workdirs: {error}")
+
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
         self._config = jobs.read_config()
@@ -993,7 +1074,8 @@ class Dispatcher:
         self.escalate_kills()
         self.check_pause()
         self.launch_ready()
-        self.maybe_purge()
+        self.maybe_reclaim()
+        self.measure_one_workdir()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:
