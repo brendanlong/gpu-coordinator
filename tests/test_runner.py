@@ -729,8 +729,36 @@ def test_an_ephemeral_host_keeps_the_secrets_file_for_the_drain(
         secrets=["AWS_ACCESS_KEY_ID"],
     )
     paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
-    runner.run_job(job_id, deps(command_runner=command_runner))
+    # Past the sync preflight: a job that fails *that* never runs, and the
+    # drain skips it, so it is not the shape this is about.
+    runner.run_job(job_id, deps(command_runner=command_runner, sync_preflight=False))
+    assert jobs.read_state(job_id).reason == "sync"
     assert paths.job_env_file(job_id).exists()
+
+
+def test_a_job_that_produced_nothing_does_not_keep_its_secrets_file(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain only retries jobs that are holding something. Keeping a job's
+    credentials on disk for a retry that will never come is pure exposure."""
+    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    jobs.write_config(
+        HostConfig(
+            host="pod",
+            gpus=[],
+            s3_prefix="s3://b/gpuc/pod",
+            provider={"kind": "runpod", "pod_id": "p1"},
+        )
+    )
+    command_runner, _ = uploading(fail_dest="s3://bucket/")
+    job_id = prepare(
+        command="echo nothing-under-results",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+        secrets=["AWS_ACCESS_KEY_ID"],
+    )
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    runner.run_job(job_id, deps(command_runner=command_runner, sync_preflight=False))
+    assert not paths.job_env_file(job_id).exists()
 
 
 def test_a_shared_host_still_removes_the_secrets_file(

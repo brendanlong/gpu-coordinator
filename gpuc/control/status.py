@@ -514,7 +514,10 @@ def render(
     for job in finished[:recent]:
         detail = job.reason or (f"exit {job.exit_code}" if job.exit_code else "")
         flag = ""
-        if job.outputs_lost:
+        if job.outputs_lost and job.outputs_pending:
+            # `outputs_lost` is written once and never cleared, so it outlives
+            # the thing it describes: a job the host now reports as holding
+            # nothing is not a lost result, whatever a past drain concluded.
             flag = "  OUTPUTS LOST"
         elif job.outputs_pending:
             flag = "  outputs not uploaded"
