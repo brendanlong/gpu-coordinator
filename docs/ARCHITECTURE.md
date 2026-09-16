@@ -389,8 +389,8 @@ after any outcome, `never` not at all (the table is in usage.md). No policy ever
 removes the workdir of a job that is not finished, and the removal happens after
 the final sync and the final state write, never before.
 
-`python -m gpuc.host clean (--all-finished | --older-than DAYS) [--dry-run]`
-is the after-the-fact sweep, driven by `gpuc clean --host H`. It prints JSON:
+`python -m gpuc.host clean (--all-finished | --older-than DAYS | --only IDS)
+[--dry-run]` is the after-the-fact sweep, driven by `gpuc clean --host H`. It prints JSON:
 per-job `bytes` (du-style allocated blocks, deduplicated by inode within the
 tree), what was skipped and why, and the staged specs it removed. It fails
 closed everywhere: a running or queued job, a job whose `state.json` is missing
@@ -402,10 +402,11 @@ window in which that file is load-bearing is one SSH round trip.
 ## Retention and purge
 
 `clean` keeps `spec.json`, `state.json` and `log.txt` forever. `python -m
-gpuc.host purge [--older-than DAYS] [--dry-run] [--force] [--only IDS]` (driven
-by `gpuc clean --host H --purge`) removes the whole `jobs/<id>/`, plus any stray
-queue marker, secrets file and staged spec, for finished jobs older than DAYS
-(default 7, from `ended_at`) that carry two records in their own `state.json`:
+gpuc.host purge [--older-than DAYS] [--dry-run] [--force] [--only IDS]
+[--sweep-only IDS]` (driven by `gpuc clean --host H --purge`) removes the whole
+`jobs/<id>/`, plus any stray queue marker, secrets file and staged spec, for
+finished jobs older than DAYS (default 7, from `ended_at`) that carry two
+records in their own `state.json`:
 
 - `meta_synced_at` -- the final `sync_job_meta` returned 0, so log and state are
   in S3. The local state is the authority: the host cannot consult the mirror
@@ -429,8 +430,34 @@ queue marker, secrets file and staged spec, for finished jobs older than DAYS
 `forced` so the report says so loudly. Running, queued and unreadable-state jobs
 are never purged, forced or not; `--purge` also runs the ordinary workdir sweep,
 which is what reclaims the jobs the purge refused; `--only` narrows what may be
-*purged* and nothing else. The purge removes the whole `jobs/<id>/` plus that
-job's queue marker, staged spec and `secrets/<id>.env`.
+*purged* and `--sweep-only` narrows that sweep. The purge removes the whole
+`jobs/<id>/` plus that job's queue marker, staged spec and `secrets/<id>.env`.
+
+`gpuc clean --host H --only ID[,ID...]` is the user-facing form of both, sent
+as `--only` *and* `--sweep-only`, so purging one job does not reclaim every
+other finished job's venv on the way past. The two host flags stay separate
+because `--verify` needs them to differ: it purges the ids whose mirrored
+`log.txt` answered and sweeps the ids the user asked about, which is how a named
+job that failed verification still gets its workdir back.
+
+Naming ids *replaces* the age gate rather than tightening it: a named job is
+purged and swept whatever `--older-than` says and even if its `state.json`
+records no usable `ended_at`, which is the shape a job whose state write was cut
+short has -- exactly the stuck kind somebody names. The preconditions are
+untouched: a named job with no confirmed mirror or unconfirmed outputs still
+needs `--force`, and a running or queued one is never touched at all.
+
+A named id no job dir matches is a typo, and a typo in a delete is not
+half-honoured: the host reports it, removes nothing at all, and exits 1. That
+exit code is why `clean` and `purge` are the two subcommands the control side
+reads with `host_json(check=False)` -- their document *is* the report of the
+failure, and raising on the exit code would throw away the account of what did
+and did not go. The control side refuses an empty `--only` before it can become
+"none of them".
+
+`--only` needs a host package that knows `--sweep-only`; an older one rejects
+the command line in argparse, before any subcommand runs, so nothing is deleted
+and the error says to re-run `gpuc host bootstrap`.
 
 `HostConfig.retention_days` (registry `HostEntry.retention_days`, `gpuc host
 add|set --retention-days N`, null by default) makes the dispatcher purge, never

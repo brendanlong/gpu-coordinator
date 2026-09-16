@@ -71,6 +71,22 @@ def test_host_json_without_any_json_says_what_it_got() -> None:
     assert "command not found" in str(excinfo.value)
 
 
+def test_host_json_can_keep_a_report_from_a_host_that_exited_one() -> None:
+    """`clean` and `purge` exit 1 *with* the account of what they deleted."""
+    report = '{"freed_bytes": 0, "errors": ["a: no job with that id on this host"]}'
+    assert session(report, returncode=1).host_json("purge --only a", check=False) == json.loads(
+        report
+    )
+
+
+def test_host_json_that_kept_going_still_fails_when_there_is_no_document() -> None:
+    with pytest.raises(RemoteError) as excinfo:
+        session("Traceback (most recent call last):\n", returncode=1).host_json(
+            "purge", check=False
+        )
+    assert "exited 1 and expected JSON on stdout" in str(excinfo.value)
+
+
 def test_host_command_pins_gpuc_home_and_pythonpath() -> None:
     command = host_command("/py", "/home/u/.gpuc", "status")
     assert 'GPUC_HOME="/home/u/.gpuc"' in command

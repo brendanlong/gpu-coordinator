@@ -146,28 +146,74 @@ def cmd_run(args: argparse.Namespace) -> int:
     return runner.run_job(args.job_id)
 
 
-def cmd_clean(args: argparse.Namespace) -> int:
-    result = cleanup.clean(
-        all_finished=args.all_finished,
-        older_than_days=args.older_than,
-        dry_run=args.dry_run,
+def _selection(value: str | None) -> list[str] | None:
+    """A `--only`-style comma-separated list of job ids.
+
+    `--only ''` means "none of them", which is not the same as not passing it
+    at all: the control side's `--verify` sends exactly that when no
+    candidate's mirror could be confirmed.
+    """
+    return None if value is None else [j for j in (p.strip() for p in value.split(",")) if j]
+
+
+def _refusal(dry_run: bool, *selections: list[str] | None) -> cleanup.CleanResult | None:
+    """A report saying nothing was deleted, if any named job id is a typo.
+
+    Checked before anything goes, and it refuses the whole selection rather
+    than honouring the half it recognises: `--only a,b` with one typo is far
+    more likely to be a mistyped id than a deliberate pair, and the half this
+    would delete is not recoverable. Nothing else here half-honours a delete
+    either.
+    """
+    named = {job_id for selection in selections if selection for job_id in selection}
+    unknown = sorted(named - set(jobs.list_job_ids()))
+    if not unknown:
+        return None
+    return cleanup.CleanResult(
+        dry_run=dry_run,
+        s3_prefix=cleanup.host_s3_prefix(),
+        errors=[f"{job_id}: no job with that id on this host" for job_id in unknown]
+        + ["refused the whole selection: nothing was removed"],
     )
+
+
+def _emit(result: cleanup.CleanResult) -> int:
     print(json.dumps(result.to_dict(), indent=2))
     return 1 if result.errors else 0
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    only = _selection(args.only)
+    refused = _refusal(args.dry_run, only)
+    if refused:
+        return _emit(refused)
+    return _emit(
+        cleanup.clean(
+            # Naming a job id is the selection: a named job's age is not a
+            # reason to keep its workdir.
+            all_finished=args.all_finished or only is not None,
+            older_than_days=args.older_than,
+            dry_run=args.dry_run,
+            only=only,
+        )
+    )
 
 
 def cmd_purge(args: argparse.Namespace) -> int:
-    result = cleanup.purge(
-        older_than_days=args.older_than,
-        dry_run=args.dry_run,
-        force=args.force,
-        # `--only ''` means "none of them", which is not the same as not
-        # passing it at all: the control side's `--verify` sends exactly that
-        # when no candidate's mirror could be confirmed.
-        only=None if args.only is None else [j for j in args.only.split(",") if j],
+    only = _selection(args.only)
+    sweep_only = _selection(args.sweep_only)
+    refused = _refusal(args.dry_run, only, sweep_only)
+    if refused:
+        return _emit(refused)
+    return _emit(
+        cleanup.purge(
+            older_than_days=args.older_than,
+            dry_run=args.dry_run,
+            force=args.force,
+            only=only,
+            sweep_only=sweep_only,
+        )
     )
-    print(json.dumps(result.to_dict(), indent=2))
-    return 1 if result.errors else 0
 
 
 def cmd_resume(_: argparse.Namespace) -> int:
@@ -208,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
     selection = clean.add_mutually_exclusive_group(required=True)
     selection.add_argument("--all-finished", action="store_true")
     selection.add_argument("--older-than", type=float, metavar="DAYS")
+    selection.add_argument(
+        "--only",
+        help="comma-separated job ids whose workdirs may go, and no others, whatever "
+        "their age. Empty means clean nothing.",
+    )
     clean.add_argument("--dry-run", action="store_true")
     clean.set_defaults(func=cmd_clean)
 
@@ -229,8 +280,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     purge.add_argument(
         "--only",
-        help="comma-separated job ids that may be purged, and no others; the implied "
-        "workdir sweep is unaffected. Empty means purge nothing.",
+        help="comma-separated job ids that may be purged, and no others, whatever their "
+        "age; the implied workdir sweep is unaffected. Empty means purge nothing.",
+    )
+    purge.add_argument(
+        "--sweep-only",
+        help="comma-separated job ids the implied workdir sweep may touch, and no "
+        "others, whatever their age; by default it covers every finished job past "
+        "the horizon",
     )
     purge.set_defaults(func=cmd_purge)
 

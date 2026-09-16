@@ -131,6 +131,31 @@ def _purged_line(job: dict[str, Any], *, dry_run: bool) -> str:
 PURGE_EVERYTHING_NOTE = "purging every finished job (horizon 0), however recently it ended"
 
 
+def only_note(only: list[str]) -> str:
+    return (
+        f"--only {','.join(only)}: age horizon 0 for exactly these jobs, and the workdir "
+        f"sweep --purge implies is scoped to them too"
+    )
+
+
+def parse_only(value: str | None) -> list[str] | None:
+    """`--only a,b` as a list of job ids, or None if the flag was not given.
+
+    Empty is a usage error rather than the host's "none of them": a `--only`
+    that expanded from a shell variable nobody set must not quietly become a
+    no-op (or, worse, everything).
+    """
+    if value is None:
+        return None
+    wanted = [job_id.strip() for job_id in value.split(",")]
+    wanted = [job_id for job_id in wanted if job_id]
+    if not wanted:
+        raise CleanUsageError(
+            "--only needs at least one job id, e.g. --only 20260101-000000-abcdef"
+        )
+    return list(dict.fromkeys(wanted))
+
+
 def check_flags(
     *,
     all_finished: bool = False,
@@ -140,6 +165,7 @@ def check_flags(
     force: bool = False,
     verify: bool = False,
     yes: bool = False,
+    only: list[str] | None = None,
 ) -> None:
     """The one place `gpuc clean`'s flag combinations are judged.
 
@@ -148,9 +174,16 @@ def check_flags(
     """
     if (force or verify) and not purge:
         raise CleanUsageError("--force and --verify only mean something with --purge")
-    if not purge and not all_finished and older_than_days is None:
+    if only is not None and (all_finished or older_than_days is not None):
         raise CleanUsageError(
-            f"clean needs --all-finished, --older-than DAYS, or --purge "
+            "--only names the jobs itself, so it cannot be combined with --all-finished "
+            "or --older-than"
+        )
+    if only is not None and not only:
+        raise CleanUsageError("--only needs at least one job id")
+    if not purge and only is None and not all_finished and older_than_days is None:
+        raise CleanUsageError(
+            f"clean needs --all-finished, --older-than DAYS, --only ID[,ID...], or --purge "
             f"(which defaults to --older-than {DEFAULT_RETENTION_DAYS:g})"
         )
     if purge and all_finished and not (yes or dry_run):
@@ -177,6 +210,7 @@ def clean_host(
     force: bool = False,
     verify: bool = False,
     yes: bool = False,
+    only: list[str] | None = None,
     s3_client: Any | None = None,
 ) -> CleanReport:
     check_flags(
@@ -187,6 +221,7 @@ def clean_host(
         force=force,
         verify=verify,
         yes=yes,
+        only=only,
     )
     session = session or open_session(entry, settings)
     if purge:
@@ -199,21 +234,26 @@ def clean_host(
             dry_run=dry_run,
             force=force,
             verify=verify,
+            only=only,
             s3_client=s3_client,
         )
         if all_finished:
             report.notes.insert(0, PURGE_EVERYTHING_NOTE)
+        if only:
+            report.notes.insert(0, only_note(only))
         return report
     args = ["clean"]
     if all_finished:
         args.append("--all-finished")
+    if only is not None:
+        args += ["--only", shlex.quote(",".join(only))]
     if older_than_days is not None:
         args += ["--older-than", str(older_than_days)]
     if dry_run:
         args.append("--dry-run")
     # A workdir walk over many jobs is minutes of stat() on a slow volume, and
     # the host CLI is doing the deleting too.
-    payload = session.host_json(" ".join(args), timeout=900.0)
+    payload = session.host_json(" ".join(args), timeout=900.0, check=False)
     return _report(entry.name, payload)
 
 
@@ -235,7 +275,12 @@ def _report(host: str, payload: Any, **extra: Any) -> CleanReport:
 
 
 def _purge_args(
-    older_than_days: float, *, dry_run: bool, force: bool, only: list[str] | None
+    older_than_days: float,
+    *,
+    dry_run: bool,
+    force: bool,
+    only: list[str] | None,
+    sweep_only: list[str] | None = None,
 ) -> str:
     args = ["purge", "--older-than", str(older_than_days)]
     if dry_run:
@@ -244,6 +289,8 @@ def _purge_args(
         args.append("--force")
     if only is not None:
         args += ["--only", shlex.quote(",".join(only))]
+    if sweep_only is not None:
+        args += ["--sweep-only", shlex.quote(",".join(sweep_only))]
     return " ".join(args)
 
 
@@ -257,6 +304,7 @@ def purge_host(
     dry_run: bool = False,
     force: bool = False,
     verify: bool = False,
+    only: list[str] | None = None,
     s3_client: Any | None = None,
 ) -> CleanReport:
     """Remove whole job dirs on a host, optionally checking the mirror first.
@@ -266,21 +314,29 @@ def purge_host(
     available to a host with no credentials of ours. With it we HEAD the
     mirrored `log.txt` ourselves: a dry run then *labels* each candidate, and a
     real purge only deletes the ones that answered.
+
+    `only` is the user naming job ids: an age horizon of 0 for exactly those
+    jobs, with the implied workdir sweep scoped to them as well, so purging one
+    job does not reclaim the rest of the host's venvs as a side effect.
     """
     session = session or open_session(entry, settings)
     days = (
         0.0
-        if all_finished
+        if all_finished or only is not None
         else (DEFAULT_RETENTION_DAYS if older_than_days is None else older_than_days)
     )
     if not verify:
         payload = session.host_json(
-            _purge_args(days, dry_run=dry_run, force=force, only=None), timeout=900.0
+            _purge_args(days, dry_run=dry_run, force=force, only=only, sweep_only=only),
+            timeout=900.0,
+            check=False,
         )
         return _report(entry.name, payload, purge=True)
 
     preview = session.host_json(
-        _purge_args(days, dry_run=True, force=force, only=None), timeout=900.0
+        _purge_args(days, dry_run=True, force=force, only=only, sweep_only=only),
+        timeout=900.0,
+        check=False,
     )
     report = _report(entry.name, preview, purge=True)
     verified, unverified = verify_mirror(entry, report, settings, client=s3_client)
@@ -296,12 +352,22 @@ def purge_host(
         int(job.get("bytes") or 0) for job in report.removed
     )
     if dry_run:
+        if report.purge_skipped:
+            # The host sized its dry-run sweep over the dirs it expected to
+            # purge, so the workdirs of the jobs we are about to drop from that
+            # list are in neither total. The real run does reclaim them.
+            report.notes.append(
+                "the job dirs above stay, but the real run still reclaims their workdirs, "
+                "which this dry run has not sized"
+            )
         return report
     # `--only` with the verified ids -- possibly none of them, which the host
     # reads as "purge nothing", while the workdir sweep `--purge` implies still
-    # runs.
+    # runs over whatever the user asked about.
     payload = session.host_json(
-        _purge_args(days, dry_run=False, force=force, only=sorted(keep)), timeout=900.0
+        _purge_args(days, dry_run=False, force=force, only=sorted(keep), sweep_only=only),
+        timeout=900.0,
+        check=False,
     )
     final = _report(entry.name, payload, purge=True)
     final.verified = verified

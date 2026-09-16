@@ -381,9 +381,11 @@ class StubSession:
     def __init__(self, payloads: list[dict[str, object]]) -> None:
         self.payloads = payloads
         self.calls: list[str] = []
+        self.checked: list[bool] = []
 
-    def host_json(self, args: str, *, timeout: float = 0.0) -> object:
+    def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
         self.calls.append(args)
+        self.checked.append(check)
         return self.payloads.pop(0)
 
 
@@ -480,6 +482,121 @@ def test_clean_with_no_selection_and_no_purge_exits(
     main(["host", "add", "gpubox", "--ssh", "me@box"])
     assert main(["clean", "--host", "gpubox"]) == EXIT_USAGE
     assert "--all-finished" in capsys.readouterr().err
+
+
+# -- clean --only -------------------------------------------------------------
+
+
+def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
+    control_env: Path,
+) -> None:
+    """Naming ids is the confirmation `--purge --all-finished` needs `--yes` for."""
+    from gpuc.control.clean import clean_host
+
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    session = StubSession([{"dry_run": False, "purged": [purged_entry("a")], "freed_bytes": 1}])
+    report = clean_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        purge=True,
+        only=["a", "b"],
+    )
+    assert session.calls == ["purge --older-than 0.0 --only a,b --sweep-only a,b"]
+    assert "--only a,b" in report.render()
+    # A host that exits 1 has still said what it deleted; the report is the
+    # point of the call, so `clean` must not let the exit code discard it.
+    assert session.checked == [False]
+
+
+def test_only_without_purge_cleans_just_those_workdirs(control_env: Path) -> None:
+    from gpuc.control.clean import clean_host
+
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    session = StubSession([{"dry_run": False, "removed": [], "freed_bytes": 0}])
+    clean_host(entry, Settings(), session=as_session(session), only=["a"])
+    assert session.calls == ["clean --only a"]
+
+
+def test_only_with_verify_purges_what_answered_and_sweeps_what_was_asked(
+    control_env: Path,
+) -> None:
+    client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    session = StubSession(
+        [
+            {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
+            {"dry_run": False, "purged": [purged_entry("kept")], "freed_bytes": 1024},
+        ]
+    )
+    report = purge_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        only=["kept", "gone"],
+        verify=True,
+        s3_client=client,
+    )
+    assert report.verified == ["kept"]
+    assert "--only kept,gone --sweep-only kept,gone" in session.calls[0]
+    # The job whose mirror never answered keeps its dir and still loses its venv.
+    assert session.calls[1].endswith("--only kept --sweep-only kept,gone")
+
+
+def test_a_dry_run_says_the_workdirs_verification_dropped_will_still_go(
+    control_env: Path,
+) -> None:
+    """The host sized its sweep over the dirs it expected to purge, so the
+    workdirs of the jobs we then drop are in neither total."""
+    client = FakeS3Client()
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    session = StubSession([{"dry_run": True, "purged": [purged_entry("gone")]}])
+    report = purge_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        only=["gone"],
+        verify=True,
+        dry_run=True,
+        s3_client=client,
+    )
+    assert report.purged == []
+    assert any("still reclaims their workdirs" in note for note in report.notes)
+
+
+def test_purge_only_needs_no_yes(control_env: Path) -> None:
+    from gpuc.control.clean import check_flags
+
+    check_flags(purge=True, only=["a"])
+
+
+@pytest.mark.parametrize("extra", [["--all-finished"], ["--older-than", "7"]])
+def test_only_cannot_be_combined_with_an_age_horizon(
+    control_env: Path, capsys: pytest.CaptureFixture[str], extra: list[str]
+) -> None:
+    """argparse rejects the command line; `check_flags` judges it for callers."""
+    from gpuc.control.clean import CleanUsageError, check_flags
+
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    with pytest.raises(SystemExit) as caught:
+        main(["clean", "--host", "gpubox", "--only", "a", *extra])
+    assert caught.value.code == EXIT_USAGE
+    assert "not allowed with argument --only" in capsys.readouterr().err
+    with pytest.raises(CleanUsageError, match="cannot be combined"):
+        check_flags(
+            only=["a"],
+            all_finished="--all-finished" in extra,
+            older_than_days=None if "--all-finished" in extra else 7.0,
+        )
+
+
+def test_an_empty_only_is_a_usage_error_not_a_silent_no_op(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host reads `--only ''` as "purge nothing"; a user never means that."""
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    assert main(["clean", "--host", "gpubox", "--purge", "--only", " , "]) == EXIT_USAGE
+    assert "at least one job id" in capsys.readouterr().err
 
 
 def test_retention_days_is_stored_and_cleared(control_env: Path) -> None:

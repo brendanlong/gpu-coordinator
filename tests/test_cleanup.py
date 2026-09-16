@@ -309,6 +309,60 @@ def test_host_cli_clean_requires_a_selection(gpuc_home: Path) -> None:
         host_cli.main(["clean"])
 
 
+def test_host_cli_clean_only_takes_the_named_jobs_however_recent(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Naming a job id is the selection: its age is not a reason to keep it."""
+    wanted = finished_job("succeeded")
+    other = finished_job("succeeded")
+    assert host_cli.main(["clean", "--only", wanted]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [c["job_id"] for c in payload["removed"]] == [wanted]
+    assert not paths.workdir(wanted).exists()
+    assert (paths.workdir(other) / "blob.bin").exists()
+
+
+def test_host_cli_clean_only_empty_means_none(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = finished_job("succeeded")
+    assert host_cli.main(["clean", "--only", ""]) == 0
+    assert json.loads(capsys.readouterr().out)["removed"] == []
+    assert (paths.workdir(job_id) / "blob.bin").exists()
+
+
+def test_host_cli_clean_refuses_a_selection_holding_a_job_id_it_does_not_know(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = finished_job("succeeded")
+    assert host_cli.main(["clean", "--only", f"{job_id},20260101-000000-typo11"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["errors"] == [
+        "20260101-000000-typo11: no job with that id on this host",
+        "refused the whole selection: nothing was removed",
+    ]
+    assert payload["removed"] == []
+    assert (paths.workdir(job_id) / "blob.bin").exists()
+
+
+def test_host_cli_clean_only_ignores_a_job_with_no_usable_ended_at(gpuc_home: Path) -> None:
+    job_id = finished_job("failed")
+    jobs.update_state(job_id, ended_at=None)
+    assert host_cli.main(["clean", "--only", job_id]) == 0
+    assert not paths.workdir(job_id).exists()
+
+
+def test_host_cli_clean_only_says_when_a_named_workdir_is_already_gone(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = finished_job("succeeded")
+    cleanup.clean(all_finished=True)
+    assert host_cli.main(["clean", "--only", job_id]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed"] == []
+    assert [s["why"] for s in payload["skipped"]] == ["workdir already gone"]
+
+
 def test_host_cli_status_reports_workdir_bytes(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
