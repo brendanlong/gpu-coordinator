@@ -473,6 +473,10 @@ def next_free_line(view: HostView) -> str | None:
     or go and pay for a pod. It says how many of the running jobs offered
     nothing to estimate from, because the real answer can only be *sooner* than
     this -- one of those could finish in a minute.
+
+    It is a time or it is nothing. A host where no running job estimated
+    anything has no answer to give, and saying so under a `free` label, next to
+    a gpu list that already says every card is busy, is a line to scan past.
     """
     # `gpus: 0` jobs are running but hold no card, so they can never be the
     # reason one comes free -- and naming a five-minute CPU job as the next
@@ -485,12 +489,9 @@ def next_free_line(view: HostView) -> str | None:
         remaining = job.eta_seconds
         if remaining is not None:
             known.append((remaining, job))
-    silent = len(holding) - len(known)
     if not known:
-        return (
-            f"  free    every card is busy and none of the {silent} running job(s) estimated "
-            f"an end time"
-        )
+        return None
+    silent = len(holding) - len(known)
     remaining, job = min(known, key=lambda pair: pair[0])
     when = "overdue" if remaining < 0 else f"in ~{format_duration(remaining)}"
     note = f"; {silent} other running job(s) gave no estimate" if silent else ""

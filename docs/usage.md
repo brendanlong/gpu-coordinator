@@ -123,6 +123,8 @@ is expected:
 
 The `free` line says how many running jobs offered no estimate, because the real
 answer can only ever be *sooner* than it: one of those could finish in a minute.
+It is printed only when at least one running job estimated something; a host
+where none did says nothing, since its gpu lines already say every card is busy.
 
 ## What gets synced to the host
 

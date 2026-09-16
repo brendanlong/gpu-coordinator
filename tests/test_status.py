@@ -518,8 +518,14 @@ def test_a_cpu_only_job_is_never_named_as_the_next_card_to_free_up() -> None:
             running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)),
         )
     )
-    assert "j-cpu" not in text.split("free    ")[-1]
-    assert "none of the 1 running job(s) estimated an end time" in text
+    assert "free    " not in text
+    text = render(
+        busy(
+            running_job(job_id="j-train", gpus=[GPU, "GPU-b"], eta=in_minutes(200)),
+            running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)),
+        )
+    )
+    assert "free    next card in ~3h20m (j-train)" in text
 
 
 def test_a_host_running_only_cpu_jobs_has_no_next_card_line() -> None:
@@ -575,9 +581,9 @@ def test_the_next_free_line_owns_up_to_the_jobs_it_could_not_estimate() -> None:
     assert "next card in ~3h20m (j-known); 1 other running job(s) gave no estimate" in text
 
 
-def test_a_busy_host_where_nothing_estimated_anything_says_that_plainly() -> None:
+def test_a_busy_host_where_nothing_estimated_anything_stays_quiet() -> None:
     text = render(busy(running_job(gpus=[GPU, "GPU-b"])))
-    assert "every card is busy and none of the 1 running job(s) estimated an end time" in text
+    assert "free    " not in text
 
 
 def test_a_host_with_a_free_card_does_not_guess_about_the_next_one() -> None:
