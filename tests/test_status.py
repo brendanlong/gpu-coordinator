@@ -790,6 +790,17 @@ def test_a_running_jobs_priority_comes_from_the_spec_when_its_marker_is_gone() -
     assert finished[0].priority == 0
 
 
+def test_the_highest_priority_there_is_still_comes_from_the_marker() -> None:
+    """`0` is a real priority, so the fallback to the spec cannot be an `or`:
+    a job reordered to the front would report the priority it was submitted at."""
+    document = payload(
+        queue=[{"priority": 0, "job_id": "j-queued"}],
+        jobs=[{"job_id": "j-queued", "status": "queued", "priority": 50}],
+    )
+    queued, _, _ = job_views(document)
+    assert queued[0].priority == 0
+
+
 def test_a_host_too_old_to_report_a_priority_says_nothing_rather_than_guessing() -> None:
     _, running, _ = job_views(payload(jobs=[{"job_id": "j-running", "status": "running"}]))
     assert running[0].priority is None
@@ -849,6 +860,14 @@ def test_a_two_card_job_does_not_hold_up_the_one_card_job_behind_it() -> None:
     assert 44 * 60 < starts["j-narrow"] < 46 * 60
     assert 89 * 60 < starts["j-wide"] < 91 * 60
     assert "needs 2 gpus" in render(view)
+
+
+def test_a_cpu_job_is_not_described_as_needing_no_cards() -> None:
+    """`gpus: 0` is ignored everywhere else here -- it holds no card and never
+    waits for one -- and `needs 0 gpus` is a line to stop and re-read."""
+    view = busy(running_job(gpus=[GPU, "GPU-b"]), queued=[waiting("j-cpu", gpus_requested=0)])
+    assert "needs" not in render(view)
+    assert "queued  j-cpu prio=50 starts now" in render(view)
 
 
 def test_nothing_starts_on_a_paused_or_draining_host() -> None:
@@ -915,9 +934,25 @@ def test_an_unreachable_host_places_nothing_rather_than_reporting_an_empty_queue
     assert queue_note(placement) is None
 
 
-def test_a_queued_job_whose_turn_cannot_be_dated_says_so_rather_than_nothing() -> None:
+def test_a_queued_job_whose_turn_cannot_be_dated_says_why() -> None:
+    """Each reason is a different thing to do about it, and "a job ahead of it"
+    is a lie to tell the only job in the queue of a host that is paused."""
     view = busy(running_job(gpus=[GPU, "GPU-b"]), queued=[waiting("j-next")])
     note = queue_note(queue_placement(view, "j-next"))
-    assert (
-        note == "  queue: position 1 of 1; start time unknown (a job ahead of it gave no estimate)"
+    assert note is not None and note.endswith(
+        "start time unknown (the jobs holding the cards it needs gave no end time)"
     )
+
+    view.paused = True
+    assert "host gpubox is paused" in str(queue_note(queue_placement(view, "j-next")))
+    view.paused, view.draining = False, True
+    assert "host gpubox is draining" in str(queue_note(queue_placement(view, "j-next")))
+
+    view.draining = False
+    view.queue = [waiting("j-next", gpus_requested=4)]
+    assert "asks for 4 card(s) and the host has 2" in str(
+        queue_note(queue_placement(view, "j-next"))
+    )
+
+    view.queue = [waiting("j-next", gpus_requested=None)]
+    assert "does not report how many cards" in str(queue_note(queue_placement(view, "j-next")))

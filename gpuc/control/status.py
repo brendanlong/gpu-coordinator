@@ -551,7 +551,9 @@ def _fmt_cards(job: JobView) -> str:
     job waiting for three is the answer to "there is a card free, why is it
     still queued".
     """
-    if job.gpus_requested is None or job.gpus_requested == 1:
+    # `<= 1` and not `== 1`: a `gpus: 0` job holds no card and never waits for
+    # one, which is why it is ignored everywhere else here too.
+    if job.gpus_requested is None or job.gpus_requested <= 1:
         return ""
     return f" needs {job.gpus_requested} gpus"
 
@@ -643,17 +645,46 @@ def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
     """
     if not view.reachable:
         return placement_unknown()
-    queued = [job.job_id for job in view.queue]
-    seconds = queue_start_estimates(view).get(job_id) if job_id in queued else None
+    queued = {job.job_id: job for job in view.queue}
+    job = queued.get(job_id)
+    seconds = queue_start_estimates(view).get(job_id) if job is not None else None
     return {
-        "queue_position": queued.index(job_id) + 1 if job_id in queued else None,
+        "queue_position": list(queued).index(job_id) + 1 if job is not None else None,
         "queue_length": len(queued),
         # Already running: it left the queue between the enqueue and this call,
         # so `queue_position: null` here means dispatched, not unknown.
-        "dispatched": any(job.job_id == job_id for job in view.running),
+        "dispatched": any(running.job_id == job_id for running in view.running),
         "starts_in_s": None if seconds is None else round(seconds, 1),
         "starts_at": _at(seconds),
+        "starts_unknown": None
+        if job is None or seconds is not None
+        else no_start_reason(view, job),
     }
+
+
+def no_start_reason(view: HostView, job: JobView) -> str:
+    """Why this queued job has no projected start time.
+
+    There are several reasons and they are not interchangeable: a submit to a
+    paused host is an ordinary mistake, and this is the moment the submitter is
+    looking. Saying "a job ahead of it gave no estimate" about the only job in
+    the queue of a host that is not dispatching at all would be a lie told at
+    exactly the wrong time.
+    """
+    if view.paused:
+        return f"host {view.entry.name} is paused, so nothing is being dispatched"
+    if view.draining:
+        return f"host {view.entry.name} is draining, so nothing more will be dispatched"
+    if job.gpus_requested is not None and job.gpus_requested > len(view.owned):
+        return (
+            f"it asks for {job.gpus_requested} card(s) and the host has "
+            f"{len(view.owned)}, so it will never be dispatched"
+        )
+    if any(ahead.gpus_requested is None for ahead in view.queue):
+        return "this host does not report how many cards a queued job asked for"
+    # Running or queued: either way, the cards this job is waiting for are
+    # spoken for by something that never said when it would be done with them.
+    return "the jobs holding the cards it needs gave no end time"
 
 
 def placement_unknown() -> dict[str, Any]:
@@ -665,6 +696,7 @@ def placement_unknown() -> dict[str, Any]:
         "dispatched": None,
         "starts_in_s": None,
         "starts_at": None,
+        "starts_unknown": None,
     }
 
 
@@ -678,7 +710,7 @@ def queue_note(placement: dict[str, Any]) -> str | None:
         return None
     when = placement.get("starts_in_s")
     starts = (
-        "start time unknown (a job ahead of it gave no estimate)"
+        f"start time unknown ({placement.get('starts_unknown')})"
         if when is None
         else f"starts {_fmt_wait(when)}"
     )

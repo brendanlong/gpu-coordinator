@@ -182,8 +182,8 @@ The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
 provider_util, gpus, queued, running, finished, errors`; each job in those three
 lists has `job_id, name, status, reason, phase, priority, elapsed_s, util,
 progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
-gpus_requested, iso, ended_at, outputs_pending`, and a queued job also has
-`starts_in_s, starts_at`.
+gpus_requested, starts_in_s, starts_at, iso, ended_at, outputs_pending`
+(`starts_*` are null unless the job is queued).
 
 `priority` (0-99, **lower runs first**) is the field that explains queue order,
 and it is on running jobs too. `queued` is already in dispatch order, so
@@ -199,10 +199,10 @@ scraping any of the text output.
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless) |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a paused host, a job ahead that estimated nothing — and is null when there is one |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `cancel` | `{job_id, host, status}` |
-| `reorder` | `{job_id, host, priority}` plus the same queue fields as `submit`, so you can see the move take effect |
+| `reorder` | `{job_id, host, priority, warnings[]}` plus the same queue fields as `submit`, so you can see the move take effect. A `warnings` entry means the mirrored spec kept the old priority, so a `requeue` would not carry the move |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}` |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |

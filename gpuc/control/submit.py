@@ -29,6 +29,7 @@ from gpuc.control.s3index import (
     S3IndexError,
     default_s3_prefix,
 )
+from gpuc.control.status import placement_unknown
 from gpuc.control.transport import (
     NO_GIT_EXCLUDES,
     Transport,
@@ -256,9 +257,14 @@ class SubmitResult:
     host: str
     attempt: int
     notes: list[str] = field(default_factory=list)
-    placement: dict[str, Any] = field(default_factory=dict)
+    session: HostSession | None = field(default=None, repr=False)
+    """The connection the enqueue was made over, kept so that looking up where
+    the job landed in the queue does not open a second one."""
+    placement: dict[str, Any] = field(default_factory=placement_unknown)
     """Where the job landed in the host's queue, looked up after the enqueue:
-    see `status.queue_placement`. Empty when nobody asked."""
+    see `status.queue_placement`. The default is the "we could not ask" shape,
+    so a caller that never looks still emits the document's promised keys as
+    nulls rather than leaving them out."""
 
     def render(self, queue_note: str | None = None) -> str:
         lines = [f"job {self.job_id} queued on host {self.host} (attempt {self.attempt})"]
@@ -475,7 +481,9 @@ def submit_spec(
             "the host reported no dispatcher pid; run `gpuc host bootstrap` if the job stays queued"
         )
 
-    return SubmitResult(job_id=spec.job_id, host=entry.name, attempt=attempt, notes=notes)
+    return SubmitResult(
+        job_id=spec.job_id, host=entry.name, attempt=attempt, notes=notes, session=session
+    )
 
 
 def submit_file(

@@ -339,10 +339,15 @@ def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings
             f"job {job_id} is not in host {entry.name}'s queue, so its priority cannot "
             f"change (a running or finished job cannot be reordered)."
         )
+    # The mirror, for the same reason `estimate` updates it: `requeue` submits
+    # what S3 holds, so a reorder left out of it would hand the re-run back at
+    # the priority the job was first submitted with.
+    warning = mirror_spec_field(job_id, "priority", priority, settings, what="priority")
     return {
         "job_id": job_id,
         "host": entry.name,
         "priority": priority,
+        "warnings": [warning] if warning else [],
         **queue_placement(entry, job_id, settings, session=session),
     }
 
@@ -380,27 +385,34 @@ def check_estimate(minutes: float | None, *, clear: bool) -> float | None:
     return wanted
 
 
-def mirror_estimate(job_id: str, minutes: float | None, settings: Settings) -> str | None:
-    """Put the new estimate in the job's mirrored spec too, or say why not.
+def mirror_spec_field(
+    job_id: str, field: str, value: Any, settings: Settings, *, what: str
+) -> str | None:
+    """Put a change made to a job's spec on the host in its mirrored spec too,
+    or say why it could not be.
 
-    `requeue` submits what the *mirror* holds, so leaving it behind would hand
-    a re-run of an estimated job back with no estimate, silently. A mirror that
-    cannot be updated is a note and never a failure: the estimate is already
-    recorded where `status` reads it, which is what was asked for.
+    `requeue` submits what the *mirror* holds, so leaving it behind would hand a
+    re-run of the job back with the old value, silently. A mirror that cannot be
+    updated is a note and never a failure: the change is already recorded where
+    `status` reads it, which is what was asked for.
     """
     s3 = S3Index.from_settings(settings)
     if s3 is None:
         return None
     try:
         document = s3.get_spec(job_id)
-        document["estimated_runtime_min"] = minutes
+        document[field] = value
         s3.put_spec_document(job_id, document)
     except (S3IndexError, S3ObjectMissing, ValueError) as exc:
         return (
-            f"the host has the new estimate, but its mirrored spec still has the old one, "
+            f"the host has the new {what}, but its mirrored spec still has the old one, "
             f"so `gpuc requeue {job_id}` would not carry it: {str(exc).splitlines()[0]}"
         )
     return None
+
+
+def mirror_estimate(job_id: str, minutes: float | None, settings: Settings) -> str | None:
+    return mirror_spec_field(job_id, "estimated_runtime_min", minutes, settings, what="estimate")
 
 
 def estimate_job(

@@ -195,6 +195,7 @@ function priorityControl(host, job) {
       button.disabled = true;
       try {
         const result = await post(`/api/jobs/${encodeURIComponent(job.job_id)}/reorder`, { host: host.name, priority });
+        for (const warning of result.warnings || []) notify(warning, "warn");
         notify(`job ${job.job_id} moved to priority ${result.priority}`);
         await load();
       } catch (err) {

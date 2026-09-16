@@ -748,7 +748,7 @@ def _queued(
     "position 3 of 5, starts in ~2h" is the thing the submitter actually wants
     to know and cannot work out from a job id.
     """
-    result.placement = queue_placement(entry, result.job_id, settings)
+    result.placement = queue_placement(entry, result.job_id, settings, session=result.session)
     if args.json:
         jsonout.emit(result.document(requeued_from=requeued_from))
         return EXIT_OK
@@ -944,6 +944,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def cmd_reorder(args: argparse.Namespace) -> int:
     document = reorder_job(args.job_id, args.priority, args.host, load_settings())
+    for text in document["warnings"]:
+        print(f"WARNING: {text}", file=sys.stderr)
     if args.json:
         jsonout.emit(document)
     else:

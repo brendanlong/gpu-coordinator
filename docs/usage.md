@@ -190,9 +190,11 @@ job 20260915-233000-112233 queued on host spar (attempt 1)
 ```
 
 The start time is [projected](#job-length-estimates) from what the jobs ahead
-estimated, so it is `start time unknown` where one of them estimated nothing,
-and the whole line is absent when the host could not be asked again — the job is
-queued either way. A dispatcher that got there first prints `dispatched
+estimated. Where it cannot be projected the line says so *and why* — `start time
+unknown (host spar is paused, so nothing is being dispatched)`, or a job ahead
+that gave no estimate, or a job asking for more cards than the host has — and
+the whole line is absent when the host could not be asked again, since the job
+is queued either way. A dispatcher that got there first prints `dispatched
 already; it is running now`. `gpuc reorder` prints the same line, which is how
 you check that a move did what you wanted.
 
@@ -255,9 +257,10 @@ equivalent command line instead of running it. A `local` host gets your own
 
 **`gpuc reorder <job-id> --priority N`** — queued jobs only; a running or
 finished job cannot be reordered (exit 1). It prints the job's new queue
-position and start time, and the new priority is recorded in the job's spec too,
-so `gpuc status` can still say what priority a job was dispatched at once its
-queue marker is gone.
+position and start time, and the new priority is recorded in the job's spec on
+the host and in its S3 mirror — so `gpuc requeue` carries the move — as well as
+in the queue marker, so `gpuc status` can still say what priority a job was
+dispatched at once the marker is gone.
 
 **`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or
 running job's `estimated_runtime_min`; see [job length
@@ -563,16 +566,19 @@ plus `attempt`, `started_at`, `outputs_lost`, `workdir_bytes`,
 host holds them) and `links` — one `{kind, path, target, url}` per place the
 job's results, its W&B run or its mirrored log can be opened, for the
 [dashboard](#the-web-dashboard) to render; `kind` is `s3`, `hf`, `wandb` or
-`mirror`. `priority` (0–99, lower first) is on every job, queued or not, and
-`queued` is already in dispatch order, so
+`mirror`.
+
+`priority` (0–99, lower first) is on **every** job, queued or not, and `queued`
+is already in dispatch order, so
 `gpuc status --json | jq '.hosts[].queued | sort_by(.priority)'` reproduces the
-order the host will take them in; it is null only from a host too old to report
-it. `gpus_requested` is how many cards the spec asked for — a queued job holds
-none yet, so its `gpus` is empty and this is the only thing that says whether it
-is waiting for one card or eight. `starts_in_s` and `starts_at` are when a
-queued job's turn is expected to come (see
-[the `starts` line](#job-length-estimates)); both are null for anything not
-queued, and for a queued job whose turn depends on one that estimated nothing. Each host also carries `target` (its ssh target), `draining`,
+order the host will take them in. It is null only when the host did not say —
+a build too old to report it, or a spec it could not read. `gpus_requested` is
+how many cards the spec asked for: a queued job holds none yet, so its `gpus` is
+empty and this is the only thing that says whether it is waiting for one card or
+eight. `starts_in_s` and `starts_at` are on every job too, and are when a queued
+job's turn is expected to come (see
+[the `starts` line](#job-length-estimates)); they are null for anything that is
+not queued, and for a queued job whose turn cannot be dated. Each host also carries `target` (its ssh target), `draining`,
 `paused`, `pod_gone` and `pod` (the provider's view of an ephemeral host's pod,
 null elsewhere). `eta` is absolute and `eta_s` is the same instant as seconds from now
 (negative once a job is overdue); both are null unless the job has a
@@ -627,10 +633,10 @@ survived, which never implies a non-zero exit by itself (`clean` and
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued. The queue fields are the host's answer a moment *after* the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, and every one of them is null when the host could not be asked again — never a reason to think the job was not queued |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued. The queue fields are the host's answer a moment *after* the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, `starts_unknown` says why there is no start time (a paused or draining host, a job ahead that estimated nothing, a job that asks for more cards than the host has) and is null when there is one, and every one of them is null when the host could not be asked again — never a reason to think the job was not queued |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
-| `reorder` | `{job_id, host, priority}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s` and `starts_at` as `submit`, so a move can be checked without a second call |
+| `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. `pkg_commit` here is this machine's record of what it last shipped, not what the host runs — that is `status --json`'s `pkg_commit`. Exit 3 if the registry is unreadable |

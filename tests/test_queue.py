@@ -38,12 +38,31 @@ def test_enqueue_does_not_need_the_dispatcher_lock(gpuc_home: Path) -> None:
         lock.release()
 
 
-def test_reorder_renames_the_marker(gpuc_home: Path) -> None:
+def test_reorder_renames_the_marker_and_records_it_in_the_spec(gpuc_home: Path) -> None:
+    """The marker is the move; the spec is the only copy that outlives it, and
+    a running job's priority comes from nowhere else."""
     first = queue.enqueue(make_spec(priority=50))
     second = queue.enqueue(make_spec(priority=50))
     assert queue.reorder(second, 1)
     assert [e.job_id for e in queue.list_queued()] == [second, first]
+    assert jobs.read_spec(second).priority == 1
+    assert jobs.read_spec(first).priority == 50
     assert not queue.reorder("no-such-job", 1)
+
+
+def test_a_spec_that_cannot_be_rewritten_does_not_undo_the_move(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The queue is then in the order that was asked for and only the report of
+    it is stale, which is the better of the two failures."""
+    job_id = queue.enqueue(make_spec(priority=50))
+
+    def unwritable(*_: object, **__: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(queue.jobs, "update_spec", unwritable)
+    assert queue.reorder(job_id, 3)
+    assert queue.list_queued()[0].marker.name.startswith("03-")
 
 
 def test_cancel_of_a_queued_job_is_immediate(gpuc_home: Path) -> None:

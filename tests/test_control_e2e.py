@@ -224,13 +224,17 @@ def test_submit_says_where_in_the_queue_the_job_landed(
     """The submitter's actual question -- when does it run -- answered by the
     host it was just queued on, rather than left to a second command."""
     capsys.readouterr()
-    job_id = submit(workdir, 'name: placed\ncommand: "true"\ngpus: 0\n')
+    # Long enough that it is still queued or running when the placement is
+    # looked up: a job that had already *finished* would be neither, and this
+    # test would pass on an empty line.
+    job_id = submit(workdir, "name: placed\ncommand: sleep 300\ngpus: 0\n")
     out = capsys.readouterr().out
     assert f"job {job_id} queued on host local" in out
     # A `gpus: 0` job is dispatchable the moment it is queued, so both answers
     # are honest: the dispatcher the enqueue started may have taken it already.
     assert "queue: position 1 of 1; starts now" in out or "dispatched already" in out
     # The host is shared with every other test in this module: leave it idle.
+    assert main(["cancel", job_id]) == 0
     wait_until(lambda: finished(bootstrapped_home, job_id), 120, f"job {job_id} to finish")
 
 

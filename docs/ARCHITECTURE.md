@@ -100,7 +100,8 @@ secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, 
 incoming/<jobid>.json # a spec staged 0644 by `submit`, fed to `enqueue -` and deleted
 queue/<prio>-<jobid> # empty marker files; lexical order is dispatch order. prio is 2 digits, default 50.
 jobs/<jobid>/
-  spec.json          # the submitted JobSpec (immutable)
+  spec.json          # the submitted JobSpec. Only `gpuc estimate` and `gpuc reorder` rewrite it,
+                     # and both keep keys another build wrote (see Reorder, Estimate below)
   state.json         # {"status": queued|running|succeeded|failed|cancelled, "attempt": n,
                      #  "reason": str|null, "exit_code": int|null, "gpus": [...], "started_at", "ended_at",
                      #  "phase": setup|preflight|main|sync, "pid": int|null, "pgid": int|null,
@@ -209,7 +210,13 @@ queue's lexical order, not submission order below one second.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.
-- Reorder: `queue.reorder(jobid, prio)` renames the marker.
+- Reorder: `queue.reorder(jobid, prio)` renames the marker *and*
+  `jobs.update_spec(jobid, priority=N)`. The marker is the move -- it is what
+  the dispatcher orders by -- but it is deleted at dispatch, so the spec is the
+  only copy that outlives it and the only thing that can tell `gpuc status` what
+  priority a *running* job was dispatched at. A spec that cannot be rewritten
+  does not undo the move. The control side re-mirrors the spec for the same
+  reason `estimate` does, below.
 - Estimate: `jobs.update_spec(jobid, estimated_runtime_min=N)` rewrites
   `spec.json` (raw JSON, so keys another build wrote survive). Queued or
   running, since a running job's runner re-reads the spec; see Job length
@@ -366,6 +373,21 @@ count of the running jobs that offered no end time, since the true answer can on
 be sooner. Only the jobs holding a card are considered, for both halves of that
 line; a host where none of them estimated an end time has no time to report, so
 it gets no `free` line rather than one saying so.
+
+The same estimates are what `status.queue_start_estimates` projects a queued
+job's *start* from (`starts_in_s` / `starts_at`, and ` starts in ~2h10m` on the
+queued line). It replays the dispatcher's own rule rather than assuming
+strict head-of-queue order -- cards come free at the eta of whatever holds
+them, the whole queue is walked at each release, and a job that fits into what
+is free before the job ahead of it does starts first, exactly as
+`launch_ready` backfills. A card held by a job that published no eta is not
+schedulable at all, so a job whose turn depends on one is reported as *unknown*
+rather than guessed; that is why a later job can have a start time when an
+earlier one does not. A paused or draining host projects nothing, because
+nothing is being dispatched. `submit`, `requeue` and `reorder` print the
+projection for the job they just touched, alongside its queue position, and say
+*why* there is no time when there is none -- "the host is paused" and "a job
+ahead of it gave no estimate" are different things to do about it.
 
 ## Process isolation (cgroup scope, else process group)
 
@@ -891,6 +913,10 @@ What `status` prints, and every flag, is usage.md. The invariants:
   labelled separately and never merged.
 - `--suspects` judges each running job by *its own* `low_util` window, floor and
   grace as the host reports them, and never kills anything.
+- Every job carries the `priority` it is (or was) ordered by. While a job is
+  queued that is its marker's, which is what the dispatcher reads; once the
+  marker is gone it is the spec's, which `reorder` keeps current. A host too old
+  to report either says `null`, never a default.
 - The host's `status` reports each job's `outputs` (the spec's, `{job_id}`
   expanded) and `wandb` (`entity`, `project`, `run_id` from the job's `WANDB_*`
   env, and nothing else of its env). The control side turns those into
