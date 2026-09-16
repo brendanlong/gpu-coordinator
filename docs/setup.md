@@ -358,6 +358,10 @@ their `state.json`. Only the dispatcher is ever replaced, never a runner.
 
 Before you push a change: `./check.sh` runs ruff, pyright and the test suite,
 which is exactly what CI runs on every pull request (`--fast` skips the sync).
+The GPU tests are part of it and run on whatever card this machine has (tiny
+tensors; they skip themselves where there is none). The tests that **rent** a
+RunPod pod are the one thing left out, of `check.sh` and of a bare `pytest`
+alike: run `uv run pytest -m runpod` when you mean to spend money.
 
 Two sessions on different builds are fine as long as both are recent: every file
 the two sides share is read with unknown keys ignored and a `null` for a

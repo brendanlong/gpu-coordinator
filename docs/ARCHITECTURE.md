@@ -1315,9 +1315,17 @@ reconcile by hand.
 
 ## Testing rules
 
+- `./check.sh` is the whole suite, and what CI runs. A bare `pytest` is safe
+  too: `addopts` in `pyproject.toml` excludes the `runpod` marker, so the tests
+  that rent hardware never run by accident -- opt in with `pytest -m runpod`.
+  Nothing else is excluded by default.
 - Unit tests run without a GPU (mock `nvidia-smi` output, temp `~/.gpuc`).
-- Local GPU integration tests use tiny tensors (`torch.zeros(8)`), never
-  more than ~100 MB VRAM; other people's jobs share the card.
+- Local GPU integration tests (`gpu`) **run by default**: they use tiny tensors
+  (`torch.zeros(8)`), never more than ~100 MB VRAM because other people's jobs
+  share the card, and they skip themselves on a machine whose `nvidia-smi` does
+  not report `tests.conftest.LOCAL_GPU_UUID` -- which is every CI runner. A GPU
+  queue whose GPU tests are the ones nobody runs is how they rot; two of them
+  had, asserting on a `gpuc status` line that had since gained a job name.
 - RunPod integration: A40 only, `--max-price 0.60`, a job whose command
   is under two minutes, `--idle-min 2`, `--ttl-hours 1` (a TTL is opt-in, and a
   test that creates a billable pod is exactly where opting in is right), and the test

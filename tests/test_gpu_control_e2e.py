@@ -5,6 +5,7 @@ Tiny tensors only (torch.zeros(8)); the card is shared with other people's jobs.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -79,6 +80,22 @@ def gpu_host(control_env: Path, tmp_path: Path) -> Iterator[Path]:
     _stop_dispatcher(home)
 
 
+def queued_ids(status: str) -> list[str]:
+    """The job ids on `gpuc status`'s queued lines, in the order printed.
+
+    A line is `  queued  <name> (<job-id>) prio=NN ...`, with the name and its
+    parentheses there only when the job has one -- so the id is a field whose
+    position moves, which is what these assertions used to get wrong.
+    """
+    ids: list[str] = []
+    for line in status.splitlines():
+        if not line.strip().startswith("queued"):
+            continue
+        labelled = re.search(r"\(([^)]+)\)", line)
+        ids.append(labelled.group(1) if labelled else line.split()[1])
+    return ids
+
+
 def gpu_job(command: str, name: str = "gpu-e2e", priority: int = 50) -> str:
     return (
         f"name: {name}\n"
@@ -112,7 +129,7 @@ def test_a_submitted_gpu_job_runs_on_the_owned_uuid(
 
     assert main(["status", "--host", "local"]) == 0
     status = capsys.readouterr().out
-    assert f"done    {job_id}" in status
+    assert f"done    gpu-e2e ({job_id}) succeeded" in status
     assert "gpus 1/1 free" in status
 
 
@@ -144,18 +161,17 @@ def test_queued_jobs_reorder_and_cancel_while_the_card_is_busy(
     capsys.readouterr()
 
     assert main(["status", "--host", "local"]) == 0
-    queued = [line for line in capsys.readouterr().out.splitlines() if "queued" in line]
     # Set, not sequence: job ids are second-granular, so two submits inside one
     # second tie-break on their random suffix, not on submission order.
-    assert {first, second} == {line.split()[1] for line in queued}
+    assert {first, second} == set(queued_ids(capsys.readouterr().out))
 
     assert main(["reorder", second, "--priority", "10"]) == 0
     capsys.readouterr()
     assert main(["status", "--host", "local"]) == 0
     status = capsys.readouterr().out
-    queued = [line for line in status.splitlines() if "queued" in line]
-    assert [second, first] == [line.split()[1] for line in queued]
-    assert "prio=10" in queued[0]
+    assert [second, first] == queued_ids(status)
+    head = next(line for line in status.splitlines() if line.strip().startswith("queued"))
+    assert "prio=10" in head
     assert "gpus 0/1 free" in status
 
     for job_id in (first, second, hog):
