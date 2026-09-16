@@ -11,6 +11,12 @@ was created and when it was bootstrapped, under the `provider` block that
 already named its `kind` and `pod_id`. Any machine holding the API key can ask
 a pod what it is and get the same answer, and `desired/` becomes a cache of
 that rather than the only record of it.
+
+The window this leaves is what the provisioning ceiling is for, and it is small
+on purpose: `provision` writes that config through `connect_host` as soon as ssh
+answers, *before* the ten minutes of installing uv, Python and the package. A
+pod is only unrecognisable to another machine between `create` and its first
+successful ssh -- well inside the 15 minutes the ceiling gives it.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from gpuc.control.config import (
     read_desired,
     state_lock,
     transport_for,
+    utc_now,
     write_desired,
 )
 from gpuc.control.providers.base import Offer, Pod
@@ -97,35 +104,55 @@ def address_for(name: str, pod: Pod) -> HostEntry | None:
 
 
 def desired_from(
-    pod_id: str, document: Mapping[str, Any], *, name: str = "", created_at: str = ""
+    pod_id: str,
+    document: Mapping[str, Any],
+    *,
+    name: str = "",
+    created_at: str = "",
+    seen_at: str = "",
 ) -> DesiredHost:
     """The desired record a pod's own config implies. `name` and `created_at`
-    are what to call it and when it began if the config itself does not say.
+    are what to call it and when it began if the config itself does not say;
+    `seen_at` is when whoever built this record last had the pod answer.
+
+    The name comes off the document rather than the parsed config, whose
+    default `host` is `local` -- the same trap `connect_host` avoids, and a
+    worse one here: a record called `local` is matched against *this* machine's
+    registry entry on the next pass, so the reaper would probe the wrong box
+    and then forget somebody's own host.
 
     `bootstrapped_at` falls back to the moment the pod was created, because a
     pod that has a gpuc config at all is past the create-to-bootstrap window
     the ceiling covers -- whether or not the build that set it up recorded the
     stamp. A record without one would be read as "never bootstrapped" and
     terminated at the ceiling; what judges this pod from here is the
-    dead-dispatcher rule, like any other host.
+    dead-dispatcher rule, like any other host. That is also why `ceiling_at` is
+    left empty: the ceiling rule only applies to a record that is *not*
+    bootstrapped, and these always are.
     """
     config = HostConfig.from_dict(document)
     provider = config.provider or {}
     created = _text(provider.get("created_at")) or config.created_at or created_at
     return DesiredHost(
-        name=config.host or name,
+        name=_text(document.get("host")) or name,
         pod_id=pod_id,
         offer=_offer(provider.get("offer")),
         created_at=created,
         idle_minutes=config.idle_minutes,
         ttl_hours=config.ttl_hours,
         bootstrapped_at=_text(provider.get("bootstrapped_at")) or created,
+        last_seen_at=seen_at or None,
     )
 
 
 def desired_from_entry(entry: HostEntry) -> DesiredHost:
-    """The same record, off a registered pod's entry and the config it cached."""
-    return desired_from(entry.pod_id or "", entry.cache.config, name=entry.name)
+    """The same record, off a registered pod's entry and the config it cached.
+
+    Stamped as seen: the only caller has just connected to the pod, and the
+    stamp is what gives a host this machine has only now met the same silence
+    allowance as one it provisioned itself.
+    """
+    return desired_from(entry.pod_id or "", entry.cache.config, name=entry.name, seen_at=utc_now())
 
 
 def _text(value: Any) -> str:
@@ -182,10 +209,18 @@ def ask_pod(pod: Pod, settings: Settings, *, timeout: float = ASK_TIMEOUT_S) -> 
             pod, "silent", f"{home}/config.json is there but could not be read", entry=address
         )
     if not document:
-        return PodAnswer(
-            pod, "empty", f"it answers ssh and has no {home}/config.json", entry=address
-        )
-    record = desired_from(pod.id, document, name=pod.name, created_at=_pod_created(pod))
+        return _nothing_there(pod, transport, home, address, timeout)
+    record = desired_from(
+        pod.id,
+        document,
+        name=pod.name,
+        created_at=_pod_created(pod),
+        # It answered this machine just now, which is the whole of what
+        # `last_seen_at` means. Without it the silence clock for a pod this
+        # machine has only now met starts at whenever it was bootstrapped --
+        # days ago -- and the first pulse that misses terminates it.
+        seen_at=utc_now(),
+    )
     created = record.created_at or "an unknown time"
     return PodAnswer(
         pod,
@@ -196,13 +231,41 @@ def ask_pod(pod: Pod, settings: Settings, *, timeout: float = ASK_TIMEOUT_S) -> 
     )
 
 
-PULSE = """\
+HOME_PREFIX = """\
 home="{home}"
+case "$home" in "~"|"~/"*) home="$HOME${{home#\\~}}";; esac
+"""
+"""Resolve gpuc home in the host's own shell. `$HOME` is the host's, and a `~`
+someone typed into `--gpuc-home` is not expanded by the quoting that keeps the
+rest of the path safe -- a home read as the literal `~/.gpuc` would find no
+heartbeat, which on this path means "terminate it"."""
+
+TRACES = (
+    HOME_PREFIX
+    + """\
+if [ -d "$home" ]; then echo "there is a $home, with no config.json in it"; fi
+if ps -eo args 2>/dev/null | grep -q '[g]puc\\.host'; then echo "gpuc.host is running on it"; fi
+"""
+)
+"""Anything that says gpuc has been on a pod whose `config.json` we did not find.
+
+"Nothing here" is the one answer the reaper acts on, so one missing file is not
+enough for it. A gpuc home with no config is a pod that *lost* its config (a
+restarted container with a wiped `$HOME`), and a running `gpuc.host` is a pod
+whose gpuc home is somewhere this machine was not told about (`--gpuc-home`,
+`--persistent-root`): both have jobs to lose, and both belong to whoever holds
+their record."""
+
+PULSE = (
+    HOME_PREFIX
+    + """\
 now=$(date +%s)
 beat=$(stat -c %Y "$home/dispatcher.heartbeat" 2>/dev/null || true)
-running=$(grep -l '"status": "running"' "$home"/jobs/*/state.json 2>/dev/null | wc -l)
+running=$(grep -lE '"status"[[:space:]]*:[[:space:]]*"running"' "$home"/jobs/*/state.json \
+2>/dev/null | wc -l | tr -d ' ')
 printf 'now=%s beat=%s running=%s\\n' "$now" "$beat" "$running"
 """
+)
 """The two facts the dead-dispatcher rule judges, read straight off the host's
 own files (`gpuc.host.paths`): the dispatcher's heartbeat is a file's mtime,
 and a job the host believes is running says so in its `state.json`.
@@ -210,8 +273,38 @@ and a job the host believes is running says so in its `state.json`.
 Read with `stat` and `grep` rather than by running the host's own package,
 because the machine reconciling a pod may never have bootstrapped it and so
 knows no interpreter there to run anything with. Both clocks are the host's, so
-no skew between the two machines can make a live pod look silent.
+no skew between the two machines can make a live pod look silent. The status
+pattern tolerates whitespace rather than matching `json.dumps(indent=2)`
+exactly: a miss here reads as "nothing is running", which terminates a pod.
 """
+
+
+def _nothing_there(
+    pod: Pod, transport: Transport, home: str, address: HostEntry, timeout: float
+) -> PodAnswer:
+    """The verdict on a pod with no `config.json`: proven stray, or unknown."""
+    try:
+        result = transport.run(TRACES.format(home=home), timeout=timeout, check=False)
+    except TransportError as exc:
+        return PodAnswer(pod, "silent", _why(exc), entry=address)
+    traces = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0:
+        return PodAnswer(
+            pod,
+            "silent",
+            f"it has no {home}/config.json, and would not say what else is on it",
+            entry=address,
+        )
+    if traces:
+        return PodAnswer(
+            pod, "silent", f"it has no {home}/config.json, but {traces[0]}", entry=address
+        )
+    return PodAnswer(
+        pod,
+        "empty",
+        f"it answers ssh, and has no {home}/config.json, no gpuc home and no gpuc process",
+        entry=address,
+    )
 
 
 def pulse(transport: Transport, home: str, *, timeout: float = ASK_TIMEOUT_S) -> Liveness:

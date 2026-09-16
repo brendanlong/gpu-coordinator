@@ -1978,7 +1978,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return failed(
             args,
             "RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc pods` or `gpuc reconcile`",
+            "`gpuc host add --pod`, `gpuc pods` or `gpuc reconcile`",
             EXIT_ERROR,
         )
     if args.command not in ("config", "skill"):

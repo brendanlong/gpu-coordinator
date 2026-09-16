@@ -11,6 +11,7 @@ import pytest
 
 from gpuc.control.config import HostEntry, Settings, read_desired
 from gpuc.control.rented import (
+    TRACES,
     address_for,
     ask_pod,
     desired_from,
@@ -19,6 +20,8 @@ from gpuc.control.rented import (
     remember,
 )
 from gpuc.control.transport import CommandResult, LocalTransport, TransportError
+from gpuc.host import jobs
+from gpuc.host.jobs import JobState
 from tests.fakehost import HOME, FakeHost
 from tests.fakeprovider import make_offer, running_pod
 
@@ -58,6 +61,15 @@ def test_the_desired_record_is_read_back_off_the_pods_config() -> None:
     assert record.bootstrapped_at == "2026-09-15T12:09:00+00:00"
 
 
+def test_a_config_that_names_no_host_does_not_adopt_as_local() -> None:
+    """`HostConfig.from_dict` defaults `host` to `local`, which is this
+    machine's own name: a record under it would have the reaper probing this
+    box and then forgetting the user's own host."""
+    nameless = config_document()
+    nameless.pop("host")
+    assert desired_from("pod1", nameless, name="gpuc-a-111").name == "gpuc-a-111"
+
+
 def test_a_config_written_before_the_record_existed_is_still_bootstrapped() -> None:
     """Reading "no stamp" as "never bootstrapped" would reap it at the ceiling."""
     older = config_document(provider={"kind": "runpod", "pod_id": "pod1"}, created_at="")
@@ -89,10 +101,39 @@ def test_a_pod_holding_a_gpuc_config_is_ours_whoever_created_it(pod_host: FakeHo
     assert answer.entry is not None and answer.entry.ssh == "root@1.2.3.4"
 
 
-def test_a_pod_with_no_gpuc_config_on_it_claims_nothing(pod_host: FakeHost) -> None:
+def test_a_pod_answering_just_now_is_recorded_as_seen_just_now(pod_host: FakeHost) -> None:
+    """Without the stamp, the silence clock for a pod this machine has only now
+    met starts at whenever it was bootstrapped -- and the first pulse that
+    misses terminates it."""
+    pod_host.files[f"{HOME}/.gpuc/config.json"] = json.dumps(config_document())
+    answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
+    assert answer.desired is not None
+    assert answer.desired.silent_since() == answer.desired.last_seen_at
+
+
+def test_a_pod_with_no_trace_of_gpuc_on_it_claims_nothing(pod_host: FakeHost) -> None:
     answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
     assert (answer.verdict, answer.desired) == ("empty", None)
-    assert "config.json" in answer.detail
+    assert "no gpuc home and no gpuc process" in answer.detail
+
+
+def test_a_gpuc_home_without_a_config_is_not_proof_of_a_stray(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pod whose $HOME was wiped has lost its config and may still be running
+    jobs; a pod whose gpuc home was moved never had one at the default path."""
+
+    class HasTraces(FakeHost):
+        def _answer(self, command: str) -> tuple[int, str]:
+            if "[g]puc" in command:  # the TRACES script
+                return 0, f"there is a {HOME}/.gpuc, with no config.json in it\n"
+            return super()._answer(command)
+
+    host = HasTraces()
+    monkeypatch.setattr("gpuc.control.rented.transport_for", lambda entry, settings=None: host)
+    answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
+    assert (answer.verdict, answer.desired) == ("silent", None)
+    assert "with no config.json in it" in answer.detail
 
 
 def test_a_pod_with_no_ssh_endpoint_cannot_be_asked() -> None:
@@ -129,10 +170,12 @@ def gpuc_home(root: Path, *, beat_age_s: float | None = None, running: int = 0) 
     for index in range(running):
         job = home / "jobs" / f"job{index}"
         job.mkdir()
-        (job / "state.json").write_text(json.dumps({"status": "running"}, indent=2, sort_keys=True))
+        # Through the host's own writer: the pulse greps this file, and the
+        # spelling it greps for is whatever the host package writes.
+        jobs.atomic_write_json(job / "state.json", JobState(status="running").to_dict())
     finished = home / "jobs" / "done"
     finished.mkdir()
-    (finished / "state.json").write_text(json.dumps({"status": "succeeded"}, indent=2))
+    jobs.atomic_write_json(finished / "state.json", JobState(status="succeeded").to_dict())
     return str(home)
 
 
@@ -182,3 +225,32 @@ def test_an_address_is_only_what_the_provider_says(control_env: Path) -> None:
         "pod1",
     )
     assert address.gpus == []
+
+
+def test_the_pulse_expands_a_tilde_the_way_the_host_would(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--gpuc-home ~/.gpuc` is not expanded by the quoting that keeps the path
+    safe, and a home read literally finds no heartbeat -- which on this path
+    means "terminate it"."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    gpuc_home(tmp_path, beat_age_s=5.0)
+    assert pulse(LocalTransport(), "~/.gpuc").alive
+
+
+def test_the_pulse_survives_a_home_with_a_space_in_it(tmp_path: Path) -> None:
+    root = tmp_path / "my pods"
+    root.mkdir()
+    assert pulse(LocalTransport(), gpuc_home(root, beat_age_s=5.0)).alive
+
+
+def test_the_traces_script_reports_a_gpuc_home_for_real(tmp_path: Path) -> None:
+    """The script `ask_pod` proves a stray with, run against a real shell."""
+    home = gpuc_home(tmp_path)
+    found = LocalTransport().run(TRACES.format(home=home), check=False)
+    assert found.returncode == 0 and f"there is a {home}" in found.stdout
+
+    # Said of the path asked about, not of the box: a machine that happens to
+    # be running gpuc itself reports the process line either way.
+    empty = LocalTransport().run(TRACES.format(home=str(tmp_path / "nowhere")), check=False)
+    assert empty.returncode == 0 and "there is a" not in empty.stdout

@@ -959,16 +959,27 @@ this machine's `desired/`, which is what keeps it watched on a later pass that
 cannot reach it. So the timer is a watchdog role that any machine holding the
 API key can run, and none of them is special.
 
-A stray has to be *shown* to be one, and only three things are: a prefixed pod
-that answers ssh with no gpuc config on it, one the provider never gave an ssh
-endpoint, and (either way) only once it is past the 15-minute provisioning
-ceiling, which still covers another machine's create-to-bootstrap window. A pod
-that *has* an endpoint and does not answer this machine is reported and left
-alone: "wedged" and "this machine holds no key for that pod" are the same
-silence, and terminating on it is what took someone's running job. The machine
-that does hold the record still reaps it under the dead-dispatcher rule.
-`gpuc host add <name> --pod <id>` adopts such a pod through the same connect
-path as any other host.
+A stray has to be *shown* to be one, and only two things show it: a prefixed pod
+that answers ssh and has no trace of gpuc on it (no config at the gpuc home, no
+gpuc home there at all, and no `gpuc.host` process — one missing file is not
+proof, since a pod whose `$HOME` was wiped has lost its config and may still be
+running a job), and a pod that is not RUNNING and has no ssh endpoint, which
+nothing can have bootstrapped. Either way only once it is past the 15-minute
+provisioning ceiling, which still covers another machine's create-to-bootstrap
+window. Everything else is reported and left alone: a pod that does not answer
+*this* machine is not a proof, because "wedged" and "this machine holds no key
+for that pod" are the same silence, and terminating on it is what took someone's
+running job. The machine that does hold the record still reaps it under the
+dead-dispatcher rule. `gpuc host add <name> --pod <id>` adopts such a pod
+through the same connect path as any other host.
+
+Adopting stamps `last_seen_at` on the cached record, because the pod answered
+`cat config.json` in that same pass: a machine that has only just met a pod
+gives it the same `dead_dispatcher_minutes` allowance as one it provisioned
+itself, rather than measuring silence from a `bootstrapped_at` days old. The
+name on the record comes off the config document rather than the parsed config,
+whose default `host` is `local` — a record called `local` would be matched
+against this machine's own host on the next pass.
 
 **The dead-dispatcher rule**, which is what replaced the overall TTL: a
 bootstrapped desired host is asked for its pulse each pass (a 20 s ssh

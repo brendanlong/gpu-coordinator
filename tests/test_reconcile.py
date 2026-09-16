@@ -35,7 +35,7 @@ from gpuc.control.reconcile import (
 )
 from gpuc.control.rented import PodAnswer, Verdict, address_for, desired_from
 from gpuc.control.s3index import IndexEntry, LocalIndex
-from tests.conftest import host_entry
+from tests.conftest import host_entry, register_host
 from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
 
 FOREIGN = "other-someone-else"
@@ -94,7 +94,7 @@ def asked(verdict: Verdict = "empty", config: dict[str, Any] | None = None) -> P
             "ours",
             "its config.json says so",
             entry=address_for(pod.name, pod),
-            desired=desired_from(pod.id, config, name=pod.name),
+            desired=desired_from(pod.id, config, name=pod.name, seen_at=stamp()),
         )
 
     return ask
@@ -581,18 +581,30 @@ def test_an_adopted_pod_is_judged_by_the_ttl_it_carries(control_env: Path) -> No
 
 
 def test_an_adopted_pod_that_has_gone_silent_is_reaped_from_here(control_env: Path) -> None:
-    """The watchdog role: any machine running the timer reaps a dead pod."""
+    """The watchdog role: any machine running the timer reaps a dead pod.
+
+    Not on the pass that met it, though. The pod answered `cat config.json`
+    seconds earlier, so adoption stamps `last_seen_at` and the pod gets the
+    same `dead_dispatcher_minutes` allowance as one this machine provisioned --
+    which is what stops a single misread by a pulse probe that has never run
+    against this pod before from ending someone's job.
+    """
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
     desired_dir().mkdir(parents=True, exist_ok=True)
+    settings = Settings(dead_dispatcher_minutes=30.0)
+    ask = asked(config=pod_config("gpuc-a-111", "pod1"))
     reports: list[str] = []
 
-    result = reconcile_once(
-        Settings(dead_dispatcher_minutes=30.0),
-        provider,
-        reports.append,
-        liveness=dead(),
-        ask=asked(config=pod_config("gpuc-a-111", "pod1")),
-    )
+    first = reconcile_once(settings, provider, reports.append, liveness=dead(), ask=ask)
+
+    assert (first.kept, provider.terminated) == (["gpuc-a-111"], [])
+    assert any("silent for 0 min of the 30 min limit" in line for line in reports)
+
+    # ...and once it has been silent that long, from here, it goes.
+    cached = read_desired("gpuc-a-111")
+    assert cached is not None
+    write_desired(cached.model_copy(update={"last_seen_at": stamp(minutes=-31)}))
+    result = reconcile_once(settings, provider, reports.append, liveness=dead(), ask=ask)
 
     assert result.terminated == ["gpuc-a-111"]
     assert any("DEAD DISPATCHER" in line for line in reports)
@@ -633,10 +645,10 @@ def test_a_pod_this_machine_cannot_ask_is_reported_not_terminated(control_env: P
     assert any("gpuc host add" in line for line in reports)
 
 
-def test_a_pod_that_never_got_an_ssh_endpoint_is_a_stray(control_env: Path) -> None:
+def test_a_pod_that_never_came_up_is_a_stray(control_env: Path) -> None:
     """Nothing can have bootstrapped a pod with no door, so nothing is running."""
     doorless = running_pod("gpuc-a-111", "pod1", age_minutes=120).model_copy(
-        update={"ssh_direct": None}
+        update={"ssh_direct": None, "status": "PROVISIONING"}
     )
     provider = provider_with(doorless)
     desired_dir().mkdir(parents=True, exist_ok=True)
@@ -645,6 +657,21 @@ def test_a_pod_that_never_got_an_ssh_endpoint_is_a_stray(control_env: Path) -> N
 
     assert provider.terminated == ["pod1"]
     assert result.terminated == ["gpuc-a-111"]
+
+
+def test_a_running_pod_the_provider_gives_no_endpoint_is_still_kept(control_env: Path) -> None:
+    """One provider answer that omits a port mapping is not worth a job."""
+    doorless = running_pod("gpuc-a-111", "pod1", age_minutes=120).model_copy(
+        update={"ssh_direct": None}
+    )
+    provider = provider_with(doorless)
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked("silent"))
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+    assert any("could not ask it what it is" in line for line in reports)
 
 
 def test_a_pod_already_in_desired_is_never_asked(control_env: Path) -> None:
@@ -660,3 +687,75 @@ def test_a_pod_already_in_desired_is_never_asked(control_env: Path) -> None:
     reconcile_once(Settings(), provider, lambda _: None, liveness=alive(), ask=ask)
 
     assert asked_about == []
+
+
+def test_a_pod_whose_config_names_no_host_is_not_called_local(control_env: Path) -> None:
+    """`HostConfig`'s default `host` is `local`, which is this machine's own.
+
+    A record under that name would be matched against this machine's `local`
+    entry on the next pass: the reaper would probe the wrong box and then
+    forget somebody's own host.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    register_host(name="local", gpus="0")
+    config = pod_config("gpuc-a-111", "pod1")
+    config.pop("host")
+
+    result = reconcile_once(
+        Settings(), provider, lambda _: None, liveness=alive(), ask=asked(config=config)
+    )
+
+    assert result.kept == ["gpuc-a-111"]
+    assert read_desired("gpuc-a-111") is not None
+    assert read_desired("local") is None
+    assert "local" in load_registry().hosts
+
+
+def test_a_pod_answering_to_a_name_already_taken_is_left_alone(control_env: Path) -> None:
+    """Judging it would mean forgetting the host whose record that name is."""
+    provider = provider_with(
+        running_pod("gpuc-a-111", "pod1", age_minutes=120),
+        running_pod("gpuc-a-222", "pod2", age_minutes=120),
+    )
+    desire("gpuc-a-111", "pod1", ttl_hours=None)
+    reports: list[str] = []
+
+    # The second pod says it is called `gpuc-a-111` too (a hand-set `host`).
+    result = reconcile_once(
+        Settings(),
+        provider,
+        reports.append,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod2")),
+    )
+
+    assert provider.terminated == []
+    assert sorted(result.kept) == ["gpuc-a-111", "gpuc-a-222"]
+    assert any("already here and names another pod" in line for line in reports)
+    cached = read_desired("gpuc-a-111")
+    assert cached is not None and cached.pod_id == "pod1"
+
+
+def test_the_provider_says_where_a_pod_is_now_and_the_registry_where_its_home_is(
+    control_env: Path,
+) -> None:
+    """A registry entry pinned to an endpoint the pod has moved off fails every
+    probe, which reads as a dead dispatcher; its `gpuc_home` is still the only
+    copy of where gpuc lives on that pod."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1"))
+    desire("gpuc-a-111", "pod1")
+    with registry_transaction() as registry:
+        entry = registry.require("gpuc-a-111")
+        registry.put(entry.model_copy(update={"ssh": "root@5.6.7.8", "gpuc_home": "/vol/gpuc"}))
+    seen: list[HostEntry | None] = []
+
+    def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
+        seen.append(entry)
+        return Liveness(reachable=True, heartbeat_age_s=5.0)
+
+    reconcile_once(Settings(), provider, lambda _: None, liveness=probe)
+
+    assert len(seen) == 1 and seen[0] is not None
+    assert (seen[0].ssh, seen[0].port) == ("root@1.2.3.4", 22000)
+    assert seen[0].remote_home == "/vol/gpuc"

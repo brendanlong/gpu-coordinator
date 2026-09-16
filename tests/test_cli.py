@@ -473,12 +473,13 @@ def test_runpod_commands_fail_fast_without_an_api_key(
         ["submit", "job.yaml", "--runpod", "--gpu", "A40"],
         ["pods"],
         ["reconcile", "--once"],
+        ["host", "add", "rented", "--pod", "pod1"],
     ):
         assert main(argv) == 1
         err = capsys.readouterr().err
         assert err.strip().splitlines() == [
             "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc pods` or `gpuc reconcile`"
+            "`gpuc host add --pod`, `gpuc pods` or `gpuc reconcile`"
         ]
 
 

@@ -256,8 +256,8 @@ Rules, and they are not optional:
 - `gpuc reconcile --once` cleans up registry entries for gone pods and reaps
   strays. Run it if `status` says `POD GONE`. It asks each pod with our prefix
   what it is, so a pod another machine rented is kept, not reaped; only a pod
-  that answers with no gpuc config on it (or never got an ssh endpoint) is a
-  stray, and only past the 15-minute ceiling.
+  that answers with no trace of gpuc on it (or one that is not RUNNING and has
+  no ssh endpoint) is a stray, and only past the 15-minute ceiling.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
   create, reading the config the pod already has.
 - Only act on pods named `gpuc-*`. Others belong to other people.

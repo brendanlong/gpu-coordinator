@@ -436,10 +436,13 @@ means no cap, on `submit`, `host add` and `host set` alike.
   a job for `dead_dispatcher_minutes` (30 by default) — including one whose ssh
   stopped answering, since that never refreshes `last_seen_at` either;
 - a pod past a TTL its host actually has;
-- a pod that never bootstrapped by its 15-minute ceiling;
-- a pod with our prefix that **answers ssh with no gpuc config on it**, or that
-  the provider never gave an ssh endpoint at all, **once it is over 15 minutes
-  old** (the grace is there because another session may be mid-create).
+- a pod *this machine created* that never bootstrapped by its 15-minute ceiling
+  (a pod adopted from another machine has a config on it, so it is past that
+  question by definition and the dead-dispatcher rule is what judges it);
+- a pod with our prefix that **answers ssh with no trace of gpuc on it** — no
+  config, no gpuc home, no `gpuc.host` process — or that is not RUNNING and has
+  no ssh endpoint at all, **once it is over 15 minutes old** (the grace is there
+  because another session may be mid-create).
 
 **Which pods are "ours" is asked of the pods, not of this machine.**
 `desired/<host>.json` is written by whichever machine ran `gpuc submit

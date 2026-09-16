@@ -300,11 +300,14 @@ what it refuses to touch, is in [usage.md](usage.md#reconcile).
 **On more than one machine is fine.** Each pass asks every pod with your prefix
 what it is, and a pod holding a gpuc config is left alone whichever machine
 created it — so the desktop can watch the pod the laptop queued, with the laptop
-shut. The machine running the timer does need an ssh key the pods accept
-(`ssh_key` in `config.toml`, registered on the account the first time it
-provisions anything): a pod it cannot ask is reported rather than terminated, so
-nothing is lost, but nothing watches that pod from there either. To drive it as
-well as watch it, adopt it: `gpuc host add <name> --pod <pod-id>`.
+shut. To *watch* a pod (rather than only report it) that machine needs an ssh
+key the pod accepts, and RunPod injects the account's keys when the pod is
+**created**: a key you register later is not on a pod that already exists. So
+put both machines' keys on the account before you provision, or accept that each
+pod is watched from the machines whose keys it was born with. A pod this machine
+cannot ask is reported every pass and never terminated, so nothing is lost
+either way. To drive a pod as well as watch it, adopt it: `gpuc host add <name>
+--pod <pod-id>`.
 
 ## Upgrading
 

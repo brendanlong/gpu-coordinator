@@ -246,7 +246,7 @@ def reconcile_once(
         Rented(host, _how_to_reach(host.name, by_id.get(host.pod_id), registry)) for host in cached
     ]
     known = {host.pod_id for host in cached}
-    adopted, unclaimed = _ask_the_rest(pods, known, settings, ask, report)
+    adopted, unclaimed = _ask_the_rest(pods, known, settings, ask, report, result)
     _reconcile_desired([*ours, *adopted], by_id, settings, provider, report, result, liveness)
     _reap_strays(unclaimed, provider, report, result)
     return result
@@ -255,11 +255,23 @@ def reconcile_once(
 def _how_to_reach(
     name: str, pod: Pod | None, registry: Mapping[str, HostEntry]
 ) -> HostEntry | None:
-    """This machine's address for a host, or the one the provider gives for its pod."""
+    """Where this host is now: the provider's endpoint, this machine's home.
+
+    Each side is asked what only it knows. The provider is the authority on
+    where a rented pod is reachable *now* -- a registry entry pinned to an
+    endpoint the pod no longer has fails every probe, which reads as a dead
+    dispatcher -- while the entry is the only thing that knows a gpuc home
+    somebody moved off `$HOME/.gpuc`.
+    """
     entry = registry.get(name)
-    if entry is not None:
-        return entry
-    return address_for(name, pod) if pod is not None else None
+    address = address_for(name, pod) if pod is not None else None
+    if entry is None or address is None:
+        return entry or address
+    if entry.kind != "runpod" or (entry.pod_id and pod is not None and entry.pod_id != pod.id):
+        # The name collides with some other host of this machine's. Believe
+        # the pod, and touch nothing of the entry's.
+        return address
+    return entry.model_copy(update={"ssh": address.ssh, "port": address.port})
 
 
 def _ask_the_rest(
@@ -268,6 +280,7 @@ def _ask_the_rest(
     settings: Settings,
     ask: PodQuestion,
     report: Reporter,
+    result: ReconcileResult,
 ) -> tuple[list[Rented], list[PodAnswer]]:
     """Ask every prefixed pod this machine has no record of what it is.
 
@@ -288,17 +301,39 @@ def _ask_the_rest(
         report(
             f"{pod.name} ({pod.id}) has no desired/ record here, but {answer.detail}, so it is ours"
         )
-        try:
-            if not remember(answer.desired):
-                report(
-                    f"WARNING: desired/{answer.desired.name}.json already names another pod, so "
-                    f"what {pod.name} said was not cached. Two pods answering to one host name "
-                    f"is a `host` somebody set by hand; check `gpuc pods`."
-                )
-        except (ConfigError, OSError) as exc:
-            report(f"WARNING: could not cache what {pod.name} said in desired/: {exc}")
+        if not _cache(answer.desired, pod, report):
+            # Not judged this pass rather than judged against a record that is
+            # not its own: every terminate here forgets the host it names, and
+            # that record belongs to a different pod.
+            result.kept.append(pod.name)
+            continue
         adopted.append(Rented(answer.desired, answer.entry))
     return adopted, unclaimed
+
+
+def _cache(record: DesiredHost, pod: Pod, report: Reporter) -> bool:
+    """Keep what a pod said, and say whether this pass may act on it.
+
+    A record this machine could not write is only a lost cache: the pod's own
+    answer is still what judges it. A record it *refused* to write is a name
+    that belongs to another pod, and every terminate here forgets the host it
+    names -- so that pod is left for a pass whose record is its own.
+    """
+    try:
+        if remember(record):
+            return True
+    except (ConfigError, OSError) as exc:
+        report(
+            f"WARNING: could not cache what {pod.name} said in desired/ ({exc}); judging it on "
+            f"what it just said instead"
+        )
+        return True
+    report(
+        f"WARNING: desired/{record.name}.json is already here and names another pod, so "
+        f"{pod.name} ({pod.id}) was left alone this pass. Two pods answering to one host name "
+        f"is a `host` somebody set by hand; check `gpuc pods`."
+    )
+    return False
 
 
 def _reconcile_desired(
@@ -446,6 +481,18 @@ def _minutes_since(stamp: str | None) -> float | None:
     return (datetime.now(UTC) - parsed).total_seconds() / 60.0
 
 
+def _never_came_up(pod: Pod) -> bool:
+    """A pod nothing can have bootstrapped: no ssh endpoint, and not RUNNING.
+
+    Both halves matter. A pod still waiting for its endpoint has nothing on it
+    to lose, past the ceiling -- the machine that created it is at its own
+    ceiling for the same pod. But a *RUNNING* pod the provider happens not to
+    report an endpoint for this time may be a pod with a job on it, and the
+    provider's answer is not worth a job.
+    """
+    return pod.ssh_direct is None and pod.status != "RUNNING"
+
+
 def _reap_strays(
     unclaimed: list[PodAnswer],
     provider: Provider,
@@ -455,12 +502,16 @@ def _reap_strays(
     """Terminate the pods with our prefix that nothing claims -- and only those.
 
     A stray has to be *shown* to be one. The pod itself is the record (see
-    `rented`), so a pod that answered and has no gpuc config on it is a create
-    that leaked, and a pod the provider never gave an ssh endpoint is one that
-    never came up: both bill for nothing. A pod that has an endpoint and did not
-    answer this machine is neither, because "wedged" and "this machine holds no
-    key for it" are the same silence -- and terminating on that is what took
-    someone's running job.
+    `rented`), so there are two proofs and no others: a pod that answered and
+    has no trace of gpuc on it is a create that leaked, and a pod that is not
+    even RUNNING and has no ssh endpoint is one that never came up. Both bill
+    for nothing, and nothing can be running on either.
+
+    Everything else is kept and reported. A pod that has an endpoint and did not
+    answer *this* machine is not a proof, because "wedged" and "this machine
+    holds no key for it" are the same silence -- and terminating on that is what
+    took someone's running job. Neither is a RUNNING pod whose endpoint the
+    provider did not report this time.
 
     The ceiling still covers every case: another machine's `create` is a pod
     with no config on it yet, for as long as its bootstrap takes.
@@ -487,7 +538,7 @@ def _reap_strays(
             )
             result.kept.append(pod.name)
             continue
-        if answer.verdict == "silent" and pod.ssh_direct is not None:
+        if answer.verdict == "silent" and not _never_came_up(pod):
             report(
                 f"{pod.name} ({pod.id}) has our prefix, is {minutes:.0f} min old and is billing "
                 f"${pod.cost_usd_hr:.3f}/h, but this machine could not ask it what it is "
