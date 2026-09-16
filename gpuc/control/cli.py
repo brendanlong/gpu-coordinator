@@ -502,9 +502,10 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
     entry = named_registry().require(args.name)
     report = probe_host(entry, settings)
     if not args.json:
-        print(report.render())
+        print(report.render(all_gpus=args.all_gpus))
     # A probe is the one command that runs before bootstrap, so it is also the
-    # first chance to learn what the cards are.
+    # first chance to learn what the cards are. Every card, not just the assigned
+    # ones: this is what makes `gpuc host set <name> --gpus 5` nameable later.
     if report.gpu_info:
         with registry_transaction() as registry:
             current = registry.hosts.get(args.name)
@@ -1359,6 +1360,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe = host.add_parser("probe", help="report what a host has, before bootstrap")
     probe.add_argument("name")
+    probe.add_argument(
+        "--all-gpus",
+        action="store_true",
+        help="list every GPU in the box, not just the ones assigned to this host",
+    )
     add_json_flag(probe)
     probe.set_defaults(func=cmd_host_probe)
 

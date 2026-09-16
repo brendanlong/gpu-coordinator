@@ -138,6 +138,81 @@ def test_a_host_that_answered_nothing_is_not_called_an_overlay() -> None:
 def test_a_host_that_already_has_a_root_is_told_how_to_recover_instead() -> None:
     rendered = parse_probe("gpubox", OVERLAY_HOME, "/mnt/ssd-2/brendan").render()
     assert "wiped on every restart" in rendered
-    assert "--persistent-root /mnt/ssd-2/brendan, so uv, the queue" in rendered
+    assert "--persistent-root /mnt/ssd-2/brendan, so the queue" in rendered
     assert "recover with: gpuc host bootstrap gpubox" in rendered
     assert "/mnt/<volume>" not in rendered
+
+
+TI = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+A40 = "GPU-deadbeef-0000-0000-0000-000000000000"
+
+
+def test_only_the_assigned_gpus_are_shown_by_default() -> None:
+    """A shared box lists every card; only some of them are ours."""
+    rendered = parse_probe("gpubox", SAMPLE, None, ["1"]).render()
+    assert "gpus: 1 of 2 assigned to gpubox (--all-gpus lists the rest)" in rendered
+    assert A40 in rendered
+    assert TI not in rendered
+    assert "1 of this host's 2 GPUs are not assigned to gpubox" in rendered
+    assert "gpuc host set gpubox --gpus <list>" in rendered
+
+
+def test_all_gpus_shows_the_whole_box_with_ours_marked() -> None:
+    rendered = parse_probe("gpubox", SAMPLE, None, ["1"]).render(all_gpus=True)
+    assert f"{TI}  NVIDIA GeForce RTX 3060 Ti  8192 MiB\n" in rendered + "\n"
+    assert f"{A40}  NVIDIA A40  46068 MiB  (assigned)" in rendered
+    assert "--all-gpus lists the rest" not in rendered
+
+
+def test_an_assignment_by_uuid_is_matched_as_well_as_by_index() -> None:
+    report = parse_probe("gpubox", SAMPLE, None, [A40])
+    assert [cells[1] for cells in report.owned_rows] == [A40]
+    assert report.owned_missing == []
+
+
+def test_owning_every_card_needs_no_note_and_hides_nothing() -> None:
+    rendered = parse_probe("gpubox", SAMPLE, None, ["0", "1"]).render()
+    assert "gpus: 2 of 2 assigned to gpubox\n" in rendered
+    assert TI in rendered and A40 in rendered
+    assert "not assigned" not in rendered
+
+
+def test_all_gpus_marks_nothing_when_every_card_is_ours() -> None:
+    """A mark on every line distinguishes nothing."""
+    assert "(assigned)" not in parse_probe("gpubox", SAMPLE, None, ["0", "1"]).render(all_gpus=True)
+
+
+def test_a_host_with_no_assignment_sees_every_card_and_is_told_to_assign_some() -> None:
+    rendered = parse_probe("gpubox", SAMPLE).render()
+    assert "  gpus:\n" in rendered
+    assert TI in rendered and A40 in rendered
+    assert "no GPUs are assigned to gpubox, so it can only run gpus: 0 jobs" in rendered
+
+
+def test_an_assigned_card_the_host_cannot_see_is_called_out() -> None:
+    """The failure this catches: jobs queue behind a card that is not there."""
+    report = parse_probe("gpubox", SAMPLE, None, ["1", "7"])
+    assert report.owned_missing == ["7"]
+    assert "assigned but not present on this host: 7" in report.render()
+
+
+def test_a_host_with_no_driver_calls_nothing_missing() -> None:
+    assert parse_probe("bare", BARE, None, ["0"]).owned_missing == []
+
+
+def test_the_document_flags_every_card_assigned_or_not() -> None:
+    document = parse_probe("gpubox", SAMPLE, None, ["1"]).document()
+    assert [(gpu["uuid"], gpu["assigned"]) for gpu in document["gpus"]] == [
+        (TI, False),
+        (A40, True),
+    ]
+    assert document["assigned_gpus"] == ["1"]
+    assert document["assigned_missing"] == []
+
+
+def test_the_persistent_root_note_says_what_actually_moves() -> None:
+    """uv's *cache* follows gpuc home; uv itself is reinstalled into $HOME."""
+    rendered = parse_probe("gpubox", OVERLAY_HOME).render()
+    assert "the queue and every job dir" in rendered
+    assert "uv's cache follows only to stay on gpuc home's" in rendered
+    assert "uv itself stays in $HOME" in rendered

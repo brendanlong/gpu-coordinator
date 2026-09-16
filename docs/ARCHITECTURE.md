@@ -647,7 +647,12 @@ lookup at all: that mapping is the identity, and the host is not asked.
 
 `gpuc status` and `gpuc host list` show `[index] name vram uuid` per owned
 card -- the index from the host for `status`, and from the last probe for the
-offline listing.
+offline listing. `gpuc host probe` lists the owned cards only, headed `N of M
+assigned to <host>`, because on a shared box the rest are somebody else's;
+`--all-gpus` lists all M with the owned ones marked. It matches an owned index
+against the numbering `nvidia-smi` gave *in that same probe*, records `gpu_info`
+for every card either way (so a later `--gpus 5` resolves offline), and notes
+owned entries no card answered to.
 
 ## Persistent root (a host whose `$HOME` is wiped on restart)
 

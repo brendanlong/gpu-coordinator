@@ -184,7 +184,7 @@ scraping any of the text output.
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
 | `host list` | `{hosts[], errors[]}` |
-| `host probe` | `{host, sections{}, driver_version, gpus[], uv_cache{}, notes[], ...}` |
+| `host probe` | `{host, sections{}, driver_version, gpus[] (each `assigned`), assigned_gpus[], uv_cache{}, notes[], ...}` |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
 | `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}` |
 
