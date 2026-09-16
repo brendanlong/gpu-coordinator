@@ -453,7 +453,7 @@ def run_loop(
 
 def gpuc_argv() -> str:
     """An absolute command line for `gpuc reconcile --once`, for systemd."""
-    return gpuc_command("reconcile --once")
+    return gpuc_command(["reconcile", "--once"])
 
 
 def unit_files(interval_s: float = DEFAULT_INTERVAL_S) -> dict[str, str]:

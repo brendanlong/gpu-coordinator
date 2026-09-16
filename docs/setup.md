@@ -14,7 +14,8 @@ contract the code keeps is [ARCHITECTURE.md](ARCHITECTURE.md).
 - An ssh key that reaches your hosts. Point `ssh_key` in `config.toml` at the
   private key; its `.pub` is what gets uploaded to the RunPod account before the
   first pod is created. Unset means ssh picks its own key.
-- `systemd --user`, only if you want `gpuc reconcile` on a timer.
+- `systemd --user`, only if you want `gpuc reconcile` on a timer or the web
+  dashboard as a service.
 
 **Each host**
 
@@ -102,7 +103,10 @@ the [reconcile timer](#the-reconcile-timer) uses, so RunPod hosts show their
 pod line; without it they still render. It restarts on failure, and it needs
 `loginctl enable-linger` to outlive your session, exactly like the timer.
 `--install` refuses nothing: with no password set the service starts, logs
-the `gpuc web set-password` line, and exits, and `--install` says so.
+the `gpuc web set-password` line and exits, systemd retries it five times
+over five minutes and then leaves it `failed`, and `--install` says so.
+Disabling it again is `systemctl --user disable --now gpuc-web.service` and
+removing the unit file, exactly as for the timer below.
 
 ## Credentials
 
@@ -126,7 +130,8 @@ an `s3_prefix`, with the region from `AWS_REGION`, `AWS_DEFAULT_REGION`, else
 
 **RunPod.** Export `RUNPOD_API_KEY`. `gpuc submit --runpod`, `gpuc pods` and
 `gpuc reconcile` check it first and exit 1 with one line if it is missing
-(`gpuc reconcile --install`, which only writes unit files, does not). The key is
+(`gpuc reconcile --install` and `gpuc web serve --install`, which only write
+unit files, do not). The key is
 delivered to each pod as `~/.gpuc/secrets/runpod` so it can terminate itself.
 
 **Hugging Face.** Put `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) in the job's
@@ -305,11 +310,13 @@ minutes ago has to age out (or be terminated in the RunPod console). Leaving the
 more slowly: the reaper can no longer reach it, so it terminates it after
 `dead_dispatcher_minutes`.
 
-**Disabling the timer.**
+**Disabling the timer, or the dashboard service.**
 
 ```sh
 systemctl --user disable --now gpuc-reconcile.timer
 rm ~/.config/systemd/user/gpuc-reconcile.{timer,service}
+systemctl --user disable --now gpuc-web.service      # if you installed the dashboard
+rm ~/.config/systemd/user/gpuc-web.service
 systemctl --user daemon-reload
 ```
 

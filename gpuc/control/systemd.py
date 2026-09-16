@@ -3,9 +3,10 @@ go, how to name this `gpuc` absolutely, and writing without enabling."""
 
 from __future__ import annotations
 
+import re
 import shutil
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from gpuc.control.bootstrap import package_root
@@ -17,7 +18,24 @@ def systemd_dir() -> Path:
     return Path.home() / ".config/systemd/user"
 
 
-def gpuc_command(args: str) -> str:
+SAFE_WORD = re.compile(r"^[A-Za-z0-9_./:=@+,\[\]-]+$")
+
+
+def quote(word: str) -> str:
+    """One ExecStart word, as systemd will read it back.
+
+    Left bare when it needs nothing, so a unit for an ordinary path reads
+    like one somebody typed. Otherwise double-quoted with `\\` and `"`
+    escaped, and `%` doubled either way: it is a specifier to systemd, and a
+    home directory named `100%` would otherwise expand to nothing.
+    """
+    if SAFE_WORD.match(word):
+        return word
+    escaped = word.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
+def gpuc_command(args: Sequence[str]) -> str:
     """An absolute command line for `gpuc <args>`, for a unit's ExecStart.
 
     The `gpuc` beside this interpreter first (a `uv tool install`), then the
@@ -26,12 +44,13 @@ def gpuc_command(args: str) -> str:
     """
     beside = Path(sys.executable).resolve().parent / "gpuc"
     if beside.exists():
-        return f"{beside} {args}"
-    installed = shutil.which("gpuc")
-    if installed:
-        return f"{Path(installed).resolve()} {args}"
-    uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
-    return f"{uv} run --project {package_root()} gpuc {args}"
+        argv = [str(beside), *args]
+    elif installed := shutil.which("gpuc"):
+        argv = [str(Path(installed).resolve()), *args]
+    else:
+        uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+        argv = [uv, "run", "--project", str(package_root()), "gpuc", *args]
+    return " ".join(quote(word) for word in argv)
 
 
 def write_units(directory: Path, files: Mapping[str, str], report: Reporter) -> list[Path]:

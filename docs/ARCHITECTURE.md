@@ -549,7 +549,7 @@ hold to, whatever the flags:
   `requeue` fall back to the job index and then to asking each host, and an id nothing
   knows is exit 4, never a guess.
 - Nothing runs in the background on this side except the optional
-  `gpuc reconcile` timer.
+  `gpuc reconcile` timer and, if installed, the web dashboard's service.
 
 Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`,
 `desired/<host>.json` for ephemeral hosts, `jobs/` (the local job index),
@@ -852,6 +852,14 @@ one wedged host costs its own timeout, not the sum. Realtime updates later mean
 an event stream fed by the same gather beside the same documents, not a second
 rendering: the page already treats every document as the whole truth on each
 refresh, so replacing the timer with a stream changes nothing it draws.
+
+`gpuc web serve --install` writes `gpuc-web.service` to `~/.config/systemd/user`
+the way `reconcile --install` writes its timer -- the two share
+`control/systemd.py` for the unit directory, an absolute `gpuc` for
+`ExecStart` (quoted the way systemd reads it) and writing without enabling.
+The unit pins the config and state dirs, reads the timer's env file if it
+exists, and restarts on failure under a start limit, so a service with no
+password fails after five tries rather than looping for ever.
 
 Host shutdown is deliberately absent, because the CLI has no such command yet
 (setup.md's teardown is a hand procedure); the rule is that it lands in `actions`
