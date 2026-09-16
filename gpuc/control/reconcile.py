@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from gpuc.control.bootstrap import package_root
 from gpuc.control.config import (
@@ -109,6 +110,19 @@ class ReconcileResult:
         if self.errors:
             parts.append(f"{len(self.errors)} error(s)")
         return "reconcile: " + ", ".join(parts)
+
+    def document(self) -> dict[str, Any]:
+        """`gpuc reconcile --once --json`. Host names, in the order they were judged.
+
+        A terminate that failed leaves its record in place and lands in
+        `errors`, which is the exit-1 case: the next pass retries it.
+        """
+        return {
+            "terminated": list(self.terminated),
+            "forgotten": list(self.forgotten),
+            "kept": list(self.kept),
+            "errors": list(self.errors),
+        }
 
 
 def _parse(stamp: str | None) -> datetime | None:

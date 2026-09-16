@@ -24,7 +24,14 @@ from gpuc.control.cli import (
     EXIT_USAGE,
     main,
 )
-from gpuc.control.config import HostEntry, backup_path, hosts_file, load_registry, read_registry
+from gpuc.control.config import (
+    HostEntry,
+    backup_path,
+    config_file,
+    hosts_file,
+    load_registry,
+    read_registry,
+)
 from gpuc.control.status import HostView
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -341,15 +348,6 @@ def test_status_json_carries_the_skipped_entry_as_a_top_level_error(
     assert "skipping host 'bad'" in document["errors"][0]
 
 
-def test_logs_has_no_json_flag() -> None:
-    """Deliberate: a log is a byte stream, and wrapping it in JSON helps nobody."""
-    from gpuc.control.cli import build_parser
-
-    with pytest.raises(SystemExit) as exit_info:
-        build_parser().parse_args(["logs", "20260101-000000-aaaaaa", "--json"])
-    assert exit_info.value.code == EXIT_USAGE
-
-
 def test_every_option_says_what_it_does() -> None:
     """`--help` is the only documentation most of these flags will ever get.
 
@@ -455,3 +453,170 @@ def test_the_installed_commit_comes_from_direct_url_json(
         version_mod.Distribution, "from_name", staticmethod(lambda _: PathDistribution(dist_info))
     )
     assert version_mod.installed_commit() == "c" * 40
+
+
+# -- `--json` on every command -------------------------------------------------
+
+
+def document_of(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    """stdout must be exactly one JSON object, whatever else the command said."""
+    document = json.loads(capsys.readouterr().out)
+    assert isinstance(document, dict)
+    assert document["schema_version"] == 1
+    return document
+
+
+JSON_COMMANDS = [
+    ["status"],
+    ["submit"],
+    ["requeue"],
+    ["logs"],
+    ["cancel"],
+    ["reorder"],
+    ["pods"],
+    ["version"],
+    ["clean"],
+    ["reconcile"],
+    ["host", "list"],
+    ["host", "probe"],
+]
+
+
+@pytest.mark.parametrize("command", JSON_COMMANDS, ids=lambda c: " ".join(c))
+def test_every_command_that_promises_json_has_the_flag(command: list[str]) -> None:
+    import argparse
+
+    from gpuc.control.cli import build_parser
+
+    parser: argparse.ArgumentParser = build_parser()
+    for name in command:
+        action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        parser = action.choices[name]
+    assert "--json" in parser.format_help()
+
+
+def test_a_failure_under_json_is_a_document_and_the_same_exit_code(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A caller parsing stdout must never be handed nothing at all."""
+    assert main(["cancel", "20260101-000000-aaaaaa", "--json"]) == EXIT_NOT_FOUND
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document["exit_code"] == EXIT_NOT_FOUND
+    assert "no registered host knows job" in document["error"]
+    assert "no registered host knows job" in captured.err
+
+
+def test_a_usage_error_under_json_is_a_document_too(
+    control_env: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    assert main(["submit", str(job), "--json"]) == EXIT_USAGE
+    assert json.loads(capsys.readouterr().out)["exit_code"] == EXIT_USAGE
+
+
+def test_host_list_json_carries_the_entries_and_the_skipped_ones(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    assert main(["host", "list", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    (host,) = document["hosts"]
+    assert host["name"] == "good"
+    assert host["kind"] == "local"
+    assert host["gpus"] == [GPU]
+    assert host["remote_home"] == "$HOME/.gpuc"
+    assert host["ephemeral"] is False
+    assert "skipping host 'bad'" in document["errors"][0]
+
+
+def test_host_list_json_on_an_unreadable_registry_is_exit_three_and_still_json(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = hosts_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ not json")
+    assert main(["host", "list", "--json"]) == EXIT_LOCAL_STATE
+    document = document_of(capsys)
+    assert document["hosts"] == []
+    assert document["errors"]
+
+
+def test_version_json_says_which_hosts_are_current(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control import version as version_mod
+
+    entries = {
+        name: json.loads(
+            HostEntry(
+                name=name,
+                kind="ssh",
+                ssh="me@box",
+                pkg_commit=commit,
+                bootstrapped_at="2026-09-15T20:00:00+00:00",
+            ).model_dump_json()
+        )
+        for name, commit in (("fresh", "a" * 40), ("stale", "b" * 40))
+    }
+    write_hosts({"hosts": entries})
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    monkeypatch.setattr(version_mod, "installed_commit", lambda: "a" * 40)
+    assert main(["version", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document["version"] == version_mod.__version__
+    assert document["commit"] == "a" * 40
+    assert document["source"] == "installed"
+    assert {host["name"]: host["current"] for host in document["hosts"]} == {
+        "fresh": True,
+        "stale": False,
+    }
+
+
+def test_logs_json_carries_the_lines_and_where_they_came_from(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = real_local_host / "jobs" / RUNNING_JOB / "log.txt"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("first\nsecond\n")
+    assert main(["logs", RUNNING_JOB, "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document["job_id"] == RUNNING_JOB
+    assert document["host"] == "local"
+    assert document["source"] == "host"
+    assert document["location"] == str(log)
+    assert document["lines"] == ["first", "second"]
+    assert document["notes"] == []
+
+
+def test_logs_json_refuses_to_follow(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`-f` has no end, and a document has to be complete."""
+    assert main(["logs", RUNNING_JOB, "--json", "-f"]) == EXIT_USAGE
+    assert "cannot follow" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_logs_json_says_when_it_fell_back_to_the_mirror(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.fakes3 import FakeS3Client
+
+    (config_file()).write_text('s3_bucket = "bucket"\n')
+    uri = f"bucket/gpuc/local/jobs/{RUNNING_JOB}/log.txt"
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client",
+        property(lambda self: FakeS3Client(objects={uri: b"mirrored\n"})),
+    )
+    entry = (
+        load_registry().require("local").model_copy(update={"s3_prefix": "s3://bucket/gpuc/local"})
+    )
+    write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
+
+    assert main(["logs", RUNNING_JOB, "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document["source"] == "s3"
+    assert document["location"] == f"s3://{uri}"
+    assert document["lines"] == ["mirrored"]
+    assert any("could not read" in note for note in document["notes"])

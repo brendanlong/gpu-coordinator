@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Any
 
 from gpuc.control.config import (
     DesiredUnreadable,
@@ -57,6 +58,24 @@ class PodRow:
             heartbeat,
         ]
 
+    def document(self) -> dict[str, Any]:
+        pod = self.pod
+        age = pod.age
+        return {
+            "id": pod.id,
+            "name": pod.name,
+            "status": pod.status,
+            "gpu_name": pod.gpu_name,
+            "gpu_count": pod.gpu_count,
+            "cost_usd_hr": pod.cost_usd_hr,
+            "cuda_version": pod.cuda_version,
+            "age_s": None if age is None else round(age.total_seconds(), 1),
+            "created_at": None if pod.created_at is None else pod.created_at.isoformat(),
+            "gpu_utils": list(pod.gpu_utils),
+            "desired": self.desired,
+            "heartbeat_age_s": self.heartbeat_s,
+        }
+
 
 @dataclass
 class PodsView:
@@ -67,6 +86,24 @@ class PodsView:
     @property
     def hourly(self) -> float:
         return sum(row.pod.cost_usd_hr for row in self.rows if row.pod.status != "TERMINATED")
+
+    def document(self) -> dict[str, Any]:
+        """`gpuc pods --json`: the provider's answer, ours and everyone else's.
+
+        `others` are pods without our prefix and carry a name and status only,
+        because this command never touches them. `desired: false` on one of
+        ours means nothing local wants it and the reaper will take it;
+        `heartbeat_age_s` is null under `--no-heartbeat` and for a pod that
+        could not be asked.
+        """
+        return {
+            "pods": [row.document() for row in self.rows],
+            "hourly_usd": round(self.hourly, 4),
+            "others": [
+                {"id": pod.id, "name": pod.name, "status": pod.status} for pod in self.others
+            ],
+            "notes": list(self.notes),
+        }
 
 
 def gather(

@@ -95,6 +95,28 @@ class CleanReport:
             lines.append("  nothing to remove")
         return "\n".join(lines)
 
+    def document(self) -> dict[str, Any]:
+        """`gpuc clean --json`. A non-empty `errors` is the exit-1 case.
+
+        The job objects are the host's own, passed through: each carries at
+        least `job_id`, and `status`, `bytes` and `age_days` where the host
+        could read them. `skipped`/`purge_skipped` add `why`.
+        """
+        return {
+            "host": self.host,
+            "dry_run": self.dry_run,
+            "purge": self.purge,
+            "freed_bytes": self.freed_bytes,
+            "removed": list(self.removed),
+            "skipped": list(self.skipped),
+            "purged": list(self.purged),
+            "purge_skipped": list(self.purge_skipped),
+            "incoming_removed": list(self.incoming_removed),
+            "verified": list(self.verified),
+            "notes": list(self.notes),
+            "errors": list(self.errors),
+        }
+
 
 def _purged_line(job: dict[str, Any], *, dry_run: bool) -> str:
     age = job.get("age_days")

@@ -241,6 +241,21 @@ class SubmitResult:
         lines.append(f"  logs: gpuc logs {self.job_id} -f")
         return "\n".join(lines)
 
+    def document(self, *, requeued_from: str | None = None) -> dict[str, Any]:
+        """`gpuc submit --json` and `gpuc requeue --json`.
+
+        `notes` are the things the text output prints as `note:` -- a spec that
+        could not be mirrored, files that were already under an `outputs:` path
+        -- and the job is queued regardless. `requeued_from` is null on submit.
+        """
+        return {
+            "job_id": self.job_id,
+            "host": self.host,
+            "attempt": self.attempt,
+            "requeued_from": requeued_from,
+            "notes": list(self.notes),
+        }
+
 
 def preexisting_output_warnings(spec: JobSpec, workdir: Path) -> list[str]:
     """Say so at submit time when an `outputs:` path is not empty in the checkout.

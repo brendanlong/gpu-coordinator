@@ -640,3 +640,203 @@ def test_host_add_and_set_refuse_a_gpus_value_that_is_neither(
     assert main(["host", "add", "box", "--gpus", "2"]) == 0
     assert main(["host", "set", "box", "--gpus", "GPU-a,nonsense"]) == EXIT_USAGE
     assert load_registry().require("box").gpus == ["2"]
+
+
+# -- `--json` on every command ------------------------------------------------
+
+
+def one_document(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
+    document = json.loads(capsys.readouterr().out)
+    assert isinstance(document, dict)
+    assert document["schema_version"] == 1
+    return document
+
+
+def test_submit_json_is_the_queued_job_and_its_notes(
+    control_env: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\ngpus: 0\n')
+    main(["host", "add", "local", "--gpus", GPU])
+
+    def fake_submit_file(entry: HostEntry, *args: object, **kwargs: object) -> SubmitResult:
+        # The progress a text submit prints inline must not land on the document.
+        report = kwargs["report"]
+        assert callable(report)
+        report("syncing 3 files")
+        return SubmitResult(
+            job_id="20260915-120000-abc123", host=entry.name, attempt=1, notes=["s3_bucket unset"]
+        )
+
+    monkeypatch.setattr("gpuc.control.cli.submit_file", fake_submit_file)
+    capsys.readouterr()
+    assert main(["submit", str(job), "--host", "local", "--json"]) == 0
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document == {
+        "schema_version": 1,
+        "job_id": "20260915-120000-abc123",
+        "host": "local",
+        "attempt": 1,
+        "requeued_from": None,
+        "notes": ["s3_bucket unset"],
+    }
+    assert "syncing 3 files" in captured.err
+
+
+def test_requeue_json_names_the_job_it_came_from(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
+        {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 0}
+    ).encode()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    monkeypatch.setattr(
+        "gpuc.control.cli.submit_spec",
+        lambda entry, *a, **k: SubmitResult(job_id="new", host=entry.name, attempt=2),
+    )
+    main(["host", "add", "local", "--gpus", GPU])
+    capsys.readouterr()
+
+    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == 0
+    document = one_document(capsys)
+    assert document["requeued_from"] == "20260101-000000-aaaaaa"
+    assert (document["job_id"], document["attempt"]) == ("new", 2)
+
+
+def test_cancel_json_is_the_hosts_own_answer(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    monkeypatch.setattr(
+        "gpuc.control.cli.open_session",
+        lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "cancelling"}])),
+    )
+    capsys.readouterr()
+    assert main(["cancel", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == 0
+    document = one_document(capsys)
+    assert document["status"] == "cancelling"
+    assert (document["job_id"], document["host"]) == ("20260101-000000-aaaaaa", "local")
+
+
+def test_reorder_json_repeats_the_priority_it_set(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Moved:
+        def host_cli(self, args: str, *, check: bool = True) -> object:
+            return type("Result", (), {"returncode": 0})()
+
+    main(["host", "add", "local", "--gpus", GPU])
+    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: Moved())
+    capsys.readouterr()
+    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "10", "--host", "local", "--json"]
+    assert main(argv) == 0
+    assert one_document(capsys)["priority"] == 10
+
+
+def test_pods_json_separates_ours_from_everyone_elses(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    provider = FakeProvider(existing=[running_pod("subrep-other", "podF")])
+    provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    capsys.readouterr()
+    assert main(["pods", "--no-heartbeat", "--json"]) == 0
+    document = one_document(capsys)
+    (pod,) = document["pods"]  # type: ignore[misc]
+    assert pod["name"] == "gpuc-e2e-aaa"
+    assert pod["desired"] is False
+    assert pod["heartbeat_age_s"] is None
+    assert document["others"] == [{"id": "podF", "name": "subrep-other", "status": "RUNNING"}]
+
+
+def test_reconcile_once_json_reports_the_error_it_exits_one_for(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commentary it would print goes to stderr; stdout is the document."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: FakeProvider())
+    capsys.readouterr()
+    assert main(["reconcile", "--once", "--json"]) == 1
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document["terminated"] == []
+    assert "does not exist" in document["errors"][0]
+    assert "does not exist" in captured.err
+
+
+def test_reconcile_json_without_once_is_usage(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    assert main(["reconcile", "--json"]) == EXIT_USAGE
+    assert "--once" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_clean_json_carries_what_went_and_what_was_kept(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.clean import CleanReport
+
+    main(["host", "add", "local", "--gpus", GPU])
+    report = CleanReport(
+        host="local",
+        removed=[{"job_id": "a", "status": "succeeded", "bytes": 2048, "age_days": 9.0}],
+        skipped=[{"job_id": "b", "why": "still running"}],
+        freed_bytes=2048,
+    )
+    monkeypatch.setattr("gpuc.control.cli.clean_host", lambda *a, **k: report)
+    capsys.readouterr()
+    assert main(["clean", "--host", "local", "--all-finished", "--json"]) == 0
+    document = one_document(capsys)
+    assert document["freed_bytes"] == 2048
+    assert document["removed"] == report.removed
+    assert document["skipped"] == report.skipped
+    assert document["errors"] == []
+
+
+def test_clean_json_still_exits_one_when_the_host_reported_errors(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.clean import CleanReport
+
+    main(["host", "add", "local", "--gpus", GPU])
+    monkeypatch.setattr(
+        "gpuc.control.cli.clean_host",
+        lambda *a, **k: CleanReport(host="local", errors=["could not remove workdir"]),
+    )
+    capsys.readouterr()
+    assert main(["clean", "--host", "local", "--all-finished", "--json"]) == 1
+    assert one_document(capsys)["errors"] == ["could not remove workdir"]
+
+
+def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.probe import parse_probe
+
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    sample = (
+        "===driver===\n580.173.02\n"
+        "===gpus===\n0, GPU-1111, NVIDIA A40, 46068 MiB\n"
+        "===uv===\nnot installed\n"
+    )
+    monkeypatch.setattr(
+        "gpuc.control.cli.probe_host", lambda *a, **k: parse_probe("gpubox", sample)
+    )
+    capsys.readouterr()
+    assert main(["host", "probe", "gpubox", "--json"]) == 0
+    document = one_document(capsys)
+    assert document["driver_version"] == "580.173.02"
+    assert document["has_nvidia_smi"] is True
+    assert document["sections"]["uv"] == "not installed"  # type: ignore[index]
+    assert document["gpus"] == [
+        {"uuid": "GPU-1111", "name": "NVIDIA A40", "vram_mib": 46068, "index": 0}
+    ]
+    assert any("uv is missing" in note for note in document["notes"])  # type: ignore[union-attr]
