@@ -450,11 +450,11 @@ def _fmt_eta(job: JobView) -> str:
     has neither. The tag matters: one of those numbers is evidence.
 
     A running job whose host published no `eta` falls back to the estimate the
-    same host reports, rendered as a total rather than a remaining time. That
-    is the window after `gpuc estimate` before the runner next re-reads the
-    spec, and a host old enough to have no such re-read at all -- and the one
-    thing that may not happen there is `--json` carrying an estimate the text
-    does not show."""
+    same host reports, rendered as a total rather than a remaining time. The
+    one thing that may not happen is `--json` carrying an estimate the text
+    does not show, and there are two ways to reach that: the window after
+    `gpuc estimate` before the runner next re-reads the spec, and a host on a
+    build old enough not to re-read it at all."""
     remaining = job.eta_seconds
     if remaining is None:
         return _fmt_estimate(job, total=True)
@@ -503,7 +503,10 @@ def next_free_line(view: HostView) -> str | None:
     silent = len(holding) - len(known)
     remaining, job = min(known, key=lambda pair: pair[0])
     when = "overdue" if remaining < 0 else f"in ~{format_duration(remaining)}"
-    note = f"; {silent} other running job(s) gave no estimate" if silent else ""
+    # "no end time", not "no estimate": a job whose host has an estimate it has
+    # not turned into an eta yet is counted here, and its own line above says
+    # `est ...`. Two lines of one host block may not contradict each other.
+    note = f"; {silent} other running job(s) gave no end time" if silent else ""
     return f"  free    next card {when} ({job.job_id}){note}"
 
 

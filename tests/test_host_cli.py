@@ -134,15 +134,16 @@ def test_estimate_refuses_a_finished_job_and_an_unknown_one(
     assert code == 1 and isinstance(payload, dict) and "no job with that id" in payload["error"]
 
 
-@pytest.mark.parametrize("minutes", ["0", "-5", "nan", "inf"])
+@pytest.mark.parametrize("minutes", ["0", "-5", "nan", "inf", "1e10"])
 def test_estimate_refuses_a_number_that_is_not_a_runtime(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], minutes: str
 ) -> None:
-    """`inf` reaches `utc_in` and means "no estimate", which would leave the
-    command reporting success while `gpuc status` shows nothing at all."""
+    """`inf`, and the `1e10` units typo, mean "no estimate" by the time they
+    reach `utc_in` -- so recording one would report success for a job whose
+    status then shows nothing at all."""
     job_id = queue.enqueue(make_spec())
     code, payload = run(capsys, "estimate", job_id, minutes)
-    assert code == 1 and isinstance(payload, dict) and "positive number" in payload["error"]
+    assert code == 1 and isinstance(payload, dict) and payload["error"]
     assert jobs.read_spec(job_id).estimated_runtime_min is None
 
 

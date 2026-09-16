@@ -127,9 +127,9 @@ gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc 
 gpuc ssh <host|jobid> --print    # just print the ssh line, to copy
 gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
 gpuc reorder <jobid> --priority 10          # queued jobs only
-gpuc estimate <jobid> --minutes 150         # add/change estimated_runtime_min on a queued or
-                                 # running job (--clear removes it); a running job picks it up
-                                 # within a minute
+gpuc estimate <jobid> --minutes 150
+                                 # set estimated_runtime_min on a queued or running job
+                                 # (--clear removes it); a running job picks it up within a minute
 gpuc requeue <jobid> --host <host>
                                  # re-run from the mirrored spec, attempt+1; needs s3_bucket set,
                                  # and re-syncs the workdir from your current directory

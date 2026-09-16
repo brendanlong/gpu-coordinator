@@ -537,7 +537,7 @@ def test_a_cpu_only_job_is_not_counted_among_the_ones_that_gave_no_estimate() ->
         )
     )
     assert "free    next card in ~3h20m (j-known)" in text
-    assert "gave no estimate" not in text
+    assert "gave no end time" not in text
 
 
 def test_a_host_running_only_cpu_jobs_has_no_next_card_line() -> None:
@@ -600,7 +600,7 @@ def test_the_next_free_line_owns_up_to_the_jobs_it_could_not_estimate() -> None:
             running_job(job_id="j-silent", gpus=["GPU-b"]),
         )
     )
-    assert "next card in ~3h20m (j-known); 1 other running job(s) gave no estimate" in text
+    assert "next card in ~3h20m (j-known); 1 other running job(s) gave no end time" in text
 
 
 def test_a_busy_host_where_nothing_estimated_anything_stays_quiet() -> None:

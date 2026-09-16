@@ -301,6 +301,26 @@ def test_a_measured_eta_is_not_overwritten_by_an_estimate(gpuc_home: Path) -> No
     assert all(seconds_from_now(eta) < 600.0 for eta in etas)
 
 
+def test_an_estimate_added_in_setup_survives_the_phase_that_follows(gpuc_home: Path) -> None:
+    """Each phase gets its own monitor loop. Re-seeding it from the spec loaded
+    at job start would withdraw the eta at every phase boundary -- and `setup`
+    is where somebody most often adds one, because that is the phase that
+    looks wedged."""
+    job_id = prepare(setup="sleep 0.3", command="sleep 0.4")
+    etas: list[str | None] = []
+
+    def watching_sleep(seconds: float) -> None:
+        if not etas:
+            jobs.update_spec(job_id, estimated_runtime_min=90.0)
+        if jobs.read_state(job_id).phase == "main":
+            etas.append(jobs.read_state(job_id).eta)
+        time.sleep(seconds)
+
+    assert runner.run_job(job_id, deps(sleep=watching_sleep, spec_refresh_s=0.0)) == 0
+    assert etas, "the job never reached main"
+    assert all(eta for eta in etas), "the eta was withdrawn when the phase changed"
+
+
 def test_a_progress_command_added_while_the_job_runs_is_polled(gpuc_home: Path) -> None:
     job_id = prepare(command="sleep 0.8", progress_interval_s=0.02)
     added = False

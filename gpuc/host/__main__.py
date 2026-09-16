@@ -146,8 +146,13 @@ def _estimate_error(job_id: str, minutes: float | None) -> str | None:
     """Why this host will not record this estimate, or None."""
     if not paths.job_dir(job_id).is_dir():
         return f"no job with that id on this host: {job_id}"
-    if minutes is not None and not (minutes > 0.0 and minutes < float("inf")):
+    if minutes is not None and not minutes > 0.0:
         return f"an estimate must be a positive number of minutes, got {minutes!r}"
+    if minutes is not None and jobs.utc_in(minutes * 60.0) is None:
+        # `1e10` -- the units typo `utc_in` already defends the runner against
+        # -- is not an end time any date can hold, so the runner would publish
+        # no eta and this command would have reported success for nothing.
+        return f"an estimate of {minutes:g} minutes is too far away to be an end time"
     try:
         state = jobs.read_state(job_id)
     except (RuntimeError, FileNotFoundError) as exc:

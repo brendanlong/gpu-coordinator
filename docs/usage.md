@@ -72,7 +72,10 @@ sets it on a job that is already **queued or running** — the case that matters
 most, since the job somebody needs an end time for is the one already running
 when they arrive — and `--clear` takes it off again. A running job's runner
 re-reads its spec every 30 seconds, so the new estimate reaches `gpuc status`
-within a minute; a finished job is refused (exit 1).
+within a minute; a finished job is refused (exit 1). The job's mirrored spec is
+updated too, so a later `gpuc requeue` carries the estimate; if the mirror
+cannot be written the command still succeeds and says so, since the estimate is
+already recorded where `status` reads it.
 
 `progress_command` replaces the guess with a measurement. It runs in the
 workdir, with the job's own environment, every `progress_interval_s` of phase
@@ -128,9 +131,9 @@ estimated an end time, one line saying when the next card is expected:
   free    next card in ~3h20m (20260915-120000-a1b2c3)
 ```
 
-Where some of the jobs holding a card estimated nothing, the `free` line appends
-a count of them, because the real answer can only ever be *sooner* than it: one
-of those could finish in a minute. Jobs with `gpus: 0` are ignored throughout —
+Where some of the jobs holding a card offered no end time, the `free` line
+appends a count of them, because the real answer can only ever be *sooner* than
+it: one of those could finish in a minute. Jobs with `gpus: 0` are ignored throughout —
 they hold no card, so they can neither free one nor make the answer sooner. If
 *nothing* holding a card estimated an end time there is no line at all, since
 the gpu lines above it already say every card is busy.
@@ -490,7 +493,7 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `reorder` | `{job_id, host, priority}` |
-| `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set |
+| `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. Exit 3 if the registry is unreadable |
 | `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]`. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |

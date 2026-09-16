@@ -178,6 +178,14 @@ class S3Index:
     def put_spec(self, spec: JobSpec) -> str:
         return self._put(spec_key(spec.job_id), json.dumps(spec.to_dict(), indent=2) + "\n")
 
+    def put_spec_document(self, job_id: str, document: dict[str, Any]) -> str:
+        """Re-mirror a spec as raw JSON, for an edit to a spec already up there.
+
+        Raw, rather than through `JobSpec`: this is what `requeue` will submit,
+        and a round trip would drop the keys a newer build wrote.
+        """
+        return self._put(spec_key(job_id), json.dumps(document, indent=2) + "\n")
+
     def get_spec(self, job_id: str) -> dict[str, Any]:
         document = json.loads(self._get(spec_key(job_id)))
         if not isinstance(document, dict):

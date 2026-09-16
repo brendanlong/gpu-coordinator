@@ -293,6 +293,10 @@ class JobRunner:
         """Whether a `progress_command` has produced an eta yet. Once one has,
         the spec's estimate is no longer published: it is a guess, and this is
         a measurement."""
+        self._live = self.spec
+        """The spec as the last re-read found it on disk, which outlives the
+        phase that read it: an estimate added during `setup` must not be
+        undone by `main` starting from the copy loaded at job start."""
         self._published_estimate: float | None = None
         """The `estimated_runtime_min` behind the eta now in the state file,
         null when that eta is not ours. Kept so the spec re-read only writes
@@ -358,11 +362,13 @@ class JobRunner:
         max_runtime_s = (
             None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
         )
-        # Re-read from disk on a timer, so an estimate (or a progress command)
-        # added to `spec.json` after the job started still takes effect. Only
-        # these fields: changing the command, the env or the outputs mid-flight
-        # would describe a run that never happened.
-        live = self.spec
+        # `spec.json` is re-read on a timer, so an estimate (or a progress
+        # command) added after the job started still takes effect. Only what it
+        # *reports* -- `estimated_runtime_min`, `progress_command` and its
+        # interval -- is taken from the re-read: a command, an env or an output
+        # path changing mid-flight would leave the spec describing a run that
+        # never happened.
+        live = self._live
         next_spec = phase_start + deps.spec_refresh_s
         # The submitter's estimate, published from the first phase on: a job
         # still installing torch is exactly the one somebody wants an end time
@@ -389,7 +395,7 @@ class JobRunner:
                 break
             if t >= next_spec:
                 next_spec = t + deps.spec_refresh_s
-                live = self._live_spec(live)
+                live = self._live = self._live_spec(live)
                 self._publish_estimated_eta(live.estimated_runtime_min, t - job_start)
                 progress_command = live.progress_command if phase == "main" else None
             if progress_command and t >= next_progress:
