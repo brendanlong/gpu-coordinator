@@ -88,12 +88,22 @@ cards are for — a one-card job borrows when your own cards are busy, so the
 queue drains faster; and a `gpus: 4` job on a host that owns 2 and shares 2
 waits for both shared cards to go quiet and then runs across all four.
 
-Two things it does not do. It never gives a card *back*: a job that got one
-keeps it until it ends, so if the card's real owner starts something there, the
-two of you are sharing it and `gpuc preempt` is the way out. And `gpuc status`
-will not estimate when a job waiting on a shared card starts — when somebody
-else stops using a GPU is not something your host can know — so it says that
-instead of inventing a time.
+Start-time estimates count the shared cards that are idle *right now*, so a
+borrower whose turn is the next dispatch pass is told `starts now` rather than
+being made to wait for one of your own cards. A card somebody else is on is
+left out: when they will stop is not something your host can know, so a job
+waiting for one has no start time and is told so instead of given an invented
+one.
+
+It never gives a card *back*: a job that got one keeps it until it ends, so if
+the card's real owner starts something there, the two of you are sharing it and
+`gpuc preempt` is the way out.
+
+A job held up only by `--shared-min-priority` **waits**; it is never dropped
+from the queue. That gate moves — `gpuc reorder` moves a job over it and `gpuc
+host set` moves the floor — and a job the dispatcher failed would be gone for
+good. `gpuc submit` still refuses such a job up front, before anything is
+queued.
 
 `gpuc status` shows the borrowed cards on their own `shared` lines, and
 `gpuc host bootstrap` refuses a card listed as both owned and shared.
@@ -644,7 +654,7 @@ Every `failed: <reason>`:
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`, and any other reason gains `+sync` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. Appends `+no-outputs` the same way |
 | `bad-spec` | the queued spec could not be read |
-| `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued. On a host with [shared cards](#shared-gpus) it says what they add, and why this job may not use them |
+| `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued. On a host with [shared cards](#shared-gpus) it counts the ones this job asked for, and says so when it asked for none |
 | `spawn-failed` | the dispatcher could not start a runner process |
 | `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind before freeing its GPUs |
 

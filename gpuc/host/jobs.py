@@ -642,20 +642,42 @@ class HostConfig:
     def ephemeral(self) -> bool:
         return self.provider is not None
 
-    def may_borrow(self, spec: JobSpec) -> bool:
-        """May this job be given one of this host's shared cards at all?
+    def shared_entries(self) -> list[str]:
+        """`shared_gpus`, minus anything spelled identically in `gpus`.
 
-        Two gates, and both are about the *job* rather than about what the
-        cards are doing this second -- whether they are free is the
-        dispatcher's question, asked only once this has said yes.
+        Owning a card beats borrowing it, which is how `Dispatcher.shared_gpus`
+        resolves the same collision once nvidia-smi has said which entries are
+        the same card. This is the counting version and can only catch the
+        identical spelling; `gpuc host add|set` and the host's own `gpu_uuids`
+        check refuse the rest, so what is left here is a hand-edited file.
+        """
+        owned = set(self.gpus)
+        return [entry for entry in self.shared_gpus if entry not in owned]
+
+    def may_borrow(self, spec: JobSpec) -> bool:
+        """May this job be given one of this host's shared cards *now*?
+
+        Two gates, both about the job rather than about what the cards are
+        doing this second -- whether one is free is the dispatcher's question,
+        asked only once this has said yes.
         """
         if not spec.use_shared or not self.shared_gpus:
             return False
         return self.shared_min_priority is None or spec.priority <= self.shared_min_priority
 
     def borrowable(self, spec: JobSpec) -> list[str]:
-        """The shared entries this job could reach, for counting capacity."""
-        return self.shared_gpus if self.may_borrow(spec) else []
+        """The shared entries this job may reach now, for counting capacity."""
+        return self.shared_entries() if self.may_borrow(spec) else []
+
+    def ever_borrowable(self, spec: JobSpec) -> list[str]:
+        """The shared entries this job could reach at *some* priority.
+
+        The difference from `borrowable` is what may be used to decide a job
+        can never run here: `use_shared` is fixed once a job is queued, but
+        `shared_min_priority` is not -- `gpuc reorder` moves a job over the
+        floor and `gpuc host set` moves the floor.
+        """
+        return self.shared_entries() if spec.use_shared else []
 
     def bin_dirs(self) -> list[str]:
         """Directories from `env` to put on PATH, in order, without duplicates."""

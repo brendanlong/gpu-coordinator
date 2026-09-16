@@ -77,7 +77,7 @@ def check_gpu_uuids(
         return Check(
             "gpu_uuids",
             False,
-            f"{', '.join(both)} is in both config.gpus and config.shared_gpus; a card is "
+            f"in both config.gpus and config.shared_gpus: {', '.join(both)}. A card is "
             f"either ours to hand out or somebody else's to borrow, not both",
         )
     detail = f"{len(resolved)} owned GPU(s) present"

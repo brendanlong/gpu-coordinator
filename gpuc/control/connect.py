@@ -250,6 +250,12 @@ def _refuse_shared_overlap(
     The host's own health check refuses this too, at bootstrap. This is the
     copy that fires where it was typed.
     """
+    if not any(key in patch for key in ("gpus", "shared_gpus")):
+        # A host whose config.json is already in this state -- hand-edited, or
+        # written by a build without this check -- must still be reachable by
+        # `gpuc host set <name> --idle-min 30`. Refusing a command that names
+        # neither list, over two flags nobody typed, would strand it.
+        return
     merged = {**(existing if isinstance(existing, dict) else {}), **patch}
     config = HostConfig.from_dict(merged)
     cards = _by_uuid(entry)

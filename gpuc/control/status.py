@@ -380,7 +380,10 @@ class HostView:
         answer this feeds is an explanation, and guessing one is worse than the
         general line it falls back to.
         """
-        if not job.use_shared or not self.shared:
+        # `shared_unavailable` counts: the host judges a job against the cards
+        # it is *configured* with, and makes it wait for one that is missing
+        # this minute rather than failing it.
+        if not job.use_shared or not (self.shared or self.shared_unavailable):
             return False
         if self.shared_min_priority is None:
             return True
@@ -664,24 +667,21 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
     gave no estimate is absent, never guessed at. That is why a *later* job can
     have a start time when an earlier one does not -- it fits in cards the
     unestimated job is not holding.
+
+    Shared cards are in the model, but only the ones that are idle *now* and
+    only for the jobs allowed onto them. A card somebody else is using is left
+    out entirely rather than given a release time: when they will stop is the
+    one thing this host cannot know. Leaving the idle ones out instead was the
+    other option and is worse -- it told a job that would borrow on the next
+    pass that it starts in six hours, which is the exact question this whole
+    machinery exists to answer correctly.
     """
     # Nothing is dispatched on a paused or draining host, so every start time
     # here would be an answer to a question nobody asked: when it would have
     # started if the host were taking work.
     if view.paused or view.draining or not view.queue:
         return {}
-    # Release time per owned card: now if it is free, the holder's eta if it is
-    # busy, None when the holder offered no eta and the card is therefore not
-    # one anything can be scheduled onto.
-    cards: list[float | None] = []
-    running = {job.job_id: job for job in view.running}
-    for uuid in view.owned:
-        holder = running.get(view.gpu_holder(uuid) or "")
-        if holder is None:
-            cards.append(0.0)
-            continue
-        remaining = holder.eta_seconds
-        cards.append(None if remaining is None else max(0.0, remaining))
+    cards = _card_releases(view)
     starts: dict[str, float] = {}
     pending = list(view.queue)
     clock = 0.0
@@ -694,8 +694,14 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
                 # nothing behind it can be estimated either.
                 blocked = True
                 break
+            borrows = view.may_borrow(job)
+            # Owned first, exactly as the dispatcher assigns them, so a job
+            # borrows only the shortfall and holds a shared card no longer
+            # than it has to.
             free = [
-                i for i, release in enumerate(cards) if release is not None and release <= clock
+                i
+                for i, (release, shared) in enumerate(cards)
+                if release is not None and release <= clock and (borrows or not shared)
             ]
             if len(free) < job.gpus_requested:
                 continue
@@ -705,14 +711,41 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
                 else clock + job.estimated_runtime_min * 60.0
             )
             for index in free[: job.gpus_requested]:
-                cards[index] = done
+                cards[index] = (done, cards[index][1])
             starts[job.job_id] = clock
             pending.remove(job)
-        later = [release for release in cards if release is not None and release > clock]
+        later = [release for release, _ in cards if release is not None and release > clock]
         if blocked or not later:
             break
         clock = min(later)
     return starts
+
+
+def _card_releases(view: HostView) -> list[tuple[float | None, bool]]:
+    """`(seconds until this card is free, is it a shared one)` per card.
+
+    Now if nothing holds it, the holder's eta if one of our jobs does, and None
+    when the card is not one anything can be scheduled onto -- either its
+    holder offered no end time, or it is a shared card somebody else is on and
+    nothing here can say when they will stop.
+
+    Owned cards come first so that the walk above prefers them.
+    """
+    running = {job.job_id: job for job in view.running}
+
+    def release(uuid: str) -> float | None:
+        holder = running.get(view.gpu_holder(uuid) or "")
+        if holder is None:
+            return 0.0
+        remaining = holder.eta_seconds
+        return None if remaining is None else max(0.0, remaining)
+
+    cards: list[tuple[float | None, bool]] = [(release(uuid), False) for uuid in view.owned]
+    for card in view.shared:
+        held = view.gpu_holder(card.uuid)
+        if held or card.unused:
+            cards.append((release(card.uuid), True))
+    return cards
 
 
 def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
@@ -755,7 +788,13 @@ def no_start_reason(view: HostView, job: JobView) -> str:
     if view.draining:
         return f"host {view.entry.name} is draining, so nothing more will be dispatched"
     borrows = view.may_borrow(job)
-    capacity = len(view.owned) + (len(view.shared) if borrows else 0)
+    # Cards the host cannot see this minute are counted in: the host makes a
+    # job wait for one of those, it does not fail it (see the dispatcher's
+    # `_capacity_failure`), and "it will never be dispatched" is an absolute
+    # this may not say about a job the host is perfectly well set up to run.
+    capacity = len(view.owned) + len(view.unavailable)
+    if borrows:
+        capacity += len(view.shared) + len(view.shared_unavailable)
     if job.gpus_requested is not None and job.gpus_requested > capacity:
         shared = " (shared included)" if borrows else ""
         return (
@@ -969,7 +1008,14 @@ def render(
     )
     # The cards are named one per line below, so the header carries only the
     # count a reader is deciding on: how many are free, right now.
-    cards = f"gpus {len(view.free)}/{len(view.owned)} free" if view.owned else "no GPUs"
+    # A host that owns nothing and borrows something is a real configuration,
+    # and `no GPUs` above a list of shared cards contradicts itself.
+    if view.owned:
+        cards = f"gpus {len(view.free)}/{len(view.owned)} free"
+    elif view.shared:
+        cards = f"shared {len(view.borrowable)}/{len(view.shared)} free, none owned"
+    else:
+        cards = "no GPUs"
     driver = f" (driver {entry.driver_version})" if entry.driver_version else ""
     header = f"host {entry.name} [{entry.kind}]  {cards}{driver}"
     if flags:

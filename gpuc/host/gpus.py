@@ -259,6 +259,25 @@ def sample_usage(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> dict[
     }
 
 
+def usage_or_nothing(
+    uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
+) -> tuple[dict[str, Usage], str | None]:
+    """Every reading nvidia-smi gives for `uuids`, and why there are none.
+
+    The one place "nvidia-smi would not answer" turns into "we know nothing
+    about these cards". Both the dispatcher, which decides whether to borrow
+    one, and the `status` payload, which reports whether it would, have to
+    reach the same verdict forever; this is what makes that structural rather
+    than a rule written down twice.
+    """
+    if not uuids:
+        return {}, None
+    try:
+        return sample_usage(uuids, smi), None
+    except GpuError as exc:
+        return {}, str(exc)
+
+
 def unused_gpus(
     uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
 ) -> tuple[list[str], dict[str, str]]:
@@ -270,18 +289,17 @@ def unused_gpus(
     decides whether to run a job on somebody else's GPU, so the absence of
     evidence has to count against.
     """
-    if not uuids:
-        return [], {}
-    try:
-        samples = sample_usage(uuids, smi)
-    except GpuError as exc:
-        return [], {uuid: f"could not be read ({exc})" for uuid in uuids}
+    samples, failure = usage_or_nothing(uuids, smi)
     unused: list[str] = []
     in_use: dict[str, str] = {}
     for uuid in uuids:
         usage = samples.get(uuid)
         if usage is None:
-            in_use[uuid] = "nvidia-smi reported nothing about it"
+            in_use[uuid] = (
+                f"could not be read ({failure})"
+                if failure
+                else "nvidia-smi reported nothing about it"
+            )
         elif usage.unused:
             unused.append(uuid)
         else:

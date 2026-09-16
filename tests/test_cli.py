@@ -2089,3 +2089,18 @@ def test_host_add_pod_says_what_watching_an_unbootstrapped_pod_means(
     assert "nothing has bootstrapped this pod" in out
     assert "terminates it in 30 min" in out
     assert "gpuc host bootstrap rented" in out
+
+
+def test_an_existing_gpu_overlap_does_not_block_every_other_host_set(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    """A host already in that state -- hand-edited, or written by a build
+    without the check -- must still be reachable by a command about something
+    else entirely."""
+    fake_host.put_file(
+        '{"host": "gpubox", "gpus": ["0"], "shared_gpus": ["0", "1"]}',
+        "/home/u/.gpuc/config.json",
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert main(["host", "set", "gpubox", "--idle-min", "30"]) == 0
+    assert fake_host.config is not None and fake_host.config["idle_minutes"] == 30.0

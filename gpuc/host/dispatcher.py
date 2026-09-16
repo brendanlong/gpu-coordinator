@@ -788,38 +788,37 @@ class Dispatcher:
         return unused
 
     def _capacity_failure(self, spec: jobs.JobSpec) -> str | None:
-        """Why this host can never run this job, or None if it could.
+        """Why this host can *never* run this job, or None if it could.
 
-        Against the *configured* counts, not the resolved ones: a card that is
-        missing this minute makes a job wait, but it must not permanently fail
-        a job the host is perfectly well configured to run.
+        This is a deletion: the caller unlinks the queue marker and writes the
+        job `failed`. So it is judged only on what a queued job cannot get
+        past, and only on the *configured* card counts.
 
-        A shared card is capacity only for a job allowed to borrow one. For any
-        other job it is counted out here and said so, because the alternative
-        is a `gpus: 4` job sitting forever in the queue of a host with two
-        cards of its own and two it borrows.
+        Configured rather than resolved, because a card that is missing this
+        minute makes a job wait; it must not permanently fail a job the host is
+        perfectly well set up to run.
+
+        And `use_shared` rather than `may_borrow`, because `use_shared` is
+        fixed once a job is queued while `shared_min_priority` is not: `gpuc
+        reorder` moves a job over the floor, `gpuc preempt --priority` brings
+        one back above it, and `gpuc host set --shared-min-priority` moves the
+        floor under everything already queued. Failing on that gate would make
+        `gpuc reorder <job> --priority 99` *delete* the job it was asked to
+        move. A job held up by the floor alone waits, and `gpuc status` says so.
         """
         config = self.config
-        borrowable = config.borrowable(spec)
-        if spec.gpus <= len(config.gpus) + len(borrowable):
+        shared = config.ever_borrowable(spec)
+        if spec.gpus <= len(config.gpus) + len(shared):
             return None
         have = f"host owns {len(config.gpus)}"
-        if borrowable:
-            have += f" and may borrow {len(borrowable)} shared"
+        if shared:
+            have += f" and may borrow {len(shared)} shared"
         elif config.shared_gpus:
             have += (
-                f" and shares {len(config.shared_gpus)} this job may not use "
-                f"({self._why_not_borrowing(spec)})"
+                f" and shares {len(config.shared_gpus)} this job did not ask for "
+                f"(`use_shared: true` would let it)"
             )
         return f"needs {spec.gpus} GPUs, {have}"
-
-    def _why_not_borrowing(self, spec: jobs.JobSpec) -> str:
-        if not spec.use_shared:
-            return "set `use_shared: true` to let it"
-        return (
-            f"priority {spec.priority} is worse than this host's "
-            f"shared_min_priority {self.config.shared_min_priority}"
-        )
 
     def launch_ready(self) -> None:
         if self.paused() or paths.draining_file().exists():

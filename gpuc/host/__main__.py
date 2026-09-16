@@ -101,14 +101,11 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     resolved, unavailable = _resolve(config.gpus)
     # Owning a card beats borrowing it, exactly as the dispatcher decides it.
     shared, shared_unavailable = _resolve(config.shared_gpus)
-    shared = [uuid for uuid in shared if uuid not in set(resolved)]
-    try:
-        usage = gpus.sample_usage(shared)
-    except gpus.GpuError:
-        # A card nvidia-smi would not answer about is not a borrowable one,
-        # which is what an absent `usage` entry says below. Same rule as
-        # `gpus.unused_gpus`, which is what actually hands the card out.
-        usage = {}
+    owned = set(resolved)
+    shared = [uuid for uuid in shared if uuid not in owned]
+    # Through the same reader the dispatcher borrows on, so an absent entry
+    # means here exactly what it means there: not a card we would take.
+    usage, _failure = gpus.usage_or_nothing(shared)
     return {
         "gpus": config.gpus,
         "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in resolved],

@@ -1449,21 +1449,47 @@ def test_the_priority_floor_keeps_low_priority_jobs_off_shared_cards(gpuc_home: 
 def test_a_job_too_big_even_with_shared_cards_fails_with_what_would_help(
     gpuc_home: Path,
 ) -> None:
-    """Three ways not to fit on a 2-owned, 2-shared host, and the reason has to
+    """Two ways not to fit on a 2-owned, 2-shared host, and the reason has to
     name which -- otherwise `needs 5 GPUs, host owns 2` sends somebody looking
     for a bigger host when `use_shared: true` was the answer."""
-    dispatcher, _ = shared_host(min_priority=20)
-    asked, did_not_ask, too_low = enqueue_in_order(
-        {"gpus": 5, "use_shared": True, "priority": 0},
+    dispatcher, _ = shared_host()
+    asked, did_not_ask = enqueue_in_order(
+        {"gpus": 5, "use_shared": True},
         {"gpus": 3},
-        {"gpus": 3, "use_shared": True, "priority": 99},
     )
     dispatcher.run_once()
 
-    assert all(jobs.read_state(job).status == "failed" for job in (asked, did_not_ask, too_low))
+    assert all(jobs.read_state(job).status == "failed" for job in (asked, did_not_ask))
     assert "may borrow 2 shared" in (jobs.read_state(asked).reason or "")
     assert "use_shared: true" in (jobs.read_state(did_not_ask).reason or "")
-    assert "shared_min_priority 20" in (jobs.read_state(too_low).reason or "")
+
+
+def test_the_priority_floor_makes_a_job_wait_and_never_fails_it(gpuc_home: Path) -> None:
+    """The floor is administrative and movable; `use_shared` is not. Failing a
+    job on a movable gate deletes it -- and the two commands whose whole job is
+    to move a job later in the queue both move it across this gate."""
+    dispatcher, _ = shared_host(min_priority=20, memory_used={SHARED_GPUS[1]: 4096.0})
+    (job_id,) = enqueue_in_order({"gpus": 4, "use_shared": True, "priority": 0})
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "queued"
+
+    # `gpuc reorder <job> --priority 99` was asked to move the job, not to end it.
+    queue.reorder(job_id, 99)
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "queued"
+    assert [e.job_id for e in queue.list_queued()] == [job_id]
+
+    # And the floor itself moves under jobs that are already waiting.
+    jobs.merge_config({"shared_min_priority": 0})
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "queued"
+
+    # Back under the floor, and with the borrowed card free, it runs -- so it
+    # really was only ever waiting.
+    queue.reorder(job_id, 0)
+    dispatcher.deps.smi = fake_smi(ALL_GPUS)
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).gpus == ALL_GPUS
 
 
 def test_a_card_listed_as_both_owned_and_shared_is_only_owned(gpuc_home: Path) -> None:

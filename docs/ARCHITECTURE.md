@@ -964,13 +964,26 @@ actually needs to borrow -- so a host with nothing queued that wants a shared
 card runs no extra `nvidia-smi` -- and every job in that pass is judged against
 the one reading, which is also what stops two of them being handed one card.
 
-What this deliberately does not do: **yield**. Once a job is running on a
-borrowed card it keeps it until it ends. Someone else starting a job on that
-card is a collision gpuc does not detect and does not resolve; `gpuc preempt`
-is the manual way out. Nor does `gpuc status`'s start-time estimate model
-shared cards: when somebody else stops using one is not something this host can
-predict, so a job waiting on one is reported as having no estimate and told
-why, rather than given a number we invented.
+`gpuc status`'s start-time estimate models the shared cards that are idle
+*right now*, and only for the jobs allowed onto them, so a borrower whose turn
+is the next dispatch pass is told `starts now` rather than being made to wait
+for an owned card it will not want. A card somebody else is on is left out of
+the model entirely: when they will stop is the one thing this host cannot know,
+so a job waiting for one has no start time and is told why.
+
+Two things this deliberately does not do:
+
+- **Yield.** Once a job is running on a borrowed card it keeps it until it
+  ends. Someone else starting a job on that card is a collision gpuc does not
+  detect and does not resolve; `gpuc preempt` is the manual way out.
+- **Fail a job over `shared_min_priority`.** Dropping a job out of the queue is
+  permanent, so the dispatcher only does it on a gate a queued job cannot get
+  past. `use_shared` is one -- nothing changes it after submit -- and the
+  priority floor is not: `gpuc reorder` moves a job over it, `gpuc preempt
+  --priority` brings one back above it, and `gpuc host set
+  --shared-min-priority` moves the floor under everything already waiting.
+  A job held up by the floor alone waits. `gpuc submit` still refuses it up
+  front, where nothing has been queued yet and the submitter is looking.
 
 A card in both lists is refused -- by `gpuc host add|set`, where it was typed,
 and by the host's own `gpu_uuids` health check at bootstrap. Should one reach a
