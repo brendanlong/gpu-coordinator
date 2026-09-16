@@ -241,7 +241,7 @@ def test_the_page_redirects_to_login_without_a_session(client: Client) -> None:
 
 def test_the_api_refuses_without_a_session_rather_than_redirecting(client: Client) -> None:
     status, document = client.get_json("/api/status")
-    assert status == 400
+    assert status == 401
     assert document["error"] == "not logged in"
     assert document["schema_version"] == 1
 
@@ -274,6 +274,41 @@ def test_logout_ends_the_session(logged_in: Client) -> None:
     assert (status, headers["location"]) == (303, "/login")
     status, _, _ = logged_in.get("/")
     assert status == 303
+    logged_in.cookies[SESSION_COOKIE] = "a-token-the-server-forgot"
+    status, _, _ = logged_in.get("/api/status")
+    assert status == 401
+
+
+def test_a_quiet_minute_forgets_the_run_of_failures(password_hash: str) -> None:
+    now = [0.0]
+    slept: list[float] = []
+    sessions = Sessions(password_hash, clock=lambda: now[0], sleep=slept.append)
+    assert sessions.login("wrong") is None
+    assert sessions.login("wrong") is None
+    now[0] = 61.0
+    assert sessions.login(PASSWORD) is not None
+    assert slept == [0.5]
+
+
+def test_every_bad_request_still_gets_a_status_line(client: Client) -> None:
+    """A dropped connection tells a browser nothing; these each used to be one."""
+    status, _, _ = client.get("/static/missing.js")
+    assert status == 404
+    status, _, data = client.request("POST", "/login", b"x", {"Content-Length": "abc"})
+    assert status == 400 and b"Content-Length" in data
+    # A declared 2 MiB with one byte actually sent: the server must answer
+    # from the header alone, before reading a body it is about to refuse. (A
+    # client that sends the whole body sees the same 413, or a broken pipe
+    # once the server has closed on it, depending on the race.)
+    status, _, data = client.request(
+        "POST",
+        "/login",
+        b"a",
+        {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(2 << 20)},
+    )
+    assert status == 413 and b"over" in data
+    status, _, _ = client.get("/login")
+    assert status == 200
 
 
 def test_a_post_from_another_origin_is_refused(logged_in: Client) -> None:

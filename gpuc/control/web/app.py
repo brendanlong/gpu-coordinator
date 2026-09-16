@@ -19,6 +19,7 @@ import json
 import re
 import sys
 import threading
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -173,6 +174,7 @@ class Dashboard:
             ("POST", re.compile(r"^/login$"), Dashboard.login, False),
             ("POST", re.compile(r"^/logout$"), Dashboard.logout, True),
             ("GET", re.compile(r"^/static/([a-z]+\.(?:js|css))$"), Dashboard.static, False),
+            ("GET", re.compile(r"^/favicon\.ico$"), Dashboard.no_icon, False),
             ("GET", re.compile(r"^/api/status$"), Dashboard.api_status, True),
             ("GET", re.compile(r"^/api/hosts$"), Dashboard.api_hosts, True),
             ("GET", re.compile(r"^/api/config$"), Dashboard.api_config, True),
@@ -195,7 +197,12 @@ class Dashboard:
                 return Response.error("cross-origin request refused", EXIT_USAGE)
             if protected and not self.sessions.check(request.session_token):
                 if request.wants_json:
-                    return Response.error("not logged in", EXIT_USAGE)
+                    # 401, not the exit-code table's 400: the page keys its
+                    # "go and log in again" on the status, not on the words.
+                    return Response.json(
+                        {"error": "not logged in", "exit_code": EXIT_USAGE},
+                        HTTPStatus.UNAUTHORIZED,
+                    )
                 return Response.redirect("/login")
             try:
                 return handler(self, request)
@@ -219,7 +226,15 @@ class Dashboard:
         assert request.match is not None
         name = request.match.group(1)
         suffix = name[name.rfind(".") :]
-        return Response(HTTPStatus.OK, static_file(name), STATIC_TYPES[suffix])
+        try:
+            body = static_file(name)
+        except FileNotFoundError:
+            return Response(HTTPStatus.NOT_FOUND, b"not found\n")
+        return Response(HTTPStatus.OK, body, STATIC_TYPES[suffix])
+
+    def no_icon(self, request: Request) -> Response:
+        """Browsers ask for one unprompted; an empty answer keeps the console clean."""
+        return Response(HTTPStatus.NO_CONTENT)
 
     def login_form(self, request: Request) -> Response:
         if self.sessions.check(request.session_token):
@@ -355,9 +370,21 @@ def session_cookie(token: str, *, clear: bool = False) -> str:
     return f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}"
 
 
+IDLE_TIMEOUT_S = 30
+"""How long a kept-alive connection may sit silent before its thread is
+released. Without it every idle browser connection pins a thread for ever."""
+
+
+class BadRequest(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 def make_handler(app: Dashboard) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = IDLE_TIMEOUT_S
 
         def do_GET(self) -> None:
             self._serve("GET")
@@ -366,7 +393,23 @@ def make_handler(app: Dashboard) -> type[BaseHTTPRequestHandler]:
             self._serve("POST")
 
         def _serve(self, method: str) -> None:
-            response = app.handle(self._request(method))
+            try:
+                response = app.handle(self._request(method))
+            except BadRequest as exc:
+                # The body was not read, so the bytes left on the socket must
+                # never be parsed as the next request.
+                self.close_connection = True
+                response = Response(exc.status, f"{exc}\n".encode())
+            except Exception:
+                # Every request gets a status line, even for a bug: a dropped
+                # connection tells the browser nothing and hides the traceback
+                # from the next request's log line.
+                traceback.print_exc()
+                self.close_connection = True
+                response = Response(HTTPStatus.INTERNAL_SERVER_ERROR, b"internal error\n")
+            self._write(response)
+
+        def _write(self, response: Response) -> None:
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
             self.send_header("Content-Length", str(len(response.body)))
@@ -378,7 +421,18 @@ def make_handler(app: Dashboard) -> type[BaseHTTPRequestHandler]:
 
         def _request(self, method: str) -> Request:
             parts = urlsplit(self.path)
-            length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY_BYTES)
+            raw_length = self.headers.get("Content-Length") or "0"
+            try:
+                length = int(raw_length)
+            except ValueError:
+                raise BadRequest(HTTPStatus.BAD_REQUEST, "bad Content-Length") from None
+            if length < 0:
+                raise BadRequest(HTTPStatus.BAD_REQUEST, "bad Content-Length")
+            if length > MAX_BODY_BYTES:
+                raise BadRequest(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    f"request body over {MAX_BODY_BYTES} bytes",
+                )
             body = self.rfile.read(length) if length else b""
             cookies = SimpleCookie(self.headers.get("Cookie", ""))
             return Request(

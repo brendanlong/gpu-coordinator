@@ -674,3 +674,53 @@ def test_an_eta_a_host_reports_as_nonsense_is_ignored() -> None:
         )
     )
     assert (running[0].eta, running[0].progress_pct, running[0].eta_seconds) == (None, None, None)
+
+
+def test_job_links_name_every_destination_and_quote_them() -> None:
+    """The dashboard's anchors: S3 console, HF tree, W&B run, and the host's mirror.
+
+    Derived from what the job declared and never checked, so the one thing
+    they must get right is the URL itself: a repo name with a `?` in it
+    would otherwise swallow the path into a query string.
+    """
+    from gpuc.control.status import job_links
+
+    _, running, _ = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j-running",
+                    "status": "running",
+                    "outputs": [
+                        {"path": "results", "s3": "s3://bucket/lego/j-running"},
+                        {"path": "ckpt", "hf": "me/repo?x", "hf_path": "runs/j-running"},
+                        {"path": "extra", "hf": "me/plain"},
+                        {"path": "nowhere"},
+                    ],
+                    "wandb": {"entity": "me", "project": "lego", "run_id": "r1"},
+                }
+            ]
+        )
+    )
+    links = {
+        (link["kind"], link["path"]): link["url"] for link in job_links(running[0], "s3://m/p/")
+    }
+    assert links[("s3", "results")] == (
+        "https://s3.console.aws.amazon.com/s3/buckets/bucket?prefix=lego/j-running/"
+    )
+    assert links[("hf", "ckpt")] == "https://huggingface.co/me/repo%3Fx/tree/main/runs/j-running"
+    assert links[("hf", "extra")] == "https://huggingface.co/me/plain"
+    assert links[("wandb", None)] == "https://wandb.ai/me/lego/runs/r1"
+    assert links[("mirror", None)] == (
+        "https://s3.console.aws.amazon.com/s3/buckets/m?prefix=p/jobs/j-running/"
+    )
+    assert len(links) == 5
+
+
+def test_job_links_need_a_whole_wandb_run_and_no_mirror_for_a_queued_job() -> None:
+    from gpuc.control.status import job_links
+
+    queued, _, _ = job_views(
+        payload(jobs=[{"job_id": "j-queued", "status": "queued", "wandb": {"project": "lego"}}])
+    )
+    assert job_links(queued[0], "s3://m/p") == []

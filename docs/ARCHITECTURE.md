@@ -834,9 +834,15 @@ nothing from a framework -- with `bcrypt` the one added dependency. One
 password, hashed into `config_dir()/web-password` (0600) by `gpuc web
 set-password` and read once at startup; a server with no password refuses to
 start. Sessions are random tokens held in memory, `HttpOnly; SameSite=Strict`,
-seven days; every POST must also pass an `Origin`-matches-`Host` check. Wrong
-passwords are checked one at a time under a lock with a growing pause. No TLS:
-it is for localhost or a VPN, or behind a proxy.
+seven days; a POST that carries an `Origin` header must match `Host` (a
+browser that honours `SameSite` never sends the cookie cross-site in the
+first place, so this is the second lock). Wrong passwords are checked one at
+a time under a lock of their own with a growing pause, which a quiet minute
+resets; the session table has a separate lock, so a guesser at the door
+cannot stall requests from inside. Idle keep-alive connections time out
+after 30 s, an oversized or malformed body is refused before it is read, and
+a bug in a handler is a 500 with a traceback in the server log, never a
+dropped connection. No TLS: it is for localhost or a VPN, or behind a proxy.
 
 The page is static HTML/JS that fetches `/api/status`, `/api/hosts`,
 `/api/config` and `/api/version` every 15 s and polls `/api/jobs/<id>/logs`

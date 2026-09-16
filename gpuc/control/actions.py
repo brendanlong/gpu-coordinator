@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import shlex
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -166,18 +166,20 @@ MAX_PARALLEL_HOSTS = 8
 
 def gather_all(
     entries: Sequence[HostEntry], settings: Settings, provider: Provider | None
-) -> list[status_mod.HostView]:
-    """Every host's status, asked for at once and answered in registry order.
+) -> Iterator[status_mod.HostView]:
+    """Every host's status, asked for at once and yielded in registry order.
 
     One ssh round trip per host, and a wedged host takes its whole timeout to
     say so; asked one after another that is a dashboard that takes a minute to
-    draw when one box is down.
+    draw when one box is down. Yielded rather than collected so the text
+    `gpuc status` still prints each host as soon as it, and every host before
+    it, has answered.
     """
     if not entries:
-        return []
+        return
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(entries))) as pool:
-        return list(
-            pool.map(lambda entry: status_mod.gather(entry, settings, provider=provider), entries)
+        yield from pool.map(
+            lambda entry: status_mod.gather(entry, settings, provider=provider), entries
         )
 
 
@@ -205,7 +207,7 @@ def status_document(
     """
     entries = hosts_for(read.registry, host) if not read.unreadable else []
     provider = provider_for_status(entries, settings, report) if entries else None
-    views = gather_all(entries, settings, provider)
+    views = list(gather_all(entries, settings, provider))
     errors = list(read.errors)
     if read.unreadable:
         errors.append(

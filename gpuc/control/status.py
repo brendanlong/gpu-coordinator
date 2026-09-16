@@ -816,10 +816,11 @@ def job_links(job: JobView, mirror_prefix: str | None = None) -> list[dict[str, 
         if isinstance(repo, str) and repo:
             sub = output.get("hf_path") if isinstance(output.get("hf_path"), str) else ""
             target = f"{repo}/{sub}" if sub else repo
+            safe_repo = quote(repo, safe="/")
             url = (
-                HF_TREE.format(repo=repo, path=quote(sub))
+                HF_TREE.format(repo=safe_repo, path=quote(sub))
                 if sub
-                else f"https://huggingface.co/{repo}"
+                else f"https://huggingface.co/{safe_repo}"
             )
             links.append({"kind": "hf", "path": path, "target": target, "url": url})
     entity, project, run_id = (job.wandb.get(k) for k in ("entity", "project", "run_id"))
@@ -833,6 +834,9 @@ def job_links(job: JobView, mirror_prefix: str | None = None) -> list[dict[str, 
         target = f"{entity}/{project}" + (f"/{run_id}" if run_id else "")
         links.append({"kind": "wandb", "path": None, "target": target, "url": url})
     if mirror_prefix and job.status != "queued":
+        # The host's *current* prefix. A job mirrored under a prefix the host
+        # has since been re-registered without gets a link to an empty
+        # listing; `gpuc logs` reads the job's own index entry, this does not.
         mirror = f"{mirror_prefix.rstrip('/')}/jobs/{job.job_id}"
         links.append(
             {"kind": "mirror", "path": None, "target": mirror, "url": s3_console_url(mirror)}

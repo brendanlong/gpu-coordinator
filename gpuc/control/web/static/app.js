@@ -100,7 +100,7 @@ function short(commit) {
 
 async function api(path, options) {
   const response = await fetch(path, options);
-  if (response.status === 401 || (response.redirected && new URL(response.url).pathname === "/login")) {
+  if (response.status === 401) {
     window.location.href = "/login";
     throw new Error("not logged in");
   }
@@ -110,10 +110,7 @@ async function api(path, options) {
   } catch (err) {
     throw new Error(`${path}: HTTP ${response.status}`);
   }
-  if (document_.error) {
-    if (document_.error === "not logged in") window.location.href = "/login";
-    throw new Error(document_.error);
-  }
+  if (document_.error) throw new Error(document_.error);
   return document_;
 }
 
@@ -212,8 +209,16 @@ function estimateButton(host, job) {
         job.estimated_runtime_min ?? "");
       if (raw === null) return;
       const body = { host: host.name };
-      if (raw.trim() === "") body.clear = true;
-      else body.minutes = Number(raw);
+      if (raw.trim() === "") {
+        body.clear = true;
+      } else {
+        const minutes = Number(raw);
+        if (!Number.isFinite(minutes)) {
+          notify(`${raw.trim()} is not a number of minutes`, "bad");
+          return;
+        }
+        body.minutes = minutes;
+      }
       try {
         const result = await post(`/api/jobs/${encodeURIComponent(job.job_id)}/estimate`, body);
         for (const warning of result.warnings || []) notify(warning, "warn");
@@ -469,42 +474,49 @@ function schedule() {
 // -- the log panel ------------------------------------------------------------
 
 async function fetchLog() {
-  if (!state.log) return;
-  const { jobId, host } = state.log;
+  const log = state.log;
+  if (!log || log.busy) return;
+  log.busy = true;
   const text = document.getElementById("log-text");
   try {
-    const result = await api(`/api/jobs/${encodeURIComponent(jobId)}/logs?lines=${LOG_LINES}&host=${encodeURIComponent(host)}`);
+    const result = await api(`/api/jobs/${encodeURIComponent(log.jobId)}/logs?lines=${LOG_LINES}&host=${encodeURIComponent(log.host)}`);
+    // The panel may have moved on to another job while this was in flight.
+    if (state.log !== log) return;
     document.getElementById("log-where").textContent = `${result.source}: ${result.location || ""}`;
     const atBottom = text.scrollTop + text.clientHeight >= text.scrollHeight - 4;
     text.textContent = result.lines.join("\n") + (result.notes.length ? `\n\n[${result.notes.join("; ")}]` : "");
-    if (atBottom) text.scrollTop = text.scrollHeight;
+    if (atBottom || log.firstLoad) text.scrollTop = text.scrollHeight;
+    log.firstLoad = false;
   } catch (err) {
-    text.textContent = `could not read the log: ${err.message}`;
+    if (state.log === log) text.textContent = `could not read the log: ${err.message}`;
+  } finally {
+    log.busy = false;
+    scheduleFollow(log);
   }
 }
 
 function openLog(jobId, host) {
   closeLog();
-  state.log = { jobId, host, timer: null };
-  document.getElementById("log-title").textContent = `log · ${jobId} · ${host}`;
-  document.getElementById("log-text").textContent = "loading…";
+  state.log = { jobId, host, timer: null, busy: false, firstLoad: true };
+  document.getElementById("log-title").textContent = `log \u00b7 ${jobId} \u00b7 ${host}`;
+  document.getElementById("log-text").textContent = "loading\u2026";
   document.getElementById("log-panel").hidden = false;
   document.body.classList.add("log-open");
-  fetchLog().then(() => {
-    const text = document.getElementById("log-text");
-    text.scrollTop = text.scrollHeight;
-  });
-  scheduleFollow();
+  fetchLog();
 }
 
-function scheduleFollow() {
-  if (!state.log) return;
-  if (state.log.timer) clearInterval(state.log.timer);
-  state.log.timer = document.getElementById("log-follow").checked ? setInterval(fetchLog, LOG_FOLLOW_MS) : null;
+// One fetch at a time, the next one scheduled only once the last has landed:
+// a log tail is an ssh round trip, and an interval would stack them on a slow
+// host and let an older answer overwrite a newer one.
+function scheduleFollow(log) {
+  log = log || state.log;
+  if (!log || state.log !== log) return;
+  if (log.timer) clearTimeout(log.timer);
+  log.timer = document.getElementById("log-follow").checked ? setTimeout(fetchLog, LOG_FOLLOW_MS) : null;
 }
 
 function closeLog() {
-  if (state.log && state.log.timer) clearInterval(state.log.timer);
+  if (state.log && state.log.timer) clearTimeout(state.log.timer);
   state.log = null;
   document.getElementById("log-panel").hidden = true;
   document.body.classList.remove("log-open");
@@ -519,7 +531,7 @@ document.getElementById("auto").addEventListener("change", (event) => {
 });
 document.getElementById("log-refresh").addEventListener("click", fetchLog);
 document.getElementById("log-close").addEventListener("click", closeLog);
-document.getElementById("log-follow").addEventListener("change", scheduleFollow);
+document.getElementById("log-follow").addEventListener("change", () => scheduleFollow());
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.auto) load();
 });

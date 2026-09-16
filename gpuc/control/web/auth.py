@@ -91,11 +91,19 @@ def verify(password: str, password_hash: str) -> bool:
         return False
 
 
+FAILURE_RESET_S = 60.0
+"""A quiet minute forgets the run of failures, so a typo this morning does not
+slow the owner down this afternoon."""
+
+
 class Sessions:
     """Logins checked one at a time, and tokens that expire.
 
-    The lock is the throttle: every guess waits for the one before it, and a
-    run of failures adds a growing pause on top of bcrypt's own cost.
+    Two locks on purpose. The login lock is the throttle: every guess waits
+    for the one before it, and a run of failures adds a growing pause on top
+    of bcrypt's own cost. The token lock is held for a dictionary lookup and
+    nothing else, so a guesser at the front door cannot stall the requests of
+    somebody already inside.
     """
 
     def __init__(
@@ -110,34 +118,42 @@ class Sessions:
         self._ttl_s = ttl_s
         self._clock = clock
         self._sleep = sleep
-        self._lock = threading.Lock()
+        self._login_lock = threading.Lock()
+        self._tokens_lock = threading.Lock()
         self._tokens: dict[str, float] = {}
         self.failures = 0
+        self._last_failure: float | None = None
 
     def login(self, password: str) -> str | None:
         """A session token for the right password, None for a wrong one."""
-        with self._lock:
+        with self._login_lock:
+            now = self._clock()
+            if self._last_failure is not None and now - self._last_failure > FAILURE_RESET_S:
+                self.failures = 0
             if self.failures:
                 self._sleep(min(FAILURE_DELAY_S * self.failures, FAILURE_DELAY_MAX_S))
             if not verify(password, self._hash):
                 self.failures += 1
+                self._last_failure = self._clock()
                 return None
             self.failures = 0
+            self._last_failure = None
+        token = secrets.token_urlsafe(32)
+        with self._tokens_lock:
             self._expire()
-            token = secrets.token_urlsafe(32)
             self._tokens[token] = self._clock() + self._ttl_s
-            return token
+        return token
 
     def check(self, token: str | None) -> bool:
         if not token:
             return False
-        with self._lock:
+        with self._tokens_lock:
             self._expire()
             return token in self._tokens
 
     def logout(self, token: str | None) -> None:
         if token:
-            with self._lock:
+            with self._tokens_lock:
                 self._tokens.pop(token, None)
 
     def _expire(self) -> None:

@@ -277,7 +277,8 @@ gpuc web serve                 # http://127.0.0.1:8646/
 gpuc web serve --bind 0.0.0.0 --port 8646   # reachable from other machines
 ```
 
-The whole interface — pages and API alike — is behind that one password. The
+Every page and every API document is behind that one password (only the
+stylesheet, the script and the login form itself are served without it). The
 server refuses to start until one is set. Sessions live in the server's memory
 (a restart logs everyone out) and the cookie is `HttpOnly; SameSite=Strict`, but
 there is **no TLS**: bind to localhost or a VPN interface, or put it behind a
@@ -295,14 +296,16 @@ held:
 | `GET /api/hosts` | `gpuc host list --json` |
 | `GET /api/config` | `gpuc config show --json` |
 | `GET /api/version` | `gpuc version --json` |
-| `GET /api/jobs/<id>/logs?lines=N&host=H` | `gpuc logs --json` |
+| `GET /api/jobs/<id>/logs?lines=N&host=H` | `gpuc logs --json` (no `-f`; the page re-fetches the tail instead) |
 | `POST /api/jobs/<id>/cancel` `{host?}` | `gpuc cancel --json` |
 | `POST /api/jobs/<id>/reorder` `{priority, host?}` | `gpuc reorder --json` |
 | `POST /api/jobs/<id>/estimate` `{minutes}` or `{clear: true}` | `gpuc estimate --json` |
 
 A failure is the same `{schema_version, error, exit_code}` document the CLI
 prints, with the exit code mapped onto the status: 2 is 400, 3 is 503, 4 is
-404, 1 is 500. Terminating a host from the dashboard is not there yet, because
+404, 1 is 500; a request with no session is 401. The `mirror` link is built
+from the host's *current* `s3_prefix`, where `gpuc logs` prefers the prefix
+the job's own index entry recorded. Terminating a host from the dashboard is not there yet, because
 the CLI has no command for it either (see [setup.md](setup.md#teardown)); when
 one is added the dashboard will call it.
 
