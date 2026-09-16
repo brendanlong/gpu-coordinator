@@ -284,6 +284,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "eta",
         "eta_s",
         "estimated_runtime_min",
+        "progress_error",
         "gpus",
         "iso",
         "ended_at",

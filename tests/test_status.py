@@ -498,7 +498,56 @@ def test_a_job_past_its_own_eta_is_overdue_not_negative() -> None:
 
 
 def test_a_job_with_no_estimate_at_all_gets_no_eta_column() -> None:
-    assert "eta" not in render(busy(running_job()))
+    running = [line for line in render(busy(running_job())).splitlines() if "running" in line]
+    assert running and not any("eta" in line for line in running)
+
+
+def test_zero_percent_is_labelled_as_the_guess_it_still_is() -> None:
+    """The runner does not replace the eta at 0%, so the eta on show is the
+    submitter's estimate; tagging it `(0%)` would claim evidence."""
+    text = render(busy(running_job(eta=in_minutes(90), progress_pct=0.0)))
+    assert "eta 1h30m (est)" in text
+
+
+def test_a_cpu_only_job_is_never_named_as_the_next_card_to_free_up() -> None:
+    """`gpus: 0` jobs run but hold nothing, so a five-minute preprocessing job
+    must not be offered as the reason a card frees up in five minutes."""
+    text = render(
+        busy(
+            running_job(job_id="j-train", gpus=[GPU, "GPU-b"]),
+            running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)),
+        )
+    )
+    assert "j-cpu" not in text.split("free    ")[-1]
+    assert "none of the 1 running job(s) estimated an end time" in text
+
+
+def test_a_host_running_only_cpu_jobs_has_no_next_card_line() -> None:
+    view = busy(running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)))
+    assert "free    " not in render(view)
+
+
+def test_a_multi_day_estimate_is_shown_in_days() -> None:
+    queued = JobView(job_id="j-queued", priority=10, estimated_runtime_min=3 * 24 * 60 + 120)
+    assert "est 3d02h" in render(busy(running_job(), queued=[queued]))
+
+
+def test_the_json_carries_a_broken_progress_command() -> None:
+    """Otherwise a typo'd progress command is indistinguishable from a job that
+    never had one: the log line scrolls away under hours of training output."""
+    _, running, _ = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j-running",
+                    "status": "running",
+                    "progress_error": "progress command `cat p.txt` exited 1: no such file",
+                }
+            ]
+        )
+    )
+    view = busy(running[0])
+    assert host_json(view)["running"][0]["progress_error"].endswith("no such file")
 
 
 def test_a_queued_job_shows_the_submitters_estimate() -> None:

@@ -85,7 +85,8 @@ class JobSpecModel(BaseModel):
     enforces it; it is what tells the next person whether to queue behind it."""
     progress_command: str | None = None
     """Run in the workdir every `progress_interval_s` of phase `main`; its last
-    line of stdout is how far along the job is (`42`, `42%` or `300/5000`)."""
+    line of stdout is how far along the job is, as a fraction of one (`0.42`) or
+    a percentage written with a `%` (`42%`)."""
     progress_interval_s: float = Field(default=progress.DEFAULT_INTERVAL_S, ge=5)
     low_util: LowUtilModel = Field(default_factory=LowUtilModel)
     requires: dict[str, Any] = Field(default_factory=dict)

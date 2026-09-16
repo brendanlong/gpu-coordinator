@@ -394,8 +394,9 @@ class JobRunner:
     def _publish_estimated_eta(self, elapsed_s: float) -> None:
         if self.spec.estimated_runtime_min is None:
             return
-        remaining = self.spec.estimated_runtime_min * 60.0 - elapsed_s
-        jobs.update_state(self.job_id, eta=jobs.utc_in(remaining))
+        eta = jobs.utc_in(self.spec.estimated_runtime_min * 60.0 - elapsed_s)
+        if eta is not None:
+            jobs.update_state(self.job_id, eta=eta)
 
     def _record_progress(self, command: str, elapsed_s: float, log: IO[bytes]) -> None:
         """One poll of the spec's `progress_command`, and the end time it implies.
@@ -425,7 +426,9 @@ class JobRunner:
         if percent > 0:
             # At 0% there is no rate yet, so the submitter's estimate (if any)
             # stays; overwriting it with an infinite one helps nobody.
-            fields["eta"] = jobs.utc_in(elapsed_s * (100.0 - percent) / percent)
+            eta = jobs.utc_in(elapsed_s * (100.0 - percent) / percent)
+            if eta is not None:
+                fields["eta"] = eta
         jobs.update_state(self.job_id, **fields)
 
     def _record_util(self, util: float | None) -> None:

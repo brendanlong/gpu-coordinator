@@ -309,19 +309,34 @@ ever change a job's outcome:
   identical to a wedged one.
 - `progress_command` -- run in `workdir/` with the job's own environment, only
   during `main`, every `progress_interval_s`. Its **last non-empty line of
-  stdout** is a percentage: `42`, `42.5`, `42%`, or `300/5000` for how much of
-  how many. Deliberately not a fraction of one, because `0.42` would otherwise
-  have to mean either 0.42% or 42% and the wrong guess is a hundredfold error
-  in a time somebody is planning around. Above 0% the runner replaces `eta`
-  with `now + elapsed_main * (100 - pct) / pct` -- elapsed *main*, so a slow
-  setup is never charged to the first epoch.
+  stdout** says how far along it is, in one of exactly two forms: a fraction
+  of one, which carries a decimal point (`0.42`), or a percentage, which
+  carries a `%` (`42%`). A bare integer is refused rather than guessed at --
+  `42` could be either and `1` could be 1% or a finished job, reading either
+  the wrong way is a hundredfold error in a time somebody is planning around,
+  and no rule applied after the fact can tell them apart, so the unit has to be
+  in the input. `step / total` prints `0.42`, `0.0` and `1.0` in any language,
+  so the decimal point costs the intended case nothing and catches `echo
+  $step`. Above 0% the runner replaces `eta` with `now + elapsed_main *
+  (100 - pct) / pct` -- elapsed *main*, so a slow setup is never charged to the
+  first epoch. At 0% the submitter's estimate stands, and `status` tags the eta
+  `(est)` accordingly: there is no rate to measure yet.
 
 The poll is synchronous, in the same loop that watches for a cancel, a TTL and
 `max_runtime_min`, with a 10 s timeout and a `killpg` of the whole session
-behind it: a wedged progress command therefore delays a kill by at most 10 s and
-cannot leave a grandchild behind to be re-spawned every interval. Doing it on a
-thread instead would have two writers racing on `state.json`, which is a worse
-trade than 10 s.
+behind it, so a wedged progress command delays a kill by at most 10 s of the
+15 s the runner gets before the dispatcher escalates -- most of that budget,
+which is why the timeout is fixed rather than a spec field. Its output goes to
+a temp file, not a pipe: a grandchild that `setsid`s out of the session escapes
+the `killpg` *and* would hold a pipe open, blocking the reap for ever and
+taking the cancel check down with it. Only the last `MAX_OUTPUT_BYTES` is read
+back, so a command pointed at a whole log cannot put it in the runner's memory.
+
+Doing the poll on a thread instead would add a *third* concurrent writer to
+`state.json`'s read-modify-write -- the sync loop's `sync_error` is already a
+second one, alongside the runner's main thread -- and losing a utilization
+sample that way would mislead the low-util watchdog. Bounded latency is the
+better trade.
 
 A failed, timed-out or unparseable poll writes `progress_error` and returns.
 It is logged the *first* time each distinct message appears, because this runs

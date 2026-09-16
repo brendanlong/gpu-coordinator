@@ -70,7 +70,7 @@ priority: 50                       # 0 first, 99 last
 max_runtime_min: 720               # optional wall-clock cap
 estimated_runtime_min: 480         # optional; what `gpuc status` shows the next person
 progress_command: "tail -1 results/progress.txt"   # optional; last stdout line is a percentage
-progress_interval_s: 60            # `42`, `42%` or `300/5000`; minimum 5
+progress_interval_s: 60            # prints `0.42` or `42%`; a bare `42` is refused; min 5
 low_util:                          # kills a job whose GPU sits idle; defaults are conservative
   enabled: true                    # {window_min: 25, floor_pct: 5, grace_min: 10}
 cleanup: on_success                # workdir deleted after a successful run
@@ -167,7 +167,8 @@ The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
 `name, kind, reachable, pkg_commit, dispatcher{alive, heartbeat_age_s},
 provider_util, gpus, queued, running, finished, errors`; each job in those three
 lists has `job_id, name, status, reason, phase, elapsed_s, util, progress_pct,
-eta, eta_s, estimated_runtime_min, gpus, iso, ended_at, outputs_pending`.
+eta, eta_s, estimated_runtime_min, progress_error, gpus, iso, ended_at,
+outputs_pending`.
 
 **Every command that has an answer takes `--json`**, and means the same thing by
 it: stdout is one object with `schema_version`, everything else the command says

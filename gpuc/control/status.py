@@ -89,6 +89,12 @@ class JobView:
     where there is one, from the spec's `estimated_runtime_min` otherwise."""
     estimated_runtime_min: float | None = None
     """The submitter's own estimate, which is all a *queued* job has."""
+    progress_error: str | None = None
+    """Why this job's `progress_command` last produced nothing.
+
+    Surfaced because the failure is logged into a `log.txt` that then fills up
+    with hours of training output: without this, a typo'd progress command is
+    indistinguishable from a job that never had one."""
     workdir_bytes: int | None = None
     """Disk still held by this job's `workdir/`; the host only measures it for
     finished jobs."""
@@ -206,7 +212,13 @@ def format_duration(seconds: float) -> str:
         return f"{round(seconds)}s"
     if minutes < 60:
         return f"{minutes}m"
-    return f"{minutes // 60}h{minutes % 60:02d}m"
+    hours, rest = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{rest:02d}m"
+    # A sweep really does run for days, and `est 72h00m` beside a `2d ago` on
+    # the line above is the kind of unit mismatch a reader has to stop and do
+    # arithmetic on.
+    return f"{hours // 24}d{hours % 24:02d}h"
 
 
 def _as_float(value: Any) -> float | None:
@@ -340,6 +352,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
+            progress_error=_as_str(entry.get("progress_error")),
             workdir_bytes=entry.get("workdir_bytes"),
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
@@ -438,7 +451,10 @@ def _fmt_eta(job: JobView) -> str:
     remaining = job.eta_seconds
     if remaining is None:
         return ""
-    source = "est" if job.progress_pct is None else f"{job.progress_pct:.0f}%"
+    # `not job.progress_pct` and not `is None`: at 0% the runner deliberately
+    # leaves the submitter's estimate in place, so the eta being shown is the
+    # guess and tagging it `(0%)` would claim evidence that is not there.
+    source = f"{job.progress_pct:.0f}%" if job.progress_pct else "est"
     if remaining < 0:
         return f" eta overdue ({source})"
     return f" eta {format_duration(remaining)} ({source})"
@@ -458,14 +474,18 @@ def next_free_line(view: HostView) -> str | None:
     nothing to estimate from, because the real answer can only be *sooner* than
     this -- one of those could finish in a minute.
     """
-    if not view.owned or view.free or not view.running:
+    # `gpus: 0` jobs are running but hold no card, so they can never be the
+    # reason one comes free -- and naming a five-minute CPU job as the next
+    # card would answer the one question this line exists for with a lie.
+    holding = [job for job in view.running if job.gpus]
+    if not view.owned or view.free or not holding:
         return None
     known: list[tuple[float, JobView]] = []
-    for job in view.running:
+    for job in holding:
         remaining = job.eta_seconds
         if remaining is not None:
             known.append((remaining, job))
-    silent = len(view.running) - len(known)
+    silent = len(holding) - len(known)
     if not known:
         return (
             f"  free    every card is busy and none of the {silent} running job(s) estimated "
@@ -673,6 +693,7 @@ def job_json(job: JobView) -> dict[str, Any]:
         "eta": job.eta,
         "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),
         "estimated_runtime_min": job.estimated_runtime_min,
+        "progress_error": job.progress_error,
         "gpus": list(job.gpus),
         "iso": job.isolation,
         "ended_at": job.ended_at,
