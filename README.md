@@ -19,7 +19,8 @@ is a **mirror**, never the queue — with `s3_bucket` set, specs and the job ind
 go up from here and each host mirrors its own logs and state, which is what
 makes `gpuc requeue`, `gpuc logs` after a pod is gone, and `gpuc clean --purge`
 possible. Nothing runs in the background on the control side except the
-optional `gpuc reconcile` timer, which terminates pods nothing wants any more.
+optional `gpuc reconcile` timer, which ends rented pods that can no longer end
+themselves.
 
 ## Quick start
 

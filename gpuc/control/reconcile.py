@@ -126,9 +126,10 @@ class ReconcileResult:
 
         A terminate that failed leaves its record in place and lands in
         `errors`, which is the exit-1 case: the next pass retries it.
-        `unclaimed` is pod names, not host names: they are the pods with our
-        prefix that this machine has no record of and could not place, which
-        nothing here will terminate.
+        `unclaimed` is pod names, not host names: the pods with our prefix that
+        this pass did not judge, because this machine has no record of them and
+        could not get one out of them (or because the name one answers to is
+        already another pod's record). Nothing here will terminate them.
         """
         return {
             "terminated": list(self.terminated),
@@ -177,16 +178,19 @@ def _describe_lost_jobs(host: str, settings: Settings) -> str:
     )
 
 
-def _forget(name: str, report: Reporter) -> None:
+def _forget(name: str, pod_id: str, report: Reporter) -> None:
     """Drop every local trace of a host, taking the state lock for just that.
 
     The lock is per mutation, never held across the provider and ssh calls that
     decide *whether* to mutate: a terminate polls for up to five minutes, and a
     concurrent `gpuc submit --runpod` gives up on the lock after two.
+
+    `pod_id` keeps this to the pod it is about: a registry entry under the same
+    name that belongs to some other host of this machine's is left alone.
     """
     try:
         with state_lock():
-            forget_host(name)
+            forget_host(name, pod_id)
     except ConfigError as exc:
         report(f"WARNING: could not remove host {name} from the registry: {exc}")
 
@@ -374,7 +378,7 @@ def _reconcile_desired(
                 continue
         if pod is None or pod.status == "TERMINATED":
             report(f"{host.name} ({host.pod_id}): {_describe_lost_jobs(host.name, settings)}")
-            _forget(host.name, report)
+            _forget(host.name, host.pod_id, report)
             result.forgotten.append(host.name)
             continue
 
@@ -391,7 +395,7 @@ def _reconcile_desired(
                 result,
             ):
                 result.terminated.append(host.name)
-                _forget(host.name, report)
+                _forget(host.name, host.pod_id, report)
                 result.forgotten.append(host.name)
             continue
 
@@ -405,7 +409,7 @@ def _reconcile_desired(
                 result,
             ):
                 result.terminated.append(host.name)
-                _forget(host.name, report)
+                _forget(host.name, host.pod_id, report)
                 result.forgotten.append(host.name)
             continue
 
@@ -462,7 +466,7 @@ def _reap_if_silent(
     report(f"DEAD DISPATCHER: {why}")
     if _terminate(provider, pod, why, report, result):
         result.terminated.append(host.name)
-        _forget(host.name, report)
+        _forget(host.name, host.pod_id, report)
         result.forgotten.append(host.name)
         return True
     return False

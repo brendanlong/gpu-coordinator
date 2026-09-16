@@ -288,18 +288,22 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         registry.put(entry)
     lines = [_added_line(entry, connection, args.name)]
     if args.pod:
-        lines.append(_watch_pod(entry))
+        lines.append(_watch_pod(entry, settings, bootstrapped=connection.adopted))
     print("\n".join(lines))
     return 0
 
 
-def _watch_pod(entry: HostEntry) -> str:
+def _watch_pod(entry: HostEntry, settings: Settings, bootstrapped: bool) -> str:
     """Cache what an adopted pod said in `desired/`, so this machine watches it too.
 
     `gpuc reconcile` here would ask the pod and reach the same record on its
     next pass; writing it now is what makes `gpuc pods` say straight away that
     this pod is wanted, and what keeps it watched if it stops answering before
     that pass.
+
+    Watching a pod means being willing to terminate it, so a pod nobody has
+    installed gpuc on is told the deadline it has just been given: it has no
+    dispatcher to beat, so the silence rule starts now.
     """
     record = rented.desired_from_entry(entry)
     try:
@@ -307,9 +311,17 @@ def _watch_pod(entry: HostEntry) -> str:
             return f"desired/{record.name}.json is already here; left as it is"
     except (ConfigError, OSError) as exc:
         return f"WARNING: could not record {record.name} in desired/: {exc}"
-    return (
+    line = (
         f"recorded it in desired/{record.name}.json, so `gpuc reconcile` here watches it too "
         f"(TTL {'none' if record.ttl_hours is None else f'{record.ttl_hours:g} h'})"
+    )
+    if bootstrapped:
+        return line
+    return (
+        f"{line}\n"
+        f"  nothing has bootstrapped this pod, so it has no dispatcher to beat: "
+        f"`gpuc reconcile` here terminates it in {settings.dead_dispatcher_minutes:.0f} min "
+        f"unless `gpuc host bootstrap {entry.name}` gets there first"
     )
 
 

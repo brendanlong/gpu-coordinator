@@ -436,9 +436,12 @@ means no cap, on `submit`, `host add` and `host set` alike.
   a job for `dead_dispatcher_minutes` (30 by default) — including one whose ssh
   stopped answering, since that never refreshes `last_seen_at` either;
 - a pod past a TTL its host actually has;
-- a pod *this machine created* that never bootstrapped by its 15-minute ceiling
-  (a pod adopted from another machine has a config on it, so it is past that
-  question by definition and the dead-dispatcher rule is what judges it).
+- a pod *this machine created* that never bootstrapped by its 15-minute ceiling.
+  An adopted pod has a config on it, which is all this machine can see, so the
+  dead-dispatcher rule is what judges it instead — including a pod you adopt
+  with `--pod` and never bootstrap, which has no dispatcher to beat and is
+  terminated after `dead_dispatcher_minutes`. `gpuc host add --pod` says so
+  when it registers one.
 
 Those are the three states a pod cannot get itself out of. Everything else it
 handles alone: a healthy pod drains and terminates itself once its queue has
@@ -459,7 +462,8 @@ machine is never coming back bills until somebody kills it.
 --runpod`, so a pod carries the same record itself: its `config.json` holds the
 offer it was bought on, when it was created and when it was bootstrapped, under
 the `provider` block. Every pass asks each prefixed pod it has no record of what
-it is, and a pod holding a gpuc config is ours whoever created it — it is judged
+it is (one ssh session: expand gpuc home, read `config.json`), and a pod holding
+a gpuc config is ours whoever created it — it is judged
 by the rules above, and its answer is cached in `desired/` here. So the timer
 can run on the desktop while the laptop that queued the job is switched off, and
 neither machine is special.

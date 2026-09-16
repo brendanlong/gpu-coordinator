@@ -953,7 +953,8 @@ terminates another machine's healthy pod at the ceiling. A pod therefore carries
 its own copy: `config.json` -- the file the host owns -- holds `offer`,
 `created_at` and `bootstrapped_at` under the `provider` block that already named
 its `kind` and `pod_id`. Every pass asks each prefixed pod it has no record of
-(one `cat config.json` over ssh), and a pod holding a gpuc config is *ours*
+(one ssh session: expand gpuc home, then read `config.json`), and a pod holding
+a gpuc config is *ours*
 whoever created it: it is judged by the rules above, and the answer is cached in
 this machine's `desired/`, which is what keeps it watched on a later pass that
 cannot reach it. So the timer is a watchdog role that any machine holding the
@@ -972,8 +973,19 @@ behind a report line until a person ends it, which is the deliberate trade.
 `gpuc host add <name> --pod <id>` moves that duty here, through the same connect
 path as any other host.
 
-Adopting stamps `last_seen_at` on the cached record, because the pod answered
-`cat config.json` in that same pass: a machine that has only just met a pod
+**Adoption is permanent and one-way**, and this is the sharpest edge in the
+design. After one successful read, this machine holds a `desired/` record for
+that pod for as long as the pod exists -- nothing evicts it but a terminate or
+the pod going away -- so it will terminate that pod after
+`dead_dispatcher_minutes` of it not answering *this* machine, with the machine
+that created it never consulted. That is the trade for having a watchdog at all:
+the alternative is a wedged pod that bills until a human notices. The half of it
+worth knowing is the ssh key (a machine whose key the pod does not hold can
+never adopt it, and reports it forever instead), which setup.md says under the
+reconcile timer.
+
+Adopting stamps `last_seen_at` on the cached record, because the pod answered in
+that same pass: a machine that has only just met a pod
 gives it the same `dead_dispatcher_minutes` allowance as one it provisioned
 itself, rather than measuring silence from a `bootstrapped_at` days old. The
 name on the record comes off the config document rather than the parsed config,

@@ -414,10 +414,14 @@ def bootstrapped_provider(entry: HostEntry) -> dict[str, Any]:
     A pod carries its own desired record (`rented`), and this is the stamp that
     says it got past the provisioning ceiling. Written by whichever machine
     bootstraps it, so a second one reconciling that pod does not have to have
-    been there. Empty for a host nobody is renting: there is no provider block
-    on one, and inventing one would make `gpuc pods` claim it.
+    been there. Empty for a host nobody is renting: inventing a provider block
+    for one would make `gpuc pods` claim it.
+
+    The question is whether this host is *rented*, not whether its config
+    already says so: a pod set up before the block existed has none, and it is
+    the address that knows it is a pod.
     """
-    provider = entry.config.provider
+    provider = entry.config.provider or entry.provider()
     if provider is None:
         return {}
     return {"provider": {**provider, "bootstrapped_at": utc_now()}}

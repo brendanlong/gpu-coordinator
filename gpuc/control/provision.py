@@ -723,7 +723,7 @@ def pick_reusable_host(
                 f"{'is gone' if pod is None else 'is TERMINATED'}"
             )
             with state_lock():
-                forget_host(entry.name)
+                forget_host(entry.name, entry.pod_id)
             continue
         if pod.status != "RUNNING":
             report(f"reuse: skipping {entry.name}, its pod is {pod.status}")

@@ -188,6 +188,8 @@ class PodAnswer:
     pod: Pod
     detail: str
     entry: HostEntry | None = None
+    """How to reach it, carrying the gpuc home the config was read from. Only
+    set when the pod answered with one: nothing acts on a pod that did not."""
     desired: DesiredHost | None = None
 
 
@@ -200,12 +202,12 @@ def ask_pod(pod: Pod, settings: Settings, *, timeout: float = ASK_TIMEOUT_S) -> 
         transport = transport_for(address, settings)
         home = resolve_home(transport, address, timeout=timeout)
     except (ConfigError, RemoteError, TransportError) as exc:
-        return PodAnswer(pod, _why(exc), entry=address)
+        return PodAnswer(pod, _why(exc))
     document = read_remote_config(transport, home, timeout=timeout)
     if document is None:
-        return PodAnswer(pod, f"{home}/config.json could not be read", entry=address)
+        return PodAnswer(pod, f"{home}/config.json could not be read")
     if not document:
-        return PodAnswer(pod, f"it answers ssh and has no {home}/config.json", entry=address)
+        return PodAnswer(pod, f"it answers ssh and has no {home}/config.json")
     record = desired_from(
         pod.id,
         document,
@@ -221,7 +223,10 @@ def ask_pod(pod: Pod, settings: Settings, *, timeout: float = ASK_TIMEOUT_S) -> 
     return PodAnswer(
         pod,
         f"{home}/config.json calls it {record.name}, created {created}",
-        entry=address,
+        # The home this config was read from, not the default: whatever asks
+        # this pod for a heartbeat next must look in the same directory, and
+        # a pulse that reads the wrong one says "silent", which terminates.
+        entry=address.model_copy(update={"gpuc_home": home}),
         desired=record,
     )
 

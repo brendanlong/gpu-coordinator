@@ -1906,3 +1906,25 @@ def test_host_add_pod_and_ssh_are_the_same_question_twice(
 ) -> None:
     adoptable(monkeypatch, fake_host)
     assert main(["host", "add", "rented", "--pod", "pod1", "--ssh", "me@box"]) == EXIT_USAGE
+
+
+def test_host_add_pod_says_what_watching_an_unbootstrapped_pod_means(
+    control_env: Path,
+    fake_host: FakeHost,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopting a pod nobody has set up arms the silence rule against it: it has
+    no dispatcher to beat, so `reconcile` here will end it. Say so."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    provider = FakeProvider()
+    provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+
+    assert main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111"]) == 0
+
+    out = capsys.readouterr().out
+    assert "wrote its first config" in out
+    assert "nothing has bootstrapped this pod" in out
+    assert "terminates it in 30 min" in out
+    assert "gpuc host bootstrap rented" in out

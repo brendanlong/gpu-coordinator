@@ -29,6 +29,7 @@ from gpuc.control.reconcile import (
     Liveness,
     PodQuestion,
     install,
+    probe_liveness,
     reconcile_once,
     run_loop,
     unit_files,
@@ -703,3 +704,61 @@ def test_the_provider_says_where_a_pod_is_now_and_the_registry_where_its_home_is
     assert len(seen) == 1 and seen[0] is not None
     assert (seen[0].ssh, seen[0].port) == ("root@1.2.3.4", 22000)
     assert seen[0].remote_home == "/vol/gpuc"
+
+
+def test_the_liveness_probe_reads_the_hosts_own_files(control_env: Path, tmp_path: Path) -> None:
+    """The one seam every other test here stubs: `probe_liveness` -> `pulse`.
+
+    A `local` entry means the real transport is this machine's shell, so this
+    exercises the glue -- the gpuc home the entry carries, and the script run
+    against it -- rather than a fake in the shape of an answer.
+    """
+    home = tmp_path / "gpuc"
+    (home / "jobs").mkdir(parents=True)
+    (home / "dispatcher.heartbeat").touch()
+    entry = host_entry(name="gpuc-a-111", kind="local", gpuc_home=str(home))
+
+    state = probe_liveness(DesiredHost(name="gpuc-a-111", pod_id="pod1"), entry, Settings())
+
+    assert state.reachable and state.alive
+    assert state.heartbeat_age_s is not None and state.heartbeat_age_s < 60.0
+    # And a host this machine has no address for at all is not "alive by default".
+    assert not probe_liveness(DesiredHost(name="x"), None, Settings()).reachable
+
+
+def test_an_unclaimed_pod_is_named_in_the_json_document(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-leaked-999", "podX", age_minutes=600))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+
+    document = reconcile_once(Settings(), provider, lambda _: None, ask=asked()).document()
+
+    assert document["unclaimed"] == ["gpuc-leaked-999"]
+    assert document["kept"] == [] and document["terminated"] == []
+
+
+def test_an_unclaimed_pod_of_unknown_age_is_still_only_reported(control_env: Path) -> None:
+    ageless = running_pod("gpuc-other-999", "podX").model_copy(update={"created_at": None})
+    provider = provider_with(ageless)
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
+
+    assert (provider.terminated, result.unclaimed) == ([], ["gpuc-other-999"])
+    assert any("nothing here claims it" in line for line in reports)
+
+
+def test_a_terminated_pod_is_not_asked_anything(control_env: Path) -> None:
+    gone = running_pod("gpuc-a-111", "pod1").model_copy(update={"status": "TERMINATED"})
+    provider = provider_with(gone)
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    asked_about: list[str] = []
+
+    def ask(pod: Pod, settings: Settings) -> PodAnswer:
+        asked_about.append(pod.id)
+        return PodAnswer(pod, "should not have been asked")
+
+    result = reconcile_once(Settings(), provider, lambda _: None, ask=ask)
+
+    assert asked_about == []
+    assert (result.unclaimed, result.kept) == ([], [])

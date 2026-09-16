@@ -222,3 +222,23 @@ def test_the_pulse_survives_a_home_with_a_space_in_it(tmp_path: Path) -> None:
     root = tmp_path / "my pods"
     root.mkdir()
     assert pulse(LocalTransport(), gpuc_home(root, beat_age_s=5.0)).alive
+
+
+def test_the_address_carries_the_home_the_config_was_read_from(pod_host: FakeHost) -> None:
+    """Whatever asks this pod for a heartbeat next must look in the same place.
+
+    The address a pod is reached at knows only its ssh endpoint, so without
+    this the home is resolved once to read the config and derived a second
+    time, from a template, to read the heartbeat. A pulse that reads a
+    different directory says "silent", and silent terminates.
+    """
+    pod_host.files[f"{HOME}/.gpuc/config.json"] = json.dumps(config_document())
+    answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
+    assert answer.desired is not None
+    assert answer.entry is not None
+    assert answer.entry.remote_home == f"{HOME}/.gpuc"  # resolved, not `$HOME/.gpuc`
+
+
+def test_a_pod_that_said_nothing_hands_back_no_address(pod_host: FakeHost) -> None:
+    """Nothing acts on a pod that did not answer, so nothing needs its address."""
+    assert ask_pod(running_pod("gpuc-a-111", "pod1"), Settings()).entry is None

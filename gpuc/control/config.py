@@ -856,8 +856,15 @@ def remove_desired(name: str) -> None:
     desired_file(name).unlink(missing_ok=True)
 
 
-def forget_host(name: str) -> None:
+def forget_host(name: str, pod_id: str | None = None) -> None:
     """Drop every local trace of one host. The caller must hold the state lock.
+
+    `pod_id` names the pod the caller is forgetting, and the registry entry is
+    only removed if it is that pod's. A desired record and a registry entry can
+    disagree about what a name means -- a hand-set `host`, a pod that answers
+    to a name this machine already uses for a box of its own -- and dropping
+    somebody's registered host because a *pod* under that name went away is not
+    something this should be able to do.
 
     Deliberately not a `registry_transaction`: both callers already hold the
     lock, and flock is per open file description, so re-taking it in the same
@@ -868,8 +875,15 @@ def forget_host(name: str) -> None:
     read = read_registry()
     if read.unreadable:
         return
-    if read.registry.hosts.pop(name, None) is not None:
-        save_registry(read.registry, read.skipped)
+    entry = read.registry.hosts.get(name)
+    if entry is None:
+        return
+    if pod_id is not None and entry.pod_id != pod_id:
+        # Not this pod's entry -- a box of this machine's that answers to the
+        # same name, or another pod under it. Only the record goes.
+        return
+    del read.registry.hosts[name]
+    save_registry(read.registry, read.skipped)
 
 
 def load_desired() -> list[DesiredHost]:
