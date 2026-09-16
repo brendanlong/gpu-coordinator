@@ -85,12 +85,14 @@ def test_two_pods_that_compare_equal_are_still_told_apart(control_env: Path) -> 
     assert [pod.id for pod in view.others] == ["podF", "podG"]
 
 
-def test_a_stray_pod_says_when_reconcile_will_take_it(
+def test_a_pod_nothing_wants_says_who_will_deal_with_it(
     control_env: Path, provider: FakeProvider
 ) -> None:
     desired_dir().mkdir(parents=True, exist_ok=True)
     text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
-    assert "terminates them once they are over 15 min old" in text
+    assert "asks each of them what it is" in text
+    # The one thing it must not say is that something here will terminate it.
+    assert "nothing here terminates a pod it has no record of" in text
 
 
 def test_unreadable_desired_state_is_a_note_not_a_crash(

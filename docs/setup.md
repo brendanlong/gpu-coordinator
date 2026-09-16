@@ -63,7 +63,7 @@ gpuc config show      # the effective settings, file or not
 | `ssh_key` | unset | private key for ssh and rsync; its `.pub` goes to the RunPod account |
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | default pod image (`--image` per submit) |
 | `disk_gb` | `50` | default container disk (`--disk` per submit) |
-| `dead_dispatcher_minutes` | `30.0` | how long an ephemeral host may be silent, with nothing running, before `gpuc reconcile` terminates it |
+| `dead_dispatcher_minutes` | `30.0` | how long an ephemeral host may be silent, with nothing running, before `gpuc reconcile` terminates it — counted from silence this machine watched, so a suspend or a reboot starts it again rather than cashing in the time it was away. It is also the margin a pod being bootstrapped *by another machine* has, since installing uv, a Python and the package takes about ten minutes and nothing beats until that is done — so lowering it much below 30 on a machine that reconciles other machines' pods is how you shoot one down mid-setup |
 
 **`s3_bucket` and `--s3-prefix` are two different mirrors.** `s3_bucket` is
 written by *this machine*: job specs to `s3://<bucket>/gpuc/specs/<job-id>.json`
@@ -179,9 +179,20 @@ A `config.json` that is there but does not parse stops all of this: it is a
 file the host is running on, so nothing replaces it, and the error says to fix
 or delete it.
 
-RunPod hosts are never added by hand: `gpuc submit --runpod ...` creates the
+RunPod pods are never *created* by hand: `gpuc submit --runpod ...` creates the
 pod, registers it as kind `runpod`, and bootstraps it
-([usage.md](usage.md#runpod)).
+([usage.md](usage.md#runpod)). A pod that already exists is adopted the same way
+any other host is, from any machine holding the API key:
+
+```sh
+gpuc pods                                  # the account's pods, with their ids
+gpuc host add rented --pod <pod-id>        # its address from the provider, its config from the pod
+```
+
+That is what makes a pod the laptop queued usable from the desktop: the pod owns
+its `config.json` — cards, mirror, TTL, and the record of what it was rented as —
+so nothing about the machine that created it matters afterwards. It is also
+recorded in `desired/` here, so this machine's `gpuc reconcile` watches it.
 
 The address is the top two rows; every other flag is the host's own config,
 which `host set` writes through to it.
@@ -189,6 +200,7 @@ which `host set` writes through to it.
 | flag (`host add`, and `host set` to change one) | default | meaning |
 | --- | --- | --- |
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
+| `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting instead of naming an ssh target; the provider says where it is. Needs `RUNPOD_API_KEY`. Add `--gpuc-home` if that pod keeps gpuc somewhere other than `$HOME/.gpuc` — `gpuc reconcile` only ever looks there, so such a pod is reported unclaimed rather than taken on |
 | `--gpus 2,3` or `--gpus GPU-8064…,3` | none | what this host may use: nvidia-smi **indices**, UUIDs, or a mix, stored exactly as typed. Indices are how a share of a shared box is agreed; the host re-resolves them to UUIDs on every dispatch pass and pins jobs with `CUDA_VISIBLE_DEVICES=<uuid>`, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is reported `UNAVAILABLE` and jobs wait for it |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
 | `--cache-dir PATH` | bootstrap decides | uv's cache for this host, which is `UV_CACHE_DIR` in its `env`. Bootstrap sets one on gpuc home's filesystem when they differ, because uv only reflinks or hardlinks a venv out of its cache within one filesystem — but only when the host's config names none, however it got there |
@@ -266,8 +278,11 @@ gpuc host bootstrap gpubox
 
 ## The reconcile timer
 
-`gpuc reconcile` is the only thing that terminates pods nothing wants any more,
-and it only runs when something runs it. Install it as a `systemd --user` timer
+`gpuc reconcile` is the safety net for the states a pod cannot get itself out
+of -- it never bootstrapped, its dispatcher died, or it is past a TTL its own
+config carries -- and it only runs when something runs it. (A healthy pod needs
+none of this: it drains and terminates itself once its queue has been empty for
+`--idle-min`.) Install it as a `systemd --user` timer
 (60 s by default, `--interval` to change it):
 
 ```sh
@@ -284,6 +299,18 @@ The service runs `gpuc reconcile --once` with `GPUC_CONFIG_DIR` and
 `GPUC_STATE_DIR` pinned to this user's directories and reads `RUNPOD_API_KEY`
 from that env file, which `--install` does not create. What it terminates, and
 what it refuses to touch, is in [usage.md](usage.md#reconcile).
+
+**On more than one machine is fine.** Each pass asks every pod with your prefix
+what it is, and a pod holding a gpuc config is left alone whichever machine
+created it — so the desktop can watch the pod the laptop queued, with the laptop
+shut. To *watch* a pod (rather than only report it) that machine needs an ssh
+key the pod accepts, and RunPod injects the account's keys when the pod is
+**created**: a key you register later is not on a pod that already exists. So
+put both machines' keys on the account before you provision, or accept that each
+pod is watched from the machines whose keys it was born with. Nothing is lost
+either way — a pod this machine cannot place is reported every pass and never
+terminated. To drive a pod as well as watch it, adopt it: `gpuc host add <name>
+--pod <pod-id>`.
 
 ## Upgrading
 
@@ -380,23 +407,23 @@ gpuc host clean <name> --uv-cache   # `uv cache prune` there, if you want the di
 gpuc home (`gpuc ssh <host> -- rm -rf ~/.gpuc`, or the persistent root's `gpuc`
 directory) while nothing is running.
 
-**Terminating a pod deliberately.** There is no terminate command; the pod
-terminates itself once its queue has been empty for `--idle-min`, which is the
-normal path. To do it now, remove the record that says you still want it and let
-the reaper treat it as a stray:
+**Terminating a pod deliberately.** There is no terminate command, and deleting
+local state is not one: nothing here terminates a pod for having no record. Tell
+the pod instead — it is the thing that can stop itself:
 
 ```sh
-gpuc pods                                              # confirm the name and that it is idle
-rm ~/.local/share/gpu-coordinator/desired/<name>.json
-gpuc host remove <name>
-gpuc reconcile --once                                  # terminates prefixed pods with no record
+gpuc pods                                       # confirm the name and that it is idle
+gpuc host set <name> --idle-min 0               # stop as soon as the queue is empty
+gpuc host set <name> --ttl-hours 0.1            # or: stop in six minutes, killing a running job
 ```
 
-The stray rule only fires once the pod is over 15 minutes old, so a pod created
-minutes ago has to age out (or be terminated in the RunPod console). Leaving the
-`desired/` record in place and only removing the host has the same end effect
-more slowly: the reaper can no longer reach it, so it terminates it after
-`dead_dispatcher_minutes`.
+`--idle-min 0` reaches the host's own `config.json`, so the dispatcher drains
+(retrying unconfirmed outputs, mirroring every job's log and state) and
+terminates on its next pass with nothing running. `--ttl-hours` is the one that
+does not wait for the job — it asks each runner to stop with reason `ttl`, lets
+it sync, and then terminates. For a pod that has stopped answering ssh
+altogether, the reaper gets it after `dead_dispatcher_minutes`; for one that
+answers nothing at all and belongs to nobody, the RunPod console is the tool.
 
 **Disabling the timer, or the dashboard service.**
 

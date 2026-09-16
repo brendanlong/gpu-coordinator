@@ -408,6 +408,25 @@ def start_dispatcher(session: HostSession) -> int:
     return int(pid)
 
 
+def bootstrapped_provider(entry: HostEntry) -> dict[str, Any]:
+    """`{"provider": ...}` with this moment stamped on it, for a rented host.
+
+    A pod carries its own desired record (`rented`), and this is the stamp that
+    says it got past the provisioning ceiling. Written by whichever machine
+    bootstraps it, so a second one reconciling that pod does not have to have
+    been there. Empty for a host nobody is renting: inventing a provider block
+    for one would make `gpuc pods` claim it.
+
+    The question is whether this host is *rented*, not whether its config
+    already says so: a pod set up before the block existed has none, and it is
+    the address that knows it is a pod.
+    """
+    provider = entry.config.provider or entry.provider()
+    if provider is None:
+        return {}
+    return {"provider": {**provider, "bootstrapped_at": utc_now()}}
+
+
 def read_host_config(transport: Transport, entry: HostEntry, home: str) -> dict[str, Any]:
     """The host's own config, or a refusal: `{}` means it has none, never that
     we could not tell. Bootstrap replaces a config that is not there; a config
@@ -545,6 +564,7 @@ def bootstrap_host(
     ensure_layout(transport, entry, home, python)
     commit = local_commit()
     patch["pkg_commit"] = commit
+    patch.update(bootstrapped_provider(entry))
     entry = entry.with_config(
         write_remote_config(transport, home, patch, python=python, env=entry.env)
     )

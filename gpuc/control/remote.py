@@ -147,7 +147,9 @@ things around our output (a MOTD, a shell rc warning) that no parse can
 distinguish from a config that is simply broken."""
 
 
-def read_remote_config(transport: Transport, home: str) -> dict[str, Any] | None:
+def read_remote_config(
+    transport: Transport, home: str, *, timeout: float = DEFAULT_TIMEOUT_S
+) -> dict[str, Any] | None:
     """The host's own `config.json`; ``{}`` if it has none, ``None`` if we
     could not read it.
 
@@ -161,7 +163,7 @@ def read_remote_config(transport: Transport, home: str) -> dict[str, Any] | None
     try:
         result = transport.run(
             f'if [ -f "{path}" ]; then cat "{path}"; else echo {NO_CONFIG}; fi',
-            timeout=DEFAULT_TIMEOUT_S,
+            timeout=timeout,
             check=False,
         )
     except TransportError:
@@ -273,13 +275,15 @@ def put_remote_config(transport: Transport, home: str, document: Mapping[str, An
         raise
 
 
-def resolve_home(transport: Transport, entry: HostEntry) -> str:
+def resolve_home(
+    transport: Transport, entry: HostEntry, *, timeout: float = DEFAULT_TIMEOUT_S
+) -> str:
     """Expand ``$HOME/.gpuc`` on the host: rsync and tail need a real path."""
     template = entry.remote_home
     if "$" not in template and "~" not in template:
         return template.rstrip("/")
     try:
-        result = transport.run(f'printf %s "{template}"', timeout=DEFAULT_TIMEOUT_S, check=True)
+        result = transport.run(f'printf %s "{template}"', timeout=timeout, check=True)
     except TransportError as exc:
         raise RemoteError(
             entry.name,

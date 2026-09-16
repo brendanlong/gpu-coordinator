@@ -7,15 +7,20 @@ import pytest
 from gpuc.control import config
 from gpuc.control.config import (
     ConfigError,
+    DesiredHost,
     HostEntry,
     Registry,
     config_changes,
     config_drift,
+    forget_host,
     load_registry,
     load_settings,
+    read_desired,
     registry_transaction,
     save_registry,
+    state_lock,
     transport_for,
+    write_desired,
 )
 from gpuc.control.transport import LocalTransport, SshTransport
 from gpuc.host.jobs import HostConfig
@@ -226,3 +231,28 @@ def test_config_drift_is_quiet_about_a_config_just_written() -> None:
     assert config_drift({"provider": {"kind": "runpod", "pod_id": "pod-1"}}, fresh) == [
         "provider kind=runpod pod_id=pod-1 -> kind=runpod pod_id=pod-2"
     ]
+
+
+def test_forgetting_a_pod_leaves_a_different_host_of_the_same_name_alone(
+    control_env: Path,
+) -> None:
+    """A desired record and the registry can disagree about what a name means.
+
+    The reaper forgets a host when its *pod* is gone or terminated; dropping
+    somebody's registered box because a pod answered to the same name is not
+    something that should be possible.
+    """
+    mine = host_entry(name="shared", kind="ssh", ssh="me@box")
+    with registry_transaction() as registry:
+        registry.put(mine)
+    write_desired(DesiredHost(name="shared", pod_id="podX"))
+
+    with state_lock():
+        forget_host("shared", "podX")
+
+    assert read_desired("shared") is None  # the record was this pod's
+    assert load_registry().hosts["shared"].ssh == "me@box"  # the host was not
+
+    with state_lock():
+        forget_host("shared", None)  # no pod named: forget the host too
+    assert load_registry().hosts == {}

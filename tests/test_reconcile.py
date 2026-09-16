@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from gpuc.control.config import (
     ConfigError,
     DesiredHost,
+    HostEntry,
     Settings,
     desired_dir,
     desired_file,
@@ -19,19 +22,24 @@ from gpuc.control.config import (
     state_lock,
     write_desired,
 )
-from gpuc.control.providers.base import Caps, ProviderError
+from gpuc.control.providers.base import Caps, Pod, ProviderError
 from gpuc.control.reconcile import (
     SERVICE_NAME,
     TIMER_NAME,
     HostLiveness,
     Liveness,
+    PodQuestion,
+    begin_watch,
     install,
+    probe_liveness,
     reconcile_once,
     run_loop,
     unit_files,
+    watch_file,
 )
+from gpuc.control.rented import PodAnswer, address_for, desired_from
 from gpuc.control.s3index import IndexEntry, LocalIndex
-from tests.conftest import host_entry
+from tests.conftest import host_entry, register_host
 from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
 
 FOREIGN = "other-someone-else"
@@ -65,12 +73,49 @@ def desire(
     return host
 
 
+def watching(minutes: float = 120.0) -> None:
+    """Say this machine has been reconciling for a while already.
+
+    The silence rule counts silence this machine *saw*, so a pass that has only
+    just started watching gives every host the full allowance again -- a rule
+    with tests of its own, below. Every other test here means "the timer has
+    been running", and says so.
+    """
+    watch_file().parent.mkdir(parents=True, exist_ok=True)
+    watch_file().write_text(
+        json.dumps({"pass_at": stamp(minutes=-1), "since": stamp(minutes=-minutes)})
+    )
+
+
 def alive(**overrides: object) -> HostLiveness:
     """A host that answers: the reaper only reaps hosts that have gone quiet."""
     state = Liveness(reachable=True, heartbeat_age_s=5.0, running_jobs=0)
     for key, value in overrides.items():
         setattr(state, key, value)
-    return lambda host, settings: state
+    return lambda host, entry, settings: state
+
+
+def asked(
+    detail: str = "it has no config.json", config: dict[str, Any] | None = None
+) -> PodQuestion:
+    """What every pod with no local record says when this pass asks it.
+
+    With no `config` it is a pod that claims nothing -- because gpuc was never
+    on it, or because it would not answer at all, which are the same answer
+    here. `config` is what a pod another machine set up says.
+    """
+
+    def ask(pod: Pod, settings: Settings) -> PodAnswer:
+        if config is None:
+            return PodAnswer(pod, detail, entry=address_for(pod.name, pod))
+        return PodAnswer(
+            pod,
+            "its config.json says so",
+            entry=address_for(pod.name, pod),
+            desired=desired_from(pod.id, config, name=pod.name, seen_at=stamp()),
+        )
+
+    return ask
 
 
 def provider_with(*pods: object, **kwargs: object) -> FakeProvider:
@@ -116,6 +161,7 @@ def test_the_state_lock_is_not_held_across_probes_and_terminates(control_env: Pa
     """
     provider = provider_with(running_pod("gpuc-a-111", "pod1"))
     desire("gpuc-a-111", "pod1", created_hours_ago=2.0)
+    watching()
     free: list[str] = []
 
     def note_if_free(label: str) -> None:
@@ -133,7 +179,7 @@ def test_the_state_lock_is_not_held_across_probes_and_terminates(control_env: Pa
 
     provider.terminate = watched  # type: ignore[method-assign]
 
-    def probe(host: DesiredHost, settings: Settings) -> Liveness:
+    def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
         note_if_free("liveness")
         return Liveness(reachable=False)
 
@@ -147,7 +193,7 @@ def test_a_record_written_while_the_pass_was_probing_is_not_clobbered(control_en
     provider = provider_with(running_pod("gpuc-a-111", "pod1"))
     desire("gpuc-a-111", "pod1")
 
-    def probe(host: DesiredHost, settings: Settings) -> Liveness:
+    def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
         current = read_desired("gpuc-a-111")
         assert current is not None
         write_desired(current.model_copy(update={"image": "written:by-another-session"}))
@@ -203,33 +249,49 @@ def test_bootstrapped_host_past_its_ceiling_is_kept(control_env: Path) -> None:
     assert provider.terminated == []
 
 
-def test_stray_pod_with_our_prefix_is_terminated(control_env: Path) -> None:
-    provider = provider_with(running_pod("gpuc-leaked-999", "podX", age_minutes=120))
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "it answers ssh and has no /root/.gpuc/config.json",
+        "could not reach host; Permission denied (publickey)",
+        "the provider gives it no ssh endpoint",
+    ],
+)
+def test_no_pod_is_ever_terminated_for_having_no_record_here(
+    control_env: Path, detail: str
+) -> None:
+    """Whatever it says, or does not say. A pod with no config may be a leak --
+    or another machine's create, or a container whose $HOME was wiped under a
+    running job -- and one that will not answer may be wedged or may simply
+    hold no key of ours. None of that is worth a terminate; it is worth a line."""
+    provider = provider_with(running_pod("gpuc-leaked-999", "podX", age_minutes=600))
     desired_dir().mkdir(parents=True, exist_ok=True)
     reports: list[str] = []
 
-    result = reconcile_once(Settings(), provider, reports.append)
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked(detail))
 
-    assert provider.terminated == ["podX"]
-    assert result.terminated == ["gpuc-leaked-999"]
-    assert any("no desired/ record" in line for line in reports)
+    assert provider.terminated == []
+    assert (result.terminated, result.kept) == ([], [])
+    assert result.unclaimed == ["gpuc-leaked-999"]
+    assert any("Nothing was terminated" in line and detail in line for line in reports)
+    assert any("gpuc host add <name> --pod podX" in line for line in reports)
 
 
-def test_a_young_stray_is_left_for_the_session_that_may_be_creating_it(
-    control_env: Path,
-) -> None:
+def test_a_young_unclaimed_pod_says_it_may_still_be_provisioning(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-new-999", "podX", age_minutes=2))
     desired_dir().mkdir(parents=True, exist_ok=True)
-    result = reconcile_once(Settings(), provider, lambda _: None)
+    reports: list[str] = []
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
     assert provider.terminated == []
-    assert result.kept == ["gpuc-new-999"]
+    assert result.unclaimed == ["gpuc-new-999"]
+    assert any("may still be provisioning it" in line for line in reports)
 
 
 def test_foreign_pods_are_never_touched(control_env: Path) -> None:
     provider = FakeProvider(existing=[running_pod(FOREIGN, "podF", age_minutes=600)])
     desired_dir().mkdir(parents=True, exist_ok=True)
     reports: list[str] = []
-    result = reconcile_once(Settings(), provider, reports.append)
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
     assert provider.terminated == []
     assert result.terminated == []
     assert not any(FOREIGN in line for line in reports)
@@ -239,7 +301,7 @@ def test_missing_desired_directory_does_nothing(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-leaked-999", "podX", age_minutes=600))
     reports: list[str] = []
 
-    result = reconcile_once(Settings(), provider, reports.append)
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
 
     assert provider.terminated == []
     assert result.errors and "does not exist" in result.errors[0]
@@ -251,7 +313,7 @@ def test_unreadable_desired_entry_does_nothing(control_env: Path) -> None:
     desire("gpuc-a-111", "pod1")
     desired_file("gpuc-a-111").write_text("{not json")
 
-    result = reconcile_once(Settings(), provider, lambda _: None)
+    result = reconcile_once(Settings(), provider, lambda _: None, ask=asked())
 
     assert provider.terminated == []
     assert result.errors and "Nothing was terminated" in result.errors[0]
@@ -335,34 +397,6 @@ def test_unit_files_are_absolute_and_not_enabled(
     ]
 
 
-def test_a_stray_with_no_creation_time_is_left_alone(control_env: Path) -> None:
-    """Unknown age cannot be proved past the ceiling, so it cannot be proved a stray."""
-    stray = running_pod("gpuc-other-999", "podX").model_copy(update={"created_at": None})
-    provider = provider_with(stray)
-    desired_dir().mkdir(parents=True, exist_ok=True)
-    reports: list[str] = []
-
-    result = reconcile_once(Settings(), provider, reports.append)
-
-    assert provider.terminated == []
-    assert result.kept == ["gpuc-other-999"]
-    assert any("no creation time" in line for line in reports)
-
-
-def test_a_failed_stray_terminate_is_an_error(control_env: Path) -> None:
-    class Stubborn(FakeProvider):
-        def terminate(self, pod_id: str) -> None:
-            raise ProviderError("HTTP 500")
-
-    provider = Stubborn()
-    provider.adopt(running_pod("gpuc-other-999", "podX", age_minutes=600))
-    desired_dir().mkdir(parents=True, exist_ok=True)
-
-    result = reconcile_once(Settings(), provider, lambda _: None)
-
-    assert result.terminated == [] and result.errors
-
-
 def test_a_desired_record_naming_a_foreign_pod_is_refused_not_terminated(
     control_env: Path,
 ) -> None:
@@ -387,7 +421,7 @@ def dead(**overrides: object) -> HostLiveness:
     state = Liveness(reachable=False)
     for key, value in overrides.items():
         setattr(state, key, value)
-    return lambda host, settings: state
+    return lambda host, entry, settings: state
 
 
 def test_a_host_with_no_ttl_is_never_terminated_for_age(control_env: Path) -> None:
@@ -413,6 +447,7 @@ def test_a_long_running_job_keeps_an_old_host_alive(control_env: Path) -> None:
 def test_a_dead_dispatcher_past_the_limit_is_terminated_loudly(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
     desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    watching()
     reports: list[str] = []
 
     result = reconcile_once(
@@ -433,6 +468,7 @@ def test_an_unreachable_host_is_terminated_once_it_has_been_silent_long_enough(
 ) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
     desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    watching()
     reports: list[str] = []
 
     result = reconcile_once(
@@ -475,3 +511,346 @@ def test_a_never_bootstrapped_host_still_gets_the_ceiling_not_the_silence_rule(
 
     assert result.terminated == ["gpuc-a-111"]
     assert any("never bootstrapped by its ceiling" in line for line in reports)
+
+
+# -- a pod created on another machine, reconciled from this one ----------------
+#
+# `desired/` is only ever written by the machine that ran `gpuc submit
+# --runpod`. Reconciling from a second machine used to read that as "a leak"
+# and terminate a healthy pod mid-job at the 15 min ceiling (issue #36).
+
+
+def pod_config(
+    name: str,
+    pod_id: str,
+    *,
+    ttl_hours: float | None = None,
+    created_hours_ago: float = 2.0,
+    bootstrapped: bool = True,
+) -> dict[str, Any]:
+    """The `config.json` a pod another machine provisioned is carrying."""
+    created = stamp(hours=-created_hours_ago)
+    provider: dict[str, Any] = {
+        "kind": "runpod",
+        "pod_id": pod_id,
+        "offer": make_offer().model_dump(mode="json"),
+        "created_at": created,
+    }
+    if bootstrapped:
+        provider["bootstrapped_at"] = created
+    return {
+        "host": name,
+        "gpus": ["GPU-1111"],
+        "ttl_hours": ttl_hours,
+        "created_at": created,
+        "provider": provider,
+    }
+
+
+def test_a_pod_another_machine_created_is_adopted_not_terminated(control_env: Path) -> None:
+    """The bug: past the ceiling, with no desired/ record here, and mid-job."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(),
+        provider,
+        reports.append,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod1")),
+    )
+
+    assert provider.terminated == []
+    assert result.kept == ["gpuc-a-111"]
+    assert any("so it is ours" in line for line in reports)
+    # Cached, so the next pass judges it even if the pod stops answering.
+    cached = read_desired("gpuc-a-111")
+    assert cached is not None
+    assert (cached.pod_id, cached.offer.name) == ("pod1", "A40")
+
+
+def test_an_adopted_pod_is_judged_by_the_ttl_it_carries(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=130))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(),
+        provider,
+        reports.append,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod1", ttl_hours=1.0, created_hours_ago=2.2)),
+    )
+
+    assert provider.terminated == ["pod1"]
+    assert result.terminated == ["gpuc-a-111"]
+    assert any("past its 1 h TTL" in line for line in reports)
+
+
+def test_an_adopted_pod_that_has_gone_silent_is_reaped_from_here(control_env: Path) -> None:
+    """The watchdog role: any machine running the timer reaps a dead pod.
+
+    Not on the pass that met it, though. The pod answered `cat config.json`
+    seconds earlier, so adoption stamps `last_seen_at` and the pod gets the
+    same `dead_dispatcher_minutes` allowance as one this machine provisioned --
+    which is what stops a single misread by a pulse probe that has never run
+    against this pod before from ending someone's job.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    settings = Settings(dead_dispatcher_minutes=30.0)
+    ask = asked(config=pod_config("gpuc-a-111", "pod1"))
+    reports: list[str] = []
+
+    first = reconcile_once(settings, provider, reports.append, liveness=dead(), ask=ask)
+
+    assert (first.kept, provider.terminated) == (["gpuc-a-111"], [])
+    assert any("silent for 0 min of the 30 min limit" in line for line in reports)
+
+    # ...and once it has been silent that long, with this machine watching
+    # for all of it, it goes.
+    cached = read_desired("gpuc-a-111")
+    assert cached is not None
+    write_desired(cached.model_copy(update={"last_seen_at": stamp(minutes=-31)}))
+    watching()
+    result = reconcile_once(settings, provider, reports.append, liveness=dead(), ask=ask)
+
+    assert result.terminated == ["gpuc-a-111"]
+    assert any("DEAD DISPATCHER" in line for line in reports)
+
+
+def test_a_pod_with_a_config_but_no_bootstrap_stamp_is_still_ours(control_env: Path) -> None:
+    """A pod set up by a build that did not record the stamp is not a stray.
+
+    Its record has no `bootstrapped_at` of its own, and reading that as "never
+    bootstrapped" would terminate it at the ceiling; the dead-dispatcher rule
+    is what judges it instead.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+
+    result = reconcile_once(
+        Settings(),
+        provider,
+        lambda _: None,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod1", bootstrapped=False)),
+    )
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+
+
+def test_a_pod_already_in_desired_is_never_asked(control_env: Path) -> None:
+    """One `cat config.json` per pod, and only for the pods nothing here wants."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1"))
+    desire("gpuc-a-111", "pod1")
+    asked_about: list[str] = []
+
+    def ask(pod: Pod, settings: Settings) -> PodAnswer:
+        asked_about.append(pod.id)
+        return PodAnswer(pod, "should not have been asked")
+
+    reconcile_once(Settings(), provider, lambda _: None, liveness=alive(), ask=ask)
+
+    assert asked_about == []
+
+
+def test_a_pod_whose_config_names_no_host_is_not_called_local(control_env: Path) -> None:
+    """`HostConfig`'s default `host` is `local`, which is this machine's own.
+
+    A record under that name would be matched against this machine's `local`
+    entry on the next pass: the reaper would probe the wrong box and then
+    forget somebody's own host.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    register_host(name="local", gpus="0")
+    config = pod_config("gpuc-a-111", "pod1")
+    config.pop("host")
+
+    result = reconcile_once(
+        Settings(), provider, lambda _: None, liveness=alive(), ask=asked(config=config)
+    )
+
+    assert result.kept == ["gpuc-a-111"]
+    assert read_desired("gpuc-a-111") is not None
+    assert read_desired("local") is None
+    assert "local" in load_registry().hosts
+
+
+def test_a_pod_answering_to_a_name_already_taken_is_left_alone(control_env: Path) -> None:
+    """Judging it would mean forgetting the host whose record that name is."""
+    provider = provider_with(
+        running_pod("gpuc-a-111", "pod1", age_minutes=120),
+        running_pod("gpuc-a-222", "pod2", age_minutes=120),
+    )
+    desire("gpuc-a-111", "pod1", ttl_hours=None)
+    reports: list[str] = []
+
+    # The second pod says it is called `gpuc-a-111` too (a hand-set `host`).
+    result = reconcile_once(
+        Settings(),
+        provider,
+        reports.append,
+        liveness=alive(),
+        ask=asked(config=pod_config("gpuc-a-111", "pod2")),
+    )
+
+    assert provider.terminated == []
+    assert (result.kept, result.unclaimed) == (["gpuc-a-111"], ["gpuc-a-222"])
+    assert any("already here and names another pod" in line for line in reports)
+    cached = read_desired("gpuc-a-111")
+    assert cached is not None and cached.pod_id == "pod1"
+
+
+def test_the_provider_says_where_a_pod_is_now_and_the_registry_where_its_home_is(
+    control_env: Path,
+) -> None:
+    """A registry entry pinned to an endpoint the pod has moved off fails every
+    probe, which reads as a dead dispatcher; its `gpuc_home` is still the only
+    copy of where gpuc lives on that pod."""
+    provider = provider_with(running_pod("gpuc-a-111", "pod1"))
+    desire("gpuc-a-111", "pod1")
+    with registry_transaction() as registry:
+        entry = registry.require("gpuc-a-111")
+        registry.put(entry.model_copy(update={"ssh": "root@5.6.7.8", "gpuc_home": "/vol/gpuc"}))
+    seen: list[HostEntry | None] = []
+
+    def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
+        seen.append(entry)
+        return Liveness(reachable=True, heartbeat_age_s=5.0)
+
+    reconcile_once(Settings(), provider, lambda _: None, liveness=probe)
+
+    assert len(seen) == 1 and seen[0] is not None
+    assert (seen[0].ssh, seen[0].port) == ("root@1.2.3.4", 22000)
+    assert seen[0].remote_home == "/vol/gpuc"
+
+
+def test_the_liveness_probe_reads_the_hosts_own_files(control_env: Path, tmp_path: Path) -> None:
+    """The one seam every other test here stubs: `probe_liveness` -> `pulse`.
+
+    A `local` entry means the real transport is this machine's shell, so this
+    exercises the glue -- the gpuc home the entry carries, and the script run
+    against it -- rather than a fake in the shape of an answer.
+    """
+    home = tmp_path / "gpuc"
+    (home / "jobs").mkdir(parents=True)
+    (home / "dispatcher.heartbeat").touch()
+    entry = host_entry(name="gpuc-a-111", kind="local", gpuc_home=str(home))
+
+    state = probe_liveness(DesiredHost(name="gpuc-a-111", pod_id="pod1"), entry, Settings())
+
+    assert state.reachable and state.alive
+    assert state.heartbeat_age_s is not None and state.heartbeat_age_s < 60.0
+    # And a host this machine has no address for at all is not "alive by default".
+    assert not probe_liveness(DesiredHost(name="x"), None, Settings()).reachable
+
+
+def test_an_unclaimed_pod_is_named_in_the_json_document(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-leaked-999", "podX", age_minutes=600))
+    desired_dir().mkdir(parents=True, exist_ok=True)
+
+    document = reconcile_once(Settings(), provider, lambda _: None, ask=asked()).document()
+
+    assert document["unclaimed"] == ["gpuc-leaked-999"]
+    assert document["kept"] == [] and document["terminated"] == []
+
+
+def test_an_unclaimed_pod_of_unknown_age_is_still_only_reported(control_env: Path) -> None:
+    ageless = running_pod("gpuc-other-999", "podX").model_copy(update={"created_at": None})
+    provider = provider_with(ageless)
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append, ask=asked())
+
+    assert (provider.terminated, result.unclaimed) == ([], ["gpuc-other-999"])
+    assert any("nothing here claims it" in line for line in reports)
+
+
+def test_a_terminated_pod_is_not_asked_anything(control_env: Path) -> None:
+    gone = running_pod("gpuc-a-111", "pod1").model_copy(update={"status": "TERMINATED"})
+    provider = provider_with(gone)
+    desired_dir().mkdir(parents=True, exist_ok=True)
+    asked_about: list[str] = []
+
+    def ask(pod: Pod, settings: Settings) -> PodAnswer:
+        asked_about.append(pod.id)
+        return PodAnswer(pod, "should not have been asked")
+
+    result = reconcile_once(Settings(), provider, lambda _: None, ask=ask)
+
+    assert asked_about == []
+    assert (result.unclaimed, result.kept) == ([], [])
+
+
+# -- the clock only runs while this machine is actually watching ---------------
+
+
+def test_a_machine_back_from_a_long_absence_does_not_reap_on_its_first_pass(
+    control_env: Path,
+) -> None:
+    """The desktop was asleep for three days. The pod was not necessarily dead
+    for any of it, and the pass where the machine wakes up is the one where its
+    own ssh is most likely to fail -- the timer fires two minutes after boot.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 72))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=72)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0), provider, reports.append, liveness=dead()
+    )
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+    assert any("silent for 0 min of the 30 min limit" in line for line in reports)
+    # ...and the line says why, rather than claiming a pod nothing has heard
+    # from in three days has been quiet for zero minutes.
+    assert any("this machine has only been watching for 0 min" in line for line in reports)
+
+
+def test_it_reaps_once_it_has_watched_for_the_whole_limit(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 72))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=72)
+    watching(minutes=31.0)
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0), provider, lambda _: None, liveness=dead()
+    )
+
+    assert result.terminated == ["gpuc-a-111"]
+
+
+def test_a_gap_between_passes_starts_the_allowance_again(control_env: Path) -> None:
+    """Suspended, rebooted, or the timer switched off and on: the same thing."""
+    watch_file().parent.mkdir(parents=True, exist_ok=True)
+    watch_file().write_text(
+        json.dumps({"pass_at": stamp(minutes=-90), "since": stamp(minutes=-600)})
+    )
+    reports: list[str] = []
+
+    since = begin_watch(reports.append)
+
+    assert (datetime.now(UTC) - since).total_seconds() < 5.0
+    assert any("was not watching in between" in line for line in reports)
+    # ...and a pass that follows the last one closely just carries on.
+    assert begin_watch(reports.append) == since
+
+
+def test_an_unwritable_watch_file_reaps_nothing_rather_than_everything(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(now: object, since: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("gpuc.control.reconcile._write_watch", refuse)
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=600))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=10)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append, liveness=dead())
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+    assert any("could not record this pass" in line for line in reports)

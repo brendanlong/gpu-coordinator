@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from gpuc.control import jsonout
+from gpuc.control import jsonout, rented
 from gpuc.control import pods as pods_mod
 from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import ssh as ssh_mod
@@ -214,6 +214,30 @@ def _address(args: argparse.Namespace) -> HostEntry:
     )
 
 
+def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEntry:
+    """Where a rented pod is now, asked of the provider that is billing for it.
+
+    Adopting a pod another machine created is the ordinary path, not a special
+    one: the pod owns its config and carries its own record of what it was
+    bought as (`rented`), so all this has to find is the door.
+    """
+    pod = make_provider(settings).get(pod_id)
+    if pod is None or pod.status == "TERMINATED":
+        raise CliError(
+            f"pod {pod_id} is {'gone' if pod is None else 'TERMINATED'} on this account, so "
+            f"there is nothing to add. `gpuc pods` lists the pods it can see."
+        )
+    reached = rented.address_for(address.name, pod)
+    if reached is None:
+        raise CliError(
+            f"pod {pod_id} ({pod.name}) is {pod.status} and has no direct SSH endpoint yet, so "
+            f"it cannot be asked what it is. Try again once `gpuc pods` shows it RUNNING."
+        )
+    return address.model_copy(
+        update={"kind": "runpod", "ssh": reached.ssh, "port": reached.port, "pod_id": pod.id}
+    )
+
+
 def cmd_host_add(args: argparse.Namespace) -> int:
     """Register a host by asking it what it is.
 
@@ -223,7 +247,14 @@ def cmd_host_add(args: argparse.Namespace) -> int:
     ordinary path. Flags are explicit overrides of it, and say so.
     """
     settings = load_settings()
+    if args.pod and args.ssh:
+        raise UsageError(
+            f"--pod {args.pod} finds the host's ssh endpoint from the provider, so it cannot be "
+            f"given --ssh {args.ssh} as well."
+        )
     address = _address(args)
+    if args.pod:
+        address = _pod_address(address, args.pod, settings)
     # The flags are judged before the host is touched: a typo in `--gpus` is
     # the caller's mistake and should not cost a probe to find out.
     fields, env_updates = _config_fields(args), _env_updates(args)
@@ -256,8 +287,43 @@ def cmd_host_add(args: argparse.Namespace) -> int:
                 update={"bootstrapped_at": current.bootstrapped_at}
             )
         registry.put(entry)
-    print(_added_line(entry, connection, args.name))
+    lines = [_added_line(entry, connection, args.name)]
+    if args.pod:
+        lines.append(_watch_pod(entry, settings, bootstrapped=connection.adopted))
+    print("\n".join(lines))
     return 0
+
+
+def _watch_pod(entry: HostEntry, settings: Settings, bootstrapped: bool) -> str:
+    """Cache what an adopted pod said in `desired/`, so this machine watches it too.
+
+    `gpuc reconcile` here would ask the pod and reach the same record on its
+    next pass; writing it now is what makes `gpuc pods` say straight away that
+    this pod is wanted, and what keeps it watched if it stops answering before
+    that pass.
+
+    Watching a pod means being willing to terminate it, so a pod nobody has
+    installed gpuc on is told the deadline it has just been given: it has no
+    dispatcher to beat, so the silence rule starts now.
+    """
+    record = rented.desired_from_entry(entry)
+    try:
+        if not rented.remember(record):
+            return f"desired/{record.name}.json is already here; left as it is"
+    except (ConfigError, OSError) as exc:
+        return f"WARNING: could not record {record.name} in desired/: {exc}"
+    line = (
+        f"recorded it in desired/{record.name}.json, so `gpuc reconcile` here watches it too "
+        f"(TTL {'none' if record.ttl_hours is None else f'{record.ttl_hours:g} h'})"
+    )
+    if bootstrapped:
+        return line
+    return (
+        f"{line}\n"
+        f"  nothing has bootstrapped this pod, so it has no dispatcher to beat: "
+        f"`gpuc reconcile` here terminates it in {settings.dead_dispatcher_minutes:.0f} min "
+        f"unless `gpuc host bootstrap {entry.name}` gets there first"
+    )
 
 
 def _refuse_a_taken_name(current: HostEntry | None, entry: HostEntry, asked_for: str) -> None:
@@ -1418,6 +1484,12 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--ssh", help="user@host; omit for this machine")
     add.add_argument("--port", type=int, default=22, help="ssh port (default 22)")
     add.add_argument(
+        "--pod",
+        metavar="POD_ID",
+        help="adopt a RunPod pod this account is already renting, whichever machine created "
+        "it: its address comes from the provider and its config from the pod",
+    )
+    add.add_argument(
         "--gpus",
         help=f"required for a host with no config of its own; on a host that has one this "
         f"reassigns its cards, and a list that overlaps the host's is refused. {GPUS_HELP}",
@@ -1929,6 +2001,8 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
 def wants_runpod(args: argparse.Namespace) -> bool:
     if getattr(args, "install", False):
         return False  # `reconcile --install` only writes unit files
+    if getattr(args, "pod", None):
+        return True  # `gpuc host add --pod` asks the provider where that pod is
     return bool(getattr(args, "runpod", False)) or args.command in ("pods", "reconcile")
 
 
@@ -1971,7 +2045,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return failed(
             args,
             "RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc pods` or `gpuc reconcile`",
+            "`gpuc host add --pod`, `gpuc pods` or `gpuc reconcile`",
             EXIT_ERROR,
         )
     if args.command not in ("config", "skill"):

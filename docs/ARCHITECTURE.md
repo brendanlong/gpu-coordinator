@@ -1001,28 +1001,81 @@ record is a leaked, billing pod. Each mutation re-reads the record it is about
 to change. For each `desired/` host, `get` its pod; if
 missing or TERMINATED, mark the desired entry gone and note any jobs that
 were running there (for `requeue`). A pod older than its TTL -- only when that
-host has one; the default is none -- is terminated and logged. For every
-provider pod with our prefix not in `desired/`, terminate and log -- except that
-a prefixed pod with no `desired/` record is left alone until it is older than
-the 15-minute provisioning ceiling, so a concurrent session that has created
-a pod but not yet written its record cannot have it reaped out from under it.
+host has one; the default is none -- is terminated and logged.
+
+**The pod is the record** (`rented.py`). `desired/<host>.json` exists only on
+the machine that ran `gpuc submit --runpod`, so a reaper that trusts it alone
+terminates another machine's healthy pod at the ceiling. A pod therefore carries
+its own copy: `config.json` -- the file the host owns -- holds `offer`,
+`created_at` and `bootstrapped_at` under the `provider` block that already named
+its `kind` and `pod_id`. Every pass asks each prefixed pod it has no record of
+(one ssh session: expand gpuc home, then read `config.json`), and a pod holding
+a gpuc config is *ours*
+whoever created it: it is judged by the rules above, and the answer is cached in
+this machine's `desired/`, which is what keeps it watched on a later pass that
+cannot reach it. So the timer is a watchdog role that any machine holding the
+API key can run, and none of them is special.
+
+**Nothing is terminated for the absence of a record.** A prefixed pod this
+machine has no record of and cannot get an answer out of is reported every pass,
+with its age and its hourly cost, and left running: it may be wedged, it may
+hold no key of ours, or it may be another machine's `create` still
+bootstrapping, and those are indistinguishable from here. Terminating on that
+guess is what took someone's running job, and the guess buys little — the
+machine that *does* hold a pod's record still reaps it on TTL and on a dead
+dispatcher, and a healthy pod terminates itself on idle. What is left over is a
+pod that never got a config whose creating machine never comes back: it bills
+behind a report line until a person ends it, which is the deliberate trade.
+`gpuc host add <name> --pod <id>` moves that duty here, through the same connect
+path as any other host.
+
+**Adoption is permanent and one-way**, and this is the sharpest edge in the
+design. After one successful read, this machine holds a `desired/` record for
+that pod for as long as the pod exists -- nothing evicts it but a terminate or
+the pod going away -- so it will terminate that pod after
+`dead_dispatcher_minutes` of it not answering *this* machine, with the machine
+that created it never consulted. That is the trade for having a watchdog at all:
+the alternative is a wedged pod that bills until a human notices. The half of it
+worth knowing is the ssh key (a machine whose key the pod does not hold can
+never adopt it, and reports it forever instead), which setup.md says under the
+reconcile timer.
+
+Adopting stamps `last_seen_at` on the cached record, because the pod answered in
+that same pass: a machine that has only just met a pod
+gives it the same `dead_dispatcher_minutes` allowance as one it provisioned
+itself, rather than measuring silence from a `bootstrapped_at` days old. The
+name on the record comes off the config document rather than the parsed config,
+whose default `host` is `local` — a record called `local` would be matched
+against this machine's own host on the next pass.
 
 **The dead-dispatcher rule**, which is what replaced the overall TTL: a
-bootstrapped desired host is asked for its status each pass (a 20 s ssh
-timeout, so one wedged pod cannot stall the pass). A heartbeat under
-`reconcile.HEARTBEAT_FRESH_S = 120` s, or any job the host says is running,
+bootstrapped desired host is asked for its pulse each pass (a 20 s ssh
+timeout, so one wedged pod cannot stall the pass) -- the dispatcher heartbeat's
+mtime and a count of the jobs whose `state.json` says `running`, read with
+`stat` and `grep` rather than by running the host's package, because the machine
+reconciling a pod may never have bootstrapped it and knows no interpreter there.
+A heartbeat under
+`rented.HEARTBEAT_FRESH_S = 120` s, or any job the host says is running,
 counts as alive and records `last_seen_at` in its `desired/` record. That
 constant is the reaper's own and deliberately looser than the dispatcher's 30 s
 staleness or the 30 s freshness reuse demands: this one decides whether to
-terminate a pod. A host that
-has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) --
+terminate a pod. The clock is capped by this machine's own
+watching: `reconcile` keeps `watch.json` in the state directory with the time of
+the last pass and the start of the current unbroken stretch, and a gap of more
+than `WATCH_GAP_MINUTES` (5) resets the stretch. Silence that nothing observed
+is not evidence -- a desktop resuming from three days asleep would otherwise
+terminate every pod on the first pass whose ssh had not come up yet, and the
+timer fires two minutes after boot. The service therefore also `Wants=` the
+network target it is `After=`, since `After=` alone does not pull it in. A host
+that has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) --
 including one whose ssh never answers, since that never updates `last_seen_at`
 either -- is terminated with a loud report: it cannot idle-terminate itself, it
 is doing nothing we can see, and it is still billing. A long training run keeps
 its host alive indefinitely *under this rule* -- a TTL the host actually has is
 checked first and does terminate a pod with a job on it, which is exactly why a
-TTL is opt-in. The 15-minute pre-healthy ceiling and the stray-pod rule are
-unchanged.
+TTL is opt-in. The 15-minute pre-healthy ceiling is unchanged, and it only
+applies to a record that says the pod was never bootstrapped -- which an adopted
+one never does.
 Never touch a pod without the prefix. If `desired/` is unreadable, do nothing
 and log an error (fail closed). `--install` writes a `systemd --user` service
 and timer but does not enable them, and prints the `systemctl` lines and the
