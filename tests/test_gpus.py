@@ -30,8 +30,16 @@ def test_resolve_present_takes_indices_not_just_uuids() -> None:
     assignment has to understand that form or it rejects every job."""
     assert gpus.resolve_present(["1"], smi=fake_smi()) == [FAKE_GPUS[1]]
     assert gpus.resolve_present(["0", FAKE_GPUS[1]], smi=fake_smi()) == FAKE_GPUS
+
+
+def test_resolve_present_refuses_an_assignment_that_names_one_card_twice() -> None:
+    """Owning a card under two names is one card; being *assigned* it twice is
+    a promise of two, and handing back one would run a 2-GPU job on one."""
     with pytest.raises(gpus.GpuError) as excinfo:
-        gpus.resolve_present(["0", "9"], "assigned GPUs", fake_smi())
+        gpus.resolve_present(["0", FAKE_GPUS[0]], smi=fake_smi())
+    assert "1 card(s), not 2" in str(excinfo.value)
+    with pytest.raises(gpus.GpuError) as excinfo:
+        gpus.resolve_present(["0", "9"], "assigned GPUs", smi=fake_smi())
     assert "assigned GPUs not present on this host: 9" in str(excinfo.value)
     assert f"0={FAKE_GPUS[0]}" in str(excinfo.value)
 

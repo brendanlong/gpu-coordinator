@@ -128,17 +128,20 @@ def resolve_owned(
     return _against_table(entries, index_uuids(smi))
 
 
-def describe_table(smi: SmiRunner = run_nvidia_smi) -> str:
-    """`0=GPU-..., 1=GPU-...`, for an error that has to say what is here."""
-    try:
-        table = index_uuids(smi)
-    except GpuError as exc:
-        return f"(nvidia-smi could not be read: {exc})"
+def _describe(table: dict[str, str]) -> str:
     return ", ".join(f"{index}={uuid}" for index, uuid in sorted(table.items())) or "(no GPUs)"
 
 
+def describe_table(smi: SmiRunner = run_nvidia_smi) -> str:
+    """`0=GPU-..., 1=GPU-...`, for an error that has to say what is here."""
+    try:
+        return _describe(index_uuids(smi))
+    except GpuError as exc:
+        return f"(nvidia-smi could not be read: {exc})"
+
+
 def resolve_present(
-    entries: Sequence[str], what: str = "assigned GPUs", smi: SmiRunner = run_nvidia_smi
+    entries: Sequence[str], what: str = "assigned GPUs", *, smi: SmiRunner = run_nvidia_smi
 ) -> list[str]:
     """`resolve_owned`, for the places where a card was already promised.
 
@@ -153,11 +156,21 @@ def resolve_present(
     entries = list(entries)
     if not entries:
         return []
-    resolved, missing = _against_table(entries, index_uuids(smi))
+    table = index_uuids(smi)
+    resolved, missing = _against_table(entries, table)
     if missing:
         raise GpuError(
             f"{what} not present on this host: {', '.join(missing)}; "
-            f"nvidia-smi reports: {describe_table(smi)}"
+            f"nvidia-smi reports: {_describe(table)}"
+        )
+    if len(resolved) != len(entries):
+        # `_against_table` folds an index and its own UUID into one card, which
+        # is right for counting what a host owns and wrong here: these entries
+        # are a promise of *n* cards, and quietly returning fewer would run a
+        # two-GPU job on one.
+        raise GpuError(
+            f"{what} name {len(resolved)} card(s), not {len(entries)}: "
+            f"{', '.join(entries)} against {_describe(table)}"
         )
     return resolved
 

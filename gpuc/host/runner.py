@@ -466,13 +466,13 @@ class JobRunner:
         """
         before = list(self.assigned)
         try:
-            self.assigned = gpus.resolve_present(self.assigned, "assigned GPUs", self.deps.smi)
+            self.assigned = gpus.resolve_present(self.assigned, "assigned GPUs", smi=self.deps.smi)
         except gpus.GpuError as exc:
             return str(exc)
         if self.assigned != before:
-            # A dispatcher that restarts adopts running jobs from their state
-            # and treats those cards as busy, and it does that in UUIDs; an
-            # index left here would read as a free GPU and be handed out twice.
+            # So everything reading the state afterwards -- `gpuc status`, the
+            # control side's free/busy view -- names the same cards the job is
+            # actually on. The dispatcher resolves what it adopts either way.
             jobs.update_state(self.job_id, gpus=self.assigned)
         return None
 
@@ -496,7 +496,9 @@ class JobRunner:
         )
         if gpu_error:
             self._log(log, f"GPU assertion failed: {gpu_error}")
-            return self._finalize(1, "failed", "gpu-assert", sync_loop, log)
+            # The job never ran, so its `outputs:` cannot exist and a second
+            # failure would only add a confusing `+no-outputs`.
+            return self._finalize(1, "failed", "gpu-assert", sync_loop, log, skip_output_sync=True)
 
         self._log(
             log,

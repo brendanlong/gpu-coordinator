@@ -435,7 +435,20 @@ class Dispatcher:
             if state.runner_pid and recorded_process_alive(
                 state.runner_pid, state.runner_boot_id, state.runner_starttime
             ):
-                self.running[job_id] = _Running(job_id, state.runner_pid, list(state.gpus))
+                # Through the resolver: a job launched before assignments were
+                # resolved host-side has indices in its state, and busy/free
+                # accounting is in UUIDs. An index adopted as-is would match
+                # nothing owned, so the card would read free and be handed out
+                # a second time while the job is still training on it.
+                try:
+                    held, _ = gpus.resolve_owned(state.gpus, self.deps.smi)
+                except gpus.GpuError as exc:
+                    # Adoption runs once, at startup: a job left unadopted here
+                    # is never picked up, so an unreadable nvidia-smi must cost
+                    # the resolution, not the adoption.
+                    self.log(f"could not resolve the GPUs of {job_id} ({exc}); adopting as given")
+                    held = list(state.gpus)
+                self.running[job_id] = _Running(job_id, state.runner_pid, held)
                 self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
             else:
                 self._mark_runner_died(job_id)

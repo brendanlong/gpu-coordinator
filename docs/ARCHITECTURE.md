@@ -37,9 +37,9 @@ gpuc/
     preflight.py  # sync preflight: prove `aws`/`hf` can write before the job runs
     baseline.py   # what was already under `outputs:` before the job started
     cleanup.py    # `cleanup:` policy, workdir sizing, the `clean` sweep
-    gpus.py       # nvidia-smi parsing, UUID<->index assertion, utilization sampling
+    gpus.py       # nvidia-smi parsing, index<->UUID resolution, utilization sampling
     sync.py       # periodic upload loop (shells out to `aws` or `hf`; see Sync)
-    health.py     # host preflight: driver, UUIDs, disk, network download timing
+    health.py     # host preflight: driver, owned GPUs, disk, network download timing
     terminate.py  # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
   control/     # runs on the local machine. May use third-party deps.
     cli.py        # `gpuc` top-level commands
@@ -223,10 +223,11 @@ queue's lexical order, not submission order below one second.
 
 ## Runner (one process per job)
 
-1. Export `CUDA_VISIBLE_DEVICES=<assigned UUIDs comma-joined>` (empty string
-   when `gpus: 0`), the spec `env`, and the secrets file. Assert via
-   `nvidia-smi --query-gpu=index,uuid` that every assigned UUID is present
-   on the host; fail the job otherwise.
+1. Resolve the assignment against `nvidia-smi --query-gpu=index,uuid` --
+   indices and UUIDs both, since either form may be recorded -- and fail the
+   job (`gpu-assert`) if an entry names no card that is here. Export
+   `CUDA_VISIBLE_DEVICES=<resolved UUIDs comma-joined>` (empty string when
+   `gpus: 0`), the spec `env`, and the secrets file.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json`
    (relative path, size, mtime) -- a checkout routinely ships committed files
    where the outputs go. Before `setup`, because a setup step writing there
@@ -555,7 +556,13 @@ agreed and read off `nvidia-smi`; stored verbatim because resolving them at
 registration would freeze one boot's numbering into a file nobody looks at
 again.
 
-Everything downstream is UUIDs. The dispatcher re-runs
+Everything downstream is UUIDs. The runner resolves its assignment again on
+the way in and writes the UUIDs back to the job state, and the dispatcher
+resolves what it adopts at startup: a dispatcher process from before this and
+a runner from after it meet during an in-place upgrade, and an index mistaken
+for a busy card's name is a card handed out twice.
+
+The dispatcher re-runs
 `nvidia-smi --query-gpu=index,uuid --format=csv,noheader` each pass, maps the
 owned indices to whatever the driver is calling those cards now, and assigns,
 accounts for and pins jobs by UUID -- `CUDA_VISIBLE_DEVICES` is never an index.
