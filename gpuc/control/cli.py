@@ -590,6 +590,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             gpu_count=args.gpu_count,
             use_git=use_git,
             ttl_hours=args.ttl_hours,
+            report=report,
         )
         job_id = jobs.new_job_id()
         spec_uri, notes = mirror_spec_first(model, job_id, settings)
@@ -1042,6 +1043,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     attempt = (index.attempt if index else 1) + 1
     model = validate(document, f"spec for {args.job_id}")
     use_git = not args.no_git
+    report = reporter(args)
     if target is None:
         precheck_local(
             model,
@@ -1049,8 +1051,8 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             gpu_count=args.gpu_count,
             use_git=use_git,
             ttl_hours=args.ttl_hours,
+            report=report,
         )
-    report = reporter(args)
     entry = runpod_target(args, settings) if target is None else registry.require(target)
     entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap, report=report)
     result = submit_spec(

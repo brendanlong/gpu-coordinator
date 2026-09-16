@@ -472,6 +472,10 @@ class Dispatcher:
         final.exit_code = final.exit_code or 1
         final.ended_at = jobs.utc_now()
         final.phase = None
+        # The runner clears this itself on every path it survives; here it did
+        # not survive, and a finished job carrying an eta reads to anything
+        # keying on it as a job that is still going.
+        final.eta = None
         jobs.write_state(job_id, final)
         self.log(f"job {job_id} failed: runner died without writing final state")
 

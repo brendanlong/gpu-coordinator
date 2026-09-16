@@ -427,3 +427,79 @@ def test_hf_create_survives_validation_into_the_spec() -> None:
     spec = model.to_spec("20260915-000000-aaaaaa")
     assert spec.outputs[0].hf_create is True
     assert validate(job_document(outputs=[{"path": "ckpt", "hf": "org/repo"}]))
+
+
+def test_the_estimate_fields_survive_validation_into_the_spec() -> None:
+    model = validate(
+        job_document(
+            estimated_runtime_min=360,
+            progress_command="cat progress.txt",
+            progress_interval_s=30,
+        )
+    )
+    spec = model.to_spec("20260915-000000-aaaaaa")
+    assert spec.estimated_runtime_min == 360.0
+    assert spec.progress_command == "cat progress.txt"
+    assert spec.progress_interval_s == 30.0
+
+
+def test_a_spec_that_estimates_nothing_leaves_every_estimate_field_unset() -> None:
+    spec = validate(job_document()).to_spec("20260915-000000-aaaaaa")
+    assert (spec.estimated_runtime_min, spec.progress_command) == (None, None)
+    assert spec.progress_interval_s == 60.0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"estimated_runtime_min": 0},
+        {"estimated_runtime_min": -5},
+        {"progress_interval_s": 1},
+    ],
+)
+def test_an_estimate_that_could_not_be_true_is_refused(overrides: dict[str, Any]) -> None:
+    with pytest.raises(SubmitError):
+        validate(job_document(**overrides))
+
+
+def test_submit_warns_when_the_estimate_outlives_the_jobs_own_timeout(
+    control_env: Path, repo: Path
+) -> None:
+    lines: list[str] = []
+    result = submit_spec(
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
+        validate(job_document(estimated_runtime_min=600, max_runtime_min=120)),
+        Settings(),
+        workdir=repo,
+        session=session(FakeHost()),
+        environ={},
+        report=lines.append,
+    )
+    assert any("expects to be killed as `timeout`" in line for line in lines)
+    assert any("max_runtime_min" in note for note in result.notes)
+
+
+def test_an_estimate_inside_the_timeout_is_not_warned_about(control_env: Path, repo: Path) -> None:
+    lines: list[str] = []
+    submit_spec(
+        HostEntry(name="gpubox", gpus=["GPU-a"]),
+        validate(job_document(estimated_runtime_min=60, max_runtime_min=120)),
+        Settings(),
+        workdir=repo,
+        session=session(FakeHost()),
+        environ={},
+        report=lines.append,
+    )
+    assert not any("timeout" in line for line in lines)
+
+
+def test_an_estimate_longer_than_the_pods_ttl_warns_but_does_not_refuse(repo: Path) -> None:
+    """A guess must not stop a submit the way `max_runtime_min` does."""
+    lines: list[str] = []
+    precheck_local(
+        validate(job_document(estimated_runtime_min=180)),
+        repo,
+        ttl_hours=1.0,
+        report=lines.append,
+    )
+    assert any("--ttl-hours" in line and "WARNING" in line for line in lines)

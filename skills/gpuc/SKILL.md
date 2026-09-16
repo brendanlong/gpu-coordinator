@@ -68,6 +68,9 @@ outputs:
 sync_interval_s: 180               # upload cadence while running, and at the end; minimum 10
 priority: 50                       # 0 first, 99 last
 max_runtime_min: 720               # optional wall-clock cap
+estimated_runtime_min: 480         # optional; what `gpuc status` shows the next person
+progress_command: "tail -1 results/progress.txt"   # optional; last stdout line is a percentage
+progress_interval_s: 60            # prints `0.42` or `42%`; a bare `42` is refused; min 5
 low_util:                          # kills a job whose GPU sits idle; defaults are conservative
   enabled: true                    # {window_min: 25, floor_pct: 5, grace_min: 10}
 cleanup: on_success                # workdir deleted after a successful run
@@ -94,6 +97,11 @@ Rules that avoid the classic failures:
   prints: a cu13x wheel needs a newer driver than a cu128 one, and an older
   shared box is usually the binding constraint. cu128 is the safe default; a
   `--runpod` pod is filtered to CUDA >= 12.8 (`--cuda-min` to change it).
+- Say how long the job will take. On a shared host the next person's only
+  alternative to `estimated_runtime_min` is guessing or paying for a pod. If
+  the job already writes its progress anywhere, point `progress_command` at it
+  and `gpuc status` shows a live end time instead of your guess; a progress
+  command that breaks is recorded and ignored, never fatal.
 
 ## Submit, watch, finish
 
@@ -102,7 +110,7 @@ gpuc submit job.yaml --host local
 gpuc submit job.yaml --host <host>                              # any name from `gpuc host list`
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu A40,RTX4090 --cloud any
 
-gpuc status                      # every host: queue, running job + phase, recent results
+gpuc status                      # every host: queue, running job + phase, eta, recent results
 gpuc status --json               # the same, machine-readable; --json is on every command
                                  # that has an answer (see "Exit codes" below)
 gpuc status --suspects           # running jobs that are billing but idle, judged by each job's
@@ -158,8 +166,9 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
 `name, kind, reachable, pkg_commit, dispatcher{alive, heartbeat_age_s},
 provider_util, gpus, queued, running, finished, errors`; each job in those three
-lists has `job_id, name, status, reason, phase, elapsed_s, util, gpus, iso,
-ended_at, outputs_pending`.
+lists has `job_id, name, status, reason, phase, elapsed_s, util, progress_pct,
+eta, eta_s, estimated_runtime_min, progress_error, gpus, iso, ended_at,
+outputs_pending`.
 
 **Every command that has an answer takes `--json`**, and means the same thing by
 it: stdout is one object with `schema_version`, everything else the command says

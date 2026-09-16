@@ -21,7 +21,18 @@ from pathlib import Path
 from typing import IO
 
 from gpuc._version import user_agent
-from gpuc.host import baseline, cleanup, gpus, jobs, paths, preflight, queue, scope, sync
+from gpuc.host import (
+    baseline,
+    cleanup,
+    gpus,
+    jobs,
+    paths,
+    preflight,
+    progress,
+    queue,
+    scope,
+    sync,
+)
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.jobs import JobSpec
 
@@ -32,6 +43,7 @@ POLL_INTERVAL_S = 0.5
 TERMINATED_EXIT_CODE = 143  # 128 + SIGTERM, the shell convention
 
 UtilSampler = Callable[[Sequence[str]], float]
+ProgressPoller = Callable[[str, Path, dict[str, str]], float]
 
 PREFLIGHT_SOURCE = """
 import os, sys, torch
@@ -184,6 +196,7 @@ def preflight_command() -> str:
 class RunnerDeps:
     smi: SmiRunner = gpus.run_nvidia_smi
     sampler: UtilSampler | None = None
+    progress_poller: ProgressPoller = progress.poll
     command_runner: sync.CommandRunner = sync.run_command
     sleep: Callable[[float], None] = time.sleep
     now: Callable[[], float] = time.monotonic
@@ -266,6 +279,9 @@ class JobRunner:
         self.isolation: str = self.deps.isolation or scope.isolation()
         self._current: subprocess.Popen[bytes] | None = None
         self._current_unit: str | None = None
+        self._progress_error: str | None = None
+        """The last progress failure we logged, so an interval-by-interval
+        repeat of it does not bury the job's own output."""
         self._terminating = False
         self._finalizing = False
         """Set for the whole of `_finalize`, which must run exactly once.
@@ -325,6 +341,15 @@ class JobRunner:
         max_runtime_s = (
             None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
         )
+        # The submitter's estimate, published from the first phase on: a job
+        # still installing torch is exactly the one somebody wants an end time
+        # for. A `progress_command` replaces it with a measured one below.
+        self._publish_estimated_eta(phase_start - job_start)
+        # Progress is a fraction of the job's own work, so only `main` can
+        # report it: during setup the command would be reading a file the job
+        # has not started writing.
+        progress_command = self.spec.progress_command if phase == "main" else None
+        next_progress = phase_start + self.spec.progress_interval_s
 
         while proc.poll() is None:
             deps.sleep(deps.poll_interval_s)
@@ -339,6 +364,9 @@ class JobRunner:
             if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
                 self._kill(proc, "timeout", log)
                 break
+            if progress_command and t >= next_progress:
+                next_progress = t + self.spec.progress_interval_s
+                self._record_progress(progress_command, t - phase_start, log)
             if record_util and t >= next_sample:
                 next_sample = t + deps.sample_interval_s
                 try:
@@ -362,6 +390,46 @@ class JobRunner:
                     self._kill(proc, "low-util", log)
                     break
         return proc.wait()
+
+    def _publish_estimated_eta(self, elapsed_s: float) -> None:
+        if self.spec.estimated_runtime_min is None:
+            return
+        eta = jobs.utc_in(self.spec.estimated_runtime_min * 60.0 - elapsed_s)
+        if eta is not None:
+            jobs.update_state(self.job_id, eta=eta)
+
+    def _record_progress(self, command: str, elapsed_s: float, log: IO[bytes]) -> None:
+        """One poll of the spec's `progress_command`, and the end time it implies.
+
+        `elapsed_s` is time in phase `main`, which is the work the percentage is
+        a fraction of: measuring from the runner's start would charge a 20
+        minute `uv sync` to the first epoch and put the estimate hours out.
+        """
+        try:
+            percent = self.deps.progress_poller(command, paths.workdir(self.job_id), self.env)
+        except progress.ProgressError as exc:
+            message = f"progress command {exc}"
+            if message != self._progress_error:
+                # Once per distinct failure: this runs every interval for the
+                # rest of the job, and a broken command would otherwise be the
+                # only thing left in the log.
+                self._log(log, message)
+            self._progress_error = message
+            jobs.update_state(self.job_id, progress_error=message)
+            return
+        self._progress_error = None
+        fields: dict[str, object] = {
+            "progress_pct": percent,
+            "progress_at": jobs.utc_now(),
+            "progress_error": None,
+        }
+        if percent > 0:
+            # At 0% there is no rate yet, so the submitter's estimate (if any)
+            # stays; overwriting it with an infinite one helps nobody.
+            eta = jobs.utc_in(elapsed_s * (100.0 - percent) / percent)
+            if eta is not None:
+                fields["eta"] = eta
+        jobs.update_state(self.job_id, **fields)
 
     def _record_util(self, util: float | None) -> None:
         sample = None if util is None else round(util, 1)
@@ -657,6 +725,11 @@ class JobRunner:
             pid=None,
             pgid=None,
             cgroup_unit=None,
+            # The job is over, so there is nothing left to estimate; the last
+            # `progress_pct` stays, because how far it had got when it died is
+            # the useful part. A surviving `eta` would read as a promise the
+            # job is still going.
+            eta=None,
             outputs_synced_at=sync_loop.outputs_synced_at,
         )
         self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")

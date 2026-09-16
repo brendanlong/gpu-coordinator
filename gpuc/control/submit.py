@@ -37,7 +37,7 @@ from gpuc.control.transport import (
     git_tracked_files,
     uncommitted_patch,
 )
-from gpuc.host import jobs
+from gpuc.host import jobs, progress
 from gpuc.host.jobs import JobSpec
 
 Reporter = Callable[[str], None]
@@ -80,6 +80,14 @@ class JobSpecModel(BaseModel):
     sync_interval_s: int = Field(default=180, ge=10)
     priority: int = Field(default=50, ge=0, le=99)
     max_runtime_min: float | None = None
+    estimated_runtime_min: float | None = Field(default=None, gt=0)
+    """Roughly how long this job takes, from the runner's start. Nothing
+    enforces it; it is what tells the next person whether to queue behind it."""
+    progress_command: str | None = None
+    """Run in the workdir every `progress_interval_s` of phase `main`; its last
+    line of stdout is how far along the job is, as a fraction of one (`0.42`) or
+    a percentage written with a `%` (`42%`)."""
+    progress_interval_s: float = Field(default=progress.DEFAULT_INTERVAL_S, ge=5)
     low_util: LowUtilModel = Field(default_factory=LowUtilModel)
     requires: dict[str, Any] = Field(default_factory=dict)
     cleanup: Literal["on_success", "always", "never"] = jobs.DEFAULT_CLEANUP
@@ -175,6 +183,7 @@ def precheck_local(
     environ: Mapping[str, str] | None = None,
     use_git: bool = True,
     ttl_hours: float | None = None,
+    report: Reporter = print,
 ) -> None:
     """Everything a submit can fail on without a host, checked before we buy one.
 
@@ -198,6 +207,19 @@ def precheck_local(
             f"kill the job before it could finish.\n"
             f"Raise --ttl-hours, drop it (the default is no TTL at all), or lower "
             f"max_runtime_min."
+        )
+    if (
+        ttl_hours is not None
+        and model.estimated_runtime_min is not None
+        and model.estimated_runtime_min > ttl_hours * 60.0
+    ):
+        # A warning and not a refusal: `max_runtime_min` above is a cap the job
+        # asked to be held to, while this is a guess, and a guess must not stop
+        # somebody submitting a job they are willing to have cut short.
+        report(
+            f"WARNING: the job estimates {model.estimated_runtime_min:g} min but the pod's "
+            f"--ttl-hours is {ttl_hours:g} h ({ttl_hours * 60.0:g} min), so the TTL will very "
+            f"likely kill it before it finishes"
         )
     gather_secrets(model.secrets, environ)
     if not use_git:
@@ -282,6 +304,24 @@ def preexisting_output_warnings(spec: JobSpec, workdir: Path) -> list[str]:
                 f"(for example {output.path}/{{job_id}}/) if you meant them to be"
             )
     return warnings
+
+
+def timeout_warnings(spec: JobSpec) -> list[str]:
+    """An estimate the job's own `max_runtime_min` will not let it reach.
+
+    Both fields are the submitter's, so this is a contradiction in one file,
+    and the only place anyone will notice it before the job dies as `timeout`
+    hours later.
+    """
+    if spec.estimated_runtime_min is None or spec.max_runtime_min is None:
+        return []
+    if spec.estimated_runtime_min <= spec.max_runtime_min:
+        return []
+    return [
+        f"estimated_runtime_min ({spec.estimated_runtime_min:g}) is longer than "
+        f"max_runtime_min ({spec.max_runtime_min:g}), so this job expects to be killed as "
+        f"`timeout` before it finishes"
+    ]
 
 
 def push_workdir(
@@ -380,7 +420,7 @@ def submit_spec(
             f"Submit to a bigger host, or lower `gpus:` in the spec."
         )
 
-    for warning in preexisting_output_warnings(spec, workdir):
+    for warning in [*preexisting_output_warnings(spec, workdir), *timeout_warnings(spec)]:
         report(f"WARNING: {warning}")
         notes.append(warning)
 
