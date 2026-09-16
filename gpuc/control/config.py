@@ -358,6 +358,13 @@ NOT_DRIFT = {"schema_version", "pkg_commit", "created_at"}
 commit (which moves on every re-ship, and is reported on its own), and when
 whoever registered the host first did so."""
 
+NOT_DRIFT_ENV = {"UV_CACHE_DIR"}
+"""Environment bootstrap decides, not the user: it is set from the host's own
+filesystem layout (`resolve_cache_dir`), so the machine that bootstrapped the
+host is the only one with an opinion worth having about it. Every *other*
+machine has no `cache_dir` recorded and would otherwise report a difference on
+every submit that only a re-bootstrap could clear."""
+
 JOB_CONFIG_KEYS = ("host", "gpus", "s3_prefix", "env")
 """The config a *job* is affected by: which cards it can be given, the
 environment it inherits, and where its log and outputs are mirrored. The rest
@@ -371,6 +378,12 @@ def _show(value: Any) -> str:
         return "none"
     if isinstance(value, list):
         return ",".join(str(item) for item in value) or "none"
+    if isinstance(value, dict):
+        # `provider` is the one of these, and `{'kind': 'runpod', 'pod_id':
+        # 'p1'}` in the middle of a sentence reads as punctuation. `env` never
+        # gets here: its values are not printed at all.
+        items: dict[Any, Any] = value
+        return " ".join(f"{k}={items[k]}" for k in sorted(map(str, items))) or "none"
     return str(value)
 
 
@@ -409,7 +422,9 @@ def config_drift(
             # only named differences are differences.
             theirs_env = theirs if isinstance(theirs, dict) else {}
             names = sorted(
-                k for k in set(theirs_env) | set(ours) if theirs_env.get(k) != ours.get(k)
+                k
+                for k in (set(theirs_env) | set(ours)) - NOT_DRIFT_ENV
+                if theirs_env.get(k) != ours.get(k)
             )
             if names:
                 drift.append(f"env differs in {', '.join(names)}")

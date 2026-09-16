@@ -27,7 +27,7 @@ from gpuc.control.config import (
     registry_transaction,
 )
 from gpuc.control.providers.base import Constraints
-from gpuc.control.remote import HostSession
+from gpuc.control.remote import HostSession, RemoteError
 from gpuc.control.submit import SubmitResult
 from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
 from tests.fakes3 import FakeS3Client
@@ -658,8 +658,10 @@ def test_a_negative_ttl_clears_the_cap(control_env: Path) -> None:
 def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | None) -> list[str]:
     """Answer `submit`'s "what build is this host running" with `config`.
 
-    ``None`` is a host that could not be asked at all. Returns the list every
-    re-ship appends its host to.
+    ``None`` is a host that could not be asked at all, and it is faked at the
+    ssh boundary -- `open_session` raising, which is what an unreachable host
+    really does -- so that the fallback *and* the catching are both exercised.
+    Returns the list every re-ship appends its host to.
     """
     resynced: list[str] = []
     fake_session = SimpleNamespace(transport=SimpleNamespace(host="gpubox"))
@@ -672,10 +674,13 @@ def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | N
         return entry.model_copy(update={"pkg_commit": "b" * 40})
 
     monkeypatch.setattr("gpuc.control.cli.resync_package", fake_resync)
-    monkeypatch.setattr(
-        "gpuc.control.cli._try_session",
-        lambda *a, **k: None if config is None else cast(Any, fake_session),
-    )
+
+    def open_or_fail(*_: object, **__: object) -> Any:
+        if config is None:
+            raise RemoteError("gpubox", "printf %s", "could not reach host gpubox")
+        return fake_session
+
+    monkeypatch.setattr("gpuc.control.cli.open_session", open_or_fail)
     monkeypatch.setattr("gpuc.control.cli.read_remote_config", lambda _session: config)
     monkeypatch.setattr(
         "gpuc.control.cli.submit_file",
@@ -742,13 +747,44 @@ def test_submit_asks_the_host_which_build_it_runs_not_this_machines_record(
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert resynced == ["gpubox"]
     assert "host gpubox is running gpuc " + "c" * 12 in capsys.readouterr().out
+    # The fake re-ship records what it shipped, as the real one does.
+    assert load_registry().require("gpubox").pkg_commit == "b" * 40
 
-    # And the record stops lying to `gpuc host list` about it.
+    # And when there is nothing to re-ship, the record still stops repeating a
+    # bootstrap somebody else replaced: `host list` and `version` have only it.
     resynced.clear()
-    _set_host(pkg_commit="b" * 40)
-    monkeypatch.setattr("gpuc.control.cli.read_remote_config", lambda _s: {"pkg_commit": "b" * 40})
+    monkeypatch.setattr("gpuc.control.cli.read_remote_config", lambda _s: {"pkg_commit": "c" * 40})
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "c" * 40)
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert resynced == []
+    assert load_registry().require("gpubox").pkg_commit == "c" * 40
+
+
+def test_submit_records_the_hosts_commit_without_clobbering_the_rest_of_the_entry(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It runs on every submit, so it writes the one field under the lock: the
+    entry it read at startup is stale the moment a `gpuc host probe` in another
+    session writes what it learned about the same host."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    _set_host(python="/py", pkg_commit="b" * 40)
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "c" * 40)
+    _fake_host_build(monkeypatch, {"pkg_commit": "c" * 40})
+
+    def concurrent_probe(*_: object, **__: object) -> dict[str, Any]:
+        # Between reading the entry and recording the commit, another session
+        # records a driver version against the same host.
+        _set_host(driver_version="580.173.02")
+        return {"pkg_commit": "c" * 40}
+
+    monkeypatch.setattr("gpuc.control.cli.read_remote_config", concurrent_probe)
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    entry = load_registry().require("gpubox")
+    assert (entry.pkg_commit, entry.driver_version) == ("c" * 40, "580.173.02")
 
 
 def test_submit_says_so_when_the_host_runs_a_config_this_machine_did_not_write(
@@ -830,7 +866,8 @@ def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unreachable host is the submit behind this one's error to report, in
-    full; here it only means the record we have is the best there is."""
+    full; here it only means the record we have is the best there is -- and
+    that the ssh failure never leaves `ensure_package_current` as a traceback."""
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
     main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])

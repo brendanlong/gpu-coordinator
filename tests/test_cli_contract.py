@@ -489,6 +489,42 @@ def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
     assert status_mod.host_warnings(HostView(entry=entry, pkg_commit="b" * 40)) == []
 
 
+def test_host_list_reports_this_machines_own_record_and_says_that_is_what_it_is(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`host list` never asks a host anything, so the one thing it must not do
+    is imply it did: what it has is the commit *this* machine last shipped."""
+    from gpuc.control import version as version_mod
+
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    shipped = (
+        load_registry()
+        .require("gpubox")
+        .model_copy(update={"pkg_commit": "b" * 40, "bootstrapped_at": "2026-09-15T20:00:00+00:00"})
+    )
+    write_hosts({"hosts": {"gpubox": json.loads(shipped.model_dump_json())}})
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    capsys.readouterr()
+
+    assert main(["host", "list"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "pkg     " + "b" * 12 + " shipped from here" in out
+    assert "NOTE host gpubox was last given gpuc " + "b" * 12 + " from this machine" in out
+    assert "gpuc status" in out
+
+    assert main(["host", "list", "--json"]) == EXIT_OK
+    (host,) = json.loads(capsys.readouterr().out)["hosts"]
+    assert host["warnings"] == [
+        version_mod.shipped_commit_note("gpubox", "b" * 40, "a" * 40),
+    ]
+
+    # On this build it has nothing to say, and says nothing.
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "b" * 40)
+    assert main(["host", "list", "--json"]) == EXIT_OK
+    (host,) = json.loads(capsys.readouterr().out)["hosts"]
+    assert host["warnings"] == []
+
+
 def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -503,9 +539,7 @@ def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
     (warning,) = status_mod.host_warnings(HostView(entry=entry, reachable=True))
     assert "a build too old to say which" in warning
     assert "gpuc host bootstrap gpubox" in warning
-    # Judged by the same rule the re-ship is.
-    assert version_mod.needs_package_sync("a" * 40, None)
-    # Except with nothing to compare against: a gpuc that cannot name its own
+    # With nothing to compare against: a gpuc that cannot name its own
     # commit has no business telling a host it is behind.
     monkeypatch.setattr(version_mod, "local_commit", lambda: None)
     assert status_mod.host_warnings(HostView(entry=entry, reachable=True)) == []

@@ -123,13 +123,13 @@ def test_config_drift_never_prints_an_env_value_whatever_the_host_has_there() ->
     including a null, and the fallback formatting used to print our side of the
     comparison -- which is the side holding the token."""
     entry = HostEntry(name="gpubox", env={"HF_TOKEN": "hf_secret"})
-    for existing in ({"env": None}, {"env": "HF_TOKEN=hf_theirs"}, {"env": []}):
-        drift = config_drift(existing, entry.host_config())
-        assert drift == ["env differs in HF_TOKEN"]
-        assert "hf_secret" not in drift[0]
-    assert (
-        "hf_theirs" not in config_drift({"env": {"HF_TOKEN": "hf_theirs"}}, entry.host_config())[0]
-    )
+    for existing in (
+        {"env": None},
+        {"env": "HF_TOKEN=hf_theirs"},
+        {"env": []},
+        {"env": {"HF_TOKEN": "hf_theirs"}},
+    ):
+        assert config_drift(existing, entry.host_config()) == ["env differs in HF_TOKEN"]
     # An env nobody set, however it is spelled, is not a difference.
     plain = HostEntry(name="gpubox")
     assert config_drift({"env": None}, plain.host_config()) == []
@@ -147,4 +147,23 @@ def test_config_drift_can_be_narrowed_to_the_keys_a_job_is_affected_by() -> None
 
 def test_config_drift_is_quiet_about_a_runpod_host_bootstrap_just_wrote() -> None:
     entry = HostEntry(name="gpuc-1", kind="runpod", pod_id="pod-1", gpus=["GPU-a"])
-    assert config_drift(entry.host_config().to_dict(), entry.host_config()) == []
+    written = entry.host_config().to_dict()
+    assert config_drift(written, entry.host_config()) == []
+    # A pod that was replaced under the same name reads back as a difference,
+    # spelled so it can sit in the middle of a sentence.
+    assert config_drift(written, entry.model_copy(update={"pod_id": "pod-2"}).host_config()) == [
+        "provider kind=runpod pod_id=pod-1 -> kind=runpod pod_id=pod-2"
+    ]
+
+
+def test_the_uv_cache_bootstrap_chose_is_not_drift_for_the_machine_that_did_not() -> None:
+    """`cache_dir` is decided from the *host's* filesystem layout by whichever
+    machine bootstrapped it, and reaches jobs through `env`. Every other
+    machine has none recorded, and would otherwise warn on every submit about
+    something only a re-bootstrap could change -- and should not change."""
+    entry = HostEntry(name="gpubox", env={"HF_HOME": "/big"})
+    theirs = {"env": {"UV_CACHE_DIR": "/mnt/ssd/uv-cache", "HF_HOME": "/big"}}
+    assert config_drift(theirs, entry.host_config()) == []
+    # Anything else the other machine set is still reported.
+    theirs["env"]["HF_HOME"] = "/elsewhere"
+    assert config_drift(theirs, entry.host_config()) == ["env differs in HF_HOME"]

@@ -924,8 +924,11 @@ by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
   enqueue and re-ship the package when it does not match this build -- an
   unrecorded commit included. The same read reports the fields of that config
   that would change *this job* (`host`, `gpus`, `s3_prefix`, `env`) when they
-  are not what is registered here. It then records the commit it saw, so the
-  offline commands stop repeating a bootstrap somebody else replaced.
+  are not what is registered here -- `env` by name only, and never
+  `UV_CACHE_DIR`, which bootstrap derives from the host's own filesystem and
+  which only the machine that bootstrapped it has an opinion worth having
+  about. It then records the commit it saw, so the offline commands stop
+  repeating a bootstrap somebody else replaced.
 - `gpuc host list` and `gpuc version` never ssh, so they report this machine's
   own record, labelled as such (`pkg <sha> shipped from here`), and point at
   `gpuc status` for what the host is running.
