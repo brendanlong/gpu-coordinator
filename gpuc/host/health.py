@@ -63,17 +63,9 @@ def check_gpu_uuids(owned: Sequence[str], smi: SmiRunner = gpus.run_nvidia_smi) 
     if not owned:
         return Check("gpu_uuids", True, "no GPUs owned by this host", 0)
     try:
-        resolved, missing = gpus.resolve_owned(owned, smi)
-        gpus.assert_uuids_present(resolved, smi)
+        resolved = gpus.resolve_present(owned, "config.gpus entries", smi)
     except gpus.GpuError as exc:
         return Check("gpu_uuids", False, str(exc))
-    if missing:
-        return Check(
-            "gpu_uuids",
-            False,
-            f"config.gpus entries not present on this host: {', '.join(missing)}; "
-            f"nvidia-smi reports {gpus.describe_table(smi)}",
-        )
     return Check("gpu_uuids", True, f"{len(resolved)} owned GPU(s) present", len(resolved))
 
 

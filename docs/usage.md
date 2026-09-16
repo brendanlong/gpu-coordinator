@@ -281,7 +281,7 @@ Every `failed: <reason>`:
 | --- | --- |
 | `exit <N>` | `command` exited non-zero and nothing else killed it |
 | `setup` | the `setup` phase exited non-zero |
-| `gpu-assert` | an assigned UUID is not present in the host's `nvidia-smi` |
+| `gpu-assert` | an assigned GPU (index or UUID) is not present in the host's `nvidia-smi` |
 | `gpu-preflight` | a real GPU op inside the job's venv failed, or `device_count()` did not match `gpus:` — usually a CPU-only torch |
 | `sync-preflight` | the uploads the job would do at the end cannot work (no `aws`/`hf`, a missing secret, an unwritable bucket or repo) |
 | `low-util` | the GPU sat under `floor_pct` for a full `window_min` of `main` |

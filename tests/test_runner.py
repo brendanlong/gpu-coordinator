@@ -102,6 +102,26 @@ def test_secrets_file_is_sourced_into_the_job(gpuc_home: Path) -> None:
     assert "TOKEN=hf_abc" in log_of(job_id)
 
 
+def test_a_job_assigned_gpus_by_index_runs_on_the_uuids_those_indices_name(
+    gpuc_home: Path,
+) -> None:
+    """A position-pinned host assigns `1`, and the preflight must resolve that
+    rather than compare it against UUIDs and fail every job."""
+    job_id = prepare(gpus=["1"], command='echo "CVD=$CUDA_VISIBLE_DEVICES"')
+    assert runner.run_job(job_id, deps()) == 0
+    assert f"CVD={FAKE_GPUS[1]}" in log_of(job_id)
+    # Written back so a dispatcher that restarts adopts the card as busy.
+    assert jobs.read_state(job_id).gpus == [FAKE_GPUS[1]]
+
+
+def test_an_assigned_index_the_host_does_not_have_fails_the_job(gpuc_home: Path) -> None:
+    job_id = prepare(gpus=["7"], command="echo SHOULD-NOT-RUN")
+    assert runner.run_job(job_id, deps()) == 1
+    assert jobs.read_state(job_id).reason == "gpu-assert"
+    assert "SHOULD-NOT-RUN" not in log_of(job_id)
+    assert "assigned GPUs not present on this host: 7" in log_of(job_id)
+
+
 def test_a_stale_assigned_uuid_fails_the_job_before_it_starts(gpuc_home: Path) -> None:
     job_id = prepare(gpus=["GPU-stale"], command="echo SHOULD-NOT-RUN")
     assert runner.run_job(job_id, deps()) == 1

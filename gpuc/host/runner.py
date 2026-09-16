@@ -435,6 +435,7 @@ class JobRunner:
     def run(self) -> int:
         paths.ensure_job_layout(self.job_id)
         job_start = self.deps.now()
+        gpu_error = self._resolve_assigned()
         env = build_env(self.spec, self.assigned, self.config)
         # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
         # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
@@ -449,12 +450,39 @@ class JobRunner:
         )
         with paths.log_file(self.job_id).open("ab", buffering=0) as log, self._term_handlers():
             try:
-                return self._run_phases(env, sync_loop, log, job_start)
+                return self._run_phases(env, sync_loop, log, job_start, gpu_error)
             except _Terminated as exc:
                 return self._finalize_terminated(exc, sync_loop, log)
 
+    def _resolve_assigned(self) -> str | None:
+        """Turn the assignment into UUIDs, or say why it cannot be.
+
+        A job may have been assigned cards by nvidia-smi index -- that is how
+        ownership of a shared box is written, and a dispatcher from before the
+        assignment was resolved host-side hands the index straight through. An
+        index is only meaningful against the host's numbering right now, so it
+        is resolved here and everything after this -- `CUDA_VISIBLE_DEVICES`,
+        the utilization watchdog -- sees UUIDs.
+        """
+        before = list(self.assigned)
+        try:
+            self.assigned = gpus.resolve_present(self.assigned, "assigned GPUs", self.deps.smi)
+        except gpus.GpuError as exc:
+            return str(exc)
+        if self.assigned != before:
+            # A dispatcher that restarts adopts running jobs from their state
+            # and treats those cards as busy, and it does that in UUIDs; an
+            # index left here would read as a free GPU and be handed out twice.
+            jobs.update_state(self.job_id, gpus=self.assigned)
+        return None
+
     def _run_phases(
-        self, env: dict[str, str], sync_loop: sync.SyncLoop, log: IO[bytes], job_start: float
+        self,
+        env: dict[str, str],
+        sync_loop: sync.SyncLoop,
+        log: IO[bytes],
+        job_start: float,
+        gpu_error: str | None,
     ) -> int:
         jobs.update_state(
             self.job_id,
@@ -466,10 +494,8 @@ class JobRunner:
             runner_boot_id=boot_id(),
             runner_starttime=starttime(os.getpid()),
         )
-        try:
-            gpus.assert_uuids_present(self.assigned, self.deps.smi)
-        except gpus.GpuError as exc:
-            self._log(log, f"GPU assertion failed: {exc}")
+        if gpu_error:
+            self._log(log, f"GPU assertion failed: {gpu_error}")
             return self._finalize(1, "failed", "gpu-assert", sync_loop, log)
 
         self._log(

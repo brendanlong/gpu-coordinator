@@ -16,13 +16,24 @@ def test_driver_version() -> None:
     assert gpus.driver_version(fake_smi()) == "580.173.02"
 
 
-def test_assert_uuids_present_passes_and_fails_clearly() -> None:
-    gpus.assert_uuids_present([FAKE_GPUS[0]], fake_smi())
-    gpus.assert_uuids_present([], fake_smi())
+def test_resolve_present_passes_and_fails_clearly() -> None:
+    assert gpus.resolve_present([FAKE_GPUS[0]], smi=fake_smi()) == [FAKE_GPUS[0]]
+    assert gpus.resolve_present([], smi=fake_smi()) == []
     with pytest.raises(gpus.GpuError) as excinfo:
-        gpus.assert_uuids_present(["GPU-stale"], fake_smi())
+        gpus.resolve_present(["GPU-stale"], smi=fake_smi())
     assert "GPU-stale" in str(excinfo.value)
     assert FAKE_GPUS[0] in str(excinfo.value)
+
+
+def test_resolve_present_takes_indices_not_just_uuids() -> None:
+    """A host pinned by position hands out `2`, and everything that checks an
+    assignment has to understand that form or it rejects every job."""
+    assert gpus.resolve_present(["1"], smi=fake_smi()) == [FAKE_GPUS[1]]
+    assert gpus.resolve_present(["0", FAKE_GPUS[1]], smi=fake_smi()) == FAKE_GPUS
+    with pytest.raises(gpus.GpuError) as excinfo:
+        gpus.resolve_present(["0", "9"], "assigned GPUs", fake_smi())
+    assert "assigned GPUs not present on this host: 9" in str(excinfo.value)
+    assert f"0={FAKE_GPUS[0]}" in str(excinfo.value)
 
 
 def test_sample_utilization_filters_to_requested_uuids() -> None:
