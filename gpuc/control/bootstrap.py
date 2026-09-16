@@ -16,9 +16,15 @@ from typing import Any
 
 import gpuc
 from gpuc._version import user_agent
-from gpuc.control.config import HostEntry, Settings, config_drift, transport_for, utc_now
+from gpuc.control.config import HostEntry, Settings, transport_for, utc_now
 from gpuc.control.gpuinfo import discover, summarize
-from gpuc.control.remote import HostSession, parse_last_json, read_remote_config, resolve_home
+from gpuc.control.remote import (
+    HostSession,
+    parse_last_json,
+    read_remote_config,
+    resolve_home,
+    write_remote_config,
+)
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 from gpuc.control.version import local_commit
 
@@ -83,12 +89,10 @@ def _first_line(text: str) -> str:
 def env_prefix(entry: HostEntry) -> str:
     """``K="v" `` assignments for a remote command, or ``""`` for most hosts.
 
-    This is the host's own env (`HostEntry.env` plus its `cache_dir`); it
-    reaches the host's config.json too, but bootstrap's own uv and interpreter
-    calls happen before anything reads that file, and `uv tool install` should
-    already be using the cache this host is going to use.
+    This is the host's own env, out of the `config.json` bootstrap read on the
+    way in, so `uv tool install` already populates the cache this host uses.
     """
-    return "".join(f'{key}="{value}" ' for key, value in sorted(entry.job_env().items()))
+    return "".join(f'{key}="{value}" ' for key, value in sorted(entry.env.items()))
 
 
 def remote_path(entry: HostEntry) -> str:
@@ -98,7 +102,7 @@ def remote_path(entry: HostEntry) -> str:
     environment is what every runner and every job command inherits. A host
     whose `env` names its own tool directories gets those in front.
     """
-    head = "".join(f"{d}:" for d in entry.host_config().bin_dirs())
+    head = "".join(f"{d}:" for d in entry.config.bin_dirs())
     return f'PATH="{head}$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
 
 
@@ -309,13 +313,15 @@ def resolve_cache_dir(
     torch -- written to the slowest disk the host has, on every single job.
 
     The rule is one comparison and nothing cleverer: if gpuc home and uv's
-    cache are on different filesystems, move the cache next to gpuc home. An
-    explicit `--cache-dir` or `--env UV_CACHE_DIR=...` is never overridden.
+    cache are on different filesystems, move the cache next to gpuc home. A
+    cache the host's config already names is never overridden, however it got
+    there (`--cache-dir`, `--env UV_CACHE_DIR=...`, or an earlier bootstrap):
+    this is the one key bootstrap fills in itself, and only when it is empty.
     """
-    pinned = entry.env.get("UV_CACHE_DIR") or entry.cache_dir
+    pinned = entry.cache_dir
     if pinned:
         report(f"uv cache: {pinned} (set for this host; left alone)")
-        return entry.cache_dir
+        return None
     script = UV_CACHE_PROBE.format(
         home=shlex.quote(home), env=env_prefix(entry), uv=shlex.quote(uv)
     )
@@ -343,34 +349,13 @@ def resolve_cache_dir(
     return target
 
 
-def overwrite_warnings(session: HostSession, entry: HostEntry) -> list[str]:
-    """What this bootstrap is about to change about a host somebody configured.
-
-    After `gpuc host set` this is the confirmation of what moved. The case it
-    is here for is the other one: `config.json` written by a *different*
-    control machine, registered with other cards or another mirror, which this
-    machine's registry cannot see and this bootstrap silently replaces.
-    """
-    drift = config_drift(read_remote_config(session), entry.host_config())
-    if not drift:
-        return []
-    return [
-        f"overwriting the config on host {entry.name} (host -> this machine's registration): "
-        f"{'; '.join(drift)}"
-    ]
-
-
-def write_host_config(session: HostSession, entry: HostEntry) -> None:
-    session.transport.run(
-        f'{env_prefix(entry)}GPUC_HOME="{session.home}" PYTHONPATH="{session.home}/pkg" '
-        f'"{session.python}" '
+def ensure_layout(transport: Transport, entry: HostEntry, home: str, python: str) -> None:
+    """Create gpuc home and its subdirectories 0700, using the host's own code."""
+    transport.run(
+        f'{env_prefix(entry)}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" '
+        f'"{python}" '
         f'-c "from gpuc.host import paths; paths.ensure_layout()"',
         check=True,
-    )
-    session.transport.put_file(
-        json.dumps(entry.host_config().to_dict(), indent=2, sort_keys=True) + "\n",
-        f"{session.home}/config.json",
-        0o644,
     )
 
 
@@ -438,15 +423,23 @@ def resync_package(
     still running last week's package would otherwise dispatch the job with
     code that no longer matches the spec this machine just wrote.
 
-    Returns the entry with the shipped commit recorded; the caller persists it.
+    The only thing it writes to the host's config is the commit it just
+    shipped. Returns the entry with the host's answer cached; the caller
+    persists it.
     """
     transport = transport or transport_for(entry, settings)
     home = resolve_home(transport, entry)
     sync_package(transport, home, report)
-    updated = entry.model_copy(update={"pkg_commit": local_commit()})
-    session = HostSession(updated, transport, home, updated.python or "")
-    write_host_config(session, updated)
-    start_dispatcher(session)
+    patch: dict[str, Any] = {"pkg_commit": local_commit()}
+    if not read_remote_config(transport, home):
+        # The host has lost its config (a wiped $HOME, most often a pod that
+        # restarted). Restoring the last one seen is better than dispatching
+        # this job to a host that now believes it owns no cards at all.
+        patch = {**entry.initial_config().to_dict(), **patch}
+        report(f"{home}/config.json was missing; restoring the last one seen")
+    document = write_remote_config(transport, home, patch, python=entry.python, env=entry.env)
+    updated = entry.with_config(document)
+    start_dispatcher(HostSession(updated, transport, home, updated.python or ""))
     return updated
 
 
@@ -460,13 +453,42 @@ def bootstrap_host(
 ) -> tuple[HostEntry, BootstrapResult]:
     """Bring a host to a state where `python -m gpuc.host` runs and dispatches.
 
-    Returns the registry entry updated with the discovered tool paths; the
-    caller persists it.
+    Installs, ships and starts things; it does **not** configure the host.
+    What the host is -- its cards, its mirror, its env, its timers -- is
+    `config.json`'s and stays the host's, so the only keys bootstrap writes are
+    the commit it just shipped and, on a host that has never had one,
+    `UV_CACHE_DIR`. The exception is a host with no config at all (one
+    registered before this split, or one whose gpuc home was wiped): there is
+    nothing to preserve, so the last config this machine saw is restored.
+
+    Returns the entry with what the host said cached; the caller persists it.
     """
     transport = transport or transport_for(entry, settings)
     warnings: list[str] = []
 
     ensure_persistent_root(transport, entry, report)
+    home = resolve_home(transport, entry)
+
+    # The host's own config decides every environment below -- which uv cache
+    # the installs populate, which tool directories go on PATH -- so it is read
+    # before anything else runs.
+    existing = read_remote_config(transport, home)
+    entry = entry.with_config(existing) if existing else entry
+    patch: dict[str, Any] = {}
+    if not existing:
+        patch.update(entry.initial_config().to_dict())
+        entry = entry.with_config(patch)
+        report(
+            f"{home}/config.json does not exist on {entry.name}: initialising it with "
+            f"{len(entry.gpus)} GPU(s)"
+        )
+        if not entry.gpus:
+            warnings.append(
+                f"host {entry.name} has no config of its own and this machine has none cached "
+                f"for it, so it will run nothing until "
+                f"`gpuc host set {entry.name} --gpus <list>`"
+            )
+            report(f"WARNING: {warnings[-1]}")
 
     uv = find_uv(transport)
     if uv is None:
@@ -477,14 +499,14 @@ def bootstrap_host(
     python = ensure_python(transport, uv, entry, report)
     report(f"python: {python}")
 
-    home = resolve_home(transport, entry)
     files = sync_package(transport, home, report)
 
     # Before `uv tool install`, so that call already populates the cache this
     # host will actually use.
     cache_dir = resolve_cache_dir(transport, entry, uv, home, report)
-    if cache_dir != entry.cache_dir:
-        entry = entry.model_copy(update={"cache_dir": cache_dir})
+    if cache_dir:
+        patch["env"] = {**entry.env, "UV_CACHE_DIR": cache_dir}
+        entry = entry.with_config({**entry.cache.config, **patch})
 
     aws_warning = ensure_aws_cli(transport, report)
     if aws_warning and entry.s3_prefix:
@@ -503,20 +525,18 @@ def bootstrap_host(
             warnings.append(warning)
             report(f"WARNING: {warning}")
 
-    # Recorded before the config is written, so the host's own config.json says
-    # which commit its package came from and `gpuc status` can notice when this
-    # machine has moved on and the host has not.
+    # Written before health runs, so the checks judge the config the host is
+    # about to dispatch with, and so its `pkg_commit` says which commit this
+    # package came from while `gpuc status` is still watching.
+    ensure_layout(transport, entry, home, python)
     commit = local_commit()
-    if commit != entry.pkg_commit:
-        entry = entry.model_copy(update={"pkg_commit": commit})
+    patch["pkg_commit"] = commit
+    entry = entry.with_config(
+        write_remote_config(transport, home, patch, python=python, env=entry.env)
+    )
+    report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
 
     session = HostSession(entry, transport, home, python)
-    for warning in overwrite_warnings(session, entry):
-        warnings.append(warning)
-        report(f"WARNING: {warning}")
-    write_host_config(session, entry)
-    report(f"wrote {home}/config.json for host {entry.name} with {len(entry.gpus)} GPU(s)")
-
     health = run_health(session, health_args)
     report("health: " + "; ".join(f"{c['name']} ok" for c in health.get("checks", [])))
     for warning in health.get("warnings", []):
@@ -526,20 +546,15 @@ def bootstrap_host(
     pid = start_dispatcher(session)
     report(f"dispatcher running (pid {pid})")
 
-    gpu_info = discover(transport) or entry.gpu_info
+    gpu_info = discover(transport)
     if entry.gpus:
-        report(f"gpus: {summarize(entry.gpus, gpu_info)}")
-    # `cache_dir` and `pkg_commit` are already on `entry`: they are decided
-    # before the host's config.json is written, because that file carries them.
-    updated = entry.model_copy(
-        update={
-            "uv": uv,
-            "python": python,
-            "gpu_info": gpu_info,
-            "driver_version": driver_version(health) or entry.driver_version,
-            "bootstrapped_at": utc_now(),
-        }
-    )
+        report(f"gpus: {summarize(entry.gpus, gpu_info or entry.gpu_info)}")
+    updated = entry.with_cache(
+        uv=uv,
+        python=python,
+        gpu_info=gpu_info or None,
+        driver_version=driver_version(health),
+    ).model_copy(update={"bootstrapped_at": utc_now()})
     return updated, BootstrapResult(
         host=entry.name,
         uv=uv,

@@ -143,25 +143,45 @@ in seconds if it cannot write the repo.
 ```sh
 gpuc host add local --gpus 0                               # this machine
 gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach over ssh
+gpuc host add gpubox --ssh me@gpubox                       # …one somebody already set up: adopt it
 gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] uuid name`,
-                             # disk, $HOME's filesystem, systemd --user, uv cache, network speed.
-                             # Needs the host registered, so add it first (with no --gpus if you do
-                             # not know them yet) and `gpuc host set gpubox --gpus …` once you can
-                             # read them off
+                             # disk, $HOME's filesystem, systemd --user, uv cache, network speed
 gpuc host probe gpubox --all-gpus   # every card in the box, `(assigned)` on the ones this host owns
-gpuc host bootstrap gpubox   # idempotent; run it again after any `host set`
+gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idempotent
 ```
+
+**`host add` is a connect.** It opens the host, probes it, and reads
+`~/.gpuc/config.json`:
+
+- the host **has** a config — it was set up from another machine, or from this
+  one before — and that config is adopted as it stands. Only the address
+  (`--ssh`, `--port`, `--gpuc-home` / `--persistent-root`) is recorded here.
+  Flags you pass are explicit overrides, written through to the host and
+  reported field by field (`host <- retention_days 30.0 -> 7.0`). A `--gpus`
+  that claims *some* of the cards the host already has is refused rather than
+  warned about, because that is the one difference that can hand one card to
+  two jobs; a disjoint list is a reassignment and goes through, and `--force`
+  overrides the refusal. The host is registered under the name it calls itself.
+- the host has **no** config — nothing has been set up there yet — so this is
+  where one is written, and `--gpus` is required (`--gpus ''` for a host whose
+  cards gpuc may not use). The probe's card list is printed if you leave it out.
+
+So a host is registered by asking it what it is, and a second machine
+connecting to a box the first one set up is the ordinary path.
 
 RunPod hosts are never added by hand: `gpuc submit --runpod ...` creates the
 pod, registers it as kind `runpod`, and bootstraps it
 ([usage.md](usage.md#runpod)).
+
+The address is the top two rows; every other flag is the host's own config,
+which `host set` writes through to it.
 
 | flag (`host add`, and `host set` to change one) | default | meaning |
 | --- | --- | --- |
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
 | `--gpus 2,3` or `--gpus GPU-8064…,3` | none | what this host may use: nvidia-smi **indices**, UUIDs, or a mix, stored exactly as typed. Indices are how a share of a shared box is agreed; the host re-resolves them to UUIDs on every dispatch pass and pins jobs with `CUDA_VISIBLE_DEVICES=<uuid>`, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is reported `UNAVAILABLE` and jobs wait for it |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
-| `--cache-dir PATH` | bootstrap decides | uv's cache for this host (`UV_CACHE_DIR`). Bootstrap sets one on gpuc home's filesystem when they differ, because uv only reflinks or hardlinks a venv out of its cache within one filesystem; an explicit `--env UV_CACHE_DIR=…` always wins |
+| `--cache-dir PATH` | bootstrap decides | uv's cache for this host, which is `UV_CACHE_DIR` in its `env`. Bootstrap sets one on gpuc home's filesystem when they differ, because uv only reflinks or hardlinks a venv out of its cache within one filesystem — but only when the host's config names none, however it got there |
 | `--persistent-root R` | none | gpuc home moves to `R/gpuc` (below) |
 | `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. Nothing populates it automatically |
 | `--s3-prefix s3://…` | none | this host's own log/state mirror |
@@ -173,18 +193,25 @@ On a box you share, `--gpus` is the whole of what gpuc may touch, so `host
 probe` lists only those cards and says how many it hid (`2 of 8 assigned to
 gpubox`); `--all-gpus` shows the box as nvidia-smi sees it. Either way the probe
 records **every** card's name and VRAM, so `gpuc host set gpubox --gpus 5` names
-something the registry already knows. An assigned entry no card answers to is
+something already known. An assigned entry no card answers to is
 called out, as are two entries naming one card: `gpuc host bootstrap` fails its
 `gpu_uuids` check on both, so the probe is where you want to find them.
 
-`gpuc host set` edits one entry in place — only the flags you pass — instead of
-`remove` + `add`, which would drop everything else about the host. **Nothing on
-the host changes until the next `gpuc host bootstrap <name>`**, which is what
-rewrites its `config.json`. `gpuc host list` shows what is registered, one block per host, with each card
-as `gpu [index] name vram uuid` once the host has been probed or bootstrapped
-and a `pkg` line saying which commit it was last bootstrapped with. The
-interpreter path bootstrap chose is in `gpuc host list --json` and `gpuc host
-probe`.
+`gpuc host set` changes one field at a time, and where it writes depends on
+which field: `--gpus`, `--env`, `--cache-dir`, `--s3-prefix`,
+`--retention-days`, `--idle-min` and `--ttl-hours` are the **host's own**
+config, so they are written through to its `config.json` immediately — the host
+has to answer, and every change is reported as `host <- …`. `--persistent-root`
+and `--gpuc-home` are *addresses*, kept here (`here <- …`) and applied to the
+host by the next `gpuc host bootstrap`.
+
+`gpuc host list` shows what is registered, one block per host, with each card
+as `gpu [index] name vram uuid` and a `pkg` line naming the commit the host was
+running **when it was last read** (`as of 3m ago`). It never asks a host
+anything: everything but the address is a cache of the last answer, which is
+why it is labelled with its age and why `gpuc status` is what asks. `gpuc host
+probe` refreshes that cache (and nothing else). The interpreter path bootstrap
+chose is in `gpuc host list --json` and `gpuc host probe`.
 
 ### Hosts whose `$HOME` is wiped on restart
 
@@ -209,7 +236,9 @@ gpuc host bootstrap gpubox
 1. If your key or `authorized_keys` lived in the wiped home, put it back, and
    check `gpuc host probe <host>` answers at all.
 2. `gpuc host bootstrap <host>` — idempotent, and the whole of the host-side
-   recovery.
+   recovery. A wiped home takes `config.json` with it, so this is the one case
+   where bootstrap writes one: the last config this machine read off that host
+   is restored, which is why the cache is kept.
 3. With a `--persistent-root`, stop here: the queue came back with the volume,
    so queued jobs start again as soon as the dispatcher does, and only jobs that
    were *running* need resubmitting (their runner is gone, so the dispatcher
@@ -257,9 +286,10 @@ gpuc host bootstrap <host>   # for every host `version` marks DIFFERS
 gpuc host bootstrap --all    # or all of them, in one command
 ```
 
-`gpuc version` and `gpuc host list` never ssh, so what they show is *this
-machine's* record of its own last bootstrap. `gpuc status` asks each host what
-it is running, and that is the answer that counts.
+`gpuc version` and `gpuc host list` never ssh, so what they show is the commit
+the host was running when this machine last read it, labelled with its age.
+`gpuc status` asks each host what it is running now, and that is the answer
+that counts.
 
 `--all` takes every registered host in turn, including ephemeral ones. A host
 that fails does not stop the others — a pod that has already gone away is the
@@ -270,8 +300,9 @@ stay upgraded. The tally also counts any host entry this build could not read
 
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
 to enqueue on is not on this commit — read from the host's own `config.json`,
-not from the registry here, and including a host with no commit recorded, which
-means it was bootstrapped by a build old enough not to write one. They re-sync
+which is also the read that tells them what the host's cards and mirror are,
+and including a host with no commit recorded, which means it was bootstrapped
+by a build old enough not to write one. They re-sync
 the package and restart the dispatcher first, print one line saying so, and
 `--no-bootstrap` skips it. Re-bootstrapping is safe at any time: **running
 jobs are not disturbed and do not block it.** A dispatcher that is already alive
@@ -293,23 +324,33 @@ registering one box from a desktop *and* a laptop works — each machine's
 `gpuc status`, `logs` and `cancel` see every job on it, whoever submitted it,
 and the dispatcher orders them all by priority as usual.
 
-What is per-machine is the **registry**: `--gpus`, `--s3-prefix`,
-`--retention-days`, `--env`, `--gpuc-home` and the rest are recorded locally
-and written to the host wholesale by `gpuc host bootstrap`. So the machine that
-bootstrapped last is the one the host is configured by, and registering it
-differently on the two is the thing to avoid — most of all `--gpus` (the host
-would hand out cards the other machine believes are somebody else's) and
-`--gpuc-home` / `--persistent-root`, which would give one box two separate
-queues. Copy the flags from `gpuc host list --json` on the first machine.
+What the host **is** — its cards, its mirror, its env, its timers — lives in
+`config.json` on the host and nowhere else, so there is nothing to keep in
+step: on the second machine,
 
-gpuc will tell you when they disagree rather than leaving it silent: `gpuc
-status` warns when a host runs a build or a config this machine has not shipped
-it, `gpuc submit` says so before it enqueues (for the keys a job is affected
-by — its cards, its environment, its mirror), and `gpuc host bootstrap` reports
-every field it is about to overwrite. None of them can tell another machine's
-config from a `gpuc host set` here you have not bootstrapped yet, so none of
-them claim to, and none of them refuse — bootstrap's job is to make the host
-match the machine you ran it from.
+```sh
+gpuc host add gpubox --ssh me@gpubox     # reads what the host already says it is
+```
+
+and that is all. `gpuc host set` on either machine writes through to the same
+file; `gpuc submit` reads it before it enqueues, so the cards a job is judged
+against are always the host's own answer.
+
+What is per-machine is the **address**: `--ssh`, `--port`, and `--gpuc-home` /
+`--persistent-root`, which is how this machine reaches the host and finds that
+config. Get the last two wrong and you have pointed at a second, empty gpuc
+home on the same box rather than at the host — the one thing worth copying from
+`gpuc host list --json` on the first machine.
+
+Everything else the registry holds is a **cache** of what the host last said,
+kept so `gpuc host list` and `gpuc version` have something to print offline.
+They label it with its age (`as of 3m ago`); anything that decides something
+reads the host.
+
+The exception is the reconcile timer: until [#36](https://github.com/brendanlong/gpu-coordinator/issues/36)
+lands, running `gpuc reconcile` on a second machine can terminate a pod the
+first one created, because "is this pod ours" is still answered from local
+state only.
 
 ## Teardown
 

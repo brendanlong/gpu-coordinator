@@ -279,13 +279,9 @@ def fake_bootstrap(
     health_args: str = "",
 ) -> tuple[HostEntry, BootstrapResult]:
     report(f"fake bootstrap of {entry.name}")
-    updated = entry.model_copy(
-        update={
-            "python": "/root/.venv/bin/python",
-            "uv": "/root/.local/bin/uv",
-            "bootstrapped_at": utc_now(),
-        }
-    )
+    updated = entry.with_cache(
+        python="/root/.venv/bin/python", uv="/root/.local/bin/uv"
+    ).model_copy(update={"bootstrapped_at": utc_now()})
     return updated, BootstrapResult(
         host=entry.name,
         uv="/root/.local/bin/uv",

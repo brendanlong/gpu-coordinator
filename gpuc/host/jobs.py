@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -608,3 +609,33 @@ def read_config() -> HostConfig:
 
 def write_config(config: HostConfig) -> None:
     atomic_write_json(paths.config_file(), config.to_dict())
+
+
+def merge_config(patch: dict[str, Any]) -> dict[str, Any]:
+    """Apply `patch` to this host's config.json and return what it now holds.
+
+    The host owns its config, so every control machine changes it the same way:
+    read what is there, replace the named keys, write the whole file back
+    atomically. A key this build does not know is carried through untouched --
+    it belongs to whichever build wrote it, not to us -- and the keys it does
+    know are normalised, so a hand-written `"ttl_hours": "24"` cannot leave a
+    string where the dispatcher reads a number.
+
+    `env` is replaced wholesale rather than merged: "set it to exactly this" is
+    the only rule that can also express "set it to nothing".
+    """
+    path = paths.config_file()
+    document = merged_config(read_json(path) if path.exists() else {}, patch)
+    atomic_write_json(path, document)
+    return document
+
+
+def merged_config(existing: Any, patch: Mapping[str, Any]) -> dict[str, Any]:
+    """`existing` with `patch`'s keys replaced, normalised, unknown keys kept.
+
+    Split out from `merge_config` because the control side applies the same
+    rule by hand on a host that has no gpuc package to run yet, and the two
+    must not be able to disagree about what a patch means.
+    """
+    merged = {**fields_of(existing), **patch}
+    return {**merged, **HostConfig.from_dict(merged).to_dict()}

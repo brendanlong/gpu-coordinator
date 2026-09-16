@@ -6,15 +6,16 @@ from typing import cast
 
 import pytest
 
-from gpuc.control.config import HostEntry
 from gpuc.control.remote import (
     HostSession,
     RemoteError,
     host_command,
     parse_last_json,
     read_remote_config,
+    write_remote_config,
 )
 from gpuc.control.transport import CommandResult, Transport, TransportError
+from tests.conftest import host_entry
 
 MOTD = """Welcome to Ubuntu 24.04!
  * Support: https://ubuntu.com/pro
@@ -52,8 +53,20 @@ class ScriptedTransport:
         raise AssertionError("not used")
 
 
+class Recorder(ScriptedTransport):
+    """A transport that remembers what was written to it, not just what was run."""
+
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        super().__init__(stdout, returncode)
+        self.puts: dict[str, tuple[str, int]] = {}
+
+    def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
+        text = content.decode() if isinstance(content, bytes) else content
+        self.puts[remote_path] = (text, mode)
+
+
 def session(stdout: str, returncode: int = 0) -> HostSession:
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="u@h")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="u@h")
     transport: Transport = cast("Transport", ScriptedTransport(stdout, returncode))
     return HostSession(entry, transport, "/home/u/.gpuc", "python3")
 
@@ -117,10 +130,8 @@ def test_the_last_of_two_documents_wins() -> None:
 def test_the_remote_config_is_read_from_the_host_not_the_registry() -> None:
     document = {"host": "gpubox", "gpus": ["0"], "pkg_commit": "c" * 40}
     host = ScriptedTransport(MOTD + json.dumps(document))
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="u@h")
-    elsewhere = HostSession(entry, cast("Transport", host), "/mnt/ssd/gpuc", "python3")
-    assert read_remote_config(elsewhere) == document
-    # Read out of *this session's* gpuc home. A host with a persistent root or
+    assert read_remote_config(cast("Transport", host), "/mnt/ssd/gpuc") == document
+    # Read out of *this host's* gpuc home. A host with a persistent root or
     # a `--gpuc-home` keeps its config there, and reading the default path
     # would report "no config" and re-ship the package on every submit.
     assert host.commands == ['cat "/mnt/ssd/gpuc/config.json" 2>/dev/null || true']
@@ -129,11 +140,12 @@ def test_the_remote_config_is_read_from_the_host_not_the_registry() -> None:
 def test_a_host_with_no_config_is_told_apart_from_one_that_could_not_be_asked() -> None:
     """`cat` swallows its own failure, so a non-zero exit is the transport's.
 
-    The difference decides whether `submit` re-ships the package (a host with
-    no config was never bootstrapped) or leaves this machine's record alone.
+    The difference decides whether a host is adopted as it stands or is given
+    its first config, and whether `submit` trusts what it read at all.
     """
-    assert read_remote_config(session("")) == {}
-    assert read_remote_config(session("ssh: could not resolve hostname", returncode=255)) is None
+    assert read_remote_config(cast("Transport", ScriptedTransport("")), "/h/.gpuc") == {}
+    refused = ScriptedTransport("ssh: could not resolve hostname", returncode=255)
+    assert read_remote_config(cast("Transport", refused), "/h/.gpuc") is None
 
 
 def test_a_host_that_cannot_be_reached_at_all_is_not_an_exception_to_handle() -> None:
@@ -141,5 +153,39 @@ def test_a_host_that_cannot_be_reached_at_all_is_not_an_exception_to_handle() ->
     that are down. The error belongs to the submit behind it, in full, not to
     a traceback out of the version check."""
     down = ScriptedTransport("", raises=TransportError(CommandResult("h", ["ssh"], 124, "", "")))
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="u@h")
-    assert read_remote_config(HostSession(entry, cast("Transport", down), "/h/.gpuc", "py")) is None
+    assert read_remote_config(cast("Transport", down), "/h/.gpuc") is None
+
+
+def test_writing_the_config_goes_through_the_hosts_own_cli() -> None:
+    """The host applies the patch: one atomic write, by the code that reads it.
+
+    And the patch travels as a file, because `env` may hold a token and argv is
+    readable by every other user of a shared box.
+    """
+    merged = {"host": "gpubox", "gpus": ["0"], "env": {"HF_TOKEN": "hf_secret"}}
+    host = Recorder(json.dumps(merged))
+    document = write_remote_config(
+        cast("Transport", host), "/home/u/.gpuc", {"env": {"HF_TOKEN": "hf_secret"}}, python="py"
+    )
+    assert document == merged
+    ((path, (body, mode)),) = host.puts.items()
+    assert json.loads(body) == {"env": {"HF_TOKEN": "hf_secret"}}
+    assert mode == 0o600
+    assert any(f"-m gpuc.host config --merge {path}" in c for c in host.commands)
+    assert any(c.startswith(f"rm -f {path}") for c in host.commands)
+    assert not any("hf_secret" in c for c in host.commands)
+
+
+def test_a_host_with_no_package_yet_has_its_config_written_by_rename() -> None:
+    """`gpuc host add` writes the first config before anything is installed, so
+    there is no host CLI to do the merge -- and a truncated `config.json` is
+    something the dispatcher could read."""
+    host = Recorder("")
+    document = write_remote_config(
+        cast("Transport", host), "/home/u/.gpuc", {"host": "gpubox", "gpus": ["0"]}
+    )
+    assert document["gpus"] == ["0"]
+    tmp = next(path for path in host.puts if path.startswith("/home/u/.gpuc/.config.json."))
+    assert json.loads(host.puts[tmp][0])["host"] == "gpubox"
+    assert any(f'mv -f "{tmp}" "/home/u/.gpuc/config.json"' == c for c in host.commands)
+    assert any('mkdir -p "/home/u/.gpuc" && chmod 700' in c for c in host.commands)

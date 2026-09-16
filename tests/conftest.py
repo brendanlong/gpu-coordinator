@@ -7,11 +7,17 @@ import tempfile
 import textwrap
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from gpuc.control.config import HostCache, HostEntry, HostKind, registry_transaction
+from gpuc.control.gpuinfo import GpuInfo
 from gpuc.host import jobs, paths, scope
 from gpuc.host.jobs import HostConfig, JobSpec
+
+pytest_plugins = ["tests.fakehost"]
+"""`fake_host`: the in-memory host `gpuc host add|set` talk to in these tests."""
 
 FAKE_GPUS = [
     "GPU-00000000-0000-0000-0000-000000000001",
@@ -19,6 +25,10 @@ FAKE_GPUS = [
 ]
 
 LOCAL_GPU_UUID = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+
+SEEN_AT = "2026-09-15T12:00:00+00:00"
+"""When a test entry's cache was filled. A fixed stamp, so a listing that says
+how old the cache is has something stable to say."""
 
 
 @pytest.fixture
@@ -36,6 +46,75 @@ def gpuc_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]
     paths.ensure_layout()
     jobs.write_config(HostConfig(host="test-host", gpus=list(FAKE_GPUS)))
     yield home
+
+
+def host_entry(
+    *,
+    name: str = "h",
+    kind: HostKind = "local",
+    ssh: str | None = None,
+    port: int = 22,
+    gpuc_home: str | None = None,
+    persistent_root: str | None = None,
+    pod_id: str | None = None,
+    bootstrapped_at: str | None = None,
+    python: str | None = None,
+    uv: str | None = None,
+    gpu_info: dict[str, GpuInfo] | None = None,
+    driver_version: str | None = None,
+    read_at: str | None = SEEN_AT,
+    **config: Any,
+) -> HostEntry:
+    """A registry entry whose cache already holds the host's own config.
+
+    The address is the entry's; everything in `**config` is a key of the
+    `config.json` that lives on the host, which a real entry only ever gets by
+    reading it. Tests that are not about connecting say what the host holds
+    here instead of staging an ssh round trip for it.
+    """
+    cache_dir = config.pop("cache_dir", None)
+    if cache_dir:
+        config["env"] = {**(config.get("env") or {}), "UV_CACHE_DIR": cache_dir}
+    document: dict[str, Any] = {"host": name, **config}
+    if kind == "runpod":
+        document.setdefault("provider", {"kind": "runpod", "pod_id": pod_id})
+    return HostEntry(
+        name=name,
+        kind=kind,
+        ssh=ssh,
+        port=port,
+        gpuc_home=gpuc_home,
+        persistent_root=persistent_root,
+        pod_id=pod_id,
+        bootstrapped_at=bootstrapped_at,
+        cache=HostCache(
+            read_at=read_at,
+            python=python,
+            uv=uv,
+            gpu_info=dict(gpu_info or {}),
+            driver_version=driver_version,
+            config=HostConfig.from_dict(document).to_dict(),
+        ),
+    )
+
+
+def register_host(*, gpus: str | list[str] | None = None, **fields: Any) -> HostEntry:
+    """Put a host in the registry without connecting to it.
+
+    `gpuc host add` reads the host's own config now, so a test that only needs
+    a host to exist says what that host holds here rather than staging an ssh
+    round trip for it. `gpus` takes the flag's spelling as well as a list.
+    """
+    entry = host_entry(gpus=_gpus(gpus), **fields)
+    with registry_transaction() as registry:
+        registry.put(entry)
+    return entry
+
+
+def _gpus(gpus: str | list[str] | None) -> list[str]:
+    if isinstance(gpus, str):
+        return [part for part in gpus.split(",") if part]
+    return list(gpus or [])
 
 
 def make_spec(**overrides: object) -> JobSpec:
@@ -168,6 +247,10 @@ def torch_project(session_monkeypatch: pytest.MonkeyPatch) -> Path:
 def control_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A control side whose config, state and on-host GPUC_HOME are all temporary."""
     root = tmp_path / "control"
+    # $HOME as well as the two gpuc directories: a `local` host's gpuc home is
+    # under it, and a test that reaches one must not write to the real ~/.gpuc.
+    (root / "home").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(root / "home"))
     monkeypatch.setenv("GPUC_CONFIG_DIR", str(root / "config"))
     monkeypatch.setenv("GPUC_STATE_DIR", str(root / "state"))
     monkeypatch.delenv("GPUC_HOME", raising=False)

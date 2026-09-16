@@ -32,6 +32,7 @@ from gpuc.control.provision import (
     provision,
     runpod_host,
 )
+from tests.conftest import host_entry
 from tests.fakeprovider import (
     BROKEN_LOG,
     CAPACITY_ERROR,
@@ -409,7 +410,7 @@ def test_offer_satisfies_checks_every_constraint() -> None:
 
 
 def _register_reusable(pod: Pod, price: float = 0.49) -> HostEntry:
-    entry = HostEntry(
+    entry = host_entry(
         name=pod.name,
         kind="runpod",
         ssh="root@1.2.3.4",
@@ -524,7 +525,7 @@ def test_no_reuse_always_provisions(
 
 def test_s3_credentials_are_delivered_0600_when_configured(control_env: Path) -> None:
     transport = FakeTransport()
-    entry = HostEntry(name="gpuc-x", kind="runpod", s3_prefix="s3://bucket/gpuc/gpuc-x")
+    entry = host_entry(name="gpuc-x", kind="runpod", s3_prefix="s3://bucket/gpuc/gpuc-x")
     progress: list[str] = []
 
     class _P:
@@ -544,7 +545,7 @@ def test_s3_credentials_are_delivered_0600_when_configured(control_env: Path) ->
 
 def test_s3_credentials_are_skipped_without_a_prefix(control_env: Path) -> None:
     transport = FakeTransport()
-    entry = HostEntry(name="gpuc-x", kind="runpod")
+    entry = host_entry(name="gpuc-x", kind="runpod")
     assert not deliver_s3_credentials(transport, entry, lambda m: None, {})  # type: ignore[arg-type]
     assert transport.files == {}
 

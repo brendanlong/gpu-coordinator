@@ -8,12 +8,15 @@ host whose login shell has a different `python` on PATH still runs our code.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, transport_for
 from gpuc.control.transport import CommandResult, Transport, TransportError
+from gpuc.host import jobs
 
 DEFAULT_TIMEOUT_S = 120.0
 
@@ -45,7 +48,10 @@ class HostSession:
 
     @property
     def env(self) -> dict[str, str]:
-        return self.entry.job_env()
+        return self.entry.env
+
+    def read_config(self) -> dict[str, Any] | None:
+        return read_remote_config(self.transport, self.home)
 
     def job_dir(self, job_id: str) -> str:
         return f"{self.home}/jobs/{job_id}"
@@ -128,13 +134,16 @@ def _tail(text: str, lines: int = 10) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
-def read_remote_config(session: HostSession) -> dict[str, Any] | None:
+def config_file(home: str) -> str:
+    return f"{home}/config.json"
+
+
+def read_remote_config(transport: Transport, home: str) -> dict[str, Any] | None:
     """The host's own `config.json`, or ``None`` if the host could not be asked.
 
-    The registry here records what *this* machine last shipped, which is not
-    the same question: a second control machine bootstrapping the same box
-    leaves that record describing a host it no longer matches. This is the
-    host's answer.
+    This file is the only copy of what the host *is* -- its cards, its mirror,
+    its env, its timers -- so everything that acts on a host reads it here
+    rather than trusting the registry's cache of it.
 
     An empty dict is a host that answered and has no config -- never
     bootstrapped, or its gpuc home has moved -- and that is a real answer, so
@@ -142,13 +151,89 @@ def read_remote_config(session: HostSession) -> dict[str, Any] | None:
     non-zero exit is the transport's.
     """
     try:
-        result = session.run(f'cat "{session.home}/config.json" 2>/dev/null || true')
+        result = transport.run(
+            f'cat "{config_file(home)}" 2>/dev/null || true',
+            timeout=DEFAULT_TIMEOUT_S,
+            check=False,
+        )
     except TransportError:
         return None
     if result.returncode != 0:
         return None
     document = parse_last_json(result.stdout)
     return document if isinstance(document, dict) else {}
+
+
+def write_remote_config(
+    transport: Transport,
+    home: str,
+    patch: Mapping[str, Any],
+    *,
+    python: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Apply `patch` to the host's `config.json` and return what it now holds.
+
+    Through the host's own CLI wherever the package is there: the merge then
+    happens on the host, in one atomic write, by the same code the dispatcher
+    reads the file with. A host that has not been bootstrapped yet has no
+    package to run, so the same merge is done here and the file replaced by
+    rename -- never truncated in place, because a dispatcher may be reading it.
+
+    The patch travels as a file rather than as an argument: `env` may hold a
+    token, and argv is readable by every other user of a shared box.
+    """
+    body = json.dumps(dict(patch), indent=2, sort_keys=True) + "\n"
+    if python:
+        try:
+            return _merge_on_host(transport, home, body, python, env)
+        except (RemoteError, TransportError):
+            # The interpreter or the package is not where the registry says it
+            # is (a wiped $HOME, a gpuc home that moved). The host still owns
+            # its config; we can still write it.
+            pass
+    document = jobs.merged_config(read_remote_config(transport, home) or {}, patch)
+    put_remote_config(transport, home, document)
+    return document
+
+
+def _merge_on_host(
+    transport: Transport,
+    home: str,
+    body: str,
+    python: str,
+    env: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    remote = f"{home}/.config-patch.{os.getpid()}.json"
+    transport.put_file(body, remote, 0o600)
+    command = host_command(python, home, f"config --merge {shlex.quote(remote)}", env)
+    try:
+        result = transport.run(command, timeout=DEFAULT_TIMEOUT_S, check=False)
+    finally:
+        transport.run(f"rm -f {shlex.quote(remote)}", timeout=DEFAULT_TIMEOUT_S, check=False)
+    document = parse_last_json(result.stdout)
+    if result.returncode != 0 or not isinstance(document, dict):
+        raise RemoteError(
+            transport.host,
+            command,
+            f"`python -m gpuc.host config --merge` exited {result.returncode} and printed no "
+            f"config:\n{_tail(result.output)}",
+        )
+    return document
+
+
+def put_remote_config(transport: Transport, home: str, document: Mapping[str, Any]) -> None:
+    """Replace `config.json` wholesale on a host with no package to run.
+
+    Creates gpuc home 0700 if it is not there: this runs before
+    `paths.ensure_layout` on a host being registered for the first time, and a
+    default-umask mkdir would leave the queue and every job dir readable by
+    every other user of a shared box.
+    """
+    tmp = f"{home}/.config.json.{os.getpid()}.tmp"
+    transport.run(f'mkdir -p "{home}" && chmod 700 "{home}"', timeout=DEFAULT_TIMEOUT_S, check=True)
+    transport.put_file(json.dumps(dict(document), indent=2, sort_keys=True) + "\n", tmp, 0o644)
+    transport.run(f'mv -f "{tmp}" "{config_file(home)}"', timeout=DEFAULT_TIMEOUT_S, check=True)
 
 
 def resolve_home(transport: Transport, entry: HostEntry) -> str:

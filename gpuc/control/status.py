@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import quote
 
 from gpuc.control import version
-from gpuc.control.config import HostEntry, Settings, config_drift
+from gpuc.control.config import HostEntry, Settings
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.providers.base import Pod, Provider, ProviderError
@@ -280,10 +280,6 @@ class HostView:
     """The commit the *host* says its package came from, not the one this
     machine's registry remembers shipping. Null when the host was not asked or
     was bootstrapped by a build too old to record it."""
-    configured: dict[str, Any] = field(default_factory=dict)
-    """The host's own config, as much of it as `status` reports: what it calls
-    itself and the cards it was registered with. Compared against this
-    machine's registration, it is how a host somebody else configured shows up."""
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
@@ -441,9 +437,6 @@ def gather(
         return view
     view.reachable = True
     view.pkg_commit = _as_str(payload.get("pkg_commit"))
-    view.configured = {
-        key: payload[key] for key in ("host", "gpus") if isinstance(payload.get(key), (str, list))
-    }
     view.owned, view.indices = owned_gpus(payload, entry)
     view.unavailable = [g for g in payload.get("gpus_unavailable") or [] if isinstance(g, str)]
     # Validated like `reconcile.probe_liveness` does: a host on another build
@@ -741,34 +734,22 @@ def render(
 
 
 def host_warnings(view: HostView) -> list[str]:
-    """What the host says about itself that this machine's registry does not.
+    """What the host says about itself that this machine has not caught up with.
 
-    Both lines here are the same failure seen twice: the host is not running
-    what this machine thinks it put there. Two sessions of one user on
-    different commits was the original case, and a second control machine --
-    the same boxes registered from a laptop -- is the one the registry cannot
-    see at all, because each machine only ever recorded its own bootstrap. A
-    `gpuc host set` that has not been bootstrapped yet reads the same from
-    here, which is why neither line claims to know who wrote what is there.
+    Only the build: the host owns its config, so a config here that differs
+    from the host's is a stale cache and not a disagreement -- everything that
+    acts on a host reads `config.json` first, and this block already prints the
+    host's own answer for the cards. What the host cannot fix by itself is the
+    package: whichever machine bootstrapped it last is what it runs, and that
+    may be a laptop on a newer build as easily as this machine on an older one.
 
     A host that was not reached says nothing: "we could not ask" is not
     evidence of a mismatch, and the unreachable block already says so.
     """
     if not view.reachable:
         return []
-    entry = view.entry
-    out: list[str] = []
-    stale = version.host_build_warning(entry.name, view.pkg_commit, version.local_commit())
-    if stale:
-        out.append(stale)
-    drift = config_drift(view.configured, entry.host_config())
-    if drift:
-        out.append(
-            f"host {entry.name} is running a config this machine has not shipped it "
-            f"(host -> registered here): {'; '.join(drift)}. "
-            f"`gpuc host bootstrap {entry.name}` applies this machine's registration"
-        )
-    return out
+    stale = version.host_build_warning(view.entry.name, view.pkg_commit, version.local_commit())
+    return [stale] if stale else []
 
 
 def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:

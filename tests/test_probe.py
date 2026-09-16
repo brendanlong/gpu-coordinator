@@ -4,9 +4,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from gpuc.control.config import HostEntry
 from gpuc.control.probe import parse_probe, probe_host, probe_script
 from gpuc.control.transport import CommandResult
+from tests.conftest import host_entry
 
 PROBE_SCRIPT = probe_script("$HOME/.gpuc")
 
@@ -252,7 +252,7 @@ class OneAnswerTransport:
 
 def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
     """The seam every other test here stubs: the registry's `--gpus` reaches the report."""
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["1"])
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["1"])
     report = probe_host(entry, transport=OneAnswerTransport(SAMPLE))
     assert report.owned == ["1"]
     assert [cells[1] for cells in report.owned_rows] == [A40]
@@ -260,7 +260,7 @@ def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
 
 
 def test_probe_host_carries_the_registered_persistent_root_too() -> None:
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", persistent_root="/mnt/ssd-2/me/")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", persistent_root="/mnt/ssd-2/me/")
     report: Any = probe_host(entry, transport=OneAnswerTransport(OVERLAY_HOME))
     assert report.persistent_root == "/mnt/ssd-2/me"
     assert "recover with: gpuc host bootstrap gpubox" in report.render()

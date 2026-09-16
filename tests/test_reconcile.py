@@ -10,7 +10,6 @@ import pytest
 from gpuc.control.config import (
     ConfigError,
     DesiredHost,
-    HostEntry,
     Settings,
     desired_dir,
     desired_file,
@@ -32,6 +31,7 @@ from gpuc.control.reconcile import (
     unit_files,
 )
 from gpuc.control.s3index import IndexEntry, LocalIndex
+from tests.conftest import host_entry
 from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
 
 FOREIGN = "other-someone-else"
@@ -61,7 +61,7 @@ def desire(
     )
     write_desired(host)
     with registry_transaction() as registry:
-        registry.put(HostEntry(name=name, kind="runpod", pod_id=pod_id, ssh="root@1.2.3.4"))
+        registry.put(host_entry(name=name, kind="runpod", pod_id=pod_id, ssh="root@1.2.3.4"))
     return host
 
 

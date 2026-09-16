@@ -228,20 +228,32 @@ def shipped_note(entry: HostEntry) -> str | None:
 def host_document(entry: HostEntry) -> dict[str, Any]:
     """One registered host as `gpuc host list --json` reports it.
 
-    The registry entry itself, plus what the text listing computes from it:
-    where gpuc home resolves to on the host, and the re-bootstrap note. Every
-    field here is local: this command never asks the host anything, so
-    `pkg_commit` is what *this* machine last shipped and `gpuc status` is where
-    what the host is running is reported.
+    The address, the host's config as this machine last read it, and what the
+    text listing computes from them. This command never asks the host
+    anything, so everything out of that config is as of `config_seen_at` --
+    `gpuc status` is what asks -- and it is flattened beside the address
+    because that is the shape every consumer of this document already reads.
     """
     document: dict[str, Any] = json.loads(entry.model_dump_json())
+    config = entry.config.to_dict()
+    # The host file's own version says nothing about this document's shape, and
+    # beside the address it reads as if it did.
+    config.pop("schema_version", None)
+    # `--env` is free-form and is where somebody hand-sets an HF_TOKEN, so the
+    # names are reported and the values are not -- in the flattened copy and in
+    # the cache it came from. The text listing shows neither, and this document
+    # ends up in transcripts and bug reports.
+    names = dict.fromkeys(entry.env, "<set>")
+    cache: dict[str, Any] = document.get("cache") or {}
+    cache["config"] = {**(cache.get("config") or {}), "env": names}
     stale = shipped_note(entry)
     return {
         **document,
-        # `--env` is free-form and is where somebody hand-sets an HF_TOKEN, so
-        # the names are reported and the values are not: the text listing shows
-        # neither, and this document ends up in transcripts and bug reports.
-        "env": dict.fromkeys(entry.env, "<set>"),
+        **config,
+        "env": names,
+        "cache": cache,
+        "cache_dir": entry.cache_dir,
+        "config_seen_at": entry.seen_at,
         "remote_home": entry.remote_home,
         "ephemeral": entry.ephemeral,
         "warnings": [stale] if stale else [],

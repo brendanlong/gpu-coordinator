@@ -16,8 +16,9 @@ import time
 import tomllib
 import types
 import typing
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -244,54 +245,111 @@ def load_settings() -> Settings:
         raise LocalStateUnreadable(f"{path} has bad values:\n{exc}") from exc
 
 
+class HostCache(TolerantModel):
+    """What this machine last read off a host, and when it read it.
+
+    Every field here is a copy of something the *host* owns, kept so the
+    commands that ask nothing (`gpuc host list`, `gpuc version`) still have
+    something to print -- labelled "last seen", because that is what it is.
+    Nothing that decides anything reads it: a command that acts on a host
+    (submit, bootstrap, set) asks the host, and refreshes this on the way past.
+    """
+
+    read_at: str | None = None
+    """When this cache was filled, so a listing can say how old it is."""
+    python: str | None = None
+    uv: str | None = None
+    gpu_info: dict[str, GpuInfo] = Field(default_factory=dict)
+    """What each UUID on the host is: name and VRAM, from bootstrap or `host probe`.
+
+    Additive and best effort -- a host with no nvidia-smi simply lists its
+    UUIDs without names."""
+    driver_version: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    """The host's `config.json`, verbatim, as last read.
+
+    Verbatim so a key some newer build wrote survives the round trip through
+    this build's registry; `HostEntry.config` is the parsed view of it.
+    """
+
+
+LEGACY_CACHE_KEYS = ("python", "uv", "gpu_info", "driver_version")
+LEGACY_CONFIG_KEYS = (
+    "gpus",
+    "s3_prefix",
+    "env",
+    "idle_minutes",
+    "ttl_hours",
+    "retention_days",
+    "created_at",
+    "pkg_commit",
+)
+
+
 class HostEntry(TolerantModel):
+    """How to reach one host, plus what this machine last saw on it.
+
+    Two kinds of thing, and only two:
+
+    - the **address** -- `ssh`, `port`, `gpuc_home` / `persistent_root`,
+      `pod_id` -- hand-entered, local to this machine, and saying nothing about
+      how the host behaves;
+    - the **cache**, a copy of what the host said the last time we asked.
+
+    What the host *is* -- its cards, its mirror, its env, its timers -- lives in
+    `config.json` on the host and nowhere else, so two control machines driving
+    one box cannot each believe their own version of it. `gpuc host add` reads
+    that file, `gpuc host set` writes through to it, and bootstrapping a host
+    never rewrites the rest of it.
+    """
+
     name: str = ""
     kind: HostKind = "local"
     ssh: str | None = None
     port: int = 22
-    gpus: list[str] = Field(default_factory=list)
-    gpu_info: dict[str, GpuInfo] = Field(default_factory=dict)
-    """What each UUID is: name and VRAM, recorded by bootstrap and `host probe`.
-
-    Additive and best effort -- a host registered before this existed, or one
-    with no nvidia-smi, simply lists its UUIDs without names."""
-    driver_version: str | None = None
-    pod_id: str | None = None
-    python: str | None = None
-    uv: str | None = None
     gpuc_home: str | None = None
     persistent_root: str | None = None
-    env: dict[str, str] = Field(default_factory=dict)
-    """Extra environment for every job on this host, set by hand with
-    `gpuc host add|set --env K=V`. Nothing populates it automatically."""
-    cache_dir: str | None = None
-    """uv's cache for this host, surfaced to jobs as `UV_CACHE_DIR`.
-
-    Unlike `env`, bootstrap *does* populate this: uv materialises a venv by
-    reflinking or hardlinking out of its cache, which only works within one
-    filesystem, so a host whose gpuc home is on a different volume from `$HOME`
-    gets a cache next to gpuc home instead of copying every wheel. `--cache-dir`
-    pins it by hand; an explicit `--env UV_CACHE_DIR=...` still wins."""
-    idle_minutes: float = 15.0
-    ttl_hours: float | None = None
-    """Hard cap on this host's life, in hours; None (the default) never expires.
-
-    An opt-in cap, not a safety net: killing a training run at hour 24 is worse
-    than the idle timer taking a little longer. The reaper's safety net is
-    `Settings.dead_dispatcher_minutes` instead."""
-    s3_prefix: str | None = None
-    retention_days: float | None = None
-    """Auto-purge horizon for this host, in days; None never auto-purges.
-
-    Only ever acts on jobs whose log and state are confirmed mirrored, so a
-    host with no `s3_prefix` (and no `s3_bucket` to derive one from) can set
-    this and nothing will ever be deleted."""
-    created_at: str | None = None
+    pod_id: str | None = None
     bootstrapped_at: str | None = None
-    pkg_commit: str | None = None
-    """The gpuc commit bootstrap last shipped to this host, as `gpuc version`
-    and `gpuc host list` report it. Null means "bootstrapped before this was
-    recorded", which is not the same as "up to date"."""
+    """When *this* machine last bootstrapped the host. Another machine's
+    bootstrap is invisible here, which is why nothing decides on it."""
+    cache: HostCache = Field(default_factory=HostCache)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_pre_split_entry(cls, data: Any) -> Any:
+        """Read a registry written before the address and the config were split.
+
+        Such an entry holds a copy of the host's config flat beside the
+        address, because the machine that wrote it believed it owned that
+        config. It does not, so those fields become the cache, and the next
+        connect, `gpuc host set` or bootstrap works from the host's own copy.
+        """
+        if not isinstance(data, dict):
+            return data
+        document: dict[Any, Any] = data
+        if not any(key in document for key in (*LEGACY_CACHE_KEYS, *LEGACY_CONFIG_KEYS)):
+            return document
+        cache = dict(document.get("cache") or {})
+        config = dict(cache.get("config") or {})
+        for key in LEGACY_CACHE_KEYS:
+            if key in document and key not in cache:
+                cache[key] = document[key]
+        for key in LEGACY_CONFIG_KEYS:
+            if key in document and key not in config:
+                config[key] = document[key]
+        # `cache_dir` was the one config key the registry kept outside `env`.
+        # On the host it has only ever been `env["UV_CACHE_DIR"]`.
+        if document.get("cache_dir"):
+            env = dict(config.get("env") or {})
+            env.setdefault("UV_CACHE_DIR", str(document["cache_dir"]))
+            config["env"] = env
+        if document.get("name") and not config.get("host"):
+            config["host"] = document["name"]
+        cache["config"] = config
+        return {**document, "cache": cache}
+
+    # -- the address ---------------------------------------------------------
 
     @property
     def root(self) -> str | None:
@@ -322,55 +380,149 @@ class HostEntry(TolerantModel):
         return self.kind == "runpod"
 
     def provider(self) -> dict[str, Any] | None:
+        """The `provider` block this address implies, for a config we initialise."""
         if self.kind != "runpod":
             return None
         return {"kind": "runpod", "pod_id": self.pod_id}
 
-    def job_env(self) -> dict[str, str]:
-        """The host env as jobs see it: `env`, plus `cache_dir` as a default.
+    # -- what the host last said about itself --------------------------------
 
-        One source of truth for the dispatcher's config.json, bootstrap's own
-        uv calls and every `HostSession` invocation, so they cannot disagree
-        about which uv cache this host uses.
+    @property
+    def python(self) -> str | None:
+        return self.cache.python
+
+    @property
+    def uv(self) -> str | None:
+        return self.cache.uv
+
+    @property
+    def gpu_info(self) -> dict[str, GpuInfo]:
+        return self.cache.gpu_info
+
+    @property
+    def driver_version(self) -> str | None:
+        return self.cache.driver_version
+
+    @property
+    def seen_at(self) -> str | None:
+        """When the cache below was last filled. None means never."""
+        return self.cache.read_at
+
+    @property
+    def config(self) -> HostConfig:
+        """The host's own config as this machine last read it.
+
+        Read it for a listing and say how old it is; never act on it without
+        asking the host first. Everything that does talk to a host refreshes it
+        (`with_config`), so in practice it is one round trip old.
         """
-        env = dict(self.env)
-        if self.cache_dir:
-            env.setdefault("UV_CACHE_DIR", self.cache_dir)
-        return env
+        return HostConfig.from_dict(self.cache.config)
 
-    def host_config(self) -> HostConfig:
-        return HostConfig(
-            host=self.name,
-            gpus=list(self.gpus),
-            provider=self.provider(),
-            idle_minutes=self.idle_minutes,
-            ttl_hours=self.ttl_hours,
-            s3_prefix=self.s3_prefix,
-            created_at=self.created_at,
-            retention_days=self.retention_days,
-            env=self.job_env(),
-            pkg_commit=self.pkg_commit,
+    @property
+    def gpus(self) -> list[str]:
+        return self.config.gpus
+
+    @property
+    def env(self) -> dict[str, str]:
+        """Extra environment for every job on this host (`--env K=V`), plus the
+        `UV_CACHE_DIR` bootstrap derives from the host's own filesystem."""
+        return self.config.env
+
+    @property
+    def cache_dir(self) -> str | None:
+        """uv's cache for this host, which reaches jobs as `UV_CACHE_DIR`.
+
+        uv materialises a venv by reflinking or hardlinking out of its cache,
+        which only works within one filesystem, so a host whose gpuc home is on
+        a different volume from `$HOME` gets a cache next to gpuc home instead
+        of copying every wheel. Bootstrap fills it in; `--cache-dir` pins it.
+        """
+        return self.env.get("UV_CACHE_DIR")
+
+    @property
+    def s3_prefix(self) -> str | None:
+        return self.config.s3_prefix
+
+    @property
+    def idle_minutes(self) -> float:
+        return self.config.idle_minutes
+
+    @property
+    def ttl_hours(self) -> float | None:
+        return self.config.ttl_hours
+
+    @property
+    def retention_days(self) -> float | None:
+        return self.config.retention_days
+
+    @property
+    def created_at(self) -> str | None:
+        return self.config.created_at
+
+    @property
+    def pkg_commit(self) -> str | None:
+        """The gpuc commit the host's config says its package came from.
+
+        Whoever bootstrapped last wrote it, which is the point: this machine's
+        own record of what it shipped cannot answer the question."""
+        return self.config.pkg_commit
+
+    def initial_config(self) -> HostConfig:
+        """The config to give a host that has none of its own.
+
+        Two cases reach it: a host being bootstrapped from a registry written
+        before the split (whose cached config is this machine's old record of
+        it), and one whose gpuc home was wiped and has to be rebuilt. Both want
+        the same thing -- what we last saw, with the facts only this address
+        knows filled in.
+        """
+        config = self.config
+        return replace(
+            config,
+            host=config.host if self.cache.config.get("host") else self.name or config.host,
+            provider=config.provider or self.provider(),
+            created_at=config.created_at or utc_now(),
         )
+
+    def with_config(
+        self, config: HostConfig | Mapping[str, Any], *, read_at: str | None = None
+    ) -> HostEntry:
+        """A copy whose cache holds `config`, stamped with when it was read."""
+        document = config.to_dict() if isinstance(config, HostConfig) else dict(config)
+        cache = self.cache.model_copy(update={"config": document, "read_at": read_at or utc_now()})
+        return self.model_copy(update={"cache": cache})
+
+    def with_cache(
+        self,
+        *,
+        python: str | None = None,
+        uv: str | None = None,
+        gpu_info: Mapping[str, GpuInfo] | None = None,
+        driver_version: str | None = None,
+        read_at: str | None = None,
+    ) -> HostEntry:
+        """A copy carrying what a probe or a bootstrap just found; None leaves
+        a field alone.
+
+        `gpu_info` is merged, not replaced: a probe sees every card in the box
+        and a later one may see fewer (a container handed a subset), and a UUID
+        we already have a name for is worth keeping.
+        """
+        changes: dict[str, Any] = {
+            key: value
+            for key, value in (("python", python), ("uv", uv), ("driver_version", driver_version))
+            if value is not None
+        }
+        if gpu_info is not None:
+            changes["gpu_info"] = {**self.cache.gpu_info, **gpu_info}
+        changes["read_at"] = read_at or utc_now()
+        return self.model_copy(update={"cache": self.cache.model_copy(update=changes)})
 
 
 NOT_DRIFT = {"schema_version", "pkg_commit", "created_at"}
 """Config keys a difference says nothing about: the shape of the file, the
 commit (which moves on every re-ship, and is reported on its own), and when
-whoever registered the host first did so."""
-
-NOT_DRIFT_ENV = {"UV_CACHE_DIR"}
-"""Environment bootstrap decides, not the user: it is set from the host's own
-filesystem layout (`resolve_cache_dir`), so the machine that bootstrapped the
-host is the only one with an opinion worth having about it. Every *other*
-machine has no `cache_dir` recorded and would otherwise report a difference on
-every submit that only a re-bootstrap could clear."""
-
-JOB_CONFIG_KEYS = ("host", "gpus", "s3_prefix", "env")
-"""The config a *job* is affected by: which cards it can be given, the
-environment it inherits, and where its log and outputs are mirrored. The rest
-of a host's config is about the host's own life (`idle_minutes`, `ttl_hours`,
-`retention_days`), which `gpuc host set` changes here and the next bootstrap
-ships -- a submit has nothing to say about that gap."""
+whoever first registered the host did so."""
 
 
 def _show(value: Any) -> str:
@@ -390,16 +542,13 @@ def _show(value: Any) -> str:
 def config_drift(
     existing: Any, incoming: HostConfig, keys: Collection[str] | None = None
 ) -> list[str]:
-    """How the config a host is running differs from the one we would write it.
+    """How the config a host holds differs from the one we are about to give it.
 
     Only the keys `existing` actually has are compared, so this takes a whole
-    `config.json` read off the host or the subset `gpuc status` gets back, and
-    `keys` narrows it further for a caller that only cares about some of them.
-    The difference this is for is a second control machine having registered
-    the same box with other GPUs, another mirror or another name, which the
-    registry here cannot see -- but it cannot tell that apart from a `gpuc host
-    set` on this machine that has not been bootstrapped yet, so callers say
-    "different from what is registered here", never "somebody else wrote it".
+    `config.json` read off the host or a subset of one, and `keys` narrows it
+    further for a caller that only cares about some of them. It is how `gpuc
+    host add` and `gpuc host set` name, field by field, what a flag is about to
+    change on a host somebody already configured.
 
     `env` reports the names that differ and never the values -- it is
     free-form, it is where somebody hand-sets an HF_TOKEN, and this text ends
@@ -422,15 +571,25 @@ def config_drift(
             # only named differences are differences.
             theirs_env = theirs if isinstance(theirs, dict) else {}
             names = sorted(
-                k
-                for k in (set(theirs_env) | set(ours)) - NOT_DRIFT_ENV
-                if theirs_env.get(k) != ours.get(k)
+                k for k in (set(theirs_env) | set(ours)) if theirs_env.get(k) != ours.get(k)
             )
             if names:
                 drift.append(f"env differs in {', '.join(names)}")
         else:
             drift.append(f"{key} {_show(theirs)} -> {_show(ours)}")
     return drift
+
+
+def config_changes(existing: Any, patch: Mapping[str, Any]) -> list[str]:
+    """One line per key `patch` would actually change on a host, as words.
+
+    What `gpuc host add` and `gpuc host set` print: the host's config is the
+    only copy of it, so a flag that touches it is an edit of somebody's host
+    and says so, field by field, rather than being applied in silence.
+    """
+    fields = existing if isinstance(existing, dict) else {}
+    base = {key: fields.get(key) for key in patch}
+    return config_drift(base, HostConfig.from_dict({**fields, **patch}), keys=set(patch))
 
 
 class Registry(TolerantModel):

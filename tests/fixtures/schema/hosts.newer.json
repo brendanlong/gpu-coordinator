@@ -7,38 +7,54 @@
       "kind": "local",
       "ssh": null,
       "port": null,
-      "gpus": ["GPU-2a4bad3b-9fe3-7031-914d-384254e92908"],
-      "gpu_info": {
-        "GPU-2a4bad3b-9fe3-7031-914d-384254e92908": {
-          "name": "NVIDIA GeForce RTX 3060 Ti",
-          "vram_mib": 8192,
-          "pcie_gen": 4
-        }
-      },
-      "driver_version": "580.173.02",
-      "env": null,
-      "idle_minutes": null,
-      "ttl_hours": null,
-      "retention_days": null,
-      "s3_prefix": "s3://brendanlong-experiments/gpuc/local",
-      "pkg_commit": "0123456789abcdef0123456789abcdef01234567",
-      "created_at": "2026-09-15T07:42:34+00:00",
       "bootstrapped_at": "2026-09-15T20:43:46+00:00",
-      "power_cap_watts": 220,
-      "labels": ["desktop", "shared"]
+      "labels": ["desktop", "shared"],
+      "cache": {
+        "read_at": "2026-09-15T20:44:02+00:00",
+        "python": "/home/brendan/.local/share/uv/python/cpython-3.13/bin/python3.13",
+        "uv": "/home/brendan/.local/bin/uv",
+        "gpu_info": {
+          "GPU-2a4bad3b-9fe3-7031-914d-384254e92908": {
+            "name": "NVIDIA GeForce RTX 3060 Ti",
+            "vram_mib": 8192,
+            "pcie_gen": 4
+          }
+        },
+        "driver_version": "580.173.02",
+        "reachable": true,
+        "config": {
+          "schema_version": 2,
+          "host": "local",
+          "gpus": ["GPU-2a4bad3b-9fe3-7031-914d-384254e92908"],
+          "env": null,
+          "idle_minutes": null,
+          "ttl_hours": null,
+          "retention_days": null,
+          "s3_prefix": "s3://brendanlong-experiments/gpuc/local",
+          "pkg_commit": "0123456789abcdef0123456789abcdef01234567",
+          "created_at": "2026-09-15T07:42:34+00:00",
+          "power_cap_watts": 220
+        }
+      }
     },
     "pod-a40": {
       "name": "pod-a40",
       "kind": "runpod",
       "ssh": "root@1.2.3.4",
       "port": 22,
-      "gpus": [],
       "pod_id": "abc123",
-      "idle_minutes": 15.0,
-      "ttl_hours": null,
-      "cache_dir": null,
       "spot": false,
-      "created_at": "2026-09-15T20:00:00+00:00"
+      "cache": {
+        "read_at": null,
+        "config": {
+          "host": "pod-a40",
+          "gpus": [],
+          "idle_minutes": 15.0,
+          "ttl_hours": null,
+          "provider": {"kind": "runpod", "pod_id": "abc123"},
+          "created_at": "2026-09-15T20:00:00+00:00"
+        }
+      }
     }
   }
 }

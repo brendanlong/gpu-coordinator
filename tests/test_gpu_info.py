@@ -8,6 +8,7 @@ from gpuc.control.cli import main
 from gpuc.control.config import HostEntry, load_registry, registry_transaction
 from gpuc.control.gpuinfo import GpuInfo, parse_smi, rows, summarize, vram_text
 from gpuc.control.status import HostView, JobView, render
+from tests.conftest import host_entry
 
 SMI_OUTPUT = """\
 0, GPU-80646905-50a9-afc1-4375-43ca475b15e4, NVIDIA A40, 46068
@@ -50,7 +51,7 @@ def test_rows_keep_the_hosts_own_order() -> None:
 
 
 def entry_with_cards() -> HostEntry:
-    return HostEntry(
+    return host_entry(
         name="gpubox",
         kind="ssh",
         ssh="gpubox-ssh",
@@ -88,11 +89,11 @@ def test_status_names_the_cards_and_who_holds_them() -> None:
 
 def test_a_host_registered_before_gpu_info_existed_still_lists(control_env: Path, capsys) -> None:
     with registry_transaction() as registry:
-        registry.put(HostEntry(name="old", gpus=["GPU-x"]))
+        registry.put(host_entry(name="old", gpus=["GPU-x"]))
     assert main(["host", "list"]) == 0
     out = capsys.readouterr().out
     assert "gpus 1 (1x unknown GPU)" in out
-    assert "pkg     unknown shipped from here, never bootstrapped" in out
+    assert "pkg     unknown on the host" in out
     assert "GPU-x" in out
     assert load_registry().hosts["old"].gpu_info == {}
 

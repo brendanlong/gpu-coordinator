@@ -10,6 +10,7 @@ import pytest
 from gpuc.control import reconcile as reconcile_mod
 from gpuc.control.clean import purge_host
 from gpuc.control.cli import (
+    EXIT_ERROR,
     EXIT_LOCAL_STATE,
     EXIT_NOT_FOUND,
     EXIT_USAGE,
@@ -29,30 +30,134 @@ from gpuc.control.config import (
 from gpuc.control.providers.base import Constraints
 from gpuc.control.remote import HostSession, RemoteError
 from gpuc.control.submit import SubmitResult
+from tests.conftest import host_entry, register_host
+from tests.fakehost import FakeHost
 from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
 from tests.fakes3 import FakeS3Client
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 
 
-def test_host_add_local_records_the_uuids(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
+def test_host_add_writes_the_first_config_of_a_host_that_has_none(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """The host owns its config, so `add` is where a host that has none gets
+    one -- and the only place this machine decides what a host is."""
     assert main(["host", "add", "local", "--gpus", GPU]) == 0
     entry = load_registry().require("local")
     assert (entry.kind, entry.gpus, entry.ssh) == ("local", [GPU], None)
-    assert "gpuc host bootstrap local" in capsys.readouterr().out
+    assert fake_host.config is not None
+    assert (fake_host.config["host"], fake_host.config["gpus"]) == ("local", [GPU])
+    assert fake_host.config["created_at"]
+    out = capsys.readouterr().out
+    assert "wrote its first config" in out
+    assert "gpuc host bootstrap local" in out
+
+
+def test_host_add_adopts_the_config_a_host_already_has(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The second control machine's path, and the ordinary one: what the host
+    is was decided by whoever set it up, and this machine takes it as it is."""
+    theirs = {
+        "host": "gpubox",
+        "gpus": ["2", "3"],
+        "s3_prefix": "s3://theirs/gpuc/gpubox",
+        "retention_days": 30.0,
+        "env": {"HF_HOME": "/big"},
+    }
+    fake_host.put_file(json.dumps(theirs), "/home/u/.gpuc/config.json")
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    entry = load_registry().require("gpubox")
+    assert entry.gpus == ["2", "3"]
+    assert entry.s3_prefix == "s3://theirs/gpuc/gpubox"
+    assert entry.retention_days == 30.0
+    assert entry.env == {"HF_HOME": "/big"}
+    assert entry.seen_at
+    assert fake_host.config == theirs  # nothing was written to the host
+    assert "adopted the config on the host" in capsys.readouterr().out
+
+
+def test_host_add_registers_a_host_under_the_name_it_calls_itself(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`config.json`'s `host` is what the host answers as, and what its
+    `s3_prefix` was derived from; a second local name for it would split the
+    two machines' view of one box in half."""
+    fake_host.put_file('{"host": "gpubox", "gpus": ["0"]}', "/home/u/.gpuc/config.json")
+    assert main(["host", "add", "other-name", "--ssh", "me@box"]) == 0
+    assert set(load_registry().hosts) == {"gpubox"}
+    assert "calls itself 'gpubox'" in capsys.readouterr().out
+
+
+def test_a_flag_on_an_adopted_host_is_an_override_and_says_so(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_host.put_file(
+        '{"host": "gpubox", "gpus": ["0"], "retention_days": 30.0}', "/home/u/.gpuc/config.json"
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--retention-days", "7"]) == 0
+    assert "host <- retention_days 30.0 -> 7.0" in capsys.readouterr().out
+    assert fake_host.config is not None and fake_host.config["retention_days"] == 7.0
+    assert fake_host.config["gpus"] == ["0"]
+
+
+def test_host_add_refuses_a_gpu_list_that_overlaps_the_hosts_own(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two machines each believing they own part of an overlapping share hand
+    one card to two jobs, which no warning would undo."""
+    fake_host.put_file('{"host": "gpubox", "gpus": ["0", "1"]}', "/home/u/.gpuc/config.json")
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "1,2"]) == EXIT_ERROR
+    assert "claims 1 of them and not the rest" in capsys.readouterr().err
+    assert load_registry().hosts == {}
+    assert fake_host.config is not None and fake_host.config["gpus"] == ["0", "1"]
+    # A disjoint list is a deliberate reassignment, and goes through.
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "2,3"]) == 0
+    assert fake_host.config["gpus"] == ["2", "3"]
+
+
+def test_a_second_machine_registers_the_same_box_and_agrees_with_the_first(
+    control_env: Path, fake_host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the split. One box, two control machines, one
+    configuration -- and a `host set` from either is what the other sees."""
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "2,3"]) == 0
+    first = load_registry().require("gpubox")
+
+    # The laptop: its own registry, the same host, and no flags to retype.
+    monkeypatch.setenv("GPUC_STATE_DIR", str(control_env / "laptop-state"))
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    second = load_registry().require("gpubox")
+    assert second.gpus == first.gpus == ["2", "3"]
+    assert second.created_at == first.created_at
+
+    # And a change from the laptop is the host's, so the desktop sees it.
+    assert main(["host", "set", "gpubox", "--gpus", "2,3,4"]) == 0
+    monkeypatch.setenv("GPUC_STATE_DIR", str(control_env / "state"))
+    assert main(["host", "probe", "gpubox"]) == 0
+    assert load_registry().require("gpubox").gpus == ["2", "3", "4"]
+
+
+def test_host_add_needs_gpus_for_a_host_with_no_config_and_lists_the_cards(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "has no config of its own yet" in err
+    assert "GPU-a" in err  # the probe's own card list, to copy from
+    assert load_registry().hosts == {}
 
 
 def test_host_add_ssh_records_the_target_and_port(control_env: Path) -> None:
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--port", "2222", "--gpus", "GPU-a,GPU-b"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", port=2222, gpus="GPU-a,GPU-b")
     entry = load_registry().require("gpubox")
     assert (entry.kind, entry.ssh, entry.port) == ("ssh", "me@box", 2222)
     assert entry.gpus == ["GPU-a", "GPU-b"]
 
 
 def test_host_list_and_remove(control_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     assert main(["host", "list"]) == 0
     assert GPU in capsys.readouterr().out
     assert main(["host", "remove", "local"]) == 0
@@ -94,7 +199,7 @@ def test_cancel_for_an_unknown_job_tells_you_where_to_look(
 def test_requeue_without_an_s3_bucket_explains_the_gap(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
     assert "s3_bucket is unset" in capsys.readouterr().err
 
@@ -128,7 +233,7 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
         seen.update(kwargs)
         seen["constraints"] = constraints
         seen["mirrored_before_provisioning"] = sorted(s3.objects)
-        return HostEntry(name="gpuc-e2e-1", kind="runpod", gpus=["GPU-1"])
+        return host_entry(name="gpuc-e2e-1", kind="runpod", gpus=["GPU-1"])
 
     def fake_submit_spec(entry: HostEntry, model: object, *args: object, **kwargs: object):
         seen["host"] = entry.name
@@ -216,7 +321,7 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
 
     def fake_runpod_host(constraints: Constraints, settings: Settings, **kwargs: object):
         seen["gpu_names"] = constraints.gpu_names
-        return HostEntry(name="gpuc-e2e-1", kind="runpod", gpus=["GPU-1"])
+        return host_entry(name="gpuc-e2e-1", kind="runpod", gpus=["GPU-1"])
 
     def fake_submit_spec(entry: HostEntry, model: object, *args: object, **kwargs: object):
         seen["attempt"] = kwargs["attempt"]
@@ -344,7 +449,7 @@ def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
     created: list[object] = []
     monkeypatch.setattr(
         "gpuc.control.cli.runpod_host",
-        lambda *a, **k: created.append(a) or HostEntry(name="gpuc-x", kind="runpod"),
+        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
     )
 
     assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
@@ -365,7 +470,7 @@ def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
     monkeypatch.delenv("GPUC_DEFINITELY_UNSET", raising=False)
     monkeypatch.setattr(
         "gpuc.control.cli.runpod_host",
-        lambda *a, **k: created.append(a) or HostEntry(name="gpuc-x", kind="runpod"),
+        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
     )
 
     assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
@@ -408,7 +513,7 @@ def as_session(session: StubSession) -> HostSession:
 
 def test_verify_purges_only_the_jobs_whose_mirror_answers(control_env: Path) -> None:
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession(
         [
             {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
@@ -433,7 +538,7 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
     """`--purge --all-finished --yes` is allowed, and never silent about it."""
     from gpuc.control.clean import clean_host
 
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession([{"dry_run": False, "purged": [purged_entry("old")], "freed_bytes": 1}])
     report = clean_host(
         entry,
@@ -449,7 +554,7 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
 
 def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> None:
     client = FakeS3Client()
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession(
         [
             {"dry_run": True, "purged": [purged_entry("gone")]},
@@ -472,7 +577,7 @@ def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> N
 def test_verify_without_purge_is_refused(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     assert main(["clean", "--host", "gpubox", "--verify", "--all-finished"]) == EXIT_USAGE
     assert "only mean something with --purge" in capsys.readouterr().err
 
@@ -480,7 +585,7 @@ def test_verify_without_purge_is_refused(
 def test_clean_with_no_selection_and_no_purge_exits(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     assert main(["clean", "--host", "gpubox"]) == EXIT_USAGE
     assert "--all-finished" in capsys.readouterr().err
 
@@ -494,7 +599,7 @@ def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
     """Naming ids is the confirmation `--purge --all-finished` needs `--yes` for."""
     from gpuc.control.clean import clean_host
 
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession([{"dry_run": False, "purged": [purged_entry("a")], "freed_bytes": 1}])
     report = clean_host(
         entry,
@@ -513,7 +618,7 @@ def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
 def test_only_without_purge_cleans_just_those_workdirs(control_env: Path) -> None:
     from gpuc.control.clean import clean_host
 
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession([{"dry_run": False, "removed": [], "freed_bytes": 0}])
     clean_host(entry, Settings(), session=as_session(session), only=["a"])
     assert session.calls == ["clean --only a"]
@@ -523,7 +628,7 @@ def test_only_with_verify_purges_what_answered_and_sweeps_what_was_asked(
     control_env: Path,
 ) -> None:
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession(
         [
             {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
@@ -550,7 +655,7 @@ def test_a_dry_run_says_the_workdirs_verification_dropped_will_still_go(
     """The host sized its sweep over the dirs it expected to purge, so the
     workdirs of the jobs we then drop are in neither total."""
     client = FakeS3Client()
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession([{"dry_run": True, "purged": [purged_entry("gone")]}])
     report = purge_host(
         entry,
@@ -578,7 +683,7 @@ def test_only_cannot_be_combined_with_an_age_horizon(
     """argparse rejects the command line; `check_flags` judges it for callers."""
     from gpuc.control.clean import CleanUsageError, check_flags
 
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     with pytest.raises(SystemExit) as caught:
         main(["clean", "--host", "gpubox", "--only", "a", *extra])
     assert caught.value.code == EXIT_USAGE
@@ -595,17 +700,19 @@ def test_an_empty_only_is_a_usage_error_not_a_silent_no_op(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The host reads `--only ''` as "purge nothing"; a user never means that."""
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     assert main(["clean", "--host", "gpubox", "--purge", "--only", " , "]) == EXIT_USAGE
     assert "at least one job id" in capsys.readouterr().err
 
 
-def test_retention_days_is_stored_and_cleared(control_env: Path) -> None:
-    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--retention-days", "14"]) == 0
+def test_retention_days_is_stored_and_cleared(control_env: Path, fake_host: FakeHost) -> None:
+    add = ["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "", "--retention-days", "14"]
+    assert main(add) == 0
     assert load_registry().require("gpubox").retention_days == 14.0
-    assert load_registry().require("gpubox").host_config().retention_days == 14.0
+    assert fake_host.config is not None and fake_host.config["retention_days"] == 14.0
     assert main(["host", "set", "gpubox", "--retention-days", ""]) == 0
     assert load_registry().require("gpubox").retention_days is None
+    assert fake_host.config["retention_days"] is None
 
 
 def test_a_bad_retention_value_is_rejected(
@@ -650,7 +757,7 @@ def test_ttl_is_unset_unless_asked_for() -> None:
 
 def test_a_negative_ttl_clears_the_cap(control_env: Path) -> None:
     with registry_transaction() as registry:
-        registry.put(HostEntry(name="h", gpus=[], ttl_hours=6.0))
+        registry.put(host_entry(name="h", gpus=[], ttl_hours=6.0))
     assert main(["host", "set", "h", "--ttl-hours", "-1"]) == 0
     assert load_registry().hosts["h"].ttl_hours is None
 
@@ -664,14 +771,16 @@ def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | N
     Returns the list every re-ship appends its host to.
     """
     resynced: list[str] = []
-    fake_session = SimpleNamespace(transport=SimpleNamespace(host="gpubox"))
+    fake_session = SimpleNamespace(
+        transport=SimpleNamespace(host="gpubox"), read_config=lambda: config
+    )
 
     def fake_resync(entry: HostEntry, settings: object = None, **kwargs: object) -> HostEntry:
         resynced.append(entry.name)
         # The session opened to ask the host is the one the re-ship rides on:
         # a second `open_session` here would be a second ssh handshake.
         assert kwargs.get("transport") is fake_session.transport
-        return entry.model_copy(update={"pkg_commit": "b" * 40})
+        return entry.with_config({**(config or {}), "pkg_commit": "b" * 40})
 
     monkeypatch.setattr("gpuc.control.cli.resync_package", fake_resync)
 
@@ -681,7 +790,6 @@ def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | N
         return fake_session
 
     monkeypatch.setattr("gpuc.control.cli.open_session", open_or_fail)
-    monkeypatch.setattr("gpuc.control.cli.read_remote_config", lambda _session: config)
     monkeypatch.setattr(
         "gpuc.control.cli.submit_file",
         lambda *a, **k: SubmitResult(job_id="j", host="gpubox", attempt=1),
@@ -699,7 +807,7 @@ def test_submit_reships_the_package_to_a_host_on_another_commit(
     the spec this machine just wrote."""
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     _set_host(python="/py", pkg_commit="a" * 40)
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
     host_config: dict[str, Any] = {"pkg_commit": "a" * 40}
@@ -739,7 +847,7 @@ def test_submit_asks_the_host_which_build_it_runs_not_this_machines_record(
     """
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     _set_host(python="/py", pkg_commit="b" * 40)
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
     resynced = _fake_host_build(monkeypatch, {"pkg_commit": "c" * 40})
@@ -753,7 +861,6 @@ def test_submit_asks_the_host_which_build_it_runs_not_this_machines_record(
     # And when there is nothing to re-ship, the record still stops repeating a
     # bootstrap somebody else replaced: `host list` and `version` have only it.
     resynced.clear()
-    monkeypatch.setattr("gpuc.control.cli.read_remote_config", lambda _s: {"pkg_commit": "c" * 40})
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "c" * 40)
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert resynced == []
@@ -770,73 +877,59 @@ def test_submit_records_the_hosts_commit_without_clobbering_the_rest_of_the_entr
     session writes what it learned about the same host."""
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     _set_host(python="/py", pkg_commit="b" * 40)
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "c" * 40)
     _fake_host_build(monkeypatch, {"pkg_commit": "c" * 40})
 
-    def concurrent_probe(*_: object, **__: object) -> dict[str, Any]:
-        # Between reading the entry and recording the commit, another session
-        # records a driver version against the same host.
+    def concurrent_probe() -> dict[str, Any]:
+        # Between reading the entry and recording what the host said, another
+        # session records a driver version against the same host.
         _set_host(driver_version="580.173.02")
         return {"pkg_commit": "c" * 40}
 
-    monkeypatch.setattr("gpuc.control.cli.read_remote_config", concurrent_probe)
+    monkeypatch.setattr(
+        "gpuc.control.cli.open_session",
+        lambda *a, **k: SimpleNamespace(
+            transport=SimpleNamespace(host="gpubox"), read_config=concurrent_probe
+        ),
+    )
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     entry = load_registry().require("gpubox")
     assert (entry.pkg_commit, entry.driver_version) == ("c" * 40, "580.173.02")
 
 
-def test_submit_says_so_when_the_host_runs_a_config_this_machine_did_not_write(
+def test_submit_takes_the_hosts_config_as_it_finds_it(
     control_env: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """The host owns its config, so a cache that disagrees with it is stale,
+    not a conflict: the read before the enqueue is what the job is judged by,
+    and it is what the registry then holds."""
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "2,3"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus="2,3", retention_days=7.0)
     _set_host(python="/py", pkg_commit="b" * 40)
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
-    resynced = _fake_host_build(monkeypatch, {"pkg_commit": "b" * 40, "gpus": ["0", "1"]})
+    theirs = {
+        "pkg_commit": "b" * 40,
+        "gpus": ["0", "1"],
+        "s3_prefix": "s3://theirs/gpuc/gpubox",
+        "retention_days": None,
+    }
+    resynced = _fake_host_build(monkeypatch, theirs)
 
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     out = capsys.readouterr().out
     assert resynced == []
-    assert "running a config this machine has not shipped it" in out
-    assert "gpus 0,1 -> 2,3" in out
-    assert "gpuc host bootstrap gpubox" in out
-
-
-def test_submit_is_quiet_about_a_host_set_this_machine_has_not_bootstrapped_yet(
-    control_env: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """`gpuc host set` says in so many words that the host is unchanged until
-    the next bootstrap. Reporting the host's own lifecycle settings back on
-    every submit would be noise, and the submit cannot clear it."""
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
-    _set_host(python="/py", pkg_commit="b" * 40, idle_minutes=30.0, retention_days=7.0)
-    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
-    resynced = _fake_host_build(
-        monkeypatch,
-        {
-            "pkg_commit": "b" * 40,
-            "gpus": [GPU],
-            "idle_minutes": 15.0,
-            "retention_days": None,
-            "ttl_hours": 6.0,
-        },
-    )
-
-    assert main(["submit", str(job), "--host", "gpubox"]) == 0
-    out = capsys.readouterr().out
-    assert resynced == []
+    # Nothing to warn about, and nothing to reconcile by hand.
     assert "WARNING" not in out
+    entry = load_registry().require("gpubox")
+    assert entry.gpus == ["0", "1"]
+    assert entry.s3_prefix == "s3://theirs/gpuc/gpubox"
+    assert entry.retention_days is None
 
 
 def test_submit_json_keeps_its_document_alone_and_its_warnings_on_stderr(
@@ -847,7 +940,7 @@ def test_submit_json_keeps_its_document_alone_and_its_warnings_on_stderr(
 ) -> None:
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "2,3"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus="2,3")
     _set_host(python="/py", pkg_commit="a" * 40)
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
     _fake_host_build(monkeypatch, {"pkg_commit": "c" * 40, "gpus": ["0", "1"]})
@@ -856,7 +949,6 @@ def test_submit_json_keeps_its_document_alone_and_its_warnings_on_stderr(
     assert main(["submit", str(job), "--host", "gpubox", "--json"]) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out)["job_id"] == "j"
-    assert "running a config this machine has not shipped it" in captured.err
     assert "re-syncing the package" in captured.err
 
 
@@ -870,7 +962,7 @@ def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(
     that the ssh failure never leaves `ensure_package_current` as a traceback."""
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     _set_host(python="/py", pkg_commit="b" * 40)
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
     resynced = _fake_host_build(monkeypatch, None)
@@ -880,16 +972,24 @@ def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(
     assert load_registry().require("gpubox").pkg_commit == "b" * 40
 
 
-def _set_host(**changes: object) -> None:
+def _set_host(
+    *, python: str | None = None, driver_version: str | None = None, **config: object
+) -> None:
+    """Stage what this machine has cached about `gpubox`, as a connect would."""
     with registry_transaction() as registry:
-        registry.put(registry.require("gpubox").model_copy(update=changes))
+        entry = registry.require("gpubox")
+        if python or driver_version:
+            entry = entry.with_cache(python=python, driver_version=driver_version)
+        if config:
+            entry = entry.with_config({**entry.cache.config, **config})
+        registry.put(entry)
 
 
 def test_a_negative_ttl_on_add_means_no_ttl_not_an_expired_host(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """-1 stored as a TTL is a host the next reaper pass terminates."""
-    assert main(["host", "add", "h", "--ssh", "me@box", "--ttl-hours", "-1"]) == 0
+    assert main(["host", "add", "h", "--ssh", "me@box", "--gpus", "", "--ttl-hours", "-1"]) == 0
     assert load_registry().hosts["h"].ttl_hours is None
     assert main(["host", "add", "z", "--ssh", "me@box", "--ttl-hours", "0"]) == EXIT_USAGE
     assert "would expire the host the moment it exists" in capsys.readouterr().err
@@ -902,7 +1002,7 @@ def test_runpod_and_host_together_are_a_usage_error(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     assert main(["submit", str(job), "--runpod", "--gpu", "A40", "--host", "gpubox"]) == EXIT_USAGE
     assert main(["requeue", "job-1", "--host", "gpubox", "--runpod", "--gpu", "A40"]) == EXIT_USAGE
 
@@ -914,7 +1014,7 @@ def test_requeue_of_an_unknown_job_is_exit_four(
     monkeypatch.setattr(
         "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
     )
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     assert main(["requeue", "20260101-000000-nosuch", "--host", "gpubox"]) == EXIT_NOT_FOUND
     assert "no mirrored spec for job" in capsys.readouterr().err
 
@@ -924,25 +1024,29 @@ def test_purging_every_finished_job_has_to_be_asked_for_twice(
 ) -> None:
     """`--purge --all-finished` is an age horizon of 0: it deletes the job dir
     of something that ended a minute ago, log and all."""
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     assert main(["clean", "--host", "gpubox", "--purge", "--all-finished"]) == EXIT_USAGE
     assert "Add --yes to confirm" in capsys.readouterr().err
 
 
-def test_host_add_takes_gpu_indices_and_stores_them_as_given(control_env: Path) -> None:
+def test_host_add_takes_gpu_indices_and_stores_them_as_given(
+    control_env: Path, fake_host: FakeHost
+) -> None:
     """Ownership of part of a shared box is an agreement in nvidia-smi
     numbering, so resolving it here would freeze this boot's mapping into the
-    registry; the host redoes it every dispatch pass."""
+    host's config; the host redoes it every dispatch pass."""
     assert main(["host", "add", "box", "--ssh", "me@box", "--gpus", f"2,3,{GPU}"]) == 0
     assert load_registry().require("box").gpus == ["2", "3", GPU]
+    assert fake_host.config is not None and fake_host.config["gpus"] == ["2", "3", GPU]
 
 
 def test_host_add_and_set_refuse_a_gpus_value_that_is_neither(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert main(["host", "add", "box", "--gpus", "A40,2"]) == EXIT_USAGE
     assert "gpuc host probe" in capsys.readouterr().err
     assert load_registry().hosts == {}
+    assert fake_host.commands == []  # judged before the host was touched
 
     assert main(["host", "add", "box", "--gpus", "2"]) == 0
     assert main(["host", "set", "box", "--gpus", "GPU-a,nonsense"]) == EXIT_USAGE
@@ -967,7 +1071,7 @@ def test_submit_json_is_the_queued_job_and_its_notes(
 ) -> None:
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\ngpus: 0\n')
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
 
     def fake_submit_file(entry: HostEntry, *args: object, **kwargs: object) -> SubmitResult:
         # The progress a text submit prints inline must not land on the document.
@@ -1007,7 +1111,7 @@ def test_requeue_json_names_the_job_it_came_from(
         "gpuc.control.cli.submit_spec",
         lambda entry, *a, **k: SubmitResult(job_id="new", host=entry.name, attempt=2),
     )
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == 0
@@ -1019,7 +1123,7 @@ def test_requeue_json_names_the_job_it_came_from(
 def test_cancel_json_is_the_hosts_own_answer(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     monkeypatch.setattr(
         "gpuc.control.actions.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "cancelling"}])),
@@ -1038,7 +1142,7 @@ def test_reorder_json_repeats_the_priority_it_set(
         def host_cli(self, args: str, *, check: bool = True) -> object:
             return type("Result", (), {"returncode": 0})()
 
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
     argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "10", "--host", "local", "--json"]
@@ -1049,7 +1153,7 @@ def test_reorder_json_repeats_the_priority_it_set(
 def test_estimate_json_repeats_what_the_host_recorded(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     session = StubSession(
         [{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running", "warning": None}]
     )
@@ -1068,7 +1172,7 @@ def test_estimate_json_repeats_what_the_host_recorded(
 def test_estimate_reports_the_hosts_refusal(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     payload: dict[str, object] = {"job_id": "j", "error": "job j has already succeeded"}
     monkeypatch.setattr(
         "gpuc.control.actions.open_session", lambda *a, **k: as_session(StubSession([payload]))
@@ -1081,7 +1185,7 @@ def test_estimate_reports_the_hosts_refusal(
 def test_estimate_clear_asks_the_host_to_clear_it(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     session = StubSession(
         [{"job_id": "j", "estimated_runtime_min": None, "status": "queued", "warning": None}]
     )
@@ -1098,7 +1202,7 @@ def test_estimate_refuses_a_host_that_did_not_say_what_it_recorded(
     """Otherwise a build that does not know this command -- or any document
     without the key -- reads as a successful *clear* of a job it never touched.
     """
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     monkeypatch.setattr(
         "gpuc.control.actions.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "running"}])),
@@ -1115,7 +1219,7 @@ def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
     host would be dropped by a re-run without a word."""
     from gpuc.control.s3index import S3Index
 
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     s3 = FakeS3Client()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
@@ -1140,7 +1244,7 @@ def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(
 ) -> None:
     """The host has it, so the command succeeded; but a silent divergence is
     exactly what `requeue` would fall into later."""
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     monkeypatch.setattr(
         "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
@@ -1164,7 +1268,7 @@ def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(
 def test_estimate_refuses_a_bad_invocation_before_asking_any_host(
     control_env: Path, capsys: pytest.CaptureFixture[str], flags: list[str]
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     capsys.readouterr()
     assert main(["estimate", "20260101-000000-aaaaaa", "--host", "local", *flags]) == EXIT_USAGE
 
@@ -1223,7 +1327,7 @@ def test_clean_json_carries_what_went_and_what_was_kept(
 ) -> None:
     from gpuc.control.clean import CleanReport
 
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     report = CleanReport(
         host="local",
         removed=[{"job_id": "a", "status": "succeeded", "bytes": 2048, "age_days": 9.0}],
@@ -1245,7 +1349,7 @@ def test_clean_json_still_exits_one_when_the_host_reported_errors(
 ) -> None:
     from gpuc.control.clean import CleanReport
 
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     monkeypatch.setattr(
         "gpuc.control.cli.clean_host",
         lambda *a, **k: CleanReport(host="local", errors=["could not remove workdir"]),
@@ -1260,7 +1364,7 @@ def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
 ) -> None:
     from gpuc.control.probe import parse_probe
 
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     sample = (
         "===driver===\n580.173.02\n"
         "===gpus===\n0, GPU-1111, NVIDIA A40, 46068 MiB\n"
@@ -1293,7 +1397,7 @@ def test_host_probe_shows_only_assigned_gpus_unless_all_gpus_is_asked_for(
     from gpuc.control.config import load_registry
     from gpuc.control.probe import parse_probe
 
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "1"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus="1")
     sample = (
         "===driver===\n580.173.02\n"
         "===gpus===\n0, GPU-1111, NVIDIA A40, 46068 MiB\n1, GPU-2222, NVIDIA A40, 46068 MiB\n"
@@ -1325,7 +1429,7 @@ def test_host_probe_json_is_written_after_the_registry_write_it_can_fail_on(
     from gpuc.control.config import ConfigError
     from gpuc.control.probe import parse_probe
 
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     monkeypatch.setattr(
         "gpuc.control.cli.probe_host",
         lambda *a, **k: parse_probe(
@@ -1347,7 +1451,7 @@ def test_host_list_json_reports_the_host_env_by_name_only(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """`--env` is where somebody hand-sets a token, and this document travels."""
-    main(["host", "add", "local", "--gpus", GPU, "--env", "HF_TOKEN=hf_secret"])
+    register_host(name="local", gpus=GPU, env={"HF_TOKEN": "hf_secret"})
     capsys.readouterr()
     assert main(["host", "list", "--json"]) == 0
     document = one_document(capsys)
@@ -1376,8 +1480,8 @@ def bootstrapping(
 def test_host_bootstrap_all_does_every_registered_host(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="local", gpus=GPU)
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     attempted = bootstrapping(monkeypatch)
     capsys.readouterr()
 
@@ -1398,10 +1502,10 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
     """One unreachable pod must not cost the upgrade of every other host."""
     from gpuc.control.bootstrap import BootstrapError
 
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
-    main(["host", "add", "zbox", "--ssh", "me@zbox"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="zbox", kind="ssh", ssh="me@zbox")
     with registry_transaction() as registry:
-        registry.put(HostEntry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
     attempted = bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     capsys.readouterr()
 
@@ -1422,7 +1526,7 @@ def test_host_bootstrap_all_counts_the_hosts_it_could_not_read(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A host this build cannot parse was not bootstrapped either: never say "all"."""
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
     document = json.loads(hosts_file().read_text())
     document["hosts"]["bad"] = {"name": "bad", "kind": "not a kind", "port": "twenty-two"}
     hosts_file().write_text(json.dumps(document))
@@ -1440,8 +1544,8 @@ def test_host_bootstrap_all_stops_when_the_registry_stops_being_readable(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Exit 3, after saying how far it got: the next write would be a guess."""
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="local", gpus=GPU)
     attempted = bootstrapping(
         monkeypatch, fail={"local": LocalStateUnreadable("hosts.json is not json")}
     )
@@ -1458,8 +1562,8 @@ def test_host_bootstrap_all_interrupted_still_says_what_it_got_through(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Five minutes a host for health alone makes this one people do Ctrl-C."""
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="local", gpus=GPU)
     bootstrapping(monkeypatch, fail={"local": KeyboardInterrupt()})
     capsys.readouterr()
 
@@ -1479,7 +1583,7 @@ def test_host_bootstrap_all_with_no_hosts_is_not_an_error(
 def test_host_bootstrap_wants_a_name_or_all_but_not_both(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     assert main(["host", "bootstrap"]) == EXIT_USAGE
     assert "--all" in capsys.readouterr().err
     assert main(["host", "bootstrap", "local", "--all"]) == EXIT_USAGE
