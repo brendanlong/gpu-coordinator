@@ -64,18 +64,13 @@ gpuc may *borrow*, never ones it owns.
 
 ```sh
 gpuc host set spar --gpus 2,3 --shared-gpus 4,5
-gpuc host set spar --shared-min-priority 20     # optional; '' clears it
 gpuc submit job.yaml --host spar --use-shared   # or `use_shared: true` in the spec
 ```
 
-A job reaches a shared card only when all three of these hold:
+A job reaches a shared card only when both of these hold:
 
 - it asked — `use_shared: true`, or `gpuc submit --use-shared`. Off by default,
   and a job that did not ask is never dispatched to one;
-- it clears `--shared-min-priority`, if the host sets one. Priorities are
-  `0`–`99` and lower dispatches first, so this is the largest number allowed:
-  `--shared-min-priority 20` lets `0`–`20` borrow and leaves `21`–`99` waiting
-  for a card of our own;
 - **nobody else is on the card**: nvidia-smi reports 0 MiB used and 0% util for
   it, right now. Memory is the half that matters — a CUDA context holds
   hundreds of MiB between steps, so 0 MiB means no process on the card, while
@@ -99,11 +94,11 @@ It never gives a card *back*: a job that got one keeps it until it ends, so if
 the card's real owner starts something there, the two of you are sharing it and
 `gpuc preempt` is the way out.
 
-A job held up only by `--shared-min-priority` **waits**; it is never dropped
-from the queue. That gate moves — `gpuc reorder` moves a job over it and `gpuc
-host set` moves the floor — and a job the dispatcher failed would be gone for
-good. `gpuc submit` still refuses such a job up front, before anything is
-queued.
+There is no per-host setting for *which* jobs may borrow, only the per-job
+`use_shared`. Borrowing is not a reservation — whatever job gets a shared card
+holds it until it ends — so a host-level priority floor would not protect an
+important job from a trivial one, it would only pick which trivial jobs wait.
+Leave `use_shared` off for the runs that should not take somebody else's card.
 
 `gpuc status` shows the borrowed cards on their own `shared` lines, and
 `gpuc host bootstrap` refuses a card listed as both owned and shared.
@@ -700,7 +695,6 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
         { "index": 4, "uuid": "GPU-aaaa...", "name": "NVIDIA A40", "vram_mib": 46068,
           "busy_job": null, "memory_mib": 0.0, "utilization_pct": 0.0, "unused": true }
       ],
-      "shared_min_priority": null,
       "queued": [
         { "job_id": "20260915-130000-d4e5f6", "name": "sweep", "status": "queued",
           "priority": 50, "gpus_requested": 2, "gpus": [],
@@ -754,7 +748,6 @@ for the cards this host [borrows](#shared-gpus), plus what the host just read
 off each one: `unused` is its verdict — no memory held and no work running, so
 gpuc would take it — and `busy_job` means one of *our* jobs already has it. A
 shared card the host cannot see is `{"shared_as": "5", "available": false}`.
-`shared_min_priority` is the host's floor for borrowing one, null for none.
 Every job carries `use_shared`, which is whether it may be given one at all. `pkg_commit` is the host's own
 answer for the build it is running, so `null` there means the host did not say,
 never "up to date" — and a reachable host that did not say is one on a build old

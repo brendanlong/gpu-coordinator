@@ -122,7 +122,6 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
             for uuid in shared
         ],
         "shared_gpus_unavailable": shared_unavailable,
-        "shared_min_priority": config.shared_min_priority,
     }
 
 

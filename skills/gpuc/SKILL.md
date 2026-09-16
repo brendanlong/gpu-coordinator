@@ -198,8 +198,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 
 The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
 `name, kind, reachable, pkg_commit, dispatcher{alive, heartbeat_age_s},
-provider_util, gpus, shared_gpus, shared_min_priority, queued, running,
-finished, errors`; each job in those three
+provider_util, gpus, shared_gpus, queued, running, finished, errors`; each job in those three
 lists has `job_id, name, status, reason, phase, priority, elapsed_s, util,
 progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
 gpus_requested, use_shared, starts_in_s, starts_at, iso, ended_at,

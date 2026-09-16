@@ -1003,10 +1003,9 @@ def shared_view(**overrides: Any) -> HostView:
 
 
 def test_gather_reads_the_shared_cards_and_what_is_on_them() -> None:
-    got = shared_view(shared_min_priority=20)
+    got = shared_view()
     assert [card.uuid for card in got.shared] == [SHARED]
     assert got.shared[0].unused and got.shared[0].index == 4
-    assert got.shared_min_priority == 20
     assert [card.uuid for card in got.borrowable] == [SHARED]
 
 
@@ -1056,11 +1055,6 @@ def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_not_in_use() -> None
     assert got.borrowable == []
 
 
-def test_the_priority_floor_is_printed_where_the_shared_cards_are() -> None:
-    rendered = render(shared_view(shared_min_priority=20))
-    assert "only jobs at priority 20 or better (a lower number) may borrow these" in rendered
-
-
 def test_a_shared_entry_the_host_cannot_see_says_so() -> None:
     got = shared_view(shared_gpus_resolved=[], shared_gpus_unavailable=["7"])
     assert "shared  [7] UNAVAILABLE" in render(got)
@@ -1070,13 +1064,12 @@ def test_a_shared_entry_the_host_cannot_see_says_so() -> None:
 def test_a_host_on_an_older_build_simply_has_no_shared_cards() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU])
     got = gather(entry, session=cast(Any, _ScriptedSession(payload())))
-    assert got.shared == [] and got.shared_min_priority is None
+    assert got.shared == []
     assert "shared" not in render(got)
 
 
 def test_the_json_carries_the_shared_cards_and_their_verdict() -> None:
-    document = host_json(shared_view(shared_min_priority=20))
-    assert document["shared_min_priority"] == 20
+    document = host_json(shared_view())
     assert document["shared_gpus"] == [
         {
             "index": 4,
@@ -1112,13 +1105,6 @@ def test_a_job_that_cannot_fit_even_with_shared_cards_is_still_called_impossible
 def test_a_job_that_did_not_ask_is_not_credited_with_the_shared_card() -> None:
     got = shared_view()
     job = waiting("j-queued", gpus_requested=3)
-    got.queue = [job]
-    assert "the host has 2, so it will never be dispatched" in no_start_reason(got, job)
-
-
-def test_a_job_under_the_shared_floor_is_not_credited_with_it_either() -> None:
-    got = shared_view(shared_min_priority=20)
-    job = waiting("j-queued", gpus_requested=3, use_shared=True, priority=50)
     got.queue = [job]
     assert "the host has 2, so it will never be dispatched" in no_start_reason(got, job)
 

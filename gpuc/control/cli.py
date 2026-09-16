@@ -165,27 +165,6 @@ def _gpu_list(raw: str | None, flag: str = "--gpus") -> list[str]:
     return owned
 
 
-def _shared_min_priority(raw: str | None) -> int | None:
-    """`--shared-min-priority`: a number, or '' for "no floor at all".
-
-    Priorities run 0-99 and lower dispatches first, so this is a *ceiling* on
-    the number and a floor on how important a job has to be. The flag is a
-    string for the same reason `--ttl-hours` takes -1: a setting that can be
-    set and never cleared is a trap.
-    """
-    if raw == "":
-        return None
-    try:
-        value = int(raw or "")
-    except ValueError:
-        raise UsageError(
-            f"--shared-min-priority wants a priority 0-99, or '' to clear it, got {raw!r}"
-        ) from None
-    if not 0 <= value <= 99:
-        raise UsageError(f"--shared-min-priority must be 0-99, got {value}")
-    return value
-
-
 def _env_dict(pairs: Sequence[str] | None) -> dict[str, str]:
     env: dict[str, str] = {}
     for pair in pairs or []:
@@ -208,8 +187,6 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
         fields["gpus"] = _gpu_list(args.gpus)
     if args.shared_gpus is not None:
         fields["shared_gpus"] = _gpu_list(args.shared_gpus, "--shared-gpus")
-    if args.shared_min_priority is not None:
-        fields["shared_min_priority"] = _shared_min_priority(args.shared_min_priority)
     if args.env is not None:
         # The whole dict, not a merge: "set it to exactly this" is the only
         # rule that can also express "set it to nothing" (`--env ''`).
@@ -472,7 +449,6 @@ _ADDRESS_FIELDS = ("persistent_root", "gpuc_home")
 _SET_FIELDS = (
     "gpus",
     "shared_gpus",
-    "shared_min_priority",
     "persistent_root",
     "gpuc_home",
     "env",
@@ -1541,13 +1517,6 @@ def build_parser() -> argparse.ArgumentParser:
         f"reassigns its cards, and a list that overlaps the host's is refused. {GPUS_HELP}",
     )
     add.add_argument("--shared-gpus", help=SHARED_GPUS_HELP)
-    add.add_argument(
-        "--shared-min-priority",
-        metavar="N",
-        help="only jobs at this priority or better may borrow a shared GPU; priorities "
-        "run 0-99 and lower dispatches first, so this is the largest number allowed. "
-        "Omit for no floor",
-    )
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
     add.add_argument(
         "--persistent-root",
@@ -1612,12 +1581,6 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument(
         "--shared-gpus",
         help=f"replace what this host may borrow; pass '' for none. {SHARED_GPUS_HELP}",
-    )
-    edit.add_argument(
-        "--shared-min-priority",
-        metavar="N",
-        help="0-99; only jobs at this priority or better may borrow a shared GPU (lower "
-        "dispatches first, so this is the largest number allowed). Pass '' for no floor",
     )
     edit.add_argument("--persistent-root", help="pass '' to go back to $HOME")
     edit.add_argument("--gpuc-home", help="pass '' for the default under the root or $HOME")

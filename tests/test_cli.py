@@ -119,21 +119,17 @@ def test_host_add_refuses_a_gpu_list_that_overlaps_the_hosts_own(
     assert fake_host.config["gpus"] == ["2", "3"]
 
 
-def test_host_set_writes_the_shared_cards_and_the_priority_floor(
+def test_host_set_writes_the_shared_cards(
     control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == 0
     capsys.readouterr()
-    assert main(["host", "set", "gpubox", "--shared-gpus", "1", "--shared-min-priority", "20"]) == 0
-    assert fake_host.config is not None
-    assert fake_host.config["shared_gpus"] == ["1"]
-    assert fake_host.config["shared_min_priority"] == 20
-    out = capsys.readouterr().out
-    assert "shared_gpus" in out and "shared_min_priority" in out
-    # Both are clearable, which is the point of taking them as strings.
-    assert main(["host", "set", "gpubox", "--shared-gpus", "", "--shared-min-priority", ""]) == 0
+    assert main(["host", "set", "gpubox", "--shared-gpus", "1"]) == 0
+    assert fake_host.config is not None and fake_host.config["shared_gpus"] == ["1"]
+    assert "shared_gpus" in capsys.readouterr().out
+    # Clearable, which is the point of taking it as a string.
+    assert main(["host", "set", "gpubox", "--shared-gpus", ""]) == 0
     assert fake_host.config["shared_gpus"] == []
-    assert fake_host.config["shared_min_priority"] is None
 
 
 def test_a_card_cannot_be_both_owned_and_shared(
@@ -153,15 +149,6 @@ def test_a_card_cannot_be_both_owned_and_shared(
     # Disjoint is the ordinary case and goes through.
     assert main(["host", "set", "gpubox", "--shared-gpus", "1"]) == 0
     assert fake_host.config["shared_gpus"] == ["1"]
-
-
-def test_shared_min_priority_refuses_anything_that_is_not_a_priority(
-    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == 0
-    assert main(["host", "set", "gpubox", "--shared-min-priority", "high"]) == EXIT_USAGE
-    assert main(["host", "set", "gpubox", "--shared-min-priority", "100"]) == EXIT_USAGE
-    assert "must be 0-99" in capsys.readouterr().err
 
 
 def test_the_gpu_overlap_refusal_sees_through_index_and_uuid_spellings(

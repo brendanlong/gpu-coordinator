@@ -94,8 +94,6 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uui
                      #                              # see GPU ownership
                      #  "shared_gpus": ["<index>" | "GPU-uuid", ...],  # cards it may borrow while
                      #                              # nobody else is on them; see Shared GPUs
-                     #  "shared_min_priority": null | 0-99,  # a floor on how important a job must
-                     #                              # be to borrow one (null: no floor)
                      #  "provider": null | {"kind":"runpod","pod_id":..},
                      #  "idle_minutes": 15, "ttl_hours": null | N, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
@@ -934,16 +932,16 @@ difference is the whole feature: an owned card is handed out whenever it is
 free, and a shared card is only ever *borrowed* -- for one job, and only while
 nobody else is on it.
 
-Three gates, all of which have to pass:
+Two gates, both of which have to pass:
 
 1. **The job asked.** `use_shared: true` in the spec, or `gpuc submit
    --use-shared`. Off by default, because taking somebody else's card is a
    decision about a box and not about a job; a job that did not ask is never
    dispatched to one, and shared cards are not counted as capacity for it.
-2. **The job is important enough.** `shared_min_priority` on the host, when it
-   is set: priorities run 0-99 and lower dispatches first, so it is a *ceiling*
-   on the number. Null means no floor.
-3. **Nobody else is on the card.** `nvidia-smi --query-gpu=memory.used,
+   It is also *fixed*: nothing changes a queued job's `use_shared`, which is
+   what lets the dispatcher fail a job that cannot fit rather than leaving it
+   to wait forever.
+2. **Nobody else is on the card.** `nvidia-smi --query-gpu=memory.used,
    utilization.gpu` reports 0 MiB *and* 0% for it, right now. Memory is the
    stronger half -- a CUDA context holds hundreds of MiB between steps, so
    0 MiB means no process, while util alone dips to zero between epochs of
@@ -971,19 +969,21 @@ for an owned card it will not want. A card somebody else is on is left out of
 the model entirely: when they will stop is the one thing this host cannot know,
 so a job waiting for one has no start time and is told why.
 
-Two things this deliberately does not do:
+What this deliberately does not do: **yield**. Once a job is running on a
+borrowed card it keeps it until it ends. Someone else starting a job on that
+card is a collision gpuc does not detect and does not resolve; `gpuc preempt`
+is the manual way out.
 
-- **Yield.** Once a job is running on a borrowed card it keeps it until it
-  ends. Someone else starting a job on that card is a collision gpuc does not
-  detect and does not resolve; `gpuc preempt` is the manual way out.
-- **Fail a job over `shared_min_priority`.** Dropping a job out of the queue is
-  permanent, so the dispatcher only does it on a gate a queued job cannot get
-  past. `use_shared` is one -- nothing changes it after submit -- and the
-  priority floor is not: `gpuc reorder` moves a job over it, `gpuc preempt
-  --priority` brings one back above it, and `gpuc host set
-  --shared-min-priority` moves the floor under everything already waiting.
-  A job held up by the floor alone waits. `gpuc submit` still refuses it up
-  front, where nothing has been queued yet and the submitter is looking.
+There is no per-host floor on which jobs may borrow, and the absence is on
+purpose. A version of this had `shared_min_priority`, and it was both less than
+it looked and more dangerous than it looked. Less, because borrowing is not a
+reservation: a job that clears any floor still holds its borrowed card until it
+ends, so the floor never protects an important job from a trivial one -- it only
+decides which trivial jobs wait. More, because a per-host floor *moves* under
+jobs that are already queued, and the dispatcher's "this can never run here" is
+a deletion; `gpuc reorder <job> --priority 99` would have ended the job it was
+asked to move. `use_shared` does neither: it is per-job, it is explicit, and it
+is fixed at submit.
 
 A card in both lists is refused -- by `gpuc host add|set`, where it was typed,
 and by the host's own `gpu_uuids` health check at bootstrap. Should one reach a

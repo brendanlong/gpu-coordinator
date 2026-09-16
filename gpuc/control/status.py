@@ -327,8 +327,6 @@ class HostView:
     """Cards this host may borrow, and what the host just saw on each."""
     shared_unavailable: list[str] = field(default_factory=list)
     """Shared entries the host could not resolve to a card it can see."""
-    shared_min_priority: int | None = None
-    """The floor a job's priority must clear to borrow one. None means no floor."""
     pod: Pod | None = None
     pkg_commit: str | None = None
     """The commit the *host* says its package came from, not the one this
@@ -375,19 +373,13 @@ class HostView:
         """Could this job be dispatched to a shared card at all?
 
         The host's rule (`HostConfig.may_borrow`) repeated over what the host
-        reported, so the two cannot disagree about why a job is waiting. A
-        priority the host did not report counts as not clearing a floor: the
-        answer this feeds is an explanation, and guessing one is worse than the
-        general line it falls back to.
+        reported, so the two cannot disagree about why a job is waiting.
+
+        `shared_unavailable` counts: the host judges a job against the cards it
+        is *configured* with, and makes it wait for one that is missing this
+        minute rather than failing it.
         """
-        # `shared_unavailable` counts: the host judges a job against the cards
-        # it is *configured* with, and makes it wait for one that is missing
-        # this minute rather than failing it.
-        if not job.use_shared or not (self.shared or self.shared_unavailable):
-            return False
-        if self.shared_min_priority is None:
-            return True
-        return job.priority is not None and job.priority <= self.shared_min_priority
+        return job.use_shared and bool(self.shared or self.shared_unavailable)
 
     @property
     def borrowable(self) -> list[SharedGpu]:
@@ -541,7 +533,6 @@ def gather(
     # Into the one numbering table, because it is what names a card everywhere
     # it is mentioned -- including `gpu=4` on the line of a job that borrowed it.
     view.indices.update({c.uuid: c.index for c in view.shared if c.index is not None})
-    view.shared_min_priority = _as_int(payload.get("shared_min_priority"))
     # Validated like `reconcile.probe_liveness` does: a host on another build
     # could answer with a string here, and formatting it would take out the
     # whole `gpuc status`, not just this host's line.
@@ -958,11 +949,6 @@ def _shared_gpu_lines(view: HostView) -> list[str]:
             f"  shared  [{missing}] UNAVAILABLE  nvidia-smi does not report this card on the "
             f"host, so nothing is borrowed from it"
         )
-    if view.shared and view.shared_min_priority is not None:
-        lines.append(
-            f"  shared  only jobs at priority {view.shared_min_priority} or better "
-            f"(a lower number) may borrow these"
-        )
     return lines
 
 
@@ -1307,7 +1293,6 @@ def host_json(
         "pod": pod_json(view),
         "gpus": gpu_json(view),
         "shared_gpus": shared_gpu_json(view),
-        "shared_min_priority": view.shared_min_priority,
         "queued": [
             job_json(job, entry.s3_prefix, starts_in_s=starts.get(job.job_id)) for job in view.queue
         ],

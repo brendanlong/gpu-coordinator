@@ -367,7 +367,6 @@ def test_a_config_from_before_shared_gpus_borrows_nothing() -> None:
     A null means the same, from a build that made it optional again."""
     older = HostConfig.from_dict(load("config.older.json"))
     assert older.shared_gpus == []
-    assert older.shared_min_priority is None
 
     explicit_null = HostConfig.from_dict({"gpus": ["0"], "shared_gpus": None})
     assert explicit_null.shared_gpus == []

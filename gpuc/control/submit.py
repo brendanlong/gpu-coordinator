@@ -415,9 +415,10 @@ def wont_fit(spec: JobSpec, entry: HostEntry) -> str | None:
     against the config the host itself answered with a moment ago, so the
     answer arrives before the code is shipped rather than as a failed job.
 
-    A shared card counts only for a job allowed onto one, and when it is not
-    the message says which of the two gates it is -- that is the whole point of
-    checking here rather than letting the host say `needs 4 GPUs, host owns 2`.
+    A shared card counts only for a job that asked for one, and when it did not
+    the message says so -- that is the whole point of checking here rather than
+    letting the host say `needs 4 GPUs, host owns 2` and leaving somebody to
+    look for a bigger host when a word in the spec was the answer.
     """
     config = entry.config
     if spec.gpus <= len(config.gpus) + len(config.borrowable(spec)):
@@ -431,15 +432,9 @@ def wont_fit(spec: JobSpec, entry: HostEntry) -> str | None:
             f"{owns} and may borrow {shares}.\n"
             f"Submit to a bigger host, or lower `gpus:` in the spec."
         )
-    if not spec.use_shared:
-        return (
-            f"{owns}. It also has {shares} this job did not ask for: add `use_shared: true` "
-            f"to the spec to let it wait for them, or lower `gpus:`."
-        )
     return (
-        f"{owns}. Its {shares} are only for jobs at priority "
-        f"{config.shared_min_priority} or better, and this one is {spec.priority}: "
-        f"lower `priority:`, or `gpus:`."
+        f"{owns}. It also has {shares} this job did not ask for: add `use_shared: true` "
+        f"to the spec to let it wait for them, or lower `gpus:`."
     )
 
 

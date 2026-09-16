@@ -393,15 +393,6 @@ def test_a_job_that_did_not_ask_is_not_given_the_shared_cards_as_capacity(
     assert "use_shared: true" in str(exc.value)
 
 
-def test_a_job_below_the_shared_priority_floor_is_told_which_gate_it_failed(
-    control_env: Path, repo: Path
-) -> None:
-    entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"], shared_min_priority=20)
-    with pytest.raises(SubmitError) as exc:
-        submit_to(entry, repo, job_document(gpus=2, use_shared=True, priority=50))
-    assert "priority 20 or better, and this one is 50" in str(exc.value)
-
-
 def test_a_job_bigger_than_owned_and_shared_together_is_still_refused(
     control_env: Path, repo: Path
 ) -> None:

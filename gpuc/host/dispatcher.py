@@ -791,23 +791,14 @@ class Dispatcher:
         """Why this host can *never* run this job, or None if it could.
 
         This is a deletion: the caller unlinks the queue marker and writes the
-        job `failed`. So it is judged only on what a queued job cannot get
-        past, and only on the *configured* card counts.
-
-        Configured rather than resolved, because a card that is missing this
-        minute makes a job wait; it must not permanently fail a job the host is
-        perfectly well set up to run.
-
-        And `use_shared` rather than `may_borrow`, because `use_shared` is
-        fixed once a job is queued while `shared_min_priority` is not: `gpuc
-        reorder` moves a job over the floor, `gpuc preempt --priority` brings
-        one back above it, and `gpuc host set --shared-min-priority` moves the
-        floor under everything already queued. Failing on that gate would make
-        `gpuc reorder <job> --priority 99` *delete* the job it was asked to
-        move. A job held up by the floor alone waits, and `gpuc status` says so.
+        job `failed`. So everything it reads has to be fixed for the life of a
+        queued job -- the *configured* card counts, which a card that is
+        missing this minute does not change (that makes a job wait, it must
+        not fail one the host is perfectly well set up to run), and
+        `use_shared`, which nothing changes after submit.
         """
         config = self.config
-        shared = config.ever_borrowable(spec)
+        shared = config.borrowable(spec)
         if spec.gpus <= len(config.gpus) + len(shared):
             return None
         have = f"host owns {len(config.gpus)}"

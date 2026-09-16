@@ -1302,7 +1302,6 @@ def shared_host(
     *,
     owned: list[str] | None = None,
     shared: list[str] | None = None,
-    min_priority: int | None = None,
     utilization: dict[str, float] | None = None,
     memory_used: dict[str, float] | None = None,
 ) -> tuple[Dispatcher, dict[str, FakeRunnerProcess]]:
@@ -1312,7 +1311,6 @@ def shared_host(
             host="test-host",
             gpus=list(FAKE_GPUS if owned is None else owned),
             shared_gpus=list(SHARED_GPUS if shared is None else shared),
-            shared_min_priority=min_priority,
         )
     )
     dispatcher, spawned = make_dispatcher()
@@ -1431,21 +1429,6 @@ def test_a_borrowed_card_is_busy_until_its_job_ends(gpuc_home: Path) -> None:
     assert dispatcher.borrowable_gpus() == [SHARED_GPUS[0]]
 
 
-def test_the_priority_floor_keeps_low_priority_jobs_off_shared_cards(gpuc_home: Path) -> None:
-    """Priorities are 0-99 and lower dispatches first, so a floor on how
-    important a job must be is a ceiling on the number."""
-    dispatcher, _ = shared_host(min_priority=20)
-    *_, important, ordinary = enqueue_in_order(
-        *filling_the_owned_cards(priority=0),
-        {"gpus": 1, "use_shared": True, "priority": 20},
-        {"gpus": 1, "use_shared": True, "priority": 21},
-    )
-    dispatcher.run_once()
-
-    assert jobs.read_state(important).gpus == [SHARED_GPUS[0]]
-    assert jobs.read_state(ordinary).status == "queued"
-
-
 def test_a_job_too_big_even_with_shared_cards_fails_with_what_would_help(
     gpuc_home: Path,
 ) -> None:
@@ -1464,29 +1447,23 @@ def test_a_job_too_big_even_with_shared_cards_fails_with_what_would_help(
     assert "use_shared: true" in (jobs.read_state(did_not_ask).reason or "")
 
 
-def test_the_priority_floor_makes_a_job_wait_and_never_fails_it(gpuc_home: Path) -> None:
-    """The floor is administrative and movable; `use_shared` is not. Failing a
-    job on a movable gate deletes it -- and the two commands whose whole job is
-    to move a job later in the queue both move it across this gate."""
-    dispatcher, _ = shared_host(min_priority=20, memory_used={SHARED_GPUS[1]: 4096.0})
-    (job_id,) = enqueue_in_order({"gpus": 4, "use_shared": True, "priority": 0})
-    dispatcher.run_once()
-    assert jobs.read_state(job_id).status == "queued"
-
-    # `gpuc reorder <job> --priority 99` was asked to move the job, not to end it.
-    queue.reorder(job_id, 99)
-    dispatcher.run_once()
+def test_a_job_the_host_could_run_is_never_dropped_from_the_queue(gpuc_home: Path) -> None:
+    """The dispatcher's "this can never run here" is a deletion, so it may only
+    read what is fixed for a queued job's life. The card counts are configured
+    rather than resolved, and `use_shared` cannot change after submit -- so a
+    job that fits on paper waits however long the borrowing takes."""
+    dispatcher, _ = shared_host(memory_used={SHARED_GPUS[1]: 4096.0})
+    (job_id,) = enqueue_in_order({"gpus": 4, "use_shared": True})
+    for _ in range(3):
+        dispatcher.run_once()
     assert jobs.read_state(job_id).status == "queued"
     assert [e.job_id for e in queue.list_queued()] == [job_id]
 
-    # And the floor itself moves under jobs that are already waiting.
-    jobs.merge_config({"shared_min_priority": 0})
+    # Moving it later in the queue moves it; it does not end it.
+    queue.reorder(job_id, 99)
     dispatcher.run_once()
     assert jobs.read_state(job_id).status == "queued"
 
-    # Back under the floor, and with the borrowed card free, it runs -- so it
-    # really was only ever waiting.
-    queue.reorder(job_id, 0)
     dispatcher.deps.smi = fake_smi(ALL_GPUS)
     dispatcher.run_once()
     assert jobs.read_state(job_id).gpus == ALL_GPUS

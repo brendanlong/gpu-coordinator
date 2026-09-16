@@ -562,14 +562,6 @@ class HostConfig:
     nvidia-smi says the card holds no memory and is doing no work. Nothing
     here is counted as capacity for a job that did not ask.
     """
-    shared_min_priority: int | None = None
-    """A floor on how important a job must be to borrow a shared card.
-
-    Priorities are 0-99 and *lower dispatches first*, so this is the largest
-    number a job may carry: `shared_min_priority: 20` lets priority 0-20 onto
-    the shared cards and leaves 21-99 waiting for an owned one. Null (the
-    default) puts no floor on it, so any job that asked may borrow.
-    """
     provider: dict[str, Any] | None = None
     idle_minutes: float = 15.0
     ttl_hours: float | None = None
@@ -623,7 +615,6 @@ class HostConfig:
             host=as_str(fields, "host", "local") or "local",
             gpus=as_str_list(fields, "gpus"),
             shared_gpus=as_str_list(fields, "shared_gpus"),
-            shared_min_priority=as_opt_int(fields, "shared_min_priority"),
             provider=provider if isinstance(provider, dict) else None,
             idle_minutes=as_float(fields, "idle_minutes", 15.0),
             ttl_hours=as_opt_float(fields, "ttl_hours"),
@@ -655,29 +646,19 @@ class HostConfig:
         return [entry for entry in self.shared_gpus if entry not in owned]
 
     def may_borrow(self, spec: JobSpec) -> bool:
-        """May this job be given one of this host's shared cards *now*?
+        """May this job be given one of this host's shared cards?
 
-        Two gates, both about the job rather than about what the cards are
-        doing this second -- whether one is free is the dispatcher's question,
-        asked only once this has said yes.
+        About the job, not about what the cards are doing this second --
+        whether one is free is the dispatcher's question, asked only once this
+        has said yes. And fixed for the life of a queued job: nothing changes
+        a spec's `use_shared` after submit, which is what lets the dispatcher
+        *fail* a job this says no to rather than leaving it to wait forever.
         """
-        if not spec.use_shared or not self.shared_gpus:
-            return False
-        return self.shared_min_priority is None or spec.priority <= self.shared_min_priority
+        return spec.use_shared and bool(self.shared_gpus)
 
     def borrowable(self, spec: JobSpec) -> list[str]:
-        """The shared entries this job may reach now, for counting capacity."""
+        """The shared entries this job may reach, for counting capacity."""
         return self.shared_entries() if self.may_borrow(spec) else []
-
-    def ever_borrowable(self, spec: JobSpec) -> list[str]:
-        """The shared entries this job could reach at *some* priority.
-
-        The difference from `borrowable` is what may be used to decide a job
-        can never run here: `use_shared` is fixed once a job is queued, but
-        `shared_min_priority` is not -- `gpuc reorder` moves a job over the
-        floor and `gpuc host set` moves the floor.
-        """
-        return self.shared_entries() if spec.use_shared else []
 
     def bin_dirs(self) -> list[str]:
         """Directories from `env` to put on PATH, in order, without duplicates."""
