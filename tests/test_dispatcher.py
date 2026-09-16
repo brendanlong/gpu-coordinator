@@ -1518,3 +1518,147 @@ def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) 
     queue.enqueue(make_spec(gpus=1, use_shared=True))
     dispatcher.run_once()
     assert sum("memory.used" in " ".join(args) for args in asked) == 1
+
+
+# -- automatic preemption -----------------------------------------------------
+
+
+def test_an_auto_preempt_job_gives_its_cards_to_a_more_important_one(gpuc_home: Path) -> None:
+    """The whole feature: nobody ran a command, and the cheap job is queued
+    again rather than lost."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(cheap).status == "running"
+
+    urgent = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
+    assert queue.kill_reason(cheap) == "preempted"
+    assert f"auto_preempt: stopping so job {urgent}" in paths.log_file(cheap).read_text()
+
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(urgent).status == "running"
+    state = jobs.read_state(cheap)
+    assert (state.status, state.attempt) == ("queued", 2)
+
+
+@pytest.mark.parametrize("priority", [80, 50])
+def test_an_auto_preempt_job_keeps_its_cards_when_nothing_better_is_waiting(
+    gpuc_home: Path, priority: int
+) -> None:
+    """Equal priority counts as "not better": the stopped job's id is the older
+    one, so it would win the tie, take its own cards straight back, and be
+    preempted again for ever without either job getting anywhere."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=50, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=priority))
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+    assert queue.kill_reason(cheap) is None
+
+
+def test_a_job_that_never_asked_for_it_is_not_preempted(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=2, priority=80))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=1))
+    dispatcher.run_once()
+    assert not queue.is_preempted(job_id)
+
+
+def test_nothing_is_stopped_when_it_would_not_free_enough_cards(gpuc_home: Path) -> None:
+    """One of the two cards the waiting job needs starts nothing, and the
+    attempt it costs is thrown away for a job that still waits."""
+    cheap = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    queue.enqueue(make_spec(gpus=1, priority=80))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+def test_only_as_many_jobs_are_stopped_as_the_waiting_one_needs(gpuc_home: Path) -> None:
+    """And the second pass, with the first job still stopping, does not take
+    another: the cards it is about to hand back already cover the gap."""
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=70, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    # The least important of the two.
+    assert queue.is_preempted(first)
+    assert not queue.is_preempted(second)
+    dispatcher.run_once()
+    assert not queue.is_preempted(second)
+
+
+def test_the_shortest_running_of_two_equals_is_the_one_that_gives_way(gpuc_home: Path) -> None:
+    """What a preempt throws away is the work the attempt has already done."""
+    older = queue.enqueue(
+        make_spec(job_id="20260101-000000-aaaaaa", gpus=1, priority=80, auto_preempt=True)
+    )
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    younger = queue.enqueue(
+        make_spec(job_id="20260101-000001-bbbbbb", gpus=1, priority=80, auto_preempt=True)
+    )
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(younger)
+    assert not queue.is_preempted(older)
+
+
+def test_two_waiting_jobs_are_given_a_card_each(gpuc_home: Path) -> None:
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    queue.enqueue(make_spec(gpus=1, priority=11))
+    dispatcher.run_once()
+    assert queue.is_preempted(first)
+    assert queue.is_preempted(second)
+
+
+def test_a_cancelled_job_in_the_queue_is_not_worth_preempting_for(gpuc_home: Path) -> None:
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    doomed = queue.enqueue(make_spec(gpus=2, priority=10))
+    queue.cancel(doomed)
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+@pytest.mark.parametrize("marker", ["paused", "draining"])
+def test_a_host_that_is_dispatching_nothing_preempts_nothing(gpuc_home: Path, marker: str) -> None:
+    """The cards would go to nobody: the job is stopped and nothing replaces it."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    (paths.paused_file() if marker == "paused" else paths.draining_file()).touch()
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+def test_a_pod_past_its_ttl_preempts_nothing(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It is about to terminate, so the waiting job would never be dispatched
+    and the stopped one would not even be queued again."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)

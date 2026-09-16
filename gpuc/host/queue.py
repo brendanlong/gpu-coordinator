@@ -320,8 +320,19 @@ def _log_requeue(job_id: str, attempt: int, priority: int) -> None:
     `gpuc logs` is where somebody looks at a job that has restarted, and
     without this the log simply runs two attempts together.
     """
+    note(
+        job_id,
+        f"preempted; queued again as attempt {attempt} at priority {priority}, "
+        f"to run from the start in this same workdir",
+    )
+
+
+def note(job_id: str, message: str) -> None:
+    """Append one `>>>` line to the job's own log, as the runner does.
+
+    Never raises, and never the only record of anything: the dispatcher log has
+    its own line. This one is for whoever is reading `gpuc logs <id>` and needs
+    to know why the output stops and starts again.
+    """
     with contextlib.suppress(OSError), paths.log_file(job_id).open("ab") as log:
-        log.write(
-            f">>> preempted; queued again as attempt {attempt} at priority "
-            f"{priority}, to run from the start in this same workdir\n".encode()
-        )
+        log.write(f">>> {message}\n".encode())

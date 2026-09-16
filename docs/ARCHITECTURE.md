@@ -178,6 +178,9 @@ All state writes are atomic (write temp in same dir, `os.replace`).
                                         # its last line of stdout is a percentage. See Estimates
   "progress_interval_s": 60,
   "low_util": {"enabled": true, "window_min": 25, "floor_pct": 5, "grace_min": 10},
+  "auto_preempt": false,                # let the dispatcher stop this job, as often as it
+                                        # takes, whenever that starts a strictly more
+                                        # important queued one right away
   "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
   "attempt": 1                          # set by `gpuc requeue` and `gpuc preempt`, not by the submitter
@@ -258,6 +261,22 @@ queue's lexical order, not submission order below one second.
   A kill marker the dispatcher did not write gets a clock in `escalate_kills`
   the first pass it sees one, so a runner that ignores a preempt is escalated
   like any other kill.
+- Automatic preemption: after `launch_ready` -- so everything still queued is
+  something the free cards could not take -- `preempt_for_waiting` walks the
+  queue and, for each job that does not fit, asks whether stopping the running
+  jobs whose spec says `auto_preempt` would let it start. It stops them only if
+  together they cover the *whole* gap (freeing one of two cards costs an attempt
+  and starts nothing), only for a queued job at a strictly lower priority number
+  (at the same priority the stopped job's older id wins the tie and it would
+  take its own cards straight back, for ever), and never on a host that is
+  paused or `_going_away`. Cards held by a job that is already stopping count as
+  free, or the next pass preempts a second job for a gap the first already
+  covers. Candidates go least important first, and among equals the one that
+  started most recently, since what a preempt throws away is the work already
+  done. The stop itself is `queue.preempt`, so everything above is the ordinary
+  preempt path -- including the re-queue at the job's own priority, which is
+  what makes the more important job win the next dispatch. Nothing counts how
+  often a job has given way: `auto_preempt` accepts being starved.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.

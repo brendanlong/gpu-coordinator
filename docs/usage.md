@@ -27,6 +27,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `progress_command` | none | run in the workdir during phase `main`; its last line of stdout is how far along the job is |
 | `progress_interval_s` | `60` | how often to run it; **minimum 5** |
 | `low_util` | on | `{enabled: true, window_min: 25, floor_pct: 5, grace_min: 10}` — the idle-GPU watchdog |
+| `auto_preempt` | `false` | let the host stop this job whenever that lets a job queued at a **lower** `priority` number start right away; see [automatic preemption](#automatic-preemption) |
 | `requires` | `{}` | e.g. `cuda_min: "12.8"`. **Informs provisioning only**; the host never checks it |
 | `cleanup` | `on_success` | when the runner deletes `workdir/`: `on_success`, `always`, `never` |
 | `attempt` | `1` | set by `gpuc requeue`, never by you; a submitter's value is ignored |
@@ -197,6 +198,36 @@ they hold no card, so they can neither free one nor make the answer sooner. If
 *nothing* holding a card estimated an end time there is no line at all, since
 the gpu lines above it already say every card is busy.
 
+## Automatic preemption
+
+`auto_preempt: true` in the spec says the same thing the command does, without
+anyone being there to type it: the host stops the job whenever doing so lets a
+job queued at a **lower** `priority` number start right away, and queues it
+again as its next attempt. It re-runs from the start in the workdir it left
+behind, exactly as `gpuc preempt` does, so it belongs to work that is cheap to
+repeat — a sweep point, an eval, a job that checkpoints and resumes — and not
+to a run whose `setup:` would trip over its own leftovers.
+
+The host only does it when it is worth it, and the rules are the command's:
+
+- **It has to be enough.** Freeing one of the two cards the waiting job needs
+  would cost an attempt and start nothing, so a job is stopped only when what
+  is stopped covers the whole gap. Several are stopped together where one is
+  not enough, least important first, and among equals the one that has been
+  running the shortest time.
+- **The waiting job has to be strictly more important.** At the *same*
+  priority nothing happens: dispatch order is `<priority>-<job id>` and the
+  stopped job's id is the older one, so it would win the tie and take its own
+  cards straight back. A job queued at a higher number never preempts anything.
+- **The host has to be dispatching.** Paused, draining or past its
+  `--ttl-hours`, nothing is stopped: the cards would go to nobody.
+
+There is **no limit on how often** one job gives way, and none on how long it
+then waits. A host with a steady supply of more important work may never run it
+at all; that is what marking it auto-preemptable asked for. `gpuc status` shows
+`auto-preempt` on those jobs, queued or running, and the dispatcher log and the
+job's own log name the job each preempt made room for.
+
 ## What gets synced to the host
 
 `gpuc submit` rsyncs `git ls-files --cached --others --exclude-standard`: every
@@ -341,6 +372,10 @@ for takes the cards next if it is queued at a **lower** number — the ordinary
 case, and no flag is needed for it. At the **same** priority it does not:
 dispatch order is `<priority>-<job id>`, and the preempted job was submitted
 first, so its id sorts ahead and it takes its own cards straight back.
+
+A job may also volunteer for this: `auto_preempt: true` in its spec has the
+host do it whenever something more important is waiting, with no command at
+all. See [automatic preemption](#automatic-preemption).
 
 **It only works when something can take its place.** Preempting costs the job
 everything it has done, so a preempt that would just re-run the same job is
@@ -609,7 +644,8 @@ job's group, after 30 s it SIGTERMs the runner itself, after 45 s it SIGKILLs
 the runner's group. It never signals the runner's group during the launch
 window, when the runner is the only member of it.
 
-`gpuc preempt` uses the same machinery with one extra marker: the runner stops
+`gpuc preempt` (and [`auto_preempt`](#automatic-preemption), which is the same
+thing without the command) uses the same machinery with one extra marker: the runner stops
 the job and records `failed: preempted` after its final sync, and the dispatcher
 then writes the job's state back to `queued` as the next attempt and puts a
 queue marker back. So a preempted job is briefly visible as `failed:
@@ -644,7 +680,7 @@ Every `failed: <reason>`:
 | `low-util-pause` | the host paused after two low-util failures and asked this job to stop so it could drain |
 | `timeout` | `max_runtime_min` elapsed |
 | `ttl` | the host's opt-in `--ttl-hours` cap elapsed |
-| `preempted` | `gpuc preempt` stopped this attempt; the job is queued again as the next one, and this is the record of the attempt that was stopped |
+| `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt; the job is queued again as the next one, and this is the record of the attempt that was stopped |
 | `terminated` | the runner itself was signalled (and the job was not cancelled) |
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`, and any other reason gains `+sync` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. Appends `+no-outputs` the same way |

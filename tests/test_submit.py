@@ -482,6 +482,13 @@ def test_hf_create_survives_validation_into_the_spec() -> None:
     assert validate(job_document(outputs=[{"path": "ckpt", "hf": "org/repo"}]))
 
 
+def test_auto_preempt_survives_validation_into_the_spec() -> None:
+    """`gpuc requeue` re-validates the mirrored spec, so a field the model does
+    not know is a job that comes back without it -- or not at all."""
+    assert validate(job_document(auto_preempt=True)).to_spec("20260915-000000-aaaaaa").auto_preempt
+    assert not validate(job_document()).to_spec("20260915-000000-aaaaaa").auto_preempt
+
+
 def test_the_estimate_fields_survive_validation_into_the_spec() -> None:
     model = validate(
         job_document(

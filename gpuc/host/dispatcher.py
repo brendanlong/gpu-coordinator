@@ -386,6 +386,36 @@ class _Running:
 
 
 @dataclass
+class Preemptable:
+    """A running job whose spec said it may be stopped for something better."""
+
+    job_id: str
+    priority: int
+    gpus: list[str]
+    started_at: str
+
+
+def enough_to_start(candidates: list[Preemptable], priority: int, gap: int) -> list[Preemptable]:
+    """Which of these to stop so a job at `priority` gets `gap` more cards.
+
+    All of them or none: freeing one of the two cards a job needs would cost an
+    attempt and start nothing. Least important first, and among equals the one
+    that has been running the shortest time, because what a preempt throws away
+    is the work the attempt has already done.
+    """
+    chosen: list[Preemptable] = []
+    freed = 0
+    for candidate in sorted(candidates, key=lambda c: (c.priority, c.started_at), reverse=True):
+        if freed >= gap:
+            break
+        if candidate.priority <= priority or not candidate.gpus:
+            continue
+        chosen.append(candidate)
+        freed += len(candidate.gpus)
+    return chosen if freed >= gap else []
+
+
+@dataclass
 class Dispatcher:
     deps: DispatcherDeps = field(default_factory=DispatcherDeps)
     running: dict[str, _Running] = field(default_factory=dict)
@@ -903,6 +933,113 @@ class Dispatcher:
                 f"{','.join(assigned) if assigned else 'cpu'}{borrowed}"
             )
 
+    # -- automatic preemption --------------------------------------------
+    def preempt_for_waiting(self) -> None:
+        """Stop `auto_preempt` jobs when that starts a more important one now.
+
+        After `launch_ready`, so everything still queued is something the free
+        cards could not take, and the only question left is whether stopping a
+        job that said it may be stopped would let one of them run. Two things
+        have to hold, and they are what keep this from being a way to lose work
+        for nothing:
+
+        * it has to be enough. A preempt that frees one of the two cards the
+          waiting job needs costs an attempt and starts nothing.
+        * the waiting job has to be *strictly* more important. At equal
+          priority the stopped job's id is the older one, so it would win the
+          tie, take its own cards straight back, and be preempted again on the
+          next pass for ever.
+
+        There is no limit on how often one job gives way: `auto_preempt` says
+        it would rather start over than hold a card something better wants, and
+        a host with a steady supply of better work may never run it at all.
+        """
+        if self.paused() or self._going_away() is not None:
+            return
+        candidates = self.auto_preemptable()
+        if not candidates:
+            return
+        # Cards a job that is already stopping is about to hand back. Counted
+        # here, or the next pass preempts a second job for a gap the first one
+        # has already covered -- and the job it was covering it for is still
+        # queued, because nothing starts until the runner is really gone.
+        available = len(self.free_gpus()) + sum(
+            len(entry.gpus) for job_id, entry in self.running.items() if self._stopping(job_id)
+        )
+        for waiting in queue.list_queued():
+            if queue.is_cancelled(waiting.job_id):
+                continue
+            try:
+                spec = jobs.read_spec(waiting.job_id)
+            except (RuntimeError, OSError):
+                continue  # `launch_ready` is what drops an unreadable spec
+            if spec.gpus <= available:
+                # Nothing has to be stopped for this one: it starts as soon as
+                # those cards come back, and they are no longer going spare.
+                available -= spec.gpus
+                continue
+            for candidate in enough_to_start(candidates, waiting.priority, spec.gpus - available):
+                if not self._preempt_for(candidate, waiting):
+                    continue
+                candidates.remove(candidate)
+                available += len(candidate.gpus)
+            if spec.gpus <= available:
+                available -= spec.gpus
+
+    def auto_preemptable(self) -> list[Preemptable]:
+        """The running jobs whose spec said they may be stopped for better work.
+
+        Never one that is already stopping: its cards are counted as coming
+        free instead, and a second kill request would say nothing new.
+        """
+        found: list[Preemptable] = []
+        for job_id, entry in self.running.items():
+            if self._stopping(job_id):
+                continue
+            try:
+                spec = jobs.read_spec(job_id)
+            except (RuntimeError, OSError):
+                continue
+            state = self._state_or_empty(job_id)
+            if not spec.auto_preempt or state.status != "running":
+                continue
+            found.append(
+                Preemptable(job_id, spec.priority, list(entry.gpus), state.started_at or "")
+            )
+        return found
+
+    @staticmethod
+    def _stopping(job_id: str) -> bool:
+        """Already asked to stop, so its cards are on their way back anyway."""
+        return queue.kill_reason(job_id) is not None or queue.is_cancelled(job_id)
+
+    def _preempt_for(self, candidate: Preemptable, waiting: queue.QueueEntry) -> bool:
+        """Stop one auto-preemptable job, saying in both logs who took its place.
+
+        The job's own log because that is where somebody looks at output that
+        stops mid-run; a failure is only the dispatcher's, since the job itself
+        is untouched and still running.
+        """
+        try:
+            queue.preempt(candidate.job_id)
+        except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
+            self.log(
+                f"job {candidate.job_id} is auto_preempt but was not stopped for "
+                f"{waiting.job_id} ({exc}); it keeps its cards"
+            )
+            return False
+        self.log(
+            f"job {candidate.job_id} (auto_preempt, priority {candidate.priority}) is being "
+            f"stopped so job {waiting.job_id} (priority {waiting.priority}) can have its "
+            f"{len(candidate.gpus)} card(s); it goes back in the queue as the next attempt"
+        )
+        queue.note(
+            candidate.job_id,
+            f"auto_preempt: stopping so job {waiting.job_id} (priority {waiting.priority}) "
+            f"can have these GPUs",
+        )
+        return True
+
     # -- pause / terminate ----------------------------------------------
     def paused(self) -> bool:
         return paths.paused_file().exists()
@@ -1204,6 +1341,7 @@ class Dispatcher:
         self.escalate_kills()
         self.check_pause()
         self.launch_ready()
+        self.preempt_for_waiting()
         self.maybe_reclaim()
         self.maybe_terminate()
 

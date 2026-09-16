@@ -133,6 +133,10 @@ class JobView:
     where there is one, from the spec's `estimated_runtime_min` otherwise."""
     estimated_runtime_min: float | None = None
     """The submitter's own estimate, which is all a *queued* job has."""
+    auto_preempt: bool = False
+    """This job asked to be stopped and queued again whenever that lets a more
+    important one start, so a `running` line for it is not a promise that it
+    will still be running in a minute."""
     progress_error: str | None = None
     """Why this job's `progress_command` last produced nothing.
 
@@ -463,6 +467,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
+            auto_preempt=bool(entry.get("auto_preempt")),
             progress_error=_as_str(entry.get("progress_error")),
             workdir_bytes=_as_int(entry.get("workdir_bytes")),
             outputs_pending=bool(entry.get("outputs_pending")),
@@ -635,6 +640,11 @@ def _fmt_starts(job: JobView, starts: dict[str, float]) -> str:
     """` starts in ~2h10m`: when this job's turn comes, where that is known."""
     seconds = starts.get(job.job_id)
     return "" if seconds is None else f" starts {_fmt_wait(seconds)}"
+
+
+def _fmt_auto_preempt(job: JobView) -> str:
+    """` auto-preempt`: this job gives its cards up to anything more important."""
+    return " auto-preempt" if job.auto_preempt else ""
 
 
 def _fmt_estimate(job: JobView, *, total: bool = False) -> str:
@@ -1037,13 +1047,13 @@ def render(
         lines.append(
             f"{mark} {_job_label(job)} phase={job.phase or '-'} {_fmt_minutes(job)} "
             f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
-            f"{_fmt_eta(job)}"
+            f"{_fmt_eta(job)}{_fmt_auto_preempt(job)}"
         )
     starts = queue_start_estimates(view)
     for job in view.queue:
         lines.append(
             f"  queued  {_job_label(job)} prio={job.priority}{_fmt_cards(job)}"
-            f"{_fmt_estimate(job)}{_fmt_starts(job, starts)}"
+            f"{_fmt_estimate(job)}{_fmt_starts(job, starts)}{_fmt_auto_preempt(job)}"
         )
     free = next_free_line(view)
     if free:
@@ -1143,6 +1153,7 @@ def job_json(
         "eta": job.eta,
         "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),
         "estimated_runtime_min": job.estimated_runtime_min,
+        "auto_preempt": job.auto_preempt,
         "progress_error": job.progress_error,
         "gpus": list(job.gpus),
         "gpus_requested": job.gpus_requested,

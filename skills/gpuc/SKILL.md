@@ -79,6 +79,10 @@ max_runtime_min: 720               # optional wall-clock cap
 estimated_runtime_min: 480         # optional; what `gpuc status` shows the next person
 progress_command: "tail -1 results/progress.txt"   # optional; last stdout line is a percentage
 progress_interval_s: 60            # prints `0.42` or `42%`; a bare `42` is refused; min 5
+auto_preempt: false                # true: the host stops this job whenever that lets a job
+                                   # queued at a LOWER priority number start now, and queues it
+                                   # again as attempt+1. It RE-RUNS FROM THE START, any number
+                                   # of times, and may wait for ever on a busy host
 low_util:                          # kills a job whose GPU sits idle; defaults are conservative
   enabled: true                    # {window_min: 25, floor_pct: 5, grace_min: 10}
 cleanup: on_success                # workdir deleted after a successful run
@@ -168,7 +172,8 @@ A job's status is its exit code. `failed: <reason>` reasons you will see:
 credentials missing), `low-util` (idle GPU), `low-util-pause` (the host paused
 after two low-util failures and stopped this job so it could drain), `timeout`
 (`max_runtime_min`), `ttl` (the host's opt-in lifetime cap ran out), `preempted`
-(`gpuc preempt` stopped that attempt; the job is queued again as the next one), `sync`
+(`gpuc preempt` -- or the job's own `auto_preempt` -- stopped that attempt; the job is
+queued again as the next one), `sync`
 (final upload failed; results exist only on the host), `no-outputs` (the output
 path was never written), `terminated`, `runner-died`.
 

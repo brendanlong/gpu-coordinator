@@ -292,6 +292,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "eta",
         "eta_s",
         "estimated_runtime_min",
+        "auto_preempt",
         "progress_error",
         "gpus",
         "gpus_requested",

@@ -147,6 +147,11 @@ function jobLabel(job) {
     job.name ? el("span", { class: "job-name" }, job.name, " ") : null,
     el("span", { class: "job-id" }, job.job_id),
     job.attempt > 1 ? el("span", { class: "muted" }, ` attempt ${job.attempt}`) : null,
+    // Only while it is queued or running: on a finished job it would read as
+    // something that happened to it rather than something it allows.
+    job.auto_preempt && (job.status === "queued" || job.status === "running")
+      ? el("span", { class: "muted", title: "stopped and queued again whenever that lets a more important job start" }, " auto-preempt")
+      : null,
   );
 }
 
