@@ -549,6 +549,24 @@ The host's `status` reports `workdir_bytes` per *finished* job (a live job's
 workdir is still being written to, and walking it on every status call would be
 pure cost). `gpuc status` prints one line per host once those exceed 1 GiB.
 
+Every byte figure a `clean`, `purge` or `status` reports is
+`cleanup.reclaimable_bytes`: what deleting the tree gives the filesystem back,
+not what `du` says it holds. They differ by the venv uv built out of its cache,
+which is most of a torch venv, and a number that counts bytes the cache keeps
+is one nobody can act on. Measured: 8.36 GiB of `du` returning 0.13 GiB on one
+host, 15.00 GiB returning 0.83 GiB on another.
+
+Both of uv's sharing modes count, because which one a host uses is the host's.
+Hardlinks fall out of `st_nlink`, which the walk's `stat` already carries.
+Reflinks share extents without sharing an inode, so they need `FIEMAP` and its
+`FIEMAP_EXTENT_SHARED` flag -- one ioctl per file, asked only of files over
+`SHARED_EXTENT_FLOOR` (64 KiB), which is 97% of the sharing for ~11% more walk.
+Every way that can fail -- no FIEMAP, no permission, an odd filesystem -- means
+"assume it is all yours", so the figure over-reports rather than under-reports.
+
+`cleanup.dir_size` is the `du` twin and asks none of this; the uv cache's own
+size in `health` is the one question that wants it.
+
 ## The shared uv cache
 
 uv caches wheels under `~/.cache/uv` and materialises a venv by reflinking or

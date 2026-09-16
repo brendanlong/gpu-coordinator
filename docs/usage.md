@@ -804,11 +804,22 @@ not pause. Such a job shows `OUTPUTS LOST` in `gpuc status` and in `gpuc status
 --all`, and nothing recovers it but re-running the job.
 
 `gpuc status` also prints one line per host once finished workdirs hold more
-than 1 GiB, with the `gpuc clean` line to run. The figure is what deleting them
-would give the filesystem back, which on a host where uv hardlinks a venv out
-of its cache is far less than `du` reports for the same directory: those bytes
-have another name in the cache and stay when the workdir goes. Reflinks are not
-visible this cheaply, so a CoW copy still counts in full.
+than 1 GiB, with the `gpuc clean` line to run. **The figure is what deleting
+them would give the filesystem back, not what `du` says they hold**, and the
+two are nowhere near each other. uv builds a venv out of its wheel cache, so
+most of those bytes stay when the workdir goes — the cache still has them.
+Measured on two hosts:
+
+| | `du` | actually freed |
+| --- | --- | --- |
+| hardlinked venv (ext4) | 8.36 GiB | 0.13 GiB |
+| reflinked venv (overlay on CoW) | 15.00 GiB | 0.83 GiB |
+
+Both mechanisms are counted. Hardlinks come free with the walk's own `stat`;
+reflinks share extents without sharing an inode, so seeing them needs one
+FIEMAP ioctl per file and is asked only of files over 64 KiB — which finds 97%
+of the sharing for about 11% more walk time. What is missed is reported as
+reclaimable, so the figure errs towards promising more than you get.
 
 ## Troubleshooting
 

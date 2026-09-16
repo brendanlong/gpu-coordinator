@@ -503,6 +503,83 @@ def test_reclaimable_bytes_skips_what_a_link_outside_the_tree_still_holds(
     assert linked_only < 100_000, "counted bytes the cache still holds"
 
 
+def reflink(source: Path, target: Path) -> bool:
+    """`cp --reflink=always`, or False where the filesystem cannot."""
+    import subprocess
+
+    return (
+        subprocess.run(
+            ["cp", "--reflink=always", str(source), str(target)],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def test_reclaimable_bytes_skips_extents_a_file_outside_the_tree_shares(
+    gpuc_home: Path, tmp_path: Path
+) -> None:
+    """uv's `clone` link mode: shared extents, `st_nlink` of 1, nothing to see
+    without FIEMAP."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    cached = cache / "wheel.bin"
+    cached.write_bytes(b"x" * (4 * cleanup.SHARED_EXTENT_FLOOR))
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    if not reflink(cached, root / "cloned.bin"):
+        pytest.skip("this filesystem has no reflinks, so there is nothing to detect")
+    assert (root / "cloned.bin").stat().st_nlink == 1, "a reflink is not a hardlink"
+
+    assert cleanup.dir_size(root) >= 4 * cleanup.SHARED_EXTENT_FLOOR
+    assert cleanup.reclaimable_bytes(root) < cleanup.SHARED_EXTENT_FLOOR
+
+
+def test_shared_extent_bytes_answers_zero_rather_than_raising(
+    gpuc_home: Path, tmp_path: Path
+) -> None:
+    """Every failure means "assume it is all yours": over-report, never raise."""
+    assert cleanup.shared_extent_bytes(str(tmp_path / "does-not-exist")) == 0
+    ordinary = tmp_path / "plain.bin"
+    ordinary.write_bytes(b"z" * (2 * cleanup.SHARED_EXTENT_FLOOR))
+    # A file nothing else references: zero either way, whatever the fs answers.
+    assert cleanup.shared_extent_bytes(str(ordinary)) == 0
+
+
+def test_small_files_are_not_worth_an_ioctl(gpuc_home: Path, tmp_path: Path) -> None:
+    """The floor is a real cutoff, not decoration."""
+    asked: list[str] = []
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "big.bin").write_bytes(b"x" * (2 * cleanup.SHARED_EXTENT_FLOOR))
+    (root / "small.bin").write_bytes(b"y" * 32)
+
+    real = cleanup.shared_extent_bytes
+
+    def spy(path: str) -> int:
+        asked.append(Path(path).name)
+        return real(path)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "shared_extent_bytes", spy)
+        cleanup.reclaimable_bytes(root)
+    assert asked == ["big.bin"]
+
+
+def test_du_sizing_never_asks_the_filesystem_about_sharing(gpuc_home: Path, tmp_path: Path) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "big.bin").write_bytes(b"x" * (2 * cleanup.SHARED_EXTENT_FLOOR))
+
+    def refuse(path: str) -> int:
+        raise AssertionError("du sizing asked about shared extents")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "shared_extent_bytes", refuse)
+        assert cleanup.dir_size(root) >= 2 * cleanup.SHARED_EXTENT_FLOOR
+
+
 def test_reclaimable_bytes_counts_a_file_once_every_link_to_it_is_in_the_tree(
     gpuc_home: Path, tmp_path: Path
 ) -> None:
