@@ -454,9 +454,12 @@ preconditions, both read from the job's own `state.json` on the host:
   reason is `not backed up: no s3_prefix on this host` or `not backed up: final
   upload failed`.
 - **outputs confirmed**: `outputs_synced_at` is set, or the spec declares no
-  `outputs:`, or the workdir is already gone. Otherwise `outputs not confirmed
-  uploaded` — `outputs:` paths live inside the workdir and a failed job keeps
-  its workdir, so purging one could bin the only copy of a checkpoint.
+  `outputs:`, or the workdir is already gone, or the job never wrote its
+  outputs — a job that died in its GPU preflight or its `setup`, and one whose
+  output dir holds only files that came with the checkout, produced nothing to
+  lose. Otherwise `outputs not confirmed uploaded` — `outputs:` paths live
+  inside the workdir and a failed job keeps its workdir, so purging one could
+  bin the only copy of a checkpoint.
 
 `--force` overrides those two and nothing else, and says so per job.
 `--verify` (control side only) HEADs each candidate's mirrored `log.txt` under
@@ -475,9 +478,12 @@ submit rather than on a timer. Each pass also does the ordinary workdir clean
 over the same horizon, which needs no mirror — so on a host with no
 `--s3-prefix`, `--retention-days` reclaims old venvs and nothing else.
 
-**Unconfirmed outputs.** `gpuc status` flags a finished job whose `outputs:`
-never reached S3 or HF as `outputs not uploaded`, and lists them per host,
-because those are the jobs a purge — or a pod going away — would take with them.
+**Unconfirmed outputs.** `gpuc status` flags a finished job that *produced*
+`outputs:` which never reached S3 or HF as `outputs not uploaded`, and lists
+them per host, because those are the jobs a purge — or a pod going away — would
+take with them. A job that only declared outputs and never wrote them is not
+flagged: it has nothing to lose, and saying otherwise would both misreport it
+and keep its job dir past every retention horizon.
 An ephemeral host retries them while it drains (three tries a minute apart, five
 minutes at most) and, if they still fail, records `outputs_lost` with the last
 error and terminates anyway: the pod is billing, and whatever sent it away does

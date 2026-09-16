@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from gpuc.host import __main__ as host_cli
-from gpuc.host import cleanup, jobs, paths, queue
+from gpuc.host import baseline, cleanup, jobs, paths, queue
 from gpuc.host.jobs import HostConfig
 from tests.conftest import make_spec
 
@@ -29,6 +29,7 @@ def make_job(
     meta_synced: bool = True,
     outputs: bool = False,
     outputs_synced: bool = False,
+    produced: bool = True,
     workdir: bool = True,
 ) -> str:
     spec = make_spec(outputs=[OUTPUT] if outputs else [])
@@ -47,6 +48,10 @@ def make_job(
     if workdir:
         paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
         (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
+        if outputs and produced:
+            results = paths.workdir(job_id) / "results"
+            results.mkdir(exist_ok=True)
+            (results / "checkpoint.pt").write_bytes(b"y" * 2048)
     else:
         for path in sorted(paths.workdir(job_id).rglob("*"), reverse=True):
             path.unlink()
@@ -139,6 +144,27 @@ def test_unconfirmed_outputs_keep_a_mirrored_job(gpuc_home: Path) -> None:
     assert result.purged == []
     assert why(result, job_id) == "outputs not confirmed uploaded"
     assert paths.job_dir(job_id).is_dir()
+
+
+def test_a_job_that_never_wrote_its_outputs_has_nothing_to_lose(gpuc_home: Path) -> None:
+    """Declaring `outputs:` is not producing one. A job that died in its GPU
+    preflight or its setup never wrote the path, so calling it unconfirmed both
+    misreports it and keeps its dir forever."""
+    job_id = make_job(outputs=True, outputs_synced=False, produced=False)
+    assert cleanup.outputs_confirmed(job_id, jobs.read_state(job_id)) == (True, None)
+    result = cleanup.purge(older_than_days=7.0)
+    assert [c.job_id for c in result.purged] == [job_id]
+    assert not any(c.forced for c in result.purged)
+
+
+def test_an_output_dir_holding_only_the_checkout_is_not_a_lost_result(gpuc_home: Path) -> None:
+    job_id = make_job(outputs=True, outputs_synced=False)
+    baseline.capture(jobs.read_spec(job_id), paths.workdir(job_id), job_id)
+    assert cleanup.outputs_confirmed(job_id, jobs.read_state(job_id)) == (True, None)
+
+    (paths.workdir(job_id) / "results" / "new.pt").write_bytes(b"z")
+    confirmed, why_not = cleanup.outputs_confirmed(job_id, jobs.read_state(job_id))
+    assert not confirmed and why_not == "outputs not confirmed uploaded"
 
 
 def test_confirmed_outputs_allow_the_purge(gpuc_home: Path) -> None:

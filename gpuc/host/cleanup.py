@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gpuc.host import jobs, paths, queue
+from gpuc.host import baseline, jobs, paths, queue
 from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS
 
 DEFAULT_RETENTION_DAYS = 7.0
@@ -343,15 +343,38 @@ def host_s3_prefix() -> str | None:
         return None
 
 
+def produced_outputs(job_id: str, spec: jobs.JobSpec) -> bool:
+    """Did any declared `outputs:` path actually gain content?
+
+    Declaring an output is not producing one. A job that died in its GPU
+    preflight or its `setup` never wrote the path at all, and one whose output
+    dir holds only files that came with the checkout produced nothing either --
+    the same question `sync` asks before it refuses to upload. Anything
+    unreadable answers yes, because the point of asking is to avoid throwing
+    away the only copy of something.
+    """
+    workdir = paths.workdir(job_id)
+    entries = baseline.read(job_id)
+    for output in spec.outputs:
+        key = baseline.output_key(output, job_id)
+        try:
+            if baseline.has_new_content(workdir / key, entries.get(key, {})):
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | None]:
     """Is everything this job produced known to be somewhere other than here?
 
     `outputs:` paths resolve *inside* `workdir/`, and a failed or cancelled job
     keeps its workdir by default, so a job that ended `failed: sync` can be
-    holding the only copy of a checkpoint. Three ways to be satisfied: the
-    final upload was confirmed, the spec declared no outputs, or the workdir is
-    already gone (whatever it held went with `cleanup:`, not with us). An
-    unreadable spec cannot answer the question, so it fails closed.
+    holding the only copy of a checkpoint. Four ways to be satisfied: the final
+    upload was confirmed, the spec declared no outputs, the workdir is already
+    gone (whatever it held went with `cleanup:`, not with us), or the job never
+    wrote its outputs in the first place. An unreadable spec cannot answer the
+    question, so it fails closed.
     """
     if state.outputs_synced_at:
         return True, None
@@ -362,6 +385,8 @@ def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | No
     if not spec.outputs:
         return True, None
     if not paths.workdir(job_id).is_dir():
+        return True, None
+    if not produced_outputs(job_id, spec):
         return True, None
     detail = " (the drain gave up: outputs_lost)" if state.outputs_lost else ""
     return False, f"outputs not confirmed uploaded{detail}"
