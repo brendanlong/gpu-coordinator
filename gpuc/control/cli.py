@@ -376,42 +376,70 @@ def bootstrap_and_record(entry: HostEntry, settings: Settings, health_args: str)
         print(f"{len(result.warnings)} warning(s) above")
 
 
+def bootstrap_tally(total: int, done: int, failed: Sequence[HostEntry], skipped: int) -> str:
+    """The last word of a `--all` run: what worked, what did not, what was never read.
+
+    Counted rather than claimed, because the run this ends can be long enough
+    that nobody reads the middle of it: a host this build could not parse out
+    of the registry was never bootstrapped either, and saying "all of them"
+    over the top of that warning is how one gets missed for a month.
+    """
+    lines = [f"{done}/{total} host(s) bootstrapped"]
+    if failed:
+        lines.append(f"failed: {', '.join(entry.name for entry in failed)}")
+        if any(entry.ephemeral for entry in failed):
+            lines.append(
+                "an ephemeral host whose pod is already gone is forgotten by "
+                "`gpuc reconcile --once`"
+            )
+    if skipped:
+        lines.append(f"{skipped} host(s) in the registry could not be read (warnings above)")
+    return "\n".join(lines)
+
+
 def bootstrap_every_host(settings: Settings, health_args: str) -> int:
     """`gpuc host bootstrap --all`: the upgrade loop, one command.
 
     A host that fails does not stop the others: an ephemeral host whose pod is
     already gone is the ordinary case, and the hosts that are still there are
-    the reason the flag exists. Each failure is named again at the end and the
-    command exits 1, so nobody reads a wall of output as "all upgraded".
+    the reason the flag exists. Each failure is named again in the tally and
+    the command exits 1, so nobody reads a wall of output as "all upgraded".
     """
-    hosts = list(named_registry().hosts.values())
+    read = read_registry()
+    for error in read.errors:
+        print(f"warning: {error}", file=sys.stderr)
+    if read.unreadable:
+        raise LocalStateUnreadable("\n".join(read.errors))
+    hosts = list(read.registry.hosts.values())
     if not hosts:
         print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
         return EXIT_OK
-    failures: list[str] = []
+    done = 0
+    failed: list[HostEntry] = []
     for index, entry in enumerate(hosts, start=1):
         if index > 1:
             print()
         print(f"== {entry.name} ({index}/{len(hosts)}) ==")
         try:
             bootstrap_and_record(entry, settings, health_args)
+            done += 1
+        except KeyboardInterrupt:
+            # Health alone allows five minutes a host, so this is a command
+            # somebody does give up on; what it got through is still true.
+            print(f"\ninterrupted during {entry.name}")
+            print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
+            return EXIT_ERROR
         except LocalStateUnreadable:
             # The registry stopped being readable mid-run, so the next host's
-            # write would be a guess: stop and let the caller see exit 3.
+            # write would be a guess: say how far this got, and exit 3.
+            print(f"\n{bootstrap_tally(len(hosts), done, failed, len(read.skipped))}")
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
             print(f"error: host {entry.name}: {exc}", file=sys.stderr)
-            failures.append(entry.name)
+            failed.append(entry)
     print()
-    if failures:
-        print(
-            f"{len(hosts) - len(failures)}/{len(hosts)} hosts bootstrapped; "
-            f"failed: {', '.join(failures)}",
-            file=sys.stderr,
-        )
-        return EXIT_ERROR
-    print(f"all {len(hosts)} host(s) bootstrapped")
-    return EXIT_OK
+    print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
+    return EXIT_ERROR if failed else EXIT_OK
 
 
 def cmd_host_bootstrap(args: argparse.Namespace) -> int:

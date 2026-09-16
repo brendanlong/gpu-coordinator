@@ -211,8 +211,10 @@ gpuc host bootstrap --all    # or all of them, in one command
 
 `--all` takes every registered host in turn, including ephemeral ones. A host
 that fails does not stop the others — a pod that has already gone away is the
-ordinary case — so the run ends by naming each failure again on stderr and
-exiting 1, and the hosts that did upgrade stay upgraded.
+ordinary case, and `gpuc reconcile --once` is what forgets it — so the run ends
+with a tally naming each failure and exits 1, while the hosts that did upgrade
+stay upgraded. The tally also counts any host entry this build could not read
+(skipped with a warning), because that host was not upgraded either.
 
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
 to enqueue on is not on this commit — including a host with no commit recorded,

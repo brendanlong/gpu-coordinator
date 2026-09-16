@@ -376,7 +376,7 @@ Every `failed: <reason>`:
 | code | meaning |
 | --- | --- |
 | 0 | ok. **Includes** a host that is unreachable, has a dead dispatcher, or whose pod is gone: that is data about a host, reported per host, not a failure of the command |
-| 1 | the command failed (transport, provider, a refused submit, a `clean` the host reported errors for) |
+| 1 | the command failed (transport, provider, a refused submit, a `clean` the host reported errors for, a `host bootstrap --all` any host failed — the others still upgraded, and the tally says which) |
 | 2 | usage: a bad flag, a missing required one, a bad `--since` |
 | 3 | local state is unreadable (`hosts.json` or `config.toml`), so the answer is **unknown** |
 | 4 | the job or host named on the command line does not exist |
@@ -603,7 +603,7 @@ than 1 GiB, with the `gpuc clean` line to run.
 | `uv sync` re-downloads torch on every job | uv's cache is on a different filesystem from gpuc home, so it copies instead of linking | `gpuc host bootstrap <host>` (it sets `UV_CACHE_DIR` for you), or pin one with `--cache-dir` |
 | `gpuc` exits 3 and names `hosts.json` | the registry could not be parsed at all; a `.bak` was kept beside it | fix or delete the file, then re-add hosts; nothing was written over |
 | a warning names one skipped host entry | that entry did not validate; every other host still works and is written back untouched | fix it by hand, or `gpuc host add <name> ...` to replace it |
-| `status` says `host X runs an older gpuc` | this machine was upgraded and the host's copy of the package was not | `gpuc host bootstrap X` — safe while jobs run; the new dispatcher adopts them |
+| `status` says `host X runs an older gpuc` | this machine was upgraded and the host's copy of the package was not | `gpuc host bootstrap X`, or `gpuc host bootstrap --all` for every host at once — safe while jobs run; the new dispatcher adopts them |
 | `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc reconcile --once` |
 | `reconcile` reports `DEAD DISPATCHER` and terminates a pod | it stopped beating (or answering ssh) for `dead_dispatcher_minutes` with nothing running | expected: that pod could no longer stop itself. Raise `dead_dispatcher_minutes` if your hosts go quiet legitimately |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | the runbook in [setup.md](setup.md#hosts-whose-home-is-wiped-on-restart) |
