@@ -260,9 +260,9 @@ Rules, and they are not optional:
 ## Housekeeping
 
 - A host sweeps finished jobs' workdirs itself a day after they end
-  (`--workdir-days`, default 1; `gpuc host set <host> --workdir-days N` then
-  `gpuc host bootstrap <host>` to change it). Logs, state and specs are never
-  swept. So a failed run is yours to inspect for a day, and `gpuc requeue`
+  (`--workdir-days`, 1 on a host configured for the first time; `gpuc host set
+  <host> --workdir-days N` changes it and reaches the host at once). Logs,
+  state and specs are never swept. So a failed run is yours to inspect for a day, and `gpuc requeue`
   rebuilds a workdir from git whenever it is gone.
 - That sweep refuses a job whose spec says `cleanup: never` and one whose
   `outputs:` have not reached S3 or HF — so a workdir holding results that

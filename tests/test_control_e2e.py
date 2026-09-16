@@ -586,10 +586,10 @@ def test_workdir_days_reaches_the_host_config(
 ) -> None:
     home = bootstrapped_home
     assert json.loads((home / "config.json").read_text())["workdir_days"] == 1.0
+    # No bootstrap between these: `host set` is a write-through to the host's
+    # own config, and there is no local copy for it to have changed instead.
     assert main(["host", "set", "local", "--workdir-days", "3"]) == 0
-    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
     assert json.loads((home / "config.json").read_text())["workdir_days"] == 3.0
     assert main(["host", "set", "local", "--workdir-days", ""]) == 0
-    assert load_registry().require("local").workdir_days is None
-    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
     assert json.loads((home / "config.json").read_text())["workdir_days"] is None
+    assert load_registry().require("local").workdir_days is None

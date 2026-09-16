@@ -784,10 +784,14 @@ effective workdir horizon is whichever is shorter.
 Either pass also clears staged specs (`incoming/<id>.json`) an interrupted
 submit left behind, once they are an hour old.
 
-Both are registry settings, so changing one with `gpuc host set` does nothing
-until the host's `config.json` is rewritten — by `gpuc host bootstrap <name>`,
-or by the package re-sync `gpuc submit` does when the host is running an older
-commit than this machine.
+Both live in the host's own `config.json`, and `gpuc host set <name>
+--workdir-days N` writes through to it — so it needs the host to answer, and
+takes effect without a bootstrap.
+
+`--workdir-days` is also the one timer with a default, and only for a host
+being configured for the first time. `gpuc host add` on a box that already has
+a `config.json` adopts what is there: a host that has been getting along
+without the sweep is not given one by being registered from another machine.
 
 **Unconfirmed outputs.** `gpuc status` flags a finished job that *produced*
 `outputs:` which never reached S3 or HF as `outputs not uploaded`, and lists
