@@ -447,10 +447,17 @@ def _fmt_minutes(job: JobView) -> str:
 def _fmt_eta(job: JobView) -> str:
     """` eta 2h10m (42%)` when the job measures its own progress, ` eta 2h10m
     (est)` when all it has is the submitter's guess, and nothing at all when it
-    has neither. The tag matters: one of those numbers is evidence."""
+    has neither. The tag matters: one of those numbers is evidence.
+
+    A running job whose host published no `eta` falls back to the estimate the
+    same host reports, rendered as a total rather than a remaining time. That
+    is the window after `gpuc estimate` before the runner next re-reads the
+    spec, and a host old enough to have no such re-read at all -- and the one
+    thing that may not happen there is `--json` carrying an estimate the text
+    does not show."""
     remaining = job.eta_seconds
     if remaining is None:
-        return ""
+        return _fmt_estimate(job, total=True)
     # `not job.progress_pct` and not `is None`: at 0% the runner deliberately
     # leaves the submitter's estimate in place, so the eta being shown is the
     # guess and tagging it `(0%)` would claim evidence that is not there.
@@ -460,10 +467,12 @@ def _fmt_eta(job: JobView) -> str:
     return f" eta {format_duration(remaining)} ({source})"
 
 
-def _fmt_estimate(job: JobView) -> str:
+def _fmt_estimate(job: JobView, *, total: bool = False) -> str:
+    """` est 2h30m`: the whole run, not what is left of it. `total` says so out
+    loud, for the lines that also carry elapsed or remaining times."""
     if job.estimated_runtime_min is None:
         return ""
-    return f" est {format_duration(job.estimated_runtime_min * 60.0)}"
+    return f" est {format_duration(job.estimated_runtime_min * 60.0)}{' total' if total else ''}"
 
 
 def next_free_line(view: HostView) -> str | None:

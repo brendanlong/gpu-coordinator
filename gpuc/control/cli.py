@@ -976,6 +976,51 @@ def cmd_reorder(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_estimate(args: argparse.Namespace) -> int:
+    """Add, change or clear a job's `estimated_runtime_min` after submitting it.
+
+    It is the one spec field somebody else needs and only the submitter knows,
+    and the job that most needs one is the long job already running when the
+    next person arrives -- which is too late to edit a file before `submit`.
+    """
+    if args.clear is (args.minutes is not None):
+        raise UsageError("give --minutes N or --clear, not both")
+    wanted: float | None = None if args.clear else args.minutes
+    if wanted is not None and not (0.0 < wanted < float("inf")):
+        raise UsageError(f"--minutes must be a positive number of minutes, got {wanted:g}")
+    entry, _ = find_job_host(args.job_id, named_registry(), args.host)
+    session = open_session(entry, load_settings())
+    request = "--clear" if wanted is None else repr(wanted)
+    # `check=False`: a refusal (a finished job, an id this host does not know)
+    # *is* the host's document, and raising on the exit code would throw away
+    # the reason it gave for one that only says it exited 1.
+    payload = session.host_json(f"estimate {shlex.quote(args.job_id)} {request}", check=False)
+    document = payload if isinstance(payload, dict) else {}
+    error = document.get("error")
+    if error:
+        raise CliError(f"host {entry.name} did not set the estimate: {error}")
+    recorded = document.get("estimated_runtime_min")
+    warning = document.get("warning")
+    if warning:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    if args.json:
+        jsonout.emit(
+            {
+                "job_id": args.job_id,
+                "host": entry.name,
+                "estimated_runtime_min": recorded,
+                "status": document.get("status"),
+                "warnings": [warning] if warning else [],
+            }
+        )
+    elif recorded is None:
+        print(f"job {args.job_id} on host {entry.name} no longer estimates a runtime")
+    else:
+        shown = f"{recorded:g}" if isinstance(recorded, (int, float)) else recorded
+        print(f"job {args.job_id} on host {entry.name} now estimates {shown} min")
+    return EXIT_OK
+
+
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
     command = f"tail -n {lines} -f {shlex.quote(remote_path)}"
     if isinstance(transport, SshTransport):
@@ -1551,6 +1596,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_json_flag(reorder)
     reorder.set_defaults(func=cmd_reorder)
+
+    estimate = sub.add_parser(
+        "estimate",
+        help="set (or clear) a queued or running job's estimated_runtime_min",
+        description="Records how long the job expects to take, from the runner's start. "
+        "Nothing kills a job for running past it: it is what `gpuc status` shows the next "
+        "person deciding whether to queue behind this job. A running job's runner picks the "
+        "new estimate up within a minute; a finished job is refused.",
+    )
+    estimate.add_argument("job_id")
+    estimate.add_argument("--minutes", type=float, metavar="N", help="how long the job will take")
+    estimate.add_argument("--clear", action="store_true", help="remove the estimate instead")
+    estimate.add_argument(
+        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+    )
+    add_json_flag(estimate)
+    estimate.set_defaults(func=cmd_estimate)
 
     requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
     requeue.add_argument("job_id")

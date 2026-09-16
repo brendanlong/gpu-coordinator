@@ -481,6 +481,7 @@ JSON_COMMANDS = [
     ["logs"],
     ["cancel"],
     ["reorder"],
+    ["estimate"],
     ["pods"],
     ["version"],
     ["clean"],

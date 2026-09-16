@@ -568,6 +568,16 @@ def test_the_json_carries_a_broken_progress_command() -> None:
     assert host_json(view)["running"][0]["progress_error"].endswith("no such file")
 
 
+def test_a_running_job_with_an_estimate_but_no_eta_still_shows_it() -> None:
+    """The host publishes `eta` from a copy of the spec, so an estimate added
+    to a job already running is in `--json` before it is in any eta. The text
+    may never show less than `--json` does."""
+    job = running_job(estimated_runtime_min=150.0)
+    text = render(busy(job))
+    assert "est 2h30m total" in text
+    assert host_json(busy(job))["running"][0]["estimated_runtime_min"] == 150.0
+
+
 def test_a_queued_job_shows_the_submitters_estimate() -> None:
     queued = JobView(job_id="j-queued", name="next", priority=10, estimated_runtime_min=360.0)
     assert "prio=10 est 6h00m" in render(busy(running_job(), queued=[queued]))

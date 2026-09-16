@@ -101,7 +101,9 @@ Rules that avoid the classic failures:
   alternative to `estimated_runtime_min` is guessing or paying for a pod. If
   the job already writes its progress anywhere, point `progress_command` at it
   and `gpuc status` shows a live end time instead of your guess; a progress
-  command that breaks is recorded and ignored, never fatal.
+  command that breaks is recorded and ignored, never fatal. Forgetting it at
+  submit time is recoverable: `gpuc estimate <jobid> --minutes N` sets it on a
+  job that is already queued or running.
 
 ## Submit, watch, finish
 
@@ -125,6 +127,9 @@ gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc 
 gpuc ssh <host|jobid> --print    # just print the ssh line, to copy
 gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
 gpuc reorder <jobid> --priority 10          # queued jobs only
+gpuc estimate <jobid> --minutes 150         # add/change estimated_runtime_min on a queued or
+                                 # running job (--clear removes it); a running job picks it up
+                                 # within a minute
 gpuc requeue <jobid> --host <host>
                                  # re-run from the mirrored spec, attempt+1; needs s3_bucket set,
                                  # and re-syncs the workdir from your current directory
@@ -181,6 +186,7 @@ scraping any of the text output.
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `cancel` | `{job_id, host, status}` |
 | `reorder` | `{job_id, host, priority}` |
+| `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}` |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
 | `host list` | `{hosts[], errors[]}` |

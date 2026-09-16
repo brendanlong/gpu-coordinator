@@ -38,6 +38,12 @@ from gpuc.host.jobs import JobSpec
 
 KILL_GRACE_S = 15.0
 SAMPLE_INTERVAL_S = 30.0
+SPEC_REFRESH_S = 30.0
+"""How often the monitor re-reads `spec.json` while a job runs.
+
+`gpuc estimate` edits the spec of a job that is already running, and the copy
+loaded at job start would never see it -- which is the job that most needs an
+end time, since nobody can add one before it started."""
 UTIL_SAMPLES_KEPT = 40  # 20 minutes at the default sample interval
 POLL_INTERVAL_S = 0.5
 TERMINATED_EXIT_CODE = 143  # 128 + SIGTERM, the shell convention
@@ -202,6 +208,7 @@ class RunnerDeps:
     now: Callable[[], float] = time.monotonic
     poll_interval_s: float = POLL_INTERVAL_S
     sample_interval_s: float = SAMPLE_INTERVAL_S
+    spec_refresh_s: float = SPEC_REFRESH_S
     kill_grace_s: float = KILL_GRACE_S
     preflight: bool = True
     preflight_command: Callable[[], str] = preflight_command
@@ -282,6 +289,16 @@ class JobRunner:
         self._progress_error: str | None = None
         """The last progress failure we logged, so an interval-by-interval
         repeat of it does not bury the job's own output."""
+        self._measured_eta = False
+        """Whether a `progress_command` has produced an eta yet. Once one has,
+        the spec's estimate is no longer published: it is a guess, and this is
+        a measurement."""
+        self._published_estimate: float | None = None
+        """The `estimated_runtime_min` behind the eta now in the state file,
+        null when that eta is not ours. Kept so the spec re-read only writes
+        state when the estimate actually changed: `state.json` is a
+        read-modify-write with the sync loop as a second writer, and an eta
+        recomputed from the same estimate is the same instant anyway."""
         self._terminating = False
         self._finalizing = False
         """Set for the whole of `_finalize`, which must run exactly once.
@@ -341,15 +358,21 @@ class JobRunner:
         max_runtime_s = (
             None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
         )
+        # Re-read from disk on a timer, so an estimate (or a progress command)
+        # added to `spec.json` after the job started still takes effect. Only
+        # these fields: changing the command, the env or the outputs mid-flight
+        # would describe a run that never happened.
+        live = self.spec
+        next_spec = phase_start + deps.spec_refresh_s
         # The submitter's estimate, published from the first phase on: a job
         # still installing torch is exactly the one somebody wants an end time
         # for. A `progress_command` replaces it with a measured one below.
-        self._publish_estimated_eta(phase_start - job_start)
+        self._publish_estimated_eta(live.estimated_runtime_min, phase_start - job_start)
         # Progress is a fraction of the job's own work, so only `main` can
         # report it: during setup the command would be reading a file the job
         # has not started writing.
-        progress_command = self.spec.progress_command if phase == "main" else None
-        next_progress = phase_start + self.spec.progress_interval_s
+        progress_command = live.progress_command if phase == "main" else None
+        next_progress = phase_start + live.progress_interval_s
 
         while proc.poll() is None:
             deps.sleep(deps.poll_interval_s)
@@ -364,8 +387,13 @@ class JobRunner:
             if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
                 self._kill(proc, "timeout", log)
                 break
+            if t >= next_spec:
+                next_spec = t + deps.spec_refresh_s
+                live = self._live_spec(live)
+                self._publish_estimated_eta(live.estimated_runtime_min, t - job_start)
+                progress_command = live.progress_command if phase == "main" else None
             if progress_command and t >= next_progress:
-                next_progress = t + self.spec.progress_interval_s
+                next_progress = t + live.progress_interval_s
                 self._record_progress(progress_command, t - phase_start, log)
             if record_util and t >= next_sample:
                 next_sample = t + deps.sample_interval_s
@@ -391,11 +419,30 @@ class JobRunner:
                     break
         return proc.wait()
 
-    def _publish_estimated_eta(self, elapsed_s: float) -> None:
-        if self.spec.estimated_runtime_min is None:
+    def _live_spec(self, previous: JobSpec) -> JobSpec:
+        """The spec as `spec.json` holds it now, or `previous` if it cannot be
+        read -- a spec being rewritten under us may not end a running job."""
+        try:
+            return jobs.read_spec(self.job_id)
+        except (RuntimeError, OSError, ValueError):
+            return previous
+
+    def _publish_estimated_eta(self, estimate: float | None, elapsed_s: float) -> None:
+        """The end time the submitter's estimate implies, while that is the
+        best we have. A measured one, once there is one, is never overwritten
+        by a guess -- including a guess edited in halfway through the job."""
+        if self._measured_eta or estimate == self._published_estimate:
             return
-        eta = jobs.utc_in(self.spec.estimated_runtime_min * 60.0 - elapsed_s)
+        if estimate is None:
+            # Only when we are the one who published it: an estimate cleared
+            # from the spec should take its eta with it, but a job that never
+            # had one must not have its state rewritten at all.
+            self._published_estimate = None
+            jobs.update_state(self.job_id, eta=None)
+            return
+        eta = jobs.utc_in(estimate * 60.0 - elapsed_s)
         if eta is not None:
+            self._published_estimate = estimate
             jobs.update_state(self.job_id, eta=eta)
 
     def _record_progress(self, command: str, elapsed_s: float, log: IO[bytes]) -> None:
@@ -429,6 +476,7 @@ class JobRunner:
             eta = jobs.utc_in(elapsed_s * (100.0 - percent) / percent)
             if eta is not None:
                 fields["eta"] = eta
+                self._measured_eta = True
         jobs.update_state(self.job_id, **fields)
 
     def _record_util(self, util: float | None) -> None:

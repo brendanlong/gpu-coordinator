@@ -67,6 +67,13 @@ answering it are optional, and neither ever affects a job's outcome.
 estimated_runtime_min: 480          # about eight hours, from the runner's start
 ```
 
+You do not have to know it at submit time. `gpuc estimate <job-id> --minutes N`
+sets it on a job that is already **queued or running** — the case that matters
+most, since the job somebody needs an end time for is the one already running
+when they arrive — and `--clear` takes it off again. A running job's runner
+re-reads its spec every 30 seconds, so the new estimate reaches `gpuc status`
+within a minute; a finished job is refused (exit 1).
+
 `progress_command` replaces the guess with a measurement. It runs in the
 workdir, with the job's own environment, every `progress_interval_s` of phase
 `main`, and the **last line of its stdout** is how far along the job is:
@@ -196,6 +203,10 @@ equivalent command line instead of running it. A `local` host gets your own
 **`gpuc reorder <job-id> --priority N`** — queued jobs only; a running or
 finished job cannot be reordered (exit 1).
 
+**`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or
+running job's `estimated_runtime_min`; see [job length
+estimates](#job-length-estimates).
+
 **`gpuc requeue <job-id>`** — re-reads the spec from the S3 mirror and submits
 it again as attempt+1, with the workdir re-synced from your *current* directory.
 It therefore **needs `s3_bucket`** (without it, submit the job file again) and
@@ -203,8 +214,8 @@ cannot rebuild a `--no-git` workdir. `--host H` sends it somewhere else;
 `--runpod` provisions for it; with neither, it goes back to the host the local
 index says it ran on.
 
-`--host` is optional on `logs`, `cancel`, `reorder` and `requeue`: the local job
-index is tried first, then every registered host is asked whether it knows the
+`--host` is optional on `logs`, `cancel`, `reorder`, `estimate` and `requeue`:
+the local job index is tried first, then every registered host is asked whether it knows the
 id. An unknown job or host is exit 4.
 
 **`gpuc skill`** — prints the agent guide ([`skills/gpuc/SKILL.md`](../skills/gpuc/SKILL.md))
@@ -452,8 +463,8 @@ Rules for anything automated:
 
 ### `--json` everywhere else
 
-`submit`, `requeue`, `logs`, `cancel`, `reorder`, `pods`, `version`, `clean`,
-`host list`, `host probe` and `reconcile --once` take `--json` too, under the
+`submit`, `requeue`, `logs`, `cancel`, `reorder`, `estimate`, `pods`, `version`,
+`clean`, `host list`, `host probe` and `reconcile --once` take `--json` too, under the
 same rules: **stdout is exactly one JSON object**, it carries `schema_version`,
 and everything the text output would print alongside it — progress, warnings,
 `note:` lines — goes to stderr instead. The exit codes are the table above,
@@ -479,6 +490,7 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `reorder` | `{job_id, host, priority}` |
+| `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. Exit 3 if the registry is unreadable |
 | `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]`. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |

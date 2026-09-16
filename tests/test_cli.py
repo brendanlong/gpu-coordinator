@@ -864,6 +864,61 @@ def test_reorder_json_repeats_the_priority_it_set(
     assert one_document(capsys)["priority"] == 10
 
 
+def test_estimate_json_repeats_what_the_host_recorded(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    session = StubSession(
+        [{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running", "warning": None}]
+    )
+    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: as_session(session))
+    capsys.readouterr()
+    argv = ["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local", "--json"]
+    assert main(argv) == 0
+    document = one_document(capsys)
+    assert document["estimated_runtime_min"] == 150.0 and document["status"] == "running"
+    # `check=False`: the host's refusal is a document, and raising on the exit
+    # code would throw away the reason it gave.
+    assert session.checked == [False]
+    assert session.calls == ["estimate 20260101-000000-aaaaaa 150.0"]
+
+
+def test_estimate_reports_the_hosts_refusal(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    payload: dict[str, object] = {"job_id": "j", "error": "job j has already succeeded"}
+    monkeypatch.setattr(
+        "gpuc.control.cli.open_session", lambda *a, **k: as_session(StubSession([payload]))
+    )
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "5", "--host", "local"]) == 1
+    assert "already succeeded" in capsys.readouterr().err
+
+
+def test_estimate_clear_asks_the_host_to_clear_it(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    session = StubSession(
+        [{"job_id": "j", "estimated_runtime_min": None, "status": "queued", "warning": None}]
+    )
+    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: as_session(session))
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--clear", "--host", "local"]) == 0
+    assert session.calls == ["estimate 20260101-000000-aaaaaa --clear"]
+    assert "no longer estimates" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flags", [[], ["--minutes", "5", "--clear"], ["--minutes", "0"]])
+def test_estimate_refuses_a_bad_invocation_before_asking_any_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], flags: list[str]
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--host", "local", *flags]) == EXIT_USAGE
+
+
 def test_pods_json_separates_ours_from_everyone_elses(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
