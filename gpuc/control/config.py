@@ -305,9 +305,12 @@ class HostEntry(TolerantModel):
         A persistent root moves it off ``$HOME``: on a host whose home is wiped
         on restart, the queue, specs, state, logs and workdirs are the things
         that cannot be reinstalled, so they go on the volume that survives.
-        Deliberately *only* those: uv, its caches and the aws bundle stay in
-        ``$HOME``, both because bootstrap can reinstall them in seconds and
-        because these shared volumes are much slower than the local disk.
+        Deliberately *only* those: uv, its managed Pythons and the aws bundle
+        stay in ``$HOME``, both because bootstrap can reinstall them in seconds
+        and because these shared volumes are much slower than the local disk.
+        uv's *cache* is the exception bootstrap makes (`resolve_cache_dir`),
+        and only to keep it on this home's filesystem, where uv can link a venv
+        out of it instead of copying.
         """
         if self.gpuc_home:
             return self.gpuc_home

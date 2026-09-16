@@ -854,9 +854,46 @@ def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
     assert document["has_nvidia_smi"] is True
     assert document["sections"]["uv"] == "not installed"  # type: ignore[index]
     assert document["gpus"] == [
-        {"uuid": "GPU-1111", "name": "NVIDIA A40", "vram_mib": 46068, "index": 0}
+        {
+            "uuid": "GPU-1111",
+            "name": "NVIDIA A40",
+            "vram_mib": 46068,
+            "index": 0,
+            "assigned": False,
+        }
     ]
     assert any("uv is missing" in note for note in document["notes"])  # type: ignore[union-attr]
+
+
+def test_host_probe_shows_only_assigned_gpus_unless_all_gpus_is_asked_for(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.config import load_registry
+    from gpuc.control.probe import parse_probe
+
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "1"])
+    sample = (
+        "===driver===\n580.173.02\n"
+        "===gpus===\n0, GPU-1111, NVIDIA A40, 46068 MiB\n1, GPU-2222, NVIDIA A40, 46068 MiB\n"
+    )
+    monkeypatch.setattr(
+        "gpuc.control.cli.probe_host",
+        lambda entry, *a, **k: parse_probe(entry.name, sample, entry.root, entry.gpus),
+    )
+
+    capsys.readouterr()
+    assert main(["host", "probe", "gpubox"]) == 0
+    default = capsys.readouterr().out
+    assert "1 of 2 assigned to gpubox" in default
+    assert "GPU-2222" in default and "GPU-1111" not in default
+
+    assert main(["host", "probe", "gpubox", "--all-gpus"]) == 0
+    everything = capsys.readouterr().out
+    assert "GPU-1111" in everything
+    assert "GPU-2222  NVIDIA A40  46068 MiB  (assigned)" in everything
+
+    # Both cards are recorded either way, so `host set --gpus 0` can name one.
+    assert set(load_registry().hosts["gpubox"].gpu_info) == {"GPU-1111", "GPU-2222"}
 
 
 def test_host_probe_json_is_written_after_the_registry_write_it_can_fail_on(

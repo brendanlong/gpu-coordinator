@@ -108,10 +108,12 @@ in seconds if it cannot write the repo.
 ```sh
 gpuc host add local --gpus 0                               # this machine
 gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach over ssh
-gpuc host probe gpubox       # driver, every card as `[index] uuid name`, disk, $HOME's filesystem,
-                             # systemd --user, uv cache, network speed. Needs the host registered,
-                             # so add it first (with no --gpus if you do not know them yet) and
-                             # `gpuc host set gpubox --gpus …` once you can read them off
+gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] uuid name`,
+                             # disk, $HOME's filesystem, systemd --user, uv cache, network speed.
+                             # Needs the host registered, so add it first (with no --gpus if you do
+                             # not know them yet) and `gpuc host set gpubox --gpus …` once you can
+                             # read them off
+gpuc host probe gpubox --all-gpus   # every card in the box, `(assigned)` on the ones this host owns
 gpuc host bootstrap gpubox   # idempotent; run it again after any `host set`
 ```
 
@@ -131,6 +133,14 @@ pod, registers it as kind `runpod`, and bootstraps it
 | `--retention-days N` | none | the host's dispatcher auto-purges job dirs older than this, but only ones whose log and state it has confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` goes back to keeping everything |
 | `--idle-min N` | `15` | how long an ephemeral host may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |
 | `--ttl-hours N` | none | opt-in hard cap on the host's life; past it the dispatcher kills the running job with reason `ttl`, syncs, and terminates. `-1` means no TTL, on `host add` and `host set` alike (a stored `-1` would be a host already past its TTL). `0` is refused |
+
+On a box you share, `--gpus` is the whole of what gpuc may touch, so `host
+probe` lists only those cards and says how many it hid (`2 of 8 assigned to
+gpubox`); `--all-gpus` shows the box as nvidia-smi sees it. Either way the probe
+records **every** card's name and VRAM, so `gpuc host set gpubox --gpus 5` names
+something the registry already knows. An assigned entry no card answers to is
+called out, as are two entries naming one card: `gpuc host bootstrap` fails its
+`gpu_uuids` check on both, so the probe is where you want to find them.
 
 `gpuc host set` edits one entry in place — only the flags you pass — instead of
 `remove` + `add`, which would drop everything else about the host. **Nothing on

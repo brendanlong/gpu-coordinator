@@ -6,7 +6,8 @@ a host where nothing has been bootstrapped yet.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, transport_for
@@ -113,6 +114,13 @@ class ProbeReport:
     sections: dict[str, str]
     persistent_root: str | None = None
     """The root this host is *already* registered with, if any."""
+    owned: list[str] = field(default_factory=list)
+    """This host's `--gpus`, exactly as the registry stores them: nvidia-smi
+    indices, UUIDs, or a mix.
+
+    nvidia-smi lists every card in the box, and on a shared box most of them
+    are somebody else's. A probe that does not say which is which invites
+    reading the whole list as yours."""
 
     @property
     def has_nvidia_smi(self) -> bool:
@@ -128,6 +136,28 @@ class ProbeReport:
             if len(cells) >= 3 and cells[0].isdigit():
                 rows.append(cells)
         return rows
+
+    def owns(self, cells: Sequence[str]) -> bool:
+        """Is this `gpu_rows` row one of ours?
+
+        By UUID, or by the index nvidia-smi *just* gave the card -- which is
+        the numbering `--gpus 2,3` was agreed in, and fresher than anything the
+        registry recorded."""
+        owned = set(self.owned)
+        return cells[1] in owned or cells[0] in owned
+
+    @property
+    def owned_rows(self) -> list[list[str]]:
+        return [cells for cells in self.gpu_rows if self.owns(cells)]
+
+    @property
+    def owned_missing(self) -> list[str]:
+        """`--gpus` entries no card on this host answers to: a typo, a card
+        this container was not given, or a renumbered driver."""
+        if not self.has_nvidia_smi:
+            return []
+        seen = {cell for cells in self.gpu_rows for cell in cells[:2]}
+        return [item for item in self.owned if item not in seen]
 
     @property
     def gpu_info(self) -> dict[str, GpuInfo]:
@@ -168,19 +198,12 @@ class ProbeReport:
             return None
         return cache == home
 
-    def render(self) -> str:
+    def render(self, *, all_gpus: bool = False) -> str:
         lines = [f"host {self.host}"]
         for key in SECTION_ORDER:
             value = self.sections.get(key, "(no output)")
             if key == "gpus":
-                lines.append("  gpus:")
-                rows = self.gpu_rows
-                if not rows:
-                    lines.append(f"    {value.strip() or '(none)'}")
-                for cells in rows:
-                    index, uuid, name = cells[0], cells[1], cells[2]
-                    memory = f"  {cells[3]}" if len(cells) > 3 else ""
-                    lines.append(f"    [{index}] {uuid}  {name}{memory}")
+                lines += self._gpu_lines(all_gpus)
                 continue
             if key == "uv_cache":
                 values = self.uv_cache
@@ -194,12 +217,32 @@ class ProbeReport:
         lines += [f"  note: {note}" for note in self.notes]
         return "\n".join(lines)
 
+    def _gpu_lines(self, all_gpus: bool) -> list[str]:
+        """The `gpus` section: ours by default, the whole box with `--all-gpus`."""
+        rows, owned = self.gpu_rows, self.owned_rows
+        if not rows:
+            return ["  gpus:", f"    {self.sections.get('gpus', '').strip() or '(no output)'}"]
+        # Nothing of ours to show is not a reason to show nothing: a host whose
+        # assignment matches no card needs the whole list more than anybody.
+        everything = all_gpus or not owned
+        partly = 0 < len(owned) < len(rows)
+        hidden = " (--all-gpus lists the rest)" if partly and not everything else ""
+        header = f"  gpus: {len(owned)} of {len(rows)} assigned to {self.host}{hidden}"
+        lines = [header if self.owned else "  gpus:"]
+        for cells in rows if everything else owned:
+            index, uuid, name = cells[0], cells[1], cells[2]
+            memory = f"  {cells[3]}" if len(cells) > 3 else ""
+            mine = "  (assigned)" if everything and partly and self.owns(cells) else ""
+            lines.append(f"    [{index}] {uuid}  {name}{memory}{mine}")
+        return lines
+
     @property
     def notes(self) -> list[str]:
         """What this host will do to a job unless somebody acts, in words."""
         notes: list[str] = []
         if not self.has_nvidia_smi:
             notes.append("no nvidia-smi, so this host can only run gpus: 0 jobs")
+        notes += self._gpu_notes()
         if self.sections.get("killuserprocesses", "").endswith("=yes"):
             notes.append(
                 "logind kills user processes at logout; the dispatcher will not "
@@ -219,6 +262,37 @@ class ProbeReport:
             )
         return notes
 
+    def _gpu_notes(self) -> list[str]:
+        """Which cards in this box are ours, and what to do about the answer."""
+        rows, owned = self.gpu_rows, self.owned_rows
+        notes: list[str] = []
+        if rows and not self.owned:
+            notes.append(
+                f"no GPUs are assigned to {self.host}, so it can only run gpus: 0 jobs;\n"
+                f"        assign some with `gpuc host set {self.host} --gpus <list>`, "
+                f"from the indices or UUIDs above"
+            )
+        elif owned and len(owned) < len(rows):
+            notes.append(
+                f"{len(rows) - len(owned)} of this host's {len(rows)} GPUs are not assigned to "
+                f"{self.host}, so gpuc will never\n        use them; "
+                f"`gpuc host set {self.host} --gpus <list>` changes the assignment"
+            )
+        if self.owned_missing:
+            notes.append(
+                f"assigned but not present on this host: {', '.join(self.owned_missing)}.\n"
+                f"        `gpuc host bootstrap {self.host}` fails its gpu_uuids check on this, so "
+                f"fix the\n        list first: `gpuc host set {self.host} --gpus <list>`"
+            )
+        doubled = len(self.owned) - len(self.owned_missing) - len(owned)
+        if doubled > 0:
+            notes.append(
+                f"{len(self.owned) - len(self.owned_missing)} of the assigned entries name only "
+                f"{len(owned)} card(s) -- an index and its own UUID\n        are one card. "
+                f"`gpuc host bootstrap {self.host}` fails rather than promise a card twice"
+            )
+        return notes
+
     def _overlay_note(self) -> str:
         overlay = (
             f"$HOME is on an {self.home_fs_type} filesystem, so it is a container's "
@@ -227,15 +301,16 @@ class ProbeReport:
         if self.persistent_root:
             return overlay + (
                 f"        This host is registered with --persistent-root "
-                f"{self.persistent_root}, so uv, the queue and every job dir are already "
+                f"{self.persistent_root}, so the queue and every job dir are already "
                 f"off it.\n        After a restart, recover with: "
                 f"gpuc host bootstrap {self.host}"
             )
         return overlay + (
             f"        Point this host at a volume that survives:\n"
             f"        gpuc host set {self.host} --persistent-root /mnt/<volume>/$USER\n"
-            f"        (then `gpuc host bootstrap {self.host}`; uv, the queue and every "
-            f"job dir move there)"
+            f"        (then `gpuc host bootstrap {self.host}`: the queue and every job dir\n"
+            f"        move there, and uv's cache follows only to stay on gpuc home's\n"
+            f"        filesystem; uv itself stays in $HOME and bootstrap reinstalls it)"
         )
 
     def document(self) -> dict[str, Any]:
@@ -243,17 +318,25 @@ class ProbeReport:
 
         `sections` is the probe script's raw output, section by section, so
         anything this build does not interpret is still there. Everything
-        beside it is the interpretation `render()` prints.
+        beside it is the interpretation `render()` prints. Every card the host
+        has is listed whatever `--all-gpus` said, each flagged `assigned` or not.
         """
+        assigned = {cells[1] for cells in self.owned_rows}
         return {
             "host": self.host,
             "sections": dict(self.sections),
             "driver_version": self.driver_version,
             "has_nvidia_smi": self.has_nvidia_smi,
             "gpus": [
-                {"uuid": uuid, **info.model_dump(mode="json")}
+                {
+                    "uuid": uuid,
+                    **info.model_dump(mode="json"),
+                    "assigned": uuid in assigned,
+                }
                 for uuid, info in self.gpu_info.items()
             ],
+            "assigned_gpus": list(self.owned),
+            "assigned_missing": self.owned_missing,
             "home_fs_type": self.home_fs_type,
             "home_is_overlay": self.home_is_overlay,
             "persistent_root": self.persistent_root,
@@ -265,7 +348,12 @@ class ProbeReport:
         }
 
 
-def parse_probe(host: str, output: str, persistent_root: str | None = None) -> ProbeReport:
+def parse_probe(
+    host: str,
+    output: str,
+    persistent_root: str | None = None,
+    owned: Sequence[str] | None = None,
+) -> ProbeReport:
     sections: dict[str, str] = {}
     current = "preamble"
     buffer: list[str] = []
@@ -278,7 +366,9 @@ def parse_probe(host: str, output: str, persistent_root: str | None = None) -> P
             continue
         buffer.append(line)
     sections[current] = "\n".join(buffer).strip()
-    return ProbeReport(host=host, sections=sections, persistent_root=persistent_root)
+    return ProbeReport(
+        host=host, sections=sections, persistent_root=persistent_root, owned=list(owned or [])
+    )
 
 
 def probe_host(
@@ -286,4 +376,4 @@ def probe_host(
 ) -> ProbeReport:
     transport = transport or transport_for(entry, settings)
     result = transport.run(probe_script(entry.remote_home), timeout=240.0, check=False)
-    return parse_probe(entry.name, result.output, entry.root)
+    return parse_probe(entry.name, result.output, entry.root, entry.gpus)
