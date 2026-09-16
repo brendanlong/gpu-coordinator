@@ -815,11 +815,14 @@ Measured on two hosts:
 | hardlinked venv (ext4) | 8.36 GiB | 0.13 GiB |
 | reflinked venv (overlay on CoW) | 15.00 GiB | 0.83 GiB |
 
-Both mechanisms are counted. Hardlinks come free with the walk's own `stat`;
-reflinks share extents without sharing an inode, so seeing them needs one
-FIEMAP ioctl per file and is asked only of files over 64 KiB — which finds 97%
-of the sharing for about 11% more walk time. What is missed is reported as
-reclaimable, so the figure errs towards promising more than you get.
+Both mechanisms are counted, because which one you get is your host's business:
+the same uv against the same cache hardlinks on one box and reflinks on the
+next. It is measured once, when the job ends, and recorded in its `state.json`
+— a finished workdir does not change, and walking every one of them per call
+cost `status` four seconds on a host holding sixty. `gpuc clean` measures
+afresh, since it is about to delete what it is quoting. Anything the
+filesystem will not answer about counts as reclaimable, so the figure errs
+towards promising more than you get.
 
 ## Troubleshooting
 

@@ -113,6 +113,8 @@ jobs/<jobid>/
                      #  "progress_pct": float|null, "progress_at": str|null,
                      #  "progress_error": str|null, "eta": str|null,
                      #  "workdir_removed": bool,
+                     #  "workdir_bytes": int|null,  # what removing workdir/ would free;
+                     #                              # measured once when the job ended
                      #  "meta_synced_at": str|null, "meta_synced_to": str|null,
                      #  "outputs_synced_at": str|null, "outputs_lost": bool}
                      # meta_synced_* are written only after a *successful* final sync_job_meta
@@ -305,9 +307,17 @@ queue's lexical order, not submission order below one second.
 7. Apply `spec.cleanup` to `workdir/` -- after the final sync and the final
    state write, never before: `outputs:` paths resolve *inside* the workdir, so
    any earlier removal would delete the run's results on the way past. Record
-   `workdir_removed` in `state.json`, then upload state and log. A removal that
-   fails is logged and nothing more: the job's outcome is already decided, and
-   leftover disk is not worth turning a green run red. That last upload records
+   `workdir_removed` in `state.json`, and `workdir_bytes` with it -- what the
+   workdir would free if it is still there, zero if it is not. The runner is
+   the last thing standing in that tree and the job is over, so the figure will
+   not change; `status` reads it rather than walking every finished venv on
+   every call, which cost that command four seconds on a host holding sixty.
+   A job that ended before the field existed, or whose runner died before
+   writing it, has `null` there and is measured by the dispatcher's next
+   housekeeping pass. `gpuc clean` measures afresh instead of trusting it,
+   because it is about to delete what it is quoting. Then upload state and log.
+   A removal that fails is logged and nothing more: the job's outcome is
+   already decided, and leftover disk is not worth turning a green run red. That last upload records
    `meta_synced_at`/`meta_synced_to` and puts `state.json` up once more, so the
    mirror includes the record of itself; `outputs_synced_at` is written in the
    final state write when the final output upload succeeded. See Retention.
@@ -559,10 +569,15 @@ host, 15.00 GiB returning 0.83 GiB on another.
 Both of uv's sharing modes count, because which one a host uses is the host's.
 Hardlinks fall out of `st_nlink`, which the walk's `stat` already carries.
 Reflinks share extents without sharing an inode, so they need `FIEMAP` and its
-`FIEMAP_EXTENT_SHARED` flag -- one ioctl per file, asked only of files over
-`SHARED_EXTENT_FLOOR` (64 KiB), which is 97% of the sharing for ~11% more walk.
-Every way that can fail -- no FIEMAP, no permission, an odd filesystem -- means
-"assume it is all yours", so the figure over-reports rather than under-reports.
+`FIEMAP_EXTENT_SHARED` flag -- one ioctl per file, which triples the walk. That
+is affordable because the walk happens **once per job**, not once per `status`:
+the answer goes in `JobState.workdir_bytes` (see the runner's step 7) and
+readers read it. Nothing cheaper is exact -- `LOGICAL_INO` costs more per
+extent, a filesystem scan is O(extents on the device), and only btrfs qgroups
+answer in O(1), per subvolume, with quotas on -- so the trade is to pay it once
+and write the number down. Every way it can fail (no FIEMAP, no permission, an
+odd filesystem) means "assume it is all yours", so the figure over-reports what
+a delete frees rather than under-reporting it.
 
 `cleanup.dir_size` is the `du` twin and asks none of this; the uv cache's own
 size in `health` is the one question that wants it.

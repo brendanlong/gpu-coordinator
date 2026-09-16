@@ -975,20 +975,21 @@ class Dispatcher:
         `outputs:` have not reached the mirror yet.
 
         Purge first: it takes whole job dirs, and the workdir sweep afterwards
-        should not spend its report on dirs that are already gone.
+        should not spend its report on dirs that are already gone. Measuring
+        what survives comes last, for the same reason -- and runs even with
+        neither horizon set, because `status` depends on it either way.
         """
-        purge_days = self.config.retention_days
-        workdir_days = self.config.workdir_days
-        if purge_days is None and workdir_days is None:
-            return
         now = self.deps.monotonic()
         if self._last_reclaim_at is not None and now - self._last_reclaim_at < RETENTION_INTERVAL_S:
             return
         self._last_reclaim_at = now
+        purge_days = self.config.retention_days
+        workdir_days = self.config.workdir_days
         if purge_days is not None:
             self._purge(purge_days)
         if workdir_days is not None:
             self._sweep_workdirs(workdir_days)
+        self.measure_unmeasured_workdirs()
 
     def _purge(self, days: float) -> None:
         result = cleanup.purge(older_than_days=days, now=self.deps.utcnow(), automatic=True)
@@ -1001,6 +1002,24 @@ class Dispatcher:
             )
         for error in result.errors:
             self.log(f"retention: {error}")
+
+    def measure_unmeasured_workdirs(self) -> None:
+        """Fill in `workdir_bytes` for finished jobs that have none.
+
+        The runner records it when a job ends, so this is for the two cases
+        that leaves: a job that finished before the field existed, and a runner
+        that died before writing it. Last in the pass, so it never measures a
+        workdir the sweep above was about to take, and gated by the same hour,
+        because measuring is the expensive thing `status` used to do inline.
+        """
+        for job_id in jobs.list_job_ids():
+            try:
+                state = jobs.read_state(job_id)
+            except (RuntimeError, OSError):
+                continue
+            if not state.finished or state.workdir_bytes is not None:
+                continue
+            cleanup.record_workdir_size(job_id)
 
     def _sweep_workdirs(self, days: float) -> None:
         result = cleanup.clean(older_than_days=days, now=self.deps.utcnow(), automatic=True)

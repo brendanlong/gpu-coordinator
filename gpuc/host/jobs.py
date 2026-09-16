@@ -386,6 +386,20 @@ class JobState:
     """Whether `workdir/` has been deleted, by the job's `cleanup:` policy or by
     `gpuc clean`. Recorded so `status` and `logs` can say "gone on purpose"
     rather than leaving an empty job dir to look like data loss."""
+    workdir_bytes: int | None = None
+    """What deleting `workdir/` would free, measured once when the job ended.
+
+    A finished job's workdir does not change, and measuring it is the most
+    expensive thing `status` can do -- a torch venv is ~67k files, and a host
+    holding sixty of them made every `status` call walk half a million. So it
+    is measured where the runner is already standing in the tree, and `status`
+    reads the number. Null means nobody has measured it yet (a job that ended
+    before this was recorded, or a runner that died before writing it); the
+    dispatcher backfills those. Zero means the workdir is gone.
+
+    Not the number `du` gives: see `cleanup.reclaimable_bytes`. `gpuc clean`
+    measures afresh rather than trusting this, because it is about to delete
+    what it is quoting."""
     meta_synced_at: str | None = None
     """When this job's `log.txt` and `state.json` were last confirmed mirrored.
 
@@ -446,6 +460,7 @@ class JobState:
             eta=as_opt_str(fields, "eta"),
             sync_error=as_opt_str(fields, "sync_error"),
             workdir_removed=as_bool(fields, "workdir_removed"),
+            workdir_bytes=as_opt_int(fields, "workdir_bytes"),
             meta_synced_at=as_opt_str(fields, "meta_synced_at"),
             meta_synced_to=as_opt_str(fields, "meta_synced_to"),
             outputs_synced_at=as_opt_str(fields, "outputs_synced_at"),

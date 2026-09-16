@@ -790,7 +790,16 @@ class JobRunner:
         # After the final state write, and only then: the outputs the sync just
         # uploaded live *inside* the workdir, so anything earlier would delete
         # the run's results on the way past.
-        jobs.update_state(self.job_id, workdir_removed=self._cleanup_workdir(status, log))
+        removed = self._cleanup_workdir(status, log)
+        # Measure what is left while we are still standing in it: this job is
+        # over, so the figure will not change, and `status` should not have to
+        # walk a 67k-file venv to find it out again. Exact, because once is
+        # cheap -- see `cleanup.reclaimable_bytes`.
+        jobs.update_state(
+            self.job_id,
+            workdir_removed=removed,
+            workdir_bytes=0 if removed else (cleanup.workdir_size(self.job_id) or 0),
+        )
         try:
             warning = sync.final_meta_sync(
                 self.job_id,

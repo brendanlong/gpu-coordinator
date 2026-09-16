@@ -91,27 +91,6 @@ _FIEMAP_EXTENT = 56
 """struct fiemap_extent: u64 logical, physical, length, 2x reserved64, u32 flags, 3x pad."""
 _FIEMAP_BATCH = 128
 
-SHARED_EXTENT_FLOOR = 64 * 1024
-"""Smallest file worth one FIEMAP ioctl to ask about.
-
-The ioctl is what makes reflinks visible, and it costs an open/ioctl/close per
-file where `st_nlink` costs nothing. A venv's weight is in a few hundred large
-`.so` files, so the floor is where the answer stops paying for the question.
-Measured on a 15.00 GiB torch venv of 67520 files, against a 0.54 s walk that
-asks nothing:
-
-| floor  | ioctls | sharing found | walk  |
-| ---    | ---    | ---           | ---   |
-| none   | 67520  | 14.67 GiB     | 1.60s |
-| 64 KiB | 3298   | 14.19 GiB     | 0.60s |
-| 1 MiB  | 287    | 13.84 GiB     | 0.56s |
-
-64 KiB finds 97% of the sharing for 11% more walk. What is missed is counted as
-reclaimable, so the error is in the direction of promising more than you get --
-the same direction the whole figure used to be wrong in, and now by a third of
-a gigabyte rather than fifteen.
-"""
-
 
 def shared_extent_bytes(path: str) -> int:
     """Bytes of `path` whose extents another file also references.
@@ -125,6 +104,11 @@ def shared_extent_bytes(path: str) -> int:
     tmpfs has no FIEMAP at all), for a file we may not open, and for anything
     that goes wrong: every failure here means "assume it is all yours", which
     over-reports what a delete frees rather than under-reporting it.
+
+    One open/ioctl/close per file, which is why this is asked once per finished
+    job and recorded in `state.json` rather than on every `status`: it triples
+    the walk (1.60 s against 0.54 s over a 15.00 GiB venv of 67520 files), and
+    a walk that happens once can afford to be exact. See `JobState.workdir_bytes`.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -198,7 +182,7 @@ def _walk_size(root: Path, *, reclaimable_only: bool) -> int:
             if info.st_nlink <= 1:
                 # One link is one path: this cannot be the same file twice.
                 blocks = info.st_blocks * 512
-                if reclaimable_only and blocks >= SHARED_EXTENT_FLOOR:
+                if reclaimable_only and blocks:
                     blocks -= min(blocks, shared_extent_bytes(entry.path))
                 total += blocks
                 continue
@@ -245,8 +229,15 @@ def reclaimable_bytes(root: Path) -> int:
     counted on sight and never remembered. **Reflinks** (its `clone` mode,
     where the filesystem supports it) share extents *without* sharing an inode,
     so `st_nlink` is 1 and nothing about the file says its bytes are also the
-    cache's; only FIEMAP can, at one ioctl per file, which is why it is asked
-    about files over `SHARED_EXTENT_FLOOR` and no others.
+    cache's; only FIEMAP can, at one ioctl per file.
+
+    That ioctl is the expensive part, and the reason this is measured once per
+    job rather than on demand: nothing cheaper is exact. The kernel will tell
+    you an extent is shared (FIEMAP) or who else references it (btrfs
+    `LOGICAL_INO`, a backref walk that costs *more*), and a filesystem-wide
+    scan (btrfs `TREE_SEARCH_V2`, XFS `GETFSMAP`) is O(extents on the device).
+    Only btrfs qgroups answer in O(1), and only per subvolume, with quotas on.
+    So: pay it once, exactly, and write the number down.
 
     Which mode a host gets is the host's business, not ours -- the same uv
     against the same cache hardlinks on one box and reflinks on the next -- so
@@ -268,6 +259,21 @@ def workdir_size(job_id: str) -> int | None:
     if not workdir.is_dir():
         return None
     return reclaimable_bytes(workdir)
+
+
+def record_workdir_size(job_id: str) -> int | None:
+    """Measure a finished job's workdir once and write the figure to its state.
+
+    The walk is exact and therefore not cheap, so it happens here -- at the
+    couple of moments something already knows this job is over -- rather than
+    on every `status`. A failure to record is not worth failing anything over:
+    the figure is a disk report, and a null one only means `status` says it
+    does not know yet.
+    """
+    size = workdir_size(job_id)
+    with contextlib.suppress(RuntimeError, OSError, KeyError):
+        jobs.update_state(job_id, workdir_bytes=0 if size is None else size)
+    return size
 
 
 def remove_workdir(job_id: str) -> int:
@@ -515,7 +521,7 @@ def clean(
             continue
         result.removed.append(candidate)
         try:
-            jobs.update_state(candidate.job_id, workdir_removed=True)
+            jobs.update_state(candidate.job_id, workdir_removed=True, workdir_bytes=0)
         except (RuntimeError, OSError, KeyError) as exc:
             result.errors.append(
                 f"{candidate.job_id}: workdir removed but state not updated: {exc}"

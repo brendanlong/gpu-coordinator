@@ -435,17 +435,62 @@ def test_host_cli_clean_only_says_when_a_named_workdir_is_already_gone(
     assert [s["why"] for s in payload["skipped"]] == ["workdir already gone"]
 
 
-def test_host_cli_status_reports_workdir_bytes(
+def sizes_from_status(capsys: pytest.CaptureFixture[str]) -> dict[str, int | None]:
+    assert host_cli.main(["status"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    return {job["job_id"]: job["workdir_bytes"] for job in payload["jobs"]}
+
+
+def test_host_cli_status_reports_the_recorded_workdir_bytes(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     done = finished_job("succeeded")
     running = finished_job("running")
-    assert host_cli.main(["status"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    sizes = {job["job_id"]: job["workdir_bytes"] for job in payload["jobs"]}
-    assert sizes[done] and sizes[done] > 0
+    jobs.update_state(done, workdir_bytes=4096)
+    sizes = sizes_from_status(capsys)
+    assert sizes[done] == 4096
     # A live job's workdir is still being written to; its size means nothing.
     assert sizes[running] is None
+
+
+def test_host_cli_status_never_measures_a_workdir_itself(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Walking every finished venv per call cost 4 s on a host holding sixty."""
+    done = finished_job("succeeded")
+
+    def refuse(root: Path) -> int:
+        raise AssertionError("status walked a workdir")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "reclaimable_bytes", refuse)
+        assert sizes_from_status(capsys)[done] is None, "not measured yet means null"
+
+
+def test_record_workdir_size_writes_what_a_later_status_reads(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    done = finished_job("succeeded")
+    measured = cleanup.record_workdir_size(done)
+    assert measured and measured > 0
+    assert jobs.read_state(done).workdir_bytes == measured
+    assert sizes_from_status(capsys)[done] == measured
+
+
+def test_record_workdir_size_says_zero_once_the_workdir_is_gone(gpuc_home: Path) -> None:
+    done = finished_job("succeeded")
+    cleanup.remove_workdir(done)
+    assert cleanup.record_workdir_size(done) is None
+    assert jobs.read_state(done).workdir_bytes == 0
+
+
+def test_the_sweep_records_that_it_freed_everything(gpuc_home: Path) -> None:
+    done = finished_job("succeeded")
+    jobs.update_state(done, workdir_bytes=999999)
+    cleanup.clean(all_finished=True)
+    state = jobs.read_state(done)
+    assert state.workdir_removed is True
+    assert state.workdir_bytes == 0, "status would still be quoting a workdir that is gone"
 
 
 def test_reclaimable_bytes_counts_a_hardlink_once(gpuc_home: Path, tmp_path: Path) -> None:
@@ -524,7 +569,7 @@ def test_reclaimable_bytes_skips_extents_a_file_outside_the_tree_shares(
     cache = tmp_path / "cache"
     cache.mkdir()
     cached = cache / "wheel.bin"
-    cached.write_bytes(b"x" * (4 * cleanup.SHARED_EXTENT_FLOOR))
+    cached.write_bytes(b"x" * (256 * 1024))
 
     root = tmp_path / "tree"
     root.mkdir()
@@ -532,8 +577,8 @@ def test_reclaimable_bytes_skips_extents_a_file_outside_the_tree_shares(
         pytest.skip("this filesystem has no reflinks, so there is nothing to detect")
     assert (root / "cloned.bin").stat().st_nlink == 1, "a reflink is not a hardlink"
 
-    assert cleanup.dir_size(root) >= 4 * cleanup.SHARED_EXTENT_FLOOR
-    assert cleanup.reclaimable_bytes(root) < cleanup.SHARED_EXTENT_FLOOR
+    assert cleanup.dir_size(root) >= 256 * 1024
+    assert cleanup.reclaimable_bytes(root) < 64 * 1024
 
 
 def test_shared_extent_bytes_answers_zero_rather_than_raising(
@@ -542,18 +587,19 @@ def test_shared_extent_bytes_answers_zero_rather_than_raising(
     """Every failure means "assume it is all yours": over-report, never raise."""
     assert cleanup.shared_extent_bytes(str(tmp_path / "does-not-exist")) == 0
     ordinary = tmp_path / "plain.bin"
-    ordinary.write_bytes(b"z" * (2 * cleanup.SHARED_EXTENT_FLOOR))
+    ordinary.write_bytes(b"z" * (128 * 1024))
     # A file nothing else references: zero either way, whatever the fs answers.
     assert cleanup.shared_extent_bytes(str(ordinary)) == 0
 
 
-def test_small_files_are_not_worth_an_ioctl(gpuc_home: Path, tmp_path: Path) -> None:
-    """The floor is a real cutoff, not decoration."""
+def test_every_file_with_blocks_is_asked_about(gpuc_home: Path, tmp_path: Path) -> None:
+    """No size floor: the walk happens once per job, so it may as well be exact."""
     asked: list[str] = []
     root = tmp_path / "tree"
     root.mkdir()
-    (root / "big.bin").write_bytes(b"x" * (2 * cleanup.SHARED_EXTENT_FLOOR))
+    (root / "big.bin").write_bytes(b"x" * (128 * 1024))
     (root / "small.bin").write_bytes(b"y" * 32)
+    (root / "empty.bin").touch()
 
     real = cleanup.shared_extent_bytes
 
@@ -564,20 +610,21 @@ def test_small_files_are_not_worth_an_ioctl(gpuc_home: Path, tmp_path: Path) -> 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(cleanup, "shared_extent_bytes", spy)
         cleanup.reclaimable_bytes(root)
-    assert asked == ["big.bin"]
+    # An empty file has no blocks to share, so it is not worth the syscall.
+    assert sorted(asked) == ["big.bin", "small.bin"]
 
 
 def test_du_sizing_never_asks_the_filesystem_about_sharing(gpuc_home: Path, tmp_path: Path) -> None:
     root = tmp_path / "tree"
     root.mkdir()
-    (root / "big.bin").write_bytes(b"x" * (2 * cleanup.SHARED_EXTENT_FLOOR))
+    (root / "big.bin").write_bytes(b"x" * (128 * 1024))
 
     def refuse(path: str) -> int:
         raise AssertionError("du sizing asked about shared extents")
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(cleanup, "shared_extent_bytes", refuse)
-        assert cleanup.dir_size(root) >= 2 * cleanup.SHARED_EXTENT_FLOOR
+        assert cleanup.dir_size(root) >= 128 * 1024
 
 
 def test_reclaimable_bytes_counts_a_file_once_every_link_to_it_is_in_the_tree(
