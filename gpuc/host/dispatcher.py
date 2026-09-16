@@ -393,6 +393,7 @@ class Dispatcher:
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
     _last_reclaim_at: float | None = None
+    _to_measure: list[str] = field(default_factory=list)
     _kill_sent: dict[str, float] = field(default_factory=dict)
     _kill_escalated: set[str] = field(default_factory=set)
     _pause_drain_pending: bool = False
@@ -975,9 +976,11 @@ class Dispatcher:
         `outputs:` have not reached the mirror yet.
 
         Purge first: it takes whole job dirs, and the workdir sweep afterwards
-        should not spend its report on dirs that are already gone. Measuring
-        what survives comes last, for the same reason -- and runs even with
-        neither horizon set, because `status` depends on it either way.
+        should not spend its report on dirs that are already gone. Drawing up
+        what still needs measuring comes last, for the same reason -- and
+        happens even with neither horizon set, because `status` reads those
+        figures either way. The measuring itself is paced by
+        `measure_one_workdir`, one per loop.
         """
         now = self.deps.monotonic()
         if self._last_reclaim_at is not None and now - self._last_reclaim_at < RETENTION_INTERVAL_S:
@@ -989,7 +992,7 @@ class Dispatcher:
             self._purge(purge_days)
         if workdir_days is not None:
             self._sweep_workdirs(workdir_days)
-        self.measure_unmeasured_workdirs()
+        self._to_measure = self.find_workdirs_to_measure()
 
     def _purge(self, days: float) -> None:
         result = cleanup.purge(older_than_days=days, now=self.deps.utcnow(), automatic=True)
@@ -1003,23 +1006,53 @@ class Dispatcher:
         for error in result.errors:
             self.log(f"retention: {error}")
 
-    def measure_unmeasured_workdirs(self) -> None:
-        """Fill in `workdir_bytes` for finished jobs that have none.
+    def find_workdirs_to_measure(self) -> list[str]:
+        """Finished jobs whose recorded `workdir_bytes` is missing or stale.
 
-        The runner records it when a job ends, so this is for the two cases
-        that leaves: a job that finished before the field existed, and a runner
-        that died before writing it. Last in the pass, so it never measures a
-        workdir the sweep above was about to take, and gated by the same hour,
-        because measuring is the expensive thing `status` used to do inline.
+        Missing is the runner's two gaps: a job that ended before the field
+        existed, and a runner that died before writing it. Stale is a job whose
+        workdir has since gone but whose figure did not follow it -- `status`
+        would advertise disk that `clean` cannot free, because a job with no
+        workdir is not a candidate for anything, so nothing else would ever
+        put it right.
         """
+        wanted: list[str] = []
         for job_id in jobs.list_job_ids():
             try:
                 state = jobs.read_state(job_id)
             except (RuntimeError, OSError):
                 continue
-            if not state.finished or state.workdir_bytes is not None:
+            if not state.finished:
+                continue
+            recorded = state.workdir_bytes
+            never_measured = recorded is None
+            outlived_its_workdir = bool(recorded) and not paths.workdir(job_id).is_dir()
+            if never_measured or outlived_its_workdir:
+                wanted.append(job_id)
+        return wanted
+
+    def measure_one_workdir(self) -> None:
+        """Measure at most one workdir per pass, draining the list found hourly.
+
+        One per pass, not the whole list: measuring is an ioctl per file, and a
+        host coming up after an upgrade with sixty unmeasured venvs would spend
+        a minute and a half inside `run_once` -- during which nothing launches
+        a queued job on a free GPU and the cancel and TTL backstops do not run.
+        One at a time clears the same sixty in two minutes of loop iterations
+        and never holds the loop for longer than a single walk.
+        """
+        while self._to_measure:
+            job_id = self._to_measure.pop()
+            try:
+                state = jobs.read_state(job_id)
+            except (RuntimeError, OSError):
+                continue
+            # It may have been purged, or measured by its own runner, since the
+            # list was drawn up.
+            if not state.finished:
                 continue
             cleanup.record_workdir_size(job_id)
+            return
 
     def _sweep_workdirs(self, days: float) -> None:
         result = cleanup.clean(older_than_days=days, now=self.deps.utcnow(), automatic=True)
@@ -1042,6 +1075,7 @@ class Dispatcher:
         self.check_pause()
         self.launch_ready()
         self.maybe_reclaim()
+        self.measure_one_workdir()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 from collections.abc import Callable
@@ -735,6 +736,31 @@ def test_measuring_does_not_happen_again_once_it_is_recorded(gpuc_home: Path) ->
         patch.setattr(cleanup, "reclaimable_bytes", refuse)
         dispatcher.run_once()
     assert jobs.read_state(job_id).workdir_bytes == 4096
+
+
+def test_measuring_takes_one_workdir_per_pass(gpuc_home: Path) -> None:
+    """Sixty unmeasured venvs must not hold run_once for a minute and a half:
+    nothing launches a queued job on a free GPU while it does."""
+    configure_retention(None, None)
+    ids = [finished_job(days_old=0.1) for _ in range(3)]
+    dispatcher, _ = make_dispatcher()
+    for expected in (1, 2, 3):
+        dispatcher.run_once()
+        measured = sum(1 for j in ids if jobs.read_state(j).workdir_bytes is not None)
+        assert measured == expected
+
+
+def test_a_figure_that_outlived_its_workdir_is_put_right(gpuc_home: Path) -> None:
+    """`clean` cannot heal this itself: a job with no workdir is not a
+    candidate, so the stale figure would be advertised forever."""
+    configure_retention(None, None)
+    job_id = finished_job(days_old=0.1)
+    jobs.update_state(job_id, workdir_bytes=12_000_000_000)
+    shutil.rmtree(paths.workdir(job_id))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).workdir_bytes == 0
 
 
 def test_a_running_job_is_never_measured(gpuc_home: Path) -> None:

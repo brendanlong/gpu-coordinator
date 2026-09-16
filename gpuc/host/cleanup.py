@@ -111,16 +111,24 @@ def shared_extent_bytes(path: str) -> int:
     a walk that happens once can afford to be exact. See `JobState.workdir_bytes`.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        # O_NOFOLLOW because the walk never follows one: a symlink's own
+        # st_blocks can be non-zero (ext4 stores a long target out of line), so
+        # without this the sweep opens whatever path a job happened to point at
+        # -- a device node, or a file on a hung mount that O_NONBLOCK will not
+        # save us from. The caller checks S_ISREG too; this is the backstop.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError:
         return 0
     try:
         shared = 0
         start = 0
+        buf = array.array("b", bytes(_FIEMAP_HEADER + _FIEMAP_EXTENT * _FIEMAP_BATCH))
         # Bounded rather than `while True`: a filesystem that keeps answering
-        # without ever setting LAST or advancing must not hang the sweep.
+        # without ever setting LAST or advancing must not hang the sweep. A file
+        # past the cap is under-counted as shared, never over-counted.
         for _ in range(64):
-            buf = array.array("b", bytes(_FIEMAP_HEADER + _FIEMAP_EXTENT * _FIEMAP_BATCH))
+            # Only the header needs resetting; `fm_mapped_extents` says how much
+            # of the rest the kernel wrote.
             struct.pack_into("=QQIIII", buf, 0, start, 1 << 62, 0, 0, _FIEMAP_BATCH, 0)
             try:
                 fcntl.ioctl(fd, FS_IOC_FIEMAP, buf, True)
@@ -182,7 +190,9 @@ def _walk_size(root: Path, *, reclaimable_only: bool) -> int:
             if info.st_nlink <= 1:
                 # One link is one path: this cannot be the same file twice.
                 blocks = info.st_blocks * 512
-                if reclaimable_only and blocks:
+                # Regular files only: a symlink has no extents worth asking
+                # about, and asking means opening what it points at.
+                if reclaimable_only and blocks and stat.S_ISREG(info.st_mode):
                     blocks -= min(blocks, shared_extent_bytes(entry.path))
                 total += blocks
                 continue
@@ -244,11 +254,24 @@ def reclaimable_bytes(root: Path) -> int:
     a figure that saw only one of them would be right on one host and off by
     fifteen gigabytes on another.
 
-    Two under-counts are left, both narrow and both shapes `du` shares: two
-    sibling workdirs holding the last two links to a file are each told they
-    free nothing, though deleting both would; and a file that is *both*
-    hardlinked wholly within this tree and reflinked out of it counts in full,
-    because the hardlink branch does not go on to ask FIEMAP.
+    The error is one-sided per *file* -- anything unanswerable counts as yours
+    -- but the figure as a whole can still come out low, because
+    `FIEMAP_EXTENT_SHARED` means "shared with something", not "shared with
+    something outside this tree". Learning who the other referrer is costs a
+    backref walk per extent, which is more than the whole measurement. So:
+
+    - Sharing *within* the tree reads as sharing out of it. A workdir that
+      reflinks a dataset into a second copy of itself is told it frees neither.
+    - On a snapshotted filesystem (btrfs with snapper or timeshift), every
+      extent in every workdir is shared with the snapshot, and this reports
+      little more than the directories. That is arguably honest -- the delete
+      really does free nothing until the snapshot expires -- but it is not what
+      anyone reading a `clean` report expects.
+    - Two sibling workdirs holding the last two links to one file are each told
+      they free nothing, though deleting both would. `du` splits that pair the
+      same way when asked about them separately.
+    - A file both hardlinked wholly within this tree and reflinked out of it
+      counts in full: the hardlink branch does not go on to ask FIEMAP.
     """
     return _walk_size(root, reclaimable_only=True)
 
@@ -261,7 +284,7 @@ def workdir_size(job_id: str) -> int | None:
     return reclaimable_bytes(workdir)
 
 
-def record_workdir_size(job_id: str) -> int | None:
+def record_workdir_size(job_id: str) -> int:
     """Measure a finished job's workdir once and write the figure to its state.
 
     The walk is exact and therefore not cheap, so it happens here -- at the
@@ -269,19 +292,33 @@ def record_workdir_size(job_id: str) -> int | None:
     on every `status`. A failure to record is not worth failing anything over:
     the figure is a disk report, and a null one only means `status` says it
     does not know yet.
+
+    The workdir is re-checked *after* the walk because the walk takes seconds
+    and `gpuc clean` is a different process. Without this, a clean landing in
+    that window is overwritten with the figure for a workdir that no longer
+    exists -- and `status` then advertises disk that `clean` cannot free,
+    because a job with no workdir is not a candidate for anything.
     """
     size = workdir_size(job_id)
+    if size is not None and not paths.workdir(job_id).is_dir():
+        size = None
+    recorded = 0 if size is None else size
     with contextlib.suppress(RuntimeError, OSError, KeyError):
-        jobs.update_state(job_id, workdir_bytes=0 if size is None else size)
-    return size
+        jobs.update_state(job_id, workdir_bytes=recorded)
+    return recorded
 
 
-def remove_workdir(job_id: str) -> int:
-    """Delete `jobs/<id>/workdir` and nothing else. Returns the bytes freed."""
+def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
+    """Delete `jobs/<id>/workdir` and nothing else. Returns the bytes freed.
+
+    `measured` is a figure the caller already walked for, which `clean` always
+    has: measuring is now an ioctl per file, and doing it twice to delete once
+    is most of the cost of `gpuc clean --all-finished`.
+    """
     workdir = paths.workdir(job_id)
     if not workdir.is_dir():
         return 0
-    size = reclaimable_bytes(workdir)
+    size = reclaimable_bytes(workdir) if measured is None else measured
     shutil.rmtree(workdir)
     return size
 
@@ -515,7 +552,7 @@ def clean(
             result.removed.append(candidate)
             continue
         try:
-            remove_workdir(candidate.job_id)
+            remove_workdir(candidate.job_id, measured=candidate.bytes)
         except OSError as exc:
             result.errors.append(f"{candidate.job_id}: could not remove workdir: {exc}")
             continue

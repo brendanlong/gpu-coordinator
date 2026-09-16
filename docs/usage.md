@@ -820,9 +820,16 @@ the same uv against the same cache hardlinks on one box and reflinks on the
 next. It is measured once, when the job ends, and recorded in its `state.json`
 — a finished workdir does not change, and walking every one of them per call
 cost `status` four seconds on a host holding sixty. `gpuc clean` measures
-afresh, since it is about to delete what it is quoting. Anything the
-filesystem will not answer about counts as reclaimable, so the figure errs
-towards promising more than you get.
+afresh, since it is about to delete what it is quoting, and a workdir the host
+has not sized yet is counted as `not sized yet` rather than as nothing.
+
+Anything the filesystem will not answer about counts as reclaimable, so no one
+file is ever under-counted. The total still can be, in one case worth knowing:
+the kernel says an extent is *shared*, not *who with*, so on a filesystem that
+snapshots your home (btrfs with snapper or timeshift) every workdir shares
+everything with its snapshot and reports close to nothing. The delete really
+does free nothing until the snapshot expires, but it is not what the number
+looks like it is saying.
 
 ## Troubleshooting
 

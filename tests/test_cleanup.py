@@ -85,9 +85,33 @@ def test_the_runner_applies_the_policy(
     assert state.status == status
     assert paths.workdir(job_id).exists() is not expected
     assert state.workdir_removed is expected
+    # The runner is the primary writer of the figure `status` reads, and it
+    # must agree with what it just did either way.
+    if expected:
+        assert state.workdir_bytes == 0
+    else:
+        assert state.workdir_bytes is not None and state.workdir_bytes > 0
     # Deleting the workdir must not cost the one fact a failed run is kept for.
     if status == "failed":
         assert (state.exit_code, state.reason) == (7, "exit 7")
+
+
+def test_the_runner_records_the_size_before_it_mirrors_state(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Written after the final meta sync, the mirror would never carry it."""
+    mirrored: list[int | None] = []
+
+    def capture(job_id: str, prefix: str, **kwargs: object) -> str | None:
+        mirrored.append(jobs.read_state(job_id).workdir_bytes)
+        return None
+
+    monkeypatch.setattr(runner.sync, "final_meta_sync", capture)
+    job_id = prepare(command="true", cleanup="never")
+    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
+    (paths.workdir(job_id) / "big.bin").write_bytes(b"x" * 4096)
+    runner.run_job(job_id, deps())
+    assert mirrored and mirrored[0] is not None and mirrored[0] > 0
 
 
 def test_cleanup_keeps_spec_state_and_log(gpuc_home: Path) -> None:
@@ -480,7 +504,7 @@ def test_record_workdir_size_writes_what_a_later_status_reads(
 def test_record_workdir_size_says_zero_once_the_workdir_is_gone(gpuc_home: Path) -> None:
     done = finished_job("succeeded")
     cleanup.remove_workdir(done)
-    assert cleanup.record_workdir_size(done) is None
+    assert cleanup.record_workdir_size(done) == 0
     assert jobs.read_state(done).workdir_bytes == 0
 
 
@@ -612,6 +636,86 @@ def test_every_file_with_blocks_is_asked_about(gpuc_home: Path, tmp_path: Path) 
         cleanup.reclaimable_bytes(root)
     # An empty file has no blocks to share, so it is not worth the syscall.
     assert sorted(asked) == ["big.bin", "small.bin"]
+
+
+def test_shared_extents_come_off_the_total(gpuc_home: Path, tmp_path: Path) -> None:
+    """What the reflink test proves where reflinks exist, without needing them."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * (128 * 1024))
+    whole = cleanup.reclaimable_bytes(root)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "shared_extent_bytes", lambda path: 64 * 1024)
+        assert cleanup.reclaimable_bytes(root) == whole - 64 * 1024
+
+
+def test_a_share_larger_than_the_file_cannot_drive_the_total_negative(
+    gpuc_home: Path, tmp_path: Path
+) -> None:
+    """btrfs compression makes `fe_length` logical and `st_blocks` compressed,
+    so the shared figure really can exceed what the file occupies."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * (128 * 1024))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "shared_extent_bytes", lambda path: 1 << 40)
+        assert cleanup.reclaimable_bytes(root) >= 0
+
+
+def test_a_symlink_is_never_opened_to_ask_about_it(gpuc_home: Path, tmp_path: Path) -> None:
+    """A long target makes a symlink's own st_blocks non-zero on ext4, and
+    following it would open whatever a job pointed at."""
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"x" * (128 * 1024))
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "link").symlink_to(outside)
+
+    asked: list[str] = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "shared_extent_bytes", lambda path: asked.append(path) or 0)
+        cleanup.reclaimable_bytes(root)
+    assert asked == []
+    # And the backstop holds even if something calls it directly.
+    assert cleanup.shared_extent_bytes(str(root / "link")) == 0
+
+
+def test_a_clean_measures_each_workdir_once(gpuc_home: Path) -> None:
+    """An ioctl per file is too much to pay twice for one delete."""
+    finished_job("succeeded")
+    walks = 0
+    real = cleanup.reclaimable_bytes
+
+    def counted(root: Path) -> int:
+        nonlocal walks
+        walks += 1
+        return real(root)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "reclaimable_bytes", counted)
+        result = cleanup.clean(all_finished=True)
+    assert result.freed_bytes > 0
+    assert walks == 1
+
+
+def test_measuring_after_a_clean_took_the_workdir_records_zero(gpuc_home: Path) -> None:
+    """The race: `gpuc clean` is another process, and the walk takes seconds."""
+    job_id = finished_job("succeeded")
+    real = cleanup.workdir_size
+
+    def measure_then_someone_cleans(wanted: str) -> int | None:
+        size = real(wanted)
+        cleanup.remove_workdir(wanted)  # the other process, mid-walk
+        return size
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "workdir_size", measure_then_someone_cleans)
+        assert cleanup.record_workdir_size(job_id) == 0
+    assert jobs.read_state(job_id).workdir_bytes == 0, (
+        "status would advertise disk that clean cannot free"
+    )
 
 
 def test_du_sizing_never_asks_the_filesystem_about_sharing(gpuc_home: Path, tmp_path: Path) -> None:

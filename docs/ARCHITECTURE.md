@@ -576,8 +576,12 @@ readers read it. Nothing cheaper is exact -- `LOGICAL_INO` costs more per
 extent, a filesystem scan is O(extents on the device), and only btrfs qgroups
 answer in O(1), per subvolume, with quotas on -- so the trade is to pay it once
 and write the number down. Every way it can fail (no FIEMAP, no permission, an
-odd filesystem) means "assume it is all yours", so the figure over-reports what
-a delete frees rather than under-reporting it.
+odd filesystem) means "assume it is all yours", so no *file* is ever
+under-counted. The figure as a whole still can be: `FIEMAP_EXTENT_SHARED` says
+"shared with something", not "shared with something outside this tree", and
+finding out which costs a backref walk per extent. On a filesystem where every
+extent is shared with a snapshot, a workdir reports close to nothing. See
+`reclaimable_bytes` for the full list of what that misses.
 
 `cleanup.dir_size` is the `du` twin and asks none of this; the uv cache's own
 size in `health` is the one question that wants it.
