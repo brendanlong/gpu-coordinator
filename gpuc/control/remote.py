@@ -138,21 +138,29 @@ def config_file(home: str) -> str:
     return f"{home}/config.json"
 
 
+NO_CONFIG = "__gpuc_no_config__"
+"""What the host says when it has no `config.json`, so that "there is none" is
+never confused with "it is there and did not parse" -- the second is a file
+somebody's host is running on, and replacing it would be the drift this whole
+model exists to stop. A marker rather than an exit code, because a host prints
+things around our output (a MOTD, a shell rc warning) that no parse can
+distinguish from a config that is simply broken."""
+
+
 def read_remote_config(transport: Transport, home: str) -> dict[str, Any] | None:
-    """The host's own `config.json`, or ``None`` if the host could not be asked.
+    """The host's own `config.json`; ``{}`` if it has none, ``None`` if we
+    could not read it.
 
     This file is the only copy of what the host *is* -- its cards, its mirror,
     its env, its timers -- so everything that acts on a host reads it here
-    rather than trusting the registry's cache of it.
-
-    An empty dict is a host that answered and has no config -- never
-    bootstrapped, or its gpuc home has moved -- and that is a real answer, so
-    the two cases are told apart: `cat` swallows its own failure, and a
-    non-zero exit is the transport's.
+    rather than trusting the registry's cache of it, and nothing writes over a
+    `None`: a host that could not be asked, or one whose config is there but
+    unreadable, is not a host with no config.
     """
+    path = config_file(home)
     try:
         result = transport.run(
-            f'cat "{config_file(home)}" 2>/dev/null || true',
+            f'if [ -f "{path}" ]; then cat "{path}"; else echo {NO_CONFIG}; fi',
             timeout=DEFAULT_TIMEOUT_S,
             check=False,
         )
@@ -160,8 +168,10 @@ def read_remote_config(transport: Transport, home: str) -> dict[str, Any] | None
         return None
     if result.returncode != 0:
         return None
+    if NO_CONFIG in result.stdout:
+        return {}
     document = parse_last_json(result.stdout)
-    return document if isinstance(document, dict) else {}
+    return document if isinstance(document, dict) else None
 
 
 def write_remote_config(
@@ -193,7 +203,16 @@ def write_remote_config(
             # this subcommand. The host still owns its config either way, and
             # the same merge below is what its own CLI would have done.
             pass
-    document = jobs.merged_config(read_remote_config(transport, home) or {}, patch)
+    existing = read_remote_config(transport, home)
+    if existing is None:
+        raise RemoteError(
+            transport.host,
+            f'cat "{config_file(home)}"',
+            f"the host's own config could not be read, so it was left alone.\n"
+            f"Check that {config_file(home)} is readable and holds JSON; delete it to start "
+            f"that host again.",
+        )
+    document = jobs.merged_config(existing, patch)
     put_remote_config(transport, home, document)
     return document
 
@@ -226,15 +245,29 @@ def _merge_on_host(
 def put_remote_config(transport: Transport, home: str, document: Mapping[str, Any]) -> None:
     """Replace `config.json` wholesale on a host with no package to run.
 
-    Creates gpuc home 0700 if it is not there: this runs before
+    Creates gpuc home 0700 *if it is not there*: this runs before
     `paths.ensure_layout` on a host being registered for the first time, and a
     default-umask mkdir would leave the queue and every job dir readable by
-    every other user of a shared box.
+    every other user of a shared box. An existing directory keeps its mode, as
+    `ensure_persistent_root` does -- re-chmodding one is not ours to do.
     """
     tmp = f"{home}/.config.json.{os.getpid()}.tmp"
-    transport.run(f'mkdir -p "{home}" && chmod 700 "{home}"', timeout=DEFAULT_TIMEOUT_S, check=True)
+    quoted = shlex.quote(tmp)
+    transport.run(
+        f'if [ ! -d "{home}" ]; then mkdir -p "{home}"; chmod 700 "{home}"; fi',
+        timeout=DEFAULT_TIMEOUT_S,
+        check=True,
+    )
     transport.put_file(json.dumps(dict(document), indent=2, sort_keys=True) + "\n", tmp, 0o644)
-    transport.run(f'mv -f "{tmp}" "{config_file(home)}"', timeout=DEFAULT_TIMEOUT_S, check=True)
+    try:
+        transport.run(
+            f"mv -f {quoted} {shlex.quote(config_file(home))}",
+            timeout=DEFAULT_TIMEOUT_S,
+            check=True,
+        )
+    except TransportError:
+        transport.run(f"rm -f {quoted}", timeout=DEFAULT_TIMEOUT_S, check=False)
+        raise
 
 
 def resolve_home(transport: Transport, entry: HostEntry) -> str:

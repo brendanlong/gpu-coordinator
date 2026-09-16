@@ -160,14 +160,24 @@ gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idem
   reported field by field (`host <- retention_days 30.0 -> 7.0`). A `--gpus`
   that claims *some* of the cards the host already has is refused rather than
   warned about, because that is the one difference that can hand one card to
-  two jobs; a disjoint list is a reassignment and goes through, and `--force`
-  overrides the refusal. The host is registered under the name it calls itself.
+  two jobs — in whichever spelling, since `--gpus 0` and `--gpus GPU-…` can be
+  the same card; a disjoint list is a reassignment and goes through, and
+  `--force` overrides the refusal. The host is registered under the name it
+  calls itself, unless a *different* host is already registered here under that
+  name, which is refused rather than replaced.
 - the host has **no** config — nothing has been set up there yet — so this is
   where one is written, and `--gpus` is required (`--gpus ''` for a host whose
   cards gpuc may not use). The probe's card list is printed if you leave it out.
 
 So a host is registered by asking it what it is, and a second machine
-connecting to a box the first one set up is the ordinary path.
+connecting to a box the first one set up is the ordinary path. Such a host is
+usable from that machine at once — `gpuc status`, `gpuc host set`, `gpuc logs`
+— because the probe records an interpreter to run the on-host package with;
+`gpuc host bootstrap` is still what ships *this* build's package to it.
+
+A `config.json` that is there but does not parse stops all of this: it is a
+file the host is running on, so nothing replaces it, and the error says to fix
+or delete it.
 
 RunPod hosts are never added by hand: `gpuc submit --runpod ...` creates the
 pod, registers it as kind `runpod`, and bootstraps it
@@ -183,7 +193,7 @@ which `host set` writes through to it.
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
 | `--cache-dir PATH` | bootstrap decides | uv's cache for this host, which is `UV_CACHE_DIR` in its `env`. Bootstrap sets one on gpuc home's filesystem when they differ, because uv only reflinks or hardlinks a venv out of its cache within one filesystem — but only when the host's config names none, however it got there |
 | `--persistent-root R` | none | gpuc home moves to `R/gpuc` (below) |
-| `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. Nothing populates it automatically |
+| `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. Nothing populates it automatically. It replaces the whole set, except `UV_CACHE_DIR`, which is bootstrap's and `--cache-dir`'s |
 | `--s3-prefix s3://…` | none | this host's own log/state mirror |
 | `--retention-days N` | none | the host's dispatcher auto-purges job dirs older than this, but only ones whose log and state it has confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` goes back to keeping everything |
 | `--idle-min N` | `15` | how long an ephemeral host may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |

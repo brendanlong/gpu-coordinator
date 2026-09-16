@@ -217,16 +217,18 @@ def status_document(
 
 
 def shipped_note(entry: HostEntry) -> str | None:
-    """The offline half of the version story: what this machine last shipped.
+    """The offline half of the version story: what the host last said it ran.
 
-    `gpuc host list` and `gpuc version` never ask a host anything, so this is
-    all they have. What the host is *running* is `gpuc status`, which asks it.
+    `gpuc host list` and `gpuc version` never ask a host anything, so the
+    cached commit is all they have. What the host is *running* now is `gpuc
+    status`, which asks it.
     """
     return version_mod.shipped_commit_note(entry.name, entry.pkg_commit, version_mod.local_commit())
 
 
 def host_document(entry: HostEntry) -> dict[str, Any]:
     """One registered host as `gpuc host list --json` reports it.
+
 
     The address, the host's config as this machine last read it, and what the
     text listing computes from them. This command never asks the host
@@ -281,17 +283,24 @@ def config_document(settings: Settings) -> dict[str, Any]:
 
 
 def version_document(read: RegistryRead) -> dict[str, Any]:
-    """`gpuc version --json`: this build, and what each host was last given.
+    """`gpuc version --json`: this build, and what each host was last seen on.
 
-    `hosts[].pkg_commit` is this machine's record of its own last bootstrap,
-    and `current` compares it with this build -- the same judgement the text
-    output prints as `DIFFERS: re-bootstrap`. Neither asks the host: the commit
-    a host is actually running is `gpuc status --json`'s `pkg_commit`. Nothing
-    recorded on either side is not evidence of a mismatch, so it reads as
-    current -- `submit` checks the host itself before it enqueues anyway.
+    `hosts[].pkg_commit` is the commit a host's own config named the last time
+    anything here read it, `seen_at` says when that was, and `current` compares
+    it with this build -- the same judgement the text output prints as
+    `DIFFERS: re-bootstrap`. Neither asks the host now: what it is running this
+    minute is `gpuc status --json`'s `pkg_commit`. Nothing recorded on either
+    side is not evidence of a mismatch, so it reads as current -- `submit`
+    checks the host itself before it enqueues anyway.
     """
     commit = version_mod.local_commit()
-    hosts = [entry for entry in read.registry.hosts.values() if entry.bootstrapped_at]
+    # Every host anything here has read, not only the ones *this* machine
+    # bootstrapped: adopting a host is the ordinary way to register one.
+    hosts = [
+        entry
+        for entry in read.registry.hosts.values()
+        if entry.pkg_commit or entry.bootstrapped_at or entry.seen_at
+    ]
     return {
         "version": version_mod.__version__,
         "commit": commit,
@@ -303,6 +312,7 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
             {
                 "name": entry.name,
                 "pkg_commit": entry.pkg_commit,
+                "seen_at": entry.seen_at,
                 "current": version_mod.same_commit(commit, entry.pkg_commit),
             }
             for entry in hosts

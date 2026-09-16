@@ -117,6 +117,37 @@ def test_host_add_refuses_a_gpu_list_that_overlaps_the_hosts_own(
     assert fake_host.config["gpus"] == ["2", "3"]
 
 
+def test_the_gpu_overlap_refusal_sees_through_index_and_uuid_spellings(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--gpus 0` and `--gpus GPU-a` can be the same card, and the index is the
+    spelling somebody copies off `gpuc host probe`."""
+    fake_host.put_file(
+        '{"host": "gpubox", "gpus": ["GPU-a", "GPU-b"]}', "/home/u/.gpuc/config.json"
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == EXIT_ERROR
+    assert "claims GPU-a of them and not the rest" in capsys.readouterr().err
+    assert fake_host.config is not None and fake_host.config["gpus"] == ["GPU-a", "GPU-b"]
+    # The same two cards by their other name is not a difference at all.
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0,1"]) == 0
+    assert fake_host.config["gpus"] == ["0", "1"]
+
+
+def test_an_adopted_name_never_replaces_a_different_host_registered_here(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A box somebody set up as `local` on their own machine calls itself
+    `local` here too, and this machine has one of those."""
+    register_host(name="local", gpus=GPU)
+    fake_host.put_file('{"host": "local", "gpus": ["0"]}', "/home/u/.gpuc/config.json")
+    assert main(["host", "add", "desktop", "--ssh", "me@desktop"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "calls itself 'local'" in err
+    assert "gpuc host remove local" in err
+    assert load_registry().require("local").ssh is None
+    assert set(load_registry().hosts) == {"local"}
+
+
 def test_a_second_machine_registers_the_same_box_and_agrees_with_the_first(
     control_env: Path, fake_host: FakeHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -137,6 +168,41 @@ def test_a_second_machine_registers_the_same_box_and_agrees_with_the_first(
     monkeypatch.setenv("GPUC_STATE_DIR", str(control_env / "state"))
     assert main(["host", "probe", "gpubox"]) == 0
     assert load_registry().require("gpubox").gpus == ["2", "3", "4"]
+
+
+def test_host_set_keeps_the_cache_dir_a_new_env_did_not_mention(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    """`--env` replaces what somebody set by hand. `UV_CACHE_DIR` is not that:
+    bootstrap derives it from the host's own filesystem, and dropping it costs
+    every job on that host a full copy of every wheel."""
+    fake_host.put_file(
+        json.dumps({"host": "gpubox", "gpus": ["0"], "env": {"UV_CACHE_DIR": "/vol/uv"}}),
+        "/home/u/.gpuc/config.json",
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert main(["host", "set", "gpubox", "--env", "HF_HOME=/big"]) == 0
+    assert fake_host.config is not None
+    assert fake_host.config["env"] == {"HF_HOME": "/big", "UV_CACHE_DIR": "/vol/uv"}
+    # `--cache-dir ''` is what clears it, and says so.
+    assert main(["host", "set", "gpubox", "--cache-dir", ""]) == 0
+    assert fake_host.config["env"] == {"HF_HOME": "/big"}
+
+
+def test_host_set_that_changes_nothing_does_not_rewrite_the_hosts_config(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dispatcher is reading that file; repeating what it already says is no
+    reason to replace it."""
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == 0
+    before = list(fake_host.commands)
+    capsys.readouterr()
+    assert main(["host", "set", "gpubox", "--gpus", "0"]) == 0
+    assert "nothing changed" in capsys.readouterr().out
+    written = [
+        c for c in fake_host.commands[len(before) :] if "config --merge" in c or "mv -f" in c
+    ]
+    assert written == []
 
 
 def test_host_add_needs_gpus_for_a_host_with_no_config_and_lists_the_cards(
@@ -780,7 +846,10 @@ def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | N
         # The session opened to ask the host is the one the re-ship rides on:
         # a second `open_session` here would be a second ssh handshake.
         assert kwargs.get("transport") is fake_session.transport
-        return entry.with_config({**(config or {}), "pkg_commit": "b" * 40})
+        # As the real one does: the host's config, or the last one seen where
+        # the host has none, plus the commit just shipped.
+        restored = config or entry.initial_config().to_dict()
+        return entry.with_config({**restored, "pkg_commit": "b" * 40})
 
     monkeypatch.setattr("gpuc.control.cli.resync_package", fake_resync)
 
@@ -950,6 +1019,28 @@ def test_submit_json_keeps_its_document_alone_and_its_warnings_on_stderr(
     captured = capsys.readouterr()
     assert json.loads(captured.out)["job_id"] == "j"
     assert "re-syncing the package" in captured.err
+
+
+def test_submit_keeps_the_cached_config_of_a_host_that_has_lost_its_own(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host whose gpuc home was wiped answers with no config at all. That is
+    not an answer about what the host is -- the cache here is the only copy
+    left, and the re-ship this triggers is what puts it back."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU, s3_prefix="s3://b/gpuc/gpubox")
+    _set_host(python="/py", pkg_commit="b" * 40)
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
+    resynced = _fake_host_build(monkeypatch, {})
+
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert resynced == ["gpubox"]
+    entry = load_registry().require("gpubox")
+    assert entry.gpus == [GPU]
+    assert entry.s3_prefix == "s3://b/gpuc/gpubox"
 
 
 def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(

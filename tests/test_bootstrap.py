@@ -9,6 +9,7 @@ import pytest
 
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, package_files
 from gpuc.control.config import HostEntry
+from gpuc.control.remote import NO_CONFIG
 from gpuc.control.transport import CommandResult
 from gpuc.host import jobs
 from gpuc.host.jobs import HostConfig
@@ -55,8 +56,8 @@ class ScriptedHost:
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
 
     def _answer(self, command: str) -> tuple[int, str]:
-        if command.startswith("cat ") and "config.json" in command:
-            return 0, "" if self.config is None else json.dumps(self.config)
+        if command.startswith("if [ -f") and "config.json" in command:
+            return 0, NO_CONFIG if self.config is None else json.dumps(self.config)
         if "-m gpuc.host config --merge" in command:
             # The host's own merge, done by the host's own code: whichever
             # control machine sends a patch, this is what applies it.
@@ -268,6 +269,22 @@ def test_bootstrap_restores_a_config_on_a_host_that_has_none(control_env: Path) 
     assert host.config["s3_prefix"] == "s3://mine/gpuc/h"
     assert host.config["host"] == "h"
     assert updated.gpus == ["GPU-a"]
+
+
+def test_bootstrap_refuses_to_replace_a_config_it_cannot_read(control_env: Path) -> None:
+    """A half-written `config.json` is a file the host is running on. "There is
+    none" is the host saying so, not a parse that failed."""
+
+    class Corrupt(ScriptedHost):
+        def _answer(self, command: str) -> tuple[int, str]:
+            if "config.json" in command and command.startswith("if [ -f"):
+                return 0, '{"host": "h", "gpus": ['
+            return super()._answer(command)
+
+    with pytest.raises(BootstrapError) as caught:
+        bootstrap_host(entry(), transport=Corrupt(), report=lambda _: None)
+    assert "could not be read" in str(caught.value)
+    assert "delete it" in str(caught.value)
 
 
 def test_bootstrap_says_so_when_it_has_no_config_to_give_a_bare_host(

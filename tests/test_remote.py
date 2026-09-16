@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from gpuc.control.remote import (
+    NO_CONFIG,
     HostSession,
     RemoteError,
     host_command,
@@ -134,18 +135,36 @@ def test_the_remote_config_is_read_from_the_host_not_the_registry() -> None:
     # Read out of *this host's* gpuc home. A host with a persistent root or
     # a `--gpuc-home` keeps its config there, and reading the default path
     # would report "no config" and re-ship the package on every submit.
-    assert host.commands == ['cat "/mnt/ssd/gpuc/config.json" 2>/dev/null || true']
+    assert host.commands == [
+        'if [ -f "/mnt/ssd/gpuc/config.json" ]; then cat "/mnt/ssd/gpuc/config.json"; '
+        f"else echo {NO_CONFIG}; fi"
+    ]
 
 
 def test_a_host_with_no_config_is_told_apart_from_one_that_could_not_be_asked() -> None:
-    """`cat` swallows its own failure, so a non-zero exit is the transport's.
-
-    The difference decides whether a host is adopted as it stands or is given
-    its first config, and whether `submit` trusts what it read at all.
+    """The difference decides whether a host is adopted as it stands or is
+    given its first config, so "there is none" is a marker the host prints and
+    never the absence of parseable output: a half-written `config.json` is a
+    file somebody's host is running on, and replacing it is exactly the drift
+    this model exists to stop.
     """
-    assert read_remote_config(cast("Transport", ScriptedTransport("")), "/h/.gpuc") == {}
+    no_config = ScriptedTransport(MOTD + NO_CONFIG + "\n")
+    assert read_remote_config(cast("Transport", no_config), "/h/.gpuc") == {}
+    for unreadable in (ScriptedTransport(MOTD), ScriptedTransport('{"host": "gpub')):
+        assert read_remote_config(cast("Transport", unreadable), "/h/.gpuc") is None
     refused = ScriptedTransport("ssh: could not resolve hostname", returncode=255)
     assert read_remote_config(cast("Transport", refused), "/h/.gpuc") is None
+
+
+def test_a_config_that_could_not_be_read_is_never_written_over() -> None:
+    """The fallback merge has to know what it is merging into. A host that did
+    not answer, or answered with something unparseable, is not a host with no
+    config -- and writing the patch alone would drop everything else."""
+    host = Recorder('{"host": "gpub')
+    with pytest.raises(RemoteError) as caught:
+        write_remote_config(cast("Transport", host), "/home/u/.gpuc", {"gpus": ["0"]})
+    assert "left alone" in str(caught.value)
+    assert host.puts == {}
 
 
 def test_a_host_that_cannot_be_reached_at_all_is_not_an_exception_to_handle() -> None:
@@ -180,12 +199,12 @@ def test_a_host_with_no_package_yet_has_its_config_written_by_rename() -> None:
     """`gpuc host add` writes the first config before anything is installed, so
     there is no host CLI to do the merge -- and a truncated `config.json` is
     something the dispatcher could read."""
-    host = Recorder("")
+    host = Recorder(NO_CONFIG + "\n")
     document = write_remote_config(
         cast("Transport", host), "/home/u/.gpuc", {"host": "gpubox", "gpus": ["0"]}
     )
     assert document["gpus"] == ["0"]
     tmp = next(path for path in host.puts if path.startswith("/home/u/.gpuc/.config.json."))
     assert json.loads(host.puts[tmp][0])["host"] == "gpubox"
-    assert any(f'mv -f "{tmp}" "/home/u/.gpuc/config.json"' == c for c in host.commands)
-    assert any('mkdir -p "/home/u/.gpuc" && chmod 700' in c for c in host.commands)
+    assert any(f"mv -f {tmp} /home/u/.gpuc/config.json" == c for c in host.commands)
+    assert any('mkdir -p "/home/u/.gpuc"; chmod 700' in c for c in host.commands)

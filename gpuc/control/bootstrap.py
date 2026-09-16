@@ -408,6 +408,20 @@ def start_dispatcher(session: HostSession) -> int:
     return int(pid)
 
 
+def read_host_config(transport: Transport, entry: HostEntry, home: str) -> dict[str, Any]:
+    """The host's own config, or a refusal: `{}` means it has none, never that
+    we could not tell. Bootstrap replaces a config that is not there; a config
+    that is there and unreadable is a file the host is running on."""
+    document = read_remote_config(transport, home)
+    if document is None:
+        raise BootstrapError(
+            f"{home}/config.json on host {entry.name} could not be read, and bootstrap will not "
+            f"replace a config it cannot see.\nFix the file (it should be JSON), or delete it "
+            f"and run this again to write a fresh one."
+        )
+    return document
+
+
 def resync_package(
     entry: HostEntry,
     settings: Settings | None = None,
@@ -431,7 +445,7 @@ def resync_package(
     home = resolve_home(transport, entry)
     sync_package(transport, home, report)
     patch: dict[str, Any] = {"pkg_commit": local_commit()}
-    if not read_remote_config(transport, home):
+    if not read_host_config(transport, entry, home):
         # The host has lost its config (a wiped $HOME, most often a pod that
         # restarted). Restoring the last one seen is better than dispatching
         # this job to a host that now believes it owns no cards at all.
@@ -472,7 +486,7 @@ def bootstrap_host(
     # The host's own config decides every environment below -- which uv cache
     # the installs populate, which tool directories go on PATH -- so it is read
     # before anything else runs.
-    existing = read_remote_config(transport, home)
+    existing = read_host_config(transport, entry, home)
     entry = entry.with_config(existing) if existing else entry
     patch: dict[str, Any] = {}
     if not existing:

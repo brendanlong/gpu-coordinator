@@ -277,3 +277,13 @@ def test_an_assignment_that_resolves_to_nothing_is_not_blamed_on_other_owners() 
     rendered = parse_probe("gpubox", SAMPLE, None, ["7", "9"]).render()
     assert "assigned but not present on this host: 7, 9" in rendered
     assert "are not assigned to gpubox" not in rendered
+
+
+def test_the_probe_finds_an_interpreter_good_enough_to_read_a_host_with() -> None:
+    """A host somebody else bootstrapped should be readable from here at once,
+    so `host add` records the `python3` it found -- if it is new enough."""
+    assert parse_probe("h", "===python3===\n/usr/bin/python3 3.12.3\n").host_python == (
+        "/usr/bin/python3"
+    )
+    for useless in ("not installed", "/usr/bin/python3 3.9.18", "", "/usr/bin/python3"):
+        assert parse_probe("h", f"===python3===\n{useless}\n").host_python is None

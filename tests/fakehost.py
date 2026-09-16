@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from gpuc.control.remote import NO_CONFIG
 from gpuc.control.transport import CommandResult
 from gpuc.host import jobs
 
@@ -67,8 +68,9 @@ class FakeHost:
     def _answer(self, command: str) -> tuple[int, str]:
         if command.startswith("printf %s"):
             return 0, shlex.split(command)[2].replace("$HOME", HOME)
-        if command.startswith("cat ") and command.endswith("|| true"):
-            return 0, self.files.get(shlex.split(command)[1], "")
+        if command.startswith("if [ -f") and "config.json" in command:
+            body = self.files.get(f"{self.home}/config.json")
+            return 0, body if body is not None else NO_CONFIG
         if "say()" in command:
             return 0, "".join(f"==={name}===\n{body}\n" for name, body in PROBE_SECTIONS.items())
         if "-m gpuc.host config --merge" in command:

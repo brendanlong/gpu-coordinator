@@ -27,6 +27,7 @@ from gpuc.control.config import (
 )
 from gpuc.control.remote import read_remote_config, resolve_home, write_remote_config
 from gpuc.control.transport import Transport
+from gpuc.host import jobs
 from gpuc.host.jobs import HostConfig
 
 
@@ -71,7 +72,7 @@ def connect_host(
     patch = dict(fields or {})
     entry = address
     if existing:
-        _refuse_overlapping_gpus(address.name, existing, patch, force)
+        _refuse_overlapping_gpus(address, existing, patch, force)
         # The host's own name wins: it is what `config.json` says, what the
         # host reports as its own, and what its `s3_prefix` was derived from.
         # Read off the document rather than the parsed config, whose default
@@ -122,9 +123,13 @@ def _apply(
 ) -> Connection:
     patch = _with_env(existing, patch, env_updates)
     changes = config_changes(existing, patch)
+    # A patch that would leave the file exactly as it is does not write it: a
+    # `gpuc host set` repeating what a host already says is not a reason to
+    # touch the file a dispatcher is reading.
+    merged = jobs.merged_config(existing, patch) if patch else existing
     document = (
         write_remote_config(transport, home, patch, python=entry.python, env=entry.env)
-        if patch
+        if merged != existing
         else existing
     )
     return Connection(
@@ -152,17 +157,25 @@ def _with_env(
     patch: dict[str, Any],
     env_updates: Mapping[str, str | None] | None,
 ) -> dict[str, Any]:
-    """Fold single-key env edits (`--cache-dir`) into the whole-env patch.
+    """Resolve the `env` this patch asks for against the one the host has.
 
     The host's `env` is replaced wholesale, because "set it to exactly this" is
-    the only rule that can also express "set it to nothing". A flag that names
-    one variable therefore has to be resolved against what the host has, which
+    the only rule that can also express "set it to nothing". Both the flag that
+    names one variable (`--cache-dir`) and the one key the host owns itself
+    (`UV_CACHE_DIR`) therefore have to be resolved against what is there, which
     is why it happens here and not where the flags are parsed.
     """
-    if not env_updates:
+    theirs = HostConfig.from_dict(existing).env
+    if not env_updates and "env" not in patch:
         return patch
-    env = dict(patch.get("env", HostConfig.from_dict(existing).env))
-    for key, value in env_updates.items():
+    env = dict(patch.get("env", theirs))
+    # `--env` replaces what somebody set by hand; it is not where the uv cache
+    # bootstrap derived from the host's own filesystem lives, and dropping that
+    # silently costs every job on the host a full copy of every wheel. Only
+    # `--cache-dir` (below) moves or clears it.
+    if "UV_CACHE_DIR" in theirs:
+        env.setdefault("UV_CACHE_DIR", theirs["UV_CACHE_DIR"])
+    for key, value in (env_updates or {}).items():
         if value is None:
             env.pop(key, None)
         else:
@@ -171,7 +184,7 @@ def _with_env(
 
 
 def _refuse_overlapping_gpus(
-    name: str, existing: Mapping[str, Any], patch: Mapping[str, Any], force: bool
+    address: HostEntry, existing: Mapping[str, Any], patch: Mapping[str, Any], force: bool
 ) -> None:
     """Refuse a `--gpus` that claims some, but not all, of the host's cards.
 
@@ -180,19 +193,40 @@ def _refuse_overlapping_gpus(
     an overlapping share of one box hand the same card to two jobs, and the
     first anyone hears of it is a run that died out of memory. A disjoint list
     is a deliberate reassignment and goes through.
+
+    Both lists are read through the cards the probe just saw, because `--gpus
+    2,3` and `--gpus GPU-a,GPU-b` can name the same two cards -- and an index
+    is the spelling somebody copies off the probe's own output.
     """
     wanted = patch.get("gpus")
     if not isinstance(wanted, list) or force:
         return
-    mine = {str(item) for item in wanted}
+    cards = _by_uuid(address)
+    mine = {cards.get(str(item), str(item)) for item in wanted}
     theirs = HostConfig.from_dict(existing).gpus
-    shared = sorted(set(theirs) & mine)
-    if not shared or set(theirs) == mine:
+    # Named as the *host* spells them, which is how the sentence below reads.
+    shared = [item for item in theirs if cards.get(item, item) in mine]
+    if not shared or {cards.get(item, item) for item in theirs} == mine:
         return
+    named = sorted(str(item) for item in wanted)
     raise ConnectError(
-        f"host {name} is already configured with GPUs {', '.join(theirs)}, and "
-        f"--gpus {','.join(sorted(mine))} claims {', '.join(shared)} of them and not the rest.\n"
+        f"host {address.name} is already configured with GPUs {', '.join(theirs)}, and "
+        f"--gpus {','.join(named)} claims {', '.join(shared)} of them and not the rest.\n"
         f"That is the one difference that can hand one card to two jobs, so it is refused "
         f"rather than warned about: drop --gpus to adopt what the host has, name a disjoint "
         f"set to reassign it, or pass --force if you are sure."
     )
+
+
+def _by_uuid(address: HostEntry) -> dict[str, str]:
+    """`index -> uuid` for the cards this host's probe saw, plus uuid -> itself.
+
+    Cards the probe did not see are left as they were typed: an unresolvable
+    entry is a typo or a card this container was not given, which the health
+    check refuses at bootstrap, not something to guess at here.
+    """
+    cards = {uuid: uuid for uuid in address.gpu_info}
+    for uuid, info in address.gpu_info.items():
+        if info.index is not None:
+            cards[str(info.index)] = uuid
+    return cards

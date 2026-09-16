@@ -56,6 +56,7 @@ from gpuc.control.config import (
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
+    Registry,
     Settings,
     config_file,
     hosts_file,
@@ -64,6 +65,7 @@ from gpuc.control.config import (
     registry_transaction,
     state_dir,
     transport_for,
+    warn_stderr,
     write_config_template,
 )
 from gpuc.control.connect import Connection, connect_host, push_config
@@ -222,7 +224,11 @@ def cmd_host_add(args: argparse.Namespace) -> int:
     # the caller's mistake and should not cost a probe to find out.
     fields, env_updates = _config_fields(args), _env_updates(args)
     report = probe_host(address, settings)
-    address = address.with_cache(gpu_info=report.gpu_info, driver_version=report.driver_version)
+    address = address.with_cache(
+        gpu_info=report.gpu_info,
+        driver_version=report.driver_version,
+        python=report.host_python,
+    )
     connection = connect_host(
         address,
         settings,
@@ -233,9 +239,37 @@ def cmd_host_add(args: argparse.Namespace) -> int:
     )
     entry = connection.entry
     with registry_transaction() as registry:
+        _refuse_a_taken_name(registry, entry, args.name)
         registry.put(entry)
     print(_added_line(entry, connection, args.name))
     return 0
+
+
+def _refuse_a_taken_name(registry: Registry, entry: HostEntry, asked_for: str) -> None:
+    """Never let an adopted name replace a different host registered under it.
+
+    A host's `config.json` says what it calls itself, and taking that name is
+    what keeps two machines agreeing about one box. But a box somebody set up
+    as `local` on their own machine is called `local` here too, and registering
+    it would otherwise overwrite *this* machine's `local` -- silently, since
+    the address is the only thing that differs.
+    """
+    current = registry.hosts.get(entry.name)
+    if entry.name == asked_for or current is None:
+        return
+    if (current.ssh, current.port, current.remote_home) == (
+        entry.ssh,
+        entry.port,
+        entry.remote_home,
+    ):
+        return
+    raise CliError(
+        f"host {asked_for} calls itself {entry.name!r}, and a different host is already "
+        f"registered here under that name ({current.ssh or 'this machine'}).\n"
+        f"Registering it would replace that one. If they are the same box, remove the entry "
+        f"here first (`gpuc host remove {entry.name}`); if they are not, give one of them a "
+        f"name of its own by editing `host` in its ~/.gpuc/config.json."
+    )
 
 
 def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str:
@@ -345,16 +379,25 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     # The config first, and through the address the host still has: a
     # `--persistent-root` in the same command moves gpuc home, and writing the
     # config to where the host is not would leave the real one behind.
+    config: dict[str, Any] | None = None
     if fields or env_updates:
         connection = push_config(entry, load_settings(), fields=fields, env_updates=env_updates)
-        entry = connection.entry
+        entry, config = connection.entry, connection.entry.cache.config
         lines += [f"  host <- {change}" for change in connection.changes] or [
             "  host already holds that config; nothing changed"
         ]
     entry = entry.model_copy(update=address)
     lines += [f"  here <- {key}={value!r}" for key, value in sorted(address.items())]
+    # Re-read under the lock: the entry above was read before an ssh round
+    # trip, and writing it back whole would undo whatever a concurrent `gpuc
+    # host probe` or submit learned about the same host in between.
     with registry_transaction() as registry:
-        registry.put(entry)
+        current = registry.hosts.get(entry.name)
+        if current is None:
+            warn_stderr(f"host {entry.name} was removed while this ran; nothing was registered")
+        else:
+            updated = current.model_copy(update=address)
+            registry.put(updated if config is None else updated.with_config(config))
     home = _home_line(entry)
     if home:
         lines.append(home.rstrip())
@@ -577,14 +620,20 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
     if not args.json:
         print(report.render(all_gpus=args.all_gpus))
     config = _probe_config(entry, settings)
-    if report.gpu_info or config is not None:
-        with registry_transaction() as registry:
-            current = registry.hosts.get(args.name)
-            if current is not None:
-                current = current.with_cache(
-                    gpu_info=report.gpu_info or None, driver_version=report.driver_version
-                )
-                registry.put(current if config is None else current.with_config(config))
+    # Written even when the host had nothing new to say: *when* it was last
+    # read is half of what the offline listings report.
+    with registry_transaction() as registry:
+        current = registry.hosts.get(args.name)
+        if current is not None:
+            current = current.with_cache(
+                gpu_info=report.gpu_info or None,
+                driver_version=report.driver_version,
+                # Only until a bootstrap of our own records the interpreter uv
+                # picked: a host somebody else set up is worth being able to
+                # read before then.
+                python=current.python or report.host_python,
+            )
+            registry.put(current if config is None else current.with_config(config))
     # After the registry write, not before: that write can fail (a held lock, a
     # registry that changed under us) and print an error document of its own,
     # and stdout may hold only one.
@@ -729,8 +778,15 @@ def ensure_package_current(
     # behind this produces the transport error in full.
     if config is None:
         return entry
-    entry = _record_config(entry, config)
-    host_commit = entry.pkg_commit
+    if config:
+        entry = _record_config(entry, config)
+        host_commit = entry.pkg_commit
+    else:
+        # The host answered and has no config at all: its gpuc home was wiped,
+        # taking the package with it. The cache here is the only copy of what
+        # that host was, so it is kept rather than overwritten with nothing --
+        # and an unrecorded commit re-ships below, which restores both.
+        host_commit = None
     if not version_mod.needs_package_sync(local, host_commit):
         return entry
     report(
@@ -756,14 +812,14 @@ def _record_config(entry: HostEntry, config: dict[str, Any]) -> HostEntry:
     """Cache what the host just said about itself, for the offline commands.
 
     `gpuc host list` and `gpuc version` never ask a host anything, so this is
-    what keeps them from repeating a bootstrap somebody else replaced. Re-read
-    under the lock and written as one field, because this runs on every submit
-    and writing back the whole entry read at startup would undo whatever a
-    concurrent `gpuc host probe` learned about the same host.
+    what keeps them from repeating a bootstrap somebody else replaced. Written
+    even when the config has not changed, because *when* it was read is half of
+    what those commands report. Re-read under the lock and written as one
+    field, because this runs on every submit and writing back the whole entry
+    read at startup would undo whatever a concurrent `gpuc host probe` learned
+    about the same host.
     """
     updated = entry.with_config(config)
-    if updated.cache.config == entry.cache.config:
-        return entry
     with registry_transaction() as registry:
         current = registry.hosts.get(entry.name)
         registry.put(current.with_config(config) if current else updated)
@@ -1193,12 +1249,12 @@ def cmd_pods(args: argparse.Namespace) -> int:
 
 
 def cmd_version(args: argparse.Namespace) -> int:
-    """What is installed here, and what each host was last given *from here*.
+    """What is installed here, and what each host was running when last read.
 
-    The host commits are read from the registry, which bootstrap wrote -- no
-    ssh, so this stays a command you can run before anything else. That also
-    means it cannot see a host somebody else has bootstrapped since:
-    `gpuc status` asks each host what it is running.
+    The host commits come from the registry's cache -- no ssh, so this stays a
+    command you can run before anything else. That also means it cannot see a
+    host somebody else has bootstrapped since it was read: `gpuc status` asks
+    each host what it is running.
     """
     read = read_registry()
     for error in read.errors:
@@ -1212,15 +1268,18 @@ def cmd_version(args: argparse.Namespace) -> int:
     print(f"gpuc {version_mod.__version__}")
     print(f"commit {version_mod.short(commit)} [{source}]{dirty}")
     print(f"python {sys.version.split()[0]} at {sys.executable}")
-    hosts = [e for e in read.registry.hosts.values() if e.bootstrapped_at]
+    hosts = [
+        e for e in read.registry.hosts.values() if e.pkg_commit or e.bootstrapped_at or e.seen_at
+    ]
     if not hosts:
-        print("hosts: none bootstrapped")
+        print("hosts: none read yet")
         return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
-    print("hosts (last shipped from this machine; gpuc status asks the hosts themselves):")
+    print("hosts (as last read from here; gpuc status asks the hosts themselves):")
     for entry in hosts:
         current = version_mod.same_commit(commit, entry.pkg_commit)
         note = "" if current else "  DIFFERS: re-bootstrap"
-        print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{note}")
+        seen = f"  {status_mod.format_age(entry.seen_at)}" if entry.seen_at else ""
+        print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{seen}{note}")
     if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
         print(
             "upgrade a host with: gpuc host bootstrap <host> (or --all for every host; "

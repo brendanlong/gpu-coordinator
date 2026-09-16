@@ -213,6 +213,9 @@ def test_config_changes_names_every_key_a_flag_would_change_on_the_host() -> Non
     # A key the host does not have yet is still a change, and reads as one.
     assert config_changes(existing, {"retention_days": 7.0}) == ["retention_days none -> 7.0"]
     assert config_changes({}, {}) == []
+    # But a key it has never written, set to the default it already behaves by,
+    # is not: `--gpus ''` on a host with no cards changes nothing.
+    assert config_changes({"host": "gpubox"}, {"gpus": [], "idle_minutes": 15.0}) == []
 
 
 def test_config_drift_is_quiet_about_a_config_just_written() -> None:

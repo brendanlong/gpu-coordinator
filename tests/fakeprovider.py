@@ -29,6 +29,7 @@ from gpuc.control.providers.base import (
     SshEndpoint,
 )
 from gpuc.control.provision import offer_satisfies
+from gpuc.control.remote import NO_CONFIG
 from gpuc.control.transport import CommandResult, Transport, TransportError
 
 CAPACITY_ERROR = "no capacity for this gpu type right now"
@@ -252,6 +253,14 @@ class FakeTransport:
             )
         if "$HOME" in command:
             return CommandResult(self.host, ["ssh", command], 0, self.home, "")
+        if command.startswith("if [ -f") and "config.json" in command:
+            # A pod nobody has configured yet, which is every pod this creates.
+            body = self.files.get(f"{self.home}/config.json")
+            return CommandResult(self.host, ["ssh", command], 0, body or NO_CONFIG, "")
+        if command.startswith("mv -f") and "config.json" in command:
+            source, target = command.split()[2], command.split()[3]
+            self.files[target] = self.files.pop(source, "")
+            return CommandResult(self.host, ["ssh", command], 0, "", "")
         return CommandResult(self.host, ["ssh", command], 0, "", "")
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:

@@ -701,7 +701,14 @@ that bootstrapped it first matters afterwards.
   no package yet gets the same merge done here and the file replaced by
   rename). It does not work offline, which is correct: there is no local copy
   to set. `--persistent-root` and `--gpuc-home` are addresses and stay here.
-- `gpuc host probe` refreshes the cache and nothing else.
+- `gpuc host probe` refreshes the cache and nothing else -- including an
+  interpreter to run the on-host package with, so a host somebody else
+  bootstrapped answers `status` and `host set` before this machine has
+  bootstrapped it.
+- "the host has no config" is a marker the host echoes, never the absence of
+  parseable output: a `config.json` that is there and does not parse is a file
+  the host is running on, so `read_remote_config` returns `None` for it, and
+  nothing -- connect, `host set` or bootstrap -- writes over a `None`.
 - `gpuc submit`'s pre-enqueue read of `config.json` is the only source for the
   `gpus` a spec is judged against, and it refreshes the cache on the way past.
 - Provision is create pod -> wait for ssh -> the same connect, with the initial

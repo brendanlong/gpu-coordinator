@@ -328,7 +328,9 @@ class HostEntry(TolerantModel):
         if not isinstance(data, dict):
             return data
         document: dict[Any, Any] = data
-        if not any(key in document for key in (*LEGACY_CACHE_KEYS, *LEGACY_CONFIG_KEYS)):
+        if not any(
+            key in document for key in (*LEGACY_CACHE_KEYS, *LEGACY_CONFIG_KEYS, "cache_dir")
+        ):
             return document
         cache = dict(document.get("cache") or {})
         config = dict(cache.get("config") or {})
@@ -588,7 +590,10 @@ def config_changes(existing: Any, patch: Mapping[str, Any]) -> list[str]:
     and says so, field by field, rather than being applied in silence.
     """
     fields = existing if isinstance(existing, dict) else {}
-    base = {key: fields.get(key) for key in patch}
+    # Compared against what the host *effectively* has, defaults included, so
+    # a key it has never written does not read as a change to its own default.
+    held = HostConfig.from_dict(fields).to_dict()
+    base = {key: held.get(key) for key in patch}
     return config_drift(base, HostConfig.from_dict({**fields, **patch}), keys=set(patch))
 
 
