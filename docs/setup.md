@@ -63,7 +63,7 @@ gpuc config show      # the effective settings, file or not
 | `ssh_key` | unset | private key for ssh and rsync; its `.pub` goes to the RunPod account |
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | default pod image (`--image` per submit) |
 | `disk_gb` | `50` | default container disk (`--disk` per submit) |
-| `dead_dispatcher_minutes` | `30.0` | how long an ephemeral host may be silent, with nothing running, before `gpuc reconcile` terminates it. It is also the margin a pod being bootstrapped *by another machine* has, since installing uv, a Python and the package takes about ten minutes and nothing beats until that is done — so lowering it much below 30 on a machine that reconciles other machines' pods is how you shoot one down mid-setup |
+| `dead_dispatcher_minutes` | `30.0` | how long an ephemeral host may be silent, with nothing running, before `gpuc reconcile` terminates it — counted from silence this machine watched, so a suspend or a reboot starts it again rather than cashing in the time it was away. It is also the margin a pod being bootstrapped *by another machine* has, since installing uv, a Python and the package takes about ten minutes and nothing beats until that is done — so lowering it much below 30 on a machine that reconciles other machines' pods is how you shoot one down mid-setup |
 
 **`s3_bucket` and `--s3-prefix` are two different mirrors.** `s3_bucket` is
 written by *this machine*: job specs to `s3://<bucket>/gpuc/specs/<job-id>.json`

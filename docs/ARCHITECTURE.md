@@ -1003,8 +1003,15 @@ A heartbeat under
 counts as alive and records `last_seen_at` in its `desired/` record. That
 constant is the reaper's own and deliberately looser than the dispatcher's 30 s
 staleness or the 30 s freshness reuse demands: this one decides whether to
-terminate a pod. A host that
-has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) --
+terminate a pod. The clock is capped by this machine's own
+watching: `reconcile` keeps `watch.json` in the state directory with the time of
+the last pass and the start of the current unbroken stretch, and a gap of more
+than `WATCH_GAP_MINUTES` (5) resets the stretch. Silence that nothing observed
+is not evidence -- a desktop resuming from three days asleep would otherwise
+terminate every pod on the first pass whose ssh had not come up yet, and the
+timer fires two minutes after boot. The service therefore also `Wants=` the
+network target it is `After=`, since `After=` alone does not pull it in. A host
+that has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) --
 including one whose ssh never answers, since that never updates `last_seen_at`
 either -- is terminated with a loud report: it cannot idle-terminate itself, it
 is doing nothing we can see, and it is still billing. A long training run keeps

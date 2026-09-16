@@ -351,7 +351,7 @@ one is added the dashboard will call it.
 export RUNPOD_API_KEY=...
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60
 gpuc pods                   # every pod with our prefix: cost, util, age, is it wanted?
-gpuc reconcile --once       # terminate leaked or expired pods now
+gpuc reconcile --once       # forget pods that are gone, enforce TTLs, report what nothing claims
 gpuc host add rented --pod <pod-id>   # drive a pod another machine rented
 ```
 
@@ -434,7 +434,12 @@ means no cap, on `submit`, `host add` and `host set` alike.
 
 - a bootstrapped pod that has neither beaten its heartbeat nor been seen running
   a job for `dead_dispatcher_minutes` (30 by default) — including one whose ssh
-  stopped answering, since that never refreshes `last_seen_at` either;
+  stopped answering, since that never refreshes `last_seen_at` either. **The
+  clock counts silence this machine watched**, not wall clock it was away for:
+  after a suspend, a reboot, or a gap of more than five minutes between passes,
+  every host gets the full allowance again. A machine that was asleep for three
+  days did not see anything, and the pass where it wakes up is the one where its
+  own ssh is likeliest to fail;
 - a pod past a TTL its host actually has;
 - a pod *this machine created* that never bootstrapped by its 15-minute ceiling.
   An adopted pod has a config on it, which is all this machine can see, so the
@@ -904,4 +909,5 @@ looks like it is saying.
 | `status` says `host X runs an older gpuc` | this machine was upgraded and the host's copy of the package was not | `gpuc host bootstrap X`, or `gpuc host bootstrap --all` for every host at once — safe while jobs run; the new dispatcher adopts them |
 | `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc reconcile --once` |
 | `reconcile` reports `DEAD DISPATCHER` and terminates a pod | it stopped beating (or answering ssh) for `dead_dispatcher_minutes` with nothing running | expected: that pod could no longer stop itself. Raise `dead_dispatcher_minutes` if your hosts go quiet legitimately |
+| `reconcile` says a pod is "silent for 0 min" that has been dead for days | the clock counts silence *this machine watched*, and it has just started (a reboot, a resume, or a hand-run after a gap). The line says so | leave the timer running and it goes on the next pass past the limit; to end a pod now, tell the pod — `gpuc host set <host> --idle-min 0` |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | the runbook in [setup.md](setup.md#hosts-whose-home-is-wiped-on-restart) |

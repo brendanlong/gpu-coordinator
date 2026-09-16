@@ -24,6 +24,8 @@ with our prefix", and pods without our prefix are never even considered.
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -60,6 +62,11 @@ from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
 from gpuc.control.systemd import gpuc_command, systemd_dir, write_units
 
 DEFAULT_INTERVAL_S = 60.0
+WATCH_GAP_MINUTES = 5.0
+"""A pass this long after the previous one means this machine was not watching
+in between: suspended, rebooted, or the timer disabled. Comfortably longer than
+the 60 s timer interval, and far shorter than the silence a host is allowed."""
+
 PROVISIONING_MINUTES = CEILING_MINUTES
 """How long a pod another machine has just created may have no config on it
 yet. Only ever used to word a report: nothing here acts on it."""
@@ -79,6 +86,69 @@ class Rented:
 
     desired: DesiredHost
     entry: HostEntry | None
+
+
+def watch_file() -> Path:
+    return state_dir() / "watch.json"
+
+
+def begin_watch(report: Reporter) -> datetime:
+    """When this machine's current unbroken stretch of watching began.
+
+    The silence rule has to count silence this machine *observed*, not wall
+    clock it was absent for. A desktop asleep for three days watched nothing in
+    between, and the pass where it wakes is the one where its own ssh is most
+    likely to fail -- the timer fires two minutes after boot, before a VPN or a
+    key agent is necessarily there. Reading `last_seen_at` at face value on that
+    pass terminates a pod that is answering everybody else perfectly well.
+
+    So a gap resets the clock: this pass may find a host silent, but it cannot
+    claim the host was silent while nothing was listening. Written without the
+    state lock -- it is one machine's note to itself, an atomic replace, and a
+    lost update costs at most one pass of patience.
+    """
+    # Truncated, because that is what the file can hold: a `since` that comes
+    # back from disk differing from the one just returned by microseconds is a
+    # difference nothing here wants to reason about.
+    now = datetime.now(UTC).replace(microsecond=0)
+    previous, since = _last_watch()
+    away = None if previous is None else (now - previous).total_seconds() / 60.0
+    if away is not None and away > WATCH_GAP_MINUTES:
+        report(
+            f"this machine last reconciled {away:.0f} min ago, so it was not watching in "
+            f"between; every host gets the full silence allowance again from now"
+        )
+    if since is None or away is None or away > WATCH_GAP_MINUTES:
+        since = now
+    try:
+        _write_watch(now, since)
+    except OSError as exc:
+        # Nothing accumulates, so nothing is reaped for silence: the safe way
+        # to fail, and loud, because it is also the way a dead pod survives.
+        report(f"WARNING: could not record this pass in {watch_file()}: {exc}")
+        return now
+    return since
+
+
+def _last_watch() -> tuple[datetime | None, datetime | None]:
+    try:
+        document = json.loads(watch_file().read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(document, dict):
+        return None, None
+    return _parse(document.get("pass_at")), _parse(document.get("since"))
+
+
+def _write_watch(now: datetime, since: datetime) -> None:
+    path = watch_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(
+        {"pass_at": now.isoformat(timespec="seconds"), "since": since.isoformat(timespec="seconds")}
+    )
+    tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    tmp.write_text(body + "\n")
+    os.replace(tmp, path)
 
 
 def probe_liveness(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
@@ -263,12 +333,15 @@ def reconcile_once(
     # and a create that cannot write desired/ is a leaked, billing pod.
     by_id = {pod.id: pod for pod in pods}
     registry = load_registry().hosts
+    watching_since = begin_watch(report)
     ours = [
         Rented(host, _how_to_reach(host.name, by_id.get(host.pod_id), registry)) for host in cached
     ]
     known = {host.pod_id for host in cached}
     adopted, unclaimed = _ask_the_rest(pods, known, settings, ask, report, result)
-    _reconcile_desired([*ours, *adopted], by_id, settings, provider, report, result, liveness)
+    _reconcile_desired(
+        [*ours, *adopted], by_id, settings, provider, report, result, liveness, watching_since
+    )
     _report_unclaimed(unclaimed, report, result)
     return result
 
@@ -365,6 +438,7 @@ def _reconcile_desired(
     report: Reporter,
     result: ReconcileResult,
     liveness: HostLiveness,
+    watching_since: datetime,
 ) -> None:
     for rented in desired:
         host = rented.desired
@@ -414,7 +488,7 @@ def _reconcile_desired(
             continue
 
         if host.bootstrapped and _reap_if_silent(
-            rented, pod, settings, provider, report, result, liveness
+            rented, pod, settings, provider, report, result, liveness, watching_since
         ):
             continue
 
@@ -435,6 +509,7 @@ def _reap_if_silent(
     report: Reporter,
     result: ReconcileResult,
     liveness: HostLiveness,
+    watching_since: datetime,
 ) -> bool:
     """Terminate a bootstrapped host that has stopped answering for too long.
 
@@ -449,13 +524,28 @@ def _reap_if_silent(
     if state.alive:
         _remember_seen(host, report)
         return False
-    silent_for = _minutes_since(host.silent_since())
+    # Never longer than this machine has been watching: see `begin_watch`.
+    watched_for = _minutes_since(watching_since.isoformat())
+    unseen_for = _minutes_since(host.silent_since())
+    silent_for = unseen_for
+    capped = False
+    if unseen_for is not None and watched_for is not None and watched_for < unseen_for:
+        silent_for, capped = watched_for, True
     limit = settings.dead_dispatcher_minutes
     if silent_for is None or silent_for < limit:
+        # Said out loud when the cap is what is holding the terminate back:
+        # "silent for 0 min" about a pod nothing has heard from in three days
+        # reads like a bug otherwise.
+        because = (
+            f" (this machine has only been watching for {watched_for:.0f} min; the host has "
+            f"not been heard from for {unseen_for:.0f})"
+            if capped and watched_for is not None and unseen_for is not None
+            else ""
+        )
         report(
             f"{host.name} ({pod.id}): {state.describe()}; silent for "
             f"{'unknown' if silent_for is None else f'{silent_for:.0f}'} min of the "
-            f"{limit:.0f} min limit"
+            f"{limit:.0f} min limit{because}"
         )
         return False
     why = (
@@ -571,6 +661,10 @@ def gpuc_argv() -> str:
 def unit_files(interval_s: float = DEFAULT_INTERVAL_S) -> dict[str, str]:
     service = f"""[Unit]
 Description=gpuc reconcile: terminate leaked or expired GPU pods
+# Both, not just After=: without the Wants= nothing pulls the target in, and a
+# pass whose ssh fails because the network is two minutes old is a pass that
+# judges every host unreachable.
+Wants=network-online.target
 After=network-online.target
 
 [Service]

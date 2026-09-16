@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,11 +29,13 @@ from gpuc.control.reconcile import (
     HostLiveness,
     Liveness,
     PodQuestion,
+    begin_watch,
     install,
     probe_liveness,
     reconcile_once,
     run_loop,
     unit_files,
+    watch_file,
 )
 from gpuc.control.rented import PodAnswer, address_for, desired_from
 from gpuc.control.s3index import IndexEntry, LocalIndex
@@ -68,6 +71,20 @@ def desire(
     with registry_transaction() as registry:
         registry.put(host_entry(name=name, kind="runpod", pod_id=pod_id, ssh="root@1.2.3.4"))
     return host
+
+
+def watching(minutes: float = 120.0) -> None:
+    """Say this machine has been reconciling for a while already.
+
+    The silence rule counts silence this machine *saw*, so a pass that has only
+    just started watching gives every host the full allowance again -- a rule
+    with tests of its own, below. Every other test here means "the timer has
+    been running", and says so.
+    """
+    watch_file().parent.mkdir(parents=True, exist_ok=True)
+    watch_file().write_text(
+        json.dumps({"pass_at": stamp(minutes=-1), "since": stamp(minutes=-minutes)})
+    )
 
 
 def alive(**overrides: object) -> HostLiveness:
@@ -144,6 +161,7 @@ def test_the_state_lock_is_not_held_across_probes_and_terminates(control_env: Pa
     """
     provider = provider_with(running_pod("gpuc-a-111", "pod1"))
     desire("gpuc-a-111", "pod1", created_hours_ago=2.0)
+    watching()
     free: list[str] = []
 
     def note_if_free(label: str) -> None:
@@ -429,6 +447,7 @@ def test_a_long_running_job_keeps_an_old_host_alive(control_env: Path) -> None:
 def test_a_dead_dispatcher_past_the_limit_is_terminated_loudly(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
     desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    watching()
     reports: list[str] = []
 
     result = reconcile_once(
@@ -449,6 +468,7 @@ def test_an_unreachable_host_is_terminated_once_it_has_been_silent_long_enough(
 ) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
     desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    watching()
     reports: list[str] = []
 
     result = reconcile_once(
@@ -588,10 +608,12 @@ def test_an_adopted_pod_that_has_gone_silent_is_reaped_from_here(control_env: Pa
     assert (first.kept, provider.terminated) == (["gpuc-a-111"], [])
     assert any("silent for 0 min of the 30 min limit" in line for line in reports)
 
-    # ...and once it has been silent that long, from here, it goes.
+    # ...and once it has been silent that long, with this machine watching
+    # for all of it, it goes.
     cached = read_desired("gpuc-a-111")
     assert cached is not None
     write_desired(cached.model_copy(update={"last_seen_at": stamp(minutes=-31)}))
+    watching()
     result = reconcile_once(settings, provider, reports.append, liveness=dead(), ask=ask)
 
     assert result.terminated == ["gpuc-a-111"]
@@ -762,3 +784,73 @@ def test_a_terminated_pod_is_not_asked_anything(control_env: Path) -> None:
 
     assert asked_about == []
     assert (result.unclaimed, result.kept) == ([], [])
+
+
+# -- the clock only runs while this machine is actually watching ---------------
+
+
+def test_a_machine_back_from_a_long_absence_does_not_reap_on_its_first_pass(
+    control_env: Path,
+) -> None:
+    """The desktop was asleep for three days. The pod was not necessarily dead
+    for any of it, and the pass where the machine wakes up is the one where its
+    own ssh is most likely to fail -- the timer fires two minutes after boot.
+    """
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 72))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=72)
+    reports: list[str] = []
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0), provider, reports.append, liveness=dead()
+    )
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+    assert any("silent for 0 min of the 30 min limit" in line for line in reports)
+    # ...and the line says why, rather than claiming a pod nothing has heard
+    # from in three days has been quiet for zero minutes.
+    assert any("this machine has only been watching for 0 min" in line for line in reports)
+
+
+def test_it_reaps_once_it_has_watched_for_the_whole_limit(control_env: Path) -> None:
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 72))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=72)
+    watching(minutes=31.0)
+
+    result = reconcile_once(
+        Settings(dead_dispatcher_minutes=30.0), provider, lambda _: None, liveness=dead()
+    )
+
+    assert result.terminated == ["gpuc-a-111"]
+
+
+def test_a_gap_between_passes_starts_the_allowance_again(control_env: Path) -> None:
+    """Suspended, rebooted, or the timer switched off and on: the same thing."""
+    watch_file().parent.mkdir(parents=True, exist_ok=True)
+    watch_file().write_text(
+        json.dumps({"pass_at": stamp(minutes=-90), "since": stamp(minutes=-600)})
+    )
+    reports: list[str] = []
+
+    since = begin_watch(reports.append)
+
+    assert (datetime.now(UTC) - since).total_seconds() < 5.0
+    assert any("was not watching in between" in line for line in reports)
+    # ...and a pass that follows the last one closely just carries on.
+    assert begin_watch(reports.append) == since
+
+
+def test_an_unwritable_watch_file_reaps_nothing_rather_than_everything(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(now: object, since: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("gpuc.control.reconcile._write_watch", refuse)
+    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=600))
+    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=10)
+    reports: list[str] = []
+
+    result = reconcile_once(Settings(), provider, reports.append, liveness=dead())
+
+    assert (result.kept, provider.terminated) == (["gpuc-a-111"], [])
+    assert any("could not record this pass" in line for line in reports)
