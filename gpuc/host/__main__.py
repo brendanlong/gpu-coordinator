@@ -17,20 +17,38 @@ from gpuc.host import cleanup, dispatcher, gpus, health, jobs, paths, queue, run
 from gpuc.host.jobs import JobSpec
 
 
-def _read_spec_document(source: str) -> dict[str, Any]:
+def _read_json_object(source: str, what: str) -> dict[str, Any]:
     text = sys.stdin.read() if source == "-" else Path(source).read_text()
     document = json.loads(text)
     if not isinstance(document, dict):
-        raise SystemExit("spec must be a JSON object")
+        raise SystemExit(f"{what} must be a JSON object")
     return document
 
 
 def cmd_enqueue(args: argparse.Namespace) -> int:
-    document = _read_spec_document(args.spec)
+    document = _read_json_object(args.spec, "spec")
     spec = JobSpec.from_dict(document)
     queue.enqueue(spec)
     pid = 0 if args.no_dispatch else dispatcher.spawn_detached_dispatcher()
     print(json.dumps({"job_id": spec.job_id, "dispatcher_pid": pid}))
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Print this host's config.json, or merge a patch into it first.
+
+    The host owns its config, so the control side never writes the file
+    itself: `gpuc host set` and `gpuc host bootstrap` send the keys they
+    change and this applies them, atomically, on the host.
+
+    The patch is a file rather than an argument because `env` may hold a token,
+    and argv is readable by every other user of a shared box.
+    """
+    if args.merge is not None:
+        document = jobs.merge_config(_read_json_object(args.merge, "a config patch"))
+    else:
+        document = jobs.read_config().to_dict()
+    print(json.dumps(document, indent=2, sort_keys=True))
     return 0
 
 
@@ -324,6 +342,15 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.set_defaults(func=cmd_enqueue)
 
     sub.add_parser("list", help="list queued jobs").set_defaults(func=cmd_list)
+
+    config = sub.add_parser("config", help="print this host's config.json")
+    config.add_argument(
+        "--merge",
+        metavar="PATH",
+        help="a JSON object (or - for stdin) whose keys replace those in config.json "
+        "before it is printed; `env` is replaced wholesale, never merged",
+    )
+    config.set_defaults(func=cmd_config)
 
     status = sub.add_parser("status", help="host and job status as JSON")
     status.add_argument("job_id", nargs="?")

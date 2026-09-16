@@ -28,9 +28,15 @@ from gpuc.control.config import (
 from gpuc.control.s3index import IndexEntry
 from gpuc.host.dispatcher import LockBody
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig, JobSpec, JobState
+from tests.conftest import host_entry
 
 FIXTURES = Path(__file__).parent / "fixtures" / "schema"
-HOSTS_SHAPES = ("hosts.current.json", "hosts.older.json", "hosts.newer.json")
+HOSTS_SHAPES = (
+    "hosts.current.json",
+    "hosts.presplit.json",
+    "hosts.older.json",
+    "hosts.newer.json",
+)
 CONFIG_SHAPES = ("config.current.json", "config.older.json", "config.newer.json")
 
 
@@ -47,7 +53,8 @@ def test_every_committed_registry_shape_parses(name: str, control_env: Path) -> 
     assert read.registry.hosts
     for entry in read.registry.hosts.values():
         assert entry.name
-        entry.host_config()  # the shape bootstrap writes to the host
+        assert entry.config  # the shape the host holds, as this registry last saw it
+        assert entry.initial_config()  # the shape written to a host that has none
 
 
 @pytest.mark.parametrize("name", CONFIG_SHAPES)
@@ -69,6 +76,23 @@ def test_the_older_registry_keeps_its_ttl_and_defaults_what_it_never_had(
     assert entry.pkg_commit is None
 
 
+def test_a_pre_split_registry_reads_as_a_cache_of_each_hosts_config(control_env: Path) -> None:
+    """The shape this build wrote until the host became the owner of its config:
+    everything it says about a host is now the last thing seen, not the truth."""
+    (control_env / "state" / "hosts.json").write_text(
+        (FIXTURES / "hosts.presplit.json").read_text()
+    )
+    entry = read_registry().registry.hosts["gpubox"]
+    assert entry.ssh == "gpubox-ssh"
+    assert entry.gpus[0] == "GPU-80646905-50a9-afc1-4375-43ca475b15e4"
+    assert entry.s3_prefix == "s3://brendanlong-experiments/gpuc/gpubox"
+    assert entry.retention_days == 14.0
+    assert entry.python is not None and entry.python.endswith("python3.12")
+    assert entry.config.host == "gpubox"
+    # Nothing has confirmed any of it with the host yet, and it says so.
+    assert entry.seen_at is None
+
+
 def test_the_newer_registry_ignores_what_it_does_not_know(control_env: Path) -> None:
     (control_env / "state" / "hosts.json").write_text((FIXTURES / "hosts.newer.json").read_text())
     read = read_registry()
@@ -80,6 +104,9 @@ def test_the_newer_registry_ignores_what_it_does_not_know(control_env: Path) -> 
     assert local.env == {}
     assert not hasattr(local, "power_cap_watts")
     assert local.gpu_info["GPU-2a4bad3b-9fe3-7031-914d-384254e92908"].vram_mib == 8192
+    # A key only the newer build knows survives the round trip through here,
+    # because the cached config is kept verbatim and written back as it came.
+    assert local.cache.config["power_cap_watts"] == 220
 
 
 def test_the_older_host_config_survives_the_null_that_crashed_the_dispatcher() -> None:
@@ -116,22 +143,8 @@ def test_a_null_non_optional_field_falls_back_to_its_default() -> None:
     assert (entry.idle_minutes, entry.port, entry.gpus, entry.env) == (15.0, 22, [], {})
 
 
-OPTIONAL_REGISTRY_FIELDS = [
-    "ssh",
-    "driver_version",
-    "pod_id",
-    "python",
-    "uv",
-    "gpuc_home",
-    "persistent_root",
-    "cache_dir",
-    "ttl_hours",
-    "s3_prefix",
-    "retention_days",
-    "created_at",
-    "bootstrapped_at",
-    "pkg_commit",
-]
+OPTIONAL_REGISTRY_FIELDS = ["ssh", "pod_id", "gpuc_home", "persistent_root", "bootstrapped_at"]
+OPTIONAL_CACHE_FIELDS = ["read_at", "python", "uv", "driver_version"]
 
 
 def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -> None:
@@ -141,29 +154,23 @@ def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -
     already None -- so this round-trips a fully populated entry in which each
     optional field has been explicitly nulled, one at a time and all at once.
     """
-    populated = HostEntry(
+    populated = host_entry(
         name="gpubox",
         kind="ssh",
         ssh="me@box",
         port=2222,
-        gpus=["GPU-a"],
-        driver_version="580.173.02",
-        pod_id="pod1",
-        python="/home/u/.local/python3.12",
-        uv="/home/u/.local/bin/uv",
         gpuc_home="/home/u/.gpuc",
         persistent_root="/workspace/me",
-        cache_dir="/home/u/.cache/uv",
-        idle_minutes=30.0,
-        ttl_hours=24.0,
-        s3_prefix="s3://bucket/gpuc/gpubox",
-        retention_days=14.0,
-        created_at="2026-09-15T20:00:00+00:00",
+        pod_id="pod1",
         bootstrapped_at="2026-09-15T20:00:00+00:00",
-        pkg_commit="b" * 40,
+        python="/home/u/.local/python3.12",
+        uv="/home/u/.local/bin/uv",
+        driver_version="580.173.02",
+        gpus=["GPU-a"],
     )
     document = json.loads(populated.model_dump_json())
     assert [key for key in OPTIONAL_REGISTRY_FIELDS if document[key] is None] == []
+    assert [key for key in OPTIONAL_CACHE_FIELDS if document["cache"][key] is None] == []
 
     for field in OPTIONAL_REGISTRY_FIELDS:
         entry = HostEntry.model_validate({**document, field: None})
@@ -174,8 +181,17 @@ def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -
             getattr(populated, k) for k in untouched
         ], field
 
+    for field in OPTIONAL_CACHE_FIELDS:
+        entry = HostEntry.model_validate({**document, "cache": {**document["cache"], field: None}})
+        assert getattr(entry.cache, field) is None, field
+        assert entry.gpus == ["GPU-a"], field
+
     all_null = HostEntry.model_validate(
-        {**document, **dict.fromkeys(OPTIONAL_REGISTRY_FIELDS, None)}
+        {
+            **document,
+            **dict.fromkeys(OPTIONAL_REGISTRY_FIELDS, None),
+            "cache": {**document["cache"], **dict.fromkeys(OPTIONAL_CACHE_FIELDS, None)},
+        }
     )
     assert [getattr(all_null, key) for key in OPTIONAL_REGISTRY_FIELDS] == [None] * len(
         OPTIONAL_REGISTRY_FIELDS

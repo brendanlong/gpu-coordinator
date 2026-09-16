@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from gpuc.control.config import HostEntry
 from gpuc.control.status import HostView, JobView, format_age, parse_duration, render, within
+from tests.conftest import host_entry
 
 
 def ago(**delta: float) -> str:
@@ -27,7 +27,7 @@ def finished(job_id: str, status: str = "succeeded", reason: str | None = None, 
 
 def view(*jobs: JobView) -> HostView:
     return HostView(
-        entry=HostEntry(name="h", gpus=["GPU-a"]),
+        entry=host_entry(name="h", gpus=["GPU-a"]),
         reachable=True,
         heartbeat_age_s=1.0,
         owned=["GPU-a"],

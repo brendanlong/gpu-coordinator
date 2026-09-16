@@ -18,6 +18,7 @@ from gpuc.control.status import (
     queue_start_estimates,
     render,
 )
+from tests.conftest import host_entry
 
 GPU = "GPU-a"
 
@@ -62,7 +63,7 @@ def payload(**overrides: Any) -> dict[str, Any]:
 
 
 def view(**overrides: Any) -> HostView:
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
     host_view = HostView(entry=entry, reachable=True, owned=[GPU, "GPU-b"], heartbeat_age_s=2.0)
     host_view.queue, host_view.running, host_view.finished = job_views(payload(**overrides))
     return host_view
@@ -103,7 +104,7 @@ def test_a_host_on_another_build_cannot_break_the_whole_status() -> None:
     assert running[0].priority is None
     assert running[0].util_recent == [90.0]
 
-    host_view = HostView(entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), reachable=True)
+    host_view = HostView(entry=host_entry(name="gpubox", kind="ssh", ssh="me@box"), reachable=True)
     host_view.queue, host_view.running, host_view.finished = queued, running, finished
     assert "dispatcher DOWN" in render(host_view)
 
@@ -222,7 +223,9 @@ def test_a_cpu_only_job_says_it_holds_no_card() -> None:
 
 
 def test_an_unreachable_host_says_what_to_run_next() -> None:
-    down = HostView(entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), error="ssh timed out")
+    down = HostView(
+        entry=host_entry(name="gpubox", kind="ssh", ssh="me@box"), error="ssh timed out"
+    )
     text = render(down)
     assert "UNREACHABLE" in text
     assert "gpuc host probe gpubox" in text
@@ -237,7 +240,7 @@ def test_a_stale_heartbeat_reads_as_a_dead_dispatcher() -> None:
 
 def test_an_ephemeral_host_past_its_ttl_is_a_suspect() -> None:
     old = view()
-    old.entry = HostEntry(
+    old.entry = host_entry(
         name="pod", kind="runpod", ttl_hours=1.0, created_at=minutes_ago(180), gpus=[GPU]
     )
     assert old.past_ttl
@@ -248,7 +251,7 @@ def test_the_two_utilizations_say_where_they_came_from() -> None:
     """The provider's number and the host sampler's legitimately differ; an
     unlabelled pair of percentages reads as a bug."""
     pod_view = view()
-    pod_view.entry = HostEntry(name="pod", kind="runpod", pod_id="p1", gpus=[GPU, "GPU-b"])
+    pod_view.entry = host_entry(name="pod", kind="runpod", pod_id="p1", gpus=[GPU, "GPU-b"])
     pod_view.pod = Pod(
         id="p1",
         name="gpuc-pod",
@@ -299,7 +302,7 @@ class _GoneProvider:
 
 
 def _runpod_entry() -> HostEntry:
-    return HostEntry(
+    return host_entry(
         name="gpuc-e2e-1", kind="runpod", ssh="root@1.2.3.4", port=22, pod_id="pod-1", gpus=[GPU]
     )
 
@@ -334,7 +337,7 @@ def test_a_terminated_pod_reads_as_gone_too() -> None:
 def test_ttl_is_measured_from_the_pod_createdat_not_the_registry() -> None:
     """The registry's created_at is when we heard of the pod; the reaper uses the provider's."""
     fresh_registration = view()
-    fresh_registration.entry = HostEntry(
+    fresh_registration.entry = host_entry(
         name="pod", kind="runpod", ttl_hours=1.0, created_at=minutes_ago(5), gpus=[GPU]
     )
     fresh_registration.pod = Pod(
@@ -426,7 +429,7 @@ def test_finished_jobs_with_unconfirmed_outputs_are_flagged() -> None:
             "outputs_pending": True,
         }
     )
-    view = HostView(entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), reachable=True)
+    view = HostView(entry=host_entry(name="gpubox", kind="ssh", ssh="me@box"), reachable=True)
     view.queue, view.running, view.finished = job_views(document)
     out = render(view)
     assert "outputs not uploaded" in out
@@ -445,7 +448,7 @@ def test_a_lost_output_says_so_louder() -> None:
             "outputs_lost": True,
         }
     )
-    view = HostView(entry=HostEntry(name="pod", kind="runpod"), reachable=True)
+    view = HostView(entry=host_entry(name="pod", kind="runpod"), reachable=True)
     view.queue, view.running, view.finished = job_views(document)
     assert "OUTPUTS LOST" in render(view)
 
@@ -453,7 +456,7 @@ def test_a_lost_output_says_so_louder() -> None:
 def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     """`config.gpus` may name cards by index, and only the host knows today's
     numbering -- so free/busy, and the per-card lines, come from its answer."""
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "7"])
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "7"])
     host_view = HostView(entry=entry, reachable=True, heartbeat_age_s=2.0)
     host_view.owned, host_view.indices = owned_gpus(
         payload(
@@ -475,7 +478,7 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
 
 
 def test_a_host_from_before_the_resolved_table_still_reports_its_gpus() -> None:
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
     owned, indices = owned_gpus(payload(), entry)
     assert owned == [GPU, "GPU-b"]
     assert indices == {}
@@ -499,7 +502,7 @@ def running_job(**overrides: Any) -> JobView:
 
 
 def busy(*jobs: JobView, queued: list[JobView] | None = None) -> HostView:
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
     host_view = HostView(entry=entry, reachable=True, owned=[GPU, "GPU-b"], heartbeat_age_s=2.0)
     host_view.running = list(jobs)
     host_view.queue = list(queued or [])
@@ -744,11 +747,11 @@ class _ScriptedSession:
 def test_gather_takes_the_build_and_the_config_from_the_hosts_own_answer() -> None:
     """Everything `gpuc status` says about what a host is is the host's, so a
     box configured from somebody else's laptop reads as what it now is."""
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
     session = _ScriptedSession(payload(pkg_commit="c" * 40, gpus=["0", "1"]))
     got = gather(entry, session=cast(Any, session))
     assert got.pkg_commit == "c" * 40
-    assert got.configured == {"host": "gpubox", "gpus": ["0", "1"]}
+    assert got.owned == ["0", "1"]
     assert host_json(got)["pkg_commit"] == "c" * 40
 
 
@@ -756,7 +759,7 @@ def test_a_reachable_host_that_never_reported_a_commit_is_not_read_as_current() 
     """The `pkg_commit` key is newer than some hosts: one still running the
     build before it answers `status` without it, and that is the oldest code
     there is, not a reason to say nothing."""
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
     document = payload()
     assert "pkg_commit" not in document, "this is what a host on the older build answers"
     got = gather(entry, session=cast(Any, _ScriptedSession(document)))

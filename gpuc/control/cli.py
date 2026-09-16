@@ -53,28 +53,34 @@ from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_packag
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
-    JOB_CONFIG_KEYS,
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
     Settings,
-    config_drift,
     config_file,
     hosts_file,
+    load_registry,
     load_settings,
     read_registry,
     registry_transaction,
     state_dir,
     transport_for,
-    utc_now,
+    warn_stderr,
     write_config_template,
 )
+from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.gpuinfo import summarize
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import Cloud, Constraints
 from gpuc.control.provision import runpod_host
-from gpuc.control.remote import HostSession, RemoteError, open_session, read_remote_config
+from gpuc.control.remote import (
+    HostSession,
+    RemoteError,
+    open_session,
+    read_remote_config,
+    resolve_home,
+)
 from gpuc.control.s3index import (
     IndexEntry,
     LocalIndex,
@@ -159,32 +165,148 @@ def _env_dict(pairs: Sequence[str] | None) -> dict[str, str]:
     return env
 
 
-def cmd_host_add(args: argparse.Namespace) -> int:
-    entry = HostEntry(
+def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
+    """The host-config keys these flags name, and only the ones given.
+
+    A flag that was not typed is not an opinion: what is here is exactly what
+    this command is about to change about a host's own `config.json`, which is
+    what it then reports field by field.
+    """
+    fields: dict[str, Any] = {}
+    if args.gpus is not None:
+        fields["gpus"] = _gpu_list(args.gpus)
+    if args.env is not None:
+        # The whole dict, not a merge: "set it to exactly this" is the only
+        # rule that can also express "set it to nothing" (`--env ''`).
+        fields["env"] = _env_dict([pair for pair in args.env if pair])
+    if args.s3_prefix is not None:
+        fields["s3_prefix"] = args.s3_prefix or None
+    if args.retention_days is not None:
+        fields["retention_days"] = _retention(args.retention_days)
+    if args.idle_min is not None:
+        fields["idle_minutes"] = args.idle_min
+    if args.ttl_hours is not None:
+        # argparse cannot express "given but empty" for a float flag, and a TTL
+        # that can be set but never unset is a trap.
+        fields["ttl_hours"] = _ttl_hours(args.ttl_hours)
+    return fields
+
+
+def _env_updates(args: argparse.Namespace) -> dict[str, str | None]:
+    """`--cache-dir`: one variable of the host's env, resolved against the host."""
+    if args.cache_dir is None:
+        return {}
+    return {"UV_CACHE_DIR": args.cache_dir or None}
+
+
+def _address(args: argparse.Namespace) -> HostEntry:
+    return HostEntry(
         name=args.name,
         kind="ssh" if args.ssh else "local",
         ssh=args.ssh,
         port=args.port,
-        gpus=_gpu_list(args.gpus),
         gpuc_home=args.gpuc_home,
         persistent_root=args.persistent_root,
-        env=_env_dict(args.env),
-        cache_dir=args.cache_dir,
-        s3_prefix=args.s3_prefix,
-        retention_days=_retention(args.retention_days),
-        idle_minutes=args.idle_min,
-        ttl_hours=_ttl_hours(args.ttl_hours),
-        created_at=utc_now(),
     )
+
+
+def cmd_host_add(args: argparse.Namespace) -> int:
+    """Register a host by asking it what it is.
+
+    The registry holds the address; the host holds its config. So this probes,
+    and a host that already has a `config.json` is adopted as it stands --
+    which is what makes a second machine driving a box somebody else set up the
+    ordinary path. Flags are explicit overrides of it, and say so.
+    """
+    settings = load_settings()
+    address = _address(args)
+    # The flags are judged before the host is touched: a typo in `--gpus` is
+    # the caller's mistake and should not cost a probe to find out.
+    fields, env_updates = _config_fields(args), _env_updates(args)
+    report = probe_host(address, settings)
+    address = address.with_cache(
+        gpu_info=report.gpu_info,
+        driver_version=report.driver_version,
+        python=report.host_python,
+    )
+    connection = connect_host(
+        address,
+        settings,
+        fields=fields,
+        env_updates=env_updates,
+        force=args.force,
+        gpu_hint="\n" + "\n".join(report.render(all_gpus=True).splitlines()[1:]),
+        before_write=lambda adopted: _refuse_a_taken_name(
+            load_registry().hosts.get(adopted.name), adopted, args.name
+        ),
+    )
+    entry = connection.entry
     with registry_transaction() as registry:
+        current = registry.hosts.get(entry.name)
+        _refuse_a_taken_name(current, entry, args.name)
+        if current is not None:
+            # Re-registering a host this machine knows: its own bootstrap and
+            # the interpreter that bootstrap chose are still true, and worth
+            # more than what a probe can see.
+            entry = entry.with_cache(python=current.python).model_copy(
+                update={"bootstrapped_at": current.bootstrapped_at}
+            )
         registry.put(entry)
-    print(
-        f"added host {entry.name} [{entry.kind}] "
-        f"{entry.ssh or 'this machine'} with {len(entry.gpus)} GPU(s)\n"
-        f"{_home_line(entry)}"
-        f"next: gpuc host bootstrap {entry.name}"
-    )
+    print(_added_line(entry, connection, args.name))
     return 0
+
+
+def _refuse_a_taken_name(current: HostEntry | None, entry: HostEntry, asked_for: str) -> None:
+    """Never let an adopted name replace a different host registered under it.
+
+    A host's `config.json` says what it calls itself, and taking that name is
+    what keeps two machines agreeing about one box. But a box somebody set up
+    as `local` on their own machine is called `local` here too, and registering
+    it would otherwise overwrite *this* machine's `local` -- silently, since
+    the address is the only thing that differs.
+
+    Judged before the host is written to as well as before the registry is, so
+    a refusal does not leave the flags applied to somebody's host.
+    """
+    if entry.name == asked_for or current is None:
+        return
+    if (current.ssh, current.port, current.remote_home) == (
+        entry.ssh,
+        entry.port,
+        entry.remote_home,
+    ):
+        return
+    raise CliError(
+        f"host {asked_for} calls itself {entry.name!r}, and a different host is already "
+        f"registered here under that name ({current.ssh or 'this machine'}).\n"
+        f"Registering it would replace that one. If they are the same box, remove the entry "
+        f"here first (`gpuc host remove {entry.name}`); if they are not, give one of them a "
+        f"name of its own by editing `host` in its ~/.gpuc/config.json."
+    )
+
+
+def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str:
+    lines = [
+        f"added host {entry.name} [{entry.kind}] "
+        f"{entry.ssh or 'this machine'} with {len(entry.gpus)} GPU(s)"
+    ]
+    if connection.adopted:
+        lines.append(f"adopted the config on the host ({connection.home}/config.json)")
+        if entry.name != asked_for:
+            lines.append(
+                f"the host calls itself {entry.name!r}, not {asked_for!r}, so that is the name "
+                f"it is registered under here"
+            )
+        # What the flags changed about somebody's host. On a host that had no
+        # config every field "changed", and the line above already said so.
+        lines += [f"  host <- {change}" for change in connection.changes]
+    else:
+        lines.append(f"wrote its first config to {connection.home}/config.json")
+    home = _home_line(entry)
+    if home:
+        lines.append(home.rstrip())
+    lines.append(f"next: gpuc host bootstrap {entry.name}")
+    return "\n".join(lines)
 
 
 def _ttl_hours(raw: float | None) -> float | None:
@@ -226,7 +348,9 @@ def _home_line(entry: HostEntry) -> str:
     )
 
 
-# None means "not given, leave it alone"; an empty string means "clear it".
+_ADDRESS_FIELDS = ("persistent_root", "gpuc_home")
+"""What `gpuc host set` changes here rather than on the host: how to reach it."""
+
 _SET_FIELDS = (
     "gpus",
     "persistent_root",
@@ -241,46 +365,57 @@ _SET_FIELDS = (
 
 
 def cmd_host_set(args: argparse.Namespace) -> int:
-    """Edit one registered host in place, without remove/add losing the rest."""
-    changes: dict[str, object] = {}
-    if args.gpus is not None:
-        changes["gpus"] = _gpu_list(args.gpus)
-    for flag, attribute in (
-        ("persistent_root", "persistent_root"),
-        ("gpuc_home", "gpuc_home"),
-        ("cache_dir", "cache_dir"),
-        ("s3_prefix", "s3_prefix"),
-    ):
+    """Change one host: its address here, its config on the host itself.
+
+    The config half writes through to the host's `config.json`, because that is
+    the only copy of it. It therefore needs the host to answer -- there is
+    nothing to set offline -- and what it changed is reported field by field.
+    """
+    address: dict[str, object] = {}
+    for flag in _ADDRESS_FIELDS:
         value = getattr(args, flag)
         if value is not None:
-            changes[attribute] = value or None
-    if args.env is not None:
-        # The whole dict, not a merge: "set it to exactly this" is the only
-        # rule that can also express "set it to nothing" (`--env ''`).
-        changes["env"] = _env_dict([pair for pair in args.env if pair])
-    if args.retention_days is not None:
-        changes["retention_days"] = _retention(args.retention_days)
-    if args.idle_min is not None:
-        changes["idle_minutes"] = args.idle_min
-    if args.ttl_hours is not None:
-        # argparse cannot express "given but empty" for a float flag, and a TTL
-        # that can be set but never unset is a trap.
-        changes["ttl_hours"] = _ttl_hours(args.ttl_hours)
-    if not changes:
+            address[flag] = value or None
+    fields = _config_fields(args)
+    env_updates = _env_updates(args)
+    if not address and not fields and not env_updates:
         raise UsageError(
             "host set changes nothing: pass at least one of "
             + ", ".join(f"--{f.replace('_', '-')}" for f in _SET_FIELDS)
         )
+    # The lookup goes through a transaction so that a registry this build
+    # cannot read refuses the whole command, in the words that say nothing was
+    # written, rather than failing halfway through with the host already changed.
     with registry_transaction() as registry:
         entry = registry.require(args.name)
-        updated = entry.model_copy(update=changes)
-        registry.put(updated)
-    print(
-        f"host {updated.name}: "
-        + ", ".join(f"{key}={value!r}" for key, value in sorted(changes.items()))
-        + f"\n{_home_line(updated)}"
-        + f"the host itself is unchanged until: gpuc host bootstrap {updated.name}"
-    )
+    lines = [f"host {entry.name}:"]
+    # The config first, and through the address the host still has: a
+    # `--persistent-root` in the same command moves gpuc home, and writing the
+    # config to where the host is not would leave the real one behind.
+    config: dict[str, Any] | None = None
+    if fields or env_updates:
+        connection = push_config(entry, load_settings(), fields=fields, env_updates=env_updates)
+        entry, config = connection.entry, connection.entry.cache.config
+        lines += [f"  host <- {change}" for change in connection.changes] or [
+            "  host already holds that config; nothing changed"
+        ]
+    entry = entry.model_copy(update=address)
+    lines += [f"  here <- {key}={value!r}" for key, value in sorted(address.items())]
+    # Re-read under the lock: the entry above was read before an ssh round
+    # trip, and writing it back whole would undo whatever a concurrent `gpuc
+    # host probe` or submit learned about the same host in between.
+    with registry_transaction() as registry:
+        current = registry.hosts.get(entry.name)
+        if current is None:
+            warn_stderr(f"host {entry.name} was removed while this ran; nothing was registered")
+        else:
+            updated = current.model_copy(update=address)
+            registry.put(updated if config is None else updated.with_config(config))
+    home = _home_line(entry)
+    if home:
+        lines.append(home.rstrip())
+        lines.append(f"the host moves there on: gpuc host bootstrap {entry.name}")
+    print("\n".join(lines))
     return 0
 
 
@@ -328,12 +463,19 @@ def cmd_host_list(args: argparse.Namespace) -> int:
             print(f"  NOTE {stale}")
         for index, name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
             print(f"  gpu     [{index}] {name:<28} {vram:<7} {uuid}")
-        bootstrapped = (
-            f"bootstrapped {status_mod.format_age(entry.bootstrapped_at)}"
-            if entry.bootstrapped_at
-            else "never bootstrapped"
+        # Everything above and here is the cache: what the host said the last
+        # time anything on this machine asked it. The host owns all of it, so
+        # it is labelled with its age rather than printed as current.
+        seen = (
+            f"as of {status_mod.format_age(entry.seen_at)}"
+            if entry.seen_at
+            else f"never read; run gpuc host probe {entry.name}"
         )
-        print(f"  pkg     {version_mod.short(entry.pkg_commit)} shipped from here, {bootstrapped}")
+        print(f"  pkg     {version_mod.short(entry.pkg_commit)} on the host, {seen}")
+        if entry.bootstrapped_at:
+            print(
+                f"  boot    bootstrapped from here {status_mod.format_age(entry.bootstrapped_at)}"
+            )
         if entry.root:
             print(f"  root    {entry.root} (gpuc home {entry.remote_home})")
     return 0
@@ -477,32 +619,49 @@ def cmd_host_clean(args: argparse.Namespace) -> int:
 
 
 def cmd_host_probe(args: argparse.Namespace) -> int:
+    """Refresh what this machine knows about a host, and print it. Nothing else.
+
+    A probe is the one command that runs before bootstrap, so it is also the
+    first chance to learn what the cards are -- every card, not just the
+    assigned ones, which is what makes `gpuc host set <name> --gpus 5` nameable
+    later. It reads the host's config too, so the offline listings stop being
+    stale, but it never writes one: a probe changes nothing about the host.
+    """
     settings = load_settings()
     entry = named_registry().require(args.name)
     report = probe_host(entry, settings)
     if not args.json:
         print(report.render(all_gpus=args.all_gpus))
-    # A probe is the one command that runs before bootstrap, so it is also the
-    # first chance to learn what the cards are. Every card, not just the assigned
-    # ones: this is what makes `gpuc host set <name> --gpus 5` nameable later.
-    if report.gpu_info:
-        with registry_transaction() as registry:
-            current = registry.hosts.get(args.name)
-            if current is not None:
-                registry.put(
-                    current.model_copy(
-                        update={
-                            "gpu_info": {**current.gpu_info, **report.gpu_info},
-                            "driver_version": report.driver_version or current.driver_version,
-                        }
-                    )
-                )
+    config = _probe_config(entry, settings)
+    # Written even when the host had nothing new to say: *when* it was last
+    # read is half of what the offline listings report.
+    with registry_transaction() as registry:
+        current = registry.hosts.get(args.name)
+        if current is not None:
+            current = current.with_cache(
+                gpu_info=report.gpu_info or None,
+                driver_version=report.driver_version,
+                # Only until a bootstrap of our own records the interpreter uv
+                # picked: a host somebody else set up is worth being able to
+                # read before then.
+                python=current.python or report.host_python,
+            )
+            registry.put(current if config is None else current.with_config(config))
     # After the registry write, not before: that write can fail (a held lock, a
     # registry that changed under us) and print an error document of its own,
     # and stdout may hold only one.
     if args.json:
         jsonout.emit(report.document())
     return EXIT_OK
+
+
+def _probe_config(entry: HostEntry, settings: Settings) -> dict[str, Any] | None:
+    """The host's `config.json`, or None if it has none or could not be read."""
+    try:
+        transport = transport_for(entry, settings)
+        return read_remote_config(transport, resolve_home(transport, entry)) or None
+    except (ConfigError, RemoteError, TransportError):
+        return None
 
 
 CLOUDS: dict[str, list[Cloud]] = {
@@ -605,42 +764,54 @@ def reporter(args: argparse.Namespace) -> Reporter:
 def ensure_package_current(
     entry: HostEntry, settings: Settings, *, bootstrap: bool = True, report: Reporter = print
 ) -> HostEntry:
-    """Re-ship the package when the *host* is not running this build.
+    """Read the host's config, and re-ship the package if it is not this build.
 
-    A host on another commit dispatches the job with code that does not match
-    the spec this machine just wrote, and that mismatch is invisible until a
-    job fails strangely. So the commit is read off the host's own config.json
-    rather than taken from this registry, which only ever recorded what this
-    machine shipped: two control machines against one box -- a laptop and a
-    desktop -- each leave that record describing a host the other has since
-    re-bootstrapped, and every submit would then skip the check it exists for.
-    An *unrecorded* commit counts as older, because the hosts with nothing
-    recorded were bootstrapped by the oldest builds of all.
+    The host's `config.json` is the only copy of what the host is, so this read
+    is also what makes the rest of the submit true: the `gpus` the spec is
+    judged against and the `s3_prefix` the job's outputs are recorded under are
+    the host's own answer, from a moment ago, not whatever this machine last
+    wrote down.
 
-    Only the package and the dispatcher: uv, the interpreter and health cannot
-    have gone stale, and the job is waiting.
+    The commit comes from the same file rather than from this registry, which
+    only ever recorded what this machine shipped: two control machines against
+    one box -- a laptop and a desktop -- each leave that record describing a
+    host the other has since re-bootstrapped, and every submit would then skip
+    the check it exists for. An *unrecorded* commit counts as older, because
+    the hosts with nothing recorded were bootstrapped by the oldest builds of all.
+
+    Only the package and the dispatcher are re-shipped: uv, the interpreter and
+    health cannot have gone stale, and the job is waiting.
     """
-    if not bootstrap or not entry.python:
+    if not bootstrap:
+        return entry
+    if not (entry.bootstrapped_at or entry.pkg_commit):
+        # Nothing has ever installed gpuc on this host -- not this machine, and
+        # not whoever else would have left a commit in its config. Re-shipping
+        # the package alone would start a dispatcher on a host with no uv and
+        # no interpreter of its own, and the first anyone would hear of it is
+        # the job failing there.
+        raise CliError(
+            f"host {entry.name} has no gpuc on it yet: nothing recorded here or in its own "
+            f"config says it was ever bootstrapped.\nRun: gpuc host bootstrap {entry.name}"
+        )
+    if not entry.python:
         return entry
     local = version_mod.local_commit()
     session = _try_session(entry, settings)
-    config = read_remote_config(session) if session else None
-    # A host that could not be asked falls back to this machine's record; the
-    # submit right behind this produces the transport error in full.
-    host_commit = _config_commit(config) if config is not None else entry.pkg_commit
-    entry = _record_commit(entry, host_commit)
-    # Only what would change *this job*: which cards it can have, the
-    # environment it inherits, where its outputs are mirrored. A host's own
-    # `idle_minutes` or `retention_days` can sit un-shipped after a `gpuc host
-    # set` for as long as the user likes, and a submit repeating that on every
-    # run would be noise it cannot even clear.
-    drift = config_drift(config, entry.host_config(), JOB_CONFIG_KEYS)
-    if drift:
-        report(
-            f"WARNING host {entry.name} is running a config this machine has not shipped it "
-            f"(host -> registered here): {'; '.join(drift)}. "
-            f"`gpuc host bootstrap {entry.name}` applies this machine's registration"
-        )
+    config = session.read_config() if session else None
+    # A host that could not be asked keeps the cache it had; the submit right
+    # behind this produces the transport error in full.
+    if config is None:
+        return entry
+    if config:
+        entry = _record_config(entry, config)
+        host_commit = entry.pkg_commit
+    else:
+        # The host answered and has no config at all: its gpuc home was wiped,
+        # taking the package with it. The cache here is the only copy of what
+        # that host was, so it is kept rather than overwritten with nothing --
+        # and an unrecorded commit re-ships below, which restores both.
+        host_commit = None
     if not version_mod.needs_package_sync(local, host_commit):
         return entry
     report(
@@ -662,26 +833,21 @@ def _try_session(entry: HostEntry, settings: Settings) -> HostSession | None:
         return None
 
 
-def _config_commit(config: dict[str, Any]) -> str | None:
-    commit = config.get("pkg_commit")
-    return commit if isinstance(commit, str) else None
+def _record_config(entry: HostEntry, config: dict[str, Any]) -> HostEntry:
+    """Cache what the host just said about itself, for the offline commands.
 
-
-def _record_commit(entry: HostEntry, commit: str | None) -> HostEntry:
-    """Keep the registry's note of this host's build honest.
-
-    `gpuc host list` and `gpuc version` never ask the host, so this is the only
-    thing that keeps them from repeating a bootstrap somebody else replaced.
-    One field, re-read under the lock: this now runs on every submit, and
-    writing back the whole entry we read at startup would undo whatever a
-    concurrent `gpuc host probe` learned about the same host.
+    `gpuc host list` and `gpuc version` never ask a host anything, so this is
+    what keeps them from repeating a bootstrap somebody else replaced. Written
+    even when the config has not changed, because *when* it was read is half of
+    what those commands report. Re-read under the lock and written as one
+    field, because this runs on every submit and writing back the whole entry
+    read at startup would undo whatever a concurrent `gpuc host probe` learned
+    about the same host.
     """
-    if commit == entry.pkg_commit:
-        return entry
-    updated = entry.model_copy(update={"pkg_commit": commit})
+    updated = entry.with_config(config)
     with registry_transaction() as registry:
         current = registry.hosts.get(entry.name)
-        registry.put(current.model_copy(update={"pkg_commit": commit}) if current else updated)
+        registry.put(current.with_config(config) if current else updated)
     return updated
 
 
@@ -1108,12 +1274,12 @@ def cmd_pods(args: argparse.Namespace) -> int:
 
 
 def cmd_version(args: argparse.Namespace) -> int:
-    """What is installed here, and what each host was last given *from here*.
+    """What is installed here, and what each host was running when last read.
 
-    The host commits are read from the registry, which bootstrap wrote -- no
-    ssh, so this stays a command you can run before anything else. That also
-    means it cannot see a host somebody else has bootstrapped since:
-    `gpuc status` asks each host what it is running.
+    The host commits come from the registry's cache -- no ssh, so this stays a
+    command you can run before anything else. That also means it cannot see a
+    host somebody else has bootstrapped since it was read: `gpuc status` asks
+    each host what it is running.
     """
     read = read_registry()
     for error in read.errors:
@@ -1127,15 +1293,18 @@ def cmd_version(args: argparse.Namespace) -> int:
     print(f"gpuc {version_mod.__version__}")
     print(f"commit {version_mod.short(commit)} [{source}]{dirty}")
     print(f"python {sys.version.split()[0]} at {sys.executable}")
-    hosts = [e for e in read.registry.hosts.values() if e.bootstrapped_at]
+    hosts = [
+        e for e in read.registry.hosts.values() if e.pkg_commit or e.bootstrapped_at or e.seen_at
+    ]
     if not hosts:
-        print("hosts: none bootstrapped")
+        print("hosts: none read yet")
         return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
-    print("hosts (last shipped from this machine; gpuc status asks the hosts themselves):")
+    print("hosts (as last read from here; gpuc status asks the hosts themselves):")
     for entry in hosts:
         current = version_mod.same_commit(commit, entry.pkg_commit)
         note = "" if current else "  DIFFERS: re-bootstrap"
-        print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{note}")
+        seen = f"  {status_mod.format_age(entry.seen_at)}" if entry.seen_at else ""
+        print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{seen}{note}")
     if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
         print(
             "upgrade a host with: gpuc host bootstrap <host> (or --all for every host; "
@@ -1194,11 +1363,18 @@ def build_parser() -> argparse.ArgumentParser:
     host = sub.add_parser("host", help="manage hosts").add_subparsers(
         dest="host_command", required=True
     )
-    add = host.add_parser("add", help="register a host")
+    add = host.add_parser(
+        "add",
+        help="register a host: read the config it already has, or give it its first",
+    )
     add.add_argument("name")
     add.add_argument("--ssh", help="user@host; omit for this machine")
     add.add_argument("--port", type=int, default=22, help="ssh port (default 22)")
-    add.add_argument("--gpus", help=GPUS_HELP)
+    add.add_argument(
+        "--gpus",
+        help=f"required for a host with no config of its own; on a host that has one this "
+        f"reassigns its cards, and a list that overlaps the host's is refused. {GPUS_HELP}",
+    )
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
     add.add_argument(
         "--persistent-root",
@@ -1225,7 +1401,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument(
         "--idle-min",
         type=float,
-        default=15.0,
+        default=None,
         metavar="MINUTES",
         help="how long an ephemeral host may sit with an empty queue before it terminates "
         "itself (default 15); ignored for hosts that are not ephemeral",
@@ -1237,11 +1413,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="hard cap on the host's life; omit or pass -1 for none (the default). When "
         "set, the dispatcher kills the running job with reason ttl, syncs, and terminates",
     )
+    add.add_argument(
+        "--force",
+        action="store_true",
+        help="allow a --gpus that claims some but not all of the cards the host is already "
+        "configured with",
+    )
     add.set_defaults(func=cmd_host_add)
 
-    edit = host.add_parser("set", help="change a registered host without remove/add")
+    edit = host.add_parser(
+        "set", help="change a host's address here, or its own config on the host"
+    )
     edit.add_argument("name")
-    edit.add_argument("--gpus", help=f"replace what this host owns; pass '' for none. {GPUS_HELP}")
+    edit.add_argument(
+        "--gpus",
+        help=f"replace what this host owns, on the host itself; pass '' for none. {GPUS_HELP}",
+    )
     edit.add_argument("--persistent-root", help="pass '' to go back to $HOME")
     edit.add_argument("--gpuc-home", help="pass '' for the default under the root or $HOME")
     edit.add_argument(
@@ -1251,7 +1438,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace this host's job environment; repeatable, '' for none",
     )
     edit.add_argument(
-        "--cache-dir", help="pin UV_CACHE_DIR for this host; pass '' to let bootstrap decide"
+        "--cache-dir", help="pin UV_CACHE_DIR in the host's env; pass '' to let bootstrap decide"
     )
     edit.add_argument("--s3-prefix", help="pass '' to stop mirroring")
     edit.add_argument(

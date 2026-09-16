@@ -4,9 +4,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from gpuc.control.config import HostEntry
 from gpuc.control.probe import parse_probe, probe_host, probe_script
 from gpuc.control.transport import CommandResult
+from tests.conftest import host_entry
 
 PROBE_SCRIPT = probe_script("$HOME/.gpuc")
 
@@ -252,7 +252,7 @@ class OneAnswerTransport:
 
 def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
     """The seam every other test here stubs: the registry's `--gpus` reaches the report."""
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["1"])
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["1"])
     report = probe_host(entry, transport=OneAnswerTransport(SAMPLE))
     assert report.owned == ["1"]
     assert [cells[1] for cells in report.owned_rows] == [A40]
@@ -260,7 +260,7 @@ def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
 
 
 def test_probe_host_carries_the_registered_persistent_root_too() -> None:
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", persistent_root="/mnt/ssd-2/me/")
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", persistent_root="/mnt/ssd-2/me/")
     report: Any = probe_host(entry, transport=OneAnswerTransport(OVERLAY_HOME))
     assert report.persistent_root == "/mnt/ssd-2/me"
     assert "recover with: gpuc host bootstrap gpubox" in report.render()
@@ -277,3 +277,13 @@ def test_an_assignment_that_resolves_to_nothing_is_not_blamed_on_other_owners() 
     rendered = parse_probe("gpubox", SAMPLE, None, ["7", "9"]).render()
     assert "assigned but not present on this host: 7, 9" in rendered
     assert "are not assigned to gpubox" not in rendered
+
+
+def test_the_probe_finds_an_interpreter_good_enough_to_read_a_host_with() -> None:
+    """A host somebody else bootstrapped should be readable from here at once,
+    so `host add` records the `python3` it found -- if it is new enough."""
+    assert parse_probe("h", "===python3===\n/usr/bin/python3 3.12.3\n").host_python == (
+        "/usr/bin/python3"
+    )
+    for useless in ("not installed", "/usr/bin/python3 3.9.18", "", "/usr/bin/python3"):
+        assert parse_probe("h", f"===python3===\n{useless}\n").host_python is None

@@ -11,6 +11,7 @@ import pytest
 from gpuc.control import ssh as ssh_mod
 from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_OK, main
 from gpuc.control.transport import CommandResult, SshTransport, Transport
+from tests.conftest import register_host
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 JOB = "20260915-120000-abc123"
@@ -122,7 +123,7 @@ def test_a_local_host_gets_a_shell_not_an_ssh(tmp_path: Path) -> None:
 def test_print_shows_a_copyable_command_line(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--port", "2222", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", port=2222, gpus=GPU)
     capsys.readouterr()
     assert main(["ssh", "gpubox", "--print"]) == EXIT_OK
     line = capsys.readouterr().out.strip()
@@ -141,7 +142,7 @@ def test_a_command_on_the_local_host_really_runs(
     """The live check, on `local` only: a real LocalTransport, a real shell."""
     home = tmp_path / "gpuc-home"
     (home / "jobs").mkdir(parents=True)
-    main(["host", "add", "local", "--gpuc-home", str(home), "--gpus", GPU])
+    register_host(name="local", gpuc_home=str(home), gpus=GPU)
     capsys.readouterr()
     assert main(["ssh", "local", "--", "pwd"]) == EXIT_OK
     assert capsys.readouterr().out.strip() == str(home)

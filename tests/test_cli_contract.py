@@ -33,6 +33,8 @@ from gpuc.control.config import (
     read_registry,
 )
 from gpuc.control.status import HostView
+from tests.conftest import host_entry, register_host
+from tests.fakehost import FakeHost
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 
@@ -72,14 +74,17 @@ def test_one_bad_host_entry_is_skipped_and_the_rest_still_work(
     assert "skipping host 'bad'" in captured.err
 
 
-def test_a_write_puts_back_the_entry_this_build_could_not_read(control_env: Path) -> None:
+def test_a_write_puts_back_the_entry_this_build_could_not_read(
+    control_env: Path, fake_host: FakeHost
+) -> None:
     """It is another session's host, not ours to delete on the next `host set`."""
     write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
     assert main(["host", "set", "good", "--idle-min", "9"]) == EXIT_OK
     document = json.loads(hosts_file().read_text())
     assert document["hosts"]["bad"] == BAD_ENTRY
-    assert document["hosts"]["good"]["idle_minutes"] == 9.0
+    assert document["hosts"]["good"]["cache"]["config"]["idle_minutes"] == 9.0
     assert document["schema_version"] == 1
+    assert fake_host.config is not None and fake_host.config["idle_minutes"] == 9.0
 
 
 def test_an_unparseable_registry_says_so_takes_a_bak_and_exits_three(
@@ -109,7 +114,7 @@ def test_a_mutation_refuses_to_overwrite_a_registry_it_could_not_read(
     path = hosts_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{ this is not json")
-    assert main(["host", "add", "local", "--gpus", GPU]) == EXIT_LOCAL_STATE
+    assert main(["host", "set", "local", "--idle-min", "9"]) == EXIT_LOCAL_STATE
     assert "Nothing was written" in capsys.readouterr().err
     assert path.read_text() == "{ this is not json"
 
@@ -139,7 +144,7 @@ def test_a_missing_registry_is_simply_no_hosts(control_env: Path) -> None:
 def test_status_is_zero_even_when_every_host_is_unreachable(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "gpubox", "--ssh", "me@nowhere.invalid", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@nowhere.invalid", gpus=GPU)
 
     def unreachable(entry: HostEntry, *args: object, **kwargs: object) -> HostView:
         return HostView(entry=entry, reachable=False, error="ssh: could not resolve hostname")
@@ -170,7 +175,7 @@ def test_a_named_host_that_does_not_exist_is_four(
 
 
 def test_a_bad_duration_is_usage(control_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    main(["host", "add", "local", "--gpus", GPU])
+    register_host(name="local", gpus=GPU)
     assert main(["status", "--since", "soon"]) == EXIT_USAGE
     assert "--since" in capsys.readouterr().err
 
@@ -252,7 +257,7 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
     monkeypatch.delenv("GPUC_HOME")
 
     (home / "pkg").symlink_to(Path(__file__).resolve().parents[1])
-    entry = HostEntry(
+    entry = host_entry(
         name="local", kind="local", gpus=[GPU], gpuc_home=str(home), python=sys.executable
     )
     write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
@@ -359,7 +364,7 @@ def test_config_show_json_is_the_effective_settings(
 def test_status_json_says_unreachable_rather_than_empty(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     capsys.readouterr()
     monkeypatch.setattr(
         status_mod,
@@ -439,13 +444,13 @@ def test_version_prints_the_version_the_commit_and_each_host(
 ) -> None:
     from gpuc.control import version as version_mod
 
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
-    with_commit = (
-        load_registry()
-        .require("gpubox")
-        .model_copy(update={"pkg_commit": "b" * 40, "bootstrapped_at": "2026-09-15T20:00:00+00:00"})
+    register_host(
+        name="gpubox",
+        kind="ssh",
+        ssh="me@box",
+        pkg_commit="b" * 40,
+        bootstrapped_at="2026-09-15T20:00:00+00:00",
     )
-    write_hosts({"hosts": {"gpubox": json.loads(with_commit.model_dump_json())}})
     capsys.readouterr()
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     monkeypatch.setattr(version_mod, "installed_commit", lambda: "a" * 40)
@@ -468,7 +473,7 @@ def test_the_commit_status_judges_is_the_hosts_own_not_the_registrys(
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     # Registry agrees with this build; the host says otherwise, and wins.
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
     view = HostView(entry=entry, reachable=True, pkg_commit="b" * 40)
     warnings = status_mod.host_warnings(view)
     assert len(warnings) == 1
@@ -485,7 +490,7 @@ def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
     from gpuc.control import version as version_mod
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
-    entry = HostEntry(name="s", pkg_commit="b" * 40)
+    entry = host_entry(name="s", pkg_commit="b" * 40)
     current = HostView(entry=entry, reachable=True, pkg_commit="a" * 40)
     assert status_mod.host_warnings(current) == []
     # Unreachable: "we could not ask" is not evidence of anything.
@@ -499,20 +504,20 @@ def test_host_list_reports_this_machines_own_record_and_says_that_is_what_it_is(
     is imply it did: what it has is the commit *this* machine last shipped."""
     from gpuc.control import version as version_mod
 
-    main(["host", "add", "gpubox", "--ssh", "me@box"])
-    shipped = (
-        load_registry()
-        .require("gpubox")
-        .model_copy(update={"pkg_commit": "b" * 40, "bootstrapped_at": "2026-09-15T20:00:00+00:00"})
+    register_host(
+        name="gpubox",
+        kind="ssh",
+        ssh="me@box",
+        pkg_commit="b" * 40,
+        bootstrapped_at="2026-09-15T20:00:00+00:00",
     )
-    write_hosts({"hosts": {"gpubox": json.loads(shipped.model_dump_json())}})
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     capsys.readouterr()
 
     assert main(["host", "list"]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "pkg     " + "b" * 12 + " shipped from here" in out
-    assert "NOTE host gpubox was last given gpuc " + "b" * 12 + " from this machine" in out
+    assert "pkg     " + "b" * 12 + " on the host, as of " in out
+    assert "NOTE host gpubox was last seen running gpuc " + "b" * 12 in out
     assert "gpuc status" in out
 
     assert main(["host", "list", "--json"]) == EXIT_OK
@@ -538,7 +543,7 @@ def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
     from gpuc.control import version as version_mod
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
     (warning,) = status_mod.host_warnings(HostView(entry=entry, reachable=True))
     assert "a build too old to say which" in warning
     assert "gpuc host bootstrap gpubox" in warning
@@ -548,22 +553,19 @@ def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
     assert status_mod.host_warnings(HostView(entry=entry, reachable=True)) == []
 
 
-def test_a_config_only_another_control_machine_could_have_written_is_flagged(
+def test_a_config_this_machine_has_not_caught_up_with_is_not_a_warning(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The host owns its config, so a cache that disagrees with it is stale and
+    not a conflict -- and the cards printed above are the host's own answer."""
     from gpuc.control import version as version_mod
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"], pkg_commit="a" * 40)
-    view = HostView(
-        entry=entry,
-        reachable=True,
-        pkg_commit="a" * 40,
-        configured={"host": "gpubox", "gpus": ["0", "1"]},
+    entry = host_entry(
+        name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"], pkg_commit="a" * 40
     )
-    (warning,) = status_mod.host_warnings(view)
-    assert "gpus 0,1 -> 2,3" in warning
-    assert "gpuc host bootstrap gpubox" in warning
+    view = HostView(entry=entry, reachable=True, pkg_commit="a" * 40, owned=["0", "1"])
+    assert status_mod.host_warnings(view) == []
 
 
 def test_the_installed_commit_comes_from_direct_url_json(
@@ -704,7 +706,7 @@ def test_version_json_says_which_hosts_are_current(
 
     entries = {
         name: json.loads(
-            HostEntry(
+            host_entry(
                 name=name,
                 kind="ssh",
                 ssh="me@box",
@@ -763,9 +765,8 @@ def test_logs_json_says_when_it_fell_back_to_the_mirror(
         "gpuc.control.s3index.S3Index.client",
         property(lambda self: FakeS3Client(objects={uri: b"mirrored\n"})),
     )
-    entry = (
-        load_registry().require("local").model_copy(update={"s3_prefix": "s3://bucket/gpuc/local"})
-    )
+    entry = load_registry().require("local")
+    entry = entry.with_config({**entry.cache.config, "s3_prefix": "s3://bucket/gpuc/local"})
     write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
 
     assert main(["logs", RUNNING_JOB, "--json"]) == EXIT_OK

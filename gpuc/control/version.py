@@ -144,13 +144,13 @@ def shipped_commit_note(name: str, recorded: str | None, local: str | None) -> s
     """What an *offline* command can honestly say about a host's build.
 
     `gpuc host list` and `gpuc version` never touch the host, so all they have
-    is this machine's record of its own last bootstrap. That is not what the
-    host is running if anybody else has bootstrapped it since, so it is
-    reported as what it is and `gpuc status` is where the answer lives.
+    is the `pkg_commit` cached from the last time something here did ask. Any
+    machine may have re-bootstrapped the host since, so it is reported as what
+    it is -- last seen -- and `gpuc status` is where the live answer lives.
     """
     if same_commit(local, recorded):
         return None
     return (
-        f"host {name} was last given gpuc {short(recorded)} from this machine, which now has "
+        f"host {name} was last seen running gpuc {short(recorded)} and this machine has "
         f"{short(local)}; run gpuc host bootstrap {name} (`gpuc status` asks the host itself)"
     )

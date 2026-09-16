@@ -46,7 +46,8 @@ gpuc/
     cli.py        # `gpuc` top-level commands
     actions.py    # what the CLI and the dashboard both do: one function per command, returning its --json document
     web/          # `gpuc web`: stdlib http.server, bcrypt login, a static page over the same documents
-    config.py     # ~/.local/share/gpu-coordinator/ layout, hosts registry
+    config.py     # ~/.local/share/gpu-coordinator/ layout, hosts registry (address + cache)
+    connect.py    # `host add` / `host set`: read or write the host's own config.json
     transport.py  # LocalTransport / SshTransport: run, rsync, put_file(0600), tail
     bootstrap.py  # install uv + this package on a host, write config, run host preflight
     clean.py      # `gpuc clean` / `gpuc host clean --uv-cache` over the transport
@@ -499,8 +500,8 @@ and did not go. The control side refuses an empty `--only` before it can become
 the command line in argparse, before any subcommand runs, so nothing is deleted
 and the error says to re-run `gpuc host bootstrap`.
 
-`HostConfig.retention_days` (registry `HostEntry.retention_days`, `gpuc host
-add|set --retention-days N`, null by default) makes the dispatcher purge, never
+`HostConfig.retention_days` (`gpuc host add|set --retention-days N`, null by
+default) makes the dispatcher purge, never
 forced, once at startup and then at most once an hour. A non-ephemeral host's
 dispatcher only lives while there is work, so in practice that sweep happens on
 the next submit.
@@ -532,12 +533,12 @@ and `UV_LINK_MODE=copy` disables them outright. Two rules follow:
 - Nothing in the job path sets `UV_LINK_MODE`, and neither the dispatcher nor
   the runner sets `UV_CACHE_DIR` unless `HostConfig.env` does.
 - `gpuc host bootstrap` compares the filesystem of gpuc home with that of `uv
-  cache dir`. If they differ it sets `HostEntry.cache_dir` (surfaced to jobs as
-  `UV_CACHE_DIR` via `HostConfig.env`) to `<parent of gpuc home>/.cache/uv` --
-  beside gpuc home, not inside it, so `clean` and an `rm -rf` of gpuc home
-  cannot take the cache with them. An explicit `--cache-dir` or an `--env
-  UV_CACHE_DIR=...` is never overridden, and an unreadable comparison changes
-  nothing.
+  cache dir`. If they differ it sets `UV_CACHE_DIR` in the host's own
+  `HostConfig.env` to `<parent of gpuc home>/.cache/uv` -- beside gpuc home,
+  not inside it, so `clean` and an `rm -rf` of gpuc home cannot take the cache
+  with them. A cache the host's config already names is never overridden,
+  however it got there (`--cache-dir`, `--env UV_CACHE_DIR=...`, or an earlier
+  bootstrap), and an unreadable comparison changes nothing.
 
 The case that matters is a pod with `--persistent-root /workspace/$USER`: gpuc
 home on the network volume, `~/.cache` on the container's overlay. Without the
@@ -598,14 +599,18 @@ file the two halves share obeys the same two rules, on both sides:
 
 Control side that means `extra="ignore"`, a default on every field, and a
 `model_validator(mode="before")` that consults the annotation (`HostEntry`,
-`Registry`, `DesiredHost`, `Settings`, `IndexEntry`, `Offer`). Host side, with
+`HostCache`, `Registry`, `DesiredHost`, `Settings`, `IndexEntry`, `Offer`). The
+host config a registry entry caches is kept **verbatim** on top of that, so a
+key some newer build wrote survives a round trip through this one. Host side, with
 no pydantic, the same rules are spelled out in `jobs.from_dict` for
 `HostConfig`, `JobSpec`, `JobState` and the dispatcher's lock body: never
 `float(None)`, never a `KeyError`, an unusable value means the default.
 
 `hosts.json` and `config.json` both carry `schema_version` (1); readers accept
 it missing. `tests/fixtures/schema/` holds today's shape of each file plus a
-hand-written older and newer variant, and every one of them must parse.
+hand-written older and newer variant -- and, for `hosts.json`, the pre-split
+shape that carried each host's config flat beside its address. Every one of
+them must parse.
 
 A host entry that still does not validate is **skipped, not fatal**: `gpuc`
 warns, works with the rest, and writes that entry back untouched on the next
@@ -663,6 +668,58 @@ touches the user's staging. `--no-git` rsyncs a non-repo directory whole, minus
 `put_file` writes 0600 content via stdin (`cat > path && chmod 600 path`);
 secrets never touch argv.
 
+## The registry is an address book
+
+`hosts.json` holds two kinds of thing about a host and only two:
+
+- the **address** -- `name`, `kind`, `ssh`, `port`, `gpuc_home` /
+  `persistent_root`, `pod_id` -- which is hand-entered, local to this machine,
+  and is everything needed to open a session and find `config.json`. Nothing in
+  it is a fact about how the host behaves.
+- a **cache** of what the host last said: `python`, `uv`, `gpu_info`,
+  `driver_version` and a copy of its `config.json`, stamped with `read_at`.
+  Offline commands (`host list`, `version`) print it labelled "as of <age>";
+  anything that decides something reads the host.
+
+What the host **is** -- `gpus`, `s3_prefix`, `env`, `idle_minutes`,
+`ttl_hours`, `retention_days`, `provider`, `pkg_commit` -- lives in
+`config.json` on the host and nowhere else. One box driven from a desktop and a
+laptop therefore has one configuration, not two, and nothing about the machine
+that bootstrapped it first matters afterwards.
+
+- `gpuc host add <name> --ssh ...` is a **connect**: probe, read `config.json`,
+  and if it is there adopt it -- registering only the address -- under the name
+  the host calls itself. Flags are explicit per-field overrides, written
+  through and reported (`host <- retention_days 30.0 -> 7.0`). A `--gpus` that
+  overlaps the host's existing set without matching it is **refused**
+  (`--force` overrides): every other difference confuses a listing, that one
+  hands one card to two jobs. A host with no config is where `--gpus` is
+  required and the initial config is written.
+- `gpuc host set <name> --gpus ... --env ...` **writes through** to
+  `config.json` via `python -m gpuc.host config --merge` (one atomic
+  read-modify-write on the host, by the code that reads the file; a host with
+  no package yet gets the same merge done here and the file replaced by
+  rename). It does not work offline, which is correct: there is no local copy
+  to set. `--persistent-root` and `--gpuc-home` are addresses and stay here.
+- `gpuc host probe` refreshes the cache and nothing else -- including an
+  interpreter to run the on-host package with, so a host somebody else
+  bootstrapped answers `status` and `host set` before this machine has
+  bootstrapped it.
+- "the host has no config" is a marker the host echoes, never the absence of
+  parseable output: a `config.json` that is there and does not parse is a file
+  the host is running on, so `read_remote_config` returns `None` for it, and
+  nothing -- connect, `host set` or bootstrap -- writes over a `None`.
+- `gpuc submit`'s pre-enqueue read of `config.json` is the only source for the
+  `gpus` a spec is judged against, and it refreshes the cache on the way past.
+- Provision is create pod -> wait for ssh -> the same connect, with the initial
+  config a pod nobody has configured yet needs.
+
+A registry from before this split still parses: `HostEntry` folds the config
+fields it carries into the cache (`cache_dir` becomes `env.UV_CACHE_DIR`, which
+is the only place the host ever had it), and the next connect, `host set` or
+bootstrap works from the host's own copy. A `config.json` from before it needs
+no change at all: it is already the shape the host reads.
+
 ## Bootstrap (any host, idempotent)
 
 1. `curl -LsSf https://astral.sh/uv/install.sh | sh` if `~/.local/bin/uv`
@@ -672,29 +729,30 @@ secrets never touch argv.
    skipped if present; failures are warnings -- **except** that a host
    registered with an `s3_prefix` whose `aws` CLI could not be installed fails
    bootstrap outright: every job on it would end `failed: sync-preflight`).
-3. Write `~/.gpuc/config.json` from the host registry entry, after reading the
-   one already there: every field of it that this bootstrap changes is reported
-   as a warning first (`overwriting the config on host h ... gpus GPU-b ->
-   GPU-a`), all of them, since this is the moment they are replaced. After a
-   `gpuc host set` that is the confirmation of what moved; the case it exists
-   for is a `config.json` another *control machine* wrote, which this registry
-   cannot see and this bootstrap would otherwise replace in silence. It is a warning, never a refusal: bootstrap's job is to make the
-   host match the machine running it.
+3. **Never rewrite `~/.gpuc/config.json`.** The host owns it (see The registry
+   is an address book), so bootstrap reads it -- the `env` in it decides which
+   uv cache the installs populate and which tool directories go on PATH -- and
+   merges back exactly two keys, through the host's own `python -m gpuc.host
+   config --merge`: the commit it just shipped, and `env.UV_CACHE_DIR` when the
+   host names none (`resolve_cache_dir`, decided from the host's own
+   filesystem). The one exception is a host with **no** config at all -- one
+   registered before this split, or one whose gpuc home was wiped -- where
+   there is nothing to preserve and the last config this machine read off it is
+   restored, with a warning if it has none either.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"`.
 5b. Record the commit this build of gpuc came from (`direct_url.json` of the
-   installed dist, else `git rev-parse` of the checkout) as `HostEntry.pkg_commit`
-   and in the host's `config.json`. The host's copy is the authoritative one and
-   is what `status` reports and what `submit` judges (see Which build is a host
-   running); the registry's is this machine's record of its own last bootstrap,
-   which is all `gpuc host list` and `gpuc version` have, and they say so.
+   installed dist, else `git rev-parse` of the checkout) in the host's
+   `config.json`. That copy is the authoritative one and is what `status`
+   reports and what `submit` judges (see Which build is a host running); the
+   registry caches it for the offline commands, which say when it was read.
    Bootstrap
-   is never blocked by running jobs: the package and config are replaced, an
+   is never blocked by running jobs: the package is replaced, an
    already-alive dispatcher keeps the lock until it exits, and whichever
    dispatcher takes over adopts the running jobs from their `state.json`.
 6. Record what the host's cards are (`nvidia-smi --query-gpu=index,uuid,name,memory.total`)
-   and the driver version from the health report into `HostEntry.gpu_info` /
-   `driver_version`, so `gpuc host list` and `gpuc status` can name them. Best
+   and the driver version from the health report into the registry's cache, so
+   `gpuc host list` and `gpuc status` can name them. Best
    effort: a host with no nvidia-smi simply lists UUIDs. `gpuc host probe`
    records the same thing before a host is ever bootstrapped, and a RunPod host
    falls back to its offer's GPU name and VRAM.
@@ -751,13 +809,13 @@ Bootstrap creates `R` 0700 if it creates it and leaves an existing `R`'s mode al
 gpuc home, which `paths.ensure_layout` already makes 0700. Without a root
 nothing changes.
 
-`HostEntry.env` (`--env K=V`, nothing populates it automatically) is written to
-`config.json` as `HostConfig.env` and applied to every job's environment
-*before* the job's own `env` -- by the dispatcher to every child it spawns, and
-by the runner -- and to every `HostSession` invocation of the on-host package.
-`UV_INSTALL_DIR`/`UV_TOOL_BIN_DIR` in it are also prepended to `PATH`.
-`HostEntry.cache_dir` is the one key bootstrap fills in itself; it reaches
-`HostConfig.env` as `UV_CACHE_DIR` and an explicit `env` entry always wins.
+`HostConfig.env` (`--env K=V`, nothing populates it automatically) is applied to
+every job's environment *before* the job's own `env` -- by the dispatcher to
+every child it spawns, and by the runner -- and to every `HostSession`
+invocation of the on-host package. `UV_INSTALL_DIR`/`UV_TOOL_BIN_DIR` in it are
+also prepended to `PATH`. `UV_CACHE_DIR` is the one key bootstrap fills in
+itself, and only when the host's config names none; `--cache-dir` is that same
+key by another name.
 
 `gpuc host probe` reports `$HOME`'s filesystem type (`df -T`, `stat -f`
 fallback) and suggests `--persistent-root` when it is an overlay. The health
@@ -929,12 +987,11 @@ What `status` prints, and every flag, is usage.md. The invariants:
 
 ## Which build is a host running
 
-The registry here records what **this machine** last shipped. That is not the
-same question as what the host runs, and the difference is not hypothetical:
-one user with a desktop and a laptop, both `gpuc host add`-ing the same ssh
-box, gives two registries that each describe their own last bootstrap and
-neither of which can see the other's. Whoever bootstrapped last is what the
-host is actually running.
+The package is the one thing a host cannot own, because it is shipped to it: two
+machines on different commits, both `gpuc host bootstrap`-ing the same ssh box,
+leave it running whichever shipped last, and neither registry can see the
+other's. (Everything else about a host it does own -- see The registry is an
+address book.)
 
 So the authoritative copy is the host's: `config.json`'s `pkg_commit`, written
 by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
@@ -948,26 +1005,21 @@ by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
   means "the host did not say", never "current".
 - `gpuc submit` and `gpuc requeue` read the host's `config.json` before they
   enqueue and re-ship the package when it does not match this build -- an
-  unrecorded commit included. The same read reports the fields of that config
-  that would change *this job* (`host`, `gpus`, `s3_prefix`, `env`) when they
-  are not what is registered here -- `env` by name only, and never
-  `UV_CACHE_DIR`, which bootstrap derives from the host's own filesystem and
-  which only the machine that bootstrapped it has an opinion worth having
-  about. It then records the commit it saw, so the offline commands stop
-  repeating a bootstrap somebody else replaced.
-- `gpuc host list` and `gpuc version` never ssh, so they report this machine's
-  own record, labelled as such (`pkg <sha> shipped from here`), and point at
-  `gpuc status` for what the host is running.
+  unrecorded commit included. That same read is what the rest of the submit
+  works from: the `gpus` the spec is judged against and the `s3_prefix` the
+  job's outputs are recorded under are the host's own answer, from a moment
+  ago, and the whole of it replaces the registry's cache on the way past.
+- `gpuc host list` and `gpuc version` never ssh, so they report the commit the
+  host was running when this machine last read it, labelled with its age
+  (`pkg <sha> on the host, as of 3m ago`), and point at `gpuc status` for what
+  it is running now.
 
-None of this can tell a second control machine's config from a `gpuc host set`
-here that has not been bootstrapped yet -- both are "the host is not running
-what is registered on this machine" -- so none of it claims to: the wording is
-what the host has, what is registered here, and that `gpuc host bootstrap
-<host>` applies the latter. That is also why a submit only reports the keys a
-job is affected by: the host's own `idle_minutes` may sit un-shipped for as
-long as the user likes, and a warning on every submit would be noise the submit
-cannot clear. Nothing here blocks anything; it is how a shared host stops being
-invisible.
+The build is the only thing left that two machines can disagree about, because
+it is the only thing a host cannot own: the package is shipped to it. Its
+config is not -- the host holds the only copy, every command that acts reads it
+first, and a registry that says something else is simply a stale cache (see The
+registry is an address book), so there is nothing to warn about and nothing to
+reconcile by hand.
 
 ## Testing rules
 

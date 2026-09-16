@@ -33,6 +33,7 @@ from gpuc.control.web.auth import (
     read_password_hash,
     verify,
 )
+from tests.conftest import register_host
 
 PASSWORD = "correct horse battery"
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -168,7 +169,7 @@ def fake_host_view(entry: HostEntry, *a: object, **k: object) -> HostView:
 
 @pytest.fixture
 def one_host(control_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     monkeypatch.setattr(status_mod, "gather", fake_host_view)
 
 

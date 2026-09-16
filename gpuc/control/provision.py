@@ -18,7 +18,7 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -42,6 +42,7 @@ from gpuc.control.config import (
     utc_now,
     write_desired,
 )
+from gpuc.control.connect import Connection, connect_host
 from gpuc.control.gpuinfo import GpuInfo, discover, summarize
 from gpuc.control.providers.base import (
     DEFAULT_IMAGE,
@@ -88,6 +89,20 @@ class ProvisionError(RuntimeError):
     pass
 
 
+class ConnectFn(Protocol):
+    def __call__(
+        self,
+        address: HostEntry,
+        settings: Settings | None = ...,
+        *,
+        fields: Mapping[str, Any] | None = ...,
+        env_updates: Mapping[str, str | None] | None = ...,
+        transport: Transport | None = ...,
+        force: bool = ...,
+        gpu_hint: str = ...,
+    ) -> Connection: ...
+
+
 class BootstrapFn(Protocol):
     def __call__(
         self,
@@ -107,6 +122,7 @@ class ProvisionDeps:
     sleep: Callable[[float], None] = time.sleep
     now: Callable[[], float] = time.monotonic
     bootstrap: BootstrapFn = bootstrap_host
+    connect: ConnectFn = connect_host
     transport_factory: Callable[[HostEntry, Settings], Transport] = transport_for
     poll_interval_s: float = POLL_INTERVAL_S
     log_check_interval_s: float = LOG_CHECK_INTERVAL_S
@@ -168,15 +184,8 @@ def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
     return offer.matches_cuda_floor(constraints.cuda_min)
 
 
-def entry_for(
-    name: str,
-    pod: Pod,
-    settings: Settings,
-    *,
-    idle_minutes: float,
-    ttl_hours: float | None,
-    created_at: str,
-) -> HostEntry:
+def address_for(name: str, pod: Pod) -> HostEntry:
+    """How to reach this pod, and nothing about what it is."""
     if pod.ssh_direct is None:
         raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
     return HostEntry(
@@ -185,11 +194,31 @@ def entry_for(
         ssh=f"{pod.ssh_direct.username}@{pod.ssh_direct.host}",
         port=pod.ssh_direct.port,
         pod_id=pod.id,
-        idle_minutes=idle_minutes,
-        ttl_hours=ttl_hours,
-        s3_prefix=default_s3_prefix(settings, name),
-        created_at=created_at,
     )
+
+
+def initial_config(
+    name: str,
+    settings: Settings,
+    *,
+    gpus: list[str],
+    idle_minutes: float,
+    ttl_hours: float | None,
+    created_at: str,
+) -> dict[str, Any]:
+    """What a pod we just bought is: the config `connect_host` gives it.
+
+    A fresh pod has no `config.json`, so this is the one case where the machine
+    that created a host also decides what it is. Everything after this reads
+    the host's copy, including the next machine to connect to it.
+    """
+    return {
+        "gpus": gpus,
+        "idle_minutes": idle_minutes,
+        "ttl_hours": ttl_hours,
+        "s3_prefix": default_s3_prefix(settings, name),
+        "created_at": created_at,
+    }
 
 
 def gpu_info_for(transport: Transport, uuids: list[str], offer: Offer) -> dict[str, GpuInfo]:
@@ -374,22 +403,29 @@ def _try_offer(
             f"ssh.direct {pod.ssh_direct.username}@{pod.ssh_direct.host}:{pod.ssh_direct.port} "
             f"(cuda {pod.cuda_version or '?'}, ${pod.cost_usd_hr:.3f}/h)"
         )
-        entry = entry_for(
-            name,
-            pod,
-            settings,
-            idle_minutes=idle_minutes,
-            ttl_hours=ttl_hours,
-            created_at=created_at,
-        )
-        transport = deps.transport_factory(entry, settings)
+        address = address_for(name, pod)
+        transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
-        deliver_s3_credentials(transport, entry, progress)
         uuids = discover_gpu_uuids(transport)
-        entry = entry.model_copy(
-            update={"gpus": uuids, "gpu_info": gpu_info_for(transport, uuids, offer)}
-        )
-        progress(f"host GPUs: {summarize(uuids, entry.gpu_info)} ({', '.join(uuids)})")
+        address = address.with_cache(gpu_info=gpu_info_for(transport, uuids, offer))
+        progress(f"host GPUs: {summarize(uuids, address.gpu_info)} ({', '.join(uuids)})")
+        # The same connect path `gpuc host add` takes, with the config a pod
+        # nobody has configured yet needs: written to the pod, which owns it
+        # from here on, and read back into the registry.
+        entry = deps.connect(
+            address,
+            settings,
+            fields=initial_config(
+                name,
+                settings,
+                gpus=uuids,
+                idle_minutes=idle_minutes,
+                ttl_hours=ttl_hours,
+                created_at=created_at,
+            ),
+            transport=transport,
+        ).entry
+        deliver_s3_credentials(transport, entry, progress)
         with registry_transaction() as registry:
             registry.put(entry)
 

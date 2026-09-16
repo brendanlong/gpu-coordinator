@@ -58,6 +58,74 @@ def test_enqueue_from_stdin(
     assert jobs.read_state(payload["job_id"]).status == "queued"
 
 
+def test_config_prints_what_the_host_holds(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, payload = run(capsys, "config")
+    assert code == 0
+    assert isinstance(payload, dict)
+    assert (payload["host"], payload["gpus"]) == ("test-host", list(FAKE_GPUS))
+
+
+def test_config_merge_replaces_the_keys_it_is_given_and_no_others(
+    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`gpuc host set` is this: the host applies the patch, atomically, with
+    the same code the dispatcher reads the file with."""
+    patch = tmp_path / "patch.json"
+    patch.write_text(json.dumps({"gpus": ["0"], "retention_days": 7.0, "env": {"HF_HOME": "/big"}}))
+    code, payload = run(capsys, "config", "--merge", str(patch))
+    assert code == 0
+    assert isinstance(payload, dict)
+    assert (payload["gpus"], payload["retention_days"]) == (["0"], 7.0)
+    # Untouched: the host's name, and every key the patch did not name.
+    assert payload["host"] == "test-host"
+    on_disk = jobs.read_config()
+    assert (on_disk.gpus, on_disk.retention_days, on_disk.env) == (["0"], 7.0, {"HF_HOME": "/big"})
+
+
+def test_config_merge_keeps_the_keys_this_build_does_not_know(
+    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A control machine on a newer build may have written fields this host has
+    never heard of; a `host set` from an older one must not drop them."""
+    document = json.loads(paths.config_file().read_text())
+    document["power_cap_watts"] = 220
+    paths.config_file().write_text(json.dumps(document))
+    patch = tmp_path / "patch.json"
+    patch.write_text(json.dumps({"idle_minutes": 5.0}))
+    _, payload = run(capsys, "config", "--merge", str(patch))
+    assert isinstance(payload, dict)
+    assert payload["power_cap_watts"] == 220
+    assert payload["idle_minutes"] == 5.0
+
+
+def test_config_merge_can_clear_a_nullable_field(
+    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    jobs.write_config(HostConfig(host="test-host", ttl_hours=24.0, s3_prefix="s3://b/p"))
+    patch = tmp_path / "patch.json"
+    patch.write_text(json.dumps({"ttl_hours": None, "s3_prefix": None}))
+    _, payload = run(capsys, "config", "--merge", str(patch))
+    assert isinstance(payload, dict)
+    assert payload["ttl_hours"] is None and payload["s3_prefix"] is None
+    assert jobs.read_config().ttl_hours is None
+
+
+def test_config_merge_on_a_host_with_no_config_writes_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("GPUC_HOME", str(tmp_path / "gpuc-home"))
+    patch = tmp_path / "patch.json"
+    patch.write_text(json.dumps({"host": "fresh", "gpus": ["GPU-a"]}))
+    code, payload = run(capsys, "config", "--merge", str(patch))
+    assert code == 0
+    assert isinstance(payload, dict)
+    assert (payload["host"], payload["gpus"]) == ("fresh", ["GPU-a"])
+    assert payload["schema_version"] == 1
+    assert jobs.read_config().host == "fresh"
+
+
 def test_list_and_status(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     job_id = queue.enqueue(make_spec(name="n", priority=12))
     _, listed = run(capsys, "list")

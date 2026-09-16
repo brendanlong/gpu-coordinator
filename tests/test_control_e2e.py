@@ -118,8 +118,23 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
 
     home = root / "gpuc-home"
     try:
+        # `--gpus ''` because this machine's cards are not this suite's to use:
+        # every job here asks for none. A host with no config of its own has to
+        # be told, one way or the other.
         assert (
-            main(["host", "add", "local", "--gpuc-home", str(home), "--cache-dir", SHARED_UV_CACHE])
+            main(
+                [
+                    "host",
+                    "add",
+                    "local",
+                    "--gpuc-home",
+                    str(home),
+                    "--cache-dir",
+                    SHARED_UV_CACHE,
+                    "--gpus",
+                    "",
+                ]
+            )
             == 0
         )
         assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
@@ -556,8 +571,11 @@ def test_retention_days_reaches_the_host_config(
     bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = bootstrapped_home
+    # Through the host's own CLI, on the host, with no bootstrap in between:
+    # `config.json` is the only copy of this setting.
     assert main(["host", "set", "local", "--retention-days", "14"]) == 0
-    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
     assert json.loads((home / "config.json").read_text())["retention_days"] == 14.0
+    assert load_registry().require("local").retention_days == 14.0
     assert main(["host", "set", "local", "--retention-days", ""]) == 0
+    assert json.loads((home / "config.json").read_text())["retention_days"] is None
     assert load_registry().require("local").retention_days is None

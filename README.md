@@ -10,7 +10,11 @@ One submit path (`gpuc submit`) for three kinds of GPU host:
 
 Each host runs a small stdlib-only dispatcher out of `~/.gpuc` (or
 `<persistent-root>/gpuc`), and **the host is authoritative** for its own queue,
-its job state and its logs: `gpuc` asks it over ssh and prints what it says. S3
+its job state, its logs and its own configuration — which cards it may use,
+where it mirrors, what environment its jobs get: `gpuc` asks it over ssh and
+prints what it says. The registry here is an address book (how to reach a host)
+plus a cache of what it last said, so a second machine picks a box up with
+`gpuc host add <name> --ssh …` and adopts what is already there. S3
 is a **mirror**, never the queue — with `s3_bucket` set, specs and the job index
 go up from here and each host mirrors its own logs and state, which is what
 makes `gpuc requeue`, `gpuc logs` after a pod is gone, and `gpuc clean --purge`
@@ -22,6 +26,7 @@ optional `gpuc reconcile` timer, which terminates pods nothing wants any more.
 ```sh
 uv tool install "git+https://github.com/brendanlong/gpu-coordinator@main"
 gpuc host add local --gpus 0                 # nvidia-smi index or GPU-… UUID
+                                             # (omit --gpus for a host already set up)
 gpuc host bootstrap local                    # installs uv, the package, the dispatcher
 gpuc submit job.example.yaml --host local    # or --runpod --gpu A40 --max-price 0.60
 gpuc status                                  # queues, running jobs, recent results

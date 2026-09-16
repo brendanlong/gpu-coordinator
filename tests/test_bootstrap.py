@@ -9,7 +9,11 @@ import pytest
 
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, package_files
 from gpuc.control.config import HostEntry
+from gpuc.control.remote import NO_CONFIG
 from gpuc.control.transport import CommandResult
+from gpuc.host import jobs
+from gpuc.host.jobs import HostConfig
+from tests.conftest import host_entry
 
 HEALTH_OK = {
     "host": "h",
@@ -20,6 +24,9 @@ HEALTH_OK = {
         {"name": "disk", "ok": True, "detail": "900 GB free"},
     ],
 }
+CONFIG_ON_HOST = HostConfig(host="h", gpus=["GPU-a"]).to_dict()
+"""What a host that has been set up already says about itself."""
+
 HEALTH_BAD = {
     "host": "h",
     "gpus": ["GPU-a"],
@@ -49,8 +56,19 @@ class ScriptedHost:
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
 
     def _answer(self, command: str) -> tuple[int, str]:
-        if command.startswith("cat ") and "config.json" in command:
-            return 0, "" if self.config is None else json.dumps(self.config)
+        if command.startswith("if [ -f") and "config.json" in command:
+            return 0, NO_CONFIG if self.config is None else json.dumps(self.config)
+        if "-m gpuc.host config --merge" in command:
+            # The host's own merge, done by the host's own code: whichever
+            # control machine sends a patch, this is what applies it.
+            patch = json.loads(self.puts[command.rsplit(" ", 1)[1]][0])
+            self.config = jobs.merged_config(self.config or {}, patch)
+            return 0, json.dumps(self.config)
+        if command.startswith("mv -f") and "config.json" in command:
+            source, target = command.split()[2].strip('"'), command.split()[3].strip('"')
+            self.config = json.loads(self.puts[source][0])
+            self.puts[target] = self.puts.pop(source)
+            return 0, ""
         if "astral.sh/uv" in command:
             self.uv_present = True
             return 0, ""
@@ -117,7 +135,12 @@ class ScriptedHost:
 
 
 def entry(**overrides: object) -> HostEntry:
-    return HostEntry.model_validate({"name": "h", "gpus": ["GPU-a"], **overrides})
+    """A registered host whose cache says the host has one GPU.
+
+    The cache, not an instruction: every test here also gives `ScriptedHost` a
+    `config`, or leaves it unset to mean "this host has never been set up".
+    """
+    return host_entry(name="h", **{"gpus": ["GPU-a"], **overrides})
 
 
 def test_package_files_are_the_git_tracked_host_modules() -> None:
@@ -169,7 +192,7 @@ def test_resync_package_ships_the_code_without_the_health_check(control_env: Pat
     the dispatcher, not the ten-minute half of bootstrap."""
     from gpuc.control.bootstrap import resync_package
 
-    host = ScriptedHost()
+    host = ScriptedHost(config=dict(CONFIG_ON_HOST))
     updated = resync_package(
         entry(python="/home/u/.local/python3.12"), transport=host, report=lambda _: None
     )
@@ -177,23 +200,101 @@ def test_resync_package_ships_the_code_without_the_health_check(control_env: Pat
     assert any("spawn_detached_dispatcher" in e for e in host.events)
     assert not any("gpuc.host health" in e for e in host.events)
     assert not any("astral.sh/uv" in e for e in host.events)
-    assert "/home/u/.gpuc/config.json" in host.puts
+    # The commit, and nothing else of the host's config: a re-ship before a
+    # submit is not the moment to re-decide what the host is.
+    assert host.config == {**CONFIG_ON_HOST, "pkg_commit": updated.pkg_commit}
     assert updated.pkg_commit
 
 
-def test_the_package_and_config_land_before_health_runs(control_env: Path) -> None:
+def test_resync_restores_a_config_the_host_has_lost(control_env: Path) -> None:
+    """A pod that restarted with a wiped $HOME: re-shipping the package to it
+    without its config would dispatch the job to a host that owns no cards."""
+    from gpuc.control.bootstrap import resync_package
+
     host = ScriptedHost()
+    resync_package(
+        entry(python="/home/u/.local/python3.12", s3_prefix="s3://mine/gpuc/h"),
+        transport=host,
+        report=lambda _: None,
+    )
+    assert host.config is not None
+    assert host.config["gpus"] == ["GPU-a"]
+    assert host.config["s3_prefix"] == "s3://mine/gpuc/h"
+
+
+def test_the_package_and_config_land_before_health_runs(control_env: Path) -> None:
+    host = ScriptedHost(config=dict(CONFIG_ON_HOST))
     bootstrap_host(entry(), transport=host, report=lambda _: None)
     rsync_root, rsync_dest, files = host.rsyncs[0]
     assert rsync_root.name == "gpu-coordinator"
     assert rsync_dest == "/home/u/.gpuc/pkg"
     assert files is not None and "gpuc/host/dispatcher.py" in files
-    config = json.loads(host.puts["/home/u/.gpuc/config.json"][0])
-    assert config["host"] == "h"
-    assert config["gpus"] == ["GPU-a"]
-    assert host.puts["/home/u/.gpuc/config.json"][1] == 0o644
-    assert host.index_of("put_file /home/u/.gpuc/config.json") < host.index_of("gpuc.host health")
+    assert host.config is not None and host.config["gpus"] == ["GPU-a"]
+    assert host.index_of("config --merge") < host.index_of("gpuc.host health")
     assert host.index_of("gpuc.host health") < host.index_of("spawn_detached_dispatcher")
+
+
+def test_bootstrap_leaves_the_config_the_host_already_has_alone(control_env: Path) -> None:
+    """The point of the split: bootstrapping a host installs things on it, it
+    does not re-decide what the host is. A second control machine, registered
+    with other cards and another mirror, used to replace both in silence."""
+    theirs = {
+        "host": "h",
+        "gpus": ["GPU-b"],
+        "s3_prefix": "s3://theirs/gpuc/h",
+        "retention_days": 30.0,
+        "env": {"HF_HOME": "/big"},
+    }
+    host = ScriptedHost(config=dict(theirs))
+    updated, result = bootstrap_host(
+        entry(gpus=["GPU-a"], s3_prefix="s3://mine/gpuc/h"), transport=host, report=lambda _: None
+    )
+    assert result.warnings == []
+    assert host.config is not None
+    assert {key: host.config[key] for key in theirs} == theirs
+    # And the registry now holds what the host says, not what it was told.
+    assert updated.gpus == ["GPU-b"]
+    assert updated.s3_prefix == "s3://theirs/gpuc/h"
+
+
+def test_bootstrap_restores_a_config_on_a_host_that_has_none(control_env: Path) -> None:
+    """A host whose $HOME was wiped, or one registered before the split: there
+    is nothing on the host to preserve, so the last config seen is written."""
+    host = ScriptedHost()
+    updated, _ = bootstrap_host(
+        entry(s3_prefix="s3://mine/gpuc/h"), transport=host, report=lambda _: None
+    )
+    assert host.config is not None
+    assert host.config["gpus"] == ["GPU-a"]
+    assert host.config["s3_prefix"] == "s3://mine/gpuc/h"
+    assert host.config["host"] == "h"
+    assert updated.gpus == ["GPU-a"]
+
+
+def test_bootstrap_refuses_to_replace_a_config_it_cannot_read(control_env: Path) -> None:
+    """A half-written `config.json` is a file the host is running on. "There is
+    none" is the host saying so, not a parse that failed."""
+
+    class Corrupt(ScriptedHost):
+        def _answer(self, command: str) -> tuple[int, str]:
+            if "config.json" in command and command.startswith("if [ -f"):
+                return 0, '{"host": "h", "gpus": ['
+            return super()._answer(command)
+
+    with pytest.raises(BootstrapError) as caught:
+        bootstrap_host(entry(), transport=Corrupt(), report=lambda _: None)
+    assert "could not be read" in str(caught.value)
+    assert "delete it" in str(caught.value)
+
+
+def test_bootstrap_says_so_when_it_has_no_config_to_give_a_bare_host(
+    control_env: Path,
+) -> None:
+    host = ScriptedHost()
+    _, result = bootstrap_host(host_entry(name="h"), transport=host, report=lambda _: None)
+    (warning,) = result.warnings
+    assert "no config of its own" in warning
+    assert "gpuc host set h --gpus" in warning
 
 
 def test_every_host_command_pins_pythonpath_and_gpuc_home(control_env: Path) -> None:
@@ -275,47 +376,19 @@ def test_bootstrap_records_what_the_cards_are(control_env: Path) -> None:
     assert updated.driver_version == "580.173.02"
 
 
-def test_bootstrap_says_what_it_is_about_to_overwrite(control_env: Path) -> None:
-    """After `gpuc host set` this is the confirmation of what moved. The case
-    it is for is a config another control machine wrote."""
-    host = ScriptedHost(config={"host": "h", "gpus": ["GPU-b"], "s3_prefix": "s3://theirs/gpuc/h"})
-    said: list[str] = []
-    _, result = bootstrap_host(entry(), transport=host, report=said.append)
-    (warning,) = result.warnings
-    assert "overwriting the config on host h" in warning
-    assert "gpus GPU-b -> GPU-a" in warning
-    assert "s3_prefix s3://theirs/gpuc/h -> none" in warning
-    assert any(warning in line for line in said)
-    # It is a warning, not a refusal: the config this machine registered wins.
-    assert json.loads(host.puts["/home/u/.gpuc/config.json"][0])["gpus"] == ["GPU-a"]
-
-
-def test_bootstrap_is_quiet_when_it_changes_nothing_that_matters(control_env: Path) -> None:
-    from gpuc.control import version as version_mod
-
-    host = ScriptedHost(
-        config={
-            "host": "h",
-            "gpus": ["GPU-a"],
-            "pkg_commit": "a" * 40,
-            "created_at": "2020-01-01T00:00:00+00:00",
-        }
-    )
-    _, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert result.warnings == []
-    assert json.loads(host.puts["/home/u/.gpuc/config.json"][0])["pkg_commit"] == (
-        version_mod.local_commit()
-    )
-
-
 def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_env: Path) -> None:
     """`gpuc version` warns by comparing these two, so a bootstrap that wrote
     neither would report every host as up to date forever."""
     from gpuc.control import version as version_mod
 
-    host = ScriptedHost()
-    updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    host = ScriptedHost(
+        config={**CONFIG_ON_HOST, "pkg_commit": "a" * 40, "created_at": "2020-01-01T00:00:00+00:00"}
+    )
+    updated, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    assert result.warnings == []
     assert updated.pkg_commit == version_mod.local_commit()
-    config = json.loads(host.puts["/home/u/.gpuc/config.json"][0])
-    assert config["pkg_commit"] == updated.pkg_commit
-    assert config["schema_version"] == 1
+    assert host.config is not None
+    assert host.config["pkg_commit"] == updated.pkg_commit
+    assert host.config["schema_version"] == 1
+    # Whoever registered the host first still owns when that was.
+    assert host.config["created_at"] == "2020-01-01T00:00:00+00:00"

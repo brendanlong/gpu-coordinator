@@ -9,7 +9,6 @@ import pytest
 from gpuc.control import pods as pods_mod
 from gpuc.control.config import (
     DesiredHost,
-    HostEntry,
     Settings,
     desired_dir,
     registry_transaction,
@@ -17,6 +16,7 @@ from gpuc.control.config import (
     write_desired,
 )
 from gpuc.control.status import HostView, render
+from tests.conftest import host_entry
 from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
 
 FOREIGN = "other-someone-else"
@@ -25,7 +25,7 @@ FOREIGN = "other-someone-else"
 def _register(pod_name: str, pod_id: str, *, desired: bool = True) -> None:
     with registry_transaction() as registry:
         registry.put(
-            HostEntry(
+            host_entry(
                 name=pod_name,
                 kind="runpod",
                 pod_id=pod_id,
@@ -108,7 +108,7 @@ def test_empty_account_renders_a_hint(control_env: Path) -> None:
 
 
 def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
-    entry = HostEntry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", ttl_hours=1.0)
+    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", ttl_hours=1.0)
     view = HostView(
         entry=entry,
         reachable=True,
@@ -121,7 +121,7 @@ def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
 
 
 def test_status_shows_the_pod_even_when_the_host_is_unreachable() -> None:
-    entry = HostEntry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
+    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
     view = HostView(entry=entry, reachable=False, error="ssh timed out", pod=running_pod("n", "p"))
     text = render(view)
     assert "UNREACHABLE" in text and "pod     p RUNNING" in text

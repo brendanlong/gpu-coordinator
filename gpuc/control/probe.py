@@ -107,6 +107,9 @@ fi
 OVERLAY_FS_TYPES = frozenset({"overlay", "overlayfs", "aufs"})
 """Filesystem types that mean "this is a container's throwaway upper layer"."""
 
+PYTHON_FLOOR = (3, 11)
+"""What the on-host package needs, as `bootstrap.PYTHON_FLOOR` spells it."""
+
 
 @dataclass
 class ProbeReport:
@@ -163,6 +166,26 @@ class ProbeReport:
     def gpu_info(self) -> dict[str, GpuInfo]:
         """The `gpus` section as the registry stores it, keyed by UUID."""
         return parse_smi("\n".join(",".join(cells) for cells in self.gpu_rows if len(cells) > 2))
+
+    @property
+    def host_python(self) -> str | None:
+        """An interpreter on this host that could run the on-host package now.
+
+        The `python3` the probe found, when it is new enough. Enough to read a
+        host's config, ask it for its status and change it -- so a host
+        somebody else bootstrapped is usable from here the moment it is
+        registered, rather than after a full bootstrap of our own. Bootstrap
+        replaces it with the interpreter uv picks, which is the one the
+        dispatcher runs under.
+        """
+        parts = self.sections.get("python3", "").split()
+        if len(parts) < 2 or not parts[0].startswith("/"):
+            return None
+        try:
+            version = tuple(int(piece) for piece in parts[1].split(".")[:2])
+        except ValueError:
+            return None
+        return parts[0] if version >= PYTHON_FLOOR else None
 
     @property
     def driver_version(self) -> str | None:
