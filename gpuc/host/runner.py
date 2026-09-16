@@ -304,6 +304,10 @@ class JobRunner:
         read-modify-write with the sync loop as a second writer, and an eta
         recomputed from the same estimate is the same instant anyway."""
         self._terminating = False
+        self._preempting = False
+        """Whether this job is going back in the queue rather than ending here.
+
+        Snapshotted at the top of `_finalize`; see the note there."""
         self._finalizing = False
         """Set for the whole of `_finalize`, which must run exactly once.
 
@@ -669,6 +673,16 @@ class JobRunner:
         """
         if not self.spec.outputs:
             return
+        if self.state.attempt > 1 and paths.outputs_baseline_file(self.job_id).exists():
+            # A preempted job re-runs in the workdir the stopped attempt left,
+            # so re-scanning now would record that attempt's own results as
+            # files "the checkout arrived with" -- and this attempt would then
+            # never upload them, nor count them towards `outputs:`. The
+            # baseline is a fact about the checkout, and the checkout has not
+            # changed. (`gpuc requeue` cannot reach this: it is a new job id,
+            # with a new job dir and no baseline in it.)
+            self._log(log, "outputs baseline: keeping the one taken before the first attempt")
+            return
         found = baseline.capture(self.spec, paths.workdir(self.job_id), self.job_id)
         for line in baseline.describe(found):
             self._log(log, f"outputs baseline: {line}")
@@ -751,6 +765,13 @@ class JobRunner:
         skip_output_sync: bool = False,
     ) -> int:
         self._finalizing = True
+        # Read once, and before the final state write below: from that write
+        # on, a dispatcher starting up sees a finished job with a preempt
+        # marker and is entitled to consume the marker. Asked again afterwards
+        # -- as the workdir and secrets decisions used to -- the answer flips
+        # to "no preempt" and this runner deletes the very workdir and secrets
+        # file the next attempt was about to be dispatched with.
+        self._preempting = queue.is_preempted(self.job_id)
         jobs.update_state(self.job_id, phase="sync")
         if skip_output_sync:
             # The preflight already proved these uploads cannot work, and the
@@ -824,6 +845,11 @@ class JobRunner:
                 "outputs are not confirmed uploaded; keeping this job's secrets file so the "
                 "host's drain can retry the upload before the pod goes away",
             )
+        elif self._preempting:
+            # The next attempt is this same job id, and nothing will deliver
+            # its secrets a second time: `gpuc preempt` never goes near the
+            # control machine that holds them.
+            self._log(log, "preempted; keeping this job's secrets file for the next attempt")
         else:
             paths.job_env_file(self.job_id).unlink(missing_ok=True)
         return exit_code
@@ -844,6 +870,12 @@ class JobRunner:
         leftover disk would be the wrong trade.
         """
         if not cleanup.should_remove(self.spec.cleanup, status):
+            return False
+        if self._preempting:
+            # `cleanup: always` would take the code with it, and the workdir is
+            # the only copy on this host: the control side rsynced it once, at
+            # submit, and the next attempt re-runs from what is there.
+            self._log(log, f"preempted; keeping workdir (cleanup={self.spec.cleanup})")
             return False
         try:
             freed = cleanup.remove_workdir(self.job_id)

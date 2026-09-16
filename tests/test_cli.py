@@ -1299,6 +1299,97 @@ def test_cancel_json_is_the_hosts_own_answer(
     assert (document["job_id"], document["host"]) == ("20260101-000000-aaaaaa", "local")
 
 
+def test_preempt_asks_the_host_and_repeats_what_it_said(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register_host(name="local", gpus=GPU)
+    session = StubSession([{"job_id": "j", "status": "preempting", "priority": 50}])
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
+    capsys.readouterr()
+    assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == 0
+    document = one_document(capsys)
+    assert (document["status"], document["priority"]) == ("preempting", 50)
+    assert (document["job_id"], document["host"]) == ("20260101-000000-aaaaaa", "local")
+    assert session.calls == ["preempt 20260101-000000-aaaaaa"]
+    # The host's refusal is a document, so the exit code must not pre-empt it.
+    assert session.checked == [False]
+
+
+def test_preempt_with_a_priority_passes_it_on_and_re_mirrors_the_spec(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same trap as `reorder`: `requeue` submits what the mirror holds, and
+    would hand the job back at the priority it was pushed off the GPU from."""
+    from gpuc.control.s3index import S3Index
+
+    main(["host", "add", "local", "--gpus", GPU])
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    S3Index("bucket", s3).put_spec_document(
+        "20260101-000000-aaaaaa", {"command": "true", "priority": 50}
+    )
+    session = StubSession([{"job_id": "j", "status": "preempting", "priority": 90}])
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
+    capsys.readouterr()
+    argv = ["preempt", "20260101-000000-aaaaaa", "--priority", "90", "--host", "local", "--json"]
+    assert main(argv) == 0
+    assert session.calls == ["preempt 20260101-000000-aaaaaa --priority 90"]
+    assert S3Index("bucket", s3).get_spec("20260101-000000-aaaaaa")["priority"] == 90
+
+
+def test_preempt_reports_the_hosts_refusal_to_free_the_host_for_nothing(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host owns this judgement -- it is the only side that knows what is
+    in its queue -- so the control side's job is to carry the reason back."""
+    register_host(name="local", gpus=GPU)
+    refusal = "nothing else is queued on this host, so preempting job j would stop it"
+    monkeypatch.setattr(
+        "gpuc.control.actions.open_session",
+        lambda *a, **k: as_session(StubSession([{"job_id": "j", "error": refusal}])),
+    )
+    capsys.readouterr()
+    assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_ERROR
+    assert "nothing else is queued" in capsys.readouterr().err
+
+
+def test_preempt_reports_the_hosts_refusal(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register_host(name="local", gpus=GPU)
+    payload: dict[str, object] = {"job_id": "j", "error": "job j is queued, not running"}
+    monkeypatch.setattr(
+        "gpuc.control.actions.open_session", lambda *a, **k: as_session(StubSession([payload]))
+    )
+    capsys.readouterr()
+    assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_ERROR
+    assert "queued, not running" in capsys.readouterr().err
+
+
+def test_a_host_too_old_to_know_preempt_is_never_reported_as_success(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise the caller frees GPUs that are still busy and submits on top."""
+    register_host(name="local", gpus=GPU)
+    monkeypatch.setattr(
+        "gpuc.control.actions.open_session",
+        lambda *a, **k: as_session(StubSession([{"job_id": "j"}])),
+    )
+    capsys.readouterr()
+    assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_ERROR
+    assert "did not say what it did" in capsys.readouterr().err
+
+
+def test_preempt_refuses_a_priority_outside_the_range(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    register_host(name="local", gpus=GPU)
+    argv = ["preempt", "20260101-000000-aaaaaa", "--priority", "100", "--host", "local"]
+    assert main(argv) == EXIT_USAGE
+    assert "0-99" in capsys.readouterr().err
+
+
 def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

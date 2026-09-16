@@ -262,6 +262,46 @@ the host and in its S3 mirror — so `gpuc requeue` carries the move — as well
 in the queue marker, so `gpuc status` can still say what priority a job was
 dispatched at once the marker is gone.
 
+**`gpuc preempt <job-id>`** — stop a *running* job and queue it again, so
+something more important can have its GPUs. Its runner stops it and syncs
+whatever it produced, exactly as a cancel does, and then the host queues the
+same job id again as its next attempt. Nothing is re-synced from here and the
+job never leaves its host; `gpuc requeue` is the command for a finished job, or
+for another host.
+
+It **starts over**: the attempt that was stopped keeps nothing but its log, and
+its `setup:` and `command:` run again from the top. What it does *not* get is a
+fresh workdir — that directory was rsynced from your checkout once, at submit,
+and it is still exactly as the stopped attempt left it, part-written
+checkpoints and all. So preempt a job that tolerates being re-run over its own
+leftovers, and not one whose `setup:` would trip over them. (The `outputs:`
+baseline is not re-taken, so anything the stopped attempt produced still counts
+as this job's output rather than as a file the checkout came with.)
+
+It comes back at its own priority unless `--priority N` changes it (recorded in
+the spec and its S3 mirror, like `gpuc reorder`). The job you are making room
+for takes the cards next if it is queued at a **lower** number — the ordinary
+case, and no flag is needed for it. At the **same** priority it does not:
+dispatch order is `<priority>-<job id>`, and the preempted job was submitted
+first, so its id sorts ahead and it takes its own cards straight back.
+
+**It only works when something can take its place.** Preempting costs the job
+everything it has done, so a preempt that would just re-run the same job is
+refused (exit 1) rather than quietly doing that: nothing else queued, nothing
+queued that sorts ahead of where this job would land (pass `--priority` above
+that job, and the refusal says which one), or a host that is paused or
+draining and so is dispatching nothing at all. **Queue the job you want to run
+first, then preempt.** Queued and finished jobs are refused too: `gpuc reorder`
+moves a queued one, `gpuc requeue` re-runs a finished one.
+
+The host decides the re-queue when the attempt actually stops, and there are
+four cases where it does not happen — the job finished, or failed for a reason
+of its own, in the seconds before the kill reached it (a re-run would be a
+retry nobody asked for); it was cancelled while it was stopping; its workdir is
+gone; or the host is draining or past its `--ttl-hours` and is about to stop
+existing. In all four the job stays finished, with `gpuc requeue` as the way to
+re-run it, and the dispatcher log says which case it was.
+
 **`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or
 running job's `estimated_runtime_min`; see [job length
 estimates](#job-length-estimates).
@@ -271,9 +311,11 @@ it again as attempt+1, with the workdir re-synced from your *current* directory.
 It therefore **needs `s3_bucket`** (without it, submit the job file again) and
 cannot rebuild a `--no-git` workdir. `--host H` sends it somewhere else;
 `--runpod` provisions for it; with neither, it goes back to the host the local
-index says it ran on.
+index says it ran on. It is the other half of the pair with `gpuc preempt`: a
+new job id from the mirror, on whichever host you name, for a job that has
+already finished.
 
-`--host` is optional on `logs`, `cancel`, `reorder`, `estimate` and `requeue`:
+`--host` is optional on `logs`, `cancel`, `preempt`, `reorder`, `estimate` and `requeue`:
 the local job index is tried first, then every registered host is asked whether it knows the
 id. An unknown job or host is exit 4.
 
@@ -291,14 +333,14 @@ cache and never touches a host, so what a host is *running* is `gpuc status` (se
 [the same host from two machines](setup.md#the-same-host-from-two-machines)).
 
 **`gpuc web serve`** — the [web dashboard](#the-web-dashboard): the same
-status, host list and config in a browser, with cancel, re-prioritise, estimate
-and a log tail per job.
+status, host list and config in a browser, with cancel, preempt, re-prioritise,
+estimate and a log tail per job.
 
 ## The web dashboard
 
 `gpuc web serve` is `gpuc status`, `gpuc host list` and `gpuc config show` on
 one page, refreshed every 15 seconds, with a button for each of `gpuc cancel`,
-`gpuc reorder` and `gpuc estimate` and a **Logs** panel that tails
+`gpuc preempt`, `gpuc reorder` and `gpuc estimate` and a **Logs** panel that tails
 `gpuc logs` (tick *follow* to keep tailing). Every job also links to where its
 `outputs:` went — the S3 console for an `s3:` output, the repo tree for an `hf:`
 one — to its W&B run when the job's `env` names `WANDB_ENTITY`,
@@ -335,6 +377,7 @@ held:
 | `GET /api/jobs/<id>/logs?lines=N&host=H` | `gpuc logs --json` (no `-f`; the page re-fetches the tail instead) |
 | `POST /api/jobs/<id>/cancel` `{host?}` | `gpuc cancel --json` |
 | `POST /api/jobs/<id>/reorder` `{priority, host?}` | `gpuc reorder --json` |
+| `POST /api/jobs/<id>/preempt` `{priority?, host?}` | `gpuc preempt --json` |
 | `POST /api/jobs/<id>/estimate` `{minutes}` or `{clear: true}` | `gpuc estimate --json` |
 
 A failure is the same `{schema_version, error, exit_code}` document the CLI
@@ -467,6 +510,16 @@ job's group, after 30 s it SIGTERMs the runner itself, after 45 s it SIGKILLs
 the runner's group. It never signals the runner's group during the launch
 window, when the runner is the only member of it.
 
+`gpuc preempt` uses the same machinery with one extra marker: the runner stops
+the job and records `failed: preempted` after its final sync, and the dispatcher
+then writes the job's state back to `queued` as the next attempt and puts a
+queue marker back. So a preempted job is briefly visible as `failed:
+preempted` — that is the record of the attempt that was stopped, and anything
+polling `gpuc status --json` will see it for a second or two before the job
+reads as `queued` again. The workdir and the job's secrets file are kept
+whatever `cleanup:` says, because the next attempt is that same job id and
+nothing delivers either a second time.
+
 The low-util watchdog samples the assigned cards every 30 s **during phase
 `main` only**, so downloads and compiles in `setup` can never look idle. Once
 `grace_min` minutes of `main` have passed, a rolling mean below `floor_pct` over
@@ -492,6 +545,7 @@ Every `failed: <reason>`:
 | `low-util-pause` | the host paused after two low-util failures and asked this job to stop so it could drain |
 | `timeout` | `max_runtime_min` elapsed |
 | `ttl` | the host's opt-in `--ttl-hours` cap elapsed |
+| `preempted` | `gpuc preempt` stopped this attempt; the job is queued again as the next one, and this is the record of the attempt that was stopped |
 | `terminated` | the runner itself was signalled (and the job was not cancelled) |
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`, and any other reason gains `+sync` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. Appends `+no-outputs` the same way |
@@ -636,6 +690,7 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued. The queue fields are the host's answer a moment *after* the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, `starts_unknown` says why there is no start time (a paused or draining host, a job ahead that estimated nothing, a job that asks for more cards than the host has) and is null when there is one, and every one of them is null when the host could not be asked again — never a reason to think the job was not queued |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
+| `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |

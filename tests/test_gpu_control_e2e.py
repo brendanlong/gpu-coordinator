@@ -79,10 +79,11 @@ def gpu_host(control_env: Path, tmp_path: Path) -> Iterator[Path]:
     _stop_dispatcher(home)
 
 
-def gpu_job(command: str, name: str = "gpu-e2e") -> str:
+def gpu_job(command: str, name: str = "gpu-e2e", priority: int = 50) -> str:
     return (
         f"name: {name}\n"
         f"command: {command}\n"
+        f"priority: {priority}\n"
         "gpus: 1\n"
         "setup: uv sync --frozen --quiet\n"
         "low_util:\n  enabled: false\n"
@@ -161,3 +162,39 @@ def test_queued_jobs_reorder_and_cancel_while_the_card_is_busy(
         assert main(["cancel", job_id]) == 0
         wait_until(lambda job_id=job_id: finished(home, job_id), 120, f"{job_id} to be cancelled")
         assert state_of(home, job_id)["status"] == "cancelled", log_tail(home, job_id)
+
+
+def test_preempting_a_gpu_job_hands_the_card_to_the_one_waiting(
+    gpu_host: Path, torch_workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """What `gpuc preempt` is for, with a real card in the middle of it: the
+    running job lets go, the job that was waiting gets the GPU, and the one
+    that let go is queued again under its own id with its workdir intact."""
+    home = gpu_host
+    hog = submit(torch_workdir, gpu_job("sleep 600", name="hog"), "hog.yaml")
+    wait_for_main_phase(home, hog)
+    waiting = submit(
+        torch_workdir, gpu_job("sleep 600", name="waiting", priority=10), "waiting.yaml"
+    )
+    wait_until(
+        lambda: state_of(home, waiting).get("status") == "queued", 60, "the second job to queue"
+    )
+    capsys.readouterr()
+
+    assert main(["preempt", hog]) == 0
+    assert "run from the start" in capsys.readouterr().out
+    wait_until(
+        lambda: state_of(home, waiting).get("status") == "running",
+        300,
+        "the waiting job to get the card",
+    )
+    stopped = state_of(home, hog)
+    assert (stopped["status"], stopped["attempt"]) == ("queued", 2), log_tail(home, hog)
+    assert stopped["gpus"] == []
+    # The workdir the next attempt re-runs from, and its venv, are still here.
+    assert (home / "jobs" / hog / "workdir" / "pyproject.toml").exists()
+    assert "queued again as attempt 2" in log_tail(home, hog, lines=200)
+
+    for job_id in (hog, waiting):
+        assert main(["cancel", job_id]) == 0
+        wait_until(lambda job_id=job_id: finished(home, job_id), 120, f"{job_id} to be cancelled")

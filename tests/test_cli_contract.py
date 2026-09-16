@@ -608,6 +608,7 @@ JSON_COMMANDS = [
     ["requeue"],
     ["logs"],
     ["cancel"],
+    ["preempt"],
     ["reorder"],
     ["estimate"],
     ["pods"],

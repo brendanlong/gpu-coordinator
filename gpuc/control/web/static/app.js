@@ -185,6 +185,25 @@ function cancelButton(host, job) {
   }, "Cancel");
 }
 
+function preemptButton(host, job) {
+  return el("button", {
+    type: "button",
+    onclick: async (event) => {
+      if (!window.confirm(`Stop ${job.name || job.job_id} on ${host.name} and queue it again? It re-runs from the start.`)) return;
+      event.target.disabled = true;
+      try {
+        const result = await post(`/api/jobs/${encodeURIComponent(job.job_id)}/preempt`, { host: host.name });
+        for (const warning of result.warnings || []) notify(warning, "warn");
+        notify(`job ${job.job_id} on ${result.host}: ${result.status}; it will be queued again at priority ${result.priority}`);
+        await load();
+      } catch (err) {
+        notify(err.message, "bad");
+        event.target.disabled = false;
+      }
+    },
+  }, "Preempt");
+}
+
 function priorityControl(host, job) {
   const input = el("input", { type: "number", min: 0, max: 99, value: job.priority ?? 50, "aria-label": "priority" });
   const button = el("button", {
@@ -284,7 +303,7 @@ function runningTable(host) {
     el("td", { class: "mono" }, gpuLabels(host, job)),
     el("td", {}, fmtEta(job), job.progress_error ? el("span", { class: "muted", title: job.progress_error }, " (progress error)") : null),
     el("td", {}, links(job)),
-    el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), cancelButton(host, job)),
+    el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), preemptButton(host, job), cancelButton(host, job)),
   ));
   return el("div", {},
     el("div", { class: "section-label" }, "running"),

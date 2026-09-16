@@ -138,6 +138,15 @@ gpuc ssh <host|jobid> --print    # just print the ssh line, to copy
 gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
 gpuc reorder <jobid> --priority 10          # queued jobs only; prints the new position and
                                  # when the job is now expected to start
+gpuc preempt <jobid> --priority 60          # running jobs only: stop it and queue it again as
+                                 # attempt+1 under the same id, so a more important job gets the
+                                 # GPUs. It RE-RUNS FROM THE START, in the same workdir the
+                                 # stopped attempt left behind, so only preempt a job that
+                                 # tolerates that. QUEUE THE OTHER JOB FIRST: this is refused
+                                 # (exit 1) unless something already waiting would be dispatched
+                                 # ahead of the preempted job. It keeps its own priority, and at
+                                 # the SAME priority it wins the tie (older job id sorts first),
+                                 # so --priority is how you put it behind the job that is waiting
 gpuc estimate <jobid> --minutes 150
                                  # set estimated_runtime_min on a queued or running job
                                  # (--clear removes it); a running job picks it up within a minute
@@ -151,7 +160,8 @@ A job's status is its exit code. `failed: <reason>` reasons you will see:
 `gpu-preflight` (no working CUDA in the venv), `sync-preflight` (aws/hf or
 credentials missing), `low-util` (idle GPU), `low-util-pause` (the host paused
 after two low-util failures and stopped this job so it could drain), `timeout`
-(`max_runtime_min`), `ttl` (the host's opt-in lifetime cap ran out), `sync`
+(`max_runtime_min`), `ttl` (the host's opt-in lifetime cap ran out), `preempted`
+(`gpuc preempt` stopped that attempt; the job is queued again as the next one), `sync`
 (final upload failed; results exist only on the host), `no-outputs` (the output
 path was never written), `terminated`, `runner-died`.
 
@@ -204,6 +214,7 @@ scraping any of the text output.
 | `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a paused host, a job ahead that estimated nothing — and is null when there is one |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `cancel` | `{job_id, host, status}` |
+| `preempt` | `{job_id, host, status, priority, warnings[]}`; `status` is `preempting` and `priority` is what it will be queued again at |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same queue fields as `submit`, so you can see the move take effect. A `warnings` entry means the mirrored spec kept the old priority, so a `requeue` would not carry the move |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}` |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |

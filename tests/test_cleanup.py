@@ -762,3 +762,49 @@ def test_human_bytes_reads_like_du() -> None:
     assert cleanup.human_bytes(0) == "0 B"
     assert cleanup.human_bytes(2048) == "2.0 KiB"
     assert cleanup.human_bytes(7 * (1 << 30)) == "7.0 GiB"
+
+
+def test_a_preempted_job_keeps_its_workdir_whatever_its_policy_says(gpuc_home: Path) -> None:
+    """`cleanup: always` would delete the code the next attempt re-runs: the
+    control side rsynced that workdir once, at submit, and `gpuc preempt` never
+    goes near the machine it came from."""
+    job_id = prepare(command="sleep 30", cleanup="always")
+    (paths.workdir(job_id) / "train.py").write_text("print('hi')\n")
+    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
+    queue.preempt(job_id)
+
+    assert runner.run_job(job_id, deps()) != 0
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "preempted")
+    assert (paths.workdir(job_id) / "train.py").exists()
+    assert state.workdir_removed is False
+    assert "preempted; keeping workdir (cleanup=always)" in log_of(job_id)
+
+
+def test_the_workdir_survives_the_dispatcher_taking_the_marker_mid_finalize(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker is a request, not a latch. A dispatcher starting up sees a
+    finished job with a preempt marker and is entitled to consume it the
+    instant the final state lands -- and the runner is still running, two
+    decisions away from deleting the workdir the next attempt was about to be
+    dispatched with."""
+    job_id = prepare(command="sleep 30", cleanup="always")
+    (paths.workdir(job_id) / "train.py").write_text("print('hi')\n")
+    paths.job_env_file(job_id).write_text('HF_TOKEN="hf_abc"\n')
+    queue.enqueue(make_spec(priority=1))
+    queue.preempt(job_id)
+
+    real_update = jobs.update_state
+
+    def take_the_marker_when_the_state_lands(job_id: str, **fields: object) -> jobs.JobState:
+        state = real_update(job_id, **fields)
+        if fields.get("status") == "failed":
+            paths.preempt_file(job_id).unlink(missing_ok=True)
+        return state
+
+    monkeypatch.setattr(runner.jobs, "update_state", take_the_marker_when_the_state_lands)
+    assert runner.run_job(job_id, deps()) != 0
+
+    assert (paths.workdir(job_id) / "train.py").exists()
+    assert paths.job_env_file(job_id).exists()

@@ -268,6 +268,28 @@ def test_a_running_job_can_be_cancelled(
     assert state_of(home, job_id)["status"] == "cancelled"
 
 
+def test_preempt_refuses_when_it_would_only_re_run_the_same_job(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Nothing is waiting, so this would stop the job and start it again --
+    losing everything it had done, to no end. (Where it *is* worth doing needs
+    a card to contend over: see the GPU end-to-end module.)"""
+    home = bootstrapped_home
+    job_id = submit(workdir, "name: lonely\ncommand: sleep 300\ngpus: 0\n")
+    wait_until(
+        lambda: state_of(home, job_id).get("status") == "running", 60, "the job to start running"
+    )
+    capsys.readouterr()
+
+    assert main(["preempt", job_id]) == 1
+    assert "nothing else is queued" in capsys.readouterr().err
+    assert state_of(home, job_id)["status"] == "running"
+    assert not (home / "jobs" / job_id / "preempt").exists()
+
+    assert main(["cancel", job_id]) == 0
+    wait_until(lambda: finished(home, job_id), 120, "the job to be cancelled")
+
+
 def test_estimate_reaches_a_running_job_and_status_and_json_agree(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

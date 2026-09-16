@@ -42,6 +42,7 @@ from gpuc.control.actions import (
     hosts_for,
     make_provider,
     named_registry,
+    preempt_job,
     provider_for_status,
     queue_placement,
     read_log,
@@ -1141,6 +1142,33 @@ def cmd_reorder(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_preempt(args: argparse.Namespace) -> int:
+    """Stop a running job and put it back in its host's queue.
+
+    The text output says which priority it comes back at, because that is what
+    decides which job runs next: dispatch order is `<priority>-<job id>`, so a
+    job waiting at a lower number takes the cards, and one waiting at the
+    *same* priority does not -- the preempted job was submitted first, so its
+    id sorts ahead and it takes its own cards straight back. The host refuses
+    outright when nothing at all would go first, rather than throw away what
+    the job has done to re-run the same job.
+    """
+    document = preempt_job(args.job_id, args.priority, args.host, load_settings())
+    for text in document["warnings"]:
+        print(f"WARNING: {text}", file=sys.stderr)
+    if args.json:
+        jsonout.emit(document)
+        return EXIT_OK
+    priority = document["priority"]
+    at = f" at priority {priority}" if priority is not None else ""
+    print(
+        f"job {args.job_id} on host {document['host']}: {document['status']}\n"
+        f"  its runner is stopping it and syncing what it produced; the host queues it "
+        f"again{at}, to run from the start"
+    )
+    return EXIT_OK
+
+
 def cmd_estimate(args: argparse.Namespace) -> int:
     """Add, change or clear a job's `estimated_runtime_min` after submitting it.
 
@@ -1689,6 +1717,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_json_flag(reorder)
     reorder.set_defaults(func=cmd_reorder)
+
+    preempt = sub.add_parser(
+        "preempt",
+        help="stop a running job and queue it again, to run from the start",
+        description="Frees a running job's GPUs for something more important without "
+        "losing the job: its runner stops it and syncs whatever it produced, and the host "
+        "queues it again under the same job id as its next attempt. It re-runs from the "
+        "start, in the workdir the stopped attempt left behind -- nothing is re-synced from "
+        "here -- so preempt a job that tolerates being re-run over its own leftovers. "
+        "Queue the job you want to run FIRST: this is refused unless something already "
+        "waiting would be dispatched ahead of the preempted job, since otherwise it would "
+        "only stop it and start it again. Use `gpuc requeue` to re-run a finished job, or "
+        "to run one on another host.",
+    )
+    preempt.add_argument("job_id")
+    preempt.add_argument(
+        "--priority",
+        type=int,
+        metavar="N",
+        help="0-99; queue it again at this priority instead of its own (lower dispatches "
+        "first, so a higher number keeps it out of the way)",
+    )
+    preempt.add_argument(
+        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+    )
+    add_json_flag(preempt)
+    preempt.set_defaults(func=cmd_preempt)
 
     estimate = sub.add_parser(
         "estimate",

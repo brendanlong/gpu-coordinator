@@ -799,3 +799,15 @@ def test_a_sigterm_during_the_final_sync_does_not_rerun_finalize(
     state = jobs.read_state(job_id)
     assert (state.status, state.reason, state.exit_code) == ("succeeded", None, 0)
     assert calls == ["final"]
+
+
+def test_a_preempted_job_keeps_its_secrets_for_the_next_attempt(gpuc_home: Path) -> None:
+    """Nothing delivers them a second time: the next attempt is this same job
+    id, dispatched by the host, and the secrets only ever arrive at submit."""
+    job_id = prepare(command="sleep 30")
+    paths.job_env_file(job_id).write_text('HF_TOKEN="hf_abc"\n')
+    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
+    queue.preempt(job_id)
+    assert runner.run_job(job_id, deps()) != 0
+    assert paths.job_env_file(job_id).exists()
+    assert "keeping this job's secrets file for the next attempt" in log_of(job_id)

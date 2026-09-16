@@ -117,6 +117,16 @@ def kill_file(job_id: str) -> Path:
     return job_dir(job_id) / "kill"
 
 
+def preempt_file(job_id: str) -> Path:
+    """A request to put this job back in the queue once its runner has stopped.
+
+    Written beside the `kill` marker by `queue.preempt`, and acted on by the
+    dispatcher when the job ends: the runner still owns the kill and the final
+    sync, and the queue is the dispatcher's.
+    """
+    return job_dir(job_id) / "preempt"
+
+
 def lock_file() -> Path:
     return home() / "dispatcher.lock"
 
