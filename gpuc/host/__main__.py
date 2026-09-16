@@ -184,6 +184,36 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preempt(args: argparse.Namespace) -> int:
+    """Stop a running job and queue it again, to run from the start.
+
+    The error document rather than a traceback, like `estimate`: which job this
+    host will not preempt, and why, is the whole answer the control side needs.
+    """
+    try:
+        status = queue.preempt(args.job_id, args.priority)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
+        return 1
+    spec = _spec(args.job_id)
+    print(
+        json.dumps(
+            {
+                "job_id": args.job_id,
+                "status": status,
+                # What it will be queued at once its runner stops, which is the
+                # spec's priority whether or not this call changed it.
+                "priority": spec.priority if spec else None,
+                # The dispatcher is what puts the job back, so make sure there
+                # is one: on a host whose dispatcher died, the kill would land
+                # and nothing would ever queue the job again.
+                "dispatcher_pid": dispatcher.spawn_detached_dispatcher(),
+            }
+        )
+    )
+    return 0
+
+
 def cmd_reorder(args: argparse.Namespace) -> int:
     moved = queue.reorder(args.job_id, args.priority)
     print(json.dumps({"job_id": args.job_id, "reordered": moved}))
@@ -361,6 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel", help="cancel a queued or running job")
     cancel.add_argument("job_id")
     cancel.set_defaults(func=cmd_cancel)
+
+    preempt = sub.add_parser("preempt", help="stop a running job and queue it again")
+    preempt.add_argument("job_id")
+    preempt.add_argument(
+        "--priority", type=int, help="queue it again at this priority instead of its own"
+    )
+    preempt.set_defaults(func=cmd_preempt)
 
     reorder = sub.add_parser("reorder", help="change a queued job's priority")
     reorder.add_argument("job_id")

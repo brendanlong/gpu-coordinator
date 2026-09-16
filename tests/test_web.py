@@ -428,6 +428,18 @@ def test_cancel_is_the_cancel_command(logged_in: Client, stub: StubSession) -> N
     assert stub.commands == [f"cancel {RUNNING_JOB}"]
 
 
+def test_preempt_is_the_preempt_command(logged_in: Client, stub: StubSession) -> None:
+    stub.answers.append({"job_id": RUNNING_JOB, "status": "preempting", "priority": 50})
+    status, document = logged_in.post_json(f"/api/jobs/{RUNNING_JOB}/preempt", {"host": "gpubox"})
+    assert status == 200
+    assert (document["status"], document["priority"]) == ("preempting", 50)
+    assert stub.commands == [f"preempt {RUNNING_JOB}"]
+    status, document = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/preempt", {"host": "gpubox", "priority": "7"}
+    )
+    assert status == 400 and "0-99" in document["error"]
+
+
 def test_reorder_is_the_reorder_command_and_checks_the_range(
     logged_in: Client, stub: StubSession
 ) -> None:

@@ -373,6 +373,56 @@ def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings
     }
 
 
+def preempt_job(
+    job_id: str, priority: int | None, host: str | None, settings: Settings
+) -> dict[str, Any]:
+    """Stop a running job and put it back in its host's queue.
+
+    The job keeps its id and re-runs from the start as its next attempt, from
+    the workdir that is already on the host -- nothing is re-synced from here,
+    and the job never leaves the host it was submitted to. `gpuc requeue` is
+    the other half of that pair: a fresh job id, from the mirrored spec, on
+    whichever host you name.
+    """
+    if priority is not None and not 0 <= priority <= 99:
+        raise UsageError(f"priority must be 0-99 (lower dispatches first), got {priority}")
+    entry, _ = find_job_host(job_id, named_registry(), host)
+    session = open_session(entry, settings)
+    request = f"preempt {shlex.quote(job_id)}"
+    if priority is not None:
+        request += f" --priority {priority}"
+    # `check=False`: a refusal -- a finished job, one that is only queued -- is
+    # the host's document, and raising on the exit code would throw away the
+    # reason it gave.
+    payload = session.host_json(request, check=False)
+    document = payload if isinstance(payload, dict) else {}
+    if document.get("error"):
+        raise CliError(f"host {entry.name} did not preempt {job_id}: {document['error']}")
+    status = document.get("status")
+    if not status:
+        # A host too old to know the command, or one that answered with
+        # something else entirely: either way nothing was preempted, and
+        # reporting success would leave the job running under a caller who
+        # thinks its GPUs are free.
+        raise CliError(
+            f"host {entry.name} did not say what it did with {job_id}: {json.dumps(payload)[:200]}"
+        )
+    warnings = []
+    if priority is not None:
+        # The same reason `reorder` re-mirrors: `requeue` submits what S3
+        # holds, and would otherwise hand the job back at its old priority.
+        warning = mirror_spec_field(job_id, "priority", priority, settings, what="priority")
+        if warning:
+            warnings.append(warning)
+    return {
+        "job_id": job_id,
+        "host": entry.name,
+        "status": status,
+        "priority": document.get("priority"),
+        "warnings": warnings,
+    }
+
+
 def queue_placement(
     entry: HostEntry, job_id: str, settings: Settings, *, session: HostSession | None = None
 ) -> dict[str, Any]:

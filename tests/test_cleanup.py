@@ -762,3 +762,19 @@ def test_human_bytes_reads_like_du() -> None:
     assert cleanup.human_bytes(0) == "0 B"
     assert cleanup.human_bytes(2048) == "2.0 KiB"
     assert cleanup.human_bytes(7 * (1 << 30)) == "7.0 GiB"
+
+
+def test_a_preempted_job_keeps_its_workdir_whatever_its_policy_says(gpuc_home: Path) -> None:
+    """`cleanup: always` would delete the code the next attempt re-runs: the
+    control side rsynced that workdir once, at submit, and `gpuc preempt` never
+    goes near the machine it came from."""
+    job_id = prepare(command="sleep 30", cleanup="always")
+    (paths.workdir(job_id) / "train.py").write_text("print('hi')\n")
+    queue.preempt(job_id)
+
+    assert runner.run_job(job_id, deps()) != 0
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "preempted")
+    assert (paths.workdir(job_id) / "train.py").exists()
+    assert state.workdir_removed is False
+    assert "preempted; keeping workdir (cleanup=always)" in log_of(job_id)

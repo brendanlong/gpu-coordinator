@@ -824,9 +824,18 @@ class JobRunner:
                 "outputs are not confirmed uploaded; keeping this job's secrets file so the "
                 "host's drain can retry the upload before the pod goes away",
             )
+        elif self._preempted():
+            # The next attempt is this same job id, and nothing will deliver
+            # its secrets a second time: `gpuc preempt` never goes near the
+            # control machine that holds them.
+            self._log(log, "preempted; keeping this job's secrets file for the next attempt")
         else:
             paths.job_env_file(self.job_id).unlink(missing_ok=True)
         return exit_code
+
+    def _preempted(self) -> bool:
+        """Is this job going back in the queue rather than ending here?"""
+        return queue.is_preempted(self.job_id)
 
     def _keep_secrets_for_drain(self, sync_loop: sync.SyncLoop) -> bool:
         if not (self.config.ephemeral and self.spec.outputs and not sync_loop.outputs_synced_at):
@@ -844,6 +853,12 @@ class JobRunner:
         leftover disk would be the wrong trade.
         """
         if not cleanup.should_remove(self.spec.cleanup, status):
+            return False
+        if self._preempted():
+            # `cleanup: always` would take the code with it, and the workdir is
+            # the only copy on this host: the control side rsynced it once, at
+            # submit, and the next attempt re-runs from what is there.
+            self._log(log, f"preempted; keeping workdir (cleanup={self.spec.cleanup})")
             return False
         try:
             freed = cleanup.remove_workdir(self.job_id)

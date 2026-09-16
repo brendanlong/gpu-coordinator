@@ -42,6 +42,7 @@ from gpuc.control.actions import (
     exit_code_for,
     failure_message,
     hosts_document,
+    preempt_job,
     read_log,
     reorder_job,
     status_document,
@@ -182,6 +183,7 @@ class Dashboard:
             ("GET", re.compile(r"^/api/jobs/([^/]+)/logs$"), Dashboard.api_logs, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/cancel$"), Dashboard.api_cancel, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/reorder$"), Dashboard.api_reorder, True),
+            ("POST", re.compile(r"^/api/jobs/([^/]+)/preempt$"), Dashboard.api_preempt, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/estimate$"), Dashboard.api_estimate, True),
         ]
 
@@ -306,6 +308,14 @@ class Dashboard:
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise UsageError("reorder needs an integer `priority` (0-99)")
         return Response.json(reorder_job(job_id, priority, host_of(body), self.load_settings()))
+
+    def api_preempt(self, request: Request) -> Response:
+        job_id = job_id_of(request)
+        body = request.json()
+        priority = body.get("priority")
+        if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
+            raise UsageError("preempt takes an integer `priority` (0-99), or none at all")
+        return Response.json(preempt_job(job_id, priority, host_of(body), self.load_settings()))
 
     def api_estimate(self, request: Request) -> Response:
         job_id = job_id_of(request)

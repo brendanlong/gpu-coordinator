@@ -428,6 +428,10 @@ class Dispatcher:
             except RuntimeError as exc:
                 self.log(f"job {job_id} has an unreadable state.json ({exc}); skipping")
                 continue
+            if state.finished:
+                # Its runner stopped it and nothing was left to put it back.
+                self.requeue_if_preempted(job_id)
+                continue
             if state.status != "running" or job_id in self.running:
                 continue
             # A recorded pid means nothing across a reboot, and little after a
@@ -505,11 +509,10 @@ class Dispatcher:
             self._kill_sent.pop(job_id, None)
             self._kill_escalated.discard(job_id)
             try:
-                state = jobs.read_state(job_id)
+                state: jobs.JobState | None = jobs.read_state(job_id)
             except RuntimeError:
-                self._mark_runner_died(job_id)
-                continue
-            if not state.finished:
+                state = None
+            if state is None or not state.finished:
                 self._mark_runner_died(job_id)
             else:
                 self.log(
@@ -517,6 +520,32 @@ class Dispatcher:
                     f"{f' ({state.reason})' if state.reason else ''} "
                     f"exit={state.exit_code}"
                 )
+            self.requeue_if_preempted(job_id)
+
+    def requeue_if_preempted(self, job_id: str) -> None:
+        """Put a job `gpuc preempt` stopped back in the queue.
+
+        Here rather than in the runner: the queue is the dispatcher's, and a
+        job whose runner died on the way out must still come back.
+        """
+        if not queue.is_preempted(job_id):
+            return
+        try:
+            attempt = queue.requeue_preempted(job_id)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.log(
+                f"job {job_id} was preempted but could not be queued again ({exc}); "
+                f"it stays finished"
+            )
+            return
+        if attempt is None:
+            self.log(
+                f"job {job_id} was preempted but is not going back in the queue: it "
+                f"{self._state_or_empty(job_id).status} before the kill reached it, it was "
+                f"cancelled while it stopped, or its workdir is gone"
+            )
+            return
+        self.log(f"job {job_id} was preempted; queued again as attempt {attempt}")
 
     def handle_cancels(self) -> None:
         """Escalate a cancel, without ever killing the runner's own group during
@@ -566,6 +595,11 @@ class Dispatcher:
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
         for job_id, entry in list(self.running.items()):
+            if queue.kill_reason(job_id):
+                # A marker somebody else wrote -- `gpuc preempt`, or a
+                # dispatcher we took over from -- needs a clock of its own, or
+                # a runner that never acts on it is never escalated either.
+                self._kill_sent.setdefault(job_id, now)
             sent = self._kill_sent.get(job_id)
             # A cancelled job already has an escalation, and one owner is enough.
             if sent is None or queue.is_cancelled(job_id):

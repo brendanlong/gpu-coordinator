@@ -125,3 +125,101 @@ def kill_reason(job_id: str) -> str | None:
         return paths.kill_file(job_id).read_text().strip() or None
     except OSError:
         return None
+
+
+PREEMPTED = "preempted"
+"""The kill reason of a job stopped so that something else can have its GPUs.
+
+Its own reason, like `ttl` and `low-util-pause` are: a preempted job is not a
+failure of the job, and the log of the attempt that was stopped should say
+which of the three ended it.
+"""
+
+
+def preempt(job_id: str, priority: int | None = None) -> str:
+    """Stop a running job and queue it again, from the start.
+
+    Two steps, because the runner owns the kill: the marker says the job is
+    coming back, and the kill request stops it. The dispatcher re-queues it
+    once its runner has stopped it and synced whatever it had produced -- see
+    `requeue_preempted`, which is also what decides the new attempt number.
+
+    The marker is written first. A runner that stops between the two writes
+    would otherwise end the job for good, with nothing left saying it was
+    meant to come back.
+    """
+    if not paths.job_dir(job_id).is_dir():
+        raise FileNotFoundError(f"no such job: {job_id}")
+    state = jobs.read_state(job_id)
+    if state.finished:
+        raise ValueError(
+            f"job {job_id} has already {state.status}, so there is nothing to preempt; "
+            f"`gpuc requeue {job_id}` submits it again"
+        )
+    if state.status != "running":
+        raise ValueError(
+            f"job {job_id} is {state.status}, not running, so it is already waiting its turn; "
+            f"`gpuc reorder {job_id} --priority N` moves it"
+        )
+    if is_cancelled(job_id):
+        raise ValueError(f"job {job_id} is already being cancelled, so it is not coming back")
+    if priority is not None:
+        # Before the kill, and in the spec rather than a marker: the spec is
+        # what `requeue_preempted` queues the job at, and the only copy of a
+        # running job's priority. `reorder` writes it the same way.
+        jobs.update_spec(job_id, priority=priority)
+    paths.preempt_file(job_id).touch()
+    request_kill(job_id, PREEMPTED)
+    return "preempting"
+
+
+def is_preempted(job_id: str) -> bool:
+    return paths.preempt_file(job_id).exists()
+
+
+def requeue_preempted(job_id: str) -> int | None:
+    """Put a preempted job back in the queue, and say which attempt it is now.
+
+    None means it is not going back: it finished before the kill reached it,
+    it was cancelled while it stopped, or it has no workdir left to re-run
+    from. Either way the marker goes, so nothing tries again on the next pass.
+
+    The state is written fresh rather than patched. The job runs from the
+    start, so the exit code, the end time and the GPUs of the attempt that was
+    stopped would all be lies about a queued job.
+    """
+    paths.preempt_file(job_id).unlink(missing_ok=True)
+    state = jobs.read_state(job_id)
+    if state.status == "succeeded":
+        # It beat the kill to the finish line. Running the work again is not
+        # what "put it back in the queue" was asking for.
+        return None
+    if is_cancelled(job_id):
+        return None
+    if not paths.workdir(job_id).is_dir():
+        return None
+    # Before anything else: it is still the request the stopped attempt was
+    # given, and a runner that found it would kill the new attempt on its
+    # first poll.
+    paths.kill_file(job_id).unlink(missing_ok=True)
+    attempt = state.attempt + 1
+    spec = jobs.update_spec(job_id, attempt=attempt)
+    _log_requeue(job_id, attempt, spec.priority)
+    jobs.write_state(job_id, JobState(status="queued", attempt=attempt))
+    # Marker last, exactly as `enqueue` writes it: a job is only dispatchable
+    # once its spec and state say it is queued.
+    (paths.queue_dir() / marker_name(spec.priority, job_id)).touch()
+    return attempt
+
+
+def _log_requeue(job_id: str, attempt: int, priority: int) -> None:
+    """Say in the job's own log why it is starting over.
+
+    `gpuc logs` is where somebody looks at a job that has restarted, and
+    without this the log simply runs two attempts together.
+    """
+    with contextlib.suppress(OSError), paths.log_file(job_id).open("ab") as log:
+        log.write(
+            f">>> preempted; queued again as attempt {attempt} at priority "
+            f"{priority}, to run from the start\n".encode()
+        )
