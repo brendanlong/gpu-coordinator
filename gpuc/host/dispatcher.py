@@ -970,6 +970,10 @@ class Dispatcher:
         that could bin the only copy of a job's log is not something anyone
         should have to opt out of.
 
+        Both passes go through `automatic=True`, which is what keeps a sweep
+        nobody asked for off a job that said `cleanup: never` or whose
+        `outputs:` have not reached the mirror yet.
+
         Purge first: it takes whole job dirs, and the workdir sweep afterwards
         should not spend its report on dirs that are already gone.
         """
@@ -987,7 +991,7 @@ class Dispatcher:
             self._sweep_workdirs(workdir_days)
 
     def _purge(self, days: float) -> None:
-        result = cleanup.purge(older_than_days=days, now=self.deps.utcnow())
+        result = cleanup.purge(older_than_days=days, now=self.deps.utcnow(), automatic=True)
         if result.purged or result.removed:
             purged = ", ".join(c.job_id for c in result.purged) or "none"
             self.log(
@@ -999,7 +1003,7 @@ class Dispatcher:
             self.log(f"retention: {error}")
 
     def _sweep_workdirs(self, days: float) -> None:
-        result = cleanup.clean(older_than_days=days, now=self.deps.utcnow())
+        result = cleanup.clean(older_than_days=days, now=self.deps.utcnow(), automatic=True)
         if result.removed:
             self.log(
                 f"workdirs ({days:g} days): removed {len(result.removed)} workdir(s), freeing "

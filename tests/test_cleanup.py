@@ -206,6 +206,78 @@ def test_clean_leaves_a_job_whose_state_is_corrupt(gpuc_home: Path) -> None:
     assert (paths.workdir(job_id) / "blob.bin").exists()
 
 
+# -- what only the automatic sweep refuses ------------------------------------
+
+
+def job_wanting_its_workdir_kept(policy: str) -> str:
+    job_id = queue.enqueue(make_spec(cleanup=policy))
+    queue.remove_marker(job_id)
+    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
+    (paths.workdir(job_id) / "blob.bin").write_bytes(b"y" * 8192)
+    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now())
+    return job_id
+
+
+def job_with_outputs_still_only_here() -> str:
+    spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
+    job_id = queue.enqueue(spec)
+    queue.remove_marker(job_id)
+    results = paths.workdir(job_id) / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    (results / "checkpoint.pt").write_bytes(b"w" * 8192)
+    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now())
+    return job_id
+
+
+def test_the_automatic_sweep_leaves_a_job_that_asked_to_keep_its_workdir(
+    gpuc_home: Path,
+) -> None:
+    never = job_wanting_its_workdir_kept("never")
+    on_success = job_wanting_its_workdir_kept("on_success")
+    result = cleanup.clean(all_finished=True, automatic=True)
+    assert [c.job_id for c in result.removed] == [on_success]
+    assert (paths.workdir(never) / "blob.bin").exists()
+    assert any(s.job_id == never and s.why == "cleanup: never" for s in result.skipped)
+
+
+def test_the_automatic_sweep_leaves_outputs_that_are_still_only_here(gpuc_home: Path) -> None:
+    """The sweep must not bin what `purge` refuses to, and `status` warns about."""
+    job_id = job_with_outputs_still_only_here()
+    result = cleanup.clean(all_finished=True, automatic=True)
+    assert not result.removed
+    assert (paths.workdir(job_id) / "results" / "checkpoint.pt").exists()
+    assert any(s.job_id == job_id and "outputs" in s.why for s in result.skipped)
+
+    # ...and once they are somewhere else, it is free to go.
+    jobs.update_state(job_id, outputs_synced_at=jobs.utc_now())
+    assert [c.job_id for c in cleanup.clean(all_finished=True, automatic=True).removed] == [job_id]
+
+
+def test_a_person_naming_the_job_still_takes_it(gpuc_home: Path) -> None:
+    """Both guards are about a sweep nobody asked for, not about `gpuc clean`."""
+    never = job_wanting_its_workdir_kept("never")
+    unconfirmed = job_with_outputs_still_only_here()
+    result = cleanup.clean(all_finished=True, only=[never, unconfirmed])
+    assert sorted(c.job_id for c in result.removed) == sorted([never, unconfirmed])
+
+
+def test_the_automatic_sweep_leaves_a_job_whose_spec_is_unreadable(gpuc_home: Path) -> None:
+    job_id = finished_job("succeeded")
+    paths.job_dir(job_id).joinpath("spec.json").write_text("{not json")
+    result = cleanup.clean(all_finished=True, automatic=True)
+    assert not result.removed
+    assert (paths.workdir(job_id) / "blob.bin").exists()
+
+
+def test_the_purge_implied_sweep_is_guarded_too_when_it_is_automatic(gpuc_home: Path) -> None:
+    """`retention_days` must not be a way around what `workdir_days` respects."""
+    job_id = job_with_outputs_still_only_here()
+    result = cleanup.purge(older_than_days=0.0, automatic=True)
+    assert not result.purged
+    assert not result.removed
+    assert (paths.workdir(job_id) / "results" / "checkpoint.pt").exists()
+
+
 def test_clean_keeps_spec_state_and_log(gpuc_home: Path) -> None:
     job_id = finished_job("succeeded")
     cleanup.clean(all_finished=True)
@@ -387,6 +459,18 @@ def test_reclaimable_bytes_counts_a_hardlink_once(gpuc_home: Path, tmp_path: Pat
     assert cleanup.reclaimable_bytes(root) > once
 
 
+def test_dir_size_counts_an_in_tree_hardlink_once(gpuc_home: Path, tmp_path: Path) -> None:
+    """du semantics still means one inode, one count."""
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    original = root / "a.bin"
+    original.write_bytes(b"x" * 100_000)
+    (root / "sub" / "b.bin").hardlink_to(original)
+    both_names = cleanup.dir_size(root)
+    original.unlink()
+    assert cleanup.dir_size(root) == both_names
+
+
 def test_dir_size_counts_what_another_tree_links_to(gpuc_home: Path, tmp_path: Path) -> None:
     """The uv cache's own size is a `du` question: it holds those bytes."""
     cache = tmp_path / "cache"
@@ -440,7 +524,10 @@ def test_reclaimable_bytes_counts_a_directory_whose_nlink_counts_subdirectories(
         (root / name).mkdir(parents=True)
     assert root.stat().st_nlink > 1, "the case this is about"
     every_dir = [root, *(root / name for name in ("a", "b", "c"))]
-    assert cleanup.reclaimable_bytes(root) == sum(d.stat().st_blocks for d in every_dir) * 512
+    blocks = sum(d.stat().st_blocks for d in every_dir)
+    if blocks == 0:
+        pytest.skip("directories occupy no blocks here (tmpfs), so there is nothing to lose")
+    assert cleanup.reclaimable_bytes(root) == blocks * 512
 
 
 def test_human_bytes_reads_like_du() -> None:

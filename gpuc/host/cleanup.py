@@ -109,8 +109,12 @@ def _walk_size(root: Path, *, reclaimable_only: bool) -> int:
                 stack.append(Path(entry.path))
                 total += info.st_blocks * 512
                 continue
+            if info.st_nlink <= 1:
+                # One link is one path: this cannot be the same file twice.
+                total += info.st_blocks * 512
+                continue
             key = (info.st_dev, info.st_ino)
-            if not reclaimable_only or info.st_nlink <= 1:
+            if not reclaimable_only:
                 if key not in seen:
                     seen.add(key)
                     total += info.st_blocks * 512
@@ -147,7 +151,8 @@ def reclaimable_bytes(root: Path) -> int:
 
     That is exact for hardlinks and costs nothing -- `st_nlink` comes with the
     `stat` the walk already does, and only multiply-linked inodes are held in
-    memory until the end. It says nothing about *reflinks*: shared extents need
+    memory until the end (a single-link file cannot be reached twice, so it is
+    counted on sight and never remembered). It says nothing about *reflinks*: shared extents need
     a FIEMAP ioctl per file to see, which would be slow and filesystem-specific,
     so a CoW copy still counts in full, as it does for `du`.
 
@@ -260,6 +265,7 @@ def candidates(
     older_than_days: float | None = None,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
+    automatic: bool = False,
 ) -> tuple[list[Candidate], list[Skipped]]:
     """Which finished jobs' workdirs may be removed, and why the rest may not.
 
@@ -267,6 +273,21 @@ def candidates(
     finished, and (under `--older-than`) a job whose end time cannot be read are
     all skipped. A workdir is only ever removed because its own `state.json`
     says the job is over.
+
+    `automatic` is the dispatcher sweeping on its own horizon rather than a
+    person typing a delete, and it adds the two guards that only make sense
+    when nobody is watching:
+
+    - a job whose spec says `cleanup: never`, which is the one way to ask for
+      a workdir to be kept and would otherwise mean "kept for a day";
+    - a job whose `outputs:` are not confirmed to be anywhere else. Those paths
+      live *inside* the workdir, so this is the difference between reclaiming a
+      venv and binning the only copy of a checkpoint -- the same precondition
+      `purge` fails closed on, and the one the `outputs not uploaded` warning in
+      `gpuc status` is pointing at.
+
+    A person can still take both with `gpuc clean --only <id>`, which is a
+    delete somebody typed with the id in front of them.
     """
     moment = now or datetime.now(UTC)
     wanted = None if only is None else set(only)
@@ -303,6 +324,21 @@ def candidates(
         elif not all_finished:
             skipped.append(Skipped(job_id, "no selection given"))
             continue
+        if automatic:
+            try:
+                policy = jobs.read_spec(job_id).cleanup
+            except (RuntimeError, FileNotFoundError, OSError, ValueError):
+                # An unreadable spec cannot say it wanted this kept, but it
+                # cannot say it did not either.
+                skipped.append(Skipped(job_id, "no readable spec.json"))
+                continue
+            if policy == jobs.NEVER:
+                skipped.append(Skipped(job_id, "cleanup: never"))
+                continue
+            confirmed, why = outputs_confirmed(job_id, state)
+            if not confirmed and why:
+                skipped.append(Skipped(job_id, why))
+                continue
         picked.append(
             Candidate(
                 job_id=job_id,
@@ -359,9 +395,14 @@ def clean(
     dry_run: bool = False,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
+    automatic: bool = False,
 ) -> CleanResult:
     picked, skipped = candidates(
-        all_finished=all_finished, older_than_days=older_than_days, now=now, only=only
+        all_finished=all_finished,
+        older_than_days=older_than_days,
+        now=now,
+        only=only,
+        automatic=automatic,
     )
     result = CleanResult(dry_run=dry_run, skipped=skipped, s3_prefix=host_s3_prefix())
     for candidate in picked:
@@ -583,6 +624,7 @@ def purge(
     now: datetime | None = None,
     only: Iterable[str] | None = None,
     sweep_only: Iterable[str] | None = None,
+    automatic: bool = False,
 ) -> CleanResult:
     """Remove whole job dirs, then run the ordinary workdir sweep over the rest.
 
@@ -623,6 +665,7 @@ def purge(
         dry_run=dry_run,
         now=now,
         only=sweep_only,
+        automatic=automatic,
     )
     # In a dry run the purged dirs are still there, so the sweep sees their
     # workdirs too; counting both would report the same bytes twice.

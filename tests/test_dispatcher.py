@@ -676,6 +676,41 @@ def test_the_two_horizons_run_together_without_double_counting(gpuc_home: Path) 
     assert "workdirs (1 days): removed 1 workdir(s)" in log
 
 
+def test_the_workdir_horizon_leaves_outputs_that_never_reached_the_mirror(
+    gpuc_home: Path,
+) -> None:
+    """The sweep is on by default, so it may not be the thing that loses data."""
+    configure_retention(None, 1.0)
+    spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
+    job_id = queue.enqueue(spec)
+    queue.remove_marker(job_id)
+    ended = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    jobs.update_state(job_id, status="failed", ended_at=ended)
+    results = paths.workdir(job_id) / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    (results / "checkpoint.pt").write_bytes(b"w" * 4096)
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert (results / "checkpoint.pt").exists()
+
+
+def test_the_workdir_horizon_leaves_a_job_that_asked_to_keep_its_workdir(
+    gpuc_home: Path,
+) -> None:
+    configure_retention(None, 1.0)
+    job_id = queue.enqueue(make_spec(cleanup="never"))
+    queue.remove_marker(job_id)
+    ended = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    jobs.update_state(job_id, status="failed", ended_at=ended)
+    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
+    (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert paths.workdir(job_id).is_dir()
+
+
 def test_the_workdir_horizon_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
     configure_retention(None, 1.0)
     clock = FakeClock()

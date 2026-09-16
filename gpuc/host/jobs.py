@@ -548,10 +548,11 @@ class HostConfig:
     from git -- and leaves the record alone, so it needs no mirror and asks
     nothing of the caller. `retention_days` is the one that deletes `log.txt`.
 
-    Null rather than a default here on purpose: a host whose `config.json`
-    predates this key must not start deleting because its package was
-    upgraded. The default lives on the control side, where `host add` records
-    it and `host bootstrap` ships it."""
+    Null rather than a default here on purpose: a `config.json` written before
+    this key existed must not start deleting on its own. The default lives on
+    the control side, and arrives whenever it next writes this file -- `gpuc
+    host bootstrap`, or the package re-sync `gpuc submit` runs against a host
+    on an older commit."""
     env: dict[str, str] = field(default_factory=dict)
     """Host-wide environment, applied to every job before the job's own `env`.
 

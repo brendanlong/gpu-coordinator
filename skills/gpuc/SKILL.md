@@ -264,6 +264,9 @@ Rules, and they are not optional:
   `gpuc host bootstrap <host>` to change it). Logs, state and specs are never
   swept. So a failed run is yours to inspect for a day, and `gpuc requeue`
   rebuilds a workdir from git whenever it is gone.
+- That sweep refuses a job whose spec says `cleanup: never` and one whose
+  `outputs:` have not reached S3 or HF — so a workdir holding results that
+  never uploaded is never taken from under you. `gpuc status` names them.
 - `gpuc clean --host <host> --all-finished` does that sweep now, at any age.
   Records and logs stay until `--purge`, which only removes jobs whose
   log, state and outputs are confirmed mirrored.
