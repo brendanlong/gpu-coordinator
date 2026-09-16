@@ -516,6 +516,25 @@ def test_a_usage_error_under_json_is_a_document_too(
     assert json.loads(capsys.readouterr().out)["exit_code"] == EXIT_USAGE
 
 
+def test_a_command_line_argparse_rejects_still_prints_a_document(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """argparse exits before any command runs; stdout must not be empty."""
+    with pytest.raises(SystemExit) as exit_info:
+        main(["reorder", "20260101-000000-aaaaaa", "--priority", "soon", "--json"])
+    assert exit_info.value.code == EXIT_USAGE
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["exit_code"] == EXIT_USAGE
+    assert "--priority" in captured.err
+
+
+def test_help_under_json_is_not_an_error_document(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["status", "--json", "--help"])
+    assert exit_info.value.code == EXIT_OK
+    assert "error" not in capsys.readouterr().out
+
+
 def test_host_list_json_carries_the_entries_and_the_skipped_ones(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

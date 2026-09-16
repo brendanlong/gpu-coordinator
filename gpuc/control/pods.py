@@ -90,8 +90,8 @@ class PodsView:
     def document(self) -> dict[str, Any]:
         """`gpuc pods --json`: the provider's answer, ours and everyone else's.
 
-        `others` are pods without our prefix and carry a name and status only,
-        because this command never touches them. `desired: false` on one of
+        `others` are pods without our prefix: an id, a name and a status, and
+        nothing else, because this command never touches them. `desired: false` on one of
         ours means nothing local wants it and the reaper will take it;
         `heartbeat_age_s` is null under `--no-heartbeat` and for a pod that
         could not be asked.

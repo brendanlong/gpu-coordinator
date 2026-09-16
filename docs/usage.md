@@ -384,7 +384,8 @@ never handed nothing at all:
 ```
 
 `error` (singular) is the whole answer: the command did not do what it was
-asked. `errors` (plural) is different — per-host or per-job trouble a command
+asked. A command line argparse itself rejects (a bad flag, a missing required
+one) gets the same document, with the reason on stderr where argparse wrote it. `errors` (plural) is different — per-host or per-job trouble a command
 survived, which never implies a non-zero exit by itself (`clean` and
 `reconcile --once` are the two that exit 1 on their own `errors`).
 
@@ -396,10 +397,10 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `reorder` | `{job_id, host, priority}` |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. Exit 3 if the registry is unreadable |
-| `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]`. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
+| `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]`. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
-| `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones |
-| `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}`, host names in the order they were judged. `--json` needs `--once`: the loop has no document to print |
+| `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
+| `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}`, host names in the order they were judged. `--json` needs `--once` and nothing else: neither the loop nor `--install` has a document to print |
 
 ```sh
 gpuc submit job.yaml --host gpubox --json | jq -r .job_id

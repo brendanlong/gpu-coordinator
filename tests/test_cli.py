@@ -771,12 +771,21 @@ def test_reconcile_once_json_reports_the_error_it_exits_one_for(
     assert "does not exist" in captured.err
 
 
-def test_reconcile_json_without_once_is_usage(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("extra", [[], ["--install"], ["--once", "--install"]])
+def test_reconcile_json_needs_once_and_nothing_else(
+    control_env: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    extra: list[str],
 ) -> None:
+    """`--install` writes unit files and a systemd blurb, which is not a document."""
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    assert main(["reconcile", "--json"]) == EXIT_USAGE
+    units = tmp_path / "systemd"
+    monkeypatch.setattr(reconcile_mod, "systemd_dir", lambda: units)
+    assert main(["reconcile", "--json", *extra]) == EXIT_USAGE
     assert "--once" in json.loads(capsys.readouterr().out)["error"]
+    assert not units.exists()
 
 
 def test_clean_json_carries_what_went_and_what_was_kept(
@@ -840,3 +849,41 @@ def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
         {"uuid": "GPU-1111", "name": "NVIDIA A40", "vram_mib": 46068, "index": 0}
     ]
     assert any("uv is missing" in note for note in document["notes"])  # type: ignore[union-attr]
+
+
+def test_host_probe_json_is_written_after_the_registry_write_it_can_fail_on(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing write prints an error document, and stdout may hold only one."""
+    from gpuc.control.config import ConfigError
+    from gpuc.control.probe import parse_probe
+
+    main(["host", "add", "gpubox", "--ssh", "me@box"])
+    monkeypatch.setattr(
+        "gpuc.control.cli.probe_host",
+        lambda *a, **k: parse_probe(
+            "gpubox", "===driver===\n580.173.02\n===gpus===\n0, GPU-1111, NVIDIA A40, 46068 MiB\n"
+        ),
+    )
+
+    def locked() -> object:
+        raise ConfigError("state lock is held by another gpuc")
+
+    monkeypatch.setattr("gpuc.control.cli.registry_transaction", locked)
+    capsys.readouterr()
+    assert main(["host", "probe", "gpubox", "--json"]) == 1
+    document = one_document(capsys)
+    assert "state lock" in str(document["error"])
+
+
+def test_host_list_json_reports_the_host_env_by_name_only(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--env` is where somebody hand-sets a token, and this document travels."""
+    main(["host", "add", "local", "--gpus", GPU, "--env", "HF_TOKEN=hf_secret"])
+    capsys.readouterr()
+    assert main(["host", "list", "--json"]) == 0
+    document = one_document(capsys)
+    (host,) = document["hosts"]  # type: ignore[misc]
+    assert host["env"] == {"HF_TOKEN": "<set>"}
+    assert "hf_secret" not in json.dumps(document)

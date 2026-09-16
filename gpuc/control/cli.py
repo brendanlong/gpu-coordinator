@@ -316,6 +316,10 @@ def host_document(entry: HostEntry) -> dict[str, Any]:
     stale = status_mod.stale_warning(entry)
     return {
         **document,
+        # `--env` is free-form and is where somebody hand-sets an HF_TOKEN, so
+        # the names are reported and the values are not: the text listing shows
+        # neither, and this document ends up in transcripts and bug reports.
+        "env": dict.fromkeys(entry.env, "<set>"),
         "remote_home": entry.remote_home,
         "ephemeral": entry.ephemeral,
         "warnings": [stale] if stale else [],
@@ -419,9 +423,7 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
     settings = load_settings()
     entry = named_registry().require(args.name)
     report = probe_host(entry, settings)
-    if args.json:
-        jsonout.emit(report.document())
-    else:
+    if not args.json:
         print(report.render())
     # A probe is the one command that runs before bootstrap, so it is also the
     # first chance to learn what the cards are.
@@ -437,7 +439,12 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
                         }
                     )
                 )
-    return 0
+    # After the registry write, not before: that write can fail (a held lock, a
+    # registry that changed under us) and print an error document of its own,
+    # and stdout may hold only one.
+    if args.json:
+        jsonout.emit(report.document())
+    return EXIT_OK
 
 
 CLOUDS: dict[str, list[Cloud]] = {
@@ -1059,10 +1066,10 @@ def cmd_requeue(args: argparse.Namespace) -> int:
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
-    if args.json and not args.once:
+    if args.json and (args.install or not args.once):
         raise UsageError(
-            "reconcile --json needs --once: the loop and --install have no document to "
-            "print, only a running commentary."
+            "reconcile --json needs --once and nothing else: the loop and --install have "
+            "no document to print, only a running commentary."
         )
     if args.install:
         reconcile_mod.install(args.interval)
@@ -1590,7 +1597,18 @@ def failed(args: argparse.Namespace, message: str, exit_code: int) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    try:
+        args = build_parser().parse_args(raw)
+    except SystemExit as exc:
+        # argparse writes its own message and exits before `failed()` can be
+        # reached. The reason stays on stderr, where every other note goes, but
+        # stdout still gets a document: "exit 2 and nothing at all" is the one
+        # answer --json promises never to give. `--help` exits 0 and is not one.
+        code = exc.code if isinstance(exc.code, int) else EXIT_USAGE
+        if code and "--json" in raw:
+            jsonout.emit_error("the command line was rejected; the reason is on stderr", code)
+        raise
     if wants_runpod(args) and not os.environ.get("RUNPOD_API_KEY"):
         # Before anything else: provisioning spends money, and finding out after
         # the spec has been mirrored and a host picked helps nobody.
