@@ -206,7 +206,13 @@ uv tool upgrade gpu-coordinator
 uv tool install --reinstall "git+https://github.com/brendanlong/gpu-coordinator@<commit>"   # or pin
 gpuc version                 # this build's commit, and each host's
 gpuc host bootstrap <host>   # for every host `version` marks OLDER
+gpuc host bootstrap --all    # or all of them, in one command
 ```
+
+`--all` takes every registered host in turn, including ephemeral ones. A host
+that fails does not stop the others — a pod that has already gone away is the
+ordinary case — so the run ends by naming each failure again on stderr and
+exiting 1, and the hosts that did upgrade stay upgraded.
 
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
 to enqueue on is not on this commit — including a host with no commit recorded,

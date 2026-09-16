@@ -363,10 +363,9 @@ def cmd_host_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_host_bootstrap(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    entry = named_registry().require(args.name)
-    updated, result = bootstrap_host(entry, settings, health_args=args.health_args)
+def bootstrap_and_record(entry: HostEntry, settings: Settings, health_args: str) -> None:
+    """Bootstrap one host, persist what it told us about itself, and say so."""
+    updated, result = bootstrap_host(entry, settings, health_args=health_args)
     with registry_transaction() as registry:
         registry.put(updated)
     print(
@@ -375,7 +374,58 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
     )
     if result.warnings:
         print(f"{len(result.warnings)} warning(s) above")
-    return 0
+
+
+def bootstrap_every_host(settings: Settings, health_args: str) -> int:
+    """`gpuc host bootstrap --all`: the upgrade loop, one command.
+
+    A host that fails does not stop the others: an ephemeral host whose pod is
+    already gone is the ordinary case, and the hosts that are still there are
+    the reason the flag exists. Each failure is named again at the end and the
+    command exits 1, so nobody reads a wall of output as "all upgraded".
+    """
+    hosts = list(named_registry().hosts.values())
+    if not hosts:
+        print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        return EXIT_OK
+    failures: list[str] = []
+    for index, entry in enumerate(hosts, start=1):
+        if index > 1:
+            print()
+        print(f"== {entry.name} ({index}/{len(hosts)}) ==")
+        try:
+            bootstrap_and_record(entry, settings, health_args)
+        except LocalStateUnreadable:
+            # The registry stopped being readable mid-run, so the next host's
+            # write would be a guess: stop and let the caller see exit 3.
+            raise
+        except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
+            print(f"error: host {entry.name}: {exc}", file=sys.stderr)
+            failures.append(entry.name)
+    print()
+    if failures:
+        print(
+            f"{len(hosts) - len(failures)}/{len(hosts)} hosts bootstrapped; "
+            f"failed: {', '.join(failures)}",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    print(f"all {len(hosts)} host(s) bootstrapped")
+    return EXIT_OK
+
+
+def cmd_host_bootstrap(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    if args.all:
+        if args.name:
+            raise UsageError(
+                f"host bootstrap takes a host name or --all, not both (got {args.name!r})"
+            )
+        return bootstrap_every_host(settings, args.health_args)
+    if not args.name:
+        raise UsageError("host bootstrap wants a host name, or --all for every registered host")
+    bootstrap_and_record(named_registry().require(args.name), settings, args.health_args)
+    return EXIT_OK
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
@@ -1131,7 +1181,10 @@ def cmd_version(args: argparse.Namespace) -> int:
         note = "" if version_mod.same_commit(commit, entry.pkg_commit) else "  OLDER: re-bootstrap"
         print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{note}")
     if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
-        print("upgrade a host with: gpuc host bootstrap <host> (running jobs are not disturbed)")
+        print(
+            "upgrade a host with: gpuc host bootstrap <host> (or --all for every host; "
+            "running jobs are not disturbed)"
+        )
     return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
 
 
@@ -1264,7 +1317,13 @@ def build_parser() -> argparse.ArgumentParser:
     edit.set_defaults(func=cmd_host_set)
 
     bootstrap = host.add_parser("bootstrap", help="install uv, the package and the dispatcher")
-    bootstrap.add_argument("name")
+    bootstrap.add_argument("name", nargs="?", help="the host to bootstrap; omit it with --all")
+    bootstrap.add_argument(
+        "--all",
+        action="store_true",
+        help="bootstrap every registered host instead of one, in the order `host list` shows "
+        "them; a host that fails does not stop the rest, and the command exits 1 if any did",
+    )
     bootstrap.add_argument(
         "--health-args", default="", help="extra flags for `gpuc.host health`, e.g. --min-mbps 0.1"
     )
