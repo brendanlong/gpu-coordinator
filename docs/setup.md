@@ -86,6 +86,24 @@ reachable from other machines; there is no TLS, so do that only on a VPN
 interface or behind a proxy that terminates TLS. What it shows and does is in
 [usage.md](usage.md#the-web-dashboard).
 
+To keep it running, `--install` writes a `systemd --user` service that serves
+with the same `--bind` and `--port`, and deliberately does not enable it:
+
+```sh
+gpuc web serve --bind 0.0.0.0 --port 8646 --install
+systemctl --user daemon-reload
+systemctl --user enable --now gpuc-web.service
+journalctl --user -u gpuc-web.service -f
+```
+
+The unit pins `GPUC_CONFIG_DIR` and `GPUC_STATE_DIR` to this user's
+directories and reads `RUNPOD_API_KEY` from the same `config_dir()/env` file
+the [reconcile timer](#the-reconcile-timer) uses, so RunPod hosts show their
+pod line; without it they still render. It restarts on failure, and it needs
+`loginctl enable-linger` to outlive your session, exactly like the timer.
+`--install` refuses nothing: with no password set the service starts, logs
+the `gpuc web set-password` line, and exits, and `--install` says so.
+
 ## Credentials
 
 **This machine (boto3).** The S3 mirror uses boto3's default credential chain:

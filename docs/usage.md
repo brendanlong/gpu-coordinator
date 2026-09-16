@@ -275,6 +275,7 @@ an `outputs not uploaded` flag beside one means the link is empty.
 gpuc web set-password          # once; prompts twice, stores a bcrypt hash 0600
 gpuc web serve                 # http://127.0.0.1:8646/
 gpuc web serve --bind 0.0.0.0 --port 8646   # reachable from other machines
+gpuc web serve --bind 0.0.0.0 --install     # the same, as a systemd --user service (see setup.md)
 ```
 
 Every page and every API document is behind that one password (only the
