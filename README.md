@@ -26,6 +26,7 @@ gpuc host bootstrap local                    # installs uv, the package, the dis
 gpuc submit job.example.yaml --host local    # or --runpod --gpu A40 --max-price 0.60
 gpuc status                                  # queues, running jobs, recent results
 gpuc logs <job-id> -f
+gpuc web set-password && gpuc web serve   # the same, in a browser at http://127.0.0.1:8646/
 ```
 
 ## Documentation

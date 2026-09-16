@@ -839,7 +839,7 @@ def test_cancel_json_is_the_hosts_own_answer(
 ) -> None:
     main(["host", "add", "local", "--gpus", GPU])
     monkeypatch.setattr(
-        "gpuc.control.cli.open_session",
+        "gpuc.control.actions.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "cancelling"}])),
     )
     capsys.readouterr()
@@ -857,7 +857,7 @@ def test_reorder_json_repeats_the_priority_it_set(
             return type("Result", (), {"returncode": 0})()
 
     main(["host", "add", "local", "--gpus", GPU])
-    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: Moved())
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
     argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "10", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -871,7 +871,7 @@ def test_estimate_json_repeats_what_the_host_recorded(
     session = StubSession(
         [{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running", "warning": None}]
     )
-    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: as_session(session))
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
     argv = ["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -889,7 +889,7 @@ def test_estimate_reports_the_hosts_refusal(
     main(["host", "add", "local", "--gpus", GPU])
     payload: dict[str, object] = {"job_id": "j", "error": "job j has already succeeded"}
     monkeypatch.setattr(
-        "gpuc.control.cli.open_session", lambda *a, **k: as_session(StubSession([payload]))
+        "gpuc.control.actions.open_session", lambda *a, **k: as_session(StubSession([payload]))
     )
     capsys.readouterr()
     assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "5", "--host", "local"]) == 1
@@ -903,7 +903,7 @@ def test_estimate_clear_asks_the_host_to_clear_it(
     session = StubSession(
         [{"job_id": "j", "estimated_runtime_min": None, "status": "queued", "warning": None}]
     )
-    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: as_session(session))
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
     assert main(["estimate", "20260101-000000-aaaaaa", "--clear", "--host", "local"]) == 0
     assert session.calls == ["estimate 20260101-000000-aaaaaa --clear"]
@@ -918,7 +918,7 @@ def test_estimate_refuses_a_host_that_did_not_say_what_it_recorded(
     """
     main(["host", "add", "local", "--gpus", GPU])
     monkeypatch.setattr(
-        "gpuc.control.cli.open_session",
+        "gpuc.control.actions.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "running"}])),
     )
     capsys.readouterr()
@@ -941,7 +941,7 @@ def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
         "20260101-000000-aaaaaa", {"command": "true", "some_future_field": 1}
     )
     monkeypatch.setattr(
-        "gpuc.control.cli.open_session",
+        "gpuc.control.actions.open_session",
         lambda *a, **k: as_session(
             StubSession([{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running"}])
         ),
@@ -964,7 +964,7 @@ def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(
         "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
     )
     monkeypatch.setattr(
-        "gpuc.control.cli.open_session",
+        "gpuc.control.actions.open_session",
         lambda *a, **k: as_session(
             StubSession([{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running"}])
         ),

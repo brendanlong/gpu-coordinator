@@ -80,6 +80,13 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     }
 
 
+WANDB_HINTS = {"WANDB_ENTITY": "entity", "WANDB_PROJECT": "project", "WANDB_RUN_ID": "run_id"}
+
+
+def wandb_hints(env: dict[str, str]) -> dict[str, str]:
+    return {name: env[key] for key, name in WANDB_HINTS.items() if env.get(key)}
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = jobs.read_config()
     job_ids = [args.job_id] if args.job_id else jobs.list_job_ids()
@@ -99,6 +106,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         # estimate is exactly what somebody deciding whether to queue behind it
         # needs. The control side never sees the spec.
         entry["estimated_runtime_min"] = spec.estimated_runtime_min if spec else None
+        # Where the results went, for anything that wants to link to them. The
+        # W&B keys are the three that name a run; the job's env is otherwise
+        # its own business and never leaves the host.
+        entry["outputs"] = [asdict(o) for o in spec.outputs] if spec else []
+        entry["wandb"] = wandb_hints(spec.env) if spec else {}
         # Only for finished jobs: a running job's workdir is being written to,
         # its size is meaningless, and walking a live venv on every `gpuc
         # status` would be pure cost.

@@ -116,6 +116,7 @@ gpuc status                      # every host: free cards, queue, running job + 
                                  # recent results; each job as `name (job-id)`, each running
                                  # job's cards as `gpu=2,3`
 gpuc status --json               # the same, machine-readable; --json is on every command
+                                 # (a human wants `gpuc web serve`: the same in a browser)
                                  # that has an answer (see "Exit codes" below)
 gpuc status --suspects           # running jobs that are billing but idle, judged by each job's
                                  # own low_util window/floor/grace, plus pods past a TTL they have;

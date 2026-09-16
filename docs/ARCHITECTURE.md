@@ -15,7 +15,7 @@ a box reached over SSH with no sudo there (a subset of its GPUs), and ephemeral
 RunPod pods. Not finicky, not buggy, and never leaks a paid pod in the normal
 path.
 
-Non-goals for the prototype: Vast, multi-node, spot, a web UI, S3 as the
+Non-goals for the prototype: Vast, multi-node, spot, S3 as the
 authoritative queue (host is authoritative, S3 is the mirror; `gpuc requeue`
 resubmits from the S3 spec if a host dies).
 
@@ -44,6 +44,8 @@ gpuc/
     terminate.py  # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
   control/     # runs on the local machine. May use third-party deps.
     cli.py        # `gpuc` top-level commands
+    actions.py    # what the CLI and the dashboard both do: one function per command, returning its --json document
+    web/          # `gpuc web`: stdlib http.server, bcrypt login, a static page over the same documents
     config.py     # ~/.local/share/gpu-coordinator/ layout, hosts registry
     transport.py  # LocalTransport / SshTransport: run, rsync, put_file(0600), tail
     bootstrap.py  # install uv + this package on a host, write config, run host preflight
@@ -817,6 +819,44 @@ and log an error (fail closed). `--install` writes a `systemd --user` service
 and timer but does not enable them, and prints the `systemctl` lines and the
 `config_dir()/env` file the service reads `RUNPOD_API_KEY` from.
 
+## Web dashboard (`gpuc web serve`)
+
+A thin view, by construction: `gpuc.control.actions` holds one function per
+command that returns the document its `--json` form prints, and both `cli.py`
+and `web/app.py` call those. Nothing the dashboard shows or does exists only in
+the dashboard; a job the CLI refuses to reorder is refused on the wire with the
+same words, and `exit_code_for` is the one table mapping an error to an exit
+code (CLI) or an HTTP status (2 -> 400, 3 -> 503, 4 -> 404, 1 -> 500). The
+API's failure document is `--json`'s: `{schema_version, error, exit_code}`.
+
+The server is stdlib `ThreadingHTTPServer` -- a routing table this size buys
+nothing from a framework -- with `bcrypt` the one added dependency. One
+password, hashed into `config_dir()/web-password` (0600) by `gpuc web
+set-password` and read once at startup; a server with no password refuses to
+start. Sessions are random tokens held in memory, `HttpOnly; SameSite=Strict`,
+seven days; a POST that carries an `Origin` header must match `Host` (a
+browser that honours `SameSite` never sends the cookie cross-site in the
+first place, so this is the second lock). Wrong passwords are checked one at
+a time under a lock of their own with a growing pause, which a quiet minute
+resets; the session table has a separate lock, so a guesser at the door
+cannot stall requests from inside. Idle keep-alive connections time out
+after 30 s, an oversized or malformed body is refused before it is read, and
+a bug in a handler is a 500 with a traceback in the server log, never a
+dropped connection. No TLS: it is for localhost or a VPN, or behind a proxy.
+
+The page is static HTML/JS that fetches `/api/status`, `/api/hosts`,
+`/api/config` and `/api/version` every 15 s and polls `/api/jobs/<id>/logs`
+while a log panel is open with *follow* on. Status is gathered across hosts in
+parallel (`actions.gather_all`, also what the text `gpuc status` uses now), so
+one wedged host costs its own timeout, not the sum. Realtime updates later mean
+an event stream fed by the same gather beside the same documents, not a second
+rendering: the page already treats every document as the whole truth on each
+refresh, so replacing the timer with a stream changes nothing it draws.
+
+Host shutdown is deliberately absent, because the CLI has no such command yet
+(setup.md's teardown is a hand procedure); the rule is that it lands in `actions`
+first and the dashboard calls it.
+
 ## Status output
 
 What `status` prints, and every flag, is usage.md. The invariants:
@@ -833,6 +873,12 @@ What `status` prints, and every flag, is usage.md. The invariants:
   labelled separately and never merged.
 - `--suspects` judges each running job by *its own* `low_util` window, floor and
   grace as the host reports them, and never kills anything.
+- The host's `status` reports each job's `outputs` (the spec's, `{job_id}`
+  expanded) and `wandb` (`entity`, `project`, `run_id` from the job's `WANDB_*`
+  env, and nothing else of its env). The control side turns those into
+  `links[]` in `--json` -- S3 console, HF tree, W&B run, and the host's
+  `s3_prefix` mirror of the job -- derived from what the job declared and never
+  checked; the text view does not show them.
 
 ## Testing rules
 

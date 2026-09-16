@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from gpuc.control import jsonout
 from gpuc.control import pods as pods_mod
@@ -19,16 +18,41 @@ from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
 from gpuc.control import version as version_mod
+from gpuc.control import web as web_mod
+from gpuc.control.actions import (
+    EXIT_ERROR,
+    EXIT_LOCAL_STATE,
+    EXIT_NOT_FOUND,
+    EXIT_OK,
+    EXIT_USAGE,
+    CliError,
+    NotFound,
+    UsageError,
+    cancel_job,
+    check_estimate,
+    config_document,
+    estimate_job,
+    exit_code_for,
+    failure_message,
+    find_job_host,
+    gather_all,
+    hosts_document,
+    hosts_for,
+    make_provider,
+    named_registry,
+    provider_for_status,
+    read_log,
+    reorder_job,
+    status_document,
+    version_document,
+)
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_package
-from gpuc.control.clean import CleanError, clean_host, parse_only, prune_uv_cache
 from gpuc.control.clean import check_flags as check_clean_flags
+from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
-    HostNotFound,
     LocalStateUnreadable,
-    Registry,
-    RegistryRead,
     Settings,
     config_file,
     hosts_file,
@@ -43,23 +67,20 @@ from gpuc.control.config import (
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.gpuinfo import summarize
 from gpuc.control.probe import probe_host
-from gpuc.control.providers.base import Cloud, Constraints, Provider, ProviderError
-from gpuc.control.providers.runpod import RunPodProvider
-from gpuc.control.provision import ProvisionError, runpod_host
-from gpuc.control.remote import HostSession, RemoteError, open_session
+from gpuc.control.providers.base import Cloud, Constraints
+from gpuc.control.provision import runpod_host
+from gpuc.control.remote import RemoteError, open_session
 from gpuc.control.s3index import (
     IndexEntry,
     LocalIndex,
     S3Index,
     S3IndexError,
     S3ObjectMissing,
-    job_log_uri,
 )
-from gpuc.control.skill import SkillError, install_skill, read_skill
+from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import (
     JobSpecModel,
     Reporter,
-    SubmitError,
     SubmitResult,
     expand_job_id,
     load_document,
@@ -77,35 +98,18 @@ from gpuc.control.transport import (
 from gpuc.host import jobs
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
-EXIT_OK = 0
-"""Everything the command was asked to do happened, including reporting that a
-host is unreachable: that is data about a host, not a failure of the command."""
-EXIT_ERROR = 1
-"""The command failed: a transport error, a provider error, a refused submit."""
-EXIT_USAGE = 2
-"""The command line itself was wrong (argparse uses this too)."""
-EXIT_LOCAL_STATE = 3
-"""Local state -- the registry or the config file -- could not be read, so the
-answer is unknown. Automation must not read this as `nothing is running`."""
-EXIT_NOT_FOUND = 4
-"""The named job or host does not exist."""
-
-
-class CliError(RuntimeError):
-    exit_code = EXIT_ERROR
-
-
-class UsageError(CliError):
-    """The invocation was wrong, not the world."""
-
-    exit_code = EXIT_USAGE
-
-
-class NotFound(CliError):
-    """The job or host named on the command line does not exist."""
-
-    exit_code = EXIT_NOT_FOUND
-
+__all__ = [
+    "EXIT_ERROR",
+    "EXIT_LOCAL_STATE",
+    "EXIT_NOT_FOUND",
+    "EXIT_OK",
+    "EXIT_USAGE",
+    "CliError",
+    "NotFound",
+    "UsageError",
+    "build_parser",
+    "main",
+]
 
 GPUS_HELP = (
     "GPU UUIDs or nvidia-smi indices this host may use, comma-separated "
@@ -148,22 +152,6 @@ def _env_dict(pairs: Sequence[str] | None) -> dict[str, str]:
             raise UsageError(f"--env wants KEY=VALUE, got {pair!r}")
         env[key.strip()] = value
     return env
-
-
-def named_registry() -> Registry:
-    """The registry, for a command that was given a host or job name to find.
-
-    A registry that could not be parsed is exit 3 (unknown), not exit 4 (does
-    not exist): "no host named gpubox" would be a lie when the file holding
-    gpubox is the thing that is broken. Listing commands do not use this --
-    they can honestly show what parsed.
-    """
-    read = read_registry()
-    for error in read.errors:
-        print(f"warning: {error}", file=sys.stderr)
-    if read.unreadable:
-        raise LocalStateUnreadable("\n".join(read.errors))
-    return read.registry
 
 
 def cmd_host_add(args: argparse.Namespace) -> int:
@@ -306,38 +294,13 @@ def cmd_host_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def host_document(entry: HostEntry) -> dict[str, Any]:
-    """One registered host as `gpuc host list --json` reports it.
-
-    The registry entry itself, plus what the text listing computes from it:
-    where gpuc home resolves to on the host, and the re-bootstrap warning.
-    """
-    document: dict[str, Any] = json.loads(entry.model_dump_json())
-    stale = status_mod.stale_warning(entry)
-    return {
-        **document,
-        # `--env` is free-form and is where somebody hand-sets an HF_TOKEN, so
-        # the names are reported and the values are not: the text listing shows
-        # neither, and this document ends up in transcripts and bug reports.
-        "env": dict.fromkeys(entry.env, "<set>"),
-        "remote_home": entry.remote_home,
-        "ephemeral": entry.ephemeral,
-        "warnings": [stale] if stale else [],
-    }
-
-
 def cmd_host_list(args: argparse.Namespace) -> int:
     read = read_registry()
     for error in read.errors:
         print(f"warning: {error}", file=sys.stderr)
     registry = read.registry
     if args.json:
-        jsonout.emit(
-            {
-                "hosts": [host_document(entry) for entry in registry.hosts.values()],
-                "errors": list(read.errors),
-            }
-        )
+        jsonout.emit(hosts_document(read))
         return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
     if not registry.hosts:
         if read.unreadable:
@@ -544,10 +507,6 @@ CLOUDS: dict[str, list[Cloud]] = {
 }
 
 
-def make_provider(settings: Settings) -> Provider:
-    return RunPodProvider(caps=settings.caps())
-
-
 def constraints_from(args: argparse.Namespace) -> Constraints:
     names = _comma_list(args.gpu)
     if not names:
@@ -587,16 +546,20 @@ def cmd_config_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_config_show(_: argparse.Namespace) -> int:
-    path = config_file()
+def cmd_config_show(args: argparse.Namespace) -> int:
     settings = load_settings()
+    document = config_document(settings)
+    if args.json:
+        jsonout.emit(document)
+        return EXIT_OK
+    path = config_file()
     print(f"config file: {path}{'' if path.exists() else ' (does not exist; using defaults)'}")
     print(f"state dir:   {state_dir()}")
     for name, value in settings.model_dump().items():
         print(f"  {name} = {value!r}")
-    if settings.s3_bucket is None:
-        print("  note: no s3_bucket, so nothing is mirrored to S3")
-    return 0
+    for text in document["notes"]:
+        print(f"  note: {text}")
+    return EXIT_OK
 
 
 def mirror_spec_first(
@@ -726,12 +689,6 @@ def _queued(
     return EXIT_OK
 
 
-def _hosts(registry: Registry, only: str | None) -> list[HostEntry]:
-    if only:
-        return [registry.require(only)]
-    return list(registry.hosts.values())
-
-
 def cmd_status(args: argparse.Namespace) -> int:
     """Report on every host, and only fail for reasons that are not a host.
 
@@ -746,11 +703,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         since_s = status_mod.parse_duration(args.since) if args.since else None
     except ValueError as exc:
         raise UsageError(f"--since: {exc}") from exc
-    entries = _hosts(read.registry, args.host) if not read.unreadable else []
     if args.json:
-        return _status_json(args, settings, read, entries, since_s)
+        # One JSON document on stdout, whatever happened. Notes stay on stderr.
+        document = status_document(
+            read, settings, host=args.host, recent=args.recent, since_s=since_s
+        )
+        print(json.dumps(document, indent=2))
+        return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
     for error in read.errors:
         print(f"warning: {error}", file=sys.stderr)
+    entries = hosts_for(read.registry, args.host) if not read.unreadable else []
     if not entries:
         if read.unreadable:
             print(
@@ -765,10 +727,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         if args.all and not args.suspects:
             _print_unhosted(settings, set(), args.host)
         return EXIT_OK
-    provider = _provider_for_status(entries, settings)
+    provider = provider_for_status(entries, settings)
     seen: set[str] = set()
-    for entry in entries:
-        view = status_mod.gather(entry, settings, provider=provider)
+    for view in gather_all(entries, settings, provider):
         seen.update(job.job_id for job in view.queue + view.running + view.finished)
         print(
             status_mod.render(
@@ -778,41 +739,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.all and not args.suspects:
         _print_unhosted(settings, seen, args.host)
     return EXIT_OK
-
-
-def _status_json(
-    args: argparse.Namespace,
-    settings: Settings,
-    read: RegistryRead,
-    entries: list[HostEntry],
-    since_s: float | None,
-) -> int:
-    """One JSON document on stdout, whatever happened. Notes stay on stderr."""
-    provider = _provider_for_status(entries, settings) if entries else None
-    views = [status_mod.gather(entry, settings, provider=provider) for entry in entries]
-    errors = list(read.errors)
-    if read.unreadable:
-        errors.append(
-            f"{hosts_file()} could not be read, so `hosts` is empty because nothing is known"
-        )
-    print(
-        json.dumps(
-            status_mod.document(views, errors=errors, recent=args.recent, since_s=since_s),
-            indent=2,
-        )
-    )
-    return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
-
-
-def _provider_for_status(entries: list[HostEntry], settings: Settings) -> Provider | None:
-    """Only build a provider when an ephemeral host is on screen, and never fail on it."""
-    if not any(entry.kind == "runpod" for entry in entries):
-        return None
-    try:
-        return make_provider(settings)
-    except ProviderError as exc:
-        print(f"note: pod status unavailable: {exc}", file=sys.stderr)
-        return None
 
 
 def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None) -> None:
@@ -882,27 +808,6 @@ def _outputs_lost_ids(s3: S3Index | None, entries: Sequence[IndexEntry]) -> set[
     return lost
 
 
-def find_job_host(
-    job_id: str, registry: Registry, explicit: str | None
-) -> tuple[HostEntry, IndexEntry | None]:
-    index = LocalIndex().get(job_id)
-    if explicit:
-        return registry.require(explicit), index
-    if index is not None and index.host in registry.hosts:
-        return registry.hosts[index.host], index
-    for entry in registry.hosts.values():
-        try:
-            payload = open_session(entry).host_json(f"status {shlex.quote(job_id)}", timeout=60.0)
-        except (RemoteError, TransportError):
-            continue
-        if payload.get("jobs"):
-            return entry, index
-    raise NotFound(
-        f"no registered host knows job {job_id}.\n"
-        f"Pass --host <name>, or check `gpuc host list` and `gpuc status --all`."
-    )
-
-
 def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
     """`(host, directory, fallback)` for a host name or a job id.
 
@@ -957,55 +862,21 @@ def cmd_ssh(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    entry, _ = find_job_host(args.job_id, named_registry(), args.host)
-    payload = open_session(entry, load_settings()).host_json(f"cancel {shlex.quote(args.job_id)}")
-    # The host's own word for what it did: `cancelled` for a queued job it
-    # dequeued, `cancelling` for a running one whose runner has been marked.
-    status = payload.get("status")
+    document = cancel_job(args.job_id, args.host, load_settings())
     if args.json:
-        jsonout.emit({"job_id": args.job_id, "host": entry.name, "status": status})
+        jsonout.emit(document)
     else:
-        print(f"job {args.job_id} on host {entry.name}: {status}")
+        print(f"job {args.job_id} on host {document['host']}: {document['status']}")
     return EXIT_OK
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
-    entry, _ = find_job_host(args.job_id, named_registry(), args.host)
-    session = open_session(entry, load_settings())
-    result = session.host_cli(f"reorder {shlex.quote(args.job_id)} {args.priority}", check=False)
-    if result.returncode != 0:
-        raise CliError(
-            f"job {args.job_id} is not in host {entry.name}'s queue, so its priority cannot "
-            f"change (a running or finished job cannot be reordered)."
-        )
+    document = reorder_job(args.job_id, args.priority, args.host, load_settings())
     if args.json:
-        jsonout.emit({"job_id": args.job_id, "host": entry.name, "priority": args.priority})
+        jsonout.emit(document)
     else:
-        print(f"job {args.job_id} on host {entry.name} moved to priority {args.priority}")
+        print(f"job {args.job_id} on host {document['host']} moved to priority {args.priority}")
     return EXIT_OK
-
-
-def mirror_estimate(job_id: str, minutes: float | None, settings: Settings) -> str | None:
-    """Put the new estimate in the job's mirrored spec too, or say why not.
-
-    `requeue` submits what the *mirror* holds, so leaving it behind would hand
-    a re-run of an estimated job back with no estimate, silently. A mirror that
-    cannot be updated is a note and never a failure: the estimate is already
-    recorded where `status` reads it, which is what was asked for.
-    """
-    s3 = S3Index.from_settings(settings)
-    if s3 is None:
-        return None
-    try:
-        document = s3.get_spec(job_id)
-        document["estimated_runtime_min"] = minutes
-        s3.put_spec_document(job_id, document)
-    except (S3IndexError, S3ObjectMissing, ValueError) as exc:
-        return (
-            f"the host has the new estimate, but its mirrored spec still has the old one, "
-            f"so `gpuc requeue {job_id}` would not carry it: {str(exc).splitlines()[0]}"
-        )
-    return None
 
 
 def cmd_estimate(args: argparse.Namespace) -> int:
@@ -1015,57 +886,19 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     and the job that most needs one is the long job already running when the
     next person arrives -- which is too late to edit a file before `submit`.
     """
-    if args.clear is (args.minutes is not None):
-        raise UsageError("give --minutes N or --clear, not both")
-    wanted: float | None = None if args.clear else args.minutes
-    if wanted is not None and not wanted > 0.0:
-        raise UsageError(f"--minutes must be a positive number of minutes, got {wanted:g}")
-    if wanted is not None and jobs.utc_in(wanted * 60.0) is None:
-        # An `inf`, or the `1e10` units typo: no date can hold it, so the host
-        # would record it and then publish no eta at all.
-        raise UsageError(f"--minutes {wanted:g} is too far away to be an end time")
-    settings = load_settings()
-    entry, _ = find_job_host(args.job_id, named_registry(), args.host)
-    session = open_session(entry, settings)
-    request = "--clear" if wanted is None else repr(wanted)
-    # `check=False`: a refusal (a finished job, an id this host does not know)
-    # *is* the host's document, and raising on the exit code would throw away
-    # the reason it gave for one that only says it exited 1.
-    payload = session.host_json(f"estimate {shlex.quote(args.job_id)} {request}", check=False)
-    document = payload if isinstance(payload, dict) else {}
-    error = document.get("error")
-    if error:
-        raise CliError(f"host {entry.name} did not set the estimate: {error}")
-    recorded = document.get("estimated_runtime_min")
-    if wanted is not None and not isinstance(recorded, (int, float)):
-        # Otherwise a host that answered with something else -- a build that
-        # does not know this command, a document with the key missing --
-        # reports a successful *clear* of a job it never touched.
-        raise CliError(
-            f"host {entry.name} did not say what estimate it recorded for {args.job_id}: "
-            f"{json.dumps(payload)[:200]}"
-        )
-    warnings = [str(document["warning"])] if document.get("warning") else []
-    note = mirror_estimate(args.job_id, wanted, settings)
-    if note:
-        warnings.append(note)
-    for text in warnings:
+    wanted = check_estimate(args.minutes, clear=args.clear)
+    document = estimate_job(args.job_id, wanted, args.host, load_settings())
+    for text in document["warnings"]:
         print(f"WARNING: {text}", file=sys.stderr)
+    recorded = document["estimated_runtime_min"]
+    host = document["host"]
     if args.json:
-        jsonout.emit(
-            {
-                "job_id": args.job_id,
-                "host": entry.name,
-                "estimated_runtime_min": recorded,
-                "status": document.get("status"),
-                "warnings": warnings,
-            }
-        )
+        jsonout.emit(document)
     elif recorded is None:
-        print(f"job {args.job_id} on host {entry.name} no longer estimates a runtime")
+        print(f"job {args.job_id} on host {host} no longer estimates a runtime")
     else:
         shown = f"{recorded:g}" if isinstance(recorded, (int, float)) else recorded
-        print(f"job {args.job_id} on host {entry.name} now estimates {shown} min")
+        print(f"job {args.job_id} on host {host} now estimates {shown} min")
     return EXIT_OK
 
 
@@ -1076,17 +909,6 @@ def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str
     return ["bash", "-lc", command]
 
 
-@dataclass
-class LogText:
-    """A job's log and where it was read from, for both output forms."""
-
-    source: str
-    """`host` or `s3`."""
-    location: str | None
-    text: str = ""
-    notes: list[str] = field(default_factory=list)
-
-
 def cmd_logs(args: argparse.Namespace) -> int:
     if args.json and args.follow:
         raise UsageError(
@@ -1094,60 +916,17 @@ def cmd_logs(args: argparse.Namespace) -> int:
             "document has to be complete. Drop one of them."
         )
     settings = load_settings()
-    entry, index = find_job_host(args.job_id, named_registry(), args.host)
-    remote = None
-    purged = False
-    try:
+    if args.follow:
+        entry, _ = find_job_host(args.job_id, named_registry(), args.host)
         session = open_session(entry, settings)
-        remote = f"{session.job_dir(args.job_id)}/log.txt"
-        if args.follow:
-            return _follow(session.transport, remote, args.lines)
-        result = session.transport.tail(remote, lines=args.lines)
-        if result.returncode == 0:
-            return _write_log(args, entry, LogText("host", remote, result.stdout))
-        purged = _job_dir_gone(session, args.job_id)
-        why = (result.output.strip().splitlines() or ["no log file on the host"])[-1]
-    except (RemoteError, TransportError) as exc:
-        why = str(exc).splitlines()[0]
-    # A job dir that is gone entirely is what `gpuc clean --purge` does on
-    # purpose. Saying "purged" beats printing a `tail: No such file`.
-    note = (
-        f"job {args.job_id} was purged from host {entry.name} "
-        f"(gpuc clean --purge removes the whole job dir once it is mirrored)"
-        if purged
-        else f"could not read {remote or 'the host log'}: {why}"
-    )
-    print(f"note: {note}", file=sys.stderr)
-    log = _logs_from_s3(args.job_id, entry, index, settings, purged=purged)
-    log.notes.insert(0, note)
-    return _write_log(args, entry, log)
-
-
-def _write_log(args: argparse.Namespace, entry: HostEntry, log: LogText) -> int:
-    """Bytes for a human; lines plus where they came from for a script."""
+        return _follow(session.transport, f"{session.job_dir(args.job_id)}/log.txt", args.lines)
+    entry, log = read_log(args.job_id, args.host, args.lines, settings)
+    # Bytes for a human; lines plus where they came from for a script.
     if args.json:
-        jsonout.emit(
-            {
-                "job_id": args.job_id,
-                "host": entry.name,
-                "source": log.source,
-                "location": log.location,
-                "lines": log.text.splitlines(),
-                "notes": log.notes,
-            }
-        )
+        jsonout.emit(log.document(args.job_id, entry.name))
     else:
         sys.stdout.write(log.text)
     return EXIT_OK
-
-
-def _job_dir_gone(session: HostSession, job_id: str) -> bool:
-    """Is the job dir itself missing, rather than just its log?"""
-    try:
-        result = session.run(f"test -d {shlex.quote(session.job_dir(job_id))}", timeout=30.0)
-    except TransportError:
-        return False
-    return result.returncode != 0
 
 
 def _follow(transport: Transport, remote: str, lines: int) -> int:
@@ -1156,35 +935,6 @@ def _follow(transport: Transport, remote: str, lines: int) -> int:
         return subprocess.call(argv)
     except KeyboardInterrupt:
         return 0
-
-
-def _logs_from_s3(
-    job_id: str,
-    entry: HostEntry,
-    index: IndexEntry | None,
-    settings: Settings,
-    *,
-    purged: bool = False,
-) -> LogText:
-    s3 = S3Index.from_settings(settings)
-    prefix = (index.s3_prefix if index else None) or entry.s3_prefix
-    if s3 is None or not prefix:
-        gone = (
-            f"Its job dir was purged from host {entry.name}, so this log no longer exists "
-            f"anywhere.\n"
-            if purged
-            else ""
-        )
-        raise CliError(
-            f"no S3 mirror to fall back on for {job_id}.\n"
-            f"{gone}"
-            f"Set s3_bucket in ~/.config/gpu-coordinator/config.toml to keep logs after a "
-            f"host goes away."
-        )
-    uri = job_log_uri(prefix, job_id)
-    fallback = f"falling back to the S3 mirror at {uri}"
-    print(f"note: {fallback}", file=sys.stderr)
-    return LogText("s3", uri, s3.get_uri(uri), [fallback])
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
@@ -1286,17 +1036,18 @@ def cmd_version(args: argparse.Namespace) -> int:
     The host commits are read from the registry, which bootstrap wrote -- no
     ssh, so this stays a command you can run before anything else.
     """
-    commit = version_mod.local_commit()
-    source = "installed" if version_mod.installed_commit() else "source checkout"
-    dirty = " (+uncommitted changes)" if version_mod.dirty() else ""
-    if args.json:
-        return _version_json(commit, source=source, dirty=bool(dirty))
-    print(f"gpuc {version_mod.__version__}")
-    print(f"commit {version_mod.short(commit)} [{source}]{dirty}")
-    print(f"python {sys.version.split()[0]} at {sys.executable}")
     read = read_registry()
     for error in read.errors:
         print(f"warning: {error}", file=sys.stderr)
+    if args.json:
+        jsonout.emit(version_document(read))
+        return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
+    commit = version_mod.local_commit()
+    source = "installed" if version_mod.installed_commit() else "source checkout"
+    dirty = " (+uncommitted changes)" if version_mod.dirty() else ""
+    print(f"gpuc {version_mod.__version__}")
+    print(f"commit {version_mod.short(commit)} [{source}]{dirty}")
+    print(f"python {sys.version.split()[0]} at {sys.executable}")
     hosts = [e for e in read.registry.hosts.values() if e.bootstrapped_at]
     if not hosts:
         print("hosts: none bootstrapped")
@@ -1313,38 +1064,31 @@ def cmd_version(args: argparse.Namespace) -> int:
     return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
 
 
-def _version_json(commit: str | None, *, source: str, dirty: bool) -> int:
-    """`gpuc version --json`: this build, and each bootstrapped host's package.
+def cmd_web_set_password(args: argparse.Namespace) -> int:
+    if args.stdin:
+        password = sys.stdin.readline().rstrip("\r\n")
+    else:
+        password = getpass.getpass("dashboard password: ")
+        if password != getpass.getpass("again: "):
+            raise UsageError("the two passwords differ; nothing was written")
+    path = web_mod.write_password(password)
+    print(f"wrote {path} (0600)\nserve the dashboard with: gpuc web serve")
+    return EXIT_OK
 
-    `hosts[].current` is the same judgement the text output prints as `OLDER:
-    re-bootstrap`: a commit that does not match this build's. Nothing recorded
-    on either side is not evidence of a mismatch, so it reads as current --
-    `submit` re-ships the package to such a host anyway.
-    """
-    read = read_registry()
-    for error in read.errors:
-        print(f"warning: {error}", file=sys.stderr)
-    hosts = [entry for entry in read.registry.hosts.values() if entry.bootstrapped_at]
-    jsonout.emit(
-        {
-            "version": version_mod.__version__,
-            "commit": commit,
-            "source": source,
-            "dirty": dirty,
-            "python": sys.version.split()[0],
-            "executable": sys.executable,
-            "hosts": [
-                {
-                    "name": entry.name,
-                    "pkg_commit": entry.pkg_commit,
-                    "current": version_mod.same_commit(commit, entry.pkg_commit),
-                }
-                for entry in hosts
-            ],
-            "errors": list(read.errors),
-        }
+
+def cmd_web_serve(args: argparse.Namespace) -> int:
+    server = web_mod.make_server(args.bind, args.port)
+    print(
+        f"gpuc dashboard on http://{args.bind}:{server.server_port}/ (Ctrl-C to stop)",
+        file=sys.stderr,
     )
-    return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("stopped", file=sys.stderr)
+    finally:
+        server.server_close()
+    return EXIT_OK
 
 
 def cmd_skill(args: argparse.Namespace) -> int:
@@ -1706,9 +1450,44 @@ def build_parser() -> argparse.ArgumentParser:
     config_init = config.add_parser("init", help="write a commented config.toml")
     config_init.add_argument("--force", action="store_true", help="overwrite an existing file")
     config_init.set_defaults(func=cmd_config_init)
-    config.add_parser("show", help="print the effective settings").set_defaults(
-        func=cmd_config_show
+    config_show = config.add_parser("show", help="print the effective settings")
+    add_json_flag(config_show)
+    config_show.set_defaults(func=cmd_config_show)
+
+    web = sub.add_parser(
+        "web", help="the web dashboard: serve it, or set the password it asks for"
+    ).add_subparsers(dest="web_command", required=True)
+    serve = web.add_parser(
+        "serve",
+        help="serve the dashboard over HTTP until Ctrl-C",
+        description="Every page and API call is behind the password `gpuc web set-password` "
+        "records. The dashboard is a thin view over the same code the CLI runs: what it "
+        "shows is `gpuc status --json`, `gpuc host list --json` and `gpuc config show "
+        "--json`, and what it can do is `gpuc cancel`, `gpuc reorder` and `gpuc estimate`.",
     )
+    serve.add_argument(
+        "--bind",
+        default=web_mod.DEFAULT_BIND,
+        metavar="ADDRESS",
+        help=f"address to listen on (default {web_mod.DEFAULT_BIND}; 0.0.0.0 for every "
+        f"interface, which is only sensible behind a VPN or a TLS proxy)",
+    )
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=web_mod.DEFAULT_PORT,
+        help=f"port to listen on (default {web_mod.DEFAULT_PORT})",
+    )
+    serve.set_defaults(func=cmd_web_serve)
+    set_password = web.add_parser(
+        "set-password", help="record the dashboard password (bcrypt-hashed, never stored)"
+    )
+    set_password.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read the password from the first line of stdin instead of prompting",
+    )
+    set_password.set_defaults(func=cmd_web_set_password)
     return parser
 
 
@@ -1837,26 +1616,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         first_run_note()
     try:
         return int(args.func(args))
-    except LocalStateUnreadable as exc:
-        return failed(args, str(exc), EXIT_LOCAL_STATE)
-    except HostNotFound as exc:
-        return failed(args, str(exc), EXIT_NOT_FOUND)
-    except (
-        CleanError,
-        CliError,
-        ConfigError,
-        SubmitError,
-        BootstrapError,
-        ProvisionError,
-        ProviderError,
-        RemoteError,
-        S3IndexError,
-        SkillError,
-        TransportError,
-    ) as exc:
-        return failed(args, str(exc), getattr(exc, "exit_code", EXIT_ERROR))
-    except json.JSONDecodeError as exc:
-        return failed(args, f"a host returned malformed JSON: {exc}", EXIT_ERROR)
+    except Exception as exc:
+        code = exit_code_for(exc)
+        if code is None:
+            raise
+        return failed(args, failure_message(exc), code)
 
 
 if __name__ == "__main__":

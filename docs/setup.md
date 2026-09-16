@@ -74,6 +74,18 @@ anything. A pod from `gpuc submit --runpod` gets `s3://<bucket>/gpuc/<pod-name>`
 derived automatically; a `local` or `ssh` host does **not** — set it by hand,
 and only on a host whose jobs can authenticate to that bucket.
 
+## The web dashboard
+
+```sh
+gpuc web set-password        # prompts twice; writes a bcrypt hash to ~/.config/gpu-coordinator/web-password (0600)
+gpuc web serve               # http://127.0.0.1:8646/ until Ctrl-C
+```
+
+One password guards every page and API call. `--bind 0.0.0.0` makes it
+reachable from other machines; there is no TLS, so do that only on a VPN
+interface or behind a proxy that terminates TLS. What it shows and does is in
+[usage.md](usage.md#the-web-dashboard).
+
 ## Credentials
 
 **This machine (boto3).** The S3 mirror uses boto3's default credential chain:
