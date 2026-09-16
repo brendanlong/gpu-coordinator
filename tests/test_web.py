@@ -539,3 +539,81 @@ def test_serve_binds_and_stops(
         assert server.server_address[1] > 0
     finally:
         server.server_close()
+
+
+# -- `serve --install` ----------------------------------------------------------
+
+
+def test_serve_install_writes_the_unit_and_does_not_enable_it(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from gpuc.control.web import service as service_mod
+
+    units = tmp_path / "systemd-user"
+    monkeypatch.setattr(service_mod, "systemd_dir", lambda: units)
+
+    def refuse(*a: object, **k: object) -> Any:
+        raise AssertionError("enabling is the user's call: nothing may spawn a process")
+
+    # Everything in `subprocess` funnels through Popen; and `--install` that
+    # fell through to the server would sit in serve_forever, not fail.
+    monkeypatch.setattr("subprocess.Popen", refuse)
+    monkeypatch.setattr(web, "make_server", refuse)
+    assert main(["web", "serve", "--bind", "0.0.0.0", "--port", "9000", "--install"]) == 0
+    unit = (units / "gpuc-web.service").read_text()
+    assert "ExecStart=/" in unit
+    assert "WantedBy=default.target" in unit
+    exec_line = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+    assert exec_line.endswith("web serve --bind 0.0.0.0 --port 9000")
+    assert f"Environment=GPUC_CONFIG_DIR={control_env / 'config'}" in unit
+    assert f"Environment=GPUC_STATE_DIR={control_env / 'state'}" in unit
+    assert f"EnvironmentFile=-{control_env / 'config'}/env" in unit
+    assert "Restart=on-failure" in unit
+    assert "StartLimitBurst=5" in unit
+    out = capsys.readouterr().out
+    assert "not enabled" in out
+    assert "systemctl --user enable --now gpuc-web.service" in out
+    assert "gpuc web set-password" in out, "no password is set, and the unit would only crash"
+
+
+def test_serve_install_is_quiet_about_the_password_once_one_is_set(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    password_hash: str,
+) -> None:
+    from gpuc.control.web import service as service_mod
+
+    monkeypatch.setattr(service_mod, "systemd_dir", lambda: tmp_path / "units")
+    path = password_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(password_hash + "\n")
+    assert main(["web", "serve", "--install"]) == 0
+    out = capsys.readouterr().out
+    assert "set-password" not in out
+    assert (tmp_path / "units" / "gpuc-web.service").exists()
+
+
+def test_serve_install_refuses_a_bind_that_would_rewrite_the_unit(
+    control_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.web import service as service_mod
+
+    monkeypatch.setattr(service_mod, "systemd_dir", lambda: tmp_path / "units")
+    bad = "0.0.0.0\nExecStart=/bin/echo pwned"
+    assert main(["web", "serve", "--bind", bad, "--install"]) == EXIT_USAGE
+    assert not (tmp_path / "units").exists()
+
+
+def test_exec_start_words_are_quoted_the_way_systemd_reads_them() -> None:
+    from gpuc.control.systemd import quote
+
+    assert quote("/home/me/.local/bin/gpuc") == "/home/me/.local/bin/gpuc"
+    assert quote("--bind") == "--bind"
+    assert quote("/home/my name/gpuc") == '"/home/my name/gpuc"'
+    assert quote("/home/100%/gpuc") == '"/home/100%%/gpuc"'
+    assert quote('a"b\\c') == '"a\\"b\\\\c"'

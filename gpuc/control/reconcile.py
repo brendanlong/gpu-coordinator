@@ -11,8 +11,6 @@ someone else their pod.
 from __future__ import annotations
 
 import contextlib
-import shutil
-import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -20,7 +18,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from gpuc.control.bootstrap import package_root
 from gpuc.control.config import (
     ConfigError,
     DesiredHost,
@@ -37,6 +34,7 @@ from gpuc.control.config import (
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.provision import CEILING_MINUTES, host_status
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
+from gpuc.control.systemd import gpuc_command, systemd_dir, write_units
 
 DEFAULT_INTERVAL_S = 60.0
 STRAY_GRACE_MINUTES = CEILING_MINUTES
@@ -455,18 +453,7 @@ def run_loop(
 
 def gpuc_argv() -> str:
     """An absolute command line for `gpuc reconcile --once`, for systemd."""
-    beside = Path(sys.executable).resolve().parent / "gpuc"
-    if beside.exists():
-        return f"{beside} reconcile --once"
-    installed = shutil.which("gpuc")
-    if installed:
-        return f"{Path(installed).resolve()} reconcile --once"
-    uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
-    return f"{uv} run --project {package_root()} gpuc reconcile --once"
-
-
-def systemd_dir() -> Path:
-    return Path.home() / ".config/systemd/user"
+    return gpuc_command(["reconcile", "--once"])
 
 
 def unit_files(interval_s: float = DEFAULT_INTERVAL_S) -> dict[str, str]:
@@ -498,14 +485,7 @@ WantedBy=timers.target
 
 def install(interval_s: float = DEFAULT_INTERVAL_S, report: Reporter = print) -> list[Path]:
     """Write the unit files only. Enabling is the user's call, not ours."""
-    directory = systemd_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    for name, body in unit_files(interval_s).items():
-        path = directory / name
-        path.write_text(body)
-        written.append(path)
-        report(f"wrote {path}")
+    written = write_units(systemd_dir(), unit_files(interval_s), report)
     report(
         f"not enabled. The service reads RUNPOD_API_KEY from {config_dir()}/env, which it does "
         f"not create:\n"

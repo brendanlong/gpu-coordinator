@@ -1077,6 +1077,9 @@ def cmd_web_set_password(args: argparse.Namespace) -> int:
 
 
 def cmd_web_serve(args: argparse.Namespace) -> int:
+    if args.install:
+        web_mod.install_service(args.bind, args.port)
+        return EXIT_OK
     server = web_mod.make_server(args.bind, args.port)
     print(
         f"gpuc dashboard on http://{args.bind}:{server.server_port}/ (Ctrl-C to stop)",
@@ -1477,6 +1480,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=web_mod.DEFAULT_PORT,
         help=f"port to listen on (default {web_mod.DEFAULT_PORT})",
+    )
+    serve.add_argument(
+        "--install",
+        action="store_true",
+        help="write (but do not enable) a systemd --user service that serves with these "
+        "flags at login, then print the systemctl lines to turn it on",
     )
     serve.set_defaults(func=cmd_web_serve)
     set_password = web.add_parser(
