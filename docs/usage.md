@@ -514,7 +514,17 @@ No policy ever touches a job that is not finished. `spec.json`, `state.json` and
 gpuc clean --host gpubox --all-finished --dry-run   # what would go, and how big
 gpuc clean --host gpubox --all-finished             # every succeeded/failed/cancelled job
 gpuc clean --host gpubox --older-than 7             # only jobs that ended over 7 days ago
+gpuc clean --host gpubox --only 20260101-120000-ab12,20260101-130000-cd34
 ```
+
+`--only ID[,ID...]` names the jobs itself, so it replaces `--all-finished` and
+`--older-than` rather than combining with them: an age horizon of 0 for exactly
+those jobs and no others. Naming ids is its own confirmation, so `--purge
+--only` needs no `--yes`, and the workdir sweep `--purge` implies is scoped to
+the same ids — purging one job does not reclaim every other finished job's venv
+on the way past. An id no job dir on the host matches is reported and the
+command exits 1; an empty `--only` is a usage error (exit 2), never a silent
+"everything" or a silent no-op.
 
 |  | `clean` | `clean --purge` |
 | --- | --- | --- |
@@ -594,6 +604,7 @@ than 1 GiB, with the `gpuc clean` line to run.
 | job is `failed: no-outputs` | the `outputs:` path was never written, or holds only what came with the checkout | check the job writes there, relative to the workdir; use a `{job_id}` subdirectory |
 | a host is out of disk, or `status` shows a `disk` line | finished jobs' workdirs (usually venvs) are still there | `gpuc clean --host <host> --all-finished`, and set `cleanup: always` on jobs you never need to inspect |
 | `gpuc host clean <host>` printed nothing useful | without `--uv-cache` it does nothing at all; it is not `gpuc clean` | `gpuc host clean <host> --uv-cache` prunes uv's cache; `gpuc clean --host <host> ...` is the one that frees job dirs |
+| one job dir is stuck and the rest of the host is fine | that job's mirror genuinely failed, so an age-based purge either misses it or sweeps up everything else | `gpuc clean --host <host> --purge --only <job-id>` (add `--force` to accept losing its only copy); it leaves every other job alone |
 | `clean --purge` skips everything as "not backed up" | the host has no `s3_prefix`, so nothing is mirrored and deleting a job dir would lose its log | `gpuc host set <host> --s3-prefix s3://bucket/gpuc/<host>` + `gpuc host bootstrap`, or accept the loss with `--force` |
 | `status` says a job's `outputs not uploaded` | the final upload of its `outputs:` failed, so the results exist only on that host | copy them off, or `gpuc requeue <id>`; a purge will not remove it until they are confirmed |
 | a job is `OUTPUTS LOST` | an ephemeral host drained, retried three times and gave up before terminating | the results are gone; fix the credential or bucket, then `gpuc requeue <id>` |

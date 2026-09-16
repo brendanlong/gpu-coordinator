@@ -233,6 +233,10 @@ Rules, and they are not optional:
 - `gpuc clean --host <host> --all-finished` removes finished jobs' workdirs
   (venvs). Records and logs stay until `--purge`, which only removes jobs whose
   log, state and outputs are confirmed mirrored.
+- `gpuc clean --host <host> --only <job-id>[,<job-id>]` does the same for named
+  jobs only, however recently they ended, and touches no other job. Add
+  `--purge` for their whole job dirs (plus `--force` for a job with no confirmed
+  mirror, which deletes its only copy).
 - After a host restarts with its `$HOME` wiped (`dispatcher DOWN`, or ssh
   failing outright): re-copy the SSH key if needed, then `gpuc host bootstrap
   <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` whatever

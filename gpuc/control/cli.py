@@ -20,7 +20,7 @@ from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
 from gpuc.control import version as version_mod
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_package
-from gpuc.control.clean import CleanError, clean_host, prune_uv_cache
+from gpuc.control.clean import CleanError, clean_host, parse_only, prune_uv_cache
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.config import (
     ConfigError,
@@ -461,6 +461,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     # Checked before the host lookup so a wrong command line answers in the
     # same way whether or not the host exists. `clean` owns the rule; keeping a
     # second copy here is what let the two disagree about the exit code.
+    only = parse_only(args.only)
     check_clean_flags(
         all_finished=args.all_finished,
         older_than_days=args.older_than,
@@ -469,6 +470,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         force=args.force,
         verify=args.verify,
         yes=args.yes,
+        only=only,
     )
     entry = named_registry().require(args.host)
     report = clean_host(
@@ -481,6 +483,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         force=args.force,
         verify=args.verify,
         yes=args.yes,
+        only=only,
     )
     if args.json:
         jsonout.emit(report.document())
@@ -1446,6 +1449,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     selection.add_argument(
         "--older-than", type=float, metavar="DAYS", help="only jobs that ended over DAYS ago"
+    )
+    selection.add_argument(
+        "--only",
+        metavar="ID[,ID...]",
+        help="exactly these job ids, however recently they ended; with --purge the "
+        "implied workdir sweep is scoped to them too, and no --yes is needed",
     )
     clean.add_argument(
         "--purge",

@@ -223,6 +223,10 @@ def candidates(
             continue
         workdir = paths.workdir(job_id)
         if not workdir.is_dir():
+            # Worth a line only when the caller named this job: otherwise it is
+            # every job a previous clean already dealt with.
+            if wanted is not None:
+                skipped.append(Skipped(job_id, "workdir already gone"))
             continue
         try:
             state = jobs.read_state(job_id)
@@ -519,6 +523,7 @@ def purge(
     force: bool = False,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
+    sweep_only: Iterable[str] | None = None,
 ) -> CleanResult:
     """Remove whole job dirs, then run the ordinary workdir sweep over the rest.
 
@@ -528,6 +533,11 @@ def purge(
     *purged* and nothing else -- it exists for the control side's `--verify`,
     which cannot let an unverified job dir go but has no reason to keep its
     venv either.
+
+    `sweep_only` narrows that implied sweep, and is what a user naming job ids
+    wants: purging two jobs should not also reclaim every other finished job's
+    venv. The two are separate because `--verify` needs both at once -- purge
+    the ids whose mirror answered, sweep the ids the user asked about.
     """
     picked, skipped = purge_candidates(
         older_than_days=older_than_days, now=now, force=force, only=only
@@ -544,7 +554,7 @@ def purge(
             continue
         result.purged.append(candidate)
     purged_ids = {candidate.job_id for candidate in result.purged}
-    sweep = clean(older_than_days=older_than_days, dry_run=dry_run, now=now)
+    sweep = clean(older_than_days=older_than_days, dry_run=dry_run, now=now, only=sweep_only)
     # In a dry run the purged dirs are still there, so the sweep sees their
     # workdirs too; counting both would report the same bytes twice.
     result.removed = [c for c in sweep.removed if c.job_id not in purged_ids]

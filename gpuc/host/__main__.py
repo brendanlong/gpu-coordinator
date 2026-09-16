@@ -146,26 +146,54 @@ def cmd_run(args: argparse.Namespace) -> int:
     return runner.run_job(args.job_id)
 
 
+def _selection(value: str | None) -> list[str] | None:
+    """A `--only`-style comma-separated list of job ids.
+
+    `--only ''` means "none of them", which is not the same as not passing it
+    at all: the control side's `--verify` sends exactly that when no
+    candidate's mirror could be confirmed.
+    """
+    return None if value is None else [j for j in value.split(",") if j]
+
+
+def _unknown_jobs(*selections: list[str] | None) -> list[str]:
+    """Named job ids this host has never heard of. Must be called before the
+    delete, or the jobs this very command purged would look like typos."""
+    named = {job_id for selection in selections if selection for job_id in selection}
+    if not named:
+        return []
+    known = set(jobs.list_job_ids())
+    return [f"{job_id}: no job with that id on this host" for job_id in sorted(named - known)]
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
+    only = _selection(args.only)
+    unknown = _unknown_jobs(only)
     result = cleanup.clean(
-        all_finished=args.all_finished,
+        # Naming a job id is the selection: a named job's age is not a reason
+        # to keep its workdir.
+        all_finished=args.all_finished or only is not None,
         older_than_days=args.older_than,
         dry_run=args.dry_run,
+        only=only,
     )
+    result.errors += unknown
     print(json.dumps(result.to_dict(), indent=2))
     return 1 if result.errors else 0
 
 
 def cmd_purge(args: argparse.Namespace) -> int:
+    only = _selection(args.only)
+    sweep_only = _selection(args.sweep_only)
+    unknown = _unknown_jobs(only, sweep_only)
     result = cleanup.purge(
         older_than_days=args.older_than,
         dry_run=args.dry_run,
         force=args.force,
-        # `--only ''` means "none of them", which is not the same as not
-        # passing it at all: the control side's `--verify` sends exactly that
-        # when no candidate's mirror could be confirmed.
-        only=None if args.only is None else [j for j in args.only.split(",") if j],
+        only=only,
+        sweep_only=sweep_only,
     )
+    result.errors += unknown
     print(json.dumps(result.to_dict(), indent=2))
     return 1 if result.errors else 0
 
@@ -208,6 +236,11 @@ def build_parser() -> argparse.ArgumentParser:
     selection = clean.add_mutually_exclusive_group(required=True)
     selection.add_argument("--all-finished", action="store_true")
     selection.add_argument("--older-than", type=float, metavar="DAYS")
+    selection.add_argument(
+        "--only",
+        help="comma-separated job ids whose workdirs may go, and no others, however "
+        "recently they ended. Empty means clean nothing.",
+    )
     clean.add_argument("--dry-run", action="store_true")
     clean.set_defaults(func=cmd_clean)
 
@@ -231,6 +264,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--only",
         help="comma-separated job ids that may be purged, and no others; the implied "
         "workdir sweep is unaffected. Empty means purge nothing.",
+    )
+    purge.add_argument(
+        "--sweep-only",
+        help="comma-separated job ids the implied workdir sweep may touch, and no "
+        "others; by default it covers every finished job past the horizon",
     )
     purge.set_defaults(func=cmd_purge)
 

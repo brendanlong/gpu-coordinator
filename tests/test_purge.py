@@ -308,6 +308,28 @@ def test_only_nothing_purges_nothing(gpuc_home: Path) -> None:
     assert paths.state_file(job_id).exists()
 
 
+def test_sweep_only_keeps_the_implied_sweep_off_every_other_job(gpuc_home: Path) -> None:
+    """What `gpuc clean --purge --only` sends: purge one job, sweep no others."""
+    keep = make_job()
+    go = make_job()
+    result = cleanup.purge(older_than_days=7.0, only=[go], sweep_only=[go])
+    assert [c.job_id for c in result.purged] == [go]
+    assert result.removed == []
+    assert paths.workdir(keep).is_dir()
+
+
+def test_sweep_only_still_reclaims_a_named_job_that_could_not_be_purged(
+    gpuc_home: Path,
+) -> None:
+    """The `--verify` shape: purge what the mirror confirmed, sweep what was asked."""
+    unverified = make_job()
+    result = cleanup.purge(older_than_days=7.0, only=[], sweep_only=[unverified])
+    assert result.purged == []
+    assert [c.job_id for c in result.removed] == [unverified]
+    assert paths.state_file(unverified).exists()
+    assert not paths.workdir(unverified).exists()
+
+
 # -- the host CLI -------------------------------------------------------------
 
 
@@ -335,3 +357,32 @@ def test_host_cli_purge_only_empty_means_none(
     make_job()
     assert host_cli.main(["purge", "--older-than", "0", "--only", ""]) == 0
     assert json.loads(capsys.readouterr().out)["purged"] == []
+
+
+def test_host_cli_purge_sweep_only_scopes_the_sweep(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    keep = make_job()
+    go = make_job()
+    assert host_cli.main(["purge", "--older-than", "0", "--only", go, "--sweep-only", go]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [c["job_id"] for c in payload["purged"]] == [go]
+    assert payload["removed"] == []
+    assert paths.workdir(keep).is_dir()
+
+
+def test_host_cli_purge_reports_a_job_id_it_has_never_heard_of(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = make_job()
+    selection = f"{job_id},20260101-000000-typo11"
+    assert (
+        host_cli.main(
+            ["purge", "--older-than", "0", "--only", selection, "--sweep-only", selection]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    # Named once, though both flags carried it, and the real job still went.
+    assert payload["errors"] == ["20260101-000000-typo11: no job with that id on this host"]
+    assert [c["job_id"] for c in payload["purged"]] == [job_id]
