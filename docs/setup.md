@@ -308,6 +308,12 @@ with a tally naming each failure and exits 1, while the hosts that did upgrade
 stay upgraded. The tally also counts any host entry this build could not read
 (skipped with a warning), because that host was not upgraded either.
 
+A host nothing has ever installed gpuc on -- registered with `gpuc host add`
+and not bootstrapped, by this machine or any other -- is refused by `gpuc
+submit` rather than half-installed on the way past: shipping the package to it
+would start a dispatcher with no uv under it, and the job would fail there
+instead of here.
+
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
 to enqueue on is not on this commit — read from the host's own `config.json`,
 which is also the read that tells them what the host's cards and mirror are,

@@ -109,7 +109,7 @@ def test_host_add_refuses_a_gpu_list_that_overlaps_the_hosts_own(
     one card to two jobs, which no warning would undo."""
     fake_host.put_file('{"host": "gpubox", "gpus": ["0", "1"]}', "/home/u/.gpuc/config.json")
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "1,2"]) == EXIT_ERROR
-    assert "claims 1 of them and not the rest" in capsys.readouterr().err
+    assert "shares 1 with that list without matching it" in capsys.readouterr().err
     assert load_registry().hosts == {}
     assert fake_host.config is not None and fake_host.config["gpus"] == ["0", "1"]
     # A disjoint list is a deliberate reassignment, and goes through.
@@ -126,7 +126,7 @@ def test_the_gpu_overlap_refusal_sees_through_index_and_uuid_spellings(
         '{"host": "gpubox", "gpus": ["GPU-a", "GPU-b"]}', "/home/u/.gpuc/config.json"
     )
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == EXIT_ERROR
-    assert "claims GPU-a of them and not the rest" in capsys.readouterr().err
+    assert "shares GPU-a with that list without matching it" in capsys.readouterr().err
     assert fake_host.config is not None and fake_host.config["gpus"] == ["GPU-a", "GPU-b"]
     # The same two cards by their other name is not a difference at all.
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0,1"]) == 0
@@ -140,12 +140,14 @@ def test_an_adopted_name_never_replaces_a_different_host_registered_here(
     `local` here too, and this machine has one of those."""
     register_host(name="local", gpus=GPU)
     fake_host.put_file('{"host": "local", "gpus": ["0"]}', "/home/u/.gpuc/config.json")
-    assert main(["host", "add", "desktop", "--ssh", "me@desktop"]) == EXIT_ERROR
+    assert main(["host", "add", "desktop", "--ssh", "me@desktop", "--idle-min", "99"]) == EXIT_ERROR
     err = capsys.readouterr().err
     assert "calls itself 'local'" in err
     assert "gpuc host remove local" in err
     assert load_registry().require("local").ssh is None
     assert set(load_registry().hosts) == {"local"}
+    # Refused before the flags reached the host, not after.
+    assert fake_host.config is not None and "idle_minutes" not in fake_host.config
 
 
 def test_a_second_machine_registers_the_same_box_and_agrees_with_the_first(
@@ -1021,6 +1023,26 @@ def test_submit_json_keeps_its_document_alone_and_its_warnings_on_stderr(
     assert "re-syncing the package" in captured.err
 
 
+def test_submit_refuses_a_host_nobody_has_ever_bootstrapped(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`host add` writes a config; it does not install anything. Re-shipping
+    the package to such a host would start a dispatcher with no uv under it,
+    and the job would fail there instead of here."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    register_host(name="bare", kind="ssh", ssh="me@bare", gpus=GPU, bootstrapped_at=None)
+    _fake_host_build(monkeypatch, {})
+
+    assert main(["submit", str(job), "--host", "bare"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "no gpuc on it yet" in err
+    assert "gpuc host bootstrap bare" in err
+
+
 def test_submit_keeps_the_cached_config_of_a_host_that_has_lost_its_own(
     control_env: Path,
     tmp_path: Path,
@@ -1681,7 +1703,15 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     register_host(name="zbox", kind="ssh", ssh="me@zbox")
     with registry_transaction() as registry:
-        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+        registry.put(
+            host_entry(
+                name="pod",
+                kind="runpod",
+                ssh="root@1.2.3.4",
+                pod_id="p1",
+                bootstrapped_at=None,
+            )
+        )
     attempted = bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     capsys.readouterr()
 

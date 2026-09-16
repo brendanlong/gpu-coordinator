@@ -57,7 +57,7 @@ def host_entry(
     gpuc_home: str | None = None,
     persistent_root: str | None = None,
     pod_id: str | None = None,
-    bootstrapped_at: str | None = None,
+    bootstrapped_at: str | None = SEEN_AT,
     python: str | None = None,
     uv: str | None = None,
     gpu_info: dict[str, GpuInfo] | None = None,
@@ -71,6 +71,10 @@ def host_entry(
     `config.json` that lives on the host, which a real entry only ever gets by
     reading it. Tests that are not about connecting say what the host holds
     here instead of staging an ssh round trip for it.
+
+    Bootstrapped by default, because "a registered host" in a test almost
+    always means one that is set up and can be submitted to; a test about a
+    host nobody has installed gpuc on passes `bootstrapped_at=None`.
     """
     cache_dir = config.pop("cache_dir", None)
     if cache_dir:

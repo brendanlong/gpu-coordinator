@@ -13,7 +13,7 @@ so it does not work offline, which is the point.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,7 +27,6 @@ from gpuc.control.config import (
 )
 from gpuc.control.remote import read_remote_config, resolve_home, write_remote_config
 from gpuc.control.transport import Transport
-from gpuc.host import jobs
 from gpuc.host.jobs import HostConfig
 
 
@@ -57,6 +56,7 @@ def connect_host(
     transport: Transport | None = None,
     force: bool = False,
     gpu_hint: str = "",
+    before_write: Callable[[HostEntry], None] = lambda entry: None,
 ) -> Connection:
     """Read the host's config (or write its first one) and return its entry.
 
@@ -65,6 +65,10 @@ def connect_host(
     override, written through to the host and reported field by field; on a
     host that has none they are its initial config, and `gpus` must be among
     them because nothing else can know which of the cards in the box are ours.
+
+    `before_write` is judged once the host's own name is known and before
+    anything is written to it, so a caller that refuses the result refuses it
+    without having changed the host first.
     """
     transport = transport or transport_for(address, settings)
     home = resolve_home(transport, address)
@@ -79,6 +83,10 @@ def connect_host(
         # name is `local` -- which would quietly rename somebody's ssh box.
         name = str(existing.get("host") or "") or address.name
         entry = address.model_copy(update={"name": name})
+        # Whatever else has to be true of the name we just took -- it is the
+        # caller's rule, and it is judged here, before the flags below reach
+        # somebody's host.
+        before_write(entry)
     else:
         if "gpus" not in patch:
             raise ConnectError(
@@ -123,13 +131,13 @@ def _apply(
 ) -> Connection:
     patch = _with_env(existing, patch, env_updates)
     changes = config_changes(existing, patch)
-    # A patch that would leave the file exactly as it is does not write it: a
-    # `gpuc host set` repeating what a host already says is not a reason to
-    # touch the file a dispatcher is reading.
-    merged = jobs.merged_config(existing, patch) if patch else existing
+    # A patch that changes nothing the host is not already doing does not write
+    # it: `gpuc host set` repeating what a host says is no reason to replace a
+    # file a dispatcher is reading, and it is what the report says happened.
+    # A host with no config at all is the exception -- there is the whole file.
     document = (
         write_remote_config(transport, home, patch, python=entry.python, env=entry.env)
-        if merged != existing
+        if patch and (changes or not existing)
         else existing
     )
     return Connection(
@@ -145,9 +153,10 @@ def _read_config(transport: Transport, home: str, name: str) -> dict[str, Any]:
     document = read_remote_config(transport, home)
     if document is None:
         raise ConnectError(
-            f"host {name} answered ssh but {home}/config.json could not be read.\n"
-            f"Check that {home} is readable by this user, or point the host somewhere else "
-            f"with --gpuc-home."
+            f"host {name} answered, but {home}/config.json could not be read -- and what a "
+            f"host is is that file, so nothing here will replace it.\n"
+            f"Check that it is readable by this user and holds JSON; delete it to set that "
+            f"host up again, or point somewhere else with --gpuc-home."
         )
     return document
 
@@ -211,7 +220,8 @@ def _refuse_overlapping_gpus(
     named = sorted(str(item) for item in wanted)
     raise ConnectError(
         f"host {address.name} is already configured with GPUs {', '.join(theirs)}, and "
-        f"--gpus {','.join(named)} claims {', '.join(shared)} of them and not the rest.\n"
+        f"--gpus {','.join(named)} shares {', '.join(shared)} with that list without "
+        f"matching it.\n"
         f"That is the one difference that can hand one card to two jobs, so it is refused "
         f"rather than warned about: drop --gpus to adopt what the host has, name a disjoint "
         f"set to reassign it, or pass --force if you are sure."

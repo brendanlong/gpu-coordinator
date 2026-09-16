@@ -229,7 +229,6 @@ def shipped_note(entry: HostEntry) -> str | None:
 def host_document(entry: HostEntry) -> dict[str, Any]:
     """One registered host as `gpuc host list --json` reports it.
 
-
     The address, the host's config as this machine last read it, and what the
     text listing computes from them. This command never asks the host
     anything, so everything out of that config is as of `config_seen_at` --

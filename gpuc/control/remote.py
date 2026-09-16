@@ -168,10 +168,13 @@ def read_remote_config(transport: Transport, home: str) -> dict[str, Any] | None
         return None
     if result.returncode != 0:
         return None
-    if NO_CONFIG in result.stdout:
-        return {}
+    # Parsed first: a config whose own values happen to hold the marker is
+    # still a config, and it is the one thing here that must not be mistaken
+    # for a host that has none.
     document = parse_last_json(result.stdout)
-    return document if isinstance(document, dict) else None
+    if isinstance(document, dict):
+        return document
+    return {} if NO_CONFIG in result.stdout else None
 
 
 def write_remote_config(

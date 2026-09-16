@@ -56,10 +56,10 @@ from gpuc.control.config import (
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
-    Registry,
     Settings,
     config_file,
     hosts_file,
+    load_registry,
     load_settings,
     read_registry,
     registry_transaction,
@@ -236,16 +236,27 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         env_updates=env_updates,
         force=args.force,
         gpu_hint="\n" + "\n".join(report.render(all_gpus=True).splitlines()[1:]),
+        before_write=lambda adopted: _refuse_a_taken_name(
+            load_registry().hosts.get(adopted.name), adopted, args.name
+        ),
     )
     entry = connection.entry
     with registry_transaction() as registry:
-        _refuse_a_taken_name(registry, entry, args.name)
+        current = registry.hosts.get(entry.name)
+        _refuse_a_taken_name(current, entry, args.name)
+        if current is not None:
+            # Re-registering a host this machine knows: its own bootstrap and
+            # the interpreter that bootstrap chose are still true, and worth
+            # more than what a probe can see.
+            entry = entry.with_cache(python=current.python).model_copy(
+                update={"bootstrapped_at": current.bootstrapped_at}
+            )
         registry.put(entry)
     print(_added_line(entry, connection, args.name))
     return 0
 
 
-def _refuse_a_taken_name(registry: Registry, entry: HostEntry, asked_for: str) -> None:
+def _refuse_a_taken_name(current: HostEntry | None, entry: HostEntry, asked_for: str) -> None:
     """Never let an adopted name replace a different host registered under it.
 
     A host's `config.json` says what it calls itself, and taking that name is
@@ -253,8 +264,10 @@ def _refuse_a_taken_name(registry: Registry, entry: HostEntry, asked_for: str) -
     as `local` on their own machine is called `local` here too, and registering
     it would otherwise overwrite *this* machine's `local` -- silently, since
     the address is the only thing that differs.
+
+    Judged before the host is written to as well as before the registry is, so
+    a refusal does not leave the flags applied to somebody's host.
     """
-    current = registry.hosts.get(entry.name)
     if entry.name == asked_for or current is None:
         return
     if (current.ssh, current.port, current.remote_home) == (
@@ -769,7 +782,19 @@ def ensure_package_current(
     Only the package and the dispatcher are re-shipped: uv, the interpreter and
     health cannot have gone stale, and the job is waiting.
     """
-    if not bootstrap or not entry.python:
+    if not bootstrap:
+        return entry
+    if not (entry.bootstrapped_at or entry.pkg_commit):
+        # Nothing has ever installed gpuc on this host -- not this machine, and
+        # not whoever else would have left a commit in its config. Re-shipping
+        # the package alone would start a dispatcher on a host with no uv and
+        # no interpreter of its own, and the first anyone would hear of it is
+        # the job failing there.
+        raise CliError(
+            f"host {entry.name} has no gpuc on it yet: nothing recorded here or in its own "
+            f"config says it was ever bootstrapped.\nRun: gpuc host bootstrap {entry.name}"
+        )
+    if not entry.python:
         return entry
     local = version_mod.local_commit()
     session = _try_session(entry, settings)
