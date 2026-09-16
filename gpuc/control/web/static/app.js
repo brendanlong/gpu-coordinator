@@ -85,6 +85,11 @@ function fmtEta(job) {
   return job.eta_s < 0 ? `overdue (${source})` : `${fmtDuration(job.eta_s)} (${source})`;
 }
 
+function fmtStarts(job) {
+  if (job.starts_in_s === null || job.starts_in_s === undefined) return "";
+  return job.starts_in_s < 60 ? "now" : `in ~${fmtDuration(job.starts_in_s)}`;
+}
+
 function fmtBytes(n) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let i = 0;
@@ -293,12 +298,13 @@ function queuedTable(host) {
     el("td", {}, jobLabel(job)),
     el("td", {}, priorityControl(host, job)),
     el("td", {}, job.estimated_runtime_min === null ? "" : `est ${fmtDuration(job.estimated_runtime_min * 60)}`),
+    el("td", {}, fmtStarts(job)),
     el("td", {}, links(job)),
     el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), cancelButton(host, job)),
   ));
   return el("div", {},
     el("div", { class: "section-label" }, "queued (lower priority dispatches first)"),
-    table([{ text: "job" }, { text: "priority" }, { text: "estimate" }, { text: "links" }, { text: "" }], rows),
+    table([{ text: "job" }, { text: "priority" }, { text: "estimate" }, { text: "starts" }, { text: "links" }, { text: "" }], rows),
   );
 }
 

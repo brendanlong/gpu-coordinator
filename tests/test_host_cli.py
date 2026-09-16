@@ -244,3 +244,32 @@ def test_status_reports_the_commit_the_host_was_bootstrapped_with(
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
     assert status["pkg_commit"] is None
+
+
+def test_status_reports_each_jobs_priority_and_card_count_from_its_spec(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The queue marker only carries a priority while the job is queued, and a
+    queued job holds no cards, so the spec is the only place either survives."""
+    job_id = queue.enqueue(make_spec(priority=12, gpus=2))
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0], FAKE_GPUS[1]])
+    queue.remove_marker(job_id)
+
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    assert status["queue"] == []
+    assert (status["jobs"][0]["priority"], status["jobs"][0]["gpus_requested"]) == (12, 2)
+
+
+def test_reorder_records_the_new_priority_in_the_spec(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Otherwise the priority a job was dispatched at is lost with its marker,
+    and `gpuc status` could only ever report a running job's as its original."""
+    job_id = queue.enqueue(make_spec(priority=50))
+    run(capsys, "reorder", job_id, "7")
+    assert jobs.read_spec(job_id).priority == 7
+
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    assert status["jobs"][0]["priority"] == 7

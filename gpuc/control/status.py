@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -77,6 +77,10 @@ class JobView:
     phase: str | None = None
     priority: int | None = None
     gpus: list[str] = field(default_factory=list)
+    gpus_requested: int | None = None
+    """How many cards the spec asked for. A queued job holds none yet, so this
+    is the only thing that says whether it is waiting for one card or eight.
+    None from a host on a build that does not report it."""
     reason: str | None = None
     exit_code: int | None = None
     attempt: int = 1
@@ -238,6 +242,11 @@ def _as_int(value: Any) -> int | None:
     return None if number is None else int(number)
 
 
+def _first_int(marker: int | None, reported: Any) -> int | None:
+    """`0` is a real priority -- the highest one -- so this cannot be an `or`."""
+    return marker if marker is not None else _as_int(reported)
+
+
 def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -355,6 +364,10 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
     A host on a different commit -- or a half-written state file -- must cost
     one missing row, never a traceback out of `gpuc status` for every host.
     """
+    # The queue marker is the priority the dispatcher is actually ordering by,
+    # so it wins while a job is queued; the job's own `priority` (from its
+    # spec) is what is left once the marker is gone, and is all a running job
+    # ever has.
     priorities = {
         e["job_id"]: _as_int(e.get("priority"))
         for e in payload.get("queue") or []
@@ -371,8 +384,9 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             name=entry.get("name", ""),
             status=entry.get("status", "queued"),
             phase=entry.get("phase"),
-            priority=priorities.get(entry["job_id"]),
+            priority=_first_int(priorities.get(entry["job_id"]), entry.get("priority")),
             gpus=list(entry.get("gpus") or []),
+            gpus_requested=_as_int(entry.get("gpus_requested")),
             reason=entry.get("reason"),
             exit_code=entry.get("exit_code"),
             attempt=entry.get("attempt", 1),
@@ -530,12 +544,157 @@ def _fmt_eta(job: JobView) -> str:
     return f" eta {format_duration(remaining)} ({source})"
 
 
+def _fmt_cards(job: JobView) -> str:
+    """` needs 3 gpus` on a queued job that wants more than one card.
+
+    The usual job wants exactly one and saying so on every line is noise, but a
+    job waiting for three is the answer to "there is a card free, why is it
+    still queued".
+    """
+    if job.gpus_requested is None or job.gpus_requested == 1:
+        return ""
+    return f" needs {job.gpus_requested} gpus"
+
+
+def _fmt_starts(job: JobView, starts: dict[str, float]) -> str:
+    """` starts in ~2h10m`: when this job's turn comes, where that is known."""
+    seconds = starts.get(job.job_id)
+    return "" if seconds is None else f" starts {_fmt_wait(seconds)}"
+
+
 def _fmt_estimate(job: JobView, *, total: bool = False) -> str:
     """` est 2h30m`: the whole run, not what is left of it. `total` says so out
     loud, for the lines that also carry elapsed or remaining times."""
     if job.estimated_runtime_min is None:
         return ""
     return f" est {format_duration(job.estimated_runtime_min * 60.0)}{' total' if total else ''}"
+
+
+def queue_start_estimates(view: HostView) -> dict[str, float]:
+    """Seconds until each queued job is expected to start, by job id.
+
+    The host's own dispatch rule run forward over the estimates it has: a card
+    comes free at the eta of the job holding it, the queue is walked in
+    priority order, and a job that fits into what is free before the job ahead
+    of it does starts first -- which is what the dispatcher does, since it
+    walks the whole queue on every pass rather than blocking on the head of it.
+
+    A job is in the answer or it is not: one whose turn depends on a job that
+    gave no estimate is absent, never guessed at. That is why a *later* job can
+    have a start time when an earlier one does not -- it fits in cards the
+    unestimated job is not holding.
+    """
+    # Nothing is dispatched on a paused or draining host, so every start time
+    # here would be an answer to a question nobody asked: when it would have
+    # started if the host were taking work.
+    if view.paused or view.draining or not view.queue:
+        return {}
+    # Release time per owned card: now if it is free, the holder's eta if it is
+    # busy, None when the holder offered no eta and the card is therefore not
+    # one anything can be scheduled onto.
+    cards: list[float | None] = []
+    running = {job.job_id: job for job in view.running}
+    for uuid in view.owned:
+        holder = running.get(view.gpu_holder(uuid) or "")
+        if holder is None:
+            cards.append(0.0)
+            continue
+        remaining = holder.eta_seconds
+        cards.append(None if remaining is None else max(0.0, remaining))
+    starts: dict[str, float] = {}
+    pending = list(view.queue)
+    clock = 0.0
+    blocked = False
+    while pending and not blocked:
+        for job in list(pending):
+            if job.gpus_requested is None:
+                # A host too old to say what a queued job asked for. It is
+                # ahead in the queue and will take cards we cannot count, so
+                # nothing behind it can be estimated either.
+                blocked = True
+                break
+            free = [
+                i for i, release in enumerate(cards) if release is not None and release <= clock
+            ]
+            if len(free) < job.gpus_requested:
+                continue
+            done = (
+                None
+                if job.estimated_runtime_min is None
+                else clock + job.estimated_runtime_min * 60.0
+            )
+            for index in free[: job.gpus_requested]:
+                cards[index] = done
+            starts[job.job_id] = clock
+            pending.remove(job)
+        later = [release for release in cards if release is not None and release > clock]
+        if blocked or not later:
+            break
+        clock = min(later)
+    return starts
+
+
+def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
+    """Where one job sits in its host's queue, for `submit` and `reorder` to
+    print: the answer to "so when does it run".
+
+    Every field is null when the host could not be asked, which is not the same
+    as "not queued": the job was enqueued before this was ever looked up.
+    """
+    if not view.reachable:
+        return placement_unknown()
+    queued = [job.job_id for job in view.queue]
+    seconds = queue_start_estimates(view).get(job_id) if job_id in queued else None
+    return {
+        "queue_position": queued.index(job_id) + 1 if job_id in queued else None,
+        "queue_length": len(queued),
+        # Already running: it left the queue between the enqueue and this call,
+        # so `queue_position: null` here means dispatched, not unknown.
+        "dispatched": any(job.job_id == job_id for job in view.running),
+        "starts_in_s": None if seconds is None else round(seconds, 1),
+        "starts_at": _at(seconds),
+    }
+
+
+def placement_unknown() -> dict[str, Any]:
+    """Nobody could be asked. Not the same as "not queued": the enqueue already
+    happened, and every field being null is what says we do not know."""
+    return {
+        "queue_position": None,
+        "queue_length": None,
+        "dispatched": None,
+        "starts_in_s": None,
+        "starts_at": None,
+    }
+
+
+def queue_note(placement: dict[str, Any]) -> str | None:
+    """The one line `submit` and `reorder` print about the queue, or nothing
+    when the host could not be asked (their own output already says so)."""
+    if placement.get("dispatched"):
+        return "  queue: dispatched already; it is running now"
+    position = placement.get("queue_position")
+    if position is None:
+        return None
+    when = placement.get("starts_in_s")
+    starts = (
+        "start time unknown (a job ahead of it gave no estimate)"
+        if when is None
+        else f"starts {_fmt_wait(when)}"
+    )
+    return f"  queue: position {position} of {placement['queue_length']}; {starts}"
+
+
+def _at(seconds: float | None) -> str | None:
+    """A wait, as the wall-clock instant it lands on."""
+    if seconds is None:
+        return None
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+
+def _fmt_wait(seconds: float) -> str:
+    """`now` for a job the next dispatcher pass will take, `in ~2h10m` beyond that."""
+    return "now" if seconds < 60.0 else f"in ~{format_duration(seconds)}"
 
 
 def next_free_line(view: HostView) -> str | None:
@@ -693,8 +852,12 @@ def render(
             f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             f"{_fmt_eta(job)}"
         )
+    starts = queue_start_estimates(view)
     for job in view.queue:
-        lines.append(f"  queued  {_job_label(job)} prio={job.priority}{_fmt_estimate(job)}")
+        lines.append(
+            f"  queued  {_job_label(job)} prio={job.priority}{_fmt_cards(job)}"
+            f"{_fmt_estimate(job)}{_fmt_starts(job, starts)}"
+        )
     free = next_free_line(view)
     if free:
         lines.append(free)
@@ -771,12 +934,20 @@ def host_warnings(view: HostView) -> list[str]:
     return out
 
 
-def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
+def job_json(
+    job: JobView, mirror_prefix: str | None = None, *, starts_in_s: float | None = None
+) -> dict[str, Any]:
     """The text view's fields, named the same, with nothing rendered.
 
     `running` is the list automation should key on. It is the host's own
     answer, so an empty list here means the host said "nothing is running" --
     never "we could not ask", which is `reachable: false` and an `errors` entry.
+
+    `queued` is in dispatch order and every job carries the `priority` that
+    put it there, so sorting the list by `priority` reproduces the order the
+    host will actually take them in. `starts_in_s` and `starts_at` are when a
+    queued job's turn is expected to come, and are null for anything that is
+    not queued -- or whose turn depends on a job that gave no estimate.
 
     `links` is the one thing here the text view has no room for: where the
     job's outputs, its W&B run and its mirrored log can be opened, for a
@@ -799,6 +970,9 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "estimated_runtime_min": job.estimated_runtime_min,
         "progress_error": job.progress_error,
         "gpus": list(job.gpus),
+        "gpus_requested": job.gpus_requested,
+        "starts_in_s": None if starts_in_s is None else round(starts_in_s, 1),
+        "starts_at": _at(starts_in_s),
         "iso": job.isolation,
         "ended_at": job.ended_at,
         "outputs_pending": job.outputs_pending,
@@ -901,6 +1075,7 @@ def host_json(
     errors = [view.error] if view.error else []
     errors += host_warnings(view)
     finished = [job for job in view.finished if within(job, since_s)][:recent]
+    starts = queue_start_estimates(view)
     return {
         "name": entry.name,
         "kind": entry.kind,
@@ -919,7 +1094,9 @@ def host_json(
         "provider_util": list(view.pod.gpu_utils) if view.pod is not None else None,
         "pod": pod_json(view),
         "gpus": gpu_json(view),
-        "queued": [job_json(job, entry.s3_prefix) for job in view.queue],
+        "queued": [
+            job_json(job, entry.s3_prefix, starts_in_s=starts.get(job.job_id)) for job in view.queue
+        ],
         "running": [job_json(job, entry.s3_prefix) for job in view.running],
         "finished": [job_json(job, entry.s3_prefix) for job in finished],
         "errors": errors,

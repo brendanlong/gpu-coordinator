@@ -339,7 +339,31 @@ def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings
             f"job {job_id} is not in host {entry.name}'s queue, so its priority cannot "
             f"change (a running or finished job cannot be reordered)."
         )
-    return {"job_id": job_id, "host": entry.name, "priority": priority}
+    return {
+        "job_id": job_id,
+        "host": entry.name,
+        "priority": priority,
+        **queue_placement(entry, job_id, settings, session=session),
+    }
+
+
+def queue_placement(
+    entry: HostEntry, job_id: str, settings: Settings, *, session: HostSession | None = None
+) -> dict[str, Any]:
+    """Where the job now sits in the host's queue: what `submit` and `reorder`
+    answer "so when does it run" with.
+
+    Asked *after* the enqueue or the move, so it is best effort by
+    construction: whatever goes wrong here costs a document of nulls, never the
+    command's exit code -- the job is queued either way, and a submit that
+    printed a traceback over a job it had already enqueued would be worse than
+    one that said nothing about the queue.
+    """
+    try:
+        view = status_mod.gather(entry, settings, session=session)
+    except (ConfigError, ProviderError, RemoteError, TransportError, OSError):
+        return status_mod.placement_unknown()
+    return status_mod.queue_placement(view, job_id)
 
 
 def check_estimate(minutes: float | None, *, clear: bool) -> float | None:

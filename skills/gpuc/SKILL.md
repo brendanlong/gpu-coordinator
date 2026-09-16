@@ -134,7 +134,8 @@ gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc 
                                  # command's own exit code
 gpuc ssh <host|jobid> --print    # just print the ssh line, to copy
 gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
-gpuc reorder <jobid> --priority 10          # queued jobs only
+gpuc reorder <jobid> --priority 10          # queued jobs only; prints the new position and
+                                 # when the job is now expected to start
 gpuc estimate <jobid> --minutes 150
                                  # set estimated_runtime_min on a queued or running job
                                  # (--clear removes it); a running job picks it up within a minute
@@ -179,9 +180,17 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
 `name, kind, reachable, pkg_commit, dispatcher{alive, heartbeat_age_s},
 provider_util, gpus, queued, running, finished, errors`; each job in those three
-lists has `job_id, name, status, reason, phase, elapsed_s, util, progress_pct,
-eta, eta_s, estimated_runtime_min, progress_error, gpus, iso, ended_at,
-outputs_pending`.
+lists has `job_id, name, status, reason, phase, priority, elapsed_s, util,
+progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
+gpus_requested, iso, ended_at, outputs_pending`, and a queued job also has
+`starts_in_s, starts_at`.
+
+`priority` (0-99, **lower runs first**) is the field that explains queue order,
+and it is on running jobs too. `queued` is already in dispatch order, so
+`jq '.hosts[].queued | sort_by(.priority)'` reproduces it. `starts_in_s` is when
+that job's turn is expected to come, projected from the estimates of the jobs
+ahead of it; it is null when one of them estimated nothing, so absent means
+"not known", never "not soon".
 
 **Every command that has an answer takes `--json`**, and means the same thing by
 it: stdout is one object with `schema_version`, everything else the command says
@@ -190,10 +199,10 @@ scraping any of the text output.
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[]}` |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless) |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `cancel` | `{job_id, host, status}` |
-| `reorder` | `{job_id, host, priority}` |
+| `reorder` | `{job_id, host, priority}` plus the same queue fields as `submit`, so you can see the move take effect |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}` |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
@@ -211,6 +220,9 @@ Rules, and they are not optional:
 
 - **Key on the JSON `running` list**, never on scraped text and never on the
   exit code alone.
+- **Order a queue by `priority`, not by position in the file you read it from**
+  — and never by `eta` or `estimated_runtime_min`, which say how long a job
+  takes, not when it is taken.
 - **Exit 3 means "unknown", never "nothing is running".** Stop and say so;
   something local is broken, and jobs may well be running. The same goes for a
   non-empty top-level `errors`, and for `"reachable": false` on the host you

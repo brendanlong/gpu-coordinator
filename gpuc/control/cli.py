@@ -42,6 +42,7 @@ from gpuc.control.actions import (
     make_provider,
     named_registry,
     provider_for_status,
+    queue_placement,
     read_log,
     reorder_job,
     shipped_note,
@@ -721,7 +722,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             report=report,
         )
         result.notes.extend(notes)
-        return _queued(result, args)
+        return _queued(result, args, entry, settings)
     if not args.host:
         raise UsageError("submit needs --host <name> (see `gpuc host list`)")
     entry = named_registry().require(args.host)
@@ -729,17 +730,29 @@ def cmd_submit(args: argparse.Namespace) -> int:
     result = submit_file(
         entry, args.job_file, settings, workdir=Path.cwd(), use_git=use_git, report=report
     )
-    return _queued(result, args)
+    return _queued(result, args, entry, settings)
 
 
 def _queued(
-    result: SubmitResult, args: argparse.Namespace, *, requeued_from: str | None = None
+    result: SubmitResult,
+    args: argparse.Namespace,
+    entry: HostEntry,
+    settings: Settings,
+    *,
+    requeued_from: str | None = None,
 ) -> int:
-    """The last word of `submit` and `requeue`, in whichever form was asked for."""
+    """The last word of `submit` and `requeue`, in whichever form was asked for.
+
+    The queue is looked up again here rather than inferred from the enqueue:
+    the dispatcher the enqueue started may well have taken the job already, and
+    "position 3 of 5, starts in ~2h" is the thing the submitter actually wants
+    to know and cannot work out from a job id.
+    """
+    result.placement = queue_placement(entry, result.job_id, settings)
     if args.json:
         jsonout.emit(result.document(requeued_from=requeued_from))
         return EXIT_OK
-    print(result.render())
+    print(result.render(status_mod.queue_note(result.placement)))
     if requeued_from is not None:
         print(
             f"  requeued from {requeued_from} (attempt {result.attempt}); "
@@ -935,6 +948,9 @@ def cmd_reorder(args: argparse.Namespace) -> int:
         jsonout.emit(document)
     else:
         print(f"job {args.job_id} on host {document['host']} moved to priority {args.priority}")
+        note = status_mod.queue_note(document)
+        if note:
+            print(note)
     return EXIT_OK
 
 
@@ -1048,7 +1064,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         use_git=use_git,
         report=report,
     )
-    return _queued(result, args, requeued_from=args.job_id)
+    return _queued(result, args, entry, settings, requeued_from=args.job_id)
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
