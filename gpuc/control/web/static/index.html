@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gpuc dashboard</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>gpuc</h1>
+  <span id="updated" class="muted" aria-live="polite">loading…</span>
+  <span class="spacer"></span>
+  <label class="toggle"><input id="auto" type="checkbox" checked> auto-refresh</label>
+  <button id="refresh" type="button">Refresh</button>
+  <form method="post" action="/logout" class="inline"><button type="submit" class="quiet">Log out</button></form>
+</header>
+<main>
+  <div id="notices" class="notices" role="status"></div>
+  <section id="hosts" aria-labelledby="hosts-heading">
+    <h2 id="hosts-heading">Hosts</h2>
+    <div id="host-list" class="host-list"></div>
+  </section>
+  <section id="config" aria-labelledby="config-heading">
+    <h2 id="config-heading">Config</h2>
+    <div id="config-body"></div>
+  </section>
+</main>
+<aside id="log-panel" class="log-panel" hidden aria-labelledby="log-title">
+  <header>
+    <h2 id="log-title">log</h2>
+    <span id="log-where" class="muted"></span>
+    <span class="spacer"></span>
+    <label class="toggle"><input id="log-follow" type="checkbox"> follow</label>
+    <button id="log-refresh" type="button">Refresh</button>
+    <button id="log-close" type="button" class="quiet">Close</button>
+  </header>
+  <pre id="log-text" tabindex="0"></pre>
+</aside>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from gpuc.control import version
 from gpuc.control.config import HostEntry, Settings
@@ -112,6 +113,12 @@ class JobView:
     """This job's own watchdog settings, so `--suspects` names the jobs the host
     is actually about to kill -- and stays quiet about the ones that turned the
     watchdog off on purpose."""
+    outputs: list[dict[str, Any]] = field(default_factory=list)
+    """The spec's `outputs:` as the host reports them, `{job_id}` already
+    expanded: where this job's results went, or were meant to go."""
+    wandb: dict[str, str] = field(default_factory=dict)
+    """`entity`, `project` and `run_id` from the job's `WANDB_*` environment,
+    when it set them; enough to link to the run and nothing more."""
 
     @property
     def minutes(self) -> float | None:
@@ -233,6 +240,12 @@ def _as_int(value: Any) -> int | None:
 
 def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _str_dict(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, str)}
 
 
 def _parse(stamp: str | None) -> datetime | None:
@@ -371,6 +384,8 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             outputs_lost=bool(entry.get("outputs_lost")),
             isolation=entry.get("isolation"),
             low_util=LowUtilView.from_payload(entry.get("low_util")),
+            outputs=[o for o in entry.get("outputs") or [] if isinstance(o, dict)],
+            wandb=_str_dict(entry.get("wandb")),
         )
         if view.status == "running":
             running.append(view)
@@ -726,12 +741,16 @@ def stale_warning(entry: HostEntry) -> str | None:
     return version.stale_host_warning(entry.name, entry.pkg_commit, version.local_commit())
 
 
-def job_json(job: JobView) -> dict[str, Any]:
+def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
     """The text view's fields, named the same, with nothing rendered.
 
     `running` is the list automation should key on. It is the host's own
     answer, so an empty list here means the host said "nothing is running" --
     never "we could not ask", which is `reachable: false` and an `errors` entry.
+
+    `links` is the one thing here the text view has no room for: where the
+    job's outputs, its W&B run and its mirrored log can be opened, for a
+    dashboard to render as anchors. `mirror_prefix` is the host's `s3_prefix`.
     """
     return {
         "job_id": job.job_id,
@@ -739,6 +758,9 @@ def job_json(job: JobView) -> dict[str, Any]:
         "status": job.status,
         "reason": job.reason,
         "phase": job.phase,
+        "priority": job.priority,
+        "attempt": job.attempt,
+        "started_at": job.started_at,
         "elapsed_s": None if job.minutes is None else round(job.minutes * 60.0, 1),
         "util": job.last_util,
         "progress_pct": job.progress_pct,
@@ -750,7 +772,72 @@ def job_json(job: JobView) -> dict[str, Any]:
         "iso": job.isolation,
         "ended_at": job.ended_at,
         "outputs_pending": job.outputs_pending,
+        "outputs_lost": job.outputs_lost,
+        "suspect": job.suspect,
+        "workdir_bytes": job.workdir_bytes,
+        "outputs": [dict(o) for o in job.outputs],
+        "links": job_links(job, mirror_prefix),
     }
+
+
+S3_CONSOLE = "https://s3.console.aws.amazon.com/s3/buckets/{bucket}?prefix={prefix}"
+HF_TREE = "https://huggingface.co/{repo}/tree/main/{path}"
+WANDB_RUN = "https://wandb.ai/{entity}/{project}/runs/{run_id}"
+WANDB_PROJECT = "https://wandb.ai/{entity}/{project}"
+
+
+def s3_console_url(uri: str) -> str | None:
+    """The console page listing an `s3://bucket/key` prefix, or None for a non-S3 uri."""
+    if not uri.startswith("s3://"):
+        return None
+    bucket, _, key = uri[len("s3://") :].partition("/")
+    if not bucket:
+        return None
+    key = key.strip("/")
+    return S3_CONSOLE.format(
+        bucket=quote(bucket, safe=""), prefix=quote(key + "/" if key else "", safe="/")
+    )
+
+
+def job_links(job: JobView, mirror_prefix: str | None = None) -> list[dict[str, str | None]]:
+    """Where to open what this job wrote: one entry per destination it declared.
+
+    Every link is derived from what the job *said* it would do; none of them
+    is checked. An S3 output that the final sync never uploaded still gets a
+    link, and `outputs_pending` beside it is what says the link is empty.
+    """
+    links: list[dict[str, str | None]] = []
+    for output in job.outputs:
+        path = output.get("path") if isinstance(output.get("path"), str) else None
+        s3 = output.get("s3")
+        if isinstance(s3, str) and s3:
+            links.append({"kind": "s3", "path": path, "target": s3, "url": s3_console_url(s3)})
+        repo = output.get("hf")
+        if isinstance(repo, str) and repo:
+            sub = output.get("hf_path") if isinstance(output.get("hf_path"), str) else ""
+            target = f"{repo}/{sub}" if sub else repo
+            url = (
+                HF_TREE.format(repo=repo, path=quote(sub))
+                if sub
+                else f"https://huggingface.co/{repo}"
+            )
+            links.append({"kind": "hf", "path": path, "target": target, "url": url})
+    entity, project, run_id = (job.wandb.get(k) for k in ("entity", "project", "run_id"))
+    if entity and project:
+        template = WANDB_RUN if run_id else WANDB_PROJECT
+        url = template.format(
+            entity=quote(entity, safe=""),
+            project=quote(project, safe=""),
+            run_id=quote(run_id or "", safe=""),
+        )
+        target = f"{entity}/{project}" + (f"/{run_id}" if run_id else "")
+        links.append({"kind": "wandb", "path": None, "target": target, "url": url})
+    if mirror_prefix and job.status != "queued":
+        mirror = f"{mirror_prefix.rstrip('/')}/jobs/{job.job_id}"
+        links.append(
+            {"kind": "mirror", "path": None, "target": mirror, "url": s3_console_url(mirror)}
+        )
+    return links
 
 
 def gpu_json(view: HostView) -> list[dict[str, Any]]:
@@ -785,18 +872,40 @@ def host_json(
     return {
         "name": entry.name,
         "kind": entry.kind,
+        "target": entry.ssh,
         "reachable": view.reachable,
+        "pod_gone": view.pod_gone,
+        "draining": view.draining,
+        "paused": view.paused,
         "pkg_commit": entry.pkg_commit,
         "dispatcher": {
             "alive": view.dispatcher_alive,
             "heartbeat_age_s": view.heartbeat_age_s,
         },
         "provider_util": list(view.pod.gpu_utils) if view.pod is not None else None,
+        "pod": pod_json(view),
         "gpus": gpu_json(view),
-        "queued": [job_json(job) for job in view.queue],
-        "running": [job_json(job) for job in view.running],
-        "finished": [job_json(job) for job in finished],
+        "queued": [job_json(job, entry.s3_prefix) for job in view.queue],
+        "running": [job_json(job, entry.s3_prefix) for job in view.running],
+        "finished": [job_json(job, entry.s3_prefix) for job in finished],
         "errors": errors,
+    }
+
+
+def pod_json(view: HostView) -> dict[str, Any] | None:
+    """The provider's view of an ephemeral host's pod: the `pod` line, as data."""
+    pod = view.pod
+    if pod is None:
+        return None
+    return {
+        "id": pod.id,
+        "status": pod.status,
+        "gpu_name": pod.gpu_name,
+        "gpu_count": pod.gpu_count,
+        "cost_usd_hr": pod.cost_usd_hr,
+        "cuda_version": pod.cuda_version,
+        "age_s": None if pod.age is None else round(pod.age.total_seconds(), 1),
+        "past_ttl": view.past_ttl,
     }
 
 

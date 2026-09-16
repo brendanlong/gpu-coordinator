@@ -292,16 +292,41 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "iso",
         "ended_at",
         "outputs_pending",
+        "outputs_lost",
+        "suspect",
+        "priority",
+        "attempt",
+        "started_at",
+        "workdir_bytes",
+        "outputs",
+        "links",
     }
     assert (job["name"], job["status"], job["phase"]) == ("lego-s4", "running", "main")
     assert job["util"] == 95.0
     assert job["gpus"] == [GPU]
     assert job["iso"] == "cgroup"
     assert job["elapsed_s"] > 0
+    assert (job["outputs"], job["links"]) == ([], [])
 
     done = next(j for j in host["finished"] if j["job_id"] == FINISHED_JOB)
     assert done["reason"] == "low-util"
     assert done["outputs_pending"] is True
+    # Where the results were meant to go, and a console link to open it: the
+    # dashboard's anchors come from here, and the text view has no room for them.
+    assert done["outputs"] == [
+        {
+            "path": "results",
+            "s3": "s3://bucket/{job_id}",
+            "hf": None,
+            "hf_path": None,
+            "hf_create": False,
+        }
+    ]
+    (link,) = done["links"]
+    assert (link["kind"], link["path"], link["target"]) == ("s3", "results", "s3://bucket/{job_id}")
+    assert link["url"].startswith("https://s3.console.aws.amazon.com/s3/buckets/bucket?prefix=")
+    assert host["pod"] is None
+    assert (host["draining"], host["paused"], host["pod_gone"]) == (False, False, False)
 
     # One row for the owned card. Which shape it takes says whether nvidia-smi
     # on *this* machine could resolve it, which is not what this test is about.

@@ -255,6 +255,57 @@ have their own sections below and in [setup.md](setup.md). `gpuc version` prints
 this build, its commit, and each bootstrapped host's package commit, marking the
 ones to re-bootstrap; it reads the registry and never touches a host.
 
+**`gpuc web serve`** — the [web dashboard](#the-web-dashboard): the same
+status, host list and config in a browser, with cancel, re-prioritise, estimate
+and a log tail per job.
+
+## The web dashboard
+
+`gpuc web serve` is `gpuc status`, `gpuc host list` and `gpuc config show` on
+one page, refreshed every 15 seconds, with a button for each of `gpuc cancel`,
+`gpuc reorder` and `gpuc estimate` and a **Logs** panel that tails
+`gpuc logs` (tick *follow* to keep tailing). Every job also links to where its
+`outputs:` went — the S3 console for an `s3:` output, the repo tree for an `hf:`
+one — to its W&B run when the job's `env` names `WANDB_ENTITY`,
+`WANDB_PROJECT` (and `WANDB_RUN_ID`), and to its mirrored log under the host's
+`s3_prefix`. The links are derived from what the job *declared*, never checked:
+an `outputs not uploaded` flag beside one means the link is empty.
+
+```sh
+gpuc web set-password          # once; prompts twice, stores a bcrypt hash 0600
+gpuc web serve                 # http://127.0.0.1:8646/
+gpuc web serve --bind 0.0.0.0 --port 8646   # reachable from other machines
+```
+
+The whole interface — pages and API alike — is behind that one password. The
+server refuses to start until one is set. Sessions live in the server's memory
+(a restart logs everyone out) and the cookie is `HttpOnly; SameSite=Strict`, but
+there is **no TLS**: bind to localhost or a VPN interface, or put it behind a
+TLS-terminating proxy. Wrong guesses are answered one at a time with a growing
+pause.
+
+It is a thin wrapper over the same code the CLI runs, and it has no
+functionality of its own: what it shows is the `--json` documents, what it can
+do is the commands. The API it uses is plain HTTP, once the session cookie is
+held:
+
+| endpoint | the document |
+| --- | --- |
+| `GET /api/status?host=H&recent=N&since=24h` | `gpuc status --json`, plus `gathered_at` |
+| `GET /api/hosts` | `gpuc host list --json` |
+| `GET /api/config` | `gpuc config show --json` |
+| `GET /api/version` | `gpuc version --json` |
+| `GET /api/jobs/<id>/logs?lines=N&host=H` | `gpuc logs --json` |
+| `POST /api/jobs/<id>/cancel` `{host?}` | `gpuc cancel --json` |
+| `POST /api/jobs/<id>/reorder` `{priority, host?}` | `gpuc reorder --json` |
+| `POST /api/jobs/<id>/estimate` `{minutes}` or `{clear: true}` | `gpuc estimate --json` |
+
+A failure is the same `{schema_version, error, exit_code}` document the CLI
+prints, with the exit code mapped onto the status: 2 is 400, 3 is 503, 4 is
+404, 1 is 500. Terminating a host from the dashboard is not there yet, because
+the CLI has no command for it either (see [setup.md](setup.md#teardown)); when
+one is added the dashboard will call it.
+
 ## RunPod
 
 ```sh
@@ -465,8 +516,15 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 }
 ```
 
-The job objects in `queued`, `running` and `finished` all carry those sixteen
-fields. `eta` is absolute and `eta_s` is the same instant as seconds from now
+The job objects in `queued`, `running` and `finished` all carry those fields,
+plus `priority`, `attempt`, `started_at`, `outputs_lost`, `workdir_bytes`,
+`suspect` (the `--suspects` judgement), `outputs` (the spec's `outputs:` as the
+host holds them) and `links` — one `{kind, path, target, url}` per place the
+job's results, its W&B run or its mirrored log can be opened, for the
+[dashboard](#the-web-dashboard) to render; `kind` is `s3`, `hf`, `wandb` or
+`mirror`. Each host also carries `target` (its ssh target), `draining`,
+`paused`, `pod_gone` and `pod` (the provider's view of an ephemeral host's pod,
+null elsewhere). `eta` is absolute and `eta_s` is the same instant as seconds from now
 (negative once a job is overdue); both are null unless the job has a
 [length estimate](#job-length-estimates), and null again once it is finished.
 `progress_pct` is null unless the job measures its own, and survives the job so
@@ -490,8 +548,8 @@ Rules for anything automated:
 ### `--json` everywhere else
 
 `submit`, `requeue`, `logs`, `cancel`, `reorder`, `estimate`, `pods`, `version`,
-`clean`, `host list`, `host probe` and `reconcile --once` take `--json` too, under the
-same rules: **stdout is exactly one JSON object**, it carries `schema_version`,
+`clean`, `config show`, `host list`, `host probe` and `reconcile --once` take
+`--json` too, under the same rules: **stdout is exactly one JSON object**, it carries `schema_version`,
 and everything the text output would print alongside it — progress, warnings,
 `note:` lines — goes to stderr instead. The exit codes are the table above,
 unchanged by the flag.
@@ -519,6 +577,7 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. Exit 3 if the registry is unreadable |
+| `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}` — the effective settings, file or not |
 | `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]`. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
