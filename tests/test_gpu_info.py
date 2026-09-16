@@ -65,8 +65,8 @@ def test_host_list_names_the_cards_and_the_driver(control_env: Path, capsys) -> 
         registry.put(entry_with_cards())
     assert main(["host", "list"]) == 0
     out = capsys.readouterr().out
-    assert "gpus=2 (2x NVIDIA A40 45 GB, driver 580.65.06)" in out
-    assert f"[0] NVIDIA A40                   45 GB   {A40}" in out
+    assert "host gpubox [ssh] gpubox-ssh  gpus 2 (2x NVIDIA A40 45 GB, driver 580.65.06)" in out
+    assert f"gpu     [0] NVIDIA A40                   45 GB   {A40}" in out
 
 
 def test_status_names_the_cards_and_who_holds_them() -> None:
@@ -78,9 +78,12 @@ def test_status_names_the_cards_and_who_holds_them() -> None:
         running=[JobView(job_id="20260915-1", status="running", gpus=[A40])],
     )
     text = render(view)
-    assert "gpus 1/2 free (2x NVIDIA A40 45 GB, driver 580.65.06)" in text
-    assert f"gpu     [0] NVIDIA A40 45 GB  {A40}  busy 20260915-1" in text
-    assert f"gpu     [1] NVIDIA A40 45 GB  {A40_TWO}  free" in text
+    assert "gpus 1/2 free (driver 580.65.06)" in text
+    assert "gpu     [0] busy NVIDIA A40 45 GB" in text
+    assert "gpu     [1] free NVIDIA A40 45 GB" in text
+    # The UUIDs are `gpuc host list`'s job: this block answers "is there a card
+    # free", and a line of hex per card is what made it unreadable.
+    assert A40 not in text and A40_TWO not in text
 
 
 def test_a_host_registered_before_gpu_info_existed_still_lists(control_env: Path, capsys) -> None:
@@ -88,7 +91,8 @@ def test_a_host_registered_before_gpu_info_existed_still_lists(control_env: Path
         registry.put(HostEntry(name="old", gpus=["GPU-x"]))
     assert main(["host", "list"]) == 0
     out = capsys.readouterr().out
-    assert "gpus=1 (1x unknown GPU)" in out
+    assert "gpus 1 (1x unknown GPU)" in out
+    assert "pkg     unknown never bootstrapped" in out
     assert "GPU-x" in out
     assert load_registry().hosts["old"].gpu_info == {}
 

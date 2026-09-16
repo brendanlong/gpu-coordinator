@@ -145,8 +145,11 @@ called out, as are two entries naming one card: `gpuc host bootstrap` fails its
 `gpuc host set` edits one entry in place — only the flags you pass — instead of
 `remove` + `add`, which would drop everything else about the host. **Nothing on
 the host changes until the next `gpuc host bootstrap <name>`**, which is what
-rewrites its `config.json`. `gpuc host list` shows what is registered, with each
-card as `[index] name vram uuid` once the host has been probed or bootstrapped.
+rewrites its `config.json`. `gpuc host list` shows what is registered, one block per host, with each card
+as `gpu [index] name vram uuid` once the host has been probed or bootstrapped
+and a `pkg` line saying which commit it was last bootstrapped with. The
+interpreter path bootstrap chose is in `gpuc host list --json` and `gpuc host
+probe`.
 
 ### Hosts whose `$HOME` is wiped on restart
 

@@ -116,7 +116,7 @@ def test_a_full_window_of_floor_utilization_in_main_is_a_suspect() -> None:
     idle = view()
     idle.running[0].util_recent = [0.0] * 40
     assert [j.job_id for j in idle.suspects] == ["j-running"]
-    assert "SUSPECT j-running" in render(idle, suspects_only=True)
+    assert "SUSPECT train (j-running)" in render(idle, suspects_only=True)
 
 
 def test_the_suspect_rule_is_the_jobs_own_low_util_settings() -> None:
@@ -193,11 +193,28 @@ def test_a_cpu_only_job_is_never_a_suspect() -> None:
 
 def test_render_shows_the_host_line_queue_running_and_recent() -> None:
     text = render(view())
-    assert "host gpubox [ssh] me@box  dispatcher 2s ago  gpus 1/2 free" in text
-    assert "running j-running train phase=main" in text
+    assert "host gpubox [ssh]  gpus 1/2 free" in text
+    assert "  dispatcher 2s ago" in text
+    assert "running train (j-running) phase=main" in text
     assert "util 90%" in text
-    assert "queued  j-queued next prio=10" in text
-    assert "done    j-old prev failed (exit 17)" in text
+    assert "queued  next (j-queued) prio=10" in text
+    assert "done    prev (j-old) failed (exit 17)" in text
+
+
+def test_a_running_job_names_the_cards_it_holds_by_index() -> None:
+    """The other direction from the gpu lines: they say busy, the job says which."""
+    host_view = busy(running_job(gpus=[GPU, "GPU-b"]))
+    host_view.indices = {GPU: 2, "GPU-b": 3}
+    text = render(host_view)
+    assert "gpu=2,3" in text
+    assert "  gpu     [2] busy" in text and "  gpu     [3] busy" in text
+    assert "j-running" not in "\n".join(
+        line for line in text.splitlines() if line.startswith("  gpu ")
+    )
+
+
+def test_a_cpu_only_job_says_it_holds_no_card() -> None:
+    assert "gpu=none" in render(busy(running_job(gpus=[])))
 
 
 def test_an_unreachable_host_says_what_to_run_next() -> None:
@@ -239,6 +256,9 @@ def test_the_two_utilizations_say_where_they_came_from() -> None:
     text = render(pod_view)
     assert "provider util 71%" in text
     assert "util 90% (host)" in text
+    # ...and on a host with no pod there is no second percentage to confuse it
+    # with, so the tag is left off every running line.
+    assert "(host)" not in render(view())
     assert host_json(pod_view)["provider_util"] == [71]
     assert host_json(pod_view)["running"][0]["util"] == 90.0
     assert host_json(view())["provider_util"] is None
@@ -445,7 +465,7 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     assert host_view.owned == [GPU]
     assert host_view.free == []
     text = render(host_view)
-    assert "gpu     [0] ?" in text and GPU in text
+    assert "gpu     [0] busy ?" in text
     assert "gpu     [7] UNAVAILABLE" in text
     assert host_json(host_view)["gpus"][-1] == {"owned_as": "7", "available": False}
 

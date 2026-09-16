@@ -116,8 +116,8 @@ queued job, and, on a host with no free card where something holding one
 estimated an end time, one line saying when the next card is expected:
 
 ```
-  running …-a1b2c3 lego-s4 phase=main 96.2m util 98% (host) gpus=1 iso=cgroup eta 3h20m (37%)
-  queued  …-d4e5f6 sweep   prio=50 est 6h00m
+  running lego-s4 (20260915-120000-a1b2c3) phase=main 96.2m util 98% gpu=0 eta 3h20m (37%)
+  queued  sweep (20260915-130000-d4e5f6) prio=50 est 6h00m
   free    next card in ~3h20m (20260915-120000-a1b2c3)
 ```
 
@@ -159,10 +159,14 @@ host's package is older than this machine's (without it the package is re-synced
 and the dispatcher restarted first, see [setup.md](setup.md#upgrading)).
 `--runpod` and its flags are [below](#runpod).
 
-**`gpuc status`** — per host: kind, reachability, dispatcher heartbeat, owned
-cards (`free` / `busy <job-id>` / `UNAVAILABLE`), the queue, running jobs with
-phase, minutes, last util and any [end-time estimate](#job-length-estimates),
-and recent finished jobs. `--host H` narrows it;
+**`gpuc status`** — per host: kind, reachability, how many cards are free,
+dispatcher heartbeat, one line per owned card (`free` / `busy` / `UNAVAILABLE`,
+and what the card is), the queue, running jobs with phase, minutes, last util,
+the cards they hold (`gpu=2,3`) and any
+[end-time estimate](#job-length-estimates), and recent finished jobs. Every job
+is `name (job-id)`. It is the at-a-glance view: card UUIDs are in
+`gpuc host list`, everything a host can say about itself is in
+`gpuc host probe`, and `--json` carries more than either. `--host H` narrows it;
 `--recent N` (default 5) and `--since 24h|7d|90m` (a bare number means hours)
 choose how much of the finished list to show; `--all` adds jobs only the local
 index and the S3 index know, which is how you find what was on a host that lost
@@ -172,6 +176,25 @@ only in phase `main`, judged by **its own `low_util` settings** as the host
 reports them, so a job that raised its floor is judged by what it asked for and
 one with `enabled: false` is never listed. It also flags a pod past a TTL it
 actually has.
+
+```
+host local [local]  gpus 0/1 free (driver 580.173.02)
+  dispatcher 0s ago
+  gpu     [0] busy NVIDIA GeForce RTX 3060 Ti 8 GB
+  running lego-s4 (20260915-231241-f880d9) phase=main 27.2m util 100% gpu=0 eta 45m (37%)
+  done    hello (20260915-074344-1d4db4) succeeded 15h ago
+host spar [ssh]  gpus 0/2 free (driver 535.309.01)
+  dispatcher 2s ago
+  gpu     [2] busy NVIDIA A40 45 GB
+  gpu     [3] busy NVIDIA A40 45 GB
+  running paper-diff (20260915-222409-7a2b60) phase=main 75.7m util 100% gpu=2
+  running paper-plain (20260915-224057-9f10c3) phase=main 58.9m util 100% gpu=3
+  queued  sweep (20260915-233000-112233) prio=50 est 6h00m
+```
+
+A job's `util` is labelled `(host)` — the host's own nvidia-smi sampler — only
+on a host that also prints a pod line, where the provider's `provider util` is
+on screen to confuse it with.
 
 **`gpuc logs <job-id> [-f] [-n N] [--host H]`** — tails `log.txt` on the host
 (`-n` defaults to 200). If the host cannot produce it, gpuc says why — including

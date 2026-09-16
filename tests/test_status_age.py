@@ -69,7 +69,7 @@ def test_a_bad_duration_says_what_it_wanted() -> None:
 
 def test_done_lines_carry_the_age() -> None:
     text = render(view(finished("20260915-1", reason=None, minutes=3)))
-    assert "done    20260915-1 t succeeded 3m ago" in text
+    assert "done    t (20260915-1) succeeded 3m ago" in text
 
 
 def test_a_failure_reason_and_age_appear_together() -> None:

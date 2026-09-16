@@ -13,7 +13,7 @@ from typing import Any
 
 from gpuc.control import version
 from gpuc.control.config import HostEntry, Settings
-from gpuc.control.gpuinfo import GpuInfo, summarize
+from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.remote import HostSession, RemoteError, open_session
@@ -280,6 +280,19 @@ class HostView:
     def suspects(self) -> list[JobView]:
         return [job for job in self.running if job.suspect]
 
+    def gpu_label(self, uuid: str) -> str:
+        """What to call this card on a job's line: its index where we know it.
+
+        The index is what the gpu lines above are numbered by, so `gpu=2,3`
+        points at two of them. A card the host never resolved falls back to its
+        UUID rather than a `?` that could be any of several.
+        """
+        index = self.indices.get(uuid)
+        if index is None:
+            info = self.entry.gpu_info.get(uuid)
+            index = info.index if info else None
+        return uuid if index is None else str(index)
+
     def gpu_holder(self, uuid: str) -> str | None:
         """Which running job has this card, per the host's own state."""
         for job in self.running:
@@ -435,9 +448,32 @@ def pod_line(pod: Pod | None) -> str | None:
     )
 
 
-def _fmt_util(job: JobView) -> str:
-    """`(host)` names the source: the host's sampler, not the provider's."""
-    return "util -- (host)" if job.last_util is None else f"util {job.last_util:.0f}% (host)"
+def _fmt_util(job: JobView, *, source: bool = False) -> str:
+    """`(host)` names the source: the host's sampler, not the provider's.
+
+    Only worth saying where a provider's own reading is on screen -- on a host
+    with no pod line there is no second percentage to confuse it with, and the
+    tag is then a word on every running line that answers nothing.
+    """
+    tag = " (host)" if source else ""
+    return f"util --{tag}" if job.last_util is None else f"util {job.last_util:.0f}%{tag}"
+
+
+def _job_label(job: JobView) -> str:
+    """`name (job-id)`: the name is what a reader is looking for, the id is
+    what every other command takes as an argument."""
+    return f"{job.name} ({job.job_id})" if job.name else job.job_id
+
+
+def _fmt_gpus(view: HostView, job: JobView) -> str:
+    """Which cards this job holds, by the index the gpu lines above use.
+
+    The other direction from the gpu lines' old `busy <job-id>`: a job holding
+    four cards was four lines repeating its id, and this is one field.
+    """
+    if not job.gpus:
+        return "gpu=none"
+    return "gpu=" + ",".join(view.gpu_label(uuid) for uuid in job.gpus)
 
 
 def _fmt_minutes(job: JobView) -> str:
@@ -520,14 +556,16 @@ def owned_gpus(payload: dict[str, Any], entry: HostEntry) -> tuple[list[str], di
 
 
 def _gpu_lines(view: HostView) -> list[str]:
-    """One line per owned card: which one it is, what it is, and who has it."""
+    """One line per owned card: free or busy first, then what the card is.
+
+    No UUID and no holder: the question asked of this block is "is there a card
+    for my job", and the running lines below name their own cards. `gpuc host
+    list` is where UUIDs live, because that is where they are copied from.
+    """
     lines: list[str] = []
     for index, name, vram, uuid in gpu_rows(view.owned, view.entry.gpu_info, view.indices):
-        holder = view.gpu_holder(uuid)
-        lines.append(
-            f"  gpu     [{index}] {name} {vram}".rstrip()
-            + f"  {uuid}  {f'busy {holder}' if holder else 'free'}"
-        )
+        state = "busy" if view.gpu_holder(uuid) else "free"
+        lines.append(f"  gpu     [{index}] {state} {name} {vram}".rstrip())
     for missing in view.unavailable:
         lines.append(
             f"  gpu     [{missing}] UNAVAILABLE  nvidia-smi does not report this card on the "
@@ -576,18 +614,18 @@ def render(
         if view.dispatcher_alive
         else "dispatcher DOWN (submit or bootstrap restarts it)"
     )
-    summary = summarize(view.owned, entry.gpu_info) if view.owned else "no GPUs"
-    driver = f", driver {entry.driver_version}" if entry.driver_version else ""
-    header = (
-        f"host {entry.name} [{entry.kind}] {target}  {dispatcher}  "
-        f"gpus {len(view.free)}/{len(view.owned)} free ({summary}{driver})"
-    )
+    # The cards are named one per line below, so the header carries only the
+    # count a reader is deciding on: how many are free, right now.
+    cards = f"gpus {len(view.free)}/{len(view.owned)} free" if view.owned else "no GPUs"
+    driver = f" (driver {entry.driver_version})" if entry.driver_version else ""
+    header = f"host {entry.name} [{entry.kind}]  {cards}{driver}"
     if flags:
         header += "  " + " ".join(flags)
     lines = [header]
     stale = stale_warning(entry)
     if stale:
         lines.append(f"  WARNING {stale}")
+    lines.append(f"  {dispatcher}")
     if not suspects_only:
         lines += _gpu_lines(view)
     pod = pod_line(view.pod)
@@ -602,8 +640,8 @@ def render(
     if suspects_only:
         for job in view.suspects:
             lines.append(
-                f"  SUSPECT {job.job_id} {job.name or '-'} phase={job.phase} "
-                f"{_fmt_minutes(job)} {_fmt_util(job)}"
+                f"  SUSPECT {_job_label(job)} phase={job.phase} {_fmt_minutes(job)} "
+                f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             )
         if view.past_ttl:
             lines.append(f"  SUSPECT pod for host {entry.name} is older than {entry.ttl_hours}h")
@@ -614,14 +652,12 @@ def render(
     for job in view.running:
         mark = "  running" if not job.suspect else "  running!"
         lines.append(
-            f"{mark} {job.job_id} {job.name or '-'} phase={job.phase or '-'} "
-            f"{_fmt_minutes(job)} {_fmt_util(job)} gpus={len(job.gpus)} "
-            f"iso={job.isolation or '?'}{_fmt_eta(job)}"
+            f"{mark} {_job_label(job)} phase={job.phase or '-'} {_fmt_minutes(job)} "
+            f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
+            f"{_fmt_eta(job)}"
         )
     for job in view.queue:
-        lines.append(
-            f"  queued  {job.job_id} {job.name or '-'} prio={job.priority}{_fmt_estimate(job)}"
-        )
+        lines.append(f"  queued  {_job_label(job)} prio={job.priority}{_fmt_estimate(job)}")
     free = next_free_line(view)
     if free:
         lines.append(free)
@@ -637,7 +673,7 @@ def render(
         elif job.outputs_pending:
             flag = "  outputs not uploaded"
         lines.append(
-            f"  done    {job.job_id} {job.name or '-'} {job.status}"
+            f"  done    {_job_label(job)} {job.status}"
             f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
         )
     if since_s is not None and not finished and view.finished:

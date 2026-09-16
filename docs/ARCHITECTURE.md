@@ -372,7 +372,8 @@ The kill path becomes `systemctl --user stop <unit>` (SIGTERM, then SIGKILL
 after `TimeoutStopSec`), with the existing process-group kill kept as a
 fallback, and the dispatcher's backstop uses the unit when `state.json` records
 one. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are in `state.json` and
-shown by `gpuc status`. The probe runs once per dispatcher and is passed to
+in `gpuc status --json`; the text view leaves them out, because what a kill
+reaps is a question asked while debugging one job, not while scanning a host. The probe runs once per dispatcher and is passed to
 runners in `GPUC_ISOLATION`. On a host with no user systemd -- every RunPod pod,
 the shared box -- `pgid` is the mode and a daemonised grandchild still escapes;
 that is a documented hole, not a fixed one.
@@ -674,9 +675,10 @@ treated as unavailable (jobs wait, they do not fail), and reported by
 `gpuc status` and the health check's `gpu_uuids`. Owning UUIDs only costs no
 lookup at all: that mapping is the identity, and the host is not asked.
 
-`gpuc status` and `gpuc host list` show `[index] name vram uuid` per owned
-card -- the index from the host for `status`, and from the last probe for the
-offline listing. `gpuc host probe` lists the owned cards only, headed `N of M
+`gpuc host list` shows `[index] name vram uuid` per owned card, from the last
+probe; `gpuc status` shows `[index] free|busy name vram` from the host itself
+and names each running job's cards on the job's own line (`gpu=2,3`), because a
+UUID per card and a job id per card was most of what made that block unreadable. `gpuc host probe` lists the owned cards only, headed `N of M
 assigned to <host>`, because on a shared box the rest are somebody else's;
 `--all-gpus` lists all M with the owned ones marked, and a host that owns
 nothing (or whose entries resolve to nothing) sees every card, because a probe

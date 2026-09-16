@@ -396,7 +396,7 @@ def test_host_list_shows_the_root(control_env: Path, capsys: pytest.CaptureFixtu
     main(["host", "add", "gpubox", "--ssh", "gpubox", "--persistent-root", ROOT])
     capsys.readouterr()
     main(["host", "list"])
-    assert f"persistent root {ROOT} (gpuc home {ROOT}/gpuc)" in capsys.readouterr().out
+    assert f"root    {ROOT} (gpuc home {ROOT}/gpuc)" in capsys.readouterr().out
 
 
 # -- finding what was on a host that lost its state -----------------------
@@ -418,7 +418,7 @@ def test_status_all_lists_index_jobs_per_host(
     capsys.readouterr()
     assert main(["status", "--all"]) == 0
     out = capsys.readouterr().out
-    assert "20260101-000000-aaaaaa n-20260101-000000-aaaaaa host=gpubox" in out
+    assert "n-20260101-000000-aaaaaa (20260101-000000-aaaaaa) host=gpubox" in out
     assert "host=other" in out
     assert "gpuc requeue 20260101-000000-aaaaaa --host gpubox" in out
 

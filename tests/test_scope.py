@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.config import HostEntry
-from gpuc.control.status import HostView, job_views, render
+from gpuc.control.status import HostView, host_json, job_views
 from gpuc.host import jobs, paths, queue, runner, scope
 from gpuc.host.runner import RunnerDeps
 from tests.conftest import make_spec
@@ -206,12 +206,14 @@ def test_cancel_under_a_process_group_cannot_reach_a_double_forked_grandchild(
     assert jobs.read_state(job_id).status == "cancelled"
 
 
-def test_status_says_which_isolation_a_running_job_has() -> None:
+def test_status_json_says_which_isolation_a_running_job_has() -> None:
+    """Text dropped it -- what a kill reaps is a debugging question, and the
+    answer costs a column on every running line -- but automation still gets it."""
     queued, running, finished = job_views(
         {"jobs": [{"job_id": "j1", "status": "running", "phase": "main", "isolation": "cgroup"}]}
     )
     assert (queued, finished) == ([], [])
-    text = render(
+    document = host_json(
         HostView(entry=HostEntry(name="h"), reachable=True, heartbeat_age_s=1.0, running=running)
     )
-    assert "iso=cgroup" in text
+    assert document["running"][0]["iso"] == "cgroup"
