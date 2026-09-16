@@ -208,6 +208,12 @@ queue's lexical order, not submission order below one second.
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.
 - Reorder: `queue.reorder(jobid, prio)` renames the marker.
+- Estimate: `jobs.update_spec(jobid, estimated_runtime_min=N)` rewrites
+  `spec.json` (raw JSON, so keys another build wrote survive). Queued or
+  running, since a running job's runner re-reads the spec; see Job length
+  estimates. The control side then re-mirrors the spec, because `requeue`
+  submits what S3 holds and would otherwise drop the estimate silently; a
+  mirror it cannot write is a warning, not a failure.
 - Idle terminate (only when `config.provider` is set): if no running jobs
   and the queue has been empty for `idle_minutes`: write `draining`, retry any
   unconfirmed outputs, run one final sync of every job's state and log to
@@ -306,7 +312,14 @@ ever change a job's outcome:
   runner's start exactly as `max_runtime_min` is. The runner publishes it as
   `eta` at the top of *every* phase, not just `main`: a job twenty minutes into
   a `uv sync` is the one somebody most wants an end time for, and it looks
-  identical to a wedged one.
+  identical to a wedged one. It may also be set *after* submitting, with
+  `gpuc estimate <jobid> --minutes N`, which is only an edit of `spec.json`:
+  the monitor loop re-reads the spec every `SPEC_REFRESH_S` and republishes the
+  eta from it, so the estimate reaches a job that is already running -- exactly
+  the job nobody could have estimated in time. The same re-read picks up a
+  `progress_command` added mid-run, and its `progress_interval_s`. Those three
+  fields are the whole of it: they describe what the job *reports*, while the
+  command, the env and the outputs a run started with are what it ran with.
 - `progress_command` -- run in `workdir/` with the job's own environment, only
   during `main`, every `progress_interval_s`. Its **last non-empty line of
   stdout** says how far along it is, in one of exactly two forms: a fraction
@@ -343,9 +356,11 @@ It is logged the *first* time each distinct message appears, because this runs
 every interval for the rest of the job. `eta` is cleared when the job ends;
 `progress_pct` is not, because how far it had got when it died is the useful
 part. `gpuc status` renders the remaining time relative (`eta 3h20m`), tagged
-`(42%)` when it was measured and `(est)` when it was a guess, and adds one
+`(42%)` when it was measured and `(est)` when it was a guess -- falling back to
+` est <total>` on a running job whose host published no eta, so the text can
+never show less than `--json` does -- and adds one
 `free` line per fully-busy host saying when its next card is expected -- with a
-count of the running jobs that estimated nothing, since the true answer can only
+count of the running jobs that offered no end time, since the true answer can only
 be sooner. Only the jobs holding a card are considered, for both halves of that
 line; a host where none of them estimated an end time has no time to report, so
 it gets no `free` line rather than one saying so.
@@ -528,8 +543,8 @@ hold to, whatever the flags:
   `RUNPOD_API_KEY` first and exits 1 with a single line if it is unset, before
   mirroring a spec or picking a host. `reconcile --install` does not, since it
   only writes unit files.
-- A host name is looked up locally; `logs`, `cancel`, `reorder` and `requeue`
-  fall back to the job index and then to asking each host, and an id nothing
+- A host name is looked up locally; `logs`, `cancel`, `reorder`, `estimate` and
+  `requeue` fall back to the job index and then to asking each host, and an id nothing
   knows is exit 4, never a guess.
 - Nothing runs in the background on this side except the optional
   `gpuc reconcile` timer.

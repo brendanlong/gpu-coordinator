@@ -483,10 +483,17 @@ def _fmt_minutes(job: JobView) -> str:
 def _fmt_eta(job: JobView) -> str:
     """` eta 2h10m (42%)` when the job measures its own progress, ` eta 2h10m
     (est)` when all it has is the submitter's guess, and nothing at all when it
-    has neither. The tag matters: one of those numbers is evidence."""
+    has neither. The tag matters: one of those numbers is evidence.
+
+    A running job whose host published no `eta` falls back to the estimate the
+    same host reports, rendered as a total rather than a remaining time. The
+    one thing that may not happen is `--json` carrying an estimate the text
+    does not show, and there are two ways to reach that: the window after
+    `gpuc estimate` before the runner next re-reads the spec, and a host on a
+    build old enough not to re-read it at all."""
     remaining = job.eta_seconds
     if remaining is None:
-        return ""
+        return _fmt_estimate(job, total=True)
     # `not job.progress_pct` and not `is None`: at 0% the runner deliberately
     # leaves the submitter's estimate in place, so the eta being shown is the
     # guess and tagging it `(0%)` would claim evidence that is not there.
@@ -496,10 +503,12 @@ def _fmt_eta(job: JobView) -> str:
     return f" eta {format_duration(remaining)} ({source})"
 
 
-def _fmt_estimate(job: JobView) -> str:
+def _fmt_estimate(job: JobView, *, total: bool = False) -> str:
+    """` est 2h30m`: the whole run, not what is left of it. `total` says so out
+    loud, for the lines that also carry elapsed or remaining times."""
     if job.estimated_runtime_min is None:
         return ""
-    return f" est {format_duration(job.estimated_runtime_min * 60.0)}"
+    return f" est {format_duration(job.estimated_runtime_min * 60.0)}{' total' if total else ''}"
 
 
 def next_free_line(view: HostView) -> str | None:
@@ -530,7 +539,10 @@ def next_free_line(view: HostView) -> str | None:
     silent = len(holding) - len(known)
     remaining, job = min(known, key=lambda pair: pair[0])
     when = "overdue" if remaining < 0 else f"in ~{format_duration(remaining)}"
-    note = f"; {silent} other running job(s) gave no estimate" if silent else ""
+    # "no end time", not "no estimate": a job whose host has an estimate it has
+    # not turned into an eta yet is counted here, and its own line above says
+    # `est ...`. Two lines of one host block may not contradict each other.
+    note = f"; {silent} other running job(s) gave no end time" if silent else ""
     return f"  free    next card {when} ({job.job_id}){note}"
 
 

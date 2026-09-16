@@ -864,6 +864,129 @@ def test_reorder_json_repeats_the_priority_it_set(
     assert one_document(capsys)["priority"] == 10
 
 
+def test_estimate_json_repeats_what_the_host_recorded(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    session = StubSession(
+        [{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running", "warning": None}]
+    )
+    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: as_session(session))
+    capsys.readouterr()
+    argv = ["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local", "--json"]
+    assert main(argv) == 0
+    document = one_document(capsys)
+    assert document["estimated_runtime_min"] == 150.0 and document["status"] == "running"
+    # `check=False`: the host's refusal is a document, and raising on the exit
+    # code would throw away the reason it gave.
+    assert session.checked == [False]
+    assert session.calls == ["estimate 20260101-000000-aaaaaa 150.0"]
+
+
+def test_estimate_reports_the_hosts_refusal(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    payload: dict[str, object] = {"job_id": "j", "error": "job j has already succeeded"}
+    monkeypatch.setattr(
+        "gpuc.control.cli.open_session", lambda *a, **k: as_session(StubSession([payload]))
+    )
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "5", "--host", "local"]) == 1
+    assert "already succeeded" in capsys.readouterr().err
+
+
+def test_estimate_clear_asks_the_host_to_clear_it(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    session = StubSession(
+        [{"job_id": "j", "estimated_runtime_min": None, "status": "queued", "warning": None}]
+    )
+    monkeypatch.setattr("gpuc.control.cli.open_session", lambda *a, **k: as_session(session))
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--clear", "--host", "local"]) == 0
+    assert session.calls == ["estimate 20260101-000000-aaaaaa --clear"]
+    assert "no longer estimates" in capsys.readouterr().out
+
+
+def test_estimate_refuses_a_host_that_did_not_say_what_it_recorded(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise a build that does not know this command -- or any document
+    without the key -- reads as a successful *clear* of a job it never touched.
+    """
+    main(["host", "add", "local", "--gpus", GPU])
+    monkeypatch.setattr(
+        "gpuc.control.cli.open_session",
+        lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "running"}])),
+    )
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "5", "--host", "local"]) == 1
+    assert "did not say what estimate it recorded" in capsys.readouterr().err
+
+
+def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`requeue` submits what the mirror holds, so an estimate left only on the
+    host would be dropped by a re-run without a word."""
+    from gpuc.control.s3index import S3Index
+
+    main(["host", "add", "local", "--gpus", GPU])
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    S3Index("bucket", s3).put_spec_document(
+        "20260101-000000-aaaaaa", {"command": "true", "some_future_field": 1}
+    )
+    monkeypatch.setattr(
+        "gpuc.control.cli.open_session",
+        lambda *a, **k: as_session(
+            StubSession([{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running"}])
+        ),
+    )
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local"]) == 0
+    mirrored = S3Index("bucket", s3).get_spec("20260101-000000-aaaaaa")
+    assert mirrored["estimated_runtime_min"] == 150.0
+    assert mirrored["some_future_field"] == 1
+
+
+def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host has it, so the command succeeded; but a silent divergence is
+    exactly what `requeue` would fall into later."""
+    main(["host", "add", "local", "--gpus", GPU])
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
+    )
+    monkeypatch.setattr(
+        "gpuc.control.cli.open_session",
+        lambda *a, **k: as_session(
+            StubSession([{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running"}])
+        ),
+    )
+    capsys.readouterr()
+    argv = ["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local", "--json"]
+    assert main(argv) == 0
+    warnings = one_document(capsys)["warnings"]
+    assert isinstance(warnings, list) and "requeue" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "flags", [[], ["--minutes", "5", "--clear"], ["--minutes", "0"], ["--minutes", "1e10"]]
+)
+def test_estimate_refuses_a_bad_invocation_before_asking_any_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], flags: list[str]
+) -> None:
+    main(["host", "add", "local", "--gpus", GPU])
+    capsys.readouterr()
+    assert main(["estimate", "20260101-000000-aaaaaa", "--host", "local", *flags]) == EXIT_USAGE
+
+
 def test_pods_json_separates_ours_from_everyone_elses(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

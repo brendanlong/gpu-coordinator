@@ -233,6 +233,40 @@ def test_a_running_job_can_be_cancelled(
     assert state_of(home, job_id)["status"] == "cancelled"
 
 
+def test_estimate_reaches_a_running_job_and_status_and_json_agree(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The bug this command exists for: a job submitted without an estimate,
+    given one while it runs. The text and `--json` must say the same thing --
+    a scripted caller seeing an estimate the operator cannot is the worst of it.
+    """
+    home = bootstrapped_home
+    job_id = submit(workdir, "name: sleepy\ncommand: sleep 300\ngpus: 0\n")
+    wait_until(
+        lambda: state_of(home, job_id).get("status") == "running", 60, "the job to start running"
+    )
+    capsys.readouterr()
+
+    assert main(["estimate", job_id, "--minutes", "150"]) == 0
+    assert "150 min" in capsys.readouterr().out
+    assert json.loads((home / "jobs" / job_id / "spec.json").read_text())[
+        "estimated_runtime_min"
+    ] == pytest.approx(150.0)
+
+    assert main(["status", "--host", "local"]) == 0
+    text = capsys.readouterr().out
+    assert main(["status", "--host", "local", "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    (running,) = document["hosts"][0]["running"]
+    assert running["estimated_runtime_min"] == 150.0
+    assert "2h30m" in text
+
+    assert main(["cancel", job_id]) == 0
+    wait_until(lambda: finished(home, job_id), 120, "the job to be cancelled")
+    assert main(["estimate", job_id, "--minutes", "10"]) == 1
+    assert "already cancelled" in capsys.readouterr().err
+
+
 def test_a_failing_job_keeps_its_exit_code(bootstrapped_home: Path, workdir: Path) -> None:
     home = bootstrapped_home
     job_id = submit(workdir, "name: nope\ncommand: exit 23\ngpus: 0\n")

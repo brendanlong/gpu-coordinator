@@ -557,7 +557,7 @@ def test_a_cpu_only_job_is_not_counted_among_the_ones_that_gave_no_estimate() ->
         )
     )
     assert "free    next card in ~3h20m (j-known)" in text
-    assert "gave no estimate" not in text
+    assert "gave no end time" not in text
 
 
 def test_a_host_running_only_cpu_jobs_has_no_next_card_line() -> None:
@@ -588,6 +588,16 @@ def test_the_json_carries_a_broken_progress_command() -> None:
     assert host_json(view)["running"][0]["progress_error"].endswith("no such file")
 
 
+def test_a_running_job_with_an_estimate_but_no_eta_still_shows_it() -> None:
+    """The host publishes `eta` from a copy of the spec, so an estimate added
+    to a job already running is in `--json` before it is in any eta. The text
+    may never show less than `--json` does."""
+    job = running_job(estimated_runtime_min=150.0)
+    text = render(busy(job))
+    assert "est 2h30m total" in text
+    assert host_json(busy(job))["running"][0]["estimated_runtime_min"] == 150.0
+
+
 def test_a_queued_job_shows_the_submitters_estimate() -> None:
     queued = JobView(job_id="j-queued", name="next", priority=10, estimated_runtime_min=360.0)
     assert "prio=10 est 6h00m" in render(busy(running_job(), queued=[queued]))
@@ -610,7 +620,7 @@ def test_the_next_free_line_owns_up_to_the_jobs_it_could_not_estimate() -> None:
             running_job(job_id="j-silent", gpus=["GPU-b"]),
         )
     )
-    assert "next card in ~3h20m (j-known); 1 other running job(s) gave no estimate" in text
+    assert "next card in ~3h20m (j-known); 1 other running job(s) gave no end time" in text
 
 
 def test_a_busy_host_where_nothing_estimated_anything_stays_quiet() -> None:

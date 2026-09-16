@@ -94,6 +94,77 @@ def test_cancel_and_reorder(gpuc_home: Path, capsys: pytest.CaptureFixture[str])
     assert code == 1
 
 
+def test_estimate_sets_a_queued_jobs_runtime(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    code, payload = run(capsys, "estimate", job_id, "150")
+    assert code == 0 and isinstance(payload, dict)
+    assert payload["estimated_runtime_min"] == 150.0 and payload["status"] == "queued"
+    assert jobs.read_spec(job_id).estimated_runtime_min == 150.0
+
+    code, payload = run(capsys, "estimate", job_id, "--clear")
+    assert code == 0 and isinstance(payload, dict) and payload["estimated_runtime_min"] is None
+    assert jobs.read_spec(job_id).estimated_runtime_min is None
+
+
+def test_estimate_keeps_the_keys_this_build_does_not_know(gpuc_home: Path) -> None:
+    """A spec written by a newer build round-tripped through `JobSpec` would
+    lose them, and an estimate is not a reason to rewrite somebody's job."""
+    job_id = queue.enqueue(make_spec())
+    document = json.loads(paths.spec_file(job_id).read_text())
+    document["some_future_field"] = ["keep", "me"]
+    paths.spec_file(job_id).write_text(json.dumps(document))
+    jobs.update_spec(job_id, estimated_runtime_min=42.0)
+    written = json.loads(paths.spec_file(job_id).read_text())
+    assert written["some_future_field"] == ["keep", "me"]
+    assert written["estimated_runtime_min"] == 42.0
+
+
+def test_estimate_refuses_a_finished_job_and_an_unknown_one(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, status="succeeded")
+    code, payload = run(capsys, "estimate", job_id, "10")
+    assert code == 1 and isinstance(payload, dict) and "already succeeded" in payload["error"]
+    assert jobs.read_spec(job_id).estimated_runtime_min is None
+
+    code, payload = run(capsys, "estimate", "no-such-job", "10")
+    assert code == 1 and isinstance(payload, dict) and "no job with that id" in payload["error"]
+
+
+@pytest.mark.parametrize("minutes", ["0", "-5", "nan", "inf", "1e10"])
+def test_estimate_refuses_a_number_that_is_not_a_runtime(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], minutes: str
+) -> None:
+    """`inf`, and the `1e10` units typo, mean "no estimate" by the time they
+    reach `utc_in` -- so recording one would report success for a job whose
+    status then shows nothing at all."""
+    job_id = queue.enqueue(make_spec())
+    code, payload = run(capsys, "estimate", job_id, minutes)
+    assert code == 1 and isinstance(payload, dict) and payload["error"]
+    assert jobs.read_spec(job_id).estimated_runtime_min is None
+
+
+def test_estimate_needs_a_number_or_clear_and_not_both(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(estimated_runtime_min=30.0))
+    for args in ((job_id,), (job_id, "60", "--clear")):
+        code, payload = run(capsys, "estimate", *args)
+        assert code == 1 and isinstance(payload, dict) and "not both" in payload["error"]
+    assert jobs.read_spec(job_id).estimated_runtime_min == 30.0
+
+
+def test_estimate_warns_when_the_job_will_be_killed_first(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=60.0))
+    _, payload = run(capsys, "estimate", job_id, "120")
+    assert isinstance(payload, dict) and "max_runtime_min" in (payload["warning"] or "")
+
+
 def test_resume_clears_the_pause(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

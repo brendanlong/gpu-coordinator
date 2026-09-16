@@ -239,6 +239,120 @@ def test_estimated_runtime_min_publishes_an_eta_from_the_first_phase(gpuc_home: 
     assert 5000.0 < seconds_from_now(published[0]) < 5500.0
 
 
+def test_an_estimate_added_while_the_job_runs_becomes_an_eta(gpuc_home: Path) -> None:
+    """The case the whole command exists for: the long job already running when
+    the next person arrives is the one nobody could estimate in time."""
+    job_id = prepare(command="sleep 0.6")
+    seen: list[str | None] = []
+
+    def watching_sleep(seconds: float) -> None:
+        if not seen:
+            jobs.update_spec(job_id, estimated_runtime_min=90.0)
+        seen.append(jobs.read_state(job_id).eta)
+        time.sleep(seconds)
+
+    assert runner.run_job(job_id, deps(sleep=watching_sleep, spec_refresh_s=0.0)) == 0
+    published = [eta for eta in seen if eta]
+    assert published, "the estimate never became an eta"
+    assert 5000.0 < seconds_from_now(published[-1]) < 5500.0
+
+
+def test_clearing_the_estimate_withdraws_the_eta_it_published(gpuc_home: Path) -> None:
+    """An estimate somebody decided was wrong must not outlive the decision."""
+    job_id = prepare(command="true", estimated_runtime_min=90.0)
+    with live_runner(job_id) as (started, _log):
+        started._publish_estimated_eta(90.0, 0.0)  # pyright: ignore[reportPrivateUsage]
+        assert jobs.read_state(job_id).eta
+        started._publish_estimated_eta(None, 0.0)  # pyright: ignore[reportPrivateUsage]
+    assert jobs.read_state(job_id).eta is None
+
+
+def test_an_eta_the_runner_did_not_publish_is_not_withdrawn(gpuc_home: Path) -> None:
+    """The re-read runs for the rest of the job; a job with no estimate at all
+    must not have its state rewritten every thirty seconds."""
+    job_id = prepare(command="true")
+    jobs.update_state(job_id, eta=jobs.utc_in(3600.0))
+    with live_runner(job_id) as (started, _log):
+        started._publish_estimated_eta(None, 0.0)  # pyright: ignore[reportPrivateUsage]
+    assert jobs.read_state(job_id).eta
+
+
+def test_a_measured_eta_is_not_overwritten_by_an_estimate(gpuc_home: Path) -> None:
+    """The re-read runs on a timer for the rest of the job; a guess replacing a
+    measurement every thirty seconds would be worse than never re-reading."""
+    job_id = prepare(
+        command="sleep 0.6",
+        progress_command="echo 50%",
+        progress_interval_s=0.02,
+        estimated_runtime_min=600.0,
+    )
+    etas: list[str] = []
+
+    def watching_sleep(seconds: float) -> None:
+        eta = jobs.read_state(job_id).eta
+        if eta and jobs.read_state(job_id).progress_pct == 50.0:
+            etas.append(eta)
+        time.sleep(seconds)
+
+    assert runner.run_job(job_id, deps(sleep=watching_sleep, spec_refresh_s=0.0)) == 0
+    assert etas, "no progress eta was published"
+    # Half done after a fraction of a second: the measured eta is seconds away,
+    # nowhere near the ten hours the spec guesses at.
+    assert all(seconds_from_now(eta) < 600.0 for eta in etas)
+
+
+def test_an_estimate_added_in_setup_survives_the_phase_that_follows(gpuc_home: Path) -> None:
+    """Each phase gets its own monitor loop. Re-seeding it from the spec loaded
+    at job start would withdraw the eta at every phase boundary -- and `setup`
+    is where somebody most often adds one, because that is the phase that
+    looks wedged."""
+    job_id = prepare(setup="sleep 0.3", command="sleep 0.4")
+    etas: list[str | None] = []
+
+    def watching_sleep(seconds: float) -> None:
+        if not etas:
+            jobs.update_spec(job_id, estimated_runtime_min=90.0)
+        if jobs.read_state(job_id).phase == "main":
+            etas.append(jobs.read_state(job_id).eta)
+        time.sleep(seconds)
+
+    assert runner.run_job(job_id, deps(sleep=watching_sleep, spec_refresh_s=0.0)) == 0
+    assert etas, "the job never reached main"
+    assert all(eta for eta in etas), "the eta was withdrawn when the phase changed"
+
+
+def test_a_progress_command_added_while_the_job_runs_is_polled(gpuc_home: Path) -> None:
+    job_id = prepare(command="sleep 0.8", progress_interval_s=0.02)
+    added = False
+
+    def adding_sleep(seconds: float) -> None:
+        nonlocal added
+        if not added:
+            added = True
+            jobs.update_spec(job_id, progress_command="echo 25%")
+        time.sleep(seconds)
+
+    assert runner.run_job(job_id, deps(sleep=adding_sleep, spec_refresh_s=0.0)) == 0
+    assert jobs.read_state(job_id).progress_pct == 25.0
+
+
+def test_a_spec_that_cannot_be_read_leaves_the_running_job_alone(gpuc_home: Path) -> None:
+    """A spec.json being rewritten under us is a transient state, not a reason
+    to end a job that is running fine."""
+    job_id = prepare(command="sleep 0.4", estimated_runtime_min=90.0)
+    truncated = False
+
+    def truncating_sleep(seconds: float) -> None:
+        nonlocal truncated
+        if not truncated:
+            truncated = True
+            paths.spec_file(job_id).write_text("{ not json")
+        time.sleep(seconds)
+
+    assert runner.run_job(job_id, deps(sleep=truncating_sleep, spec_refresh_s=0.0)) == 0
+    assert jobs.read_state(job_id).status == "succeeded"
+
+
 def test_no_estimate_and_no_progress_command_means_no_eta(gpuc_home: Path) -> None:
     job_id = prepare(command="true")
     assert runner.run_job(job_id, deps()) == 0

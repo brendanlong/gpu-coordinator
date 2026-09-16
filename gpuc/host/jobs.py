@@ -467,6 +467,22 @@ def read_spec(job_id: str) -> JobSpec:
     return JobSpec.from_dict(read_json(paths.spec_file(job_id)))
 
 
+def update_spec(job_id: str, **fields: Any) -> JobSpec:
+    """Change fields of a job's spec, in place on disk.
+
+    Raw JSON in and raw JSON out rather than a `JobSpec` round trip: a spec
+    written by another build holds keys `from_dict` drops, and setting an
+    estimate is not a reason to lose them.
+    """
+    document = dict(fields_of(read_json(paths.spec_file(job_id))))
+    for key, value in fields.items():
+        if key not in JobSpec.__dataclass_fields__:
+            raise KeyError(f"unknown JobSpec field: {key}")
+        document[key] = value
+    atomic_write_json(paths.spec_file(job_id), document)
+    return JobSpec.from_dict(document)
+
+
 def write_state(job_id: str, state: JobState) -> None:
     atomic_write_json(paths.state_file(job_id), state.to_dict())
 

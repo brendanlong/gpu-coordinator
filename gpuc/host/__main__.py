@@ -142,6 +142,70 @@ def cmd_reorder(args: argparse.Namespace) -> int:
     return 0 if moved else 1
 
 
+def _estimate_error(job_id: str, minutes: float | None) -> str | None:
+    """Why this host will not record this estimate, or None."""
+    if not paths.job_dir(job_id).is_dir():
+        return f"no job with that id on this host: {job_id}"
+    if minutes is not None and not minutes > 0.0:
+        return f"an estimate must be a positive number of minutes, got {minutes!r}"
+    if minutes is not None and jobs.utc_in(minutes * 60.0) is None:
+        # `1e10` -- the units typo `utc_in` already defends the runner against
+        # -- is not an end time any date can hold, so the runner would publish
+        # no eta and this command would have reported success for nothing.
+        return f"an estimate of {minutes:g} minutes is too far away to be an end time"
+    try:
+        state = jobs.read_state(job_id)
+    except (RuntimeError, FileNotFoundError) as exc:
+        return f"could not read the state of {job_id}: {exc}"
+    if state.finished:
+        # Nothing would ever show it: `eta` is a live job's business, and the
+        # status line of a finished job says how long it actually took.
+        return f"job {job_id} has already {state.status}, so an estimate cannot change anything"
+    return None
+
+
+def cmd_estimate(args: argparse.Namespace) -> int:
+    """Set (or clear) `estimated_runtime_min` on a job that is already here.
+
+    A running job's runner re-reads `spec.json` on a timer, so this reaches it
+    without any message passing: see `runner.SPEC_REFRESH_S`.
+    """
+    job_id = args.job_id
+    if args.clear is (args.minutes is not None):
+        print(json.dumps({"job_id": job_id, "error": "give MINUTES, or --clear, not both"}))
+        return 1
+    minutes = None if args.clear else args.minutes
+    error = _estimate_error(job_id, minutes)
+    if error is not None:
+        print(json.dumps({"job_id": job_id, "error": error}))
+        return 1
+    spec = jobs.update_spec(job_id, estimated_runtime_min=minutes)
+    warning = None
+    if (
+        spec.estimated_runtime_min is not None
+        and spec.max_runtime_min is not None
+        and spec.estimated_runtime_min > spec.max_runtime_min
+    ):
+        # The same contradiction `submit` warns about, and the only place
+        # anyone will see it before the job dies as `timeout`.
+        warning = (
+            f"estimated_runtime_min ({spec.estimated_runtime_min:g}) is longer than this job's "
+            f"max_runtime_min ({spec.max_runtime_min:g}), so it expects to be killed as "
+            f"`timeout` before it finishes"
+        )
+    print(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "estimated_runtime_min": spec.estimated_runtime_min,
+                "status": jobs.read_state(job_id).status,
+                "warning": warning,
+            }
+        )
+    )
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     return runner.run_job(args.job_id)
 
@@ -245,6 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
     reorder.add_argument("job_id")
     reorder.add_argument("priority", type=int)
     reorder.set_defaults(func=cmd_reorder)
+
+    estimate = sub.add_parser("estimate", help="set a queued or running job's runtime estimate")
+    estimate.add_argument("job_id")
+    estimate.add_argument("minutes", nargs="?", type=float)
+    estimate.add_argument("--clear", action="store_true", help="remove the estimate instead")
+    estimate.set_defaults(func=cmd_estimate)
 
     run = sub.add_parser("run", help="run one job in the foreground (used by the dispatcher)")
     run.add_argument("job_id")
