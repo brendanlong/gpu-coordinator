@@ -128,6 +128,29 @@ def _tail(text: str, lines: int = 10) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
+def read_remote_config(session: HostSession) -> dict[str, Any] | None:
+    """The host's own `config.json`, or ``None`` if the host could not be asked.
+
+    The registry here records what *this* machine last shipped, which is not
+    the same question: a second control machine bootstrapping the same box
+    leaves that record describing a host it no longer matches. This is the
+    host's answer.
+
+    An empty dict is a host that answered and has no config -- never
+    bootstrapped, or its gpuc home has moved -- and that is a real answer, so
+    the two cases are told apart: `cat` swallows its own failure, and a
+    non-zero exit is the transport's.
+    """
+    try:
+        result = session.run(f'cat "{session.home}/config.json" 2>/dev/null || true')
+    except TransportError:
+        return None
+    if result.returncode != 0:
+        return None
+    document = parse_last_json(result.stdout)
+    return document if isinstance(document, dict) else {}
+
+
 def resolve_home(transport: Transport, entry: HostEntry) -> str:
     """Expand ``$HOME/.gpuc`` on the host: rsync and tail need a real path."""
     template = entry.remote_home

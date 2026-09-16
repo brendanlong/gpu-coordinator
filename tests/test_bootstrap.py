@@ -40,6 +40,8 @@ class ScriptedHost:
     health: dict[str, object] = field(default_factory=lambda: dict(HEALTH_OK))
     hf_install_fails: bool = False
     uv_cache: str = "/home/u/.cache/uv"
+    config: dict[str, object] | None = None
+    """What `config.json` on this host already says, if anything."""
     cache_dev: str = "66"
     home_dev: str = "66"
     events: list[str] = field(default_factory=list)
@@ -47,6 +49,8 @@ class ScriptedHost:
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
 
     def _answer(self, command: str) -> tuple[int, str]:
+        if command.startswith("cat ") and "config.json" in command:
+            return 0, "" if self.config is None else json.dumps(self.config)
         if "astral.sh/uv" in command:
             self.uv_present = True
             return 0, ""
@@ -269,6 +273,39 @@ def test_bootstrap_records_what_the_cards_are(control_env: Path) -> None:
     assert updated.gpu_info["GPU-a"].name == "NVIDIA A40"
     assert updated.gpu_info["GPU-a"].vram_mib == 46068
     assert updated.driver_version == "580.173.02"
+
+
+def test_bootstrap_says_what_it_is_about_to_overwrite(control_env: Path) -> None:
+    """After `gpuc host set` this is the confirmation of what moved. The case
+    it is for is a config another control machine wrote."""
+    host = ScriptedHost(config={"host": "h", "gpus": ["GPU-b"], "s3_prefix": "s3://theirs/gpuc/h"})
+    said: list[str] = []
+    _, result = bootstrap_host(entry(), transport=host, report=said.append)
+    (warning,) = result.warnings
+    assert "overwriting the config on host h" in warning
+    assert "gpus GPU-b -> GPU-a" in warning
+    assert "s3_prefix s3://theirs/gpuc/h -> none" in warning
+    assert any(warning in line for line in said)
+    # It is a warning, not a refusal: the config this machine registered wins.
+    assert json.loads(host.puts["/home/u/.gpuc/config.json"][0])["gpus"] == ["GPU-a"]
+
+
+def test_bootstrap_is_quiet_when_it_changes_nothing_that_matters(control_env: Path) -> None:
+    from gpuc.control import version as version_mod
+
+    host = ScriptedHost(
+        config={
+            "host": "h",
+            "gpus": ["GPU-a"],
+            "pkg_commit": "a" * 40,
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }
+    )
+    _, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    assert result.warnings == []
+    assert json.loads(host.puts["/home/u/.gpuc/config.json"][0])["pkg_commit"] == (
+        version_mod.local_commit()
+    )
 
 
 def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_env: Path) -> None:

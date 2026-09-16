@@ -7,7 +7,13 @@ from typing import cast
 import pytest
 
 from gpuc.control.config import HostEntry
-from gpuc.control.remote import HostSession, RemoteError, host_command, parse_last_json
+from gpuc.control.remote import (
+    HostSession,
+    RemoteError,
+    host_command,
+    parse_last_json,
+    read_remote_config,
+)
 from gpuc.control.transport import CommandResult, Transport
 
 MOTD = """Welcome to Ubuntu 24.04!
@@ -101,3 +107,18 @@ def test_a_pretty_printed_report_is_not_mistaken_for_its_last_nested_object() ->
 
 def test_the_last_of_two_documents_wins() -> None:
     assert parse_last_json('{"first": 1}\n{"second": 2}\n') == {"second": 2}
+
+
+def test_the_remote_config_is_read_from_the_host_not_the_registry() -> None:
+    document = {"host": "gpubox", "gpus": ["0"], "pkg_commit": "c" * 40}
+    assert read_remote_config(session(MOTD + json.dumps(document))) == document
+
+
+def test_a_host_with_no_config_is_told_apart_from_one_that_could_not_be_asked() -> None:
+    """`cat` swallows its own failure, so a non-zero exit is the transport's.
+
+    The difference decides whether `submit` re-ships the package (a host with
+    no config was never bootstrapped) or leaves this machine's record alone.
+    """
+    assert read_remote_config(session("")) == {}
+    assert read_remote_config(session("ssh: could not resolve hostname", returncode=255)) is None

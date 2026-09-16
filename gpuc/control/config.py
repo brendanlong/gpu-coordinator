@@ -353,6 +353,50 @@ class HostEntry(TolerantModel):
         )
 
 
+NOT_DRIFT = {"schema_version", "pkg_commit", "created_at"}
+"""Config keys a difference says nothing about: the shape of the file, the
+commit (which moves on every re-ship, and is reported on its own), and when
+whoever registered the host first did so."""
+
+
+def _show(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value) or "none"
+    return str(value)
+
+
+def config_drift(existing: Any, incoming: HostConfig) -> list[str]:
+    """How the config a host is running differs from the one we would write it.
+
+    Only the keys `existing` actually has are compared, so this takes a whole
+    `config.json` read off the host or the subset `gpuc status` gets back. The
+    difference that matters is not ours-versus-ours: it is a second control
+    machine having registered the same box with other GPUs, another mirror or
+    another name, which the registry here cannot see.
+
+    `env` reports the names that differ and never the values -- it is
+    free-form, it is where somebody hand-sets an HF_TOKEN, and this text ends
+    up in transcripts.
+    """
+    if not isinstance(existing, dict):
+        return []
+    drift: list[str] = []
+    for key, ours in incoming.to_dict().items():
+        if key in NOT_DRIFT or key not in existing:
+            continue
+        theirs = existing[key]
+        if theirs == ours:
+            continue
+        if key == "env" and isinstance(theirs, dict):
+            names = sorted(k for k in set(theirs) | set(ours) if theirs.get(k) != ours.get(k))
+            drift.append(f"env differs in {', '.join(names)}")
+        else:
+            drift.append(f"{key} {_show(theirs)} -> {_show(ours)}")
+    return drift
+
+
 class Registry(TolerantModel):
     schema_version: int = SCHEMA_VERSION
     """The shape of hosts.json. Written always, accepted missing: a registry

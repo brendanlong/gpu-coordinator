@@ -126,6 +126,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "host": config.host,
+                # The commit whoever bootstrapped this host last shipped. The
+                # control side cannot infer it: its own registry only records
+                # what *this* machine shipped, and a second control machine --
+                # a laptop against the same box -- leaves that record
+                # describing a host it no longer matches.
+                "pkg_commit": config.pkg_commit,
                 **_gpu_table(config),
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),

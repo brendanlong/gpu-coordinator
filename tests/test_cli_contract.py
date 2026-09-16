@@ -451,32 +451,61 @@ def test_version_prints_the_version_the_commit_and_each_host(
     assert version_mod.__version__ in out
     assert "a" * 12 in out
     assert "b" * 12 in out
-    assert "OLDER" in out
+    assert "DIFFERS" in out
     assert "gpuc host bootstrap <host>" in out
 
 
-def test_a_host_on_another_commit_gets_one_warning_line(
+def test_the_commit_status_judges_is_the_hosts_own_not_the_registrys(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry records what *this* machine shipped. A second control
+    machine (a laptop on another build) makes that record describe a host it no
+    longer matches, so the warning has to come from the host's answer."""
+    from gpuc.control import version as version_mod
+
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    # Registry agrees with this build; the host says otherwise, and wins.
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
+    view = HostView(entry=entry, reachable=True, pkg_commit="b" * 40)
+    warnings = status_mod.host_warnings(view)
+    assert len(warnings) == 1
+    assert "host gpubox is running gpuc " + "b" * 12 in warnings[0]
+    assert "gpuc host bootstrap gpubox" in warnings[0]
+    assert status_mod.render(view).count("WARNING") == 1
+    assert status_mod.host_json(view)["pkg_commit"] == "b" * 40
+    assert warnings[0] in status_mod.host_json(view)["errors"]
+
+
+def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from gpuc.control import version as version_mod
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="b" * 40)
-    warning = status_mod.stale_warning(entry)
-    assert warning is not None
-    assert "host gpubox runs an older gpuc" in warning
+    entry = HostEntry(name="s", pkg_commit="b" * 40)
+    current = HostView(entry=entry, reachable=True, pkg_commit="a" * 40)
+    assert status_mod.host_warnings(current) == []
+    assert status_mod.host_warnings(HostView(entry=entry, reachable=True)) == []
+    # Unreachable: "we could not ask" is not evidence of anything.
+    assert status_mod.host_warnings(HostView(entry=entry, pkg_commit="b" * 40)) == []
+
+
+def test_a_config_only_another_control_machine_could_have_written_is_flagged(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control import version as version_mod
+
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"], pkg_commit="a" * 40)
+    view = HostView(
+        entry=entry,
+        reachable=True,
+        pkg_commit="a" * 40,
+        configured={"host": "gpubox", "gpus": ["0", "1"]},
+    )
+    (warning,) = status_mod.host_warnings(view)
+    assert "gpus 0,1 -> 2,3" in warning
     assert "gpuc host bootstrap gpubox" in warning
-    assert status_mod.render(HostView(entry=entry, reachable=True)).count("WARNING") == 1
-
-
-def test_a_host_on_the_same_commit_or_none_at_all_says_nothing(
-    control_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from gpuc.control import version as version_mod
-
-    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
-    assert status_mod.stale_warning(HostEntry(name="s", pkg_commit="a" * 40)) is None
-    assert status_mod.stale_warning(HostEntry(name="s", pkg_commit=None)) is None
 
 
 def test_the_installed_commit_comes_from_direct_url_json(

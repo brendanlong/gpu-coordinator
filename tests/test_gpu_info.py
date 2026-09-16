@@ -92,7 +92,7 @@ def test_a_host_registered_before_gpu_info_existed_still_lists(control_env: Path
     assert main(["host", "list"]) == 0
     out = capsys.readouterr().out
     assert "gpus 1 (1x unknown GPU)" in out
-    assert "pkg     unknown never bootstrapped" in out
+    assert "pkg     unknown shipped from here, never bootstrapped" in out
     assert "GPU-x" in out
     assert load_registry().hosts["old"].gpu_info == {}
 

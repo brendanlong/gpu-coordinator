@@ -252,10 +252,14 @@ A host's package is a *copy*, not a link, so upgrading here does not upgrade it.
 ```sh
 uv tool upgrade gpu-coordinator
 uv tool install --reinstall "git+https://github.com/brendanlong/gpu-coordinator@<commit>"   # or pin
-gpuc version                 # this build's commit, and each host's
-gpuc host bootstrap <host>   # for every host `version` marks OLDER
+gpuc version                 # this build's commit, and what each host was last given from here
+gpuc host bootstrap <host>   # for every host `version` marks DIFFERS
 gpuc host bootstrap --all    # or all of them, in one command
 ```
+
+`gpuc version` and `gpuc host list` never ssh, so what they show is *this
+machine's* record of its own last bootstrap. `gpuc status` asks each host what
+it is running, and that is the answer that counts.
 
 `--all` takes every registered host in turn, including ephemeral ones. A host
 that fails does not stop the others — a pod that has already gone away is the
@@ -265,10 +269,11 @@ stay upgraded. The tally also counts any host entry this build could not read
 (skipped with a warning), because that host was not upgraded either.
 
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
-to enqueue on is not on this commit — including a host with no commit recorded,
-which means it was bootstrapped by a build old enough not to write one. They
-re-sync the package and restart the dispatcher first, print one line saying so,
-and `--no-bootstrap` skips it. Re-bootstrapping is safe at any time: **running
+to enqueue on is not on this commit — read from the host's own `config.json`,
+not from the registry here, and including a host with no commit recorded, which
+means it was bootstrapped by a build old enough not to write one. They re-sync
+the package and restart the dispatcher first, print one line saying so, and
+`--no-bootstrap` skips it. Re-bootstrapping is safe at any time: **running
 jobs are not disturbed and do not block it.** A dispatcher that is already alive
 keeps the lock and finishes on its own (older) code; every new runner uses the
 new package, and whichever dispatcher takes over adopts the running jobs from
@@ -280,6 +285,28 @@ which is exactly what CI runs on every pull request (`--fast` skips the sync).
 Two sessions on different builds are fine as long as both are recent: every file
 the two sides share is read with unknown keys ignored and a `null` for a
 non-optional field taken as that field's default.
+
+### The same host from two machines
+
+A host is the host's own: its queue, its job state and its logs live there, so
+registering one box from a desktop *and* a laptop works — each machine's
+`gpuc status`, `logs` and `cancel` see every job on it, whoever submitted it,
+and the dispatcher orders them all by priority as usual.
+
+What is per-machine is the **registry**: `--gpus`, `--s3-prefix`,
+`--retention-days`, `--env`, `--gpuc-home` and the rest are recorded locally
+and written to the host wholesale by `gpuc host bootstrap`. So the machine that
+bootstrapped last is the one the host is configured by, and registering it
+differently on the two is the thing to avoid — most of all `--gpus` (the host
+would hand out cards the other machine believes are somebody else's) and
+`--gpuc-home` / `--persistent-root`, which would give one box two separate
+queues. Copy the flags from `gpuc host list --json` on the first machine.
+
+gpuc will tell you when they disagree rather than leaving it silent: `gpuc
+status` warns when a host runs a build or a config this machine did not write,
+`gpuc submit` says so before it enqueues, and `gpuc host bootstrap` reports
+every field it is about to overwrite. None of them refuse — bootstrap's job is
+to make the host match the machine you ran it from.
 
 ## Teardown
 

@@ -9,6 +9,7 @@ from gpuc.control.config import (
     ConfigError,
     HostEntry,
     Registry,
+    config_drift,
     load_registry,
     load_settings,
     registry_transaction,
@@ -79,3 +80,38 @@ def test_host_config_for_the_host_side(control_env: Path) -> None:
 def test_remote_home_defaults_to_dot_gpuc(control_env: Path) -> None:
     assert HostEntry(name="local").remote_home == "$HOME/.gpuc"
     assert HostEntry(name="local", gpuc_home="/tmp/x").remote_home == "/tmp/x"
+
+
+def test_config_drift_compares_only_what_the_host_reported() -> None:
+    """The whole config.json off a host, or the subset `status` answers with."""
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"])
+    assert config_drift({"host": "gpubox", "gpus": ["2", "3"]}, entry.host_config()) == []
+    assert config_drift({"gpus": ["0", "1"]}, entry.host_config()) == ["gpus 0,1 -> 2,3"]
+    # A key the host did not report is not a difference.
+    assert config_drift({}, entry.host_config()) == []
+    assert config_drift(None, entry.host_config()) == []
+
+
+def test_config_drift_ignores_the_commit_and_names_env_without_its_values() -> None:
+    """`--env` is where somebody hand-sets an HF_TOKEN, and this text is printed."""
+    entry = HostEntry(name="gpubox", env={"HF_TOKEN": "ours", "HF_HOME": "/big"})
+    existing = {
+        "pkg_commit": "c" * 40,
+        "created_at": "2020-01-01T00:00:00+00:00",
+        "schema_version": 999,
+        "env": {"HF_TOKEN": "theirs", "HF_HOME": "/big"},
+    }
+    assert config_drift(existing, entry.host_config()) == ["env differs in HF_TOKEN"]
+
+
+def test_config_drift_reports_the_settings_that_change_what_a_host_does() -> None:
+    entry = HostEntry(name="gpubox", s3_prefix="s3://mine/gpuc/gpubox", retention_days=7.0)
+    drift = config_drift(
+        {"host": "laptop-box", "s3_prefix": None, "retention_days": 30.0, "ttl_hours": None},
+        entry.host_config(),
+    )
+    assert drift == [
+        "host laptop-box -> gpubox",
+        "s3_prefix none -> s3://mine/gpuc/gpubox",
+        "retention_days 30.0 -> 7.0",
+    ]

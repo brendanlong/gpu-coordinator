@@ -13,9 +13,14 @@ once stay registered.
 ## Before you trust any of this
 
 ```bash
-gpuc version     # this build's commit, and each host's package commit
+gpuc version     # this build's commit, and what this machine last shipped to each host
 gpuc status      # registered hosts, their queues, and what is running
 ```
+
+`gpuc status` is the one that asks the hosts themselves; a `WARNING` line under
+a host means it is running a build or a config this machine did not write
+(somebody else's `gpuc host bootstrap`), and `gpuc host bootstrap <host>` is the
+fix. Jobs still queue and run either way.
 
 `gpuc skill` prints this file, and `gpuc skill --install [DIR]` writes a copy
 to `DIR/.claude/skills/gpuc/SKILL.md`.

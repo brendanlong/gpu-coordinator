@@ -650,13 +650,23 @@ secrets never touch argv.
    skipped if present; failures are warnings -- **except** that a host
    registered with an `s3_prefix` whose `aws` CLI could not be installed fails
    bootstrap outright: every job on it would end `failed: sync-preflight`).
-3. Write `~/.gpuc/config.json` from the host registry entry.
+3. Write `~/.gpuc/config.json` from the host registry entry, after reading the
+   one already there: every field of it that this bootstrap changes is reported
+   as a warning first (`overwriting the config on host h ... gpus GPU-b ->
+   GPU-a`). After a `gpuc host set` that is the confirmation of what moved; the
+   case it exists for is a `config.json` another *control machine* wrote, which
+   this registry cannot see and this bootstrap would otherwise replace in
+   silence. It is a warning, never a refusal: bootstrap's job is to make the
+   host match the machine running it.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"`.
 5b. Record the commit this build of gpuc came from (`direct_url.json` of the
    installed dist, else `git rev-parse` of the checkout) as `HostEntry.pkg_commit`
-   and in the host's `config.json`. `gpuc host list` and `gpuc version` show it,
-   and `gpuc status` warns when a host's differs from this machine's. Bootstrap
+   and in the host's `config.json`. The host's copy is the authoritative one and
+   is what `status` reports and what `submit` judges (see Which build is a host
+   running); the registry's is this machine's record of its own last bootstrap,
+   which is all `gpuc host list` and `gpuc version` have, and they say so.
+   Bootstrap
    is never blocked by running jobs: the package and config are replaced, an
    already-alive dispatcher keeps the lock until it exits, and whichever
    dispatcher takes over adopts the running jobs from their `state.json`.
@@ -887,6 +897,39 @@ What `status` prints, and every flag, is usage.md. The invariants:
   `links[]` in `--json` -- S3 console, HF tree, W&B run, and the host's
   `s3_prefix` mirror of the job -- derived from what the job declared and never
   checked; the text view does not show them.
+- Everything said about *what a host is* -- the build it runs, the cards it was
+  registered with, what it calls itself -- is the host's own answer, and a host
+  that could not be reached produces no claim about any of it. See below.
+
+## Which build is a host running
+
+The registry here records what **this machine** last shipped. That is not the
+same question as what the host runs, and the difference is not hypothetical:
+one user with a desktop and a laptop, both `gpuc host add`-ing the same ssh
+box, gives two registries that each describe their own last bootstrap and
+neither of which can see the other's. Whoever bootstrapped last is what the
+host is actually running.
+
+So the authoritative copy is the host's: `config.json`'s `pkg_commit`, written
+by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
+
+- `gpuc status` warns from that value (`host gpubox is running gpuc <sha> and
+  this machine has <sha>`), never from the registry, and says nothing at all
+  about a host it could not reach. `status --json`'s `pkg_commit` is the host's
+  answer, so `null` there means "not asked", never "current".
+- `gpuc submit` and `gpuc requeue` read the host's `config.json` before they
+  enqueue and re-ship the package when it does not match this build -- an
+  unrecorded commit included. The same read reports any *other* field of that
+  config this machine did not write, which is what a second control machine's
+  `--gpus` looks like from here. It then records what it saw, so the offline
+  commands stop repeating a bootstrap somebody else replaced.
+- `gpuc host list` and `gpuc version` never ssh, so they report this machine's
+  own record, labelled as such (`pkg <sha> shipped from here`), and point at
+  `gpuc status` for what the host is running.
+
+Neither the drift report nor the version check blocks anything: they are how a
+shared host stops being invisible, and `gpuc host bootstrap <host>` is always
+the fix.
 
 ## Testing rules
 

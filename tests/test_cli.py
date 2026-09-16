@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -654,19 +655,12 @@ def test_a_negative_ttl_clears_the_cap(control_env: Path) -> None:
     assert load_registry().hosts["h"].ttl_hours is None
 
 
-def test_submit_reships_the_package_to_a_host_on_another_commit(
-    control_env: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A host on older code dispatches the job with code that does not match
-    the spec this machine just wrote."""
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\n')
-    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
-    _set_host(python="/py", pkg_commit="a" * 40)
-    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
+def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | None) -> list[str]:
+    """Answer `submit`'s "what build is this host running" with `config`.
+
+    ``None`` is a host that could not be asked at all. Returns the list every
+    re-ship appends its host to.
+    """
     resynced: list[str] = []
 
     def fake_resync(entry: HostEntry, settings: object = None, **kwargs: object) -> HostEntry:
@@ -674,10 +668,34 @@ def test_submit_reships_the_package_to_a_host_on_another_commit(
         return entry.model_copy(update={"pkg_commit": "b" * 40})
 
     monkeypatch.setattr("gpuc.control.cli.resync_package", fake_resync)
+    fake_session = SimpleNamespace(transport=None)
+    monkeypatch.setattr(
+        "gpuc.control.cli._try_session",
+        lambda *a, **k: None if config is None else cast(Any, fake_session),
+    )
+    monkeypatch.setattr("gpuc.control.cli.read_remote_config", lambda _session: config)
     monkeypatch.setattr(
         "gpuc.control.cli.submit_file",
         lambda *a, **k: SubmitResult(job_id="j", host="gpubox", attempt=1),
     )
+    return resynced
+
+
+def test_submit_reships_the_package_to_a_host_on_another_commit(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A host on other code dispatches the job with code that does not match
+    the spec this machine just wrote."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    _set_host(python="/py", pkg_commit="a" * 40)
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
+    host_config: dict[str, Any] = {"pkg_commit": "a" * 40}
+    resynced = _fake_host_build(monkeypatch, host_config)
 
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     out = capsys.readouterr().out
@@ -687,15 +705,86 @@ def test_submit_reships_the_package_to_a_host_on_another_commit(
 
     # Now the host is on this build, so nothing is shipped.
     resynced.clear()
+    host_config["pkg_commit"] = "b" * 40
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert resynced == []
 
     # An unrecorded commit counts as different: those hosts are the oldest.
-    _set_host(pkg_commit=None)
+    del host_config["pkg_commit"]
     assert main(["submit", str(job), "--host", "gpubox", "--no-bootstrap"]) == 0
     assert resynced == []
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert resynced == ["gpubox"]
+
+
+def test_submit_asks_the_host_which_build_it_runs_not_this_machines_record(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The registry only ever recorded what *this* machine shipped.
+
+    Register the same box from a laptop too and that record describes a host
+    the laptop has since re-bootstrapped: both machines would then agree with
+    themselves and skip the check forever.
+    """
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    _set_host(python="/py", pkg_commit="b" * 40)
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
+    resynced = _fake_host_build(monkeypatch, {"pkg_commit": "c" * 40})
+
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert resynced == ["gpubox"]
+    assert "host gpubox is running gpuc " + "c" * 12 in capsys.readouterr().out
+
+    # And the record stops lying to `gpuc host list` about it.
+    resynced.clear()
+    _set_host(pkg_commit="b" * 40)
+    monkeypatch.setattr("gpuc.control.cli.read_remote_config", lambda _s: {"pkg_commit": "b" * 40})
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert resynced == []
+
+
+def test_submit_says_so_when_the_host_runs_a_config_this_machine_did_not_write(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "2,3"])
+    _set_host(python="/py", pkg_commit="b" * 40)
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
+    resynced = _fake_host_build(monkeypatch, {"pkg_commit": "b" * 40, "gpus": ["0", "1"]})
+
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    out = capsys.readouterr().out
+    assert resynced == []
+    assert "running a config this machine did not write" in out
+    assert "gpus 0,1 -> 2,3" in out
+
+
+def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(
+    control_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable host is the submit behind this one's error to report, in
+    full; here it only means the record we have is the best there is."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", GPU])
+    _set_host(python="/py", pkg_commit="b" * 40)
+    monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
+    resynced = _fake_host_build(monkeypatch, None)
+
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert resynced == []
+    assert load_registry().require("gpubox").pkg_commit == "b" * 40
 
 
 def _set_host(**changes: object) -> None:

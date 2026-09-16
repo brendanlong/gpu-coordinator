@@ -252,8 +252,10 @@ existing copy without `--force`.
 
 **`gpuc clean`**, **`gpuc pods`**, **`gpuc reconcile`** and the host commands
 have their own sections below and in [setup.md](setup.md). `gpuc version` prints
-this build, its commit, and each bootstrapped host's package commit, marking the
-ones to re-bootstrap; it reads the registry and never touches a host.
+this build, its commit, and the commit this machine last shipped to each
+bootstrapped host, marking the ones to re-bootstrap; it reads the registry and
+never touches a host, so what a host is *running* is `gpuc status` (see
+[the same host from two machines](setup.md#the-same-host-from-two-machines)).
 
 **`gpuc web serve`** — the [web dashboard](#the-web-dashboard): the same
 status, host list and config in a browser, with cancel, re-prioritise, estimate
@@ -534,7 +536,10 @@ null elsewhere). `eta` is absolute and `eta_s` is the same instant as seconds fr
 `progress_pct` is null unless the job measures its own, and survives the job so
 you can see how far it got; `progress_error` is why the last poll produced
 nothing. A card the host cannot see appears in `gpus` as
-`{"owned_as": "3", "available": false}` instead. A job's `util` is its **last**
+`{"owned_as": "3", "available": false}` instead. `pkg_commit` is the host's own
+answer for the build it is running, so `null` there means we did not ask, never
+"up to date"; when it differs from this build, or the host's config does, the
+host's `errors` says so and nothing else changes. A job's `util` is its **last**
 sample from the host's own nvidia-smi over that job's cards; a pod's `provider_util` is the
 provider's per-GPU reading for the whole pod, and is null for any other host —
 two different measurements that will differ. `--recent` and `--since` apply to
@@ -580,9 +585,9 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `reorder` | `{job_id, host, priority}` |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
-| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. Exit 3 if the registry is unreadable |
+| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. `pkg_commit` here is this machine's record of what it last shipped, not what the host runs — that is `status --json`'s `pkg_commit`. Exit 3 if the registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}` — the effective settings, file or not |
-| `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]`. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
+| `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]` (a re-bootstrap note, from this machine's own record: nothing here asks the host). The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
 | `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}`, host names in the order they were judged. `--json` needs `--once` and nothing else: neither the loop nor `--install` has a document to print |
