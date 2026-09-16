@@ -112,8 +112,8 @@ whole of it.
 
 `gpuc status` then shows an `eta` on each running job, tagged with where it came
 from — `(42%)` for a measurement, `(est)` for your guess — an `est` on each
-queued job, and, on a host with no free card, one line saying when the next one
-is expected:
+queued job, and, on a host with no free card where something holding one
+estimated an end time, one line saying when the next card is expected:
 
 ```
   running …-a1b2c3 lego-s4 phase=main 96.2m util 98% (host) gpus=1 iso=cgroup eta 3h20m (37%)
@@ -121,8 +121,12 @@ is expected:
   free    next card in ~3h20m (20260915-120000-a1b2c3)
 ```
 
-The `free` line says how many running jobs offered no estimate, because the real
-answer can only ever be *sooner* than it: one of those could finish in a minute.
+Where some of the jobs holding a card estimated nothing, the `free` line appends
+a count of them, because the real answer can only ever be *sooner* than it: one
+of those could finish in a minute. Jobs with `gpus: 0` are ignored throughout —
+they hold no card, so they can neither free one nor make the answer sooner. If
+*nothing* holding a card estimated an end time there is no line at all, since
+the gpu lines above it already say every card is busy.
 
 ## What gets synced to the host
 
