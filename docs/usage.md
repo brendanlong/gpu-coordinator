@@ -879,8 +879,9 @@ the same uv against the same cache hardlinks on one box and reflinks on the
 next. It is measured once, when the job ends, and recorded in its `state.json`
 — a finished workdir does not change, and walking every one of them per call
 cost `status` four seconds on a host holding sixty. `gpuc clean` measures
-afresh, since it is about to delete what it is quoting, and a workdir the host
-has not sized yet is counted as `not sized yet` rather than as nothing.
+afresh, since it is about to delete what it is quoting. A workdir that is
+already gone frees nothing and is reported as zero without measuring anything,
+so a host that has been idle for a week still answers straight away.
 
 Anything the filesystem will not answer about counts as reclaimable, so no one
 file is ever under-counted. The total still can be, in one case worth knowing:

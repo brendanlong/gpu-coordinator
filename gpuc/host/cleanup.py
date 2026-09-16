@@ -23,6 +23,7 @@ import os
 import shutil
 import stat
 import struct
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -287,11 +288,10 @@ def workdir_size(job_id: str) -> int | None:
 def record_workdir_size(job_id: str) -> int:
     """Measure a finished job's workdir once and write the figure to its state.
 
-    The walk is exact and therefore not cheap, so it happens here -- at the
-    couple of moments something already knows this job is over -- rather than
-    on every `status`. A failure to record is not worth failing anything over:
-    the figure is a disk report, and a null one only means `status` says it
-    does not know yet.
+    The walk is exact and therefore not cheap, so the figure is written down
+    where the next reader finds it instead of being walked again. A failure to
+    record is not worth failing anything over: the figure is a disk report, and
+    the caller still gets the number it asked for.
 
     The workdir is re-checked *after* the walk because the walk takes seconds
     and `gpuc clean` is a different process. Without this, a clean landing in
@@ -306,6 +306,58 @@ def record_workdir_size(job_id: str) -> int:
     with contextlib.suppress(RuntimeError, OSError, KeyError):
         jobs.update_state(job_id, workdir_bytes=recorded)
     return recorded
+
+
+MEASURING_BUDGET_S = 10.0
+"""How long one `status` call will spend walking workdirs nobody measured.
+
+The control side gives `status` 60 seconds (`control/status.py`), and a host
+that blew it would not render as "some figures are missing" -- it would render
+as an error line with no queue, no running jobs and no cards, and
+`provision`'s reusable-host check would read the same timeout as unreachable.
+So the walking is bounded rather than paced: every walk that finishes inside
+the budget is written down permanently, so successive calls converge on a fully
+measured host instead of re-doing the same work.
+"""
+
+
+def reported_workdir_bytes(
+    job_id: str, state: jobs.JobState, *, deadline: float | None = None
+) -> int | None:
+    """What deleting a finished job's workdir would free.
+
+    A job with no workdir left frees nothing, and answering that costs one
+    `is_dir()`: it is the common case -- most jobs carry a `cleanup:` policy
+    that takes the workdir the moment they end -- and it needs no recorded
+    figure, which is what kept jobs that ended before the figure existed
+    reading as "not sized yet" forever.
+
+    A workdir still on disk is the only case worth walking, and normally
+    nobody here walks it either: the runner recorded the figure as the job
+    ended. The walk happens here when nothing did (the runner's own death, or a
+    job older than the field), and what it finds goes to `state.json` for the
+    next reader, so a host with no dispatcher running still gives a straight
+    answer -- and gives it once, unless writing it down failed too, in which
+    case the walk is repeated rather than the answer withheld.
+
+    A recorded zero is believed. It is the usual figure for a workdir that has
+    gone, but it is also a real measurement of one that has not: a tree whose
+    extents are all shared with something outside it reclaims nothing, and its
+    directories add nothing on a filesystem that reports no blocks for them.
+    Reading that as "unmeasured" would walk the same tree on every call.
+
+    Null only for the straggler that arrives after `deadline`, which is a
+    figure this call declined to go and get rather than one that does not
+    exist. `MEASURING_BUDGET_S` says why there is a deadline at all.
+    """
+    if not paths.workdir(job_id).is_dir():
+        return 0
+    recorded = state.workdir_bytes
+    if recorded is not None:
+        return recorded
+    if deadline is not None and time.monotonic() > deadline:
+        return None
+    return record_workdir_size(job_id)
 
 
 def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
