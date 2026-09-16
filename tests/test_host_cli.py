@@ -142,3 +142,17 @@ def test_status_resolves_the_owned_gpus_and_reports_each_jobs_watchdog(
     assert status["gpus_unavailable"] == ["9"]
     low_util = status["jobs"][0]["low_util"]
     assert (job_id, low_util["enabled"], low_util["floor_pct"]) == (job_id, False, 20.0)
+
+
+def test_status_reports_a_queued_jobs_estimate_from_its_spec(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A queued job has no eta yet, and its estimate is exactly what somebody
+    deciding whether to queue behind it needs. Only the spec has it."""
+    queue.enqueue(make_spec(estimated_runtime_min=360.0))
+    queue.enqueue(make_spec())
+
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    estimates = {entry["job_id"]: entry["estimated_runtime_min"] for entry in status["jobs"]}
+    assert sorted(estimates.values(), key=lambda v: v is None) == [360.0, None]

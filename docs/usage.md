@@ -22,6 +22,9 @@ commented example; `-` as the file name reads the spec from stdin.
 | `sync_interval_s` | `180` | background upload cadence; **minimum 10** |
 | `priority` | `50` | `0`–`99`, lower dispatches first |
 | `max_runtime_min` | none | wall clock from the runner's start; over it the job is `failed: timeout` |
+| `estimated_runtime_min` | none | roughly how long you expect it to take, measured the same way. Nothing enforces it; see [job length estimates](#job-length-estimates) |
+| `progress_command` | none | run in the workdir during phase `main`; its last line of stdout is how far along the job is |
+| `progress_interval_s` | `60` | how often to run it; **minimum 5** |
 | `low_util` | on | `{enabled: true, window_min: 25, floor_pct: 5, grace_min: 10}` — the idle-GPU watchdog |
 | `requires` | `{}` | e.g. `cuda_min: "12.8"`. **Informs provisioning only**; the host never checks it |
 | `cleanup` | `on_success` | when the runner deletes `workdir/`: `on_success`, `always`, `never` |
@@ -51,6 +54,54 @@ prefix; with HF outputs, `hf` must resolve, `hf auth whoami` must succeed with
 the job's token, and a `.preflight` file must upload to each repo. Failure is
 `failed: sync-preflight`, seconds in, with the command and its error in the log.
 A job with no outputs on a host with no mirror checks nothing.
+
+## Job length estimates
+
+A shared host's queue is a question — *do I wait for this, or do I go and pay
+for a pod?* — that nothing but the job itself can answer. Both ways of
+answering it are optional, and neither ever affects a job's outcome.
+
+`estimated_runtime_min` is your own guess, and costs nothing:
+
+```yaml
+estimated_runtime_min: 480          # about eight hours, from the runner's start
+```
+
+`progress_command` replaces the guess with a measurement. It runs in the
+workdir, with the job's own environment, every `progress_interval_s` of phase
+`main`, and the **last line of its stdout** is how far along the job is:
+
+```yaml
+progress_command: "tail -1 results/progress.txt"   # the job appends `37` as it goes
+progress_interval_s: 60
+```
+
+Accepted: `42`, `42.5`, `42%`, and `300/5000` for how much of how many.
+**Not** a fraction of one — `0.42` means 0.42%, because guessing which you meant
+would be wrong by a hundredfold in an end time somebody is planning around.
+Only the last line is read, so a progress command may be a pipeline that also
+logs. gpuc extrapolates from how long phase `main` has taken so far, so the
+estimate improves as the job runs and a slow `uv sync` is never charged to it.
+
+A progress command that exits non-zero, prints nonsense, or takes longer than
+10 seconds is killed, recorded, and otherwise ignored: the failure appears once
+in `log.txt` and in `gpuc status --json` as `progress_error`, and the job runs
+on. The runner polls it from the same loop that watches for a cancel, which is
+why the timeout is short.
+
+`gpuc status` then shows an `eta` on each running job, tagged with where it came
+from — `(42%)` for a measurement, `(est)` for your guess — an `est` on each
+queued job, and, on a host with no free card, one line saying when the next one
+is expected:
+
+```
+  running …-a1b2c3 lego-s4 phase=main 96.2m util 98% (host) gpus=1 iso=cgroup eta 3h20m (37%)
+  queued  …-d4e5f6 sweep   prio=50 est 6h00m
+  free    next card in ~3h20m (20260915-120000-a1b2c3)
+```
+
+The `free` line says how many running jobs offered no estimate, because the real
+answer can only ever be *sooner* than it: one of those could finish in a minute.
 
 ## What gets synced to the host
 
@@ -85,7 +136,8 @@ and the dispatcher restarted first, see [setup.md](setup.md#upgrading)).
 
 **`gpuc status`** — per host: kind, reachability, dispatcher heartbeat, owned
 cards (`free` / `busy <job-id>` / `UNAVAILABLE`), the queue, running jobs with
-phase, minutes and last util, and recent finished jobs. `--host H` narrows it;
+phase, minutes, last util and any [end-time estimate](#job-length-estimates),
+and recent finished jobs. `--host H` narrows it;
 `--recent N` (default 5) and `--since 24h|7d|90m` (a bare number means hours)
 choose how much of the finished list to show; `--all` adds jobs only the local
 index and the S3 index know, which is how you find what was on a host that lost
@@ -338,8 +390,9 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
       "running": [
         { "job_id": "20260915-120000-abc123", "name": "lego-s4", "status": "running",
           "reason": null, "phase": "main", "elapsed_s": 4210.5, "util": 96.0,
-          "gpus": ["GPU-8064..."], "iso": "pgid", "ended_at": null,
-          "outputs_pending": false }
+          "progress_pct": 37.0, "eta": "2026-09-15T16:31:00+00:00", "eta_s": 12060.0,
+          "estimated_runtime_min": 480.0, "gpus": ["GPU-8064..."], "iso": "pgid",
+          "ended_at": null, "outputs_pending": false }
       ],
       "finished": [],
       "errors": []
@@ -349,10 +402,13 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 }
 ```
 
-The job objects in `queued`, `running` and `finished` all carry those eleven
-fields. A card the host cannot see appears in `gpus` as `{"owned_as": "3",
-"available": false}` instead. A job's `util` is its **last** sample from the
-host's own nvidia-smi over that job's cards; a pod's `provider_util` is the
+The job objects in `queued`, `running` and `finished` all carry those fifteen
+fields. `eta` is absolute and `eta_s` is the same instant as seconds from now
+(negative once a job is overdue); both are null unless the job has a
+[length estimate](#job-length-estimates), and `progress_pct` is null unless it
+measures its own. A card the host cannot see appears in `gpus` as
+`{"owned_as": "3", "available": false}` instead. A job's `util` is its **last**
+sample from the host's own nvidia-smi over that job's cards; a pod's `provider_util` is the
 provider's per-GPU reading for the whole pod, and is null for any other host —
 two different measurements that will differ. `--recent` and `--since` apply to
 `--json`; `--suspects` and `--all` do not.

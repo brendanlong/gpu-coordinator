@@ -82,6 +82,13 @@ class JobView:
     started_at: str | None = None
     ended_at: str | None = None
     util_recent: list[float] = field(default_factory=list)
+    progress_pct: float | None = None
+    """How far along the job's own `progress_command` last said it was."""
+    eta: str | None = None
+    """When the host expects this job to finish: measured from `progress_pct`
+    where there is one, from the spec's `estimated_runtime_min` otherwise."""
+    estimated_runtime_min: float | None = None
+    """The submitter's own estimate, which is all a *queued* job has."""
     workdir_bytes: int | None = None
     """Disk still held by this job's `workdir/`; the host only measures it for
     finished jobs."""
@@ -113,6 +120,16 @@ class JobView:
     @property
     def last_util(self) -> float | None:
         return self.util_recent[-1] if self.util_recent else None
+
+    @property
+    def eta_seconds(self) -> float | None:
+        """Seconds until the estimated finish; negative once it is overdue.
+
+        Read here rather than on the host so a `status` of a host whose clock
+        or whose last report is minutes old still counts down.
+        """
+        when = _parse(self.eta)
+        return None if when is None else (when - datetime.now(UTC)).total_seconds()
 
     @property
     def suspect(self) -> bool:
@@ -173,6 +190,25 @@ def format_age(stamp: str | None, now: datetime | None = None) -> str:
     return f"{int(seconds)}s ago"
 
 
+def format_duration(seconds: float) -> str:
+    """`2h10m`, `35m`, `50s`: how much longer, not a wall-clock time.
+
+    Relative on purpose. Every consumer of this is deciding "do I wait or do I
+    go somewhere else", and a clock time makes them do the subtraction -- in
+    whichever timezone the host happens to think it is in.
+    """
+    # Rounded, not truncated, unlike `format_age`: an age of 59 minutes really
+    # is "not an hour yet", but an estimate 45 minutes out printed as `44m` is
+    # just wrong by the width of the arithmetic.
+    seconds = max(0.0, seconds)
+    minutes = round(seconds / 60.0)
+    if minutes == 0:
+        return f"{round(seconds)}s"
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
 def _as_float(value: Any) -> float | None:
     """A number the host sent, or None for anything else (including a bool)."""
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
@@ -181,6 +217,10 @@ def _as_float(value: Any) -> float | None:
 def _as_int(value: Any) -> int | None:
     number = _as_float(value)
     return None if number is None else int(number)
+
+
+def _as_str(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
 
 
 def _parse(stamp: str | None) -> datetime | None:
@@ -297,6 +337,9 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             util_recent=[
                 float(u) for u in entry.get("util_recent") or [] if isinstance(u, (int, float))
             ],
+            progress_pct=_as_float(entry.get("progress_pct")),
+            eta=_as_str(entry.get("eta")),
+            estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
             workdir_bytes=entry.get("workdir_bytes"),
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
@@ -386,6 +429,52 @@ def _fmt_util(job: JobView) -> str:
 
 def _fmt_minutes(job: JobView) -> str:
     return "--" if job.minutes is None else f"{job.minutes:.1f}m"
+
+
+def _fmt_eta(job: JobView) -> str:
+    """` eta 2h10m (42%)` when the job measures its own progress, ` eta 2h10m
+    (est)` when all it has is the submitter's guess, and nothing at all when it
+    has neither. The tag matters: one of those numbers is evidence."""
+    remaining = job.eta_seconds
+    if remaining is None:
+        return ""
+    source = "est" if job.progress_pct is None else f"{job.progress_pct:.0f}%"
+    if remaining < 0:
+        return f" eta overdue ({source})"
+    return f" eta {format_duration(remaining)} ({source})"
+
+
+def _fmt_estimate(job: JobView) -> str:
+    if job.estimated_runtime_min is None:
+        return ""
+    return f" est {format_duration(job.estimated_runtime_min * 60.0)}"
+
+
+def next_free_line(view: HostView) -> str | None:
+    """When a card on a fully-busy host is expected to come free.
+
+    The whole point of the estimates: whether to queue behind what is running
+    or go and pay for a pod. It says how many of the running jobs offered
+    nothing to estimate from, because the real answer can only be *sooner* than
+    this -- one of those could finish in a minute.
+    """
+    if not view.owned or view.free or not view.running:
+        return None
+    known: list[tuple[float, JobView]] = []
+    for job in view.running:
+        remaining = job.eta_seconds
+        if remaining is not None:
+            known.append((remaining, job))
+    silent = len(view.running) - len(known)
+    if not known:
+        return (
+            f"  free    every card is busy and none of the {silent} running job(s) estimated "
+            f"an end time"
+        )
+    remaining, job = min(known, key=lambda pair: pair[0])
+    when = "overdue" if remaining < 0 else f"in ~{format_duration(remaining)}"
+    note = f"; {silent} other running job(s) gave no estimate" if silent else ""
+    return f"  free    next card {when} ({job.job_id}){note}"
 
 
 def owned_gpus(payload: dict[str, Any], entry: HostEntry) -> tuple[list[str], dict[str, int]]:
@@ -506,10 +595,15 @@ def render(
         lines.append(
             f"{mark} {job.job_id} {job.name or '-'} phase={job.phase or '-'} "
             f"{_fmt_minutes(job)} {_fmt_util(job)} gpus={len(job.gpus)} "
-            f"iso={job.isolation or '?'}"
+            f"iso={job.isolation or '?'}{_fmt_eta(job)}"
         )
     for job in view.queue:
-        lines.append(f"  queued  {job.job_id} {job.name or '-'} prio={job.priority}")
+        lines.append(
+            f"  queued  {job.job_id} {job.name or '-'} prio={job.priority}{_fmt_estimate(job)}"
+        )
+    free = next_free_line(view)
+    if free:
+        lines.append(free)
     finished = [job for job in view.finished if within(job, since_s)]
     for job in finished[:recent]:
         detail = job.reason or (f"exit {job.exit_code}" if job.exit_code else "")
@@ -575,6 +669,10 @@ def job_json(job: JobView) -> dict[str, Any]:
         "phase": job.phase,
         "elapsed_s": None if job.minutes is None else round(job.minutes * 60.0, 1),
         "util": job.last_util,
+        "progress_pct": job.progress_pct,
+        "eta": job.eta,
+        "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),
+        "estimated_runtime_min": job.estimated_runtime_min,
         "gpus": list(job.gpus),
         "iso": job.isolation,
         "ended_at": job.ended_at,

@@ -95,6 +95,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         # `gpuc status --suspects` names the jobs the host is about to kill
         # rather than applying a constant of its own.
         entry["low_util"] = asdict(spec.low_util) if spec else None
+        # From the spec, not the state: a *queued* job has no eta yet, and its
+        # estimate is exactly what somebody deciding whether to queue behind it
+        # needs. The control side never sees the spec.
+        entry["estimated_runtime_min"] = spec.estimated_runtime_min if spec else None
         # Only for finished jobs: a running job's workdir is being written to,
         # its size is meaningless, and walking a live venv on every `gpuc
         # status` would be pure cost.

@@ -455,3 +455,125 @@ def test_a_host_from_before_the_resolved_table_still_reports_its_gpus() -> None:
     owned, indices = owned_gpus(payload(), entry)
     assert owned == [GPU, "GPU-b"]
     assert indices == {}
+
+
+def in_minutes(minutes: float) -> str:
+    return (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()
+
+
+def running_job(**overrides: Any) -> JobView:
+    document: dict[str, Any] = {
+        "job_id": "j-running",
+        "name": "train",
+        "status": "running",
+        "phase": "main",
+        "gpus": [GPU, "GPU-b"],
+        "started_at": minutes_ago(30),
+    }
+    document.update(overrides)
+    return JobView(**document)
+
+
+def busy(*jobs: JobView, queued: list[JobView] | None = None) -> HostView:
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
+    host_view = HostView(entry=entry, reachable=True, owned=[GPU, "GPU-b"], heartbeat_age_s=2.0)
+    host_view.running = list(jobs)
+    host_view.queue = list(queued or [])
+    return host_view
+
+
+def test_a_measured_eta_is_labelled_with_the_percentage_it_came_from() -> None:
+    text = render(busy(running_job(eta=in_minutes(130), progress_pct=42.0)))
+    assert "eta 2h10m (42%)" in text
+
+
+def test_an_eta_with_no_measurement_behind_it_says_so() -> None:
+    text = render(busy(running_job(eta=in_minutes(45), estimated_runtime_min=90.0)))
+    assert "eta 45m (est)" in text
+
+
+def test_a_job_past_its_own_eta_is_overdue_not_negative() -> None:
+    text = render(busy(running_job(eta=minutes_ago(20), progress_pct=80.0)))
+    assert "eta overdue (80%)" in text
+
+
+def test_a_job_with_no_estimate_at_all_gets_no_eta_column() -> None:
+    assert "eta" not in render(busy(running_job()))
+
+
+def test_a_queued_job_shows_the_submitters_estimate() -> None:
+    queued = JobView(job_id="j-queued", name="next", priority=10, estimated_runtime_min=360.0)
+    assert "prio=10 est 6h00m" in render(busy(running_job(), queued=[queued]))
+
+
+def test_a_fully_busy_host_says_when_the_next_card_frees_up() -> None:
+    text = render(
+        busy(
+            running_job(job_id="j-long", gpus=[GPU], eta=in_minutes(200), progress_pct=30.0),
+            running_job(job_id="j-short", gpus=["GPU-b"], eta=in_minutes(20), progress_pct=90.0),
+        )
+    )
+    assert "free    next card in ~20m (j-short)" in text
+
+
+def test_the_next_free_line_owns_up_to_the_jobs_it_could_not_estimate() -> None:
+    text = render(
+        busy(
+            running_job(job_id="j-known", gpus=[GPU], eta=in_minutes(200)),
+            running_job(job_id="j-silent", gpus=["GPU-b"]),
+        )
+    )
+    assert "next card in ~3h20m (j-known); 1 other running job(s) gave no estimate" in text
+
+
+def test_a_busy_host_where_nothing_estimated_anything_says_that_plainly() -> None:
+    text = render(busy(running_job(gpus=[GPU, "GPU-b"])))
+    assert "every card is busy and none of the 1 running job(s) estimated an end time" in text
+
+
+def test_a_host_with_a_free_card_does_not_guess_about_the_next_one() -> None:
+    text = render(busy(running_job(gpus=[GPU], eta=in_minutes(200))))
+    assert "free    " not in text
+
+
+def test_the_json_carries_the_estimate_and_what_it_was_based_on() -> None:
+    host_view = busy(running_job(eta=in_minutes(60), progress_pct=50.0))
+    job = host_json(host_view)["running"][0]
+    assert job["progress_pct"] == 50.0
+    assert 3400 < job["eta_s"] < 3700
+
+
+def test_job_views_read_the_estimate_fields_off_the_hosts_payload() -> None:
+    _, running, _ = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j-running",
+                    "status": "running",
+                    "phase": "main",
+                    "progress_pct": 12.5,
+                    "eta": in_minutes(10),
+                    "estimated_runtime_min": 60,
+                }
+            ]
+        )
+    )
+    assert running[0].progress_pct == 12.5
+    assert running[0].estimated_runtime_min == 60.0
+    assert running[0].eta_seconds is not None and running[0].eta_seconds > 0
+
+
+def test_an_eta_a_host_reports_as_nonsense_is_ignored() -> None:
+    _, running, _ = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j-running",
+                    "status": "running",
+                    "eta": 1750000000,
+                    "progress_pct": "half",
+                }
+            ]
+        )
+    )
+    assert (running[0].eta, running[0].progress_pct, running[0].eta_seconds) == (None, None, None)

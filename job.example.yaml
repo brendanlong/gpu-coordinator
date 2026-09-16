@@ -40,6 +40,20 @@ sync_interval_s: 180                            # background upload cadence
 priority: 50                                    # 0 (first) .. 99 (last)
 max_runtime_min: 600                            # null for no limit
 
+# How long this is expected to take, from the runner's start. Nothing enforces
+# it -- it is what `gpuc status` shows the next person, so they can decide
+# between queueing behind this job and paying for another host.
+estimated_runtime_min: 480
+
+# Optional, and better than the guess above: run every `progress_interval_s` of
+# phase `main`, in the workdir, with this job's environment. gpuc reads the last
+# line of its stdout as how far along the job is -- `42`, `42%` or `300/5000`
+# (not `0.42`; a fraction of one would be ambiguous with 0.42%) -- and turns it
+# into a live end time. A command that fails, hangs or prints nonsense is
+# recorded in `status` and ignored; it can never fail the job.
+progress_command: "tail -1 results/progress.txt"
+progress_interval_s: 60                         # minimum 5
+
 low_util:                                       # kill a job that is not using the GPU
   enabled: true
   window_min: 25                                # rolling mean over this window

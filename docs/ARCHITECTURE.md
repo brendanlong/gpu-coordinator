@@ -38,6 +38,7 @@ gpuc/
     baseline.py   # what was already under `outputs:` before the job started
     cleanup.py    # `cleanup:` policy, workdir sizing, the `clean` sweep
     gpus.py       # nvidia-smi parsing, index<->UUID resolution, utilization sampling
+    progress.py   # the optional `progress_command`: run it, read a percentage off it
     sync.py       # periodic upload loop (shells out to `aws` or `hf`; see Sync)
     health.py     # host preflight: driver, owned GPUs, disk, network download timing
     terminate.py  # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
@@ -105,6 +106,8 @@ jobs/<jobid>/
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null, "sync_error": str|null,
                      #  "util_recent": [float|null, ...], "util_sampled_at": str|null,
+                     #  "progress_pct": float|null, "progress_at": str|null,
+                     #  "progress_error": str|null, "eta": str|null,
                      #  "workdir_removed": bool,
                      #  "meta_synced_at": str|null, "meta_synced_to": str|null,
                      #  "outputs_synced_at": str|null, "outputs_lost": bool}
@@ -115,6 +118,9 @@ jobs/<jobid>/
                      # drain after it retried and gave up.
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and the sample must not be read as 0%.
+                     # eta is null on a queued job and on a finished one; while the job runs
+                     # it is the submitter's estimate until progress_pct measures a better
+                     # one. progress_pct survives the job so `status` can say how far it got.
                      # pgid is the *job's* group, published by the runner when it spawns a phase.
                      # It is absent during the launch window; cancel is the marker alone until then.
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
@@ -152,6 +158,11 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "sync_interval_s": 180,
   "priority": 50,
   "max_runtime_min": null,
+  "estimated_runtime_min": null,        # the submitter's own guess, measured from the runner's
+                                        # start exactly as max_runtime_min is. Informational only
+  "progress_command": null,             # run in workdir/ every progress_interval_s of phase main;
+                                        # its last line of stdout is a percentage. See Estimates
+  "progress_interval_s": 60,
   "low_util": {"enabled": true, "window_min": 25, "floor_pct": 5, "grace_min": 10},
   "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
@@ -269,7 +280,8 @@ queue's lexical order, not submission order below one second.
    utilization every 30 s; if the rolling mean over `window_min` is below
    `floor_pct`, SIGTERM the process group, then SIGKILL after 15 s, status
    `failed: low-util`. `max_runtime_min` is enforced the same way with
-   reason `timeout`.
+   reason `timeout`. In the same loop, run `spec.progress_command` every
+   `progress_interval_s` and record what it says; see Job length estimates.
 6. Capture the exit code **before** any cleanup. Stop the sync loop and run
    one final sync; a failed final sync makes a succeeded job `failed: sync`,
    and an output path that was never written makes it `failed: no-outputs`.
@@ -283,6 +295,43 @@ queue's lexical order, not submission order below one second.
    `meta_synced_at`/`meta_synced_to` and puts `state.json` up once more, so the
    mirror includes the record of itself; `outputs_synced_at` is written in the
    final state write when the final output upload succeeded. See Retention.
+
+## Job length estimates
+
+Nothing infers how long a job will take. Two optional, purely informational
+inputs answer "queue behind this, or pay for another host?", and neither may
+ever change a job's outcome:
+
+- `estimated_runtime_min` -- the submitter's own guess, measured from the
+  runner's start exactly as `max_runtime_min` is. The runner publishes it as
+  `eta` at the top of *every* phase, not just `main`: a job twenty minutes into
+  a `uv sync` is the one somebody most wants an end time for, and it looks
+  identical to a wedged one.
+- `progress_command` -- run in `workdir/` with the job's own environment, only
+  during `main`, every `progress_interval_s`. Its **last non-empty line of
+  stdout** is a percentage: `42`, `42.5`, `42%`, or `300/5000` for how much of
+  how many. Deliberately not a fraction of one, because `0.42` would otherwise
+  have to mean either 0.42% or 42% and the wrong guess is a hundredfold error
+  in a time somebody is planning around. Above 0% the runner replaces `eta`
+  with `now + elapsed_main * (100 - pct) / pct` -- elapsed *main*, so a slow
+  setup is never charged to the first epoch.
+
+The poll is synchronous, in the same loop that watches for a cancel, a TTL and
+`max_runtime_min`, with a 10 s timeout and a `killpg` of the whole session
+behind it: a wedged progress command therefore delays a kill by at most 10 s and
+cannot leave a grandchild behind to be re-spawned every interval. Doing it on a
+thread instead would have two writers racing on `state.json`, which is a worse
+trade than 10 s.
+
+A failed, timed-out or unparseable poll writes `progress_error` and returns.
+It is logged the *first* time each distinct message appears, because this runs
+every interval for the rest of the job. `eta` is cleared when the job ends;
+`progress_pct` is not, because how far it had got when it died is the useful
+part. `gpuc status` renders the remaining time relative (`eta 3h20m`), tagged
+`(42%)` when it was measured and `(est)` when it was a guess, and adds one
+`free` line per fully-busy host saying when its next card is expected -- with a
+count of the running jobs that estimated nothing, since the true answer can only
+be sooner.
 
 ## Process isolation (cgroup scope, else process group)
 

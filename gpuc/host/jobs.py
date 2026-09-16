@@ -7,11 +7,11 @@ import os
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from gpuc.host import paths
+from gpuc.host import paths, progress
 
 SCHEMA_VERSION = 1
 """The shape of the JSON files two builds of gpuc share (`~/.gpuc/config.json`
@@ -52,6 +52,12 @@ def utc_now() -> str:
     # Microseconds, not seconds: `ended_at` is what orders "the last two jobs
     # to finish", and jobs on a multi-GPU host routinely end in the same second.
     return datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def utc_in(seconds: float) -> str:
+    """A timestamp `seconds` from now. Seconds granularity, because everything
+    that uses it is an estimate and a microsecond ETA reads as a promise."""
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def atomic_write_text(path: Path, text: str, mode: int = 0o644) -> None:
@@ -251,6 +257,19 @@ class JobSpec:
     sync_interval_s: int = 180
     priority: int = 50
     max_runtime_min: float | None = None
+    estimated_runtime_min: float | None = None
+    """Roughly how long this job expects to take, measured from the runner's
+    start exactly as `max_runtime_min` is. Purely informational: nothing kills a
+    job for running past it. It is how somebody else deciding between queueing
+    behind this job and paying for another host finds out what they are waiting
+    for, which nothing on the host can work out for them."""
+    progress_command: str | None = None
+    """An optional shell command, run in `workdir/` with the job's own
+    environment every `progress_interval_s` of phase `main`, whose last line of
+    stdout is how far along the job is (`42`, `42%` or `300/5000`). It replaces
+    the submitter's estimate with a measured one. A failure is recorded and
+    ignored; see `progress.py`."""
+    progress_interval_s: float = progress.DEFAULT_INTERVAL_S
     low_util: LowUtil = field(default_factory=LowUtil)
     requires: dict[str, Any] = field(default_factory=dict)
     cleanup: str = DEFAULT_CLEANUP
@@ -283,6 +302,11 @@ class JobSpec:
             sync_interval_s=as_int(fields, "sync_interval_s", 180),
             priority=as_int(fields, "priority", 50),
             max_runtime_min=as_opt_float(fields, "max_runtime_min"),
+            estimated_runtime_min=as_opt_float(fields, "estimated_runtime_min"),
+            progress_command=as_opt_str(fields, "progress_command"),
+            progress_interval_s=as_float(
+                fields, "progress_interval_s", progress.DEFAULT_INTERVAL_S
+            ),
             low_util=LowUtil.from_dict(fields.get("low_util")),
             requires=dict(fields.get("requires") or {})
             if isinstance(fields.get("requires"), dict)
@@ -321,6 +345,18 @@ class JobState:
     runner_starttime: str | None = None
     util_recent: list[float | None] = field(default_factory=list)
     util_sampled_at: str | None = None
+    progress_pct: float | None = None
+    """The last percentage the spec's `progress_command` reported, 0-100. Null
+    on a job that has no progress command, or has not answered yet."""
+    progress_at: str | None = None
+    progress_error: str | None = None
+    """Why the last progress poll produced nothing. Kept because the alternative
+    is a job that silently never estimates and nobody knowing the command is
+    broken; it never affects the job's outcome."""
+    eta: str | None = None
+    """When this job is expected to finish, from `progress_pct` if there is one
+    and from the spec's `estimated_runtime_min` otherwise. Null while the job is
+    queued, once it is finished, and whenever it has nothing to estimate from."""
     sync_error: str | None = None
     workdir_removed: bool = False
     """Whether `workdir/` has been deleted, by the job's `cleanup:` policy or by
@@ -380,6 +416,10 @@ class JobState:
             runner_starttime=as_opt_str(fields, "runner_starttime"),
             util_recent=as_opt_float_list(fields, "util_recent"),
             util_sampled_at=as_opt_str(fields, "util_sampled_at"),
+            progress_pct=as_opt_float(fields, "progress_pct"),
+            progress_at=as_opt_str(fields, "progress_at"),
+            progress_error=as_opt_str(fields, "progress_error"),
+            eta=as_opt_str(fields, "eta"),
             sync_error=as_opt_str(fields, "sync_error"),
             workdir_removed=as_bool(fields, "workdir_removed"),
             meta_synced_at=as_opt_str(fields, "meta_synced_at"),
