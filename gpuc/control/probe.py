@@ -7,6 +7,7 @@ a host where nothing has been bootstrapped yet.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, transport_for
 from gpuc.control.gpuinfo import GpuInfo, parse_smi
@@ -190,44 +191,78 @@ class ProbeReport:
                 )
                 continue
             lines.append(f"  {key}: {value.strip() or '(no output)'}")
+        lines += [f"  note: {note}" for note in self.notes]
+        return "\n".join(lines)
+
+    @property
+    def notes(self) -> list[str]:
+        """What this host will do to a job unless somebody acts, in words."""
+        notes: list[str] = []
         if not self.has_nvidia_smi:
-            lines.append("  note: no nvidia-smi, so this host can only run gpus: 0 jobs")
+            notes.append("no nvidia-smi, so this host can only run gpus: 0 jobs")
         if self.sections.get("killuserprocesses", "").endswith("=yes"):
-            lines.append(
-                "  note: logind kills user processes at logout; the dispatcher will not "
+            notes.append(
+                "logind kills user processes at logout; the dispatcher will not "
                 "survive your SSH session ending"
             )
         if self.home_is_overlay:
-            overlay = (
-                f"  note: $HOME is on an {self.home_fs_type} filesystem, so it is a container's "
-                f"throwaway upper layer and is wiped on every restart.\n"
-            )
-            if self.persistent_root:
-                overlay += (
-                    f"        This host is registered with --persistent-root "
-                    f"{self.persistent_root}, so uv, the queue and every job dir are already "
-                    f"off it.\n        After a restart, recover with: "
-                    f"gpuc host bootstrap {self.host}"
-                )
-            else:
-                overlay += (
-                    f"        Point this host at a volume that survives:\n"
-                    f"        gpuc host set {self.host} --persistent-root /mnt/<volume>/$USER\n"
-                    f"        (then `gpuc host bootstrap {self.host}`; uv, the queue and every "
-                    f"job dir move there)"
-                )
-            lines.append(overlay)
+            notes.append(self._overlay_note())
         if self.sections.get("uv") == "not installed":
-            lines.append(f"  note: uv is missing; `gpuc host bootstrap {self.host}` installs it")
+            notes.append(f"uv is missing; `gpuc host bootstrap {self.host}` installs it")
         if self.cache_shares_gpuc_home_fs is False:
-            lines.append(
-                f"  note: uv's cache and gpuc home are on different filesystems, so uv cannot\n"
+            notes.append(
+                f"uv's cache and gpuc home are on different filesystems, so uv cannot\n"
                 f"        hardlink or reflink wheels into a job's venv and copies each one "
                 f"instead\n        (~6.5 GB per torch venv). "
                 f"`gpuc host bootstrap {self.host}` fixes this by pointing\n"
                 f"        UV_CACHE_DIR at gpuc home's own volume."
             )
-        return "\n".join(lines)
+        return notes
+
+    def _overlay_note(self) -> str:
+        overlay = (
+            f"$HOME is on an {self.home_fs_type} filesystem, so it is a container's "
+            f"throwaway upper layer and is wiped on every restart.\n"
+        )
+        if self.persistent_root:
+            return overlay + (
+                f"        This host is registered with --persistent-root "
+                f"{self.persistent_root}, so uv, the queue and every job dir are already "
+                f"off it.\n        After a restart, recover with: "
+                f"gpuc host bootstrap {self.host}"
+            )
+        return overlay + (
+            f"        Point this host at a volume that survives:\n"
+            f"        gpuc host set {self.host} --persistent-root /mnt/<volume>/$USER\n"
+            f"        (then `gpuc host bootstrap {self.host}`; uv, the queue and every "
+            f"job dir move there)"
+        )
+
+    def document(self) -> dict[str, Any]:
+        """`gpuc host probe --json`.
+
+        `sections` is the probe script's raw output, section by section, so
+        anything this build does not interpret is still there. Everything
+        beside it is the interpretation `render()` prints.
+        """
+        return {
+            "host": self.host,
+            "sections": dict(self.sections),
+            "driver_version": self.driver_version,
+            "has_nvidia_smi": self.has_nvidia_smi,
+            "gpus": [
+                {"uuid": uuid, **info.model_dump(mode="json")}
+                for uuid, info in self.gpu_info.items()
+            ],
+            "home_fs_type": self.home_fs_type,
+            "home_is_overlay": self.home_is_overlay,
+            "persistent_root": self.persistent_root,
+            "uv_cache": {
+                **self.uv_cache,
+                "shares_gpuc_home_fs": self.cache_shares_gpuc_home_fs,
+            },
+            "notes": self.notes,
+        }
 
 
 def parse_probe(host: str, output: str, persistent_root: str | None = None) -> ProbeReport:

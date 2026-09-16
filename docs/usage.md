@@ -101,7 +101,7 @@ actually has.
 "was purged" when the whole job dir is gone — and falls back to the S3 mirror,
 which needs `s3_bucket` set here **and** an `s3_prefix` for that job (from the
 job's index entry, else the host's). `-f` follows the host's file and never
-falls back. There is no `--json`: a log is a byte stream.
+falls back, and cannot be combined with `--json`.
 
 **`gpuc ssh <host|job-id> [--print] [-- CMD ...]`** — the hand version of the
 transport, with gpuc's own key, port, `known_hosts` and ControlMaster socket,
@@ -365,6 +365,49 @@ Rules for anything automated:
   non-empty top-level `errors`, and so is `"reachable": false` for the host you
   care about — we could not ask it.
 - Unknown keys will be added over time; ignore the ones you do not know.
+
+### `--json` everywhere else
+
+`submit`, `requeue`, `logs`, `cancel`, `reorder`, `pods`, `version`, `clean`,
+`host list`, `host probe` and `reconcile --once` take `--json` too, under the
+same rules: **stdout is exactly one JSON object**, it carries `schema_version`,
+and everything the text output would print alongside it — progress, warnings,
+`note:` lines — goes to stderr instead. The exit codes are the table above,
+unchanged by the flag.
+
+**A command that failed prints a document too**, so a caller parsing stdout is
+never handed nothing at all:
+
+```json
+{ "schema_version": 1, "error": "no registered host knows job 20260915-120000-abc123.\n...",
+  "exit_code": 4 }
+```
+
+`error` (singular) is the whole answer: the command did not do what it was
+asked. A command line argparse itself rejects (a bad flag, a missing required
+one) gets the same document, with the reason on stderr where argparse wrote it. `errors` (plural) is different — per-host or per-job trouble a command
+survived, which never implies a non-zero exit by itself (`clean` and
+`reconcile --once` are the two that exit 1 on their own `errors`).
+
+| command | the document |
+| --- | --- |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[]}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued |
+| `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
+| `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
+| `reorder` | `{job_id, host, priority}` |
+| `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
+| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, current}`. Exit 3 if the registry is unreadable |
+| `host list` | `{hosts[], errors[]}` — each registry entry as stored, plus `remote_home`, `ephemeral` and `warnings[]`. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
+| `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
+| `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
+| `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}`, host names in the order they were judged. `--json` needs `--once` and nothing else: neither the loop nor `--install` has a document to print |
+
+```sh
+gpuc submit job.yaml --host gpubox --json | jq -r .job_id
+gpuc logs "$id" --json | jq -r '.lines[-20:][]'
+gpuc pods --json | jq '[.pods[] | select(.desired | not) | .name]'
+gpuc clean --host gpubox --all-finished --dry-run --json | jq .freed_bytes
+```
 
 ## Cleanup and retention
 

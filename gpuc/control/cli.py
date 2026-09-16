@@ -9,8 +9,11 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from gpuc.control import jsonout
 from gpuc.control import pods as pods_mod
 from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import ssh as ssh_mod
@@ -55,7 +58,9 @@ from gpuc.control.s3index import (
 from gpuc.control.skill import SkillError, install_skill, read_skill
 from gpuc.control.submit import (
     JobSpecModel,
+    Reporter,
     SubmitError,
+    SubmitResult,
     expand_job_id,
     load_document,
     precheck_local,
@@ -247,7 +252,7 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     changes: dict[str, object] = {}
     if args.gpus is not None:
         changes["gpus"] = _gpu_list(args.gpus)
-    for flag, field in (
+    for flag, attribute in (
         ("persistent_root", "persistent_root"),
         ("gpuc_home", "gpuc_home"),
         ("cache_dir", "cache_dir"),
@@ -255,7 +260,7 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     ):
         value = getattr(args, flag)
         if value is not None:
-            changes[field] = value or None
+            changes[attribute] = value or None
     if args.env is not None:
         # The whole dict, not a merge: "set it to exactly this" is the only
         # rule that can also express "set it to nothing" (`--env ''`).
@@ -301,11 +306,39 @@ def cmd_host_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_host_list(_: argparse.Namespace) -> int:
+def host_document(entry: HostEntry) -> dict[str, Any]:
+    """One registered host as `gpuc host list --json` reports it.
+
+    The registry entry itself, plus what the text listing computes from it:
+    where gpuc home resolves to on the host, and the re-bootstrap warning.
+    """
+    document: dict[str, Any] = json.loads(entry.model_dump_json())
+    stale = status_mod.stale_warning(entry)
+    return {
+        **document,
+        # `--env` is free-form and is where somebody hand-sets an HF_TOKEN, so
+        # the names are reported and the values are not: the text listing shows
+        # neither, and this document ends up in transcripts and bug reports.
+        "env": dict.fromkeys(entry.env, "<set>"),
+        "remote_home": entry.remote_home,
+        "ephemeral": entry.ephemeral,
+        "warnings": [stale] if stale else [],
+    }
+
+
+def cmd_host_list(args: argparse.Namespace) -> int:
     read = read_registry()
     for error in read.errors:
         print(f"warning: {error}", file=sys.stderr)
     registry = read.registry
+    if args.json:
+        jsonout.emit(
+            {
+                "hosts": [host_document(entry) for entry in registry.hosts.values()],
+                "errors": list(read.errors),
+            }
+        )
+        return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
     if not registry.hosts:
         if read.unreadable:
             return EXIT_LOCAL_STATE
@@ -371,8 +404,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
         verify=args.verify,
         yes=args.yes,
     )
-    print(report.render())
-    return 1 if report.errors else 0
+    if args.json:
+        jsonout.emit(report.document())
+    else:
+        print(report.render())
+    return EXIT_ERROR if report.errors else EXIT_OK
 
 
 def cmd_host_clean(args: argparse.Namespace) -> int:
@@ -387,7 +423,8 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
     settings = load_settings()
     entry = named_registry().require(args.name)
     report = probe_host(entry, settings)
-    print(report.render())
+    if not args.json:
+        print(report.render())
     # A probe is the one command that runs before bootstrap, so it is also the
     # first chance to learn what the cards are.
     if report.gpu_info:
@@ -402,7 +439,12 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
                         }
                     )
                 )
-    return 0
+    # After the registry write, not before: that write can fail (a held lock, a
+    # registry that changed under us) and print an error document of its own,
+    # and stdout may hold only one.
+    if args.json:
+        jsonout.emit(report.document())
+    return EXIT_OK
 
 
 CLOUDS: dict[str, list[Cloud]] = {
@@ -438,6 +480,7 @@ def runpod_target(args: argparse.Namespace, settings: Settings) -> HostEntry:
         constraints_from(args),
         settings,
         provider=make_provider(settings),
+        report=reporter(args),
         reuse=not args.no_reuse,
         name_hint=args.name_hint,
         idle_minutes=args.idle_min,
@@ -496,8 +539,13 @@ def check_runpod_args(args: argparse.Namespace) -> None:
     args.ttl_hours = _ttl_hours(args.ttl_hours)
 
 
+def reporter(args: argparse.Namespace) -> Reporter:
+    """Where a step's progress goes: stdout, or stderr when stdout is a document."""
+    return jsonout.note if getattr(args, "json", False) else print
+
+
 def ensure_package_current(
-    entry: HostEntry, settings: Settings, *, bootstrap: bool = True
+    entry: HostEntry, settings: Settings, *, bootstrap: bool = True, report: Reporter = print
 ) -> HostEntry:
     """Re-ship the package when the host is not running this build.
 
@@ -513,7 +561,7 @@ def ensure_package_current(
     local = version_mod.local_commit()
     if not version_mod.needs_package_sync(local, entry.pkg_commit):
         return entry
-    print(
+    report(
         f"host {entry.name} has gpuc {version_mod.short(entry.pkg_commit)} and this machine "
         f"has {version_mod.short(local)}: re-syncing the package and restarting the "
         f"dispatcher before enqueueing"
@@ -532,6 +580,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     settings = load_settings()
     check_runpod_args(args)
     use_git = not args.no_git
+    report = reporter(args)
     if args.runpod:
         document = load_document(args.job_file)
         model = validate(document, str(args.job_file))
@@ -545,7 +594,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
         job_id = jobs.new_job_id()
         spec_uri, notes = mirror_spec_first(model, job_id, settings)
         entry = runpod_target(args, settings)
-        entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap)
+        entry = ensure_package_current(
+            entry, settings, bootstrap=not args.no_bootstrap, report=report
+        )
         result = submit_spec(
             entry,
             model,
@@ -554,17 +605,34 @@ def cmd_submit(args: argparse.Namespace) -> int:
             job_id=job_id,
             spec_uri=spec_uri,
             use_git=use_git,
+            report=report,
         )
         result.notes.extend(notes)
-        print(result.render())
-        return 0
+        return _queued(result, args)
     if not args.host:
         raise UsageError("submit needs --host <name> (see `gpuc host list`)")
     entry = named_registry().require(args.host)
-    entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap)
-    result = submit_file(entry, args.job_file, settings, workdir=Path.cwd(), use_git=use_git)
+    entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap, report=report)
+    result = submit_file(
+        entry, args.job_file, settings, workdir=Path.cwd(), use_git=use_git, report=report
+    )
+    return _queued(result, args)
+
+
+def _queued(
+    result: SubmitResult, args: argparse.Namespace, *, requeued_from: str | None = None
+) -> int:
+    """The last word of `submit` and `requeue`, in whichever form was asked for."""
+    if args.json:
+        jsonout.emit(result.document(requeued_from=requeued_from))
+        return EXIT_OK
     print(result.render())
-    return 0
+    if requeued_from is not None:
+        print(
+            f"  requeued from {requeued_from} (attempt {result.attempt}); "
+            f"workdir re-synced from {Path.cwd()}"
+        )
+    return EXIT_OK
 
 
 def _hosts(registry: Registry, only: str | None) -> list[HostEntry]:
@@ -799,8 +867,14 @@ def cmd_ssh(args: argparse.Namespace) -> int:
 def cmd_cancel(args: argparse.Namespace) -> int:
     entry, _ = find_job_host(args.job_id, named_registry(), args.host)
     payload = open_session(entry, load_settings()).host_json(f"cancel {shlex.quote(args.job_id)}")
-    print(f"job {args.job_id} on host {entry.name}: {payload.get('status')}")
-    return 0
+    # The host's own word for what it did: `cancelled` for a queued job it
+    # dequeued, `cancelling` for a running one whose runner has been marked.
+    status = payload.get("status")
+    if args.json:
+        jsonout.emit({"job_id": args.job_id, "host": entry.name, "status": status})
+    else:
+        print(f"job {args.job_id} on host {entry.name}: {status}")
+    return EXIT_OK
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
@@ -812,8 +886,11 @@ def cmd_reorder(args: argparse.Namespace) -> int:
             f"job {args.job_id} is not in host {entry.name}'s queue, so its priority cannot "
             f"change (a running or finished job cannot be reordered)."
         )
-    print(f"job {args.job_id} on host {entry.name} moved to priority {args.priority}")
-    return 0
+    if args.json:
+        jsonout.emit({"job_id": args.job_id, "host": entry.name, "priority": args.priority})
+    else:
+        print(f"job {args.job_id} on host {entry.name} moved to priority {args.priority}")
+    return EXIT_OK
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
@@ -823,7 +900,23 @@ def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str
     return ["bash", "-lc", command]
 
 
+@dataclass
+class LogText:
+    """A job's log and where it was read from, for both output forms."""
+
+    source: str
+    """`host` or `s3`."""
+    location: str | None
+    text: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
+    if args.json and args.follow:
+        raise UsageError(
+            "logs --json cannot follow: -f streams a log that has no end, and a JSON "
+            "document has to be complete. Drop one of them."
+        )
     settings = load_settings()
     entry, index = find_job_host(args.job_id, named_registry(), args.host)
     remote = None
@@ -835,23 +928,41 @@ def cmd_logs(args: argparse.Namespace) -> int:
             return _follow(session.transport, remote, args.lines)
         result = session.transport.tail(remote, lines=args.lines)
         if result.returncode == 0:
-            sys.stdout.write(result.stdout)
-            return 0
+            return _write_log(args, entry, LogText("host", remote, result.stdout))
         purged = _job_dir_gone(session, args.job_id)
-        note = result.output.strip().splitlines()[-1:] or ["no log file on the host"]
+        why = (result.output.strip().splitlines() or ["no log file on the host"])[-1]
     except (RemoteError, TransportError) as exc:
-        note = [str(exc).splitlines()[0]]
-    if purged:
-        # The whole job dir is gone, which is what `gpuc clean --purge` does on
-        # purpose. Saying "purged" beats printing a `tail: No such file`.
-        print(
-            f"note: job {args.job_id} was purged from host {entry.name} "
-            f"(gpuc clean --purge removes the whole job dir once it is mirrored)",
-            file=sys.stderr,
+        why = str(exc).splitlines()[0]
+    # A job dir that is gone entirely is what `gpuc clean --purge` does on
+    # purpose. Saying "purged" beats printing a `tail: No such file`.
+    note = (
+        f"job {args.job_id} was purged from host {entry.name} "
+        f"(gpuc clean --purge removes the whole job dir once it is mirrored)"
+        if purged
+        else f"could not read {remote or 'the host log'}: {why}"
+    )
+    print(f"note: {note}", file=sys.stderr)
+    log = _logs_from_s3(args.job_id, entry, index, settings, purged=purged)
+    log.notes.insert(0, note)
+    return _write_log(args, entry, log)
+
+
+def _write_log(args: argparse.Namespace, entry: HostEntry, log: LogText) -> int:
+    """Bytes for a human; lines plus where they came from for a script."""
+    if args.json:
+        jsonout.emit(
+            {
+                "job_id": args.job_id,
+                "host": entry.name,
+                "source": log.source,
+                "location": log.location,
+                "lines": log.text.splitlines(),
+                "notes": log.notes,
+            }
         )
     else:
-        print(f"note: could not read {remote or 'the host log'}: {note[0]}", file=sys.stderr)
-    return _logs_from_s3(args.job_id, entry, index, settings, purged=purged)
+        sys.stdout.write(log.text)
+    return EXIT_OK
 
 
 def _job_dir_gone(session: HostSession, job_id: str) -> bool:
@@ -878,7 +989,7 @@ def _logs_from_s3(
     settings: Settings,
     *,
     purged: bool = False,
-) -> int:
+) -> LogText:
     s3 = S3Index.from_settings(settings)
     prefix = (index.s3_prefix if index else None) or entry.s3_prefix
     if s3 is None or not prefix:
@@ -895,9 +1006,9 @@ def _logs_from_s3(
             f"host goes away."
         )
     uri = job_log_uri(prefix, job_id)
-    print(f"note: falling back to the S3 mirror at {uri}", file=sys.stderr)
-    sys.stdout.write(s3.get_uri(uri))
-    return 0
+    fallback = f"falling back to the S3 mirror at {uri}"
+    print(f"note: {fallback}", file=sys.stderr)
+    return LogText("s3", uri, s3.get_uri(uri), [fallback])
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
@@ -939,8 +1050,9 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             use_git=use_git,
             ttl_hours=args.ttl_hours,
         )
+    report = reporter(args)
     entry = runpod_target(args, settings) if target is None else registry.require(target)
-    entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap)
+    entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap, report=report)
     result = submit_spec(
         entry,
         model,
@@ -948,38 +1060,50 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         workdir=Path.cwd(),
         attempt=attempt,
         use_git=use_git,
+        report=report,
     )
-    print(result.render())
-    print(f"  requeued from {args.job_id} (attempt {attempt}); workdir re-synced from {Path.cwd()}")
-    return 0
+    return _queued(result, args, requeued_from=args.job_id)
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
+    if args.json and (args.install or not args.once):
+        raise UsageError(
+            "reconcile --json needs --once and nothing else: the loop and --install have "
+            "no document to print, only a running commentary."
+        )
     if args.install:
         reconcile_mod.install(args.interval)
-        return 0
+        return EXIT_OK
     settings = load_settings()
     provider = make_provider(settings)
     if args.once:
-        result = reconcile_mod.reconcile_once(settings, provider)
-        print(result.render())
-        return 1 if result.errors else 0
+        # Every pod it judges is a line of commentary, and under --json stdout
+        # belongs to the document.
+        result = reconcile_mod.reconcile_once(settings, provider, report=reporter(args))
+        if args.json:
+            jsonout.emit(result.document())
+        else:
+            print(result.render())
+        return EXIT_ERROR if result.errors else EXIT_OK
     print(f"reconciling every {args.interval:.0f}s; Ctrl-C to stop")
     try:
         reconcile_mod.run_loop(settings, provider, interval_s=args.interval)
     except KeyboardInterrupt:
         print("stopped")
-    return 0
+    return EXIT_OK
 
 
 def cmd_pods(args: argparse.Namespace) -> int:
     settings = load_settings()
     view = pods_mod.gather(settings, make_provider(settings), heartbeats=not args.no_heartbeat)
-    print(pods_mod.render(view))
-    return 0
+    if args.json:
+        jsonout.emit(view.document())
+    else:
+        print(pods_mod.render(view))
+    return EXIT_OK
 
 
-def cmd_version(_: argparse.Namespace) -> int:
+def cmd_version(args: argparse.Namespace) -> int:
     """What is installed here, and what each host was last given.
 
     The host commits are read from the registry, which bootstrap wrote -- no
@@ -988,6 +1112,8 @@ def cmd_version(_: argparse.Namespace) -> int:
     commit = version_mod.local_commit()
     source = "installed" if version_mod.installed_commit() else "source checkout"
     dirty = " (+uncommitted changes)" if version_mod.dirty() else ""
+    if args.json:
+        return _version_json(commit, source=source, dirty=bool(dirty))
     print(f"gpuc {version_mod.__version__}")
     print(f"commit {version_mod.short(commit)} [{source}]{dirty}")
     print(f"python {sys.version.split()[0]} at {sys.executable}")
@@ -1004,6 +1130,40 @@ def cmd_version(_: argparse.Namespace) -> int:
         print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{note}")
     if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
         print("upgrade a host with: gpuc host bootstrap <host> (running jobs are not disturbed)")
+    return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
+
+
+def _version_json(commit: str | None, *, source: str, dirty: bool) -> int:
+    """`gpuc version --json`: this build, and each bootstrapped host's package.
+
+    `hosts[].current` is the same judgement the text output prints as `OLDER:
+    re-bootstrap`: a commit that does not match this build's. Nothing recorded
+    on either side is not evidence of a mismatch, so it reads as current --
+    `submit` re-ships the package to such a host anyway.
+    """
+    read = read_registry()
+    for error in read.errors:
+        print(f"warning: {error}", file=sys.stderr)
+    hosts = [entry for entry in read.registry.hosts.values() if entry.bootstrapped_at]
+    jsonout.emit(
+        {
+            "version": version_mod.__version__,
+            "commit": commit,
+            "source": source,
+            "dirty": dirty,
+            "python": sys.version.split()[0],
+            "executable": sys.executable,
+            "hosts": [
+                {
+                    "name": entry.name,
+                    "pkg_commit": entry.pkg_commit,
+                    "current": version_mod.same_commit(commit, entry.pkg_commit),
+                }
+                for entry in hosts
+            ],
+            "errors": list(read.errors),
+        }
+    )
     return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
 
 
@@ -1110,6 +1270,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe = host.add_parser("probe", help="report what a host has, before bootstrap")
     probe.add_argument("name")
+    add_json_flag(probe)
     probe.set_defaults(func=cmd_host_probe)
 
     host_clean = host.add_parser("clean", help="prune the host's uv cache")
@@ -1119,7 +1280,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     host_clean.set_defaults(func=cmd_host_clean)
 
-    host.add_parser("list", help="list registered hosts").set_defaults(func=cmd_host_list)
+    host_list = host.add_parser("list", help="list registered hosts")
+    add_json_flag(host_list)
+    host_list.set_defaults(func=cmd_host_list)
     resume = host.add_parser(
         "resume", help="clear a low-util pause on a host and restart its dispatcher"
     )
@@ -1137,6 +1300,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_no_git_flag(submit)
     add_bootstrap_flag(submit)
     add_runpod_flags(submit)
+    add_json_flag(submit)
     submit.set_defaults(func=cmd_submit)
 
     status = sub.add_parser("status", help="per-host queue, running and recent jobs")
@@ -1176,9 +1340,11 @@ def build_parser() -> argparse.ArgumentParser:
     skill.add_argument("--force", action="store_true", help="overwrite an existing installed copy")
     skill.set_defaults(func=cmd_skill)
 
-    sub.add_parser(
+    version = sub.add_parser(
         "version", help="version, installed commit, and each host's package commit"
-    ).set_defaults(func=cmd_version)
+    )
+    add_json_flag(version)
+    version.set_defaults(func=cmd_version)
 
     clean = sub.add_parser("clean", help="remove finished jobs' workdirs on a host")
     clean.add_argument("--host", required=True, metavar="NAME", help="the host to reclaim disk on")
@@ -1216,6 +1382,7 @@ def build_parser() -> argparse.ArgumentParser:
         "finished job with no age horizon at all",
     )
     clean.add_argument("--dry-run", action="store_true", help="list what would go, delete nothing")
+    add_json_flag(clean)
     clean.set_defaults(func=cmd_clean)
 
     logs = sub.add_parser("logs", help="tail a job log from its host")
@@ -1226,6 +1393,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     logs.add_argument(
         "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+    )
+    add_json_flag(
+        logs,
+        "the log as a list of lines, with the host or S3 uri it came from; "
+        "not with -f, which has no end",
     )
     logs.set_defaults(func=cmd_logs)
 
@@ -1258,6 +1430,7 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument(
         "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
     )
+    add_json_flag(cancel)
     cancel.set_defaults(func=cmd_cancel)
 
     reorder = sub.add_parser("reorder", help="change a queued job's priority")
@@ -1271,6 +1444,7 @@ def build_parser() -> argparse.ArgumentParser:
     reorder.add_argument(
         "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
     )
+    add_json_flag(reorder)
     reorder.set_defaults(func=cmd_reorder)
 
     requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
@@ -1283,6 +1457,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_no_git_flag(requeue)
     add_bootstrap_flag(requeue)
     add_runpod_flags(requeue)
+    add_json_flag(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
     reconcile = sub.add_parser(
@@ -1300,12 +1475,14 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument(
         "--install", action="store_true", help="write (but do not enable) systemd --user units"
     )
+    add_json_flag(reconcile, f"{JSON_HELP}; needs --once")
     reconcile.set_defaults(func=cmd_reconcile)
 
     pods = sub.add_parser("pods", help="every pod with our prefix, cost, util, age, desired?")
     pods.add_argument(
         "--no-heartbeat", action="store_true", help="skip the per-pod dispatcher ssh check"
     )
+    add_json_flag(pods)
     pods.set_defaults(func=cmd_pods)
 
     config = sub.add_parser("config", help="show or create the settings file").add_subparsers(
@@ -1318,6 +1495,17 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_config_show
     )
     return parser
+
+
+JSON_HELP = (
+    "one JSON document on stdout and nothing else; progress and warnings go to "
+    "stderr. `error` is set (and nothing else but schema_version) when the command "
+    "failed, and the exit code is the same as without --json"
+)
+
+
+def add_json_flag(parser: argparse.ArgumentParser, help_text: str = JSON_HELP) -> None:
+    parser.add_argument("--json", action="store_true", help=help_text)
 
 
 def add_bootstrap_flag(parser: argparse.ArgumentParser) -> None:
@@ -1398,27 +1586,46 @@ def first_run_note() -> None:
         )
 
 
+def failed(args: argparse.Namespace, message: str, exit_code: int) -> int:
+    """One exit for every failure: the message on stderr, and under `--json` a
+    document on stdout saying the same thing, so a caller parsing stdout is
+    never handed half an answer or nothing at all."""
+    print(f"error: {message}", file=sys.stderr)
+    if getattr(args, "json", False):
+        jsonout.emit_error(message, exit_code)
+    return exit_code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    try:
+        args = build_parser().parse_args(raw)
+    except SystemExit as exc:
+        # argparse writes its own message and exits before `failed()` can be
+        # reached. The reason stays on stderr, where every other note goes, but
+        # stdout still gets a document: "exit 2 and nothing at all" is the one
+        # answer --json promises never to give. `--help` exits 0 and is not one.
+        code = exc.code if isinstance(exc.code, int) else EXIT_USAGE
+        if code and "--json" in raw:
+            jsonout.emit_error("the command line was rejected; the reason is on stderr", code)
+        raise
     if wants_runpod(args) and not os.environ.get("RUNPOD_API_KEY"):
         # Before anything else: provisioning spends money, and finding out after
         # the spec has been mirrored and a host picked helps nobody.
-        print(
-            "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
+        return failed(
+            args,
+            "RUNPOD_API_KEY is not set; export it before using --runpod, "
             "`gpuc pods` or `gpuc reconcile`",
-            file=sys.stderr,
+            EXIT_ERROR,
         )
-        return 1
     if args.command not in ("config", "skill"):
         first_run_note()
     try:
         return int(args.func(args))
     except LocalStateUnreadable as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_LOCAL_STATE
+        return failed(args, str(exc), EXIT_LOCAL_STATE)
     except HostNotFound as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_NOT_FOUND
+        return failed(args, str(exc), EXIT_NOT_FOUND)
     except (
         CleanError,
         CliError,
@@ -1432,11 +1639,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         SkillError,
         TransportError,
     ) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return getattr(exc, "exit_code", EXIT_ERROR)
+        return failed(args, str(exc), getattr(exc, "exit_code", EXIT_ERROR))
     except json.JSONDecodeError as exc:
-        print(f"error: a host returned malformed JSON: {exc}", file=sys.stderr)
-        return EXIT_ERROR
+        return failed(args, f"a host returned malformed JSON: {exc}", EXIT_ERROR)
 
 
 if __name__ == "__main__":

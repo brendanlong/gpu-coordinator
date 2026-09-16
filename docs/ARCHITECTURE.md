@@ -478,7 +478,15 @@ a dead dispatcher and a pod that is gone (data about a host, reported per host),
 is a name that does not exist. `gpuc status` never exits non-zero because of one
 bad host entry or one unreachable host, and `gpuc status --json` always prints
 one document. Automation keys on `hosts[].running` and treats exit 3 as unknown,
-never as "nothing running". `gpuc logs` has no `--json`.
+never as "nothing running".
+
+`--json` is on every command that has an answer to give, and means the same
+thing on each: stdout is one object carrying `schema_version`, everything else
+the command has to say goes to stderr, and a failure prints
+`{schema_version, error, exit_code}` rather than nothing. The flag never changes
+an exit code. `gpuc logs --json` is the tail as `lines[]` plus where it was read
+from; with `-f` it is exit 2, because a stream has no end. Each command's schema
+is the table in usage.md.
 
 ## Transport
 

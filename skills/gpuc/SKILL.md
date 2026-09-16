@@ -103,7 +103,8 @@ gpuc submit job.yaml --host <host>                              # any name from 
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu A40,RTX4090 --cloud any
 
 gpuc status                      # every host: queue, running job + phase, recent results
-gpuc status --json               # the same, machine-readable (see "Exit codes" below)
+gpuc status --json               # the same, machine-readable; --json is on every command
+                                 # that has an answer (see "Exit codes" below)
 gpuc status --suspects           # running jobs that are billing but idle, judged by each job's
                                  # own low_util window/floor/grace, plus pods past a TTL they have;
                                  # it never kills anything
@@ -160,6 +161,29 @@ provider_util, gpus, queued, running, finished, errors`; each job in those three
 lists has `job_id, name, status, reason, phase, elapsed_s, util, gpus, iso,
 ended_at, outputs_pending`.
 
+**Every command that has an answer takes `--json`**, and means the same thing by
+it: stdout is one object with `schema_version`, everything else the command says
+goes to stderr, and the exit code is unchanged by the flag. Prefer it to
+scraping any of the text output.
+
+| command | the document |
+| --- | --- |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[]}` |
+| `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
+| `cancel` | `{job_id, host, status}` |
+| `reorder` | `{job_id, host, priority}` |
+| `pods` | `{pods[], hourly_usd, others[], notes[]}` |
+| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
+| `host list` | `{hosts[], errors[]}` |
+| `host probe` | `{host, sections{}, driver_version, gpus[], uv_cache{}, notes[], ...}` |
+| `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
+| `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}` |
+
+```bash
+id=$(gpuc submit job.yaml --host gpubox --json | jq -r .job_id)
+gpuc logs "$id" --json | jq -r '.lines[-20:][]'
+```
+
 Rules, and they are not optional:
 
 - **Key on the JSON `running` list**, never on scraped text and never on the
@@ -168,11 +192,13 @@ Rules, and they are not optional:
   something local is broken, and jobs may well be running. The same goes for a
   non-empty top-level `errors`, and for `"reachable": false` on the host you
   care about — we could not ask it.
+- A command that failed still prints a document: `{schema_version, error,
+  exit_code}`. `error` (singular) means it did not do what you asked; `errors`
+  (plural) is trouble it survived and does not imply a non-zero exit on its own.
 - A job's `util` is the host's own nvidia-smi sampler (shown as
   `util 98% (host)`); a pod's `provider_util` is RunPod's reading for the whole
   pod (`provider util 71%`). They differ legitimately; do not compare them.
-- Ignore keys you do not recognise; more will be added. (`gpuc logs` has no
-  `--json`; it is a byte stream.)
+- Ignore keys you do not recognise; more will be added.
 
 ## RunPod specifics
 
