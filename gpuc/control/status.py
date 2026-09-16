@@ -335,9 +335,10 @@ class HostView:
     def leftover_bytes(self) -> int:
         """Disk held by workdirs of jobs that are over: reclaimable by `gpuc clean`.
 
-        The host answers for every finished job, so a null here is either a
-        running job or a host too old to answer -- and a build that far behind
-        is what `host_warnings` is for.
+        The host answers for all but the finished job it ran out of measuring
+        budget for, and that one is measured by the next call. A null that
+        never resolves means a host too old to answer, which is what the build
+        warning in `host_warnings` is for.
         """
         return sum(job.workdir_bytes or 0 for job in self.finished)
 

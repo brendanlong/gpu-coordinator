@@ -516,13 +516,57 @@ def test_host_cli_status_measures_the_workdir_nobody_measured(
     assert jobs.read_state(done).workdir_bytes == measured, "the next call must not walk again"
 
 
-def test_host_cli_status_does_not_believe_a_zero_over_a_live_workdir(
+def test_host_cli_status_believes_a_measured_zero(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Zero is a real answer for a workdir that is there: a tree whose extents
+    are all shared measures nothing, and so does an empty dir on tmpfs. Reading
+    it as "unknown" would walk that tree again on every single call."""
     done = finished_job("succeeded")
     jobs.update_state(done, workdir_bytes=0)
-    measured = sizes_from_status(capsys)[done]
-    assert measured is not None and measured > 0
+
+    def refuse(root: Path) -> int:
+        raise AssertionError("re-walked a workdir that had been measured at zero")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "reclaimable_bytes", refuse)
+        assert sizes_from_status(capsys)[done] == 0
+
+
+class RunsOutOfTime:
+    """A monotonic clock that is past any deadline after its first answer."""
+
+    def __init__(self) -> None:
+        self.answers = 0
+
+    def monotonic(self) -> float:
+        self.answers += 1
+        return 0.0 if self.answers == 1 else 1e12
+
+
+def test_host_cli_status_stops_measuring_when_its_budget_is_spent(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Blowing the control side's 60 s deadline would cost the whole host line
+    -- its queue, its running jobs and its cards -- not just these figures."""
+    ids = [finished_job("succeeded"), finished_job("failed")]
+    walked: list[Path] = []
+
+    def watch(root: Path) -> int:
+        walked.append(root)
+        return 4096
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "time", RunsOutOfTime())
+        patch.setattr(cleanup, "reclaimable_bytes", watch)
+        sizes = sizes_from_status(capsys)
+    assert len(walked) == 1, "the second job is past the budget"
+    measured = [job for job in ids if sizes[job] == 4096]
+    assert len(measured) == 1
+    assert [sizes[job] for job in ids if job not in measured] == [None]
+    # Written down, so the next call carries on from here rather than starting
+    # the same queue of walks over again.
+    assert jobs.read_state(measured[0]).workdir_bytes == 4096
 
 
 def test_host_cli_status_never_sizes_a_running_job(

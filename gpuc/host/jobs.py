@@ -396,9 +396,11 @@ class JobState:
     reads the number. Null means nobody has measured it yet (a job that ended
     before this was recorded, or a runner that died before writing it), which
     matters only while the workdir is still there: the first `status` after
-    that walks it and writes the figure here. See
+    that walks it and writes the figure here. Zero is an answer and not an
+    absence -- usually the workdir being gone, sometimes a tree all of whose
+    extents are shared with something else. See
     `cleanup.reported_workdir_bytes`, which is what decides what `status`
-    reports and never needs this to be populated to answer.
+    reports and needs this populated only for a workdir still on disk.
 
     Not the number `du` gives: see `cleanup.reclaimable_bytes`. `gpuc clean`
     measures afresh rather than trusting this, because it is about to delete

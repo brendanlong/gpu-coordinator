@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -108,6 +109,7 @@ def wandb_hints(env: dict[str, str]) -> dict[str, str]:
 def cmd_status(args: argparse.Namespace) -> int:
     config = jobs.read_config()
     job_ids = [args.job_id] if args.job_id else jobs.list_job_ids()
+    measuring_until = time.monotonic() + cleanup.MEASURING_BUDGET_S
     entries: list[dict[str, Any]] = []
     for job_id in job_ids:
         try:
@@ -139,12 +141,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         # its own business and never leaves the host.
         entry["outputs"] = [asdict(o) for o in spec.outputs] if spec else []
         entry["wandb"] = wandb_hints(spec.env) if spec else {}
-        # Null only for a job that is not over: a running job's workdir is
-        # being written to, so any size for it would be a lie. A finished job
-        # always gets a figure, which is free for the workdirs that are already
-        # gone and read from `state.json` for the rest.
+        # Null for a job that is not over -- a running job's workdir is being
+        # written to, so any size for it would be a lie -- and for a finished
+        # one only when the call's measuring budget is spent. Otherwise free
+        # for the workdirs that are already gone, and read from `state.json`
+        # for the rest.
         entry["workdir_bytes"] = (
-            cleanup.reported_workdir_bytes(job_id, state) if state.finished else None
+            cleanup.reported_workdir_bytes(job_id, state, deadline=measuring_until)
+            if state.finished
+            else None
         )
         # "this job produced something that is still only here": the control
         # side cannot work it out, since it never sees the spec's `outputs:`.

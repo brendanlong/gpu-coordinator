@@ -114,7 +114,8 @@ jobs/<jobid>/
                      #  "progress_error": str|null, "eta": str|null,
                      #  "workdir_removed": bool,
                      #  "workdir_bytes": int|null,  # what removing workdir/ would free;
-                     #                              # measured once when the job ended
+                     #                              # measured once, as the job ended (or by
+                     #                              # the first status to find it missing)
                      #  "meta_synced_at": str|null, "meta_synced_to": str|null,
                      #  "outputs_synced_at": str|null, "outputs_lost": bool}
                      # meta_synced_* are written only after a *successful* final sync_job_meta
@@ -314,9 +315,10 @@ queue's lexical order, not submission order below one second.
    every call, which cost that command four seconds on a host holding sixty.
    A job that ended before the field existed, or whose runner died before
    writing it, has `null` there; the first `status` that finds a workdir still
-   on disk with no figure walks it and writes one. `gpuc clean` measures
-   afresh instead of trusting it,
-   because it is about to delete what it is quoting. Then upload state and log.
+   on disk with no figure walks it and writes one, within a per-call budget so
+   the walking cannot cost the host its whole `status`. `gpuc clean` measures
+   afresh instead of trusting any of it, because it is about to delete what it
+   is quoting. Then upload state and log.
    A removal that fails is logged and nothing more: the job's outcome is
    already decided, and leftover disk is not worth turning a green run red. That last upload records
    `meta_synced_at`/`meta_synced_to` and puts `state.json` up once more, so the
@@ -560,9 +562,11 @@ The host's `status` reports `workdir_bytes` per *finished* job (a live job's
 workdir is still being written to, and walking it on every status call would be
 pure cost). A finished job always gets a number: zero when its workdir is gone,
 which is one `is_dir()` and needs nothing recorded, and otherwise the recorded
-figure or a walk on the spot. Nothing schedules that, so a host with no
-dispatcher running -- the normal state of an idle one -- answers as well as a
-busy one. `gpuc status` prints one line per host once the total exceeds 1 GiB.
+figure or a walk on the spot, bounded by `cleanup.MEASURING_BUDGET_S` so a
+host that has many to do reports the rest as `null` and measures them on the
+next call rather than blowing the control side's deadline and reporting nothing
+at all. Nothing schedules any of it, so a host with no dispatcher running --
+the normal state of an idle one -- answers as well as a busy one. `gpuc status` prints one line per host once the total exceeds 1 GiB.
 
 Every byte figure a `clean`, `purge` or `status` reports is
 `cleanup.reclaimable_bytes`: what deleting the tree gives the filesystem back,
@@ -578,8 +582,9 @@ Reflinks share extents without sharing an inode, so they need `FIEMAP` and its
 is affordable because the walk happens **once per job**, not once per `status`:
 the answer goes in `JobState.workdir_bytes` (see the runner's step 7) and
 readers read it -- and the job that no longer has a workdir, which is most of
-them, is answered without walking anything. Nothing cheaper is exact -- `LOGICAL_INO` costs more per
-extent, a filesystem scan is O(extents on the device), and only btrfs qgroups
+them, is answered without walking anything. Nothing cheaper is exact --
+`LOGICAL_INO` costs more per extent, a filesystem scan is O(extents on the
+device), and only btrfs qgroups
 answer in O(1), per subvolume, with quotas on -- so the trade is to pay it once
 and write the number down. Every way it can fail (no FIEMAP, no permission, an
 odd filesystem) means "assume it is all yours", so no *file* is ever
