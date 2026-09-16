@@ -250,9 +250,11 @@ def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str
                 f"the host calls itself {entry.name!r}, not {asked_for!r}, so that is the name "
                 f"it is registered under here"
             )
+        # What the flags changed about somebody's host. On a host that had no
+        # config every field "changed", and the line above already said so.
+        lines += [f"  host <- {change}" for change in connection.changes]
     else:
         lines.append(f"wrote its first config to {connection.home}/config.json")
-    lines += [f"  host <- {change}" for change in connection.changes if connection.adopted]
     home = _home_line(entry)
     if home:
         lines.append(home.rstrip())

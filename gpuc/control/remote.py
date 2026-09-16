@@ -188,9 +188,10 @@ def write_remote_config(
         try:
             return _merge_on_host(transport, home, body, python, env)
         except (RemoteError, TransportError):
-            # The interpreter or the package is not where the registry says it
-            # is (a wiped $HOME, a gpuc home that moved). The host still owns
-            # its config; we can still write it.
+            # The package is not where the registry says it is (a wiped $HOME,
+            # a gpuc home that moved), or it is a build old enough not to have
+            # this subcommand. The host still owns its config either way, and
+            # the same merge below is what its own CLI would have done.
             pass
     document = jobs.merged_config(read_remote_config(transport, home) or {}, patch)
     put_remote_config(transport, home, document)
