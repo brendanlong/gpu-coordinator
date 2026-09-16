@@ -376,15 +376,71 @@ def test_host_cli_status_reports_workdir_bytes(
     assert sizes[running] is None
 
 
-def test_dir_size_counts_a_hardlink_once(gpuc_home: Path, tmp_path: Path) -> None:
+def test_reclaimable_bytes_counts_a_hardlink_once(gpuc_home: Path, tmp_path: Path) -> None:
     root = tmp_path / "tree"
     (root / "sub").mkdir(parents=True)
     original = root / "a.bin"
     original.write_bytes(b"x" * 100_000)
     (root / "sub" / "b.bin").hardlink_to(original)
-    once = cleanup.dir_size(root)
+    once = cleanup.reclaimable_bytes(root)
     (root / "sub" / "c.bin").write_bytes(b"x" * 100_000)
-    assert cleanup.dir_size(root) > once
+    assert cleanup.reclaimable_bytes(root) > once
+
+
+def test_dir_size_counts_what_another_tree_links_to(gpuc_home: Path, tmp_path: Path) -> None:
+    """The uv cache's own size is a `du` question: it holds those bytes."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    cached = cache / "wheel.bin"
+    cached.write_bytes(b"x" * 100_000)
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "wheel.bin").hardlink_to(cached)
+    assert cleanup.dir_size(cache) >= 100_000
+    assert cleanup.reclaimable_bytes(cache) < 100_000
+
+
+def test_reclaimable_bytes_skips_what_a_link_outside_the_tree_still_holds(
+    gpuc_home: Path, tmp_path: Path
+) -> None:
+    """The uv cache case: deleting the workdir frees none of those bytes."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    cached = cache / "wheel.bin"
+    cached.write_bytes(b"x" * 100_000)
+
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "linked.bin").hardlink_to(cached)
+    linked_only = cleanup.reclaimable_bytes(root)
+
+    (root / "own.bin").write_bytes(b"y" * 100_000)
+    assert cleanup.reclaimable_bytes(root) - linked_only >= 100_000
+    assert linked_only < 100_000, "counted bytes the cache still holds"
+
+
+def test_reclaimable_bytes_counts_a_file_once_every_link_to_it_is_in_the_tree(
+    gpuc_home: Path, tmp_path: Path
+) -> None:
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    original = root / "a.bin"
+    original.write_bytes(b"x" * 100_000)
+    (root / "sub" / "b.bin").hardlink_to(original)
+    # Both names are inside the tree, so the bytes really are reclaimable.
+    assert cleanup.reclaimable_bytes(root) >= 100_000
+
+
+def test_reclaimable_bytes_counts_a_directory_whose_nlink_counts_subdirectories(
+    gpuc_home: Path, tmp_path: Path
+) -> None:
+    """A dir's st_nlink is 2 + its subdirs, which must not read as "shared"."""
+    root = tmp_path / "tree"
+    for name in ("a", "b", "c"):
+        (root / name).mkdir(parents=True)
+    assert root.stat().st_nlink > 1, "the case this is about"
+    every_dir = [root, *(root / name for name in ("a", "b", "c"))]
+    assert cleanup.reclaimable_bytes(root) == sum(d.stat().st_blocks for d in every_dir) * 512
 
 
 def test_human_bytes_reads_like_du() -> None:

@@ -540,6 +540,18 @@ class HostConfig:
     When set, the dispatcher purges finished, mirrored job dirs older than this
     at startup and at most once an hour while it lives. Never forced: a job
     without a confirmed mirror is kept however old it is."""
+    workdir_days: float | None = None
+    """Automatic workdir horizon, in days. Null (the default) never sweeps.
+
+    The shorter of the two horizons, and the one worth setting: it reclaims a
+    finished job's `workdir/` -- code and venv, the part `gpuc requeue` rebuilds
+    from git -- and leaves the record alone, so it needs no mirror and asks
+    nothing of the caller. `retention_days` is the one that deletes `log.txt`.
+
+    Null rather than a default here on purpose: a host whose `config.json`
+    predates this key must not start deleting because its package was
+    upgraded. The default lives on the control side, where `host add` records
+    it and `host bootstrap` ships it."""
     env: dict[str, str] = field(default_factory=dict)
     """Host-wide environment, applied to every job before the job's own `env`.
 
@@ -569,6 +581,7 @@ class HostConfig:
             s3_prefix=as_opt_str(fields, "s3_prefix"),
             created_at=as_opt_str(fields, "created_at"),
             retention_days=as_opt_float(fields, "retention_days"),
+            workdir_days=as_opt_float(fields, "workdir_days"),
             env=as_str_dict(fields, "env"),
             pkg_commit=as_opt_str(fields, "pkg_commit"),
         )

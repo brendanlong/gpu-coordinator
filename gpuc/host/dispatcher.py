@@ -42,9 +42,9 @@ KILL_GRACE_S = 15.0
 TERMINATE_RETRY_S = 600.0
 MAX_CONSECUTIVE_FAILURES = 20
 RETENTION_INTERVAL_S = 3600.0
-"""How often a dispatcher with `retention_days` set runs the purge.
+"""How often a dispatcher with `retention_days` or `workdir_days` set reclaims.
 
-Once at startup and then hourly: deleting week-old job dirs is not urgent, and
+Once at startup and then hourly: deleting day-old venvs is not urgent, and
 on a non-ephemeral host the dispatcher only lives while there is work, so the
 startup pass is the one that usually fires.
 """
@@ -392,7 +392,7 @@ class Dispatcher:
     _queue_empty_since: float | None = None
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
-    _last_purge_at: float | None = None
+    _last_reclaim_at: float | None = None
     _kill_sent: dict[str, float] = field(default_factory=dict)
     _kill_escalated: set[str] = field(default_factory=set)
     _pause_drain_pending: bool = False
@@ -960,19 +960,33 @@ class Dispatcher:
         )
 
     # -- retention -------------------------------------------------------
-    def maybe_purge(self) -> None:
-        """Run the retention purge at startup, then at most once an hour.
+    def maybe_reclaim(self) -> None:
+        """Run the two retention horizons at startup, then at most once an hour.
 
-        Never forced: an automatic sweep that could delete the only copy of a
-        job's log is not something anyone should have to opt out of.
+        They are separate because they cost different things. `workdir_days`
+        reclaims only what `gpuc requeue` can rebuild from git, so it is short
+        by default and needs no mirror; `retention_days` deletes the record of
+        a run, so it is long, opt-in, and never forced -- an automatic sweep
+        that could bin the only copy of a job's log is not something anyone
+        should have to opt out of.
+
+        Purge first: it takes whole job dirs, and the workdir sweep afterwards
+        should not spend its report on dirs that are already gone.
         """
-        days = self.config.retention_days
-        if days is None:
+        purge_days = self.config.retention_days
+        workdir_days = self.config.workdir_days
+        if purge_days is None and workdir_days is None:
             return
         now = self.deps.monotonic()
-        if self._last_purge_at is not None and now - self._last_purge_at < RETENTION_INTERVAL_S:
+        if self._last_reclaim_at is not None and now - self._last_reclaim_at < RETENTION_INTERVAL_S:
             return
-        self._last_purge_at = now
+        self._last_reclaim_at = now
+        if purge_days is not None:
+            self._purge(purge_days)
+        if workdir_days is not None:
+            self._sweep_workdirs(workdir_days)
+
+    def _purge(self, days: float) -> None:
         result = cleanup.purge(older_than_days=days, now=self.deps.utcnow())
         if result.purged or result.removed:
             purged = ", ".join(c.job_id for c in result.purged) or "none"
@@ -984,6 +998,17 @@ class Dispatcher:
         for error in result.errors:
             self.log(f"retention: {error}")
 
+    def _sweep_workdirs(self, days: float) -> None:
+        result = cleanup.clean(older_than_days=days, now=self.deps.utcnow())
+        if result.removed:
+            self.log(
+                f"workdirs ({days:g} days): removed {len(result.removed)} workdir(s), freeing "
+                f"{cleanup.human_bytes(result.freed_bytes)}; "
+                f"{', '.join(c.job_id for c in result.removed)}"
+            )
+        for error in result.errors:
+            self.log(f"workdirs: {error}")
+
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
         self._config = jobs.read_config()
@@ -993,7 +1018,7 @@ class Dispatcher:
         self.escalate_kills()
         self.check_pause()
         self.launch_ready()
-        self.maybe_purge()
+        self.maybe_reclaim()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:

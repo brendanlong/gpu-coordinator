@@ -600,9 +600,15 @@ def finished_job(days_old: float = 30.0, *, mirrored: bool = True) -> str:
     return job_id
 
 
-def configure_retention(days: float | None) -> None:
+def configure_retention(days: float | None, workdir_days: float | None = None) -> None:
     jobs.write_config(
-        HostConfig(host="h", gpus=list(FAKE_GPUS), s3_prefix="s3://b/gpuc/h", retention_days=days)
+        HostConfig(
+            host="h",
+            gpus=list(FAKE_GPUS),
+            s3_prefix="s3://b/gpuc/h",
+            retention_days=days,
+            workdir_days=workdir_days,
+        )
     )
 
 
@@ -612,6 +618,78 @@ def test_no_retention_setting_never_purges(gpuc_home: Path) -> None:
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     assert paths.state_file(job_id).exists()
+
+
+def test_neither_horizon_set_reclaims_nothing(gpuc_home: Path) -> None:
+    configure_retention(None, None)
+    job_id = finished_job()
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert paths.workdir(job_id).is_dir()
+
+
+def test_the_workdir_horizon_sweeps_without_a_purge_horizon(gpuc_home: Path) -> None:
+    configure_retention(None, 1.0)
+    old = finished_job(days_old=2.0)
+    young = finished_job(days_old=0.5)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert not paths.workdir(old).exists()
+    assert paths.workdir(young).is_dir()
+    # Only the workdir: the record of the run is what `retention_days` takes.
+    assert paths.state_file(old).exists()
+    assert jobs.read_state(old).workdir_removed is True
+    assert "workdirs (1 days): removed 1 workdir(s)" in paths.dispatcher_log().read_text()
+
+
+def test_the_workdir_horizon_needs_no_mirror(gpuc_home: Path) -> None:
+    configure_retention(None, 1.0)
+    job_id = finished_job(days_old=2.0, mirrored=False)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert not paths.workdir(job_id).exists()
+    assert paths.state_file(job_id).exists()
+
+
+def test_the_workdir_horizon_never_touches_a_running_job(gpuc_home: Path) -> None:
+    configure_retention(None, 0.0)
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "running"
+    dispatcher._last_reclaim_at = None
+    dispatcher.run_once()
+    assert paths.workdir(job_id).is_dir()
+
+
+def test_the_two_horizons_run_together_without_double_counting(gpuc_home: Path) -> None:
+    configure_retention(7.0, 1.0)
+    ancient = finished_job(days_old=30.0)
+    middling = finished_job(days_old=2.0)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert not paths.job_dir(ancient).exists(), "the purge horizon takes the whole dir"
+    assert paths.state_file(middling).exists()
+    assert not paths.workdir(middling).exists()
+    log = paths.dispatcher_log().read_text()
+    assert "retention (7 days): purged 1 job dir" in log
+    assert "workdirs (1 days): removed 1 workdir(s)" in log
+
+
+def test_the_workdir_horizon_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
+    configure_retention(None, 1.0)
+    clock = FakeClock()
+    dispatcher, _ = make_dispatcher(clock=clock)
+    dispatcher.run_once()
+
+    later = finished_job(days_old=2.0)
+    clock.advance(59 * 60)
+    dispatcher.run_once()
+    assert paths.workdir(later).is_dir(), "swept again inside the hour"
+
+    clock.advance(2 * 60)
+    dispatcher.run_once()
+    assert not paths.workdir(later).exists()
 
 
 def test_retention_purges_at_startup(gpuc_home: Path) -> None:
@@ -657,7 +735,7 @@ def test_retention_never_touches_a_running_job(gpuc_home: Path) -> None:
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     assert jobs.read_state(job_id).status == "running"
-    dispatcher._last_purge_at = None
+    dispatcher._last_reclaim_at = None
     dispatcher.run_once()
     assert paths.job_dir(job_id).is_dir()
 

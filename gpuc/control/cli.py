@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -183,6 +184,8 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
         fields["s3_prefix"] = args.s3_prefix or None
     if args.retention_days is not None:
         fields["retention_days"] = _retention(args.retention_days)
+    if args.workdir_days is not None:
+        fields["workdir_days"] = _days(args.workdir_days, "--workdir-days")
     if args.idle_min is not None:
         fields["idle_minutes"] = args.idle_min
     if args.ttl_hours is not None:
@@ -326,17 +329,32 @@ def _ttl_hours(raw: float | None) -> float | None:
     return raw
 
 
-def _retention(raw: str | None) -> float | None:
-    """`--retention-days`: a number, or '' to go back to keeping everything."""
+def _days(raw: str | None, flag: str) -> float | None:
+    """A horizon flag: a number of days, or '' to go back to keeping everything.
+
+    A string, not `type=float`, because argparse cannot express "given but
+    empty" for a float -- and a horizon that can be set but never unset is a
+    trap. Zero is a real answer here, unlike `--ttl-hours`: "reclaim it as soon
+    as it finishes" is what `cleanup: always` says per job.
+    """
     if raw is None or raw == "":
         return None
     try:
         days = float(raw)
     except ValueError as exc:
-        raise UsageError(f"--retention-days wants a number of days or '', got {raw!r}") from exc
+        raise UsageError(f"{flag} wants a number of days or '', got {raw!r}") from exc
+    # `float` takes "nan" and "inf". A NaN horizon compares false against every
+    # age, so it would sweep everything that has finished at all, and it is not
+    # even JSON either half could write.
+    if not math.isfinite(days):
+        raise UsageError(f"{flag} wants a number of days or '', got {raw!r}")
     if days < 0:
-        raise UsageError("--retention-days cannot be negative")
+        raise UsageError(f"{flag} cannot be negative")
     return days
+
+
+def _retention(raw: str | None) -> float | None:
+    return _days(raw, "--retention-days")
 
 
 def _home_line(entry: HostEntry) -> str:
@@ -359,6 +377,7 @@ _SET_FIELDS = (
     "cache_dir",
     "s3_prefix",
     "retention_days",
+    "workdir_days",
     "idle_min",
     "ttl_hours",
 )
@@ -1399,6 +1418,13 @@ def build_parser() -> argparse.ArgumentParser:
         "and state are mirrored; omit to keep everything forever",
     )
     add.add_argument(
+        "--workdir-days",
+        metavar="DAYS",
+        help="reclaim a finished job's workdir (checkout and venv, never its log or "
+        "state) once it ended this long ago; pass '' to keep workdirs until you run "
+        "`gpuc clean`. A host being configured for the first time gets 1",
+    )
+    add.add_argument(
         "--idle-min",
         type=float,
         default=None,
@@ -1443,6 +1469,11 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--s3-prefix", help="pass '' to stop mirroring")
     edit.add_argument(
         "--retention-days", help="auto-purge horizon in days; pass '' to keep everything"
+    )
+    edit.add_argument(
+        "--workdir-days",
+        metavar="DAYS",
+        help="workdir sweep horizon in days; pass '' to keep workdirs until `gpuc clean`",
     )
     edit.add_argument(
         "--idle-min",

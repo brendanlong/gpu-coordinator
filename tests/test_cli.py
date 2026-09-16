@@ -792,6 +792,35 @@ def test_a_bad_retention_value_is_rejected(
     assert "wants a number of days" in capsys.readouterr().err
 
 
+def test_a_new_host_sweeps_workdirs_after_a_day_without_being_asked(
+    control_env: Path,
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    entry = load_registry().require("gpubox")
+    assert entry.workdir_days == 1.0
+    assert entry.host_config().workdir_days == 1.0
+    # ...and it is the only horizon that is on by default.
+    assert entry.retention_days is None
+
+
+def test_workdir_days_is_stored_and_cleared(control_env: Path) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--workdir-days", "3.5"]) == 0
+    assert load_registry().require("gpubox").host_config().workdir_days == 3.5
+    assert main(["host", "set", "gpubox", "--workdir-days", "0"]) == 0
+    # Zero is a real horizon -- "reclaim it as soon as it finishes" -- and must
+    # not be confused with the empty string that turns the sweep off.
+    assert load_registry().require("gpubox").workdir_days == 0.0
+    assert main(["host", "set", "gpubox", "--workdir-days", ""]) == 0
+    assert load_registry().require("gpubox").workdir_days is None
+
+
+def test_a_bad_workdir_days_value_is_rejected(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--workdir-days", "-1"]) == EXIT_USAGE
+    assert "--workdir-days cannot be negative" in capsys.readouterr().err
+
+
 def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:
     from gpuc.control.cli import _outputs_lost_ids
     from gpuc.control.s3index import IndexEntry, S3Index

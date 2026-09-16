@@ -733,13 +733,35 @@ answer a host with no credentials of ours can give. `--purge --all-finished` is
 an age horizon of zero — it deletes the job dir of something that ended a minute
 ago — so it needs `--yes`, or `--dry-run` to see the list first.
 
-**Automatic retention.** `--retention-days N` on a host makes its dispatcher run
-the same purge itself, never forced, once at startup and then at most once an
-hour. On an ephemeral host that is its whole life; on a **non-ephemeral host the
-dispatcher only lives while there is work**, so the sweep happens on your next
-submit rather than on a timer. Each pass also does the ordinary workdir clean
-over the same horizon, which needs no mirror — so on a host with no
-`--s3-prefix`, `--retention-days` reclaims old venvs and nothing else.
+**Automatic, by the host: two horizons.** The dispatcher reclaims disk itself,
+once at startup and then at most once an hour. On an ephemeral host that is its
+whole life; on a **non-ephemeral host the dispatcher only lives while there is
+work**, so both happen on your next submit rather than on a timer.
+
+| | `--workdir-days N` | `--retention-days N` |
+| --- | --- | --- |
+| default | `1` | none |
+| takes | `workdir/` only | the whole `jobs/<id>/` |
+| needs a mirror | no | yes, and never forced |
+
+`--workdir-days` is the one that keeps a busy host from filling up. A failed or
+cancelled job keeps its workdir under the default `cleanup: on_success` so you
+can look at it, and a day later you either have or you haven't — so the sweep
+takes the checkout and the venv (a torch venv is ~6.5 GB) and leaves
+`spec.json`, `state.json` and `log.txt`, which is everything `logs`, `status`
+and `requeue` need. `gpuc requeue` re-syncs a workdir from git, so nothing here
+is unrecoverable. `--workdir-days ''` keeps them until you run `gpuc clean`
+yourself.
+
+`--retention-days` is the purge, and deletes the record of the run, so it is
+opt-in and only ever acts on jobs whose log and state the host has confirmed
+mirrored. Each purge pass also does the ordinary workdir clean over *its* own
+horizon, which needs no mirror — so on a host with no `--s3-prefix`,
+`--retention-days` reclaims old venvs and nothing else.
+
+Both are registry settings: `gpuc host set <name> --workdir-days 1` changes
+what this machine has recorded, and **`gpuc host bootstrap <name>` is what
+ships it to the host**.
 
 **Unconfirmed outputs.** `gpuc status` flags a finished job that *produced*
 `outputs:` which never reached S3 or HF as `outputs not uploaded`, and lists
@@ -756,7 +778,11 @@ not pause. Such a job shows `OUTPUTS LOST` in `gpuc status` and in `gpuc status
 --all`, and nothing recovers it but re-running the job.
 
 `gpuc status` also prints one line per host once finished workdirs hold more
-than 1 GiB, with the `gpuc clean` line to run.
+than 1 GiB, with the `gpuc clean` line to run. The figure is what deleting them
+would give the filesystem back, which on a host where uv hardlinks a venv out
+of its cache is far less than `du` reports for the same directory: those bytes
+have another name in the cache and stay when the workdir goes. Reflinks are not
+visible this cheaply, so a CoW copy still counts in full.
 
 ## Troubleshooting
 
@@ -780,6 +806,7 @@ than 1 GiB, with the `gpuc clean` line to run.
 | `status` says a job's `outputs not uploaded` | the final upload of its `outputs:` failed, so the results exist only on that host | copy them off, or `gpuc requeue <id>`; a purge will not remove it until they are confirmed |
 | a job is `OUTPUTS LOST` | an ephemeral host drained, retried three times and gave up before terminating | the results are gone; fix the credential or bucket, then `gpuc requeue <id>` |
 | `--retention-days` never deletes anything | the dispatcher only lives while a non-ephemeral host has work, and it never purges an unmirrored job | check `gpuc status` for `not backed up`, and remember the sweep runs on the next submit |
+| finished workdirs pile up anyway | `cleanup: on_success` keeps a failed or cancelled job's workdir on purpose, and the host's own sweep only runs once they are `--workdir-days` old (and only while its dispatcher is alive) | `gpuc clean --host H --all-finished --dry-run` to see them now; `gpuc host set H --workdir-days N` + `gpuc host bootstrap H` to change the horizon |
 | `requeue` refuses, or rebuilds the wrong code | it reads the spec from S3 (so `s3_bucket` must be set) and re-syncs the workdir from your current directory | run it from the right checkout; a `--no-git` workdir cannot be rebuilt from a commit |
 | `--idle-min` did nothing on a shared box | it only applies to ephemeral (RunPod) hosts; `local` and `ssh` hosts never terminate themselves | nothing to do; use `--retention-days` for disk, not `--idle-min` |
 | `uv sync` re-downloads torch on every job | uv's cache is on a different filesystem from gpuc home, so it copies instead of linking | `gpuc host bootstrap <host>` (it sets `UV_CACHE_DIR` for you), or pin one with `--cache-dir` |

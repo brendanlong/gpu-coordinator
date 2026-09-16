@@ -28,6 +28,16 @@ from pathlib import Path
 from gpuc.host import baseline, jobs, paths, queue
 from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS
 
+DEFAULT_WORKDIR_DAYS = 1.0
+"""What a host with no config of its own is given for `workdir_days`.
+
+Here rather than on `HostConfig`, whose default stays null, because those are
+different questions: a host being configured for the first time should reclaim
+its venvs, and a host whose `config.json` predates the key should not start
+deleting because somebody shipped it a newer package. `connect_host` applies
+this one; nothing applies the other.
+"""
+
 DEFAULT_RETENTION_DAYS = 7.0
 """How old a finished job must be before `purge` will consider it.
 
@@ -69,17 +79,18 @@ def human_bytes(count: int) -> str:
     return f"{size:.1f} TiB"
 
 
-def dir_size(root: Path) -> int:
-    """Disk usage of `root` in bytes, counting allocated blocks the way `du` does.
+def _walk_size(root: Path, *, reclaimable_only: bool) -> int:
+    """Sum `st_blocks` under `root`, counting each inode once.
 
-    `st_blocks`, not `st_size`: a venv is mostly files uv linked out of its
-    cache, and an inode reached twice inside this tree must only be counted
-    once. Blocks shared with something *outside* the tree (uv's reflinks) still
-    count, exactly as `du` counts them, so a reported figure is an upper bound
-    on what the filesystem actually gets back.
+    `st_blocks`, not `st_size`, so a sparse or compressed file is counted as it
+    actually sits on disk -- the same thing `du` counts.
+
+    `reclaimable_only` is what separates the two callers. See the wrappers.
     """
     total = 0
     seen: set[tuple[int, int]] = set()
+    # inode -> (blocks, links found in this tree, links the filesystem has)
+    shared: dict[tuple[int, int], tuple[int, int, int]] = {}
     stack = [root]
     while stack:
         current = stack.pop()
@@ -92,16 +103,59 @@ def dir_size(root: Path) -> int:
                 info = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
-            key = (info.st_dev, info.st_ino)
-            if key in seen:
-                continue
-            seen.add(key)
-            total += info.st_blocks * 512
+            # A directory's st_nlink counts its subdirectories, not other names
+            # for it -- nothing can hardlink one -- so it is never "shared".
             if entry.is_dir(follow_symlinks=False):
                 stack.append(Path(entry.path))
+                total += info.st_blocks * 512
+                continue
+            key = (info.st_dev, info.st_ino)
+            if not reclaimable_only or info.st_nlink <= 1:
+                if key not in seen:
+                    seen.add(key)
+                    total += info.st_blocks * 512
+                continue
+            blocks, found, _ = shared.get(key, (info.st_blocks, 0, info.st_nlink))
+            shared[key] = (blocks, found + 1, info.st_nlink)
+    total += sum(blocks * 512 for blocks, found, nlink in shared.values() if found >= nlink)
     with contextlib.suppress(OSError):
         total += root.stat().st_blocks * 512
     return total
+
+
+def dir_size(root: Path) -> int:
+    """Disk usage of `root` in bytes, the way `du` counts it.
+
+    How much space this tree occupies, whoever else has a name for it. That is
+    the question to ask about the uv cache, whose whole job is to hold bytes
+    other trees link to.
+    """
+    return _walk_size(root, reclaimable_only=False)
+
+
+def reclaimable_bytes(root: Path) -> int:
+    """Bytes deleting `root` would actually give back to the filesystem.
+
+    Where this parts company with `du` is the file whose inode has links from
+    *outside* the tree. uv materialises a venv by hardlinking wheels out of its
+    cache, so on a host where that works most of a 6.5 GB torch venv is bytes
+    the cache also holds, and removing the workdir frees none of them: `du`
+    says 8 GB, the disk gets back 130 MB. Reporting the `du` figure would make
+    every `status` disk line and every `clean` report an overstatement nobody
+    can act on, so a file counts only once every one of its links has been
+    found inside this tree.
+
+    That is exact for hardlinks and costs nothing -- `st_nlink` comes with the
+    `stat` the walk already does, and only multiply-linked inodes are held in
+    memory until the end. It says nothing about *reflinks*: shared extents need
+    a FIEMAP ioctl per file to see, which would be slow and filesystem-specific,
+    so a CoW copy still counts in full, as it does for `du`.
+
+    The one under-count left is two sibling workdirs sharing a link the cache no
+    longer holds: each is told it frees nothing, and deleting both frees the
+    file. `du` splits that pair the same way when asked about them separately.
+    """
+    return _walk_size(root, reclaimable_only=True)
 
 
 def workdir_size(job_id: str) -> int | None:
@@ -109,7 +163,7 @@ def workdir_size(job_id: str) -> int | None:
     workdir = paths.workdir(job_id)
     if not workdir.is_dir():
         return None
-    return dir_size(workdir)
+    return reclaimable_bytes(workdir)
 
 
 def remove_workdir(job_id: str) -> int:
@@ -117,7 +171,7 @@ def remove_workdir(job_id: str) -> int:
     workdir = paths.workdir(job_id)
     if not workdir.is_dir():
         return 0
-    size = dir_size(workdir)
+    size = reclaimable_bytes(workdir)
     shutil.rmtree(workdir)
     return size
 
@@ -253,7 +307,7 @@ def candidates(
             Candidate(
                 job_id=job_id,
                 status=state.status,
-                bytes=dir_size(workdir),
+                bytes=reclaimable_bytes(workdir),
                 ended_at=state.ended_at,
                 age_days=age_days,
                 meta_synced_at=state.meta_synced_at,
@@ -494,7 +548,7 @@ def purge_candidates(
             Candidate(
                 job_id=job_id,
                 status=state.status,
-                bytes=dir_size(paths.job_dir(job_id)),
+                bytes=reclaimable_bytes(paths.job_dir(job_id)),
                 ended_at=state.ended_at,
                 age_days=age_days,
                 meta_synced_at=state.meta_synced_at,
@@ -508,7 +562,7 @@ def purge_candidates(
 def remove_job_dir(job_id: str) -> int:
     """Delete `jobs/<id>/` and every stray trace of the job. Bytes freed."""
     directory = paths.job_dir(job_id)
-    size = dir_size(directory) if directory.is_dir() else 0
+    size = reclaimable_bytes(directory) if directory.is_dir() else 0
     if directory.is_dir():
         shutil.rmtree(directory)
     # A finished job has no business in the queue, but a marker left by a

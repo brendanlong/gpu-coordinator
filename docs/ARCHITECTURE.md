@@ -500,11 +500,37 @@ and did not go. The control side refuses an empty `--only` before it can become
 the command line in argparse, before any subcommand runs, so nothing is deleted
 and the error says to re-run `gpuc host bootstrap`.
 
+The dispatcher reclaims disk on two horizons, both once at startup and then at
+most once an hour, purge first. A non-ephemeral host's dispatcher only lives
+while there is work, so in practice both happen on the next submit.
+
 `HostConfig.retention_days` (`gpuc host add|set --retention-days N`, null by
-default) makes the dispatcher purge, never
-forced, once at startup and then at most once an hour. A non-ephemeral host's
-dispatcher only lives while there is work, so in practice that sweep happens on
-the next submit.
+default) is the purge: whole job dirs, never forced.
+
+`HostConfig.workdir_days` (`gpuc host add|set --workdir-days N`) is the
+ordinary `clean` sweep over finished jobs that ended that long ago. It takes
+`workdir/` and leaves `spec.json`, `state.json` and `log.txt`, so it has no
+mirror precondition and takes nothing a re-run cannot rebuild -- which is why
+it may be short where the purge may not.
+
+Its default is `cleanup.DEFAULT_WORKDIR_DAYS` (1), and it lives in
+`connect_host`, applied only to a host being configured for the first time --
+*not* on the `HostConfig` field, which stays null. Those are different
+questions: a host getting its first config should reclaim its venvs, and a host
+whose `config.json` predates the key should not start deleting because somebody
+shipped it a newer package. An adopted config that says nothing about
+`workdir_days` has been getting along without the sweep, and meeting it is not
+the moment to start.
+
+Both dispatcher passes go through `cleanup.clean(automatic=True)`, which adds
+the two refusals that only make sense for a delete nobody typed: a job whose
+spec says `cleanup: never`, and a job whose `outputs:` are not confirmed
+elsewhere -- `outputs:` resolve inside `workdir/`, so without that guard the
+sweep would bin precisely what `purge` fails closed on and `status` flags as
+`outputs not uploaded`. An unreadable `spec.json` is skipped for the same
+reason an unreadable `state.json` is. `gpuc clean --only <id>` waives both,
+because that is a person naming the job. With both horizons set the effective
+workdir horizon is the shorter, since each purge pass sweeps at its own.
 
 An ephemeral host's drain retries unconfirmed outputs before terminating --
 three attempts a minute apart, five minutes in total, with the job's secrets

@@ -579,3 +579,17 @@ def test_retention_days_reaches_the_host_config(
     assert main(["host", "set", "local", "--retention-days", ""]) == 0
     assert json.loads((home / "config.json").read_text())["retention_days"] is None
     assert load_registry().require("local").retention_days is None
+
+
+def test_workdir_days_reaches_the_host_config(
+    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    assert json.loads((home / "config.json").read_text())["workdir_days"] == 1.0
+    assert main(["host", "set", "local", "--workdir-days", "3"]) == 0
+    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
+    assert json.loads((home / "config.json").read_text())["workdir_days"] == 3.0
+    assert main(["host", "set", "local", "--workdir-days", ""]) == 0
+    assert load_registry().require("local").workdir_days is None
+    assert main(["host", "bootstrap", "local", "--health-args", HEALTH_ARGS]) == 0
+    assert json.loads((home / "config.json").read_text())["workdir_days"] is None
