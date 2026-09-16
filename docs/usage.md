@@ -268,11 +268,15 @@ whatever it produced, exactly as a cancel does, and then the host queues the
 same job id again as its next attempt: it **re-runs from the start**, from the
 workdir already on the host, so a job that is not safe to re-run should not be
 preempted. Nothing is re-synced from here and the job never leaves its host.
-`--priority N` queues it again at a new priority (recorded in the spec and its
-S3 mirror, like `gpuc reorder`) — worth passing, because with nothing else in
-the queue it simply starts again on the same cards. Queued and finished jobs are
-refused (exit 1): `gpuc reorder` moves a queued one, `gpuc requeue` re-runs a
-finished one.
+It comes back at its own priority unless `--priority N` changes it (recorded in
+the spec and its S3 mirror, like `gpuc reorder`). The job you are making room
+for takes the cards next if it is queued at a **lower** number — the ordinary
+case, and no flag is needed for it. At the **same** priority it does not:
+dispatch order is `<priority>-<job id>`, and the preempted job was submitted
+first, so its id sorts ahead and it takes its own cards straight back. Pass
+`--priority` there, and whenever the job you want to run is not queued yet.
+Queued and finished jobs are refused (exit 1): `gpuc reorder` moves a queued
+one, `gpuc requeue` re-runs a finished one.
 
 **`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or
 running job's `estimated_runtime_min`; see [job length

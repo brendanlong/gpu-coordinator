@@ -1145,10 +1145,11 @@ def cmd_reorder(args: argparse.Namespace) -> int:
 def cmd_preempt(args: argparse.Namespace) -> int:
     """Stop a running job and put it back in its host's queue.
 
-    The job somebody wants the GPUs for is normally already queued, so the
-    text output says where the preempted one lands: at a priority above it
-    (a higher number) it waits, and at the same one it is back in line behind
-    whatever was queued while it ran.
+    The text output says which priority it comes back at, because that is what
+    decides whether this worked: dispatch order is `<priority>-<job id>`, so a
+    job waiting at a lower number takes the cards next, and one waiting at the
+    *same* priority does not -- the preempted job was submitted first, so its
+    id sorts ahead and it takes its own cards straight back.
     """
     document = preempt_job(args.job_id, args.priority, args.host, load_settings())
     for text in document["warnings"]:
