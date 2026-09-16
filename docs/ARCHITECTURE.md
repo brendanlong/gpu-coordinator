@@ -653,10 +653,10 @@ secrets never touch argv.
 3. Write `~/.gpuc/config.json` from the host registry entry, after reading the
    one already there: every field of it that this bootstrap changes is reported
    as a warning first (`overwriting the config on host h ... gpus GPU-b ->
-   GPU-a`). After a `gpuc host set` that is the confirmation of what moved; the
-   case it exists for is a `config.json` another *control machine* wrote, which
-   this registry cannot see and this bootstrap would otherwise replace in
-   silence. It is a warning, never a refusal: bootstrap's job is to make the
+   GPU-a`), all of them, since this is the moment they are replaced. After a
+   `gpuc host set` that is the confirmation of what moved; the case it exists
+   for is a `config.json` another *control machine* wrote, which this registry
+   cannot see and this bootstrap would otherwise replace in silence. It is a warning, never a refusal: bootstrap's job is to make the
    host match the machine running it.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"`.
@@ -915,21 +915,30 @@ by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
 
 - `gpuc status` warns from that value (`host gpubox is running gpuc <sha> and
   this machine has <sha>`), never from the registry, and says nothing at all
-  about a host it could not reach. `status --json`'s `pkg_commit` is the host's
-  answer, so `null` there means "not asked", never "current".
+  about a host it could not reach. It judges by the same rule `submit`
+  re-ships on, so a host that *answered* and named no commit -- one on a build
+  from before `status` reported it -- is warned about rather than passed as
+  current. `status --json`'s `pkg_commit` is the host's answer, so `null` there
+  means "the host did not say", never "current".
 - `gpuc submit` and `gpuc requeue` read the host's `config.json` before they
   enqueue and re-ship the package when it does not match this build -- an
-  unrecorded commit included. The same read reports any *other* field of that
-  config this machine did not write, which is what a second control machine's
-  `--gpus` looks like from here. It then records what it saw, so the offline
-  commands stop repeating a bootstrap somebody else replaced.
+  unrecorded commit included. The same read reports the fields of that config
+  that would change *this job* (`host`, `gpus`, `s3_prefix`, `env`) when they
+  are not what is registered here. It then records the commit it saw, so the
+  offline commands stop repeating a bootstrap somebody else replaced.
 - `gpuc host list` and `gpuc version` never ssh, so they report this machine's
   own record, labelled as such (`pkg <sha> shipped from here`), and point at
   `gpuc status` for what the host is running.
 
-Neither the drift report nor the version check blocks anything: they are how a
-shared host stops being invisible, and `gpuc host bootstrap <host>` is always
-the fix.
+None of this can tell a second control machine's config from a `gpuc host set`
+here that has not been bootstrapped yet -- both are "the host is not running
+what is registered on this machine" -- so none of it claims to: the wording is
+what the host has, what is registered here, and that `gpuc host bootstrap
+<host>` applies the latter. That is also why a submit only reports the keys a
+job is affected by: the host's own `idle_minutes` may sit un-shipped for as
+long as the user likes, and a warning on every submit would be noise the submit
+cannot clear. Nothing here blocks anything; it is how a shared host stops being
+invisible.
 
 ## Testing rules
 

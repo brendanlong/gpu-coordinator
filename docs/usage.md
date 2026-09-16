@@ -537,9 +537,11 @@ null elsewhere). `eta` is absolute and `eta_s` is the same instant as seconds fr
 you can see how far it got; `progress_error` is why the last poll produced
 nothing. A card the host cannot see appears in `gpus` as
 `{"owned_as": "3", "available": false}` instead. `pkg_commit` is the host's own
-answer for the build it is running, so `null` there means we did not ask, never
-"up to date"; when it differs from this build, or the host's config does, the
-host's `errors` says so and nothing else changes. A job's `util` is its **last**
+answer for the build it is running, so `null` there means the host did not say,
+never "up to date" — and a reachable host that did not say is one on a build old
+enough that it cannot, which `errors` reports like any other mismatch. When the
+host's config differs from what is registered here, `errors` says that too, and
+nothing else changes. A job's `util` is its **last**
 sample from the host's own nvidia-smi over that job's cards; a pod's `provider_util` is the
 provider's per-GPU reading for the whole pod, and is null for any other host —
 two different measurements that will differ. `--recent` and `--since` apply to

@@ -6,6 +6,7 @@ import pytest
 
 from gpuc.control import config
 from gpuc.control.config import (
+    JOB_CONFIG_KEYS,
     ConfigError,
     HostEntry,
     Registry,
@@ -115,3 +116,35 @@ def test_config_drift_reports_the_settings_that_change_what_a_host_does() -> Non
         "s3_prefix none -> s3://mine/gpuc/gpubox",
         "retention_days 30.0 -> 7.0",
     ]
+
+
+def test_config_drift_never_prints_an_env_value_whatever_the_host_has_there() -> None:
+    """A config.json from another build may have anything at all under `env`,
+    including a null, and the fallback formatting used to print our side of the
+    comparison -- which is the side holding the token."""
+    entry = HostEntry(name="gpubox", env={"HF_TOKEN": "hf_secret"})
+    for existing in ({"env": None}, {"env": "HF_TOKEN=hf_theirs"}, {"env": []}):
+        drift = config_drift(existing, entry.host_config())
+        assert drift == ["env differs in HF_TOKEN"]
+        assert "hf_secret" not in drift[0]
+    assert (
+        "hf_theirs" not in config_drift({"env": {"HF_TOKEN": "hf_theirs"}}, entry.host_config())[0]
+    )
+    # An env nobody set, however it is spelled, is not a difference.
+    plain = HostEntry(name="gpubox")
+    assert config_drift({"env": None}, plain.host_config()) == []
+
+
+def test_config_drift_can_be_narrowed_to_the_keys_a_job_is_affected_by() -> None:
+    """`gpuc host set` changes the registry and says the host is unchanged until
+    the next bootstrap, so a submit repeating the host's own lifecycle settings
+    back at the user would be noise it cannot even clear."""
+    entry = HostEntry(name="gpubox", gpus=["2"], idle_minutes=30.0, retention_days=7.0)
+    existing = {"gpus": ["0"], "idle_minutes": 15.0, "retention_days": None}
+    assert config_drift(existing, entry.host_config(), JOB_CONFIG_KEYS) == ["gpus 0 -> 2"]
+    assert len(config_drift(existing, entry.host_config())) == 3
+
+
+def test_config_drift_is_quiet_about_a_runpod_host_bootstrap_just_wrote() -> None:
+    entry = HostEntry(name="gpuc-1", kind="runpod", pod_id="pod-1", gpus=["GPU-a"])
+    assert config_drift(entry.host_config().to_dict(), entry.host_config()) == []

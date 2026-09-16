@@ -303,10 +303,13 @@ would hand out cards the other machine believes are somebody else's) and
 queues. Copy the flags from `gpuc host list --json` on the first machine.
 
 gpuc will tell you when they disagree rather than leaving it silent: `gpuc
-status` warns when a host runs a build or a config this machine did not write,
-`gpuc submit` says so before it enqueues, and `gpuc host bootstrap` reports
-every field it is about to overwrite. None of them refuse — bootstrap's job is
-to make the host match the machine you ran it from.
+status` warns when a host runs a build or a config this machine has not shipped
+it, `gpuc submit` says so before it enqueues (for the keys a job is affected
+by — its cards, its environment, its mirror), and `gpuc host bootstrap` reports
+every field it is about to overwrite. None of them can tell another machine's
+config from a `gpuc host set` here you have not bootstrapped yet, so none of
+them claim to, and none of them refuse — bootstrap's job is to make the host
+match the machine you ran it from.
 
 ## Teardown
 

@@ -485,9 +485,30 @@ def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
     entry = HostEntry(name="s", pkg_commit="b" * 40)
     current = HostView(entry=entry, reachable=True, pkg_commit="a" * 40)
     assert status_mod.host_warnings(current) == []
-    assert status_mod.host_warnings(HostView(entry=entry, reachable=True)) == []
     # Unreachable: "we could not ask" is not evidence of anything.
     assert status_mod.host_warnings(HostView(entry=entry, pkg_commit="b" * 40)) == []
+
+
+def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A *reachable* host that answered without a commit is a host on a build
+    from before `status` reported one -- which is the oldest code of all, and
+    exactly what `submit` re-ships on every run. Staying quiet about it would
+    have `status` calling those hosts current while every submit disagreed."""
+    from gpuc.control import version as version_mod
+
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
+    (warning,) = status_mod.host_warnings(HostView(entry=entry, reachable=True))
+    assert "a build too old to say which" in warning
+    assert "gpuc host bootstrap gpubox" in warning
+    # Judged by the same rule the re-ship is.
+    assert version_mod.needs_package_sync("a" * 40, None)
+    # Except with nothing to compare against: a gpuc that cannot name its own
+    # commit has no business telling a host it is behind.
+    monkeypatch.setattr(version_mod, "local_commit", lambda: None)
+    assert status_mod.host_warnings(HostView(entry=entry, reachable=True)) == []
 
 
 def test_a_config_only_another_control_machine_could_have_written_is_flagged(

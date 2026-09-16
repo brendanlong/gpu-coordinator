@@ -116,18 +116,26 @@ def needs_package_sync(local: str | None, host: str | None) -> bool:
     return not host or not same_commit(local, host)
 
 
-def stale_host_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
+def host_build_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
     """`host_commit` is the host's own answer, from its `config.json`.
+
+    Judged by exactly the rule `submit` re-ships on, which is stricter than
+    `same_commit` in the case that matters here: a host that *answered* and
+    named no commit is a host on a build old enough not to report one, so
+    saying nothing about it would leave `status` quiet about the very hosts
+    `submit` re-ships on every single run. A host nobody could ask is the
+    caller's to skip -- that one really is "we do not know".
 
     Not "older": whichever machine bootstrapped the host last is the one it
     runs, and that can as easily be a laptop on a newer build as this machine
     on an older one. Both directions are the same problem -- the host is not
     running the code that wrote the spec -- and the same fix.
     """
-    if same_commit(local, host_commit):
+    if not needs_package_sync(local, host_commit):
         return None
+    running = f"gpuc {short(host_commit)}" if host_commit else "a build too old to say which"
     return (
-        f"host {name} is running gpuc {short(host_commit)} and this machine has "
+        f"host {name} is running {running} and this machine has "
         f"{short(local)}; run gpuc host bootstrap {name}"
     )
 

@@ -10,6 +10,7 @@ from gpuc.control.status import (
     JobView,
     gather,
     host_json,
+    host_warnings,
     job_views,
     owned_gpus,
     render,
@@ -725,6 +726,7 @@ def test_job_links_need_a_whole_wandb_run_and_no_mirror_for_a_queued_job() -> No
     )
     assert job_links(queued[0], "s3://m/p") == []
 
+
 class _ScriptedSession:
     """A host that answers `status` with one payload and nothing else."""
 
@@ -745,3 +747,16 @@ def test_gather_takes_the_build_and_the_config_from_the_hosts_own_answer() -> No
     assert got.pkg_commit == "c" * 40
     assert got.configured == {"host": "gpubox", "gpus": ["0", "1"]}
     assert host_json(got)["pkg_commit"] == "c" * 40
+
+
+def test_a_reachable_host_that_never_reported_a_commit_is_not_read_as_current() -> None:
+    """The `pkg_commit` key is newer than some hosts: one still running the
+    build before it answers `status` without it, and that is the oldest code
+    there is, not a reason to say nothing."""
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
+    document = payload()
+    assert "pkg_commit" not in document, "this is what a host on the older build answers"
+    got = gather(entry, session=cast(Any, _ScriptedSession(document)))
+    assert got.reachable and got.pkg_commit is None
+    assert host_json(got)["pkg_commit"] is None
+    assert any("too old to say which" in warning for warning in host_warnings(got))

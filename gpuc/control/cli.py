@@ -52,6 +52,7 @@ from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_packag
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
+    JOB_CONFIG_KEYS,
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
@@ -627,11 +628,17 @@ def ensure_package_current(
     # submit right behind this produces the transport error in full.
     host_commit = _config_commit(config) if config is not None else entry.pkg_commit
     entry = _record_commit(entry, host_commit)
-    drift = config_drift(config, entry.host_config())
+    # Only what would change *this job*: which cards it can have, the
+    # environment it inherits, where its outputs are mirrored. A host's own
+    # `idle_minutes` or `retention_days` can sit un-shipped after a `gpuc host
+    # set` for as long as the user likes, and a submit repeating that on every
+    # run would be noise it cannot even clear.
+    drift = config_drift(config, entry.host_config(), JOB_CONFIG_KEYS)
     if drift:
         report(
-            f"WARNING host {entry.name} is running a config this machine did not write "
-            f"(host -> registered here): {'; '.join(drift)}"
+            f"WARNING host {entry.name} is running a config this machine has not shipped it "
+            f"(host -> registered here): {'; '.join(drift)}. "
+            f"`gpuc host bootstrap {entry.name}` applies this machine's registration"
         )
     if not version_mod.needs_package_sync(local, host_commit):
         return entry
@@ -650,7 +657,7 @@ def ensure_package_current(
 def _try_session(entry: HostEntry, settings: Settings) -> HostSession | None:
     try:
         return open_session(entry, settings)
-    except (RemoteError, TransportError):
+    except (ConfigError, RemoteError, TransportError):
         return None
 
 
@@ -664,12 +671,16 @@ def _record_commit(entry: HostEntry, commit: str | None) -> HostEntry:
 
     `gpuc host list` and `gpuc version` never ask the host, so this is the only
     thing that keeps them from repeating a bootstrap somebody else replaced.
+    One field, re-read under the lock: this now runs on every submit, and
+    writing back the whole entry we read at startup would undo whatever a
+    concurrent `gpuc host probe` learned about the same host.
     """
     if commit == entry.pkg_commit:
         return entry
     updated = entry.model_copy(update={"pkg_commit": commit})
     with registry_transaction() as registry:
-        registry.put(updated)
+        current = registry.hosts.get(entry.name)
+        registry.put(current.model_copy(update={"pkg_commit": commit}) if current else updated)
     return updated
 
 

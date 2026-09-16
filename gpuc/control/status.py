@@ -747,7 +747,9 @@ def host_warnings(view: HostView) -> list[str]:
     what this machine thinks it put there. Two sessions of one user on
     different commits was the original case, and a second control machine --
     the same boxes registered from a laptop -- is the one the registry cannot
-    see at all, because each machine only ever recorded its own bootstrap.
+    see at all, because each machine only ever recorded its own bootstrap. A
+    `gpuc host set` that has not been bootstrapped yet reads the same from
+    here, which is why neither line claims to know who wrote what is there.
 
     A host that was not reached says nothing: "we could not ask" is not
     evidence of a mismatch, and the unreachable block already says so.
@@ -756,15 +758,15 @@ def host_warnings(view: HostView) -> list[str]:
         return []
     entry = view.entry
     out: list[str] = []
-    stale = version.stale_host_warning(entry.name, view.pkg_commit, version.local_commit())
+    stale = version.host_build_warning(entry.name, view.pkg_commit, version.local_commit())
     if stale:
         out.append(stale)
     drift = config_drift(view.configured, entry.host_config())
     if drift:
         out.append(
-            f"host {entry.name} is running a config this machine did not write "
+            f"host {entry.name} is running a config this machine has not shipped it "
             f"(host -> registered here): {'; '.join(drift)}. "
-            f"`gpuc host bootstrap {entry.name}` replaces it with this machine's registration"
+            f"`gpuc host bootstrap {entry.name}` applies this machine's registration"
         )
     return out
 
