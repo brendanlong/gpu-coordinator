@@ -159,7 +159,7 @@ def test_only_the_assigned_gpus_are_shown_by_default() -> None:
     assert "gpus: 1 of 2 assigned to gpubox (--all-gpus lists the rest)" in rendered
     assert A40 in rendered
     assert TI not in rendered
-    assert "1 of this host's 2 GPUs are not assigned to gpubox" in rendered
+    assert "1 of this host's 2 GPUs are neither assigned to gpubox" in rendered
     assert "gpuc host set gpubox --gpus <list>" in rendered
 
 
@@ -276,7 +276,7 @@ def test_two_entries_naming_one_card_is_called_out() -> None:
 def test_an_assignment_that_resolves_to_nothing_is_not_blamed_on_other_owners() -> None:
     rendered = parse_probe("gpubox", SAMPLE, None, ["7", "9"]).render()
     assert "assigned but not present on this host: 7, 9" in rendered
-    assert "are not assigned to gpubox" not in rendered
+    assert "are neither assigned to gpubox" not in rendered
 
 
 def test_the_probe_finds_an_interpreter_good_enough_to_read_a_host_with() -> None:
@@ -287,3 +287,30 @@ def test_the_probe_finds_an_interpreter_good_enough_to_read_a_host_with() -> Non
     )
     for useless in ("not installed", "/usr/bin/python3 3.9.18", "", "/usr/bin/python3"):
         assert parse_probe("h", f"===python3===\n{useless}\n").host_python is None
+
+
+def test_a_shared_card_is_shown_and_marked_as_shared() -> None:
+    """On a shared box the three states are ours, borrowed and none of our
+    business, and a probe that folds the last two together is the one that
+    says gpuc will never use a card it is about to use."""
+    report = parse_probe("gpubox", SAMPLE, None, ["0"], ["1"])
+    rendered = report.render()
+    assert "gpus: 1 of 2 assigned to gpubox, 1 shared" in rendered
+    assert f"{A40}  NVIDIA A40  46068 MiB  (shared)" in rendered
+    assert "are neither assigned to gpubox" not in rendered
+
+
+def test_a_shared_entry_the_host_cannot_see_is_called_out() -> None:
+    report = parse_probe("gpubox", SAMPLE, None, ["0"], ["7"])
+    assert report.shared_missing == ["7"]
+    assert "shared but not present on this host: 7" in report.render()
+
+
+def test_the_document_flags_the_shared_cards_too() -> None:
+    document = parse_probe("gpubox", SAMPLE, None, ["0"], ["1"]).document()
+    assert [(gpu["uuid"], gpu["assigned"], gpu["shared"]) for gpu in document["gpus"]] == [
+        (TI, True, False),
+        (A40, False, True),
+    ]
+    assert document["shared_gpus"] == ["1"]
+    assert document["shared_missing"] == []

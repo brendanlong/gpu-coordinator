@@ -136,6 +136,7 @@ def _apply(
     adopted: bool,
 ) -> Connection:
     patch = _with_env(existing, patch, env_updates)
+    _refuse_shared_overlap(entry, existing, patch)
     changes = config_changes(existing, patch)
     # A patch that changes nothing the host is not already doing does not write
     # it: `gpuc host set` repeating what a host says is no reason to replace a
@@ -231,6 +232,35 @@ def _refuse_overlapping_gpus(
         f"That is the one difference that can hand one card to two jobs, so it is refused "
         f"rather than warned about: drop --gpus to adopt what the host has, name a disjoint "
         f"set to reassign it, or pass --force if you are sure."
+    )
+
+
+def _refuse_shared_overlap(
+    entry: HostEntry, existing: Mapping[str, Any], patch: Mapping[str, Any]
+) -> None:
+    """Refuse a config that has one card both owned and shared.
+
+    The two lists say opposite things about a card -- hand this out, and borrow
+    this only while nobody else is on it -- so a card in both is never what
+    anybody meant, and the dispatcher has to resolve it somehow (it keeps the
+    owned claim). Judged on the *result*, patch over what the host holds, so
+    `--shared-gpus 3` on a host that already owns 3 is caught as readily as
+    both flags in one command.
+
+    The host's own health check refuses this too, at bootstrap. This is the
+    copy that fires where it was typed.
+    """
+    merged = {**(existing if isinstance(existing, dict) else {}), **patch}
+    config = HostConfig.from_dict(merged)
+    cards = _by_uuid(entry)
+    owned = {cards.get(item, item) for item in config.gpus}
+    both = [item for item in config.shared_gpus if cards.get(item, item) in owned]
+    if not both:
+        return
+    raise ConnectError(
+        f"host {entry.name} would have {', '.join(both)} in both --gpus and --shared-gpus, "
+        f"and a card is either ours to hand out or somebody else's to borrow.\n"
+        f"Owned: {', '.join(config.gpus) or 'none'}. Shared: {', '.join(config.shared_gpus)}."
     )
 
 

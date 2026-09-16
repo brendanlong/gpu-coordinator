@@ -154,3 +154,35 @@ def test_health_main_exit_code_follows_the_report(
     report = json.loads(capsys.readouterr().out)
     assert code == 0
     assert report["host"] == "test-host"
+
+
+def test_the_uuid_check_covers_the_shared_cards_too() -> None:
+    """A `--shared-gpus` entry that names nothing is the same typo as an owned
+    one, and would otherwise be a card gpuc silently never borrows."""
+    ok = health.check_gpu_uuids(["0"], fake_smi(), shared=["1"])
+    assert ok.ok and ok.value == 1
+    assert "1 shared" in ok.detail
+
+    check = health.check_gpu_uuids(["0"], fake_smi(), shared=["7"])
+    assert not check.ok
+    assert "config.shared_gpus entries not present" in check.detail
+
+
+def test_a_card_that_is_both_owned_and_shared_fails_the_check() -> None:
+    """The two lists say opposite things about a card, so one in both is never
+    what anybody meant -- and bootstrap is where it should be found."""
+    check = health.check_gpu_uuids(["0", "1"], fake_smi(), shared=["0"])
+    assert not check.ok
+    assert FAKE_GPUS[0] in check.detail
+    assert "not both" in check.detail
+
+
+def test_a_host_that_only_borrows_still_checks_its_driver(gpuc_home: Path) -> None:
+    """`gpus: []` with shared cards is a real configuration -- everything on
+    this box belongs to somebody else -- and it needs a driver like any other."""
+    jobs.write_config(HostConfig(host="h", gpus=[], shared_gpus=list(FAKE_GPUS)))
+    report = health.run_checks(smi=fake_smi(), downloader=fast_downloader)
+    checks = {check["name"]: check for check in report["checks"]}
+    assert checks["driver"]["value"] == "580.173.02"
+    assert checks["gpu_uuids"]["ok"]
+    assert report["shared_gpus"] == FAKE_GPUS

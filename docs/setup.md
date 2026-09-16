@@ -144,6 +144,7 @@ in seconds if it cannot write the repo.
 gpuc host add local --gpus 0                               # this machine
 gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach over ssh
 gpuc host add gpubox --ssh me@gpubox                       # …one somebody already set up: adopt it
+gpuc host set gpubox --shared-gpus 4,5                     # two more it may borrow while nobody else is on them
 gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] uuid name`,
                              # disk, $HOME's filesystem, systemd --user, uv cache, network speed
 gpuc host probe gpubox --all-gpus   # every card in the box, `(assigned)` on the ones this host owns
@@ -202,6 +203,8 @@ which `host set` writes through to it.
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
 | `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting instead of naming an ssh target; the provider says where it is. Needs `RUNPOD_API_KEY`. Add `--gpuc-home` if that pod keeps gpuc somewhere other than `$HOME/.gpuc` — `gpuc reconcile` only ever looks there, so such a pod is reported unclaimed rather than taken on |
 | `--gpus 2,3` or `--gpus GPU-8064…,3` | none | what this host may use: nvidia-smi **indices**, UUIDs, or a mix, stored exactly as typed. Indices are how a share of a shared box is agreed; the host re-resolves them to UUIDs on every dispatch pass and pins jobs with `CUDA_VISIBLE_DEVICES=<uuid>`, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is reported `UNAVAILABLE` and jobs wait for it |
+| `--shared-gpus 4,5` | none | cards on this box gpuc may **borrow** but does not own, spelled like `--gpus` and never overlapping it. A job reaches one only if its spec says `use_shared: true`, only after the owned cards are full, and only while nvidia-smi says the card holds no memory and is doing no work. See [shared GPUs](usage.md#shared-gpus) |
+| `--shared-min-priority N` | none | a floor on how important a job must be to borrow a shared card. Priorities run `0`–`99` and lower dispatches first, so this is the largest number allowed. `''` clears it |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
 | `--cache-dir PATH` | bootstrap decides | uv's cache for this host, which is `UV_CACHE_DIR` in its `env`. Bootstrap sets one on gpuc home's filesystem when they differ, because uv only reflinks or hardlinks a venv out of its cache within one filesystem — but only when the host's config names none, however it got there |
 | `--persistent-root R` | none | gpuc home moves to `R/gpuc` (below) |
@@ -221,7 +224,8 @@ called out, as are two entries naming one card: `gpuc host bootstrap` fails its
 `gpu_uuids` check on both, so the probe is where you want to find them.
 
 `gpuc host set` changes one field at a time, and where it writes depends on
-which field: `--gpus`, `--env`, `--cache-dir`, `--s3-prefix`,
+which field: `--gpus`, `--shared-gpus`, `--shared-min-priority`, `--env`,
+`--cache-dir`, `--s3-prefix`,
 `--retention-days`, `--workdir-days`, `--idle-min` and `--ttl-hours` are the **host's own**
 config, so they are written through to its `config.json` immediately — the host
 has to answer, and every change is reported as `host <- …`. `--persistent-root`

@@ -75,6 +75,9 @@ class JobSpecModel(BaseModel):
     name: str = ""
     setup: str | None = None
     gpus: int = Field(default=1, ge=0)
+    use_shared: bool = False
+    """Let this job be dispatched to the host's shared cards -- ones gpuc does
+    not own and may only borrow while nobody else is on them. Off by default."""
     env: dict[str, str] = Field(default_factory=dict)
     secrets: list[str] = Field(default_factory=list)
     outputs: list[OutputModel] = Field(default_factory=list)
@@ -405,6 +408,41 @@ def enqueue_spec(session: HostSession, spec: JobSpec) -> dict[str, Any]:
     return response
 
 
+def wont_fit(spec: JobSpec, entry: HostEntry) -> str | None:
+    """Why this host could never run this job, or None if it could.
+
+    The same rule the dispatcher applies (`HostConfig.may_borrow`), run here
+    against the config the host itself answered with a moment ago, so the
+    answer arrives before the code is shipped rather than as a failed job.
+
+    A shared card counts only for a job allowed onto one, and when it is not
+    the message says which of the two gates it is -- that is the whole point of
+    checking here rather than letting the host say `needs 4 GPUs, host owns 2`.
+    """
+    config = entry.config
+    if spec.gpus <= len(config.gpus) + len(config.borrowable(spec)):
+        return None
+    owns = f"job asks for {spec.gpus} GPU(s) but host {entry.name} owns {len(config.gpus)}"
+    if not config.shared_gpus:
+        return f"{owns}.\nSubmit to a bigger host, or lower `gpus:` in the spec."
+    shares = f"{len(config.shared_gpus)} shared card(s)"
+    if config.may_borrow(spec):
+        return (
+            f"{owns} and may borrow {shares}.\n"
+            f"Submit to a bigger host, or lower `gpus:` in the spec."
+        )
+    if not spec.use_shared:
+        return (
+            f"{owns}. It also has {shares} this job did not ask for: add `use_shared: true` "
+            f"to the spec to let it wait for them, or lower `gpus:`."
+        )
+    return (
+        f"{owns}. Its {shares} are only for jobs at priority "
+        f"{config.shared_min_priority} or better, and this one is {spec.priority}: "
+        f"lower `priority:`, or `gpus:`."
+    )
+
+
 def submit_spec(
     entry: HostEntry,
     spec_model: JobSpecModel,
@@ -428,11 +466,9 @@ def submit_spec(
 
     spec = expand_job_id(spec_model.to_spec(job_id or jobs.new_job_id(), attempt))
     secrets_body = gather_secrets(spec.secrets, environ)
-    if spec.gpus > len(entry.gpus):
-        raise SubmitError(
-            f"job asks for {spec.gpus} GPU(s) but host {entry.name} owns {len(entry.gpus)}.\n"
-            f"Submit to a bigger host, or lower `gpus:` in the spec."
-        )
+    too_big = wont_fit(spec, entry)
+    if too_big:
+        raise SubmitError(too_big)
 
     for warning in [*preexisting_output_warnings(spec, workdir), *timeout_warnings(spec)]:
         report(f"WARNING: {warning}")
@@ -486,11 +522,22 @@ def submit_spec(
     )
 
 
+def with_overrides(document: Mapping[str, Any], **overrides: Any) -> dict[str, Any]:
+    """Spec keys a flag set, over what the file said, ignoring the ones it did not.
+
+    Merged into the document before validation rather than onto the model
+    after it, so a flag is judged by exactly the rules the same key in the file
+    would have been.
+    """
+    return {**document, **{key: value for key, value in overrides.items() if value is not None}}
+
+
 def submit_file(
     entry: HostEntry,
     job_file: str | Path,
     settings: Settings | None = None,
+    overrides: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> SubmitResult:
-    document = load_document(job_file)
+    document = with_overrides(load_document(job_file), **dict(overrides or {}))
     return submit_spec(entry, validate(document, str(job_file)), settings, **kwargs)

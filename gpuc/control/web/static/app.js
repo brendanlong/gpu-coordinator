@@ -265,30 +265,61 @@ function table(headers, rows) {
   );
 }
 
+function model(gpu) {
+  return [gpu.name || "?", gpu.vram_mib ? ` ${Math.round(gpu.vram_mib / 1024)} GB` : ""];
+}
+
+function missingRow(entry, as, what) {
+  return el("tr", {},
+    el("td", { class: "gpu-state" }, `[${entry[as]}]`),
+    el("td", {}, badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`),
+    el("td", {}), el("td", {}),
+  );
+}
+
 function gpuTable(host) {
-  if (!host.gpus.length) return el("p", { class: "empty" }, "no GPUs");
+  const shared = host.shared_gpus || [];
+  if (!host.gpus.length && !shared.length) return el("p", { class: "empty" }, "no GPUs");
   const rows = host.gpus.map((gpu) => {
-    if (gpu.available === false) {
-      return el("tr", {},
-        el("td", { class: "gpu-state" }, `[${gpu.owned_as}]`),
-        el("td", {}, badge("UNAVAILABLE", "bad"), " nvidia-smi does not report this card, so nothing is dispatched to it"),
-        el("td", {}), el("td", {}),
-      );
-    }
+    if (gpu.available === false) return missingRow(gpu, "owned_as", "dispatched to");
     return el("tr", {},
       el("td", { class: "gpu-state" }, `[${gpu.index ?? "?"}]`),
       el("td", {}, gpu.busy_job ? badge("busy", "warn") : badge("free", "good")),
-      el("td", {}, gpu.name || "?", gpu.vram_mib ? ` ${Math.round(gpu.vram_mib / 1024)} GB` : ""),
+      el("td", {}, ...model(gpu)),
       el("td", { class: "job-id" }, gpu.busy_job || ""),
     );
   });
+  // Shared cards are somebody else's, and `IN USE` is theirs, not ours: the
+  // numbers beside it are why a job that asked for one is still queued.
+  for (const gpu of shared) {
+    if (gpu.available === false) {
+      rows.push(missingRow(gpu, "shared_as", "borrowed from"));
+      continue;
+    }
+    let state;
+    if (gpu.busy_job) state = badge("shared, busy", "warn");
+    else if (gpu.unused) state = badge("shared, free", "good");
+    else state = badge("shared, IN USE", "bad");
+    // `?` and not `0` for a reading the host could not take: that card is out
+    // *because* nothing is known about it, and "0 MiB, 0% util" beside IN USE
+    // reads as a bug.
+    const num = (v) => (v === null || v === undefined ? "?" : Math.round(v));
+    const held = gpu.busy_job || (gpu.unused ? "" : `${num(gpu.memory_mib)} MiB, ${num(gpu.utilization_pct)}% util`);
+    rows.push(el("tr", {},
+      el("td", { class: "gpu-state" }, `[${gpu.index ?? "?"}]`),
+      el("td", {}, state),
+      el("td", {}, ...model(gpu)),
+      el("td", { class: gpu.busy_job ? "job-id" : "muted" }, held),
+    ));
+  }
   return table([{ text: "card" }, { text: "state" }, { text: "model" }, { text: "held by" }], rows);
 }
 
 function gpuLabels(host, job) {
   if (!job.gpus.length) return "none";
+  const cards = [...host.gpus, ...(host.shared_gpus || [])];
   return job.gpus.map((uuid) => {
-    const card = host.gpus.find((g) => g.uuid === uuid);
+    const card = cards.find((g) => g.uuid === uuid);
     return card && card.index !== null && card.index !== undefined ? String(card.index) : uuid;
   }).join(",");
 }

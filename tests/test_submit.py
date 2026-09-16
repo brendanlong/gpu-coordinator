@@ -360,6 +360,65 @@ def test_a_job_bigger_than_the_host_is_refused_early(control_env: Path, repo: Pa
     assert host.rsyncs == []
 
 
+def submit_to(
+    entry: Any, workdir: Path, document: dict[str, Any], host: FakeHost | None = None
+) -> Any:
+    return submit_spec(
+        entry,
+        validate(document),
+        Settings(),
+        workdir=workdir,
+        session=session(host or FakeHost()),
+        environ={},
+        report=lambda _: None,
+    )
+
+
+def test_a_job_that_needs_shared_cards_to_fit_is_accepted(control_env: Path, repo: Path) -> None:
+    """Waiting for a card somebody else has is a real plan, and refusing it
+    here would make the four-GPUs-on-a-two-GPU-host case impossible."""
+    entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"])
+    assert submit_to(entry, repo, job_document(gpus=2, use_shared=True)).job_id
+
+
+def test_a_job_that_did_not_ask_is_not_given_the_shared_cards_as_capacity(
+    control_env: Path, repo: Path
+) -> None:
+    """`needs 2 GPUs, host owns 1` would send somebody looking for a bigger
+    host when one word in the spec was the answer."""
+    entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"])
+    with pytest.raises(SubmitError) as exc:
+        submit_to(entry, repo, job_document(gpus=2))
+    assert "1 shared card(s) this job did not ask for" in str(exc.value)
+    assert "use_shared: true" in str(exc.value)
+
+
+def test_a_job_below_the_shared_priority_floor_is_told_which_gate_it_failed(
+    control_env: Path, repo: Path
+) -> None:
+    entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"], shared_min_priority=20)
+    with pytest.raises(SubmitError) as exc:
+        submit_to(entry, repo, job_document(gpus=2, use_shared=True, priority=50))
+    assert "priority 20 or better, and this one is 50" in str(exc.value)
+
+
+def test_a_job_bigger_than_owned_and_shared_together_is_still_refused(
+    control_env: Path, repo: Path
+) -> None:
+    entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"])
+    with pytest.raises(SubmitError) as exc:
+        submit_to(entry, repo, job_document(gpus=4, use_shared=True))
+    assert "owns 1 and may borrow 1 shared card(s)" in str(exc.value)
+
+
+def test_use_shared_reaches_the_host_in_the_spec(control_env: Path, repo: Path) -> None:
+    host = FakeHost()
+    entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"])
+    result = submit_to(entry, repo, job_document(gpus=1, use_shared=True), host)
+    staged, _mode = host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"]
+    assert json.loads(staged)["use_shared"] is True
+
+
 def test_submitting_from_a_non_repository_says_what_to_do(
     control_env: Path, tmp_path: Path
 ) -> None:

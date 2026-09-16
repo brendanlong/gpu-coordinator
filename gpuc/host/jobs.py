@@ -277,6 +277,14 @@ class JobSpec:
     name: str = ""
     setup: str | None = None
     gpus: int = 1
+    use_shared: bool = False
+    """May this job be dispatched to the host's `shared_gpus` -- cards gpuc
+    does not own and may only borrow while nobody else is on them?
+
+    Off by default, because a shared card is somebody else's and taking one is
+    a decision about a box, not about a job. A job that opts in is dispatched
+    to owned cards first and borrows only what it could not get there; see the
+    dispatcher's `launch_ready`."""
     env: dict[str, str] = field(default_factory=dict)
     secrets: list[str] = field(default_factory=list)
     outputs: list[Output] = field(default_factory=list)
@@ -322,6 +330,7 @@ class JobSpec:
             name=as_str(fields, "name"),
             setup=as_opt_str(fields, "setup"),
             gpus=as_int(fields, "gpus", 1),
+            use_shared=as_bool(fields, "use_shared"),
             env=as_str_dict(fields, "env"),
             secrets=as_str_list(fields, "secrets"),
             outputs=[Output.from_dict(o) for o in (outputs if isinstance(outputs, list) else [])],
@@ -544,6 +553,23 @@ class HostConfig:
     schema_version: int = SCHEMA_VERSION
     host: str = "local"
     gpus: list[str] = field(default_factory=list)
+    shared_gpus: list[str] = field(default_factory=list)
+    """Cards on this box that gpuc may *borrow*, spelled like `gpus`.
+
+    Not ours: somebody else owns them, and the only time we may run on one is
+    while nothing at all is. So a job reaches them only if it asked to
+    (`use_shared`), only after the owned cards are full, and only while
+    nvidia-smi says the card holds no memory and is doing no work. Nothing
+    here is counted as capacity for a job that did not ask.
+    """
+    shared_min_priority: int | None = None
+    """A floor on how important a job must be to borrow a shared card.
+
+    Priorities are 0-99 and *lower dispatches first*, so this is the largest
+    number a job may carry: `shared_min_priority: 20` lets priority 0-20 onto
+    the shared cards and leaves 21-99 waiting for an owned one. Null (the
+    default) puts no floor on it, so any job that asked may borrow.
+    """
     provider: dict[str, Any] | None = None
     idle_minutes: float = 15.0
     ttl_hours: float | None = None
@@ -596,6 +622,8 @@ class HostConfig:
             schema_version=as_int(fields, "schema_version", SCHEMA_VERSION),
             host=as_str(fields, "host", "local") or "local",
             gpus=as_str_list(fields, "gpus"),
+            shared_gpus=as_str_list(fields, "shared_gpus"),
+            shared_min_priority=as_opt_int(fields, "shared_min_priority"),
             provider=provider if isinstance(provider, dict) else None,
             idle_minutes=as_float(fields, "idle_minutes", 15.0),
             ttl_hours=as_opt_float(fields, "ttl_hours"),
@@ -613,6 +641,21 @@ class HostConfig:
     @property
     def ephemeral(self) -> bool:
         return self.provider is not None
+
+    def may_borrow(self, spec: JobSpec) -> bool:
+        """May this job be given one of this host's shared cards at all?
+
+        Two gates, and both are about the *job* rather than about what the
+        cards are doing this second -- whether they are free is the
+        dispatcher's question, asked only once this has said yes.
+        """
+        if not spec.use_shared or not self.shared_gpus:
+            return False
+        return self.shared_min_priority is None or spec.priority <= self.shared_min_priority
+
+    def borrowable(self, spec: JobSpec) -> list[str]:
+        """The shared entries this job could reach, for counting capacity."""
+        return self.shared_gpus if self.may_borrow(spec) else []
 
     def bin_dirs(self) -> list[str]:
         """Directories from `env` to put on PATH, in order, without duplicates."""

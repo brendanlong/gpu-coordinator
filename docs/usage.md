@@ -15,7 +15,8 @@ commented example; `-` as the file name reads the spec from stdin.
 | `command` | **required** | run in `workdir/` as phase `main`. Must not be blank |
 | `name` | `""` | a label for `status`; not an identifier |
 | `setup` | none | run first, as phase `setup` |
-| `gpus` | `1` | how many of the host's owned GPUs to assign (>= 0). `0` never waits for a card. More than the host owns is refused at submit |
+| `gpus` | `1` | how many of the host's GPUs to assign (>= 0). `0` never waits for a card. More than the host can ever provide is refused at submit |
+| `use_shared` | `false` | also let this job onto the host's **shared** GPUs — cards gpuc does not own and takes only while nobody else is on them. See [shared GPUs](#shared-gpus). `gpuc submit --use-shared` sets it from the command line |
 | `env` | `{}` | plain environment for the job, applied after the host's `--env` |
 | `secrets` | `[]` | names read from *your* shell at submit time and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600). Missing from your shell is a refused submit |
 | `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir |
@@ -54,6 +55,48 @@ prefix; with HF outputs, `hf` must resolve, `hf auth whoami` must succeed with
 the job's token, and a `.preflight` file must upload to each repo. Failure is
 `failed: sync-preflight`, seconds in, with the command and its error in the log.
 A job with no outputs on a host with no mirror checks nothing.
+
+## Shared GPUs
+
+A box may hand you some cards outright and leave the rest to other people.
+`gpuc host set <name> --shared-gpus 4,5` says which are the second kind: cards
+gpuc may *borrow*, never ones it owns.
+
+```sh
+gpuc host set spar --gpus 2,3 --shared-gpus 4,5
+gpuc host set spar --shared-min-priority 20     # optional; '' clears it
+gpuc submit job.yaml --host spar --use-shared   # or `use_shared: true` in the spec
+```
+
+A job reaches a shared card only when all three of these hold:
+
+- it asked — `use_shared: true`, or `gpuc submit --use-shared`. Off by default,
+  and a job that did not ask is never dispatched to one;
+- it clears `--shared-min-priority`, if the host sets one. Priorities are
+  `0`–`99` and lower dispatches first, so this is the largest number allowed:
+  `--shared-min-priority 20` lets `0`–`20` borrow and leaves `21`–`99` waiting
+  for a card of our own;
+- **nobody else is on the card**: nvidia-smi reports 0 MiB used and 0% util for
+  it, right now. Memory is the half that matters — a CUDA context holds
+  hundreds of MiB between steps, so 0 MiB means no process on the card, while
+  util alone dips to zero between somebody else's epochs. A card that could not
+  be read counts as in use.
+
+Owned cards come first, always: a job takes every free owned card it can use
+and borrows only the shortfall. That is one rule and it does both jobs shared
+cards are for — a one-card job borrows when your own cards are busy, so the
+queue drains faster; and a `gpus: 4` job on a host that owns 2 and shares 2
+waits for both shared cards to go quiet and then runs across all four.
+
+Two things it does not do. It never gives a card *back*: a job that got one
+keeps it until it ends, so if the card's real owner starts something there, the
+two of you are sharing it and `gpuc preempt` is the way out. And `gpuc status`
+will not estimate when a job waiting on a shared card starts — when somebody
+else stops using a GPU is not something your host can know — so it says that
+instead of inventing a time.
+
+`gpuc status` shows the borrowed cards on their own `shared` lines, and
+`gpuc host bootstrap` refuses a card listed as both owned and shared.
 
 ## Job length estimates
 
@@ -177,8 +220,9 @@ requeue time.
 **`gpuc submit <job.yaml|-> --host NAME`** — validate, sync the workdir, deliver
 secrets, enqueue. `--no-git` above; `--no-bootstrap` enqueues even when the
 host's package is older than this machine's (without it the package is re-synced
-and the dispatcher restarted first, see [setup.md](setup.md#upgrading)).
-`--runpod` and its flags are [below](#runpod).
+and the dispatcher restarted first, see [setup.md](setup.md#upgrading));
+`--use-shared` is `use_shared: true` from the command line, see
+[shared GPUs](#shared-gpus). `--runpod` and its flags are [below](#runpod).
 
 It then asks the host where the job landed, so the last thing it prints is when
 the job is expected to run rather than only that it was queued:
@@ -200,7 +244,7 @@ you check that a move did what you wanted.
 
 **`gpuc status`** — per host: kind, reachability, how many cards are free,
 dispatcher heartbeat, one line per owned card (`free` / `busy` / `UNAVAILABLE`,
-and what the card is), the queue, running jobs with phase, minutes, last util,
+and what the card is) and per [shared](#shared-gpus) one, the queue, running jobs with phase, minutes, last util,
 the cards they hold (`gpu=2,3`) and any
 [end-time estimate](#job-length-estimates), and recent finished jobs. Every job
 is `name (job-id)`. It is the at-a-glance view: card UUIDs are in
@@ -226,10 +270,18 @@ host spar [ssh]  gpus 0/2 free (driver 535.309.01)
   dispatcher 2s ago
   gpu     [2] busy NVIDIA A40 45 GB
   gpu     [3] busy NVIDIA A40 45 GB
+  shared  [4] free NVIDIA A40 45 GB
+  shared  [5] IN USE NVIDIA A40 45 GB (somebody else: 21504 MiB, 98% util)
   running paper-diff (20260915-222409-7a2b60) phase=main 75.7m util 100% gpu=2
   running paper-plain (20260915-224057-9f10c3) phase=main 58.9m util 100% gpu=3
   queued  sweep (20260915-233000-112233) prio=50 est 6h00m
 ```
+
+The `shared` lines are the cards this host borrows rather than owns. `free`
+means gpuc would take one right now, `busy` means one of *our* jobs has it, and
+`IN USE` means somebody else does — with their memory and utilization, because
+"there is a card there, why is my job queued" is the question that block gets
+asked.
 
 A job's `util` is labelled `(host)` — the host's own nvidia-smi sampler — only
 on a host that also prints a pod line, where the provider's `provider util` is
@@ -592,7 +644,7 @@ Every `failed: <reason>`:
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`, and any other reason gains `+sync` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. Appends `+no-outputs` the same way |
 | `bad-spec` | the queued spec could not be read |
-| `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued |
+| `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued. On a host with [shared cards](#shared-gpus) it says what they add, and why this job may not use them |
 | `spawn-failed` | the dispatcher could not start a runner process |
 | `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind before freeing its GPUs |
 
@@ -634,6 +686,11 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
         { "index": 0, "uuid": "GPU-8064...", "name": "NVIDIA A40", "vram_mib": 46068,
           "busy_job": "20260915-120000-abc123" }
       ],
+      "shared_gpus": [
+        { "index": 4, "uuid": "GPU-aaaa...", "name": "NVIDIA A40", "vram_mib": 46068,
+          "busy_job": null, "memory_mib": 0.0, "utilization_pct": 0.0, "unused": true }
+      ],
+      "shared_min_priority": null,
       "queued": [
         { "job_id": "20260915-130000-d4e5f6", "name": "sweep", "status": "queued",
           "priority": 50, "gpus_requested": 2, "gpus": [],
@@ -682,7 +739,13 @@ null elsewhere). `eta` is absolute and `eta_s` is the same instant as seconds fr
 `progress_pct` is null unless the job measures its own, and survives the job so
 you can see how far it got; `progress_error` is why the last poll produced
 nothing. A card the host cannot see appears in `gpus` as
-`{"owned_as": "3", "available": false}` instead. `pkg_commit` is the host's own
+`{"owned_as": "3", "available": false}` instead. `shared_gpus` is the same shape
+for the cards this host [borrows](#shared-gpus), plus what the host just read
+off each one: `unused` is its verdict — no memory held and no work running, so
+gpuc would take it — and `busy_job` means one of *our* jobs already has it. A
+shared card the host cannot see is `{"shared_as": "5", "available": false}`.
+`shared_min_priority` is the host's floor for borrowing one, null for none.
+Every job carries `use_shared`, which is whether it may be given one at all. `pkg_commit` is the host's own
 answer for the build it is running, so `null` there means the host did not say,
 never "up to date" — and a reachable host that did not say is one on a build old
 enough that it cannot, which `errors` reports like any other mismatch. When the

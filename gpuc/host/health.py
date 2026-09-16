@@ -53,20 +53,37 @@ def check_driver(smi: SmiRunner = gpus.run_nvidia_smi) -> Check:
     return Check("driver", True, f"nvidia driver {version}", version)
 
 
-def check_gpu_uuids(owned: Sequence[str], smi: SmiRunner = gpus.run_nvidia_smi) -> Check:
-    """Every entry in `config.gpus` -- index or UUID -- names a card that is here.
+def check_gpu_uuids(
+    owned: Sequence[str], smi: SmiRunner = gpus.run_nvidia_smi, *, shared: Sequence[str] = ()
+) -> Check:
+    """Every entry in `config.gpus` and `config.shared_gpus` -- index or UUID --
+    names a card that is here, and no card is in both lists.
 
     An index that does not resolve is the failure this exists to catch early: a
     shared box renumbered, or the agreement moved, and the host would otherwise
-    just quietly have fewer cards to hand out than anyone thinks.
+    just quietly have fewer cards to hand out than anyone thinks. A card in
+    both lists is the other way round: it would be handed out as ours *and*
+    have its usage second-guessed as somebody else's.
     """
-    if not owned:
+    if not owned and not shared:
         return Check("gpu_uuids", True, "no GPUs owned by this host", 0)
     try:
         resolved = gpus.resolve_present(owned, "config.gpus entries", smi=smi)
+        borrowable = gpus.resolve_present(shared, "config.shared_gpus entries", smi=smi)
     except gpus.GpuError as exc:
         return Check("gpu_uuids", False, str(exc))
-    return Check("gpu_uuids", True, f"{len(resolved)} owned GPU(s) present", len(resolved))
+    both = [uuid for uuid in borrowable if uuid in set(resolved)]
+    if both:
+        return Check(
+            "gpu_uuids",
+            False,
+            f"{', '.join(both)} is in both config.gpus and config.shared_gpus; a card is "
+            f"either ours to hand out or somebody else's to borrow, not both",
+        )
+    detail = f"{len(resolved)} owned GPU(s) present"
+    if borrowable:
+        detail += f", {len(borrowable)} shared"
+    return Check("gpu_uuids", True, detail, len(resolved))
 
 
 def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:
@@ -212,8 +229,10 @@ def run_checks(
     smi = smi or gpus.run_nvidia_smi
     downloader = downloader or http_download
     checks = [
-        check_driver(smi) if config.gpus else Check("driver", True, "no GPUs owned", None),
-        check_gpu_uuids(config.gpus, smi),
+        check_driver(smi)
+        if (config.gpus or config.shared_gpus)
+        else Check("driver", True, "no GPUs owned", None),
+        check_gpu_uuids(config.gpus, smi, shared=config.shared_gpus),
         check_disk(min_free_gb),
         check_uv_cache(config),
         check_download(url, min_mbps=min_mbps, timeout=download_timeout, downloader=downloader),
@@ -221,6 +240,7 @@ def run_checks(
     return {
         "host": config.host,
         "gpus": config.gpus,
+        "shared_gpus": config.shared_gpus,
         "ok": all(c.ok for c in checks),
         "warnings": [c.detail for c in checks if c.warn],
         "checks": [asdict(c) for c in checks],

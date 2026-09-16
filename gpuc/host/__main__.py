@@ -78,24 +78,54 @@ def _name(job_id: str) -> str:
     return spec.name if spec else ""
 
 
-def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
-    """What `config.gpus` resolves to on this host right now.
+def _resolve(entries: list[str]) -> tuple[list[str], list[str]]:
+    try:
+        return gpus.resolve_owned(entries)
+    except gpus.GpuError:
+        return [], list(entries)
 
-    The control side cannot work this out: `gpus` may name cards by index, and
-    only the host knows what its driver is calling them today.
+
+def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
+    """What `config.gpus` and `config.shared_gpus` resolve to on this host now.
+
+    The control side cannot work this out: both may name cards by index, and
+    only the host knows what its driver is calling them today. The shared cards
+    carry their current memory and utilization too, because whether one is
+    borrowable is a fact about this second that only nvidia-smi here can answer
+    -- and when it is not, the numbers are how somebody sees why.
     """
     try:
         indices = {gpu.uuid: gpu.index for gpu in gpus.list_gpus()}
     except gpus.GpuError:
         indices = {}
+    resolved, unavailable = _resolve(config.gpus)
+    # Owning a card beats borrowing it, exactly as the dispatcher decides it.
+    shared, shared_unavailable = _resolve(config.shared_gpus)
+    shared = [uuid for uuid in shared if uuid not in set(resolved)]
     try:
-        resolved, unavailable = gpus.resolve_owned(config.gpus)
+        usage = gpus.sample_usage(shared)
     except gpus.GpuError:
-        resolved, unavailable = [], list(config.gpus)
+        # A card nvidia-smi would not answer about is not a borrowable one,
+        # which is what an absent `usage` entry says below. Same rule as
+        # `gpus.unused_gpus`, which is what actually hands the card out.
+        usage = {}
     return {
         "gpus": config.gpus,
         "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in resolved],
         "gpus_unavailable": unavailable,
+        "shared_gpus": config.shared_gpus,
+        "shared_gpus_resolved": [
+            {
+                "index": indices.get(uuid),
+                "uuid": uuid,
+                "memory_mib": usage[uuid].memory_mib if uuid in usage else None,
+                "utilization_pct": usage[uuid].utilization_pct if uuid in usage else None,
+                "unused": uuid in usage and usage[uuid].unused,
+            }
+            for uuid in shared
+        ],
+        "shared_gpus_unavailable": shared_unavailable,
+        "shared_min_priority": config.shared_min_priority,
     }
 
 
@@ -136,6 +166,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         # `gpus` is empty and nothing else says whether it is waiting for one
         # card or for eight.
         entry["gpus_requested"] = spec.gpus if spec else None
+        # Whether this job may be dispatched to a shared card, which is half of
+        # why a queued job asking for more cards than the host owns is waiting
+        # rather than already failed.
+        entry["use_shared"] = spec.use_shared if spec else False
         # Where the results went, for anything that wants to link to them. The
         # W&B keys are the three that name a run; the job's env is otherwise
         # its own business and never leaves the host.

@@ -132,8 +132,12 @@ def make_spec(**overrides: object) -> JobSpec:
     return JobSpec.from_dict(document)
 
 
-def fake_smi(uuids: list[str] | None = None, utilization: dict[str, float] | None = None):
-    """A stand-in for `nvidia-smi` that answers the two queries gpus.py makes.
+def fake_smi(
+    uuids: list[str] | None = None,
+    utilization: dict[str, float] | None = None,
+    memory_used: dict[str, float] | None = None,
+):
+    """A stand-in for `nvidia-smi` that answers the queries gpus.py makes.
 
     `--format=` is honoured rather than assumed: real nvidia-smi prints a header
     row unless `noheader` is asked for, and a caller that forgets it gets a
@@ -165,6 +169,8 @@ def fake_smi(uuids: list[str] | None = None, utilization: dict[str, float] | Non
                     cells.append("580.173.02")
                 elif field == "utilization.gpu":
                     cells.append(str((utilization or {}).get(uuid, 0.0)))
+                elif field == "memory.used":
+                    cells.append(str((memory_used or {}).get(uuid, 0.0)))
                 else:
                     cells.append("")
             rows.append(", ".join(cells))
