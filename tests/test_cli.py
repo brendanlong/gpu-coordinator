@@ -990,6 +990,15 @@ def test_submit_json_is_the_queued_job_and_its_notes(
         "attempt": 1,
         "requeued_from": None,
         "notes": ["s3_bucket unset"],
+        # Nothing here can answer a `status`, so the queue fields are the
+        # "we could not ask" shape. Null is not `not queued`: the submit above
+        # already happened.
+        "queue_position": None,
+        "queue_length": None,
+        "dispatched": None,
+        "starts_in_s": None,
+        "starts_at": None,
+        "starts_unknown": None,
     }
     assert "syncing 3 files" in captured.err
 
@@ -1031,19 +1040,38 @@ def test_cancel_json_is_the_hosts_own_answer(
     assert (document["job_id"], document["host"]) == ("20260101-000000-aaaaaa", "local")
 
 
-def test_reorder_json_repeats_the_priority_it_set(
+def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A move you cannot see is a move you have to re-check by hand: the
+    document says which position the job is in now, and when it should run."""
+    moved = "20260101-000000-aaaaaa"
+
     class Moved:
         def host_cli(self, args: str, *, check: bool = True) -> object:
             return type("Result", (), {"returncode": 0})()
 
+        def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            return {
+                "host": "local",
+                "gpus": [GPU],
+                "dispatcher_heartbeat_age_s": 1.0,
+                "queue": [{"priority": 10, "job_id": moved}, {"priority": 50, "job_id": "other"}],
+                "jobs": [
+                    {"job_id": moved, "status": "queued", "gpus_requested": 1},
+                    {"job_id": "other", "status": "queued", "gpus_requested": 1},
+                ],
+            }
+
     main(["host", "add", "local", "--gpus", GPU])
     monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
-    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "10", "--host", "local", "--json"]
+    argv = ["reorder", moved, "--priority", "10", "--host", "local", "--json"]
     assert main(argv) == 0
-    assert one_document(capsys)["priority"] == 10
+    document = one_document(capsys)
+    assert document["priority"] == 10
+    assert (document["queue_position"], document["queue_length"]) == (1, 2)
+    assert (document["dispatched"], document["starts_in_s"]) == (False, 0.0)
 
 
 def test_estimate_json_repeats_what_the_host_recorded(
@@ -1133,6 +1161,63 @@ def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
     mirrored = S3Index("bucket", s3).get_spec("20260101-000000-aaaaaa")
     assert mirrored["estimated_runtime_min"] == 150.0
     assert mirrored["some_future_field"] == 1
+
+
+def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same trap as the estimate: `requeue` submits what the mirror holds, so a
+    move left only on the host comes back at the priority it was submitted at."""
+    from gpuc.control.s3index import S3Index
+
+    class Moved:
+        def host_cli(self, args: str, *, check: bool = True) -> object:
+            return type("Result", (), {"returncode": 0})()
+
+        def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            raise RemoteError("local", "status", "host is busy")
+
+    main(["host", "add", "local", "--gpus", GPU])
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    S3Index("bucket", s3).put_spec_document(
+        "20260101-000000-aaaaaa", {"command": "true", "priority": 50, "some_future_field": 1}
+    )
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
+    capsys.readouterr()
+    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
+    assert main(argv) == 0
+    mirrored = S3Index("bucket", s3).get_spec("20260101-000000-aaaaaa")
+    assert mirrored["priority"] == 5
+    assert mirrored["some_future_field"] == 1
+    # The host could not be asked where the job landed, which is a document of
+    # nulls and never a failed reorder.
+    document = one_document(capsys)
+    assert (document["priority"], document["queue_position"]) == (5, None)
+
+
+def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Moved:
+        def host_cli(self, args: str, *, check: bool = True) -> object:
+            return type("Result", (), {"returncode": 0})()
+
+        def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            raise RemoteError("local", "status", "host is busy")
+
+    main(["host", "add", "local", "--gpus", GPU])
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
+    )
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
+    capsys.readouterr()
+    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
+    assert main(argv) == 0
+    warnings = one_document(capsys)["warnings"]
+    assert isinstance(warnings, list) and "requeue" in warnings[0]
 
 
 def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(

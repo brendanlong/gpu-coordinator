@@ -29,6 +29,7 @@ from gpuc.control.s3index import (
     S3IndexError,
     default_s3_prefix,
 )
+from gpuc.control.status import placement_unknown
 from gpuc.control.transport import (
     NO_GIT_EXCLUDES,
     Transport,
@@ -256,10 +257,20 @@ class SubmitResult:
     host: str
     attempt: int
     notes: list[str] = field(default_factory=list)
+    session: HostSession | None = field(default=None, repr=False)
+    """The connection the enqueue was made over, kept so that looking up where
+    the job landed in the queue does not open a second one."""
+    placement: dict[str, Any] = field(default_factory=placement_unknown)
+    """Where the job landed in the host's queue, looked up after the enqueue:
+    see `status.queue_placement`. The default is the "we could not ask" shape,
+    so a caller that never looks still emits the document's promised keys as
+    nulls rather than leaving them out."""
 
-    def render(self) -> str:
+    def render(self, queue_note: str | None = None) -> str:
         lines = [f"job {self.job_id} queued on host {self.host} (attempt {self.attempt})"]
         lines += [f"  note: {note}" for note in self.notes]
+        if queue_note:
+            lines.append(queue_note)
         lines.append(f"  logs: gpuc logs {self.job_id} -f")
         return "\n".join(lines)
 
@@ -269,6 +280,8 @@ class SubmitResult:
         `notes` are the things the text output prints as `note:` -- a spec that
         could not be mirrored, files that were already under an `outputs:` path
         -- and the job is queued regardless. `requeued_from` is null on submit.
+        The `queue_*` and `starts_*` fields are the queue as it stood a moment
+        after the enqueue, and are null when the host could not be asked again.
         """
         return {
             "job_id": self.job_id,
@@ -276,6 +289,7 @@ class SubmitResult:
             "attempt": self.attempt,
             "requeued_from": requeued_from,
             "notes": list(self.notes),
+            **self.placement,
         }
 
 
@@ -467,7 +481,9 @@ def submit_spec(
             "the host reported no dispatcher pid; run `gpuc host bootstrap` if the job stays queued"
         )
 
-    return SubmitResult(job_id=spec.job_id, host=entry.name, attempt=attempt, notes=notes)
+    return SubmitResult(
+        job_id=spec.job_id, host=entry.name, attempt=attempt, notes=notes, session=session
+    )
 
 
 def submit_file(

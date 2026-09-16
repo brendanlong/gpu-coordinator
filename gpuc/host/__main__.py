@@ -106,6 +106,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         # estimate is exactly what somebody deciding whether to queue behind it
         # needs. The control side never sees the spec.
         entry["estimated_runtime_min"] = spec.estimated_runtime_min if spec else None
+        # Also from the spec, and for the same reason: the queue marker below
+        # only carries a priority while the job is still queued, so a running
+        # job has one nowhere else. `gpuc reorder` writes the spec too, so this
+        # is the priority the job was dispatched at, not the one it was
+        # submitted with.
+        entry["priority"] = spec.priority if spec else None
+        # How many cards this job asked for. A queued job holds none, so its
+        # `gpus` is empty and nothing else says whether it is waiting for one
+        # card or for eight.
+        entry["gpus_requested"] = spec.gpus if spec else None
         # Where the results went, for anything that wants to link to them. The
         # W&B keys are the three that name a run; the job's env is otherwise
         # its own business and never leaves the host.

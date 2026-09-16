@@ -7,6 +7,7 @@ to lose an enqueue, so enqueue only writes files.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,10 +73,21 @@ def remove_marker(job_id: str) -> bool:
 
 
 def reorder(job_id: str, priority: int) -> bool:
+    """Move a queued job, and record the move in its spec.
+
+    The marker name is what the dispatcher orders by, so renaming it is the
+    move. The spec is updated too because it is the only place a priority
+    survives dispatch: without it `gpuc status` could say what a *queued* job's
+    priority is and nothing at all about a running one's. A spec that cannot be
+    rewritten does not undo the move -- the queue is still in the order that
+    was asked for, and only the report of it is stale.
+    """
     marker = find_marker(job_id)
     if marker is None:
         return False
     marker.rename(marker.parent / marker_name(priority, job_id))
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
+        jobs.update_spec(job_id, priority=priority)
     return True
 
 
