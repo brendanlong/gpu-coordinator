@@ -534,9 +534,14 @@ preconditions, both read from the job's own `state.json` on the host:
   reason is `not backed up: no s3_prefix on this host` or `not backed up: final
   upload failed`.
 - **outputs confirmed**: `outputs_synced_at` is set, or the spec declares no
-  `outputs:`, or the workdir is already gone. Otherwise `outputs not confirmed
-  uploaded` — `outputs:` paths live inside the workdir and a failed job keeps
-  its workdir, so purging one could bin the only copy of a checkpoint.
+  `outputs:`, or the workdir is already gone, or nothing was ever written under
+  the declared paths — a job that died before it produced anything, or whose
+  output dir holds only files that came with the checkout, has nothing to lose.
+  Otherwise `outputs not confirmed uploaded` — `outputs:` paths live inside the
+  workdir and a failed job keeps its workdir, so purging one could bin the only
+  copy of a checkpoint. That last question is answered conservatively: a path
+  that cannot be read, a symlink, or a declared path that cannot even be
+  resolved all count as content, so the answer errs towards keeping the dir.
 
 `--force` overrides those two and nothing else, and says so per job.
 `--verify` (control side only) HEADs each candidate's mirrored `log.txt` under
@@ -555,9 +560,14 @@ submit rather than on a timer. Each pass also does the ordinary workdir clean
 over the same horizon, which needs no mirror — so on a host with no
 `--s3-prefix`, `--retention-days` reclaims old venvs and nothing else.
 
-**Unconfirmed outputs.** `gpuc status` flags a finished job whose `outputs:`
-never reached S3 or HF as `outputs not uploaded`, and lists them per host,
-because those are the jobs a purge — or a pod going away — would take with them.
+**Unconfirmed outputs.** `gpuc status` flags a finished job that *produced*
+`outputs:` which never reached S3 or HF as `outputs not uploaded`, and lists
+them per host, because those are the jobs a purge — or a pod going away — would
+take with them. A job that only declared outputs and never wrote them is not
+flagged: it has nothing to lose, and saying otherwise would both misreport it
+and keep its job dir past every retention horizon. Note that `setup` runs after
+the baseline is taken, so a job that died in setup *after* writing a checkpoint
+is still flagged — that file is this job's doing.
 An ephemeral host retries them while it drains (three tries a minute apart, five
 minutes at most) and, if they still fail, records `outputs_lost` with the last
 error and terminates anyway: the pod is billing, and whatever sent it away does

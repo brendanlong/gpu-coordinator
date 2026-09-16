@@ -766,9 +766,12 @@ class JobRunner:
         return exit_code
 
     def _keep_secrets_for_drain(self, sync_loop: sync.SyncLoop) -> bool:
-        return bool(
-            self.config.ephemeral and self.spec.outputs and sync_loop.outputs_synced_at is None
-        )
+        if not (self.config.ephemeral and self.spec.outputs and not sync_loop.outputs_synced_at):
+            return False
+        # The same question the drain asks before it retries anything: a job
+        # that wrote no outputs is skipped there, so keeping its credentials on
+        # disk buys a retry that will never happen.
+        return cleanup.produced_outputs(self.job_id, self.spec)
 
     def _cleanup_workdir(self, status: str, log: IO[bytes]) -> bool:
         """Apply the spec's `cleanup:` policy to `workdir/`, and nothing else.

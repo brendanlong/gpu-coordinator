@@ -242,7 +242,10 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
             }
         )
     )
-    paths.workdir(FINISHED_JOB).mkdir(parents=True, exist_ok=True)
+    # With something actually under `results/`: a declared output that was
+    # never written is not a result anyone can lose.
+    (paths.workdir(FINISHED_JOB) / "results").mkdir(parents=True, exist_ok=True)
+    (paths.workdir(FINISHED_JOB) / "results" / "loss.json").write_text("{}")
     jobs.write_state(
         FINISHED_JOB, JobState(status="failed", reason="low-util", ended_at=ended, exit_code=1)
     )

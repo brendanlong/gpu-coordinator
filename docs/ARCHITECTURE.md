@@ -409,10 +409,19 @@ queue marker, secrets file and staged spec, for finished jobs older than DAYS
   in S3. The local state is the authority: the host cannot consult the mirror
   without credentials it may not have. Without it, the skip reason is `not
   backed up: no s3_prefix on this host` or `not backed up: final upload failed`.
-- confirmed outputs -- `outputs_synced_at` set, or a spec with no `outputs:`, or
-  a workdir that is already gone. `outputs:` paths resolve inside the workdir and
-  a failed job keeps its workdir, so a purge could otherwise bin the only copy of
-  a checkpoint. Without it: `outputs not confirmed uploaded`.
+- confirmed outputs -- `outputs_synced_at` set, a spec with no `outputs:`, a
+  workdir that is already gone, or a job that never wrote what it declared.
+  `outputs:` paths resolve inside the workdir and a failed job keeps its
+  workdir, so a purge could otherwise bin the only copy of a checkpoint.
+  Without it: `outputs not confirmed uploaded`. "Never wrote" is the question
+  `sync` asks before it refuses to upload -- nothing under the path, or nothing
+  there that was not already in the checkout (`outputs_baseline`) -- so a job
+  that died before producing anything neither claims a lost result nor sits in
+  the job dir forever, unpurgeable. Asked here it is answered more strictly
+  than `sync` answers it, because a wrong "nothing here" deletes rather than
+  skips an upload: an unreadable path, a symlink (`rglob` does not descend one,
+  `aws s3 sync` follows it), a walk that errors, and an `outputs.path` that
+  cannot be resolved at all each count as content.
 
 `--force` overrides those two records and nothing else, and marks each removal
 `forced` so the report says so loudly. Running, queued and unreadable-state jobs
@@ -761,9 +770,10 @@ What `status` prints, and every flag, is usage.md. The invariants:
 - An ephemeral host whose pod the provider reports missing or TERMINATED is
   `POD GONE`: no ssh is attempted, and the line says to run `gpuc reconcile
   --once` rather than printing a connection error.
-- A finished job whose `outputs:` never reached S3/HF is flagged (`outputs not
-  uploaded`, or `OUTPUTS LOST` once a drain has given up), because those are the
-  jobs a purge -- or a pod going away -- would take with them.
+- A finished job that produced `outputs:` which never reached S3/HF is flagged
+  (`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
+  those are the jobs a purge -- or a pod going away -- would take with them. One
+  that declared outputs and never wrote them is not: there is nothing there.
 - A pod's `provider_util` is the provider's reading for the whole pod; a job's
   `util` is the host's own nvidia-smi sampler over that job's cards. They are
   labelled separately and never merged.
