@@ -12,18 +12,19 @@ already named its `kind` and `pod_id`. Any machine holding the API key can ask
 a pod what it is and get the same answer, and `desired/` becomes a cache of
 that rather than the only record of it.
 
-The window this leaves is what the provisioning ceiling is for, and it is small
-on purpose: `provision` writes that config through `connect_host` as soon as ssh
-answers, *before* the ten minutes of installing uv, Python and the package. A
-pod is only unrecognisable to another machine between `create` and its first
-successful ssh -- well inside the 15 minutes the ceiling gives it.
+A pod is unrecognisable to another machine only between `create` and its first
+successful ssh: `provision` writes that config through `connect_host` as soon
+as ssh answers, *before* the ten minutes of installing uv, Python and the
+package. Nothing is done to a pod in that window, or to one that cannot be
+asked at all -- the machine that created it holds its record, and a pod nobody
+has a record of is reported for a person to deal with.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -174,20 +175,17 @@ def _offer(value: Any) -> Offer:
         return Offer()
 
 
-Verdict = Literal["ours", "empty", "silent"]
-
-
 @dataclass
 class PodAnswer:
     """What one pod said when a machine with no record of it asked what it is.
 
-    - `ours`: it holds a gpuc config, whoever created it.
-    - `empty`: it answered, and there is no gpuc home there at all.
-    - `silent`: it could not be asked, so this machine knows nothing about it.
+    `desired` is the answer: a record means the pod holds a gpuc config and is
+    ours, whoever created it. None means it does not, or could not be asked --
+    one question with two shades of no, because nothing is done to a pod on
+    either. `detail` is the sentence the report prints.
     """
 
     pod: Pod
-    verdict: Verdict
     detail: str
     entry: HostEntry | None = None
     desired: DesiredHost | None = None
@@ -197,19 +195,17 @@ def ask_pod(pod: Pod, settings: Settings, *, timeout: float = ASK_TIMEOUT_S) -> 
     """Ask a pod what it is, over ssh, using nothing this machine remembers."""
     address = address_for(pod.name, pod)
     if address is None:
-        return PodAnswer(pod, "silent", "the provider gives it no ssh endpoint")
+        return PodAnswer(pod, "the provider gives it no ssh endpoint")
     try:
         transport = transport_for(address, settings)
         home = resolve_home(transport, address, timeout=timeout)
     except (ConfigError, RemoteError, TransportError) as exc:
-        return PodAnswer(pod, "silent", _why(exc), entry=address)
+        return PodAnswer(pod, _why(exc), entry=address)
     document = read_remote_config(transport, home, timeout=timeout)
     if document is None:
-        return PodAnswer(
-            pod, "silent", f"{home}/config.json is there but could not be read", entry=address
-        )
+        return PodAnswer(pod, f"{home}/config.json could not be read", entry=address)
     if not document:
-        return _nothing_there(pod, transport, home, address, timeout)
+        return PodAnswer(pod, f"it answers ssh and has no {home}/config.json", entry=address)
     record = desired_from(
         pod.id,
         document,
@@ -224,7 +220,6 @@ def ask_pod(pod: Pod, settings: Settings, *, timeout: float = ASK_TIMEOUT_S) -> 
     created = record.created_at or "an unknown time"
     return PodAnswer(
         pod,
-        "ours",
         f"{home}/config.json calls it {record.name}, created {created}",
         entry=address,
         desired=record,
@@ -239,22 +234,6 @@ case "$home" in "~"|"~/"*) home="$HOME${{home#\\~}}";; esac
 someone typed into `--gpuc-home` is not expanded by the quoting that keeps the
 rest of the path safe -- a home read as the literal `~/.gpuc` would find no
 heartbeat, which on this path means "terminate it"."""
-
-TRACES = (
-    HOME_PREFIX
-    + """\
-if [ -d "$home" ]; then echo "there is a $home, with no config.json in it"; fi
-if ps -eo args 2>/dev/null | grep -q '[g]puc\\.host'; then echo "gpuc.host is running on it"; fi
-"""
-)
-"""Anything that says gpuc has been on a pod whose `config.json` we did not find.
-
-"Nothing here" is the one answer the reaper acts on, so one missing file is not
-enough for it. A gpuc home with no config is a pod that *lost* its config (a
-restarted container with a wiped `$HOME`), and a running `gpuc.host` is a pod
-whose gpuc home is somewhere this machine was not told about (`--gpuc-home`,
-`--persistent-root`): both have jobs to lose, and both belong to whoever holds
-their record."""
 
 PULSE = (
     HOME_PREFIX
@@ -277,34 +256,6 @@ no skew between the two machines can make a live pod look silent. The status
 pattern tolerates whitespace rather than matching `json.dumps(indent=2)`
 exactly: a miss here reads as "nothing is running", which terminates a pod.
 """
-
-
-def _nothing_there(
-    pod: Pod, transport: Transport, home: str, address: HostEntry, timeout: float
-) -> PodAnswer:
-    """The verdict on a pod with no `config.json`: proven stray, or unknown."""
-    try:
-        result = transport.run(TRACES.format(home=home), timeout=timeout, check=False)
-    except TransportError as exc:
-        return PodAnswer(pod, "silent", _why(exc), entry=address)
-    traces = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if result.returncode != 0:
-        return PodAnswer(
-            pod,
-            "silent",
-            f"it has no {home}/config.json, and would not say what else is on it",
-            entry=address,
-        )
-    if traces:
-        return PodAnswer(
-            pod, "silent", f"it has no {home}/config.json, but {traces[0]}", entry=address
-        )
-    return PodAnswer(
-        pod,
-        "empty",
-        f"it answers ssh, and has no {home}/config.json, no gpuc home and no gpuc process",
-        entry=address,
-    )
 
 
 def pulse(transport: Transport, home: str, *, timeout: float = ASK_TIMEOUT_S) -> Liveness:

@@ -438,11 +438,21 @@ means no cap, on `submit`, `host add` and `host set` alike.
 - a pod past a TTL its host actually has;
 - a pod *this machine created* that never bootstrapped by its 15-minute ceiling
   (a pod adopted from another machine has a config on it, so it is past that
-  question by definition and the dead-dispatcher rule is what judges it);
-- a pod with our prefix that **answers ssh with no trace of gpuc on it** — no
-  config, no gpuc home, no `gpuc.host` process — or that is not RUNNING and has
-  no ssh endpoint at all, **once it is over 15 minutes old** (the grace is there
-  because another session may be mid-create).
+  question by definition and the dead-dispatcher rule is what judges it).
+
+Those are the three states a pod cannot get itself out of. Everything else it
+handles alone: a healthy pod drains and terminates itself once its queue has
+been empty for `--idle-min`, and enforces its own TTL, with nothing local
+involved.
+
+**Nothing is terminated for the absence of a record.** A pod with our prefix
+that this machine has no record of and cannot get an answer out of is reported
+every pass, with its age and its hourly cost, and left running — it may be
+wedged, it may hold no key of yours, or it may be another machine's `create`
+still bootstrapping, and those look identical from here. The report says how to
+take it over (`gpuc host add <name> --pod <id>`) or where to end it. That is the
+one case that needs you: a pod that never got a config *and* whose creating
+machine is never coming back bills until somebody kills it.
 
 **Which pods are "ours" is asked of the pods, not of this machine.**
 `desired/<host>.json` is written by whichever machine ran `gpuc submit
@@ -454,26 +464,20 @@ by the rules above, and its answer is cached in `desired/` here. So the timer
 can run on the desktop while the laptop that queued the job is switched off, and
 neither machine is special.
 
-A pod that has an ssh endpoint but does not answer *this* machine is reported
-and never terminated: "wedged" and "this machine holds no key for that pod" are
-the same silence from here. Adopt it with `gpuc host add <name> --pod <id>`
-(which reads the config the pod already has), or terminate it from the machine
-that created it.
-
 A pod with a job running per the host's own state is never touched by the
 dead-dispatcher rule, however old it is — but a TTL you set overrides that and
 kills the job. The reaper otherwise fails closed in every direction: it never
 touches a pod without the configured prefix, it terminates nothing at all if
-`desired/` is unreadable or the provider reports no creation time, a terminate
-that fails keeps its record (so the next pass retries it) and makes `gpuc
-reconcile --once` exit non-zero.
+`desired/` is unreadable, and a terminate that fails keeps its record (so the
+next pass retries it) and makes `gpuc reconcile --once` exit non-zero.
 
 **`gpuc pods`** lists every pod in the account: ours (name, id, status, GPU,
 `$/h`, CUDA, age, util, `DESIRED`, heartbeat) with the hourly total, and other
 people's by name only, never touched. `DESIRED=NO` means nothing *here* wants it
 yet — `gpuc reconcile` asks each of those what it is before deciding.
 `--no-heartbeat` skips the per-pod dispatcher ssh check, which is what makes the
-command slow when a pod is wedged.
+command slow when a pod is wedged. Nothing here terminates a `DESIRED=NO` pod:
+reconcile takes on the ones running gpuc, and the rest are yours to end.
 
 ## How a job is killed
 
@@ -673,7 +677,7 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `ttl_hours`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at` saying when that was, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]` (a re-bootstrap note: nothing here asks the host). The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
-| `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}`, host names in the order they were judged. `--json` needs `--once` and nothing else: neither the loop nor `--install` has a document to print |
+| `reconcile --once` | `{terminated[], forgotten[], kept[], unclaimed[], errors[]}`, host names in the order they were judged — except `unclaimed`, which is *pod* names this machine has no record of and will not terminate. `--json` needs `--once` and nothing else: neither the loop nor `--install` has a document to print |
 
 ```sh
 gpuc submit job.yaml --host gpubox --json | jq -r .job_id

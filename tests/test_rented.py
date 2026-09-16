@@ -11,7 +11,6 @@ import pytest
 
 from gpuc.control.config import HostEntry, Settings, read_desired
 from gpuc.control.rented import (
-    TRACES,
     address_for,
     ask_pod,
     desired_from,
@@ -96,7 +95,6 @@ def pod_host(monkeypatch: pytest.MonkeyPatch) -> FakeHost:
 def test_a_pod_holding_a_gpuc_config_is_ours_whoever_created_it(pod_host: FakeHost) -> None:
     pod_host.files[f"{HOME}/.gpuc/config.json"] = json.dumps(config_document())
     answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
-    assert answer.verdict == "ours"
     assert answer.desired is not None and answer.desired.ttl_hours == 4.0
     assert answer.entry is not None and answer.entry.ssh == "root@1.2.3.4"
 
@@ -111,35 +109,17 @@ def test_a_pod_answering_just_now_is_recorded_as_seen_just_now(pod_host: FakeHos
     assert answer.desired.silent_since() == answer.desired.last_seen_at
 
 
-def test_a_pod_with_no_trace_of_gpuc_on_it_claims_nothing(pod_host: FakeHost) -> None:
+def test_a_pod_with_no_gpuc_config_on_it_claims_nothing(pod_host: FakeHost) -> None:
     answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
-    assert (answer.verdict, answer.desired) == ("empty", None)
-    assert "no gpuc home and no gpuc process" in answer.detail
-
-
-def test_a_gpuc_home_without_a_config_is_not_proof_of_a_stray(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A pod whose $HOME was wiped has lost its config and may still be running
-    jobs; a pod whose gpuc home was moved never had one at the default path."""
-
-    class HasTraces(FakeHost):
-        def _answer(self, command: str) -> tuple[int, str]:
-            if "[g]puc" in command:  # the TRACES script
-                return 0, f"there is a {HOME}/.gpuc, with no config.json in it\n"
-            return super()._answer(command)
-
-    host = HasTraces()
-    monkeypatch.setattr("gpuc.control.rented.transport_for", lambda entry, settings=None: host)
-    answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
-    assert (answer.verdict, answer.desired) == ("silent", None)
-    assert "with no config.json in it" in answer.detail
+    assert answer.desired is None
+    assert "has no /home/u/.gpuc/config.json" in answer.detail
 
 
 def test_a_pod_with_no_ssh_endpoint_cannot_be_asked() -> None:
     doorless = running_pod("gpuc-a-111", "pod1").model_copy(update={"ssh_direct": None})
     answer = ask_pod(doorless, Settings())
-    assert (answer.verdict, answer.entry) == ("silent", None)
+    assert (answer.desired, answer.entry) == (None, None)
+    assert "no ssh endpoint" in answer.detail
 
 
 def test_a_pod_that_does_not_answer_ssh_claims_nothing_either(
@@ -154,7 +134,7 @@ def test_a_pod_that_does_not_answer_ssh_claims_nothing_either(
 
     monkeypatch.setattr("gpuc.control.rented.transport_for", lambda entry, settings=None: Refuses())
     answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
-    assert (answer.verdict, answer.desired) == ("silent", None)
+    assert answer.desired is None
     assert "Permission denied" in answer.detail
 
 
@@ -242,15 +222,3 @@ def test_the_pulse_survives_a_home_with_a_space_in_it(tmp_path: Path) -> None:
     root = tmp_path / "my pods"
     root.mkdir()
     assert pulse(LocalTransport(), gpuc_home(root, beat_age_s=5.0)).alive
-
-
-def test_the_traces_script_reports_a_gpuc_home_for_real(tmp_path: Path) -> None:
-    """The script `ask_pod` proves a stray with, run against a real shell."""
-    home = gpuc_home(tmp_path)
-    found = LocalTransport().run(TRACES.format(home=home), check=False)
-    assert found.returncode == 0 and f"there is a {home}" in found.stdout
-
-    # Said of the path asked about, not of the box: a machine that happens to
-    # be running gpuc itself reports the process line either way.
-    empty = LocalTransport().run(TRACES.format(home=str(tmp_path / "nowhere")), check=False)
-    assert empty.returncode == 0 and "there is a" not in empty.stdout

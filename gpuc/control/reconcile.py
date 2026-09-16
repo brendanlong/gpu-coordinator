@@ -7,12 +7,18 @@ it, and is judged by the same rules as a host this machine provisioned itself;
 the local `desired/` directory is a cache of those answers, and what keeps a
 pod that has stopped answering under watch.
 
-Fails closed in every direction. If `desired/` cannot be read we do nothing at
-all, because "no state" must never be read as "terminate everything with our
-prefix". Pods without our prefix are never even considered; a pod this machine
-could not reach is reported and left alone, because "not my ssh key" and "dead"
-look identical from here; and a pod young enough to still be provisioning is
-given the ceiling, on whichever machine is creating it.
+Nothing is ever terminated for the *absence* of a record. A pod with our prefix
+that this machine has no record of and cannot get an answer out of is reported
+every pass and left running: it may be wedged, it may hold no key of ours, or it
+may be another machine's create still bootstrapping, and those look identical
+from here. What the reaper terminates is a pod whose own record says it is past
+its TTL, one that never bootstrapped by its ceiling, and one that has stopped
+beating with nothing running -- the three states a host cannot get itself out
+of, since a healthy pod drains and terminates itself when its queue goes quiet.
+
+Fails closed in every other direction too. If `desired/` cannot be read we do
+nothing at all, because "no state" must never be read as "terminate everything
+with our prefix", and pods without our prefix are never even considered.
 """
 
 from __future__ import annotations
@@ -54,7 +60,9 @@ from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
 from gpuc.control.systemd import gpuc_command, systemd_dir, write_units
 
 DEFAULT_INTERVAL_S = 60.0
-STRAY_GRACE_MINUTES = CEILING_MINUTES
+PROVISIONING_MINUTES = CEILING_MINUTES
+"""How long a pod another machine has just created may have no config on it
+yet. Only ever used to word a report: nothing here acts on it."""
 
 HostLiveness = Callable[[DesiredHost, "HostEntry | None", Settings], Liveness]
 PodQuestion = Callable[[Pod, Settings], PodAnswer]
@@ -96,6 +104,7 @@ class ReconcileResult:
     terminated: list[str] = field(default_factory=list)
     forgotten: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
+    unclaimed: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def render(self) -> str:
@@ -104,6 +113,10 @@ class ReconcileResult:
             f"{len(self.terminated)} terminated",
             f"{len(self.forgotten)} forgotten",
         ]
+        # Counted apart from `kept`, because a pod nothing here can place is not
+        # a healthy host -- it is money nobody has accounted for.
+        if self.unclaimed:
+            parts.append(f"{len(self.unclaimed)} unclaimed")
         if self.errors:
             parts.append(f"{len(self.errors)} error(s)")
         return "reconcile: " + ", ".join(parts)
@@ -113,11 +126,15 @@ class ReconcileResult:
 
         A terminate that failed leaves its record in place and lands in
         `errors`, which is the exit-1 case: the next pass retries it.
+        `unclaimed` is pod names, not host names: they are the pods with our
+        prefix that this machine has no record of and could not place, which
+        nothing here will terminate.
         """
         return {
             "terminated": list(self.terminated),
             "forgotten": list(self.forgotten),
             "kept": list(self.kept),
+            "unclaimed": list(self.unclaimed),
             "errors": list(self.errors),
         }
 
@@ -248,7 +265,7 @@ def reconcile_once(
     known = {host.pod_id for host in cached}
     adopted, unclaimed = _ask_the_rest(pods, known, settings, ask, report, result)
     _reconcile_desired([*ours, *adopted], by_id, settings, provider, report, result, liveness)
-    _reap_strays(unclaimed, provider, report, result)
+    _report_unclaimed(unclaimed, report, result)
     return result
 
 
@@ -305,7 +322,7 @@ def _ask_the_rest(
             # Not judged this pass rather than judged against a record that is
             # not its own: every terminate here forgets the host it names, and
             # that record belongs to a different pod.
-            result.kept.append(pod.name)
+            result.unclaimed.append(pod.name)
             continue
         adopted.append(Rented(answer.desired, answer.entry))
     return adopted, unclaimed
@@ -481,83 +498,42 @@ def _minutes_since(stamp: str | None) -> float | None:
     return (datetime.now(UTC) - parsed).total_seconds() / 60.0
 
 
-def _never_came_up(pod: Pod) -> bool:
-    """A pod nothing can have bootstrapped: no ssh endpoint, and not RUNNING.
-
-    Both halves matter. A pod still waiting for its endpoint has nothing on it
-    to lose, past the ceiling -- the machine that created it is at its own
-    ceiling for the same pod. But a *RUNNING* pod the provider happens not to
-    report an endpoint for this time may be a pod with a job on it, and the
-    provider's answer is not worth a job.
-    """
-    return pod.ssh_direct is None and pod.status != "RUNNING"
-
-
-def _reap_strays(
+def _report_unclaimed(
     unclaimed: list[PodAnswer],
-    provider: Provider,
     report: Reporter,
     result: ReconcileResult,
 ) -> None:
-    """Terminate the pods with our prefix that nothing claims -- and only those.
+    """Say what is billing that nothing here claims, and touch none of it.
 
-    A stray has to be *shown* to be one. The pod itself is the record (see
-    `rented`), so there are two proofs and no others: a pod that answered and
-    has no trace of gpuc on it is a create that leaked, and a pod that is not
-    even RUNNING and has no ssh endpoint is one that never came up. Both bill
-    for nothing, and nothing can be running on either.
+    Nothing is terminated on the *absence* of a record. A pod this machine has
+    no record of and could not get an answer out of may be wedged, may hold no
+    key of ours, or may be another machine's create still bootstrapping -- and
+    those look identical from here. The one case that is genuinely a leak (a
+    pod that never got a config, whose creating machine is never coming back)
+    is worth a line every pass and a person's judgement, not a guess that can
+    cost a running job.
 
-    Everything else is kept and reported. A pod that has an endpoint and did not
-    answer *this* machine is not a proof, because "wedged" and "this machine
-    holds no key for it" are the same silence -- and terminating on that is what
-    took someone's running job. Neither is a RUNNING pod whose endpoint the
-    provider did not report this time.
-
-    The ceiling still covers every case: another machine's `create` is a pod
-    with no config on it yet, for as long as its bootstrap takes.
+    The machine that *does* hold a pod's record still reaps it on TTL and on a
+    dead dispatcher, and `gpuc host add <name> --pod <id>` moves that duty here.
     """
     for answer in unclaimed:
         pod = answer.pod
+        result.unclaimed.append(pod.name)
         age = pod.age
-        if age is None:
-            # Cannot prove it is past the provisioning ceiling, so cannot prove
-            # it is not another session's pod mid-create. Fail closed and say so.
+        minutes = None if age is None else age.total_seconds() / 60.0
+        if minutes is not None and minutes < PROVISIONING_MINUTES:
             report(
-                f"{pod.name} ({pod.id}) is unclaimed ({answer.detail}), but the provider "
-                f"reports no creation time, so its age cannot be checked against the "
-                f"{STRAY_GRACE_MINUTES:.0f} min ceiling; leaving it alone. Check `gpuc pods`."
+                f"{pod.name} ({pod.id}) is {minutes:.0f} min old and nothing here wants it yet "
+                f"({answer.detail}); another session may still be provisioning it"
             )
-            result.kept.append(pod.name)
             continue
-        minutes = age.total_seconds() / 60.0
-        if minutes < STRAY_GRACE_MINUTES:
-            report(
-                f"{pod.name} ({pod.id}) is unclaimed ({answer.detail}) and is only "
-                f"{minutes:.0f} min old; leaving it for now in case another session is still "
-                f"provisioning it"
-            )
-            result.kept.append(pod.name)
-            continue
-        if answer.verdict == "silent" and not _never_came_up(pod):
-            report(
-                f"{pod.name} ({pod.id}) has our prefix, is {minutes:.0f} min old and is billing "
-                f"${pod.cost_usd_hr:.3f}/h, but this machine could not ask it what it is "
-                f"({answer.detail}), and a pod this machine has no key for looks exactly like a "
-                f"dead one. Nothing was terminated.\n"
-                f"  Adopt it here with `gpuc host add <name> --pod {pod.id}`, or terminate it "
-                f"from the machine that created it (or the RunPod console)."
-            )
-            result.kept.append(pod.name)
-            continue
-        if _terminate(
-            provider,
-            pod,
-            f"{pod.name} is {minutes:.0f} min old and nothing claims it: {answer.detail} "
-            f"(${pod.cost_usd_hr:.3f}/h)",
-            report,
-            result,
-        ):
-            result.terminated.append(pod.name)
+        report(
+            f"{pod.name} ({pod.id}) is billing ${pod.cost_usd_hr:.3f}/h"
+            f"{'' if minutes is None else f', is {minutes:.0f} min old'} and nothing here "
+            f"claims it: {answer.detail}. Nothing was terminated.\n"
+            f"  Take it over here with `gpuc host add <name> --pod {pod.id}`, or end it from "
+            f"the machine that created it (or the RunPod console)."
+        )
 
 
 def run_loop(

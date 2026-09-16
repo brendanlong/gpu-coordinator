@@ -253,11 +253,11 @@ Rules, and they are not optional:
   the cap. `--ttl-hours` is opt-in and *does* kill a running job when it expires.
 - A pod that stops answering (dead dispatcher, no ssh) with nothing running is
   terminated after 30 minutes by `gpuc reconcile`.
-- `gpuc reconcile --once` cleans up registry entries for gone pods and reaps
-  strays. Run it if `status` says `POD GONE`. It asks each pod with our prefix
-  what it is, so a pod another machine rented is kept, not reaped; only a pod
-  that answers with no trace of gpuc on it (or one that is not RUNNING and has
-  no ssh endpoint) is a stray, and only past the 15-minute ceiling.
+- `gpuc reconcile --once` cleans up registry entries for gone pods and enforces
+  TTLs and the dead-dispatcher rule. Run it if `status` says `POD GONE`. It asks
+  each pod with our prefix what it is, so a pod another machine rented is taken
+  on, not reaped. **It never terminates a pod it has no record of** -- one it
+  cannot place is reported with its hourly cost for a person to deal with.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
   create, reading the config the pod already has.
 - Only act on pods named `gpuc-*`. Others belong to other people.

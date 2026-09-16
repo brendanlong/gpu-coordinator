@@ -19,7 +19,6 @@ from gpuc.control.config import (
 )
 from gpuc.control.providers.base import Pod, Provider, owned_pods
 from gpuc.control.provision import dispatcher_heartbeat_age
-from gpuc.control.reconcile import STRAY_GRACE_MINUTES
 
 COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "DESIRED", "HEARTBEAT")
 
@@ -91,10 +90,11 @@ class PodsView:
         """`gpuc pods --json`: the provider's answer, ours and everyone else's.
 
         `others` are pods without our prefix: an id, a name and a status, and
-        nothing else, because this command never touches them. `desired: false` on one of
-        ours means nothing local wants it and the reaper will take it;
-        `heartbeat_age_s` is null under `--no-heartbeat` and for a pod that
-        could not be asked.
+        nothing else, because this command never touches them. `desired: false`
+        on one of ours means nothing here wants it *yet* -- `gpuc reconcile`
+        asks it what it is before anything else, and terminates nothing on the
+        absence of a record. `heartbeat_age_s` is null under `--no-heartbeat`
+        and for a pod that could not be asked.
         """
         return {
             "pods": [row.document() for row in self.rows],
@@ -155,9 +155,9 @@ def render(view: PodsView) -> str:
     if stray:
         lines.append(
             f"DESIRED=NO on {', '.join(stray)}: nothing here wants these yet. "
-            f"`gpuc reconcile --once` asks each of them what it is, adopts the ones holding a "
-            f"gpuc config, and terminates the ones holding none once they are over "
-            f"{STRAY_GRACE_MINUTES:.0f} min old."
+            f"`gpuc reconcile --once` asks each of them what it is and takes on the ones "
+            f"running gpuc; anything still DESIRED=NO after that is yours to end -- nothing "
+            f"here terminates a pod it has no record of."
         )
     if view.others:
         names = ", ".join(f"{pod.name} ({pod.status})" for pod in view.others)

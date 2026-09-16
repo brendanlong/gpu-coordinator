@@ -959,19 +959,18 @@ this machine's `desired/`, which is what keeps it watched on a later pass that
 cannot reach it. So the timer is a watchdog role that any machine holding the
 API key can run, and none of them is special.
 
-A stray has to be *shown* to be one, and only two things show it: a prefixed pod
-that answers ssh and has no trace of gpuc on it (no config at the gpuc home, no
-gpuc home there at all, and no `gpuc.host` process — one missing file is not
-proof, since a pod whose `$HOME` was wiped has lost its config and may still be
-running a job), and a pod that is not RUNNING and has no ssh endpoint, which
-nothing can have bootstrapped. Either way only once it is past the 15-minute
-provisioning ceiling, which still covers another machine's create-to-bootstrap
-window. Everything else is reported and left alone: a pod that does not answer
-*this* machine is not a proof, because "wedged" and "this machine holds no key
-for that pod" are the same silence, and terminating on it is what took someone's
-running job. The machine that does hold the record still reaps it under the
-dead-dispatcher rule. `gpuc host add <name> --pod <id>` adopts such a pod
-through the same connect path as any other host.
+**Nothing is terminated for the absence of a record.** A prefixed pod this
+machine has no record of and cannot get an answer out of is reported every pass,
+with its age and its hourly cost, and left running: it may be wedged, it may
+hold no key of ours, or it may be another machine's `create` still
+bootstrapping, and those are indistinguishable from here. Terminating on that
+guess is what took someone's running job, and the guess buys little — the
+machine that *does* hold a pod's record still reaps it on TTL and on a dead
+dispatcher, and a healthy pod terminates itself on idle. What is left over is a
+pod that never got a config whose creating machine never comes back: it bills
+behind a report line until a person ends it, which is the deliberate trade.
+`gpuc host add <name> --pod <id>` moves that duty here, through the same connect
+path as any other host.
 
 Adopting stamps `last_seen_at` on the cached record, because the pod answered
 `cat config.json` in that same pass: a machine that has only just met a pod
@@ -999,8 +998,9 @@ either -- is terminated with a loud report: it cannot idle-terminate itself, it
 is doing nothing we can see, and it is still billing. A long training run keeps
 its host alive indefinitely *under this rule* -- a TTL the host actually has is
 checked first and does terminate a pod with a job on it, which is exactly why a
-TTL is opt-in. The 15-minute pre-healthy ceiling and the stray-pod rule are
-unchanged.
+TTL is opt-in. The 15-minute pre-healthy ceiling is unchanged, and it only
+applies to a record that says the pod was never bootstrapped -- which an adopted
+one never does.
 Never touch a pod without the prefix. If `desired/` is unreadable, do nothing
 and log an error (fail closed). `--install` writes a `systemd --user` service
 and timer but does not enable them, and prints the `systemctl` lines and the

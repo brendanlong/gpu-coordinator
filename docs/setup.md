@@ -278,8 +278,11 @@ gpuc host bootstrap gpubox
 
 ## The reconcile timer
 
-`gpuc reconcile` is the only thing that terminates pods nothing wants any more,
-and it only runs when something runs it. Install it as a `systemd --user` timer
+`gpuc reconcile` is the safety net for the states a pod cannot get itself out
+of -- it never bootstrapped, its dispatcher died, or it is past a TTL its own
+config carries -- and it only runs when something runs it. (A healthy pod needs
+none of this: it drains and terminates itself once its queue has been empty for
+`--idle-min`.) Install it as a `systemd --user` timer
 (60 s by default, `--interval` to change it):
 
 ```sh
@@ -304,9 +307,9 @@ shut. To *watch* a pod (rather than only report it) that machine needs an ssh
 key the pod accepts, and RunPod injects the account's keys when the pod is
 **created**: a key you register later is not on a pod that already exists. So
 put both machines' keys on the account before you provision, or accept that each
-pod is watched from the machines whose keys it was born with. A pod this machine
-cannot ask is reported every pass and never terminated, so nothing is lost
-either way. To drive a pod as well as watch it, adopt it: `gpuc host add <name>
+pod is watched from the machines whose keys it was born with. Nothing is lost
+either way — a pod this machine cannot place is reported every pass and never
+terminated. To drive a pod as well as watch it, adopt it: `gpuc host add <name>
 --pod <pod-id>`.
 
 ## Upgrading
@@ -404,23 +407,23 @@ gpuc host clean <name> --uv-cache   # `uv cache prune` there, if you want the di
 gpuc home (`gpuc ssh <host> -- rm -rf ~/.gpuc`, or the persistent root's `gpuc`
 directory) while nothing is running.
 
-**Terminating a pod deliberately.** There is no terminate command; the pod
-terminates itself once its queue has been empty for `--idle-min`, which is the
-normal path. To do it now, remove the record that says you still want it and let
-the reaper treat it as a stray:
+**Terminating a pod deliberately.** There is no terminate command, and deleting
+local state is not one: nothing here terminates a pod for having no record. Tell
+the pod instead — it is the thing that can stop itself:
 
 ```sh
-gpuc pods                                              # confirm the name and that it is idle
-rm ~/.local/share/gpu-coordinator/desired/<name>.json
-gpuc host remove <name>
-gpuc reconcile --once                                  # terminates prefixed pods with no record
+gpuc pods                                       # confirm the name and that it is idle
+gpuc host set <name> --idle-min 0               # stop as soon as the queue is empty
+gpuc host set <name> --ttl-hours 0.1            # or: stop in six minutes, killing a running job
 ```
 
-The stray rule only fires once the pod is over 15 minutes old, so a pod created
-minutes ago has to age out (or be terminated in the RunPod console). Leaving the
-`desired/` record in place and only removing the host has the same end effect
-more slowly: the reaper can no longer reach it, so it terminates it after
-`dead_dispatcher_minutes`.
+`--idle-min 0` reaches the host's own `config.json`, so the dispatcher drains
+(retrying unconfirmed outputs, mirroring every job's log and state) and
+terminates on its next pass with nothing running. `--ttl-hours` is the one that
+does not wait for the job — it asks each runner to stop with reason `ttl`, lets
+it sync, and then terminates. For a pod that has stopped answering ssh
+altogether, the reaper gets it after `dead_dispatcher_minutes`; for one that
+answers nothing at all and belongs to nobody, the RunPod console is the tool.
 
 **Disabling the timer, or the dashboard service.**
 
