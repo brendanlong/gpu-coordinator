@@ -21,7 +21,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `secrets` | `[]` | names read from *your* shell at submit time and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600). Missing from your shell is a refused submit |
 | `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir |
 | `sync_interval_s` | `180` | background upload cadence; **minimum 10** |
-| `priority` | `50` | `0`–`99`, lower dispatches first |
+| `priority` | `50` | `0`–`99`, lower dispatches first, and the queue is taken strictly in that order — see [priority is not advisory](#priority-is-not-advisory) |
 | `max_runtime_min` | none | wall clock from the runner's start; over it the job is `failed: timeout` |
 | `estimated_runtime_min` | none | roughly how long you expect it to take, measured the same way. Nothing enforces it; see [job length estimates](#job-length-estimates) |
 | `progress_command` | none | run in the workdir during phase `main`; its last line of stdout is how far along the job is |
@@ -56,6 +56,40 @@ prefix; with HF outputs, `hf` must resolve, `hf auth whoami` must succeed with
 the job's token, and a `.preflight` file must upload to each repo. Failure is
 `failed: sync-preflight`, seconds in, with the command and its error in the log.
 A job with no outputs on a host with no mirror checks nothing.
+
+## Priority is not advisory
+
+Dispatch order is `<priority>-<job id>`, lower first, and the host takes the
+queue **in order**: a job that cannot start yet holds the free cards it is
+waiting for, and nothing behind it may take them. A two-card job at priority 10
+does not lose its card to a one-card job at 50 that happens to fit.
+
+That matters because the alternative is not "slightly unfair", it is
+*indefinite*: while the host walked past a job that did not fit, every card
+freed near a wide job at the front went to the narrow jobs behind it, and a
+steady supply of them meant the most important job in the queue never ran at
+all.
+
+**It costs utilization.** A card waiting for the rest of a job's cards runs
+nothing, for as long as the other cards stay busy — and on a rented pod that is
+billed. If you would rather a big job waited than have a card sit idle for it,
+queue it at a **higher** number than the work you want to keep the host busy
+with; priority is the only knob, and it decides both questions at once.
+
+A job only holds cards when the host can supply the **whole** of it from the
+cards it owns and can see right now. These are walked past instead, because
+holding a card for them would mean waiting on something the host does not
+control:
+
+- **`gpus: 0`** — it holds no card, so it can never be the reason anything is
+  short of one. It still never waits.
+- **a job asking for more cards than the host can currently see** — either a
+  card has dropped off `nvidia-smi`, and idling the host until it comes back
+  (if it comes back) is worse than letting the queue run; or the job can only
+  fit by [borrowing](#shared-gpus), and a shared card comes free when somebody
+  else's job ends, which is not this host's to wait for. Neither is failed: the
+  host's `config.gpus` says it owns enough. A job bigger than the *configured*
+  host, shared cards included, is failed at dispatch as it always was.
 
 ## Shared GPUs
 
@@ -181,11 +215,10 @@ estimated an end time, one line saying when the next card is expected:
 ```
 
 A queued job's `starts` is the host's own dispatch rule run forward over the
-estimates it has: cards come free at the eta of whatever holds them, the queue
-is walked in priority order, and a job that fits into what is free before the
-job ahead of it does starts first — which is what the dispatcher itself does,
-since it walks the whole queue on every pass rather than blocking on the head of
-it. It is evidence or it is absent: a job whose turn depends on a job that
+estimates it has: cards come free at the eta of whatever holds them and the
+queue is taken in order, because a job that does not fit
+[holds the cards it is waiting for](#priority-is-not-advisory). It is evidence
+or it is absent: a job whose turn depends on a job that
 estimated nothing has no `starts` at all, and a paused or draining host projects
 nothing, because nothing is being dispatched. A job waiting for more than one
 card says so (`needs 2 gpus`), which is the answer to "there is a card free, why
@@ -221,13 +254,12 @@ The host only does it when it is worth it, and the rules are the command's:
   priority nothing happens: dispatch order is `<priority>-<job id>` and the
   stopped job's id is the older one, so it would win the tie and take its own
   cards straight back. A job queued at a higher number never preempts anything.
-- **The cards are held for the job they were freed for**, until it is
-  launched. A stopped job is queued again at its own priority and the
-  dispatcher walks past a job that does not fit, so without this the first
-  card to come free would go straight back to the job that just gave it up —
-  which is then stopped again on the next pass, for ever, with the waiting job
-  no closer to starting. (The hold lives in the dispatcher, so a dispatcher
-  that restarts mid-preempt simply works it out again.)
+- **The cards stay with the job they were freed for.** A stopped job is queued
+  again at its own priority — behind the job that is waiting — and a job that
+  does not fit holds the free cards it needs, so the card cannot go back to the
+  job that just gave it up. That is the ordinary dispatch rule, not something
+  preemption does for itself: see [priority is not
+  advisory](#priority-is-not-advisory).
 - **The host has to be dispatching.** Paused, draining, past its
   `--ttl-hours` or within five minutes of it, nothing is stopped: the cards
   would go to nobody, and a job stopped that close to the end of a pod's life

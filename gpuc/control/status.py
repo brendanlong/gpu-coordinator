@@ -659,15 +659,17 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
     """Seconds until each queued job is expected to start, by job id.
 
     The host's own dispatch rule run forward over the estimates it has: a card
-    comes free at the eta of the job holding it, the queue is walked in
-    priority order, and a job that fits into what is free before the job ahead
-    of it does starts first -- which is what the dispatcher does, since it
-    walks the whole queue on every pass rather than blocking on the head of it.
+    comes free at the eta of the job holding it, and the queue is taken in
+    order, because that is what the dispatcher does -- a job that does not fit
+    holds the free cards it is waiting for, and nothing behind it may take
+    them. A `gpus: 0` job is the exception at both ends: it holds no card and
+    is never held up by one, so it starts now wherever it sits in the queue.
 
     A job is in the answer or it is not: one whose turn depends on a job that
     gave no estimate is absent, never guessed at. That is why a *later* job can
-    have a start time when an earlier one does not -- it fits in cards the
-    unestimated job is not holding.
+    have a start time when an earlier one does not: it is one of the jobs the
+    host would walk past, because holding cards for it would mean waiting on
+    something this host does not control.
 
     Shared cards are in the model, but only the ones that are idle *now* and
     only for the jobs allowed onto them. A card somebody else is using is left
@@ -684,42 +686,64 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
         return {}
     cards = _card_releases(view)
     starts: dict[str, float] = {}
-    pending = list(view.queue)
+    pending: list[JobView] = []
+    for job in view.queue:
+        if job.gpus_requested == 0:
+            # It holds no card and waits for none, wherever it sits in the queue.
+            starts[job.job_id] = 0.0
+        else:
+            pending.append(job)
     clock = 0.0
-    blocked = False
-    while pending and not blocked:
+    while pending:
+        # Cards a job that could not start is waiting for, which the host holds
+        # rather than handing to the job behind it. Reset at each release: this
+        # is the same walk the dispatcher makes on a pass, not a running total.
+        held = held_shared = 0
         for job in list(pending):
             if job.gpus_requested is None:
-                # A host too old to say what a queued job asked for. It is
-                # ahead in the queue and will take cards we cannot count, so
-                # nothing behind it can be estimated either.
-                blocked = True
-                break
+                # A host too old to say what a queued job asked for. It will
+                # take cards we cannot count, and it holds them, so nothing
+                # behind it can be estimated either.
+                return starts
             borrows = view.may_borrow(job)
             # Owned first, exactly as the dispatcher assigns them, so a job
             # borrows only the shortfall and holds a shared card no longer
             # than it has to.
-            free = [
-                i
-                for i, (release, shared) in enumerate(cards)
-                if release is not None and release <= clock and (borrows or not shared)
-            ]
-            if len(free) < job.gpus_requested:
+            free_owned = _free_now(cards, clock, shared=False)[held:]
+            free_shared = _free_now(cards, clock, shared=True)[held_shared:] if borrows else []
+            take_owned = free_owned[: job.gpus_requested]
+            take_shared = free_shared[: job.gpus_requested - len(take_owned)]
+            if len(take_owned) + len(take_shared) < job.gpus_requested:
+                # It does not fit. The host holds what it could take only when
+                # it could supply the whole job itself; a job that can only run
+                # by borrowing waits on somebody else and is walked past.
+                if job.gpus_requested <= len(view.owned):
+                    held += len(take_owned)
+                    held_shared += len(take_shared)
                 continue
             done = (
                 None
                 if job.estimated_runtime_min is None
                 else clock + job.estimated_runtime_min * 60.0
             )
-            for index in free[: job.gpus_requested]:
+            for index in [*take_owned, *take_shared]:
                 cards[index] = (done, cards[index][1])
             starts[job.job_id] = clock
             pending.remove(job)
         later = [release for release, _ in cards if release is not None and release > clock]
-        if blocked or not later:
+        if not later:
             break
         clock = min(later)
     return starts
+
+
+def _free_now(cards: list[tuple[float | None, bool]], clock: float, *, shared: bool) -> list[int]:
+    """Indices of the owned (or shared) cards that are free at `clock`."""
+    return [
+        i
+        for i, (release, is_shared) in enumerate(cards)
+        if is_shared is shared and release is not None and release <= clock
+    ]
 
 
 def _card_releases(view: HostView) -> list[tuple[float | None, bool]]:
@@ -812,6 +836,20 @@ def no_start_reason(view: HostView, job: JobView) -> str:
             f"it needs {job.gpus_requested - len(view.owned)} shared card(s), and when "
             f"somebody else stops using one is not something this host can predict"
         )
+    order = [queued.job_id for queued in view.queue]
+    blocking = next(
+        (
+            ahead
+            for ahead in view.queue[: order.index(job.job_id)]
+            if ahead.job_id not in queue_start_estimates(view)
+        ),
+        None,
+    )
+    if blocking is not None:
+        # Nothing starts before the job ahead of it does, so its turn is not
+        # knowable until that one's is -- and saying "the cards it needs" of a
+        # job that is waiting on the queue rather than on a card is a lie.
+        return f"job {blocking.job_id} is ahead of it and has no start time yet"
     # Running or queued: either way, the cards this job is waiting for are
     # spoken for by something that never said when it would be done with them.
     return "the jobs holding the cards it needs gave no end time"
