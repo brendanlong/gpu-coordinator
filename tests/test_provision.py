@@ -365,7 +365,7 @@ def test_caps_count_ignores_foreign_pods(control_env: Path, ssh_key: Path) -> No
     provider = FakeProvider(
         [make_offer()],
         caps=Caps(max_pods=1),
-        existing=[running_pod("subrep-someone-else", "podY")],
+        existing=[running_pod("other-someone-else", "podY")],
     )
     entry = run(provider)
     assert entry.pod_id == "pod1"

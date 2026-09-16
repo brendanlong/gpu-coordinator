@@ -19,7 +19,7 @@ from gpuc.control.config import (
 from gpuc.control.status import HostView, render
 from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
 
-FOREIGN = "subrep-someone-else"
+FOREIGN = "other-someone-else"
 
 
 def _register(pod_name: str, pod_id: str, *, desired: bool = True) -> None:
