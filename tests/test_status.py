@@ -13,6 +13,9 @@ from gpuc.control.status import (
     host_warnings,
     job_views,
     owned_gpus,
+    queue_note,
+    queue_placement,
+    queue_start_estimates,
     render,
 )
 from tests.conftest import host_entry
@@ -763,3 +766,196 @@ def test_a_reachable_host_that_never_reported_a_commit_is_not_read_as_current() 
     assert got.reachable and got.pkg_commit is None
     assert host_json(got)["pkg_commit"] is None
     assert any("too old to say which" in warning for warning in host_warnings(got))
+
+
+def waiting(job_id: str, **overrides: Any) -> JobView:
+    document: dict[str, Any] = {"job_id": job_id, "priority": 50, "gpus_requested": 1}
+    document.update(overrides)
+    return JobView(**document)
+
+
+def test_a_running_jobs_priority_comes_from_the_spec_when_its_marker_is_gone() -> None:
+    """The one field that explains dispatch order was absent from every job the
+    host had already started, because the queue marker is deleted at dispatch."""
+    document = payload(
+        queue=[{"priority": 10, "job_id": "j-queued"}],
+        jobs=[
+            {"job_id": "j-queued", "status": "queued", "priority": 50},
+            {"job_id": "j-running", "status": "running", "priority": 88},
+            {"job_id": "j-old", "status": "failed", "priority": 0},
+        ],
+    )
+    queued, running, finished = job_views(document)
+    # The marker is what the dispatcher orders by, so it wins over the spec's
+    # copy while the job is still queued -- `gpuc reorder` moves the marker.
+    assert queued[0].priority == 10
+    assert running[0].priority == 88
+    assert finished[0].priority == 0
+
+
+def test_the_highest_priority_there_is_still_comes_from_the_marker() -> None:
+    """`0` is a real priority, so the fallback to the spec cannot be an `or`:
+    a job reordered to the front would report the priority it was submitted at."""
+    document = payload(
+        queue=[{"priority": 0, "job_id": "j-queued"}],
+        jobs=[{"job_id": "j-queued", "status": "queued", "priority": 50}],
+    )
+    queued, _, _ = job_views(document)
+    assert queued[0].priority == 0
+
+
+def test_a_host_too_old_to_report_a_priority_says_nothing_rather_than_guessing() -> None:
+    _, running, _ = job_views(payload(jobs=[{"job_id": "j-running", "status": "running"}]))
+    assert running[0].priority is None
+
+
+def test_a_queued_job_starts_now_when_a_card_is_already_free() -> None:
+    view = busy(running_job(gpus=[GPU]), queued=[waiting("j-next")])
+    assert queue_start_estimates(view) == {"j-next": 0.0}
+    assert "starts now" in render(view)
+
+
+def test_a_queued_job_waits_for_the_card_the_running_job_gives_back() -> None:
+    view = busy(
+        running_job(gpus=[GPU], eta=in_minutes(20)),
+        running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(130)),
+        queued=[
+            waiting("j-next", estimated_runtime_min=60.0),
+            waiting("j-after", estimated_runtime_min=60.0),
+        ],
+    )
+    starts = queue_start_estimates(view)
+    assert 19 * 60 < starts["j-next"] < 21 * 60
+    # The first queued job takes that card at 20m and holds it for its own
+    # hour, so the second one has it at 1h20m -- sooner than the 2h10m card.
+    assert 79 * 60 < starts["j-after"] < 81 * 60
+    assert "starts in ~20m" in render(view)
+
+
+def test_a_job_that_gave_no_estimate_hides_only_the_jobs_behind_it() -> None:
+    """A start time is evidence or it is absent. The job that inherits an
+    unestimated job's card cannot be placed; one that needs no card from it can."""
+    view = busy(
+        running_job(gpus=[GPU], eta=in_minutes(20)),
+        running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(130)),
+        queued=[waiting("j-silent"), waiting("j-behind"), waiting("j-cpu", gpus_requested=0)],
+    )
+    starts = queue_start_estimates(view)
+    assert 19 * 60 < starts["j-silent"] < 21 * 60
+    assert 129 * 60 < starts["j-behind"] < 131 * 60
+    assert starts["j-cpu"] == 0.0
+
+
+def test_a_two_card_job_does_not_hold_up_the_one_card_job_behind_it() -> None:
+    """The dispatcher walks the whole queue every pass rather than blocking on
+    the head of it, so the estimate has to as well."""
+    view = busy(
+        running_job(gpus=[GPU], eta=in_minutes(45)),
+        running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(90)),
+        queued=[
+            waiting("j-wide", gpus_requested=2),
+            waiting("j-narrow", estimated_runtime_min=10.0),
+        ],
+    )
+    starts = queue_start_estimates(view)
+    # The one-card job takes the first card back at 45m and is done with it by
+    # 55m; the two-card job still waits for the second card, at 90m.
+    assert 44 * 60 < starts["j-narrow"] < 46 * 60
+    assert 89 * 60 < starts["j-wide"] < 91 * 60
+    assert "needs 2 gpus" in render(view)
+
+
+def test_a_cpu_job_is_not_described_as_needing_no_cards() -> None:
+    """`gpus: 0` is ignored everywhere else here -- it holds no card and never
+    waits for one -- and `needs 0 gpus` is a line to stop and re-read."""
+    view = busy(running_job(gpus=[GPU, "GPU-b"]), queued=[waiting("j-cpu", gpus_requested=0)])
+    assert "needs" not in render(view)
+    assert "queued  j-cpu prio=50 starts now" in render(view)
+
+
+def test_nothing_starts_on_a_paused_or_draining_host() -> None:
+    view = busy(running_job(gpus=[GPU]), queued=[waiting("j-next")])
+    view.paused = True
+    assert queue_start_estimates(view) == {}
+    view.paused, view.draining = False, True
+    assert queue_start_estimates(view) == {}
+    assert "starts" not in render(view)
+
+
+def test_a_host_that_does_not_say_what_a_queued_job_asked_for_estimates_nothing() -> None:
+    view = busy(
+        running_job(gpus=[GPU]),
+        queued=[waiting("j-unknown", gpus_requested=None), waiting("j-behind")],
+    )
+    assert queue_start_estimates(view) == {}
+
+
+def test_the_json_carries_the_queue_order_and_when_each_job_starts() -> None:
+    """`sort_by(.priority)` over `queued` has to reproduce dispatch order: it is
+    the only thing that says whether your job runs next."""
+    view = busy(
+        running_job(gpus=[GPU], eta=in_minutes(20)),
+        queued=[
+            waiting("j-next", priority=10, gpus_requested=2),
+            waiting("j-later", priority=90, estimated_runtime_min=10.0),
+        ],
+    )
+    document = host_json(view)
+    assert [(j["job_id"], j["priority"]) for j in document["queued"]] == [
+        ("j-next", 10),
+        ("j-later", 90),
+    ]
+    first = document["queued"][0]
+    assert first["gpus_requested"] == 2
+    assert 19 * 60 < first["starts_in_s"] < 21 * 60
+    assert first["starts_at"] > datetime.now(UTC).isoformat()
+    assert document["running"][0]["starts_in_s"] is None
+    assert document["running"][0]["starts_at"] is None
+
+
+def test_the_placement_of_a_job_in_its_hosts_queue() -> None:
+    view = busy(
+        running_job(gpus=[GPU], eta=in_minutes(20)),
+        queued=[waiting("j-first"), waiting("j-second")],
+    )
+    placement = queue_placement(view, "j-second")
+    assert (placement["queue_position"], placement["queue_length"]) == (2, 2)
+    assert placement["dispatched"] is False
+    note = queue_note(placement)
+    assert note is not None and note.startswith("  queue: position 2 of 2; starts in ~")
+
+    started = queue_placement(view, "j-running")
+    assert (started["queue_position"], started["dispatched"]) == (None, True)
+    assert queue_note(started) == "  queue: dispatched already; it is running now"
+
+
+def test_an_unreachable_host_places_nothing_rather_than_reporting_an_empty_queue() -> None:
+    """Null is not `not queued`: the job was enqueued before anything asked."""
+    view = HostView(entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), reachable=False)
+    placement = queue_placement(view, "j-next")
+    assert set(placement.values()) == {None}
+    assert queue_note(placement) is None
+
+
+def test_a_queued_job_whose_turn_cannot_be_dated_says_why() -> None:
+    """Each reason is a different thing to do about it, and "a job ahead of it"
+    is a lie to tell the only job in the queue of a host that is paused."""
+    view = busy(running_job(gpus=[GPU, "GPU-b"]), queued=[waiting("j-next")])
+    note = queue_note(queue_placement(view, "j-next"))
+    assert note is not None and note.endswith(
+        "start time unknown (the jobs holding the cards it needs gave no end time)"
+    )
+
+    view.paused = True
+    assert "host gpubox is paused" in str(queue_note(queue_placement(view, "j-next")))
+    view.paused, view.draining = False, True
+    assert "host gpubox is draining" in str(queue_note(queue_placement(view, "j-next")))
+
+    view.draining = False
+    view.queue = [waiting("j-next", gpus_requested=4)]
+    assert "asks for 4 card(s) and the host has 2" in str(
+        queue_note(queue_placement(view, "j-next"))
+    )
+
+    view.queue = [waiting("j-next", gpus_requested=None)]
+    assert "does not report how many cards" in str(queue_note(queue_placement(view, "j-next")))

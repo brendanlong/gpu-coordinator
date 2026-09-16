@@ -294,6 +294,9 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "estimated_runtime_min",
         "progress_error",
         "gpus",
+        "gpus_requested",
+        "starts_in_s",
+        "starts_at",
         "iso",
         "ended_at",
         "outputs_pending",
@@ -772,3 +775,55 @@ def test_logs_json_says_when_it_fell_back_to_the_mirror(
     assert document["location"] == f"s3://{uri}"
     assert document["lines"] == ["mirrored"]
     assert any("could not read" in note for note in document["notes"])
+
+
+def test_status_json_says_what_order_the_queue_runs_in(
+    real_local_host: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The whole round trip for dispatch order: the host's queue markers and
+    specs, through `gather`, into the document automation is told to prefer.
+
+    Priority is the one field that explains the order, so a queue you cannot
+    sort by it is a list you cannot act on.
+    """
+    from gpuc.host import jobs, paths, queue
+    from gpuc.host.jobs import JobSpec
+
+    monkeypatch.setenv("GPUC_HOME", str(real_local_host))
+    paths.ensure_layout()
+    # The card is held for another hour, which is what gives the jobs waiting
+    # for it a start time at all.
+    jobs.update_state(RUNNING_JOB, eta=(datetime.now(UTC) + timedelta(hours=1)).isoformat())
+    for job_id, name, priority, gpus in (
+        ("20260915-140000-bbbbbb", "sweep", 90, 1),
+        ("20260915-140100-cccccc", "urgent", 10, 2),
+    ):
+        queue.enqueue(
+            JobSpec.from_dict(
+                {
+                    "job_id": job_id,
+                    "name": name,
+                    "command": "train",
+                    "priority": priority,
+                    "gpus": gpus,
+                    "estimated_runtime_min": 30.0,
+                }
+            )
+        )
+    monkeypatch.delenv("GPUC_HOME")
+
+    assert main(["status", "--json"]) == EXIT_OK
+    queued = status_json(capsys)["hosts"][0]["queued"]
+    assert [(job["name"], job["priority"]) for job in queued] == [("urgent", 10), ("sweep", 90)]
+    assert queued == sorted(queued, key=lambda job: job["priority"])
+    assert (queued[0]["gpus_requested"], queued[1]["gpus_requested"]) == (2, 1)
+    # `urgent` wants two cards and the host owns one, so it never fits; `sweep`
+    # takes the card the running job gives back in an hour.
+    assert queued[0]["starts_in_s"] is None
+    assert 3500 < queued[1]["starts_in_s"] < 3600
+    assert queued[1]["starts_at"] > datetime.now(UTC).isoformat()
+
+    assert main(["status"]) == EXIT_OK
+    text = capsys.readouterr().out
+    assert "queued  urgent (20260915-140100-cccccc) prio=10 needs 2 gpus est 30m" in text
+    assert "starts in ~1h00m" in text
