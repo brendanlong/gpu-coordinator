@@ -264,19 +264,33 @@ queue's lexical order, not submission order below one second.
 - Automatic preemption: after `launch_ready` -- so everything still queued is
   something the free cards could not take -- `preempt_for_waiting` walks the
   queue and, for each job that does not fit, asks whether stopping the running
-  jobs whose spec says `auto_preempt` would let it start. It stops them only if
-  together they cover the *whole* gap (freeing one of two cards costs an attempt
-  and starts nothing), only for a queued job at a strictly lower priority number
-  (at the same priority the stopped job's older id wins the tie and it would
-  take its own cards straight back, for ever), and never on a host that is
-  paused or `_going_away`. Cards held by a job that is already stopping count as
-  free, or the next pass preempts a second job for a gap the first already
-  covers. Candidates go least important first, and among equals the one that
+  jobs whose spec says `auto_preempt` would let it start. `enough_to_start`
+  picks a set only if together they cover the *whole* gap (freeing one of two
+  cards costs an attempt and starts nothing), and only jobs at a strictly
+  higher priority number than the waiting one (at equal priority the stopped
+  job's older id wins the tie and it would take its own cards straight back,
+  for ever). Candidates go least important first, and among equals the one that
   started most recently, since what a preempt throws away is the work already
-  done. The stop itself is `queue.preempt`, so everything above is the ordinary
-  preempt path -- including the re-queue at the job's own priority, which is
-  what makes the more important job win the next dispatch. Nothing counts how
-  often a job has given way: `auto_preempt` accepts being starved.
+  done. Nothing runs on a host that is paused, `_going_away`, or within
+  `AUTO_PREEMPT_TTL_MARGIN_S` of its TTL -- a job stopped there may never be
+  queued again, and unlike the command nobody is watching. The stop itself is
+  `queue.preempt`, so all of it is the ordinary preempt path, including the
+  re-queue at the job's own priority. Nothing counts how often a job has given
+  way: `auto_preempt` accepts being starved.
+  Two pieces of bookkeeping keep it from spending attempts for nothing. Cards
+  held by a job that is already stopping count as available, or the next pass
+  preempts a second job for a gap the first already covers. And whatever is
+  freed is *reserved* for the job it was freed for (`_reserved`, uuid -> queued
+  job id): `launch_ready` will not hand a reserved card to anything else, which
+  is what stops the job that just gave a card up from being handed it straight
+  back on its way through the queue and preempted again on the next pass, for
+  ever, while the job the card was freed for still waits for the rest. A
+  reservation is released when its job launches and expired when it is no
+  longer queued or its card is no longer owned; it lives in memory, so a
+  dispatcher that takes over mid-preempt simply works the queue out again. Once
+  one stop in a set fails the rest are left alone -- the gap is no longer
+  coverable, so their attempts would buy nothing -- and what was already freed
+  stays reserved, so the next pass stops only the remainder.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.

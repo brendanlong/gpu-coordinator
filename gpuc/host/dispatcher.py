@@ -48,6 +48,15 @@ Once at startup and then hourly: deleting day-old venvs is not urgent, and
 on a non-ephemeral host the dispatcher only lives while there is work, so the
 startup pass is the one that usually fires.
 """
+AUTO_PREEMPT_TTL_MARGIN_S = 300.0
+"""How close to an ephemeral host's TTL automatic preemption stops.
+
+A job stopped inside this window may never come back: the runner's final sync
+takes as long as it takes, and `requeue_if_preempted` refuses to queue anything
+onto a host that is by then draining or past its cap. A human typing `gpuc
+preempt` is there to see that happen; this fires unattended, so it stops early
+rather than spending an attempt for nothing.
+"""
 OUTPUT_RETRY_ATTEMPTS = 3
 OUTPUT_RETRY_INTERVAL_S = 60.0
 OUTPUT_RETRY_BUDGET_S = 300.0
@@ -424,6 +433,8 @@ class Dispatcher:
     _terminate_retry_at: float | None = None
     _last_reclaim_at: float | None = None
     _kill_sent: dict[str, float] = field(default_factory=dict)
+    _reserved: dict[str, str] = field(default_factory=dict)
+    """GPU uuid -> the queued job an auto-preempt freed it for; see `_reserve`."""
     _kill_escalated: set[str] = field(default_factory=set)
     _pause_drain_pending: bool = False
     _config: jobs.HostConfig | None = None
@@ -844,6 +855,7 @@ class Dispatcher:
     def launch_ready(self) -> None:
         if self.paused() or paths.draining_file().exists():
             return
+        self._expire_reservations()
         free = self.free_gpus()
         # Sampled at most once per pass, and only if a job actually needs it:
         # see `borrowable_gpus`.
@@ -876,9 +888,16 @@ class Dispatcher:
                     ended_at=jobs.utc_now(),
                 )
                 continue
+            # Cards being assembled for a more important job that a preempt is
+            # in flight for are not on offer. Without this the job that was
+            # just stopped to free one of them is handed it straight back on
+            # its way through the queue -- and stopped again on the next pass,
+            # for ever, with the job they were freed for still waiting.
+            blocked = self._reserved_for_others(job_id)
             # Owned cards first, always: a job borrows only the shortfall, so a
             # shared card is held for the shortest time that runs the job.
-            owned_part, shared_part = free[: spec.gpus], []
+            owned_part: list[str] = [uuid for uuid in free if uuid not in blocked][: spec.gpus]
+            shared_part: list[str] = []
             if len(owned_part) < spec.gpus:
                 if not self.config.may_borrow(spec):
                     continue
@@ -888,7 +907,8 @@ class Dispatcher:
                 if need > len(borrowable):
                     continue
                 shared_part, borrowable = borrowable[:need], borrowable[need:]
-            assigned, free = [*owned_part, *shared_part], free[len(owned_part) :]
+            assigned = [*owned_part, *shared_part]
+            free = [uuid for uuid in free if uuid not in owned_part]
             entry.marker.unlink(missing_ok=True)
             jobs.update_state(
                 job_id,
@@ -927,6 +947,7 @@ class Dispatcher:
                 runner_starttime=starttime(proc.pid),
             )
             self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
+            self._release_reservation(job_id)
             borrowed = f", borrowing {','.join(shared_part)}" if shared_part else ""
             self.log(
                 f"launched {job_id} (pid {proc.pid}) on "
@@ -939,7 +960,7 @@ class Dispatcher:
 
         After `launch_ready`, so everything still queued is something the free
         cards could not take, and the only question left is whether stopping a
-        job that said it may be stopped would let one of them run. Two things
+        job that said it may be stopped would let one of them run. Three things
         have to hold, and they are what keep this from being a way to lose work
         for nothing:
 
@@ -949,23 +970,37 @@ class Dispatcher:
           priority the stopped job's id is the older one, so it would win the
           tie, take its own cards straight back, and be preempted again on the
           next pass for ever.
+        * the cards have to stay with the job they were freed for, which is
+          what the reservation is: the stopped job is queued again at its own
+          priority, and `launch_ready` walks past a job that does not fit, so
+          without one the card goes straight back to the job that just gave it
+          up while the waiting job -- still short of the rest -- watches.
 
         There is no limit on how often one job gives way: `auto_preempt` says
         it would rather start over than hold a card something better wants, and
         a host with a steady supply of better work may never run it at all.
         """
-        if self.paused() or self._going_away() is not None:
+        if self.paused() or self._going_away() is not None or self._ttl_is_near():
             return
         candidates = self.auto_preemptable()
         if not candidates:
             return
-        # Cards a job that is already stopping is about to hand back. Counted
-        # here, or the next pass preempts a second job for a gap the first one
-        # has already covered -- and the job it was covering it for is still
-        # queued, because nothing starts until the runner is really gone.
-        available = len(self.free_gpus()) + sum(
-            len(entry.gpus) for job_id, entry in self.running.items() if self._stopping(job_id)
-        )
+        # Cards held by a job that is already stopping, plus the free ones: a
+        # gap the cards of a preempt already in flight will cover needs no
+        # second job stopped for it. Only cards this host still owns and can
+        # see -- one that has dropped off nvidia-smi is never handed out, so
+        # counting it would stop a job for a card nothing can be launched on.
+        owned = set(self.owned_gpus())
+        pool = [
+            *self.free_gpus(),
+            *(
+                uuid
+                for job_id, entry in self.running.items()
+                if self._stopping(job_id)
+                for uuid in entry.gpus
+                if uuid in owned
+            ),
+        ]
         for waiting in queue.list_queued():
             if queue.is_cancelled(waiting.job_id):
                 continue
@@ -973,18 +1008,31 @@ class Dispatcher:
                 spec = jobs.read_spec(waiting.job_id)
             except (RuntimeError, OSError):
                 continue  # `launch_ready` is what drops an unreadable spec
-            if spec.gpus <= available:
+            blocked = self._reserved_for_others(waiting.job_id)
+            available = [uuid for uuid in pool if uuid not in blocked]
+            if spec.gpus <= len(available):
                 # Nothing has to be stopped for this one: it starts as soon as
                 # those cards come back, and they are no longer going spare.
-                available -= spec.gpus
+                pool = self._without(pool, available[: spec.gpus])
                 continue
-            for candidate in enough_to_start(candidates, waiting.priority, spec.gpus - available):
-                if not self._preempt_for(candidate, waiting):
-                    continue
+            chosen = enough_to_start(candidates, waiting.priority, spec.gpus - len(available))
+            if not chosen:
+                continue
+            freed: list[str] = []
+            for candidate in chosen:
+                # Dropped from the pool whatever happens: a job we could not
+                # stop this pass will not stop for the next waiting job either,
+                # and counting it again would stop a second job for a gap that
+                # is still not covered.
                 candidates.remove(candidate)
-                available += len(candidate.gpus)
-            if spec.gpus <= available:
-                available -= spec.gpus
+                if not self._preempt_for(candidate, waiting):
+                    break
+                freed.extend(candidate.gpus)
+            # What was freed even if one stop failed: holding it is what lets
+            # the next pass stop only the rest, rather than starting over with
+            # the cards already given up handed to something else.
+            self._reserve([*available, *freed][: spec.gpus], waiting.job_id)
+            pool = self._without(pool, available)
 
     def auto_preemptable(self) -> list[Preemptable]:
         """The running jobs whose spec said they may be stopped for better work.
@@ -1013,6 +1061,43 @@ class Dispatcher:
         """Already asked to stop, so its cards are on their way back anyway."""
         return queue.kill_reason(job_id) is not None or queue.is_cancelled(job_id)
 
+    @staticmethod
+    def _without(pool: list[str], taken: list[str]) -> list[str]:
+        spoken_for = set(taken)
+        return [uuid for uuid in pool if uuid not in spoken_for]
+
+    def _reserve(self, uuids: list[str], job_id: str) -> None:
+        """Hold these cards for one queued job until it is launched.
+
+        In memory, and deliberately: a reservation is a statement about a
+        preempt this dispatcher has in flight, and a dispatcher that restarts
+        has none. The worst a lost reservation costs is one more round of
+        preempts, which the next pass works out again from the queue.
+        """
+        for uuid in uuids:
+            self._reserved[uuid] = job_id
+
+    def _reserved_for_others(self, job_id: str) -> set[str]:
+        return {uuid for uuid, holder in self._reserved.items() if holder != job_id}
+
+    def _release_reservation(self, job_id: str) -> None:
+        for uuid in [u for u, holder in self._reserved.items() if holder == job_id]:
+            del self._reserved[uuid]
+
+    def _expire_reservations(self) -> None:
+        """Drop reservations that can no longer do anything.
+
+        A card is held for a job that is *queued*: one that has been launched,
+        cancelled or failed since would otherwise keep a card idle for the life
+        of the dispatcher. So would a card that has dropped off nvidia-smi,
+        which nothing can be launched on at all.
+        """
+        queued = {entry.job_id for entry in queue.list_queued()}
+        owned = set(self.owned_gpus())
+        for uuid, holder in list(self._reserved.items()):
+            if holder not in queued or uuid not in owned:
+                del self._reserved[uuid]
+
     def _preempt_for(self, candidate: Preemptable, waiting: queue.QueueEntry) -> bool:
         """Stop one auto-preemptable job, saying in both logs who took its place.
 
@@ -1022,7 +1107,7 @@ class Dispatcher:
         """
         try:
             queue.preempt(candidate.job_id)
-        except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
+        except (ValueError, RuntimeError, OSError) as exc:
             self.log(
                 f"job {candidate.job_id} is auto_preempt but was not stopped for "
                 f"{waiting.job_id} ({exc}); it keeps its cards"
@@ -1031,7 +1116,7 @@ class Dispatcher:
         self.log(
             f"job {candidate.job_id} (auto_preempt, priority {candidate.priority}) is being "
             f"stopped so job {waiting.job_id} (priority {waiting.priority}) can have its "
-            f"{len(candidate.gpus)} card(s); it goes back in the queue as the next attempt"
+            f"{len(candidate.gpus)} card(s)"
         )
         queue.note(
             candidate.job_id,
@@ -1136,21 +1221,30 @@ class Dispatcher:
             )
 
     def _ttl_expired(self, config: jobs.HostConfig) -> bool:
-        """Null `ttl_hours` -- the default -- never expires.
+        left = self._ttl_seconds_left(config)
+        return left is not None and left <= 0.0
 
-        An overall TTL is opt-in precisely because the failure it causes (a
-        training run killed at hour 24) is worse than the one it prevents.
+    def _ttl_seconds_left(self, config: jobs.HostConfig) -> float | None:
+        """Seconds until this host's hard cap, or None if it has none.
+
+        Null `ttl_hours` -- the default -- never expires. An overall TTL is
+        opt-in precisely because the failure it causes (a training run killed
+        at hour 24) is worse than the one it prevents.
         """
         if config.ttl_hours is None or not config.created_at:
-            return False
+            return None
         try:
             created = datetime.fromisoformat(config.created_at)
         except ValueError:
-            return False
+            return None
         if created.tzinfo is None:
             created = created.replace(tzinfo=UTC)
-        age_h = (self.deps.utcnow() - created).total_seconds() / 3600.0
-        return age_h >= config.ttl_hours
+        age_s = (self.deps.utcnow() - created).total_seconds()
+        return config.ttl_hours * 3600.0 - age_s
+
+    def _ttl_is_near(self) -> bool:
+        left = self._ttl_seconds_left(self.config)
+        return self.config.ephemeral and left is not None and left <= AUTO_PREEMPT_TTL_MARGIN_S
 
     def drain_and_terminate(self, why: str) -> bool:
         config = self.config

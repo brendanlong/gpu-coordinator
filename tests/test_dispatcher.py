@@ -1627,12 +1627,14 @@ def test_two_waiting_jobs_are_given_a_card_each(gpuc_home: Path) -> None:
 
 
 def test_a_cancelled_job_in_the_queue_is_not_worth_preempting_for(gpuc_home: Path) -> None:
+    """The marker alone, as `gpuc cancel` writes it before it takes the queue
+    marker off: for that instant the job is both queued and not coming back."""
     cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     doomed = queue.enqueue(make_spec(gpus=2, priority=10))
-    queue.cancel(doomed)
-    dispatcher.run_once()
+    paths.cancel_file(doomed).touch()
+    dispatcher.preempt_for_waiting()
     assert not queue.is_preempted(cheap)
 
 
@@ -1660,5 +1662,122 @@ def test_a_pod_past_its_ttl_preempts_nothing(
     dispatcher.run_once()
     queue.enqueue(make_spec(gpus=2, priority=10))
     configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+def test_the_cards_freed_for_a_waiting_job_are_not_handed_back_to_the_stopped_ones(
+    gpuc_home: Path,
+) -> None:
+    """The livelock this reserves cards to prevent. Two jobs give a card each
+    up for one that needs both; their runners stop a pass apart, so without a
+    reservation `launch_ready` -- which walks past a job that does not fit --
+    hands the first card straight back to the job that just gave it up, and the
+    next pass stops it again, for ever, with the waiting job still queued."""
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=70, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    waiting = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(first) and queue.is_preempted(second)
+
+    spawned[first].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    # Queued again, and *not* running on the card it just gave up: that card is
+    # being held for the job it was freed for.
+    assert jobs.read_state(first).status == "queued"
+    assert jobs.read_state(waiting).status == "queued"
+
+    spawned[second].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(waiting).status == "running"
+    assert jobs.read_state(waiting).gpus == FAKE_GPUS
+    for job_id in (first, second):
+        assert jobs.read_state(job_id).attempt == 2  # stopped once, not once a pass
+    assert not dispatcher._reserved  # released when the job it was held for launched
+
+
+def test_a_manual_preempt_in_flight_does_not_donate_its_cards_twice(gpuc_home: Path) -> None:
+    """`gpuc preempt` puts a job back in the *queue*, so its card is not simply
+    coming free: the job is about to compete for it at its own priority, and it
+    stops a pass before the auto-preempted one does. Counting that card towards
+    the waiting job's gap and then letting its old holder take it back is how
+    an attempt gets spent on a job that still cannot start."""
+    manual = queue.enqueue(make_spec(gpus=1, priority=20))
+    cheap = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    waiting = queue.enqueue(make_spec(gpus=2, priority=5))
+    queue.preempt(manual)  # somebody wanted that one card back for the big job
+
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)  # the other card, so the big job can start
+    spawned[manual].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(manual).status == "queued"  # and not running again
+
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(waiting).status == "running"
+
+
+def test_one_stop_that_fails_does_not_take_the_rest_of_the_set_with_it(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`enough_to_start` picks a set that covers the whole gap; once one of them
+    cannot be stopped the gap is not covered any more, and stopping the others
+    would spend their attempts on a job that still cannot start."""
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=70, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+
+    real = queue.preempt
+
+    def refuse_the_first(job_id: str, priority: int | None = None) -> str:
+        if job_id == first:  # the least important, so the one tried first
+            raise OSError("read-only file system")
+        return real(job_id, priority)
+
+    monkeypatch.setattr(host_dispatcher.queue, "preempt", refuse_the_first)
+    dispatcher.run_once()
+    assert not queue.is_preempted(first)
+    assert not queue.is_preempted(second)
+    assert "was not stopped" in paths.dispatcher_log().read_text()
+
+
+def test_a_reservation_is_dropped_when_the_job_it_was_for_is_gone(gpuc_home: Path) -> None:
+    """Otherwise a card is held idle for the life of the dispatcher, for a job
+    nobody is waiting on any more."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    waiting = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
+
+    queue.cancel(waiting)
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert not dispatcher._reserved
+    # ...and the cards go back to the job that gave them up.
+    assert jobs.read_state(cheap).status == "running"
+    assert jobs.read_state(cheap).attempt == 2
+
+
+def test_nothing_is_stopped_in_the_last_minutes_of_a_pods_ttl(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job stopped here may never come back: the final sync takes as long as
+    it takes, and by then the host refuses to queue anything at all."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.96)  # ~2.5 min left
     dispatcher.run_once()
     assert not queue.is_preempted(cheap)

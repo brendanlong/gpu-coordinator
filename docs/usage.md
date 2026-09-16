@@ -214,13 +214,24 @@ The host only does it when it is worth it, and the rules are the command's:
   would cost an attempt and start nothing, so a job is stopped only when what
   is stopped covers the whole gap. Several are stopped together where one is
   not enough, least important first, and among equals the one that has been
-  running the shortest time.
+  running the shortest time. Least important first is by `priority` alone, so
+  a job may free more cards than the waiting one needs; the surplus goes back
+  to the queue like any other card.
 - **The waiting job has to be strictly more important.** At the *same*
   priority nothing happens: dispatch order is `<priority>-<job id>` and the
   stopped job's id is the older one, so it would win the tie and take its own
   cards straight back. A job queued at a higher number never preempts anything.
-- **The host has to be dispatching.** Paused, draining or past its
-  `--ttl-hours`, nothing is stopped: the cards would go to nobody.
+- **The cards are held for the job they were freed for**, until it is
+  launched. A stopped job is queued again at its own priority and the
+  dispatcher walks past a job that does not fit, so without this the first
+  card to come free would go straight back to the job that just gave it up —
+  which is then stopped again on the next pass, for ever, with the waiting job
+  no closer to starting. (The hold lives in the dispatcher, so a dispatcher
+  that restarts mid-preempt simply works it out again.)
+- **The host has to be dispatching.** Paused, draining, past its
+  `--ttl-hours` or within five minutes of it, nothing is stopped: the cards
+  would go to nobody, and a job stopped that close to the end of a pod's life
+  may never be queued again at all.
 
 There is **no limit on how often** one job gives way, and none on how long it
 then waits. A host with a steady supply of more important work may never run it
@@ -645,7 +656,8 @@ the runner's group. It never signals the runner's group during the launch
 window, when the runner is the only member of it.
 
 `gpuc preempt` (and [`auto_preempt`](#automatic-preemption), which is the same
-thing without the command) uses the same machinery with one extra marker: the runner stops
+thing without the command) uses the same machinery with one extra marker:
+the runner stops
 the job and records `failed: preempted` after its final sync, and the dispatcher
 then writes the job's state back to `queued` as the next attempt and puts a
 queue marker back. So a preempted job is briefly visible as `failed:
