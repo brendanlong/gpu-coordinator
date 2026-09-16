@@ -7,8 +7,14 @@ from typing import cast
 import pytest
 
 from gpuc.control.config import HostEntry
-from gpuc.control.remote import HostSession, RemoteError, host_command, parse_last_json
-from gpuc.control.transport import CommandResult, Transport
+from gpuc.control.remote import (
+    HostSession,
+    RemoteError,
+    host_command,
+    parse_last_json,
+    read_remote_config,
+)
+from gpuc.control.transport import CommandResult, Transport, TransportError
 
 MOTD = """Welcome to Ubuntu 24.04!
  * Support: https://ubuntu.com/pro
@@ -18,11 +24,16 @@ MOTD = """Welcome to Ubuntu 24.04!
 class ScriptedTransport:
     host = "gpubox"
 
-    def __init__(self, stdout: str, returncode: int = 0) -> None:
+    def __init__(self, stdout: str, returncode: int = 0, raises: Exception | None = None) -> None:
         self.stdout = stdout
         self.returncode = returncode
+        self.raises = raises
+        self.commands: list[str] = []
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
+        self.commands.append(command)
+        if self.raises is not None:
+            raise self.raises
         return CommandResult(self.host, ["ssh", command], self.returncode, self.stdout, "")
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
@@ -101,3 +112,34 @@ def test_a_pretty_printed_report_is_not_mistaken_for_its_last_nested_object() ->
 
 def test_the_last_of_two_documents_wins() -> None:
     assert parse_last_json('{"first": 1}\n{"second": 2}\n') == {"second": 2}
+
+
+def test_the_remote_config_is_read_from_the_host_not_the_registry() -> None:
+    document = {"host": "gpubox", "gpus": ["0"], "pkg_commit": "c" * 40}
+    host = ScriptedTransport(MOTD + json.dumps(document))
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="u@h")
+    elsewhere = HostSession(entry, cast("Transport", host), "/mnt/ssd/gpuc", "python3")
+    assert read_remote_config(elsewhere) == document
+    # Read out of *this session's* gpuc home. A host with a persistent root or
+    # a `--gpuc-home` keeps its config there, and reading the default path
+    # would report "no config" and re-ship the package on every submit.
+    assert host.commands == ['cat "/mnt/ssd/gpuc/config.json" 2>/dev/null || true']
+
+
+def test_a_host_with_no_config_is_told_apart_from_one_that_could_not_be_asked() -> None:
+    """`cat` swallows its own failure, so a non-zero exit is the transport's.
+
+    The difference decides whether `submit` re-ships the package (a host with
+    no config was never bootstrapped) or leaves this machine's record alone.
+    """
+    assert read_remote_config(session("")) == {}
+    assert read_remote_config(session("ssh: could not resolve hostname", returncode=255)) is None
+
+
+def test_a_host_that_cannot_be_reached_at_all_is_not_an_exception_to_handle() -> None:
+    """`submit` asks every host this before it enqueues, including the ones
+    that are down. The error belongs to the submit behind it, in full, not to
+    a traceback out of the version check."""
+    down = ScriptedTransport("", raises=TransportError(CommandResult("h", ["ssh"], 124, "", "")))
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="u@h")
+    assert read_remote_config(HostSession(entry, cast("Transport", down), "/h/.gpuc", "py")) is None

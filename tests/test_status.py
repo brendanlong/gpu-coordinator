@@ -10,6 +10,7 @@ from gpuc.control.status import (
     JobView,
     gather,
     host_json,
+    host_warnings,
     job_views,
     owned_gpus,
     render,
@@ -724,3 +725,38 @@ def test_job_links_need_a_whole_wandb_run_and_no_mirror_for_a_queued_job() -> No
         payload(jobs=[{"job_id": "j-queued", "status": "queued", "wandb": {"project": "lego"}}])
     )
     assert job_links(queued[0], "s3://m/p") == []
+
+
+class _ScriptedSession:
+    """A host that answers `status` with one payload and nothing else."""
+
+    def __init__(self, document: dict[str, Any]) -> None:
+        self.document = document
+
+    def host_json(self, args: str, timeout: float = 60.0) -> Any:
+        assert args == "status"
+        return self.document
+
+
+def test_gather_takes_the_build_and_the_config_from_the_hosts_own_answer() -> None:
+    """Everything `gpuc status` says about what a host is is the host's, so a
+    box configured from somebody else's laptop reads as what it now is."""
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
+    session = _ScriptedSession(payload(pkg_commit="c" * 40, gpus=["0", "1"]))
+    got = gather(entry, session=cast(Any, session))
+    assert got.pkg_commit == "c" * 40
+    assert got.configured == {"host": "gpubox", "gpus": ["0", "1"]}
+    assert host_json(got)["pkg_commit"] == "c" * 40
+
+
+def test_a_reachable_host_that_never_reported_a_commit_is_not_read_as_current() -> None:
+    """The `pkg_commit` key is newer than some hosts: one still running the
+    build before it answers `status` without it, and that is the oldest code
+    there is, not a reason to say nothing."""
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
+    document = payload()
+    assert "pkg_commit" not in document, "this is what a host on the older build answers"
+    got = gather(entry, session=cast(Any, _ScriptedSession(document)))
+    assert got.reachable and got.pkg_commit is None
+    assert host_json(got)["pkg_commit"] is None
+    assert any("too old to say which" in warning for warning in host_warnings(got))

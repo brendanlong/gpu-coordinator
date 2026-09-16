@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import quote
 
 from gpuc.control import version
-from gpuc.control.config import HostEntry, Settings
+from gpuc.control.config import HostEntry, Settings, config_drift
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.providers.base import Pod, Provider, ProviderError
@@ -276,6 +276,14 @@ class HostView:
     unavailable: list[str] = field(default_factory=list)
     """Owned entries the host could not resolve to a card it can see."""
     pod: Pod | None = None
+    pkg_commit: str | None = None
+    """The commit the *host* says its package came from, not the one this
+    machine's registry remembers shipping. Null when the host was not asked or
+    was bootstrapped by a build too old to record it."""
+    configured: dict[str, Any] = field(default_factory=dict)
+    """The host's own config, as much of it as `status` reports: what it calls
+    itself and the cards it was registered with. Compared against this
+    machine's registration, it is how a host somebody else configured shows up."""
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
@@ -432,6 +440,10 @@ def gather(
         view.error = f"host {entry.name} answered `status` with {type(payload).__name__}, not JSON"
         return view
     view.reachable = True
+    view.pkg_commit = _as_str(payload.get("pkg_commit"))
+    view.configured = {
+        key: payload[key] for key in ("host", "gpus") if isinstance(payload.get(key), (str, list))
+    }
     view.owned, view.indices = owned_gpus(payload, entry)
     view.unavailable = [g for g in payload.get("gpus_unavailable") or [] if isinstance(g, str)]
     # Validated like `reconcile.probe_liveness` does: a host on another build
@@ -649,9 +661,7 @@ def render(
     if flags:
         header += "  " + " ".join(flags)
     lines = [header]
-    stale = stale_warning(entry)
-    if stale:
-        lines.append(f"  WARNING {stale}")
+    lines += [f"  WARNING {warning}" for warning in host_warnings(view)]
     lines.append(f"  {dispatcher}")
     if not suspects_only:
         lines += _gpu_lines(view)
@@ -730,15 +740,35 @@ def render(
     return "\n".join(lines)
 
 
-def stale_warning(entry: HostEntry) -> str | None:
-    """One line when this host's package is not the build running here.
+def host_warnings(view: HostView) -> list[str]:
+    """What the host says about itself that this machine's registry does not.
 
-    Two sessions of the same user on different commits, writing one shared
-    registry and one on-host config, is what turned a field becoming optional
-    into an hour of broken CLI. The cheap half of noticing is free: bootstrap
-    already recorded the commit it shipped.
+    Both lines here are the same failure seen twice: the host is not running
+    what this machine thinks it put there. Two sessions of one user on
+    different commits was the original case, and a second control machine --
+    the same boxes registered from a laptop -- is the one the registry cannot
+    see at all, because each machine only ever recorded its own bootstrap. A
+    `gpuc host set` that has not been bootstrapped yet reads the same from
+    here, which is why neither line claims to know who wrote what is there.
+
+    A host that was not reached says nothing: "we could not ask" is not
+    evidence of a mismatch, and the unreachable block already says so.
     """
-    return version.stale_host_warning(entry.name, entry.pkg_commit, version.local_commit())
+    if not view.reachable:
+        return []
+    entry = view.entry
+    out: list[str] = []
+    stale = version.host_build_warning(entry.name, view.pkg_commit, version.local_commit())
+    if stale:
+        out.append(stale)
+    drift = config_drift(view.configured, entry.host_config())
+    if drift:
+        out.append(
+            f"host {entry.name} is running a config this machine has not shipped it "
+            f"(host -> registered here): {'; '.join(drift)}. "
+            f"`gpuc host bootstrap {entry.name}` applies this machine's registration"
+        )
+    return out
 
 
 def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
@@ -869,9 +899,7 @@ def host_json(
     sampler. They are two different measurements and are named as such."""
     entry = view.entry
     errors = [view.error] if view.error else []
-    stale = stale_warning(entry)
-    if stale:
-        errors.append(stale)
+    errors += host_warnings(view)
     finished = [job for job in view.finished if within(job, since_s)][:recent]
     return {
         "name": entry.name,
@@ -881,7 +909,9 @@ def host_json(
         "pod_gone": view.pod_gone,
         "draining": view.draining,
         "paused": view.paused,
-        "pkg_commit": entry.pkg_commit,
+        # The host's own answer, so null means the host did not say, never
+        # "current".
+        "pkg_commit": view.pkg_commit,
         "dispatcher": {
             "alive": view.dispatcher_alive,
             "heartbeat_age_s": view.heartbeat_age_s,

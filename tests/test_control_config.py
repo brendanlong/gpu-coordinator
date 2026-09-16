@@ -6,9 +6,11 @@ import pytest
 
 from gpuc.control import config
 from gpuc.control.config import (
+    JOB_CONFIG_KEYS,
     ConfigError,
     HostEntry,
     Registry,
+    config_drift,
     load_registry,
     load_settings,
     registry_transaction,
@@ -79,3 +81,89 @@ def test_host_config_for_the_host_side(control_env: Path) -> None:
 def test_remote_home_defaults_to_dot_gpuc(control_env: Path) -> None:
     assert HostEntry(name="local").remote_home == "$HOME/.gpuc"
     assert HostEntry(name="local", gpuc_home="/tmp/x").remote_home == "/tmp/x"
+
+
+def test_config_drift_compares_only_what_the_host_reported() -> None:
+    """The whole config.json off a host, or the subset `status` answers with."""
+    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"])
+    assert config_drift({"host": "gpubox", "gpus": ["2", "3"]}, entry.host_config()) == []
+    assert config_drift({"gpus": ["0", "1"]}, entry.host_config()) == ["gpus 0,1 -> 2,3"]
+    # A key the host did not report is not a difference.
+    assert config_drift({}, entry.host_config()) == []
+    assert config_drift(None, entry.host_config()) == []
+
+
+def test_config_drift_ignores_the_commit_and_names_env_without_its_values() -> None:
+    """`--env` is where somebody hand-sets an HF_TOKEN, and this text is printed."""
+    entry = HostEntry(name="gpubox", env={"HF_TOKEN": "ours", "HF_HOME": "/big"})
+    existing = {
+        "pkg_commit": "c" * 40,
+        "created_at": "2020-01-01T00:00:00+00:00",
+        "schema_version": 999,
+        "env": {"HF_TOKEN": "theirs", "HF_HOME": "/big"},
+    }
+    assert config_drift(existing, entry.host_config()) == ["env differs in HF_TOKEN"]
+
+
+def test_config_drift_reports_the_settings_that_change_what_a_host_does() -> None:
+    entry = HostEntry(name="gpubox", s3_prefix="s3://mine/gpuc/gpubox", retention_days=7.0)
+    drift = config_drift(
+        {"host": "laptop-box", "s3_prefix": None, "retention_days": 30.0, "ttl_hours": None},
+        entry.host_config(),
+    )
+    assert drift == [
+        "host laptop-box -> gpubox",
+        "s3_prefix none -> s3://mine/gpuc/gpubox",
+        "retention_days 30.0 -> 7.0",
+    ]
+
+
+def test_config_drift_never_prints_an_env_value_whatever_the_host_has_there() -> None:
+    """A config.json from another build may have anything at all under `env`,
+    including a null, and the fallback formatting used to print our side of the
+    comparison -- which is the side holding the token."""
+    entry = HostEntry(name="gpubox", env={"HF_TOKEN": "hf_secret"})
+    for existing in (
+        {"env": None},
+        {"env": "HF_TOKEN=hf_theirs"},
+        {"env": []},
+        {"env": {"HF_TOKEN": "hf_theirs"}},
+    ):
+        assert config_drift(existing, entry.host_config()) == ["env differs in HF_TOKEN"]
+    # An env nobody set, however it is spelled, is not a difference.
+    plain = HostEntry(name="gpubox")
+    assert config_drift({"env": None}, plain.host_config()) == []
+
+
+def test_config_drift_can_be_narrowed_to_the_keys_a_job_is_affected_by() -> None:
+    """`gpuc host set` changes the registry and says the host is unchanged until
+    the next bootstrap, so a submit repeating the host's own lifecycle settings
+    back at the user would be noise it cannot even clear."""
+    entry = HostEntry(name="gpubox", gpus=["2"], idle_minutes=30.0, retention_days=7.0)
+    existing = {"gpus": ["0"], "idle_minutes": 15.0, "retention_days": None}
+    assert config_drift(existing, entry.host_config(), JOB_CONFIG_KEYS) == ["gpus 0 -> 2"]
+    assert len(config_drift(existing, entry.host_config())) == 3
+
+
+def test_config_drift_is_quiet_about_a_runpod_host_bootstrap_just_wrote() -> None:
+    entry = HostEntry(name="gpuc-1", kind="runpod", pod_id="pod-1", gpus=["GPU-a"])
+    written = entry.host_config().to_dict()
+    assert config_drift(written, entry.host_config()) == []
+    # A pod that was replaced under the same name reads back as a difference,
+    # spelled so it can sit in the middle of a sentence.
+    assert config_drift(written, entry.model_copy(update={"pod_id": "pod-2"}).host_config()) == [
+        "provider kind=runpod pod_id=pod-1 -> kind=runpod pod_id=pod-2"
+    ]
+
+
+def test_the_uv_cache_bootstrap_chose_is_not_drift_for_the_machine_that_did_not() -> None:
+    """`cache_dir` is decided from the *host's* filesystem layout by whichever
+    machine bootstrapped it, and reaches jobs through `env`. Every other
+    machine has none recorded, and would otherwise warn on every submit about
+    something only a re-bootstrap could change -- and should not change."""
+    entry = HostEntry(name="gpubox", env={"HF_HOME": "/big"})
+    theirs = {"env": {"UV_CACHE_DIR": "/mnt/ssd/uv-cache", "HF_HOME": "/big"}}
+    assert config_drift(theirs, entry.host_config()) == []
+    # Anything else the other machine set is still reported.
+    theirs["env"]["HF_HOME"] = "/elsewhere"
+    assert config_drift(theirs, entry.host_config()) == ["env differs in HF_HOME"]

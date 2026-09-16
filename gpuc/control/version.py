@@ -116,10 +116,41 @@ def needs_package_sync(local: str | None, host: str | None) -> bool:
     return not host or not same_commit(local, host)
 
 
-def stale_host_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
-    if same_commit(local, host_commit):
+def host_build_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
+    """`host_commit` is the host's own answer, from its `config.json`.
+
+    Judged by exactly the rule `submit` re-ships on, which is stricter than
+    `same_commit` in the case that matters here: a host that *answered* and
+    named no commit is a host on a build old enough not to report one, so
+    saying nothing about it would leave `status` quiet about the very hosts
+    `submit` re-ships on every single run. A host nobody could ask is the
+    caller's to skip -- that one really is "we do not know".
+
+    Not "older": whichever machine bootstrapped the host last is the one it
+    runs, and that can as easily be a laptop on a newer build as this machine
+    on an older one. Both directions are the same problem -- the host is not
+    running the code that wrote the spec -- and the same fix.
+    """
+    if not needs_package_sync(local, host_commit):
+        return None
+    running = f"gpuc {short(host_commit)}" if host_commit else "a build too old to say which"
+    return (
+        f"host {name} is running {running} and this machine has "
+        f"{short(local)}; run gpuc host bootstrap {name}"
+    )
+
+
+def shipped_commit_note(name: str, recorded: str | None, local: str | None) -> str | None:
+    """What an *offline* command can honestly say about a host's build.
+
+    `gpuc host list` and `gpuc version` never touch the host, so all they have
+    is this machine's record of its own last bootstrap. That is not what the
+    host is running if anybody else has bootstrapped it since, so it is
+    reported as what it is and `gpuc status` is where the answer lives.
+    """
+    if same_commit(local, recorded):
         return None
     return (
-        f"host {name} runs an older gpuc ({short(host_commit)}, this machine has "
-        f"{short(local)}); run gpuc host bootstrap {name}"
+        f"host {name} was last given gpuc {short(recorded)} from this machine, which now has "
+        f"{short(local)}; run gpuc host bootstrap {name} (`gpuc status` asks the host itself)"
     )

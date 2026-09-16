@@ -227,3 +227,20 @@ def test_status_reports_a_queued_jobs_estimate_from_its_spec(
     assert isinstance(status, dict)
     estimates = {entry["job_id"]: entry["estimated_runtime_min"] for entry in status["jobs"]}
     assert sorted(estimates.values(), key=lambda v: v is None) == [360.0, None]
+
+
+def test_status_reports_the_commit_the_host_was_bootstrapped_with(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The only honest answer to "what build is this host running". Whichever
+    control machine bootstrapped last wrote it, which is the one thing the
+    registry on any one of those machines cannot know."""
+    jobs.write_config(HostConfig(host="test-host", pkg_commit="c" * 40))
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    assert status["pkg_commit"] == "c" * 40
+
+    jobs.write_config(HostConfig(host="test-host"))
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    assert status["pkg_commit"] is None

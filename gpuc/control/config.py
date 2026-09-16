@@ -16,7 +16,7 @@ import time
 import tomllib
 import types
 import typing
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -351,6 +351,86 @@ class HostEntry(TolerantModel):
             env=self.job_env(),
             pkg_commit=self.pkg_commit,
         )
+
+
+NOT_DRIFT = {"schema_version", "pkg_commit", "created_at"}
+"""Config keys a difference says nothing about: the shape of the file, the
+commit (which moves on every re-ship, and is reported on its own), and when
+whoever registered the host first did so."""
+
+NOT_DRIFT_ENV = {"UV_CACHE_DIR"}
+"""Environment bootstrap decides, not the user: it is set from the host's own
+filesystem layout (`resolve_cache_dir`), so the machine that bootstrapped the
+host is the only one with an opinion worth having about it. Every *other*
+machine has no `cache_dir` recorded and would otherwise report a difference on
+every submit that only a re-bootstrap could clear."""
+
+JOB_CONFIG_KEYS = ("host", "gpus", "s3_prefix", "env")
+"""The config a *job* is affected by: which cards it can be given, the
+environment it inherits, and where its log and outputs are mirrored. The rest
+of a host's config is about the host's own life (`idle_minutes`, `ttl_hours`,
+`retention_days`), which `gpuc host set` changes here and the next bootstrap
+ships -- a submit has nothing to say about that gap."""
+
+
+def _show(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value) or "none"
+    if isinstance(value, dict):
+        # `provider` is the one of these, and `{'kind': 'runpod', 'pod_id':
+        # 'p1'}` in the middle of a sentence reads as punctuation. `env` never
+        # gets here: its values are not printed at all.
+        items: dict[Any, Any] = value
+        return " ".join(f"{k}={items[k]}" for k in sorted(map(str, items))) or "none"
+    return str(value)
+
+
+def config_drift(
+    existing: Any, incoming: HostConfig, keys: Collection[str] | None = None
+) -> list[str]:
+    """How the config a host is running differs from the one we would write it.
+
+    Only the keys `existing` actually has are compared, so this takes a whole
+    `config.json` read off the host or the subset `gpuc status` gets back, and
+    `keys` narrows it further for a caller that only cares about some of them.
+    The difference this is for is a second control machine having registered
+    the same box with other GPUs, another mirror or another name, which the
+    registry here cannot see -- but it cannot tell that apart from a `gpuc host
+    set` on this machine that has not been bootstrapped yet, so callers say
+    "different from what is registered here", never "somebody else wrote it".
+
+    `env` reports the names that differ and never the values -- it is
+    free-form, it is where somebody hand-sets an HF_TOKEN, and this text ends
+    up in transcripts. That holds however odd the host's own `env` is: a
+    `config.json` from another build may have anything at all there, including
+    a `null`, and formatting our side of the comparison would print the token
+    we are trying not to print.
+    """
+    if not isinstance(existing, dict):
+        return []
+    drift: list[str] = []
+    for key, ours in incoming.to_dict().items():
+        if key in NOT_DRIFT or key not in existing or (keys is not None and key not in keys):
+            continue
+        theirs = existing[key]
+        if theirs == ours:
+            continue
+        if key == "env":
+            # A `null` env is the default env, per the tolerant-read rules, so
+            # only named differences are differences.
+            theirs_env = theirs if isinstance(theirs, dict) else {}
+            names = sorted(
+                k
+                for k in (set(theirs_env) | set(ours)) - NOT_DRIFT_ENV
+                if theirs_env.get(k) != ours.get(k)
+            )
+            if names:
+                drift.append(f"env differs in {', '.join(names)}")
+        else:
+            drift.append(f"{key} {_show(theirs)} -> {_show(ours)}")
+    return drift
 
 
 class Registry(TolerantModel):

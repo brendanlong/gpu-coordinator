@@ -16,9 +16,9 @@ from typing import Any
 
 import gpuc
 from gpuc._version import user_agent
-from gpuc.control.config import HostEntry, Settings, transport_for, utc_now
+from gpuc.control.config import HostEntry, Settings, config_drift, transport_for, utc_now
 from gpuc.control.gpuinfo import discover, summarize
-from gpuc.control.remote import HostSession, parse_last_json, resolve_home
+from gpuc.control.remote import HostSession, parse_last_json, read_remote_config, resolve_home
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 from gpuc.control.version import local_commit
 
@@ -343,6 +343,23 @@ def resolve_cache_dir(
     return target
 
 
+def overwrite_warnings(session: HostSession, entry: HostEntry) -> list[str]:
+    """What this bootstrap is about to change about a host somebody configured.
+
+    After `gpuc host set` this is the confirmation of what moved. The case it
+    is here for is the other one: `config.json` written by a *different*
+    control machine, registered with other cards or another mirror, which this
+    machine's registry cannot see and this bootstrap silently replaces.
+    """
+    drift = config_drift(read_remote_config(session), entry.host_config())
+    if not drift:
+        return []
+    return [
+        f"overwriting the config on host {entry.name} (host -> this machine's registration): "
+        f"{'; '.join(drift)}"
+    ]
+
+
 def write_host_config(session: HostSession, entry: HostEntry) -> None:
     session.transport.run(
         f'{env_prefix(entry)}GPUC_HOME="{session.home}" PYTHONPATH="{session.home}/pkg" '
@@ -494,6 +511,9 @@ def bootstrap_host(
         entry = entry.model_copy(update={"pkg_commit": commit})
 
     session = HostSession(entry, transport, home, python)
+    for warning in overwrite_warnings(session, entry):
+        warnings.append(warning)
+        report(f"WARNING: {warning}")
     write_host_config(session, entry)
     report(f"wrote {home}/config.json for host {entry.name} with {len(entry.gpus)} GPU(s)")
 

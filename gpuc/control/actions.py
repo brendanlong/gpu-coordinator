@@ -216,14 +216,26 @@ def status_document(
     return status_mod.document(views, errors=errors, recent=recent, since_s=since_s)
 
 
+def shipped_note(entry: HostEntry) -> str | None:
+    """The offline half of the version story: what this machine last shipped.
+
+    `gpuc host list` and `gpuc version` never ask a host anything, so this is
+    all they have. What the host is *running* is `gpuc status`, which asks it.
+    """
+    return version_mod.shipped_commit_note(entry.name, entry.pkg_commit, version_mod.local_commit())
+
+
 def host_document(entry: HostEntry) -> dict[str, Any]:
     """One registered host as `gpuc host list --json` reports it.
 
     The registry entry itself, plus what the text listing computes from it:
-    where gpuc home resolves to on the host, and the re-bootstrap warning.
+    where gpuc home resolves to on the host, and the re-bootstrap note. Every
+    field here is local: this command never asks the host anything, so
+    `pkg_commit` is what *this* machine last shipped and `gpuc status` is where
+    what the host is running is reported.
     """
     document: dict[str, Any] = json.loads(entry.model_dump_json())
-    stale = status_mod.stale_warning(entry)
+    stale = shipped_note(entry)
     return {
         **document,
         # `--env` is free-form and is where somebody hand-sets an HF_TOKEN, so
@@ -257,12 +269,14 @@ def config_document(settings: Settings) -> dict[str, Any]:
 
 
 def version_document(read: RegistryRead) -> dict[str, Any]:
-    """`gpuc version --json`: this build, and each bootstrapped host's package.
+    """`gpuc version --json`: this build, and what each host was last given.
 
-    `hosts[].current` is the same judgement the text output prints as `OLDER:
-    re-bootstrap`: a commit that does not match this build's. Nothing recorded
-    on either side is not evidence of a mismatch, so it reads as current --
-    `submit` re-ships the package to such a host anyway.
+    `hosts[].pkg_commit` is this machine's record of its own last bootstrap,
+    and `current` compares it with this build -- the same judgement the text
+    output prints as `DIFFERS: re-bootstrap`. Neither asks the host: the commit
+    a host is actually running is `gpuc status --json`'s `pkg_commit`. Nothing
+    recorded on either side is not evidence of a mismatch, so it reads as
+    current -- `submit` checks the host itself before it enqueues anyway.
     """
     commit = version_mod.local_commit()
     hosts = [entry for entry in read.registry.hosts.values() if entry.bootstrapped_at]

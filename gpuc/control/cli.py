@@ -11,6 +11,7 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from gpuc.control import jsonout
 from gpuc.control import pods as pods_mod
@@ -43,6 +44,7 @@ from gpuc.control.actions import (
     provider_for_status,
     read_log,
     reorder_job,
+    shipped_note,
     status_document,
     version_document,
 )
@@ -50,10 +52,12 @@ from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_packag
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
+    JOB_CONFIG_KEYS,
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
     Settings,
+    config_drift,
     config_file,
     hosts_file,
     load_settings,
@@ -69,7 +73,7 @@ from gpuc.control.gpuinfo import summarize
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import Cloud, Constraints
 from gpuc.control.provision import runpod_host
-from gpuc.control.remote import RemoteError, open_session
+from gpuc.control.remote import HostSession, RemoteError, open_session, read_remote_config
 from gpuc.control.s3index import (
     IndexEntry,
     LocalIndex,
@@ -318,9 +322,9 @@ def cmd_host_list(args: argparse.Namespace) -> int:
             f"host {entry.name} [{entry.kind}] {entry.ssh or 'this machine'}  "
             f"gpus {len(entry.gpus)} ({summary}{driver})"
         )
-        stale = status_mod.stale_warning(entry)
+        stale = shipped_note(entry)
         if stale:
-            print(f"  WARNING {stale}")
+            print(f"  NOTE {stale}")
         for index, name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
             print(f"  gpu     [{index}] {name:<28} {vram:<7} {uuid}")
         bootstrapped = (
@@ -328,7 +332,7 @@ def cmd_host_list(args: argparse.Namespace) -> int:
             if entry.bootstrapped_at
             else "never bootstrapped"
         )
-        print(f"  pkg     {version_mod.short(entry.pkg_commit)} {bootstrapped}")
+        print(f"  pkg     {version_mod.short(entry.pkg_commit)} shipped from here, {bootstrapped}")
         if entry.root:
             print(f"  root    {entry.root} (gpuc home {entry.remote_home})")
     return 0
@@ -600,28 +604,83 @@ def reporter(args: argparse.Namespace) -> Reporter:
 def ensure_package_current(
     entry: HostEntry, settings: Settings, *, bootstrap: bool = True, report: Reporter = print
 ) -> HostEntry:
-    """Re-ship the package when the host is not running this build.
+    """Re-ship the package when the *host* is not running this build.
 
-    A host on an older commit dispatches the job with code that does not match
+    A host on another commit dispatches the job with code that does not match
     the spec this machine just wrote, and that mismatch is invisible until a
-    job fails strangely. An *unrecorded* commit counts as older, because the
-    hosts with nothing recorded were bootstrapped by the oldest builds of all.
+    job fails strangely. So the commit is read off the host's own config.json
+    rather than taken from this registry, which only ever recorded what this
+    machine shipped: two control machines against one box -- a laptop and a
+    desktop -- each leave that record describing a host the other has since
+    re-bootstrapped, and every submit would then skip the check it exists for.
+    An *unrecorded* commit counts as older, because the hosts with nothing
+    recorded were bootstrapped by the oldest builds of all.
+
     Only the package and the dispatcher: uv, the interpreter and health cannot
     have gone stale, and the job is waiting.
     """
     if not bootstrap or not entry.python:
         return entry
     local = version_mod.local_commit()
-    if not version_mod.needs_package_sync(local, entry.pkg_commit):
+    session = _try_session(entry, settings)
+    config = read_remote_config(session) if session else None
+    # A host that could not be asked falls back to this machine's record; the
+    # submit right behind this produces the transport error in full.
+    host_commit = _config_commit(config) if config is not None else entry.pkg_commit
+    entry = _record_commit(entry, host_commit)
+    # Only what would change *this job*: which cards it can have, the
+    # environment it inherits, where its outputs are mirrored. A host's own
+    # `idle_minutes` or `retention_days` can sit un-shipped after a `gpuc host
+    # set` for as long as the user likes, and a submit repeating that on every
+    # run would be noise it cannot even clear.
+    drift = config_drift(config, entry.host_config(), JOB_CONFIG_KEYS)
+    if drift:
+        report(
+            f"WARNING host {entry.name} is running a config this machine has not shipped it "
+            f"(host -> registered here): {'; '.join(drift)}. "
+            f"`gpuc host bootstrap {entry.name}` applies this machine's registration"
+        )
+    if not version_mod.needs_package_sync(local, host_commit):
         return entry
     report(
-        f"host {entry.name} has gpuc {version_mod.short(entry.pkg_commit)} and this machine "
+        f"host {entry.name} is running gpuc {version_mod.short(host_commit)} and this machine "
         f"has {version_mod.short(local)}: re-syncing the package and restarting the "
         f"dispatcher before enqueueing"
     )
-    updated = resync_package(entry, settings, report=_quiet)
+    transport = session.transport if session else None
+    updated = resync_package(entry, settings, transport=transport, report=_quiet)
     with registry_transaction() as registry:
         registry.put(updated)
+    return updated
+
+
+def _try_session(entry: HostEntry, settings: Settings) -> HostSession | None:
+    try:
+        return open_session(entry, settings)
+    except (ConfigError, RemoteError, TransportError):
+        return None
+
+
+def _config_commit(config: dict[str, Any]) -> str | None:
+    commit = config.get("pkg_commit")
+    return commit if isinstance(commit, str) else None
+
+
+def _record_commit(entry: HostEntry, commit: str | None) -> HostEntry:
+    """Keep the registry's note of this host's build honest.
+
+    `gpuc host list` and `gpuc version` never ask the host, so this is the only
+    thing that keeps them from repeating a bootstrap somebody else replaced.
+    One field, re-read under the lock: this now runs on every submit, and
+    writing back the whole entry we read at startup would undo whatever a
+    concurrent `gpuc host probe` learned about the same host.
+    """
+    if commit == entry.pkg_commit:
+        return entry
+    updated = entry.model_copy(update={"pkg_commit": commit})
+    with registry_transaction() as registry:
+        current = registry.hosts.get(entry.name)
+        registry.put(current.model_copy(update={"pkg_commit": commit}) if current else updated)
     return updated
 
 
@@ -1031,10 +1090,12 @@ def cmd_pods(args: argparse.Namespace) -> int:
 
 
 def cmd_version(args: argparse.Namespace) -> int:
-    """What is installed here, and what each host was last given.
+    """What is installed here, and what each host was last given *from here*.
 
     The host commits are read from the registry, which bootstrap wrote -- no
-    ssh, so this stays a command you can run before anything else.
+    ssh, so this stays a command you can run before anything else. That also
+    means it cannot see a host somebody else has bootstrapped since:
+    `gpuc status` asks each host what it is running.
     """
     read = read_registry()
     for error in read.errors:
@@ -1052,9 +1113,10 @@ def cmd_version(args: argparse.Namespace) -> int:
     if not hosts:
         print("hosts: none bootstrapped")
         return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
-    print("hosts:")
+    print("hosts (last shipped from this machine; gpuc status asks the hosts themselves):")
     for entry in hosts:
-        note = "" if version_mod.same_commit(commit, entry.pkg_commit) else "  OLDER: re-bootstrap"
+        current = version_mod.same_commit(commit, entry.pkg_commit)
+        note = "" if current else "  DIFFERS: re-bootstrap"
         print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{note}")
     if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
         print(
