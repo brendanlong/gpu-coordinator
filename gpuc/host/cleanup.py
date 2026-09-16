@@ -287,11 +287,10 @@ def workdir_size(job_id: str) -> int | None:
 def record_workdir_size(job_id: str) -> int:
     """Measure a finished job's workdir once and write the figure to its state.
 
-    The walk is exact and therefore not cheap, so it happens here -- at the
-    couple of moments something already knows this job is over -- rather than
-    on every `status`. A failure to record is not worth failing anything over:
-    the figure is a disk report, and a null one only means `status` says it
-    does not know yet.
+    The walk is exact and therefore not cheap, so the figure is written down
+    where the next reader finds it instead of being walked again. A failure to
+    record is not worth failing anything over: the figure is a disk report, and
+    the caller still gets the number it asked for.
 
     The workdir is re-checked *after* the walk because the walk takes seconds
     and `gpuc clean` is a different process. Without this, a clean landing in
@@ -306,6 +305,30 @@ def record_workdir_size(job_id: str) -> int:
     with contextlib.suppress(RuntimeError, OSError, KeyError):
         jobs.update_state(job_id, workdir_bytes=recorded)
     return recorded
+
+
+def reported_workdir_bytes(job_id: str, state: jobs.JobState) -> int:
+    """What deleting a finished job's workdir would free. Always a number.
+
+    A job with no workdir left frees nothing, and answering that costs one
+    `is_dir()`: it is the common case -- most jobs carry a `cleanup:` policy
+    that takes the workdir the moment they end -- and it needs no recorded
+    figure, which is what kept jobs that ended before the figure existed
+    reading as "not sized yet" forever.
+
+    A workdir still on disk is the only case worth walking, and only the first
+    caller walks it: the runner normally recorded the figure as the job ended,
+    and if it did not (its own death, or a job older than the field) the walk
+    happens here and is written to `state.json` for the next reader. Nothing
+    else needs to schedule it -- a host with no dispatcher running still gives
+    a straight answer.
+
+    A recorded zero against a workdir that is still there cannot be right, so
+    it is re-measured rather than believed.
+    """
+    if not paths.workdir(job_id).is_dir():
+        return 0
+    return state.workdir_bytes or record_workdir_size(job_id)
 
 
 def remove_workdir(job_id: str, *, measured: int | None = None) -> int:

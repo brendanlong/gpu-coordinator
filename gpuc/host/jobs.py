@@ -394,8 +394,11 @@ class JobState:
     holding sixty of them made every `status` call walk half a million. So it
     is measured where the runner is already standing in the tree, and `status`
     reads the number. Null means nobody has measured it yet (a job that ended
-    before this was recorded, or a runner that died before writing it); the
-    dispatcher backfills those. Zero means the workdir is gone.
+    before this was recorded, or a runner that died before writing it), which
+    matters only while the workdir is still there: the first `status` after
+    that walks it and writes the figure here. See
+    `cleanup.reported_workdir_bytes`, which is what decides what `status`
+    reports and never needs this to be populated to answer.
 
     Not the number `du` gives: see `cleanup.reclaimable_bytes`. `gpuc clean`
     measures afresh rather than trusting this, because it is about to delete

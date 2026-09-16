@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import signal
 import subprocess
 from collections.abc import Callable
@@ -11,8 +10,8 @@ from typing import Any, cast
 
 import pytest
 
-from gpuc.host import cleanup, jobs, paths, queue, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
+from gpuc.host import jobs, paths, queue, sync, terminate
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig
@@ -710,67 +709,6 @@ def test_the_workdir_horizon_leaves_a_job_that_asked_to_keep_its_workdir(
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     assert paths.workdir(job_id).is_dir()
-
-
-def test_a_finished_workdir_nobody_measured_gets_measured(gpuc_home: Path) -> None:
-    """A job that ended before the field existed, or whose runner died first."""
-    configure_retention(None, None)
-    job_id = finished_job(days_old=0.1)
-    assert jobs.read_state(job_id).workdir_bytes is None
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    recorded = jobs.read_state(job_id).workdir_bytes
-    assert recorded is not None and recorded > 0
-
-
-def test_measuring_does_not_happen_again_once_it_is_recorded(gpuc_home: Path) -> None:
-    configure_retention(None, None)
-    job_id = finished_job(days_old=0.1)
-    jobs.update_state(job_id, workdir_bytes=4096)
-    dispatcher, _ = make_dispatcher()
-
-    def refuse(root: Path) -> int:
-        raise AssertionError("re-measured a workdir that already had a figure")
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(cleanup, "reclaimable_bytes", refuse)
-        dispatcher.run_once()
-    assert jobs.read_state(job_id).workdir_bytes == 4096
-
-
-def test_measuring_takes_one_workdir_per_pass(gpuc_home: Path) -> None:
-    """Sixty unmeasured venvs must not hold run_once for a minute and a half:
-    nothing launches a queued job on a free GPU while it does."""
-    configure_retention(None, None)
-    ids = [finished_job(days_old=0.1) for _ in range(3)]
-    dispatcher, _ = make_dispatcher()
-    for expected in (1, 2, 3):
-        dispatcher.run_once()
-        measured = sum(1 for j in ids if jobs.read_state(j).workdir_bytes is not None)
-        assert measured == expected
-
-
-def test_a_figure_that_outlived_its_workdir_is_put_right(gpuc_home: Path) -> None:
-    """`clean` cannot heal this itself: a job with no workdir is not a
-    candidate, so the stale figure would be advertised forever."""
-    configure_retention(None, None)
-    job_id = finished_job(days_old=0.1)
-    jobs.update_state(job_id, workdir_bytes=12_000_000_000)
-    shutil.rmtree(paths.workdir(job_id))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    dispatcher.run_once()
-    assert jobs.read_state(job_id).workdir_bytes == 0
-
-
-def test_a_running_job_is_never_measured(gpuc_home: Path) -> None:
-    """Its workdir is still being written to, so any figure would be a lie."""
-    configure_retention(None, None)
-    job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert jobs.read_state(job_id).status == "running"
-    assert jobs.read_state(job_id).workdir_bytes is None
 
 
 def test_the_workdir_horizon_runs_at_most_once_an_hour(gpuc_home: Path) -> None:

@@ -313,8 +313,9 @@ queue's lexical order, not submission order below one second.
    not change; `status` reads it rather than walking every finished venv on
    every call, which cost that command four seconds on a host holding sixty.
    A job that ended before the field existed, or whose runner died before
-   writing it, has `null` there and is measured by the dispatcher's next
-   housekeeping pass. `gpuc clean` measures afresh instead of trusting it,
+   writing it, has `null` there; the first `status` that finds a workdir still
+   on disk with no figure walks it and writes one. `gpuc clean` measures
+   afresh instead of trusting it,
    because it is about to delete what it is quoting. Then upload state and log.
    A removal that fails is logged and nothing more: the job's outcome is
    already decided, and leftover disk is not worth turning a green run red. That last upload records
@@ -557,7 +558,11 @@ anything. See usage.md.
 
 The host's `status` reports `workdir_bytes` per *finished* job (a live job's
 workdir is still being written to, and walking it on every status call would be
-pure cost). `gpuc status` prints one line per host once those exceed 1 GiB.
+pure cost). A finished job always gets a number: zero when its workdir is gone,
+which is one `is_dir()` and needs nothing recorded, and otherwise the recorded
+figure or a walk on the spot. Nothing schedules that, so a host with no
+dispatcher running -- the normal state of an idle one -- answers as well as a
+busy one. `gpuc status` prints one line per host once the total exceeds 1 GiB.
 
 Every byte figure a `clean`, `purge` or `status` reports is
 `cleanup.reclaimable_bytes`: what deleting the tree gives the filesystem back,
@@ -572,7 +577,8 @@ Reflinks share extents without sharing an inode, so they need `FIEMAP` and its
 `FIEMAP_EXTENT_SHARED` flag -- one ioctl per file, which triples the walk. That
 is affordable because the walk happens **once per job**, not once per `status`:
 the answer goes in `JobState.workdir_bytes` (see the runner's step 7) and
-readers read it. Nothing cheaper is exact -- `LOGICAL_INO` costs more per
+readers read it -- and the job that no longer has a workdir, which is most of
+them, is answered without walking anything. Nothing cheaper is exact -- `LOGICAL_INO` costs more per
 extent, a filesystem scan is O(extents on the device), and only btrfs qgroups
 answer in O(1), per subvolume, with quotas on -- so the trade is to pay it once
 and write the number down. Every way it can fail (no FIEMAP, no permission, an

@@ -333,20 +333,13 @@ class HostView:
 
     @property
     def leftover_bytes(self) -> int:
-        """Disk held by workdirs of jobs that are over: reclaimable by `gpuc clean`."""
-        return sum(job.workdir_bytes or 0 for job in self.finished)
+        """Disk held by workdirs of jobs that are over: reclaimable by `gpuc clean`.
 
-    @property
-    def unmeasured_workdirs(self) -> int:
-        """Finished jobs whose workdir the host has not sized yet.
-
-        Null is not zero: a host only measures inside a live dispatcher, and a
-        non-ephemeral one lives only while there is work. Folding these into
-        `leftover_bytes` would make an idle host with sixty finished venvs
-        report that it is holding nothing at all -- which is the host the disk
-        line exists for.
+        The host answers for every finished job, so a null here is either a
+        running job or a host too old to answer -- and a build that far behind
+        is what `host_warnings` is for.
         """
-        return sum(1 for job in self.finished if job.workdir_bytes is None)
+        return sum(job.workdir_bytes or 0 for job in self.finished)
 
     @property
     def past_ttl(self) -> bool:
@@ -929,14 +922,11 @@ def render(
             f"before they are purged"
         )
     leftover = view.leftover_bytes
-    unmeasured = view.unmeasured_workdirs
-    if leftover > LEFTOVER_FLOOR_BYTES or unmeasured:
+    if leftover > LEFTOVER_FLOOR_BYTES:
         held = [job for job in view.finished if (job.workdir_bytes or 0) > 0]
-        pending = f", {unmeasured} not sized yet" if unmeasured else ""
         lines.append(
             f"  disk    {human_bytes(leftover)} still in {len(held)} finished job "
-            f"workdir(s){pending}; "
-            f"free it with: gpuc clean --host {entry.name} --all-finished"
+            f"workdir(s); free it with: gpuc clean --host {entry.name} --all-finished"
         )
     if len(lines) == body_start:
         lines.append("  idle; nothing queued, running or finished")

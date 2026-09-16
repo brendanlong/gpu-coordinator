@@ -469,26 +469,74 @@ def test_host_cli_status_reports_the_recorded_workdir_bytes(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     done = finished_job("succeeded")
-    running = finished_job("running")
     jobs.update_state(done, workdir_bytes=4096)
-    sizes = sizes_from_status(capsys)
-    assert sizes[done] == 4096
-    # A live job's workdir is still being written to; its size means nothing.
-    assert sizes[running] is None
+    assert sizes_from_status(capsys)[done] == 4096
 
 
-def test_host_cli_status_never_measures_a_workdir_itself(
+def test_host_cli_status_does_not_re_measure_what_it_already_knows(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Walking every finished venv per call cost 4 s on a host holding sixty."""
     done = finished_job("succeeded")
+    jobs.update_state(done, workdir_bytes=4096)
 
     def refuse(root: Path) -> int:
-        raise AssertionError("status walked a workdir")
+        raise AssertionError("status walked a workdir it had a figure for")
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(cleanup, "reclaimable_bytes", refuse)
-        assert sizes_from_status(capsys)[done] is None, "not measured yet means null"
+        assert sizes_from_status(capsys)[done] == 4096
+
+
+def test_host_cli_status_sizes_a_gone_workdir_without_measuring_anything(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No workdir frees nothing, and nobody has to have written that down: it
+    is what left every pre-upgrade job reading as `not sized yet` forever."""
+    done = finished_job("succeeded")
+    cleanup.remove_workdir(done)
+    jobs.update_state(done, workdir_bytes=None)
+
+    def refuse(root: Path) -> int:
+        raise AssertionError("status walked a workdir that is gone")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "reclaimable_bytes", refuse)
+        assert sizes_from_status(capsys)[done] == 0
+
+
+def test_host_cli_status_measures_the_workdir_nobody_measured(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A runner that died before writing the figure, or a job older than it."""
+    done = finished_job("succeeded")
+    assert jobs.read_state(done).workdir_bytes is None
+    measured = sizes_from_status(capsys)[done]
+    assert measured is not None and measured > 0
+    assert jobs.read_state(done).workdir_bytes == measured, "the next call must not walk again"
+
+
+def test_host_cli_status_does_not_believe_a_zero_over_a_live_workdir(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    done = finished_job("succeeded")
+    jobs.update_state(done, workdir_bytes=0)
+    measured = sizes_from_status(capsys)[done]
+    assert measured is not None and measured > 0
+
+
+def test_host_cli_status_never_sizes_a_running_job(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Its workdir is still being written to, so any figure would be a lie."""
+    running = finished_job("running")
+
+    def refuse(root: Path) -> int:
+        raise AssertionError("status walked a live job's workdir")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cleanup, "reclaimable_bytes", refuse)
+        assert sizes_from_status(capsys)[running] is None
 
 
 def test_record_workdir_size_writes_what_a_later_status_reads(
