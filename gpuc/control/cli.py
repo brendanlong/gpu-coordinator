@@ -345,21 +345,29 @@ def cmd_host_list(args: argparse.Namespace) -> int:
         print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
         return EXIT_OK
     for entry in registry.hosts.values():
-        bootstrapped = entry.bootstrapped_at or "never bootstrapped"
         summary = summarize(entry.gpus, entry.gpu_info) if entry.gpus else "no GPUs"
         driver = f", driver {entry.driver_version}" if entry.driver_version else ""
+        # One block per host, shaped like `gpuc status`: what the host is, then
+        # its cards, then the bootstrap facts. The interpreter path used to sit
+        # in the header and was longer than everything else on the line put
+        # together; `gpuc host list --json` and `gpuc host probe` still have it.
         print(
-            f"{entry.name:<16} {entry.kind:<7} {entry.ssh or 'this machine':<28} "
-            f"gpus={len(entry.gpus)} ({summary}{driver}) python={entry.python or '-'} "
-            f"pkg={version_mod.short(entry.pkg_commit)} bootstrapped={bootstrapped}"
+            f"host {entry.name} [{entry.kind}] {entry.ssh or 'this machine'}  "
+            f"gpus {len(entry.gpus)} ({summary}{driver})"
         )
         stale = status_mod.stale_warning(entry)
         if stale:
             print(f"  WARNING {stale}")
-        if entry.root:
-            print(f"  persistent root {entry.root} (gpuc home {entry.remote_home})")
         for index, name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
-            print(f"  [{index}] {name:<28} {vram:<7} {uuid}")
+            print(f"  gpu     [{index}] {name:<28} {vram:<7} {uuid}")
+        bootstrapped = (
+            f"bootstrapped {status_mod.format_age(entry.bootstrapped_at)}"
+            if entry.bootstrapped_at
+            else "never bootstrapped"
+        )
+        print(f"  pkg     {version_mod.short(entry.pkg_commit)} {bootstrapped}")
+        if entry.root:
+            print(f"  root    {entry.root} (gpuc home {entry.remote_home})")
     return 0
 
 
@@ -838,8 +846,9 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
             if entry.job_id in lost
             else ""
         )
+        label = f"{entry.name} ({entry.job_id})" if entry.name else entry.job_id
         print(
-            f"  {entry.job_id} {entry.name or '-'} host={entry.host} attempt={entry.attempt} "
+            f"  {label} host={entry.host} attempt={entry.attempt} "
             f"submitted {status_mod.format_age(entry.submitted_at)}{note}"
         )
     print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")

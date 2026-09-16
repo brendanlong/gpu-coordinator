@@ -30,8 +30,8 @@ is `docs/setup.md` in the repo, not this guide.
 
 `gpuc host list` is the list that matters: every registered host with its kind
 and its cards, each as `[index] name vram uuid` — `?` for name and VRAM until
-that host has been probed or bootstrapped. Which of them are busy is
-`gpuc status`.
+that host has been probed or bootstrapped. Which of them are busy, and what is
+holding them, is `gpuc status`.
 
 | kind | when | notes |
 |---|---|---|
@@ -110,7 +110,9 @@ gpuc submit job.yaml --host local
 gpuc submit job.yaml --host <host>                              # any name from `gpuc host list`
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu A40,RTX4090 --cloud any
 
-gpuc status                      # every host: queue, running job + phase, eta, recent results
+gpuc status                      # every host: free cards, queue, running job + phase, eta,
+                                 # recent results; each job as `name (job-id)`, each running
+                                 # job's cards as `gpu=2,3`
 gpuc status --json               # the same, machine-readable; --json is on every command
                                  # that has an answer (see "Exit codes" below)
 gpuc status --suspects           # running jobs that are billing but idle, judged by each job's
@@ -204,9 +206,10 @@ Rules, and they are not optional:
 - A command that failed still prints a document: `{schema_version, error,
   exit_code}`. `error` (singular) means it did not do what you asked; `errors`
   (plural) is trouble it survived and does not imply a non-zero exit on its own.
-- A job's `util` is the host's own nvidia-smi sampler (shown as
-  `util 98% (host)`); a pod's `provider_util` is RunPod's reading for the whole
-  pod (`provider util 71%`). They differ legitimately; do not compare them.
+- A job's `util` is the host's own nvidia-smi sampler; a pod's `provider_util`
+  is RunPod's reading for the whole pod. They differ legitimately; do not
+  compare them. (In the text output the job's is tagged `util 98% (host)` only
+  on a host that also shows a pod's `provider util 71%`.)
 - Ignore keys you do not recognise; more will be added.
 
 ## RunPod specifics
