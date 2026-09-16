@@ -346,8 +346,9 @@ part. `gpuc status` renders the remaining time relative (`eta 3h20m`), tagged
 `(42%)` when it was measured and `(est)` when it was a guess, and adds one
 `free` line per fully-busy host saying when its next card is expected -- with a
 count of the running jobs that estimated nothing, since the true answer can only
-be sooner. A host where *nothing* running estimated an end time has no time to
-report, so it gets no `free` line rather than one saying so.
+be sooner. Only the jobs holding a card are considered, for both halves of that
+line; a host where none of them estimated an end time has no time to report, so
+it gets no `free` line rather than one saying so.
 
 ## Process isolation (cgroup scope, else process group)
 

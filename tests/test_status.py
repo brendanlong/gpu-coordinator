@@ -528,6 +528,18 @@ def test_a_cpu_only_job_is_never_named_as_the_next_card_to_free_up() -> None:
     assert "free    next card in ~3h20m (j-train)" in text
 
 
+def test_a_cpu_only_job_is_not_counted_among_the_ones_that_gave_no_estimate() -> None:
+    """It cannot free a card, so it is not a reason the real answer is sooner."""
+    text = render(
+        busy(
+            running_job(job_id="j-known", gpus=[GPU, "GPU-b"], eta=in_minutes(200)),
+            running_job(job_id="j-cpu", gpus=[]),
+        )
+    )
+    assert "free    next card in ~3h20m (j-known)" in text
+    assert "gave no estimate" not in text
+
+
 def test_a_host_running_only_cpu_jobs_has_no_next_card_line() -> None:
     view = busy(running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)))
     assert "free    " not in render(view)
