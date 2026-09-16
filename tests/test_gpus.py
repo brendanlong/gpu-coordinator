@@ -16,13 +16,32 @@ def test_driver_version() -> None:
     assert gpus.driver_version(fake_smi()) == "580.173.02"
 
 
-def test_assert_uuids_present_passes_and_fails_clearly() -> None:
-    gpus.assert_uuids_present([FAKE_GPUS[0]], fake_smi())
-    gpus.assert_uuids_present([], fake_smi())
+def test_resolve_present_passes_and_fails_clearly() -> None:
+    assert gpus.resolve_present([FAKE_GPUS[0]], smi=fake_smi()) == [FAKE_GPUS[0]]
+    assert gpus.resolve_present([], smi=fake_smi()) == []
     with pytest.raises(gpus.GpuError) as excinfo:
-        gpus.assert_uuids_present(["GPU-stale"], fake_smi())
+        gpus.resolve_present(["GPU-stale"], smi=fake_smi())
     assert "GPU-stale" in str(excinfo.value)
     assert FAKE_GPUS[0] in str(excinfo.value)
+
+
+def test_resolve_present_takes_indices_not_just_uuids() -> None:
+    """A host pinned by position hands out `2`, and everything that checks an
+    assignment has to understand that form or it rejects every job."""
+    assert gpus.resolve_present(["1"], smi=fake_smi()) == [FAKE_GPUS[1]]
+    assert gpus.resolve_present(["0", FAKE_GPUS[1]], smi=fake_smi()) == FAKE_GPUS
+
+
+def test_resolve_present_refuses_an_assignment_that_names_one_card_twice() -> None:
+    """Owning a card under two names is one card; being *assigned* it twice is
+    a promise of two, and handing back one would run a 2-GPU job on one."""
+    with pytest.raises(gpus.GpuError) as excinfo:
+        gpus.resolve_present(["0", FAKE_GPUS[0]], smi=fake_smi())
+    assert "1 card(s), not 2" in str(excinfo.value)
+    with pytest.raises(gpus.GpuError) as excinfo:
+        gpus.resolve_present(["0", "9"], "assigned GPUs", smi=fake_smi())
+    assert "assigned GPUs not present on this host: 9" in str(excinfo.value)
+    assert f"0={FAKE_GPUS[0]}" in str(excinfo.value)
 
 
 def test_sample_utilization_filters_to_requested_uuids() -> None:

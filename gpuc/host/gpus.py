@@ -92,6 +92,19 @@ def is_index(entry: str) -> bool:
     return entry.isdigit()
 
 
+def _against_table(entries: Sequence[str], table: dict[str, str]) -> tuple[list[str], list[str]]:
+    present = set(table.values())
+    resolved: list[str] = []
+    missing: list[str] = []
+    for entry in entries:
+        uuid = table.get(entry) if is_index(entry) else (entry if entry in present else None)
+        if uuid is None:
+            missing.append(entry)
+        elif uuid not in resolved:
+            resolved.append(uuid)
+    return resolved, missing
+
+
 def resolve_owned(
     owned: Sequence[str], smi: SmiRunner = run_nvidia_smi
 ) -> tuple[list[str], list[str]]:
@@ -112,38 +125,54 @@ def resolve_owned(
     entries = list(owned)
     if not entries or not any(is_index(entry) for entry in entries):
         return entries, []
-    table = index_uuids(smi)
-    present = set(table.values())
-    resolved: list[str] = []
-    missing: list[str] = []
-    for entry in entries:
-        uuid = table.get(entry) if is_index(entry) else (entry if entry in present else None)
-        if uuid is None:
-            missing.append(entry)
-        elif uuid not in resolved:
-            resolved.append(uuid)
-    return resolved, missing
+    return _against_table(entries, index_uuids(smi))
+
+
+def _describe(table: dict[str, str]) -> str:
+    return ", ".join(f"{index}={uuid}" for index, uuid in sorted(table.items())) or "(no GPUs)"
 
 
 def describe_table(smi: SmiRunner = run_nvidia_smi) -> str:
     """`0=GPU-..., 1=GPU-...`, for an error that has to say what is here."""
     try:
-        table = index_uuids(smi)
+        return _describe(index_uuids(smi))
     except GpuError as exc:
         return f"(nvidia-smi could not be read: {exc})"
-    return ", ".join(f"{index}={uuid}" for index, uuid in sorted(table.items())) or "(no GPUs)"
 
 
-def assert_uuids_present(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> None:
-    if not uuids:
-        return
-    present = {gpu.uuid for gpu in list_gpus(smi)}
-    missing = [u for u in uuids if u not in present]
+def resolve_present(
+    entries: Sequence[str], what: str = "assigned GPUs", *, smi: SmiRunner = run_nvidia_smi
+) -> list[str]:
+    """`resolve_owned`, for the places where a card was already promised.
+
+    A job's assignment and a health check of `config.gpus` both describe cards
+    that are supposed to be here, so an entry that names nothing is a failure
+    rather than one to quietly skip. Entries are indices or UUIDs, the same as
+    everywhere else, so the message names the *entry* that could not be found.
+
+    Unlike `resolve_owned` this always asks the host, UUID entries included: a
+    UUID that the driver no longer reports is exactly what has to fail here.
+    """
+    entries = list(entries)
+    if not entries:
+        return []
+    table = index_uuids(smi)
+    resolved, missing = _against_table(entries, table)
     if missing:
         raise GpuError(
-            f"assigned GPU UUIDs not present on this host: {', '.join(missing)}; "
-            f"nvidia-smi reports: {', '.join(sorted(present)) or '(none)'}"
+            f"{what} not present on this host: {', '.join(missing)}; "
+            f"nvidia-smi reports: {_describe(table)}"
         )
+    if len(resolved) != len(entries):
+        # `_against_table` folds an index and its own UUID into one card, which
+        # is right for counting what a host owns and wrong here: these entries
+        # are a promise of *n* cards, and quietly returning fewer would run a
+        # two-GPU job on one.
+        raise GpuError(
+            f"{what} name {len(resolved)} card(s), not {len(entries)}: "
+            f"{', '.join(entries)} against {_describe(table)}"
+        )
+    return resolved
 
 
 def sample_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> dict[str, float]:

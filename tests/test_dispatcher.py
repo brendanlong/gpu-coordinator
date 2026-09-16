@@ -947,6 +947,24 @@ def test_gpus_owned_by_index_are_dispatched_as_uuids(gpuc_home: Path) -> None:
     assert dispatcher.free_gpus() == []
 
 
+def test_an_orphan_holding_an_index_is_adopted_as_the_uuid_that_index_names(
+    gpuc_home: Path,
+) -> None:
+    """A job launched before assignments were resolved host-side has an index in
+    its state. Adopted as-is it would match nothing owned, so its card would
+    read free and be handed to a second job while the first is still on it."""
+    configure_indices(["0", "1"])
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi()
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=["1"], runner_pid=os.getpid())
+    dispatcher.adopt_orphans()
+
+    assert job_id in dispatcher.running
+    assert dispatcher.free_gpus() == [FAKE_GPUS[0]]
+
+
 def test_an_owned_index_the_host_cannot_see_is_not_handed_out(gpuc_home: Path) -> None:
     configure_indices(["0", "7"])
     dispatcher, _ = make_dispatcher()
