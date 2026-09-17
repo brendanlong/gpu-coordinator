@@ -323,6 +323,15 @@ the host was running when this machine last read it, labelled with its age.
 `gpuc status` asks each host what it is running now, and that is the answer
 that counts.
 
+Shipping the package is only half an upgrade: the **dispatcher** imports its
+code once and then lives for as long as the host has work, so the one already
+running would otherwise go on serving the queue from the build it started with.
+The dispatcher bootstrap starts sees that it is the newer build, asks the
+incumbent to stand down (it finishes its pass and releases the lock) and takes
+over, adopting the running jobs. Nothing is interrupted. `gpuc status` reports
+the *running* dispatcher's commit alongside the package's and warns if they ever
+come apart.
+
 `--all` takes every registered host in turn, including ephemeral ones. A host
 that fails does not stop the others — a pod that has already gone away is the
 ordinary case, and `gpuc reconcile --once` is what forgets it — so the run ends
