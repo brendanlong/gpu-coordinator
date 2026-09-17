@@ -18,8 +18,8 @@ gpuc status      # registered hosts, their queues, and what is running
 ```
 
 `gpuc status` is the one that asks the hosts themselves; a `WARNING` line under
-a host means it is running a build this machine did not ship it (somebody
-else's `gpuc host bootstrap`), and `gpuc host bootstrap <host>` is the fix.
+a host means it is running a build other than this one (in either direction),
+and `gpuc host bootstrap <host>` is the fix.
 Jobs still queue and run either way. What a host *is* -- its cards, its mirror,
 its env -- is the host's own `config.json`, so there is nothing to keep in step
 between machines and nothing to warn about.
@@ -27,8 +27,8 @@ between machines and nothing to warn about.
 `gpuc skill` prints this file, and `gpuc skill --install [DIR]` writes a copy
 to `DIR/.claude/skills/gpuc/SKILL.md`.
 
-If `gpuc` is not on PATH, run it as `uv run gpuc` from a checkout. A host marked
-`OLDER: re-bootstrap` needs nothing from you: `gpuc submit` and `gpuc requeue`
+If `gpuc` is not on PATH, run it as `uv run gpuc` from a checkout. A host
+`gpuc version` marks `DIFFERS: re-bootstrap` needs nothing from you: `gpuc submit` and `gpuc requeue`
 re-sync the package and restart that host's dispatcher before enqueueing (pass
 `--no-bootstrap` to skip it). Registering, bootstrapping and configuring hosts
 is `docs/setup.md` in the repo, not this guide.
@@ -137,8 +137,8 @@ gpuc status                      # every host: free cards, queue, running job + 
                                  # recent results; each job as `name (job-id)`, each running
                                  # job's cards as `gpu=2,3`
 gpuc status --json               # the same, machine-readable; --json is on every command
-                                 # (a human wants `gpuc web serve`: the same in a browser)
-                                 # that has an answer (see "Exit codes" below)
+                                 # that has an answer (see "Exit codes" below). A human
+                                 # wants `gpuc web serve`: the same in a browser
 gpuc status --suspects           # running jobs that are billing but idle, judged by each job's
                                  # own low_util window/floor/grace, plus pods past a TTL they have;
                                  # it never kills anything
@@ -241,7 +241,7 @@ scraping any of the text output.
 | `host list` | `{hosts[], errors[]}` |
 | `host probe` | `{host, sections{}, driver_version, gpus[] each with assigned, assigned_gpus[], uv_cache{}, notes[], ...}` |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
-| `reconcile --once` | `{terminated[], forgotten[], kept[], errors[]}` |
+| `reconcile --once` | `{terminated[], forgotten[], kept[], unclaimed[], errors[]}` |
 
 ```bash
 id=$(gpuc submit job.yaml --host gpubox --json | jq -r .job_id)

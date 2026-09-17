@@ -78,7 +78,9 @@ def test_gpu_rows_are_index_uuid_name() -> None:
 
 def test_render_warns_about_logind_and_missing_uv() -> None:
     rendered = parse_probe("gpubox", SAMPLE).render()
-    assert "GPU-2a4bad3b-9fe3-7031-914d-384254e92908  NVIDIA GeForce RTX 3060 Ti" in rendered
+    assert (
+        "NVIDIA GeForce RTX 3060 Ti  8192 MiB  GPU-2a4bad3b-9fe3-7031-914d-384254e92908" in rendered
+    )
     assert "logind kills user processes at logout" in rendered
     assert "gpuc host bootstrap gpubox" in rendered
 
@@ -165,8 +167,8 @@ def test_only_the_assigned_gpus_are_shown_by_default() -> None:
 
 def test_all_gpus_shows_the_whole_box_with_ours_marked() -> None:
     rendered = parse_probe("gpubox", SAMPLE, None, ["1"]).render(all_gpus=True)
-    assert f"{TI}  NVIDIA GeForce RTX 3060 Ti  8192 MiB\n" in rendered + "\n"
-    assert f"{A40}  NVIDIA A40  46068 MiB  (assigned)" in rendered
+    assert f"NVIDIA GeForce RTX 3060 Ti  8192 MiB  {TI}\n" in rendered + "\n"
+    assert f"NVIDIA A40  46068 MiB  {A40}  (assigned)" in rendered
     assert "--all-gpus lists the rest" not in rendered
 
 
@@ -296,7 +298,7 @@ def test_a_shared_card_is_shown_and_marked_as_shared() -> None:
     report = parse_probe("gpubox", SAMPLE, None, ["0"], ["1"])
     rendered = report.render()
     assert "gpus: 1 of 2 assigned to gpubox, 1 shared" in rendered
-    assert f"{A40}  NVIDIA A40  46068 MiB  (shared)" in rendered
+    assert f"NVIDIA A40  46068 MiB  {A40}  (shared)" in rendered
     assert "are neither assigned to gpubox" not in rendered
 
 

@@ -1803,7 +1803,7 @@ def test_host_probe_shows_only_assigned_gpus_unless_all_gpus_is_asked_for(
     assert main(["host", "probe", "gpubox", "--all-gpus"]) == 0
     everything = capsys.readouterr().out
     assert "GPU-1111" in everything
-    assert "GPU-2222  NVIDIA A40  46068 MiB  (assigned)" in everything
+    assert "NVIDIA A40  46068 MiB  GPU-2222  (assigned)" in everything
 
     # Both cards are recorded either way, so `host set --gpus 0` can name one.
     assert set(load_registry().hosts["gpubox"].gpu_info) == {"GPU-1111", "GPU-2222"}

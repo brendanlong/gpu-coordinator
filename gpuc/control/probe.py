@@ -281,7 +281,7 @@ class ProbeReport:
                 mine = "  (assigned)" if everything and partly else ""
             else:
                 mine = "  (shared)" if self.shares(cells) else ""
-            lines.append(f"    [{index}] {uuid}  {name}{memory}{mine}")
+            lines.append(f"    [{index}] {name}{memory}  {uuid}{mine}")
         return lines
 
     @property

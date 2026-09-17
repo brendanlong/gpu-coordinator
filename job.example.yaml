@@ -7,17 +7,12 @@
 # .gitignore is obeyed; `--no-git` syncs a non-repo directory instead).
 
 name: lego-s4                                   # a label, not an identifier
-command: uv run python -m experiments.lego.train --k-max 6
+command: uv run --no-sync python -m experiments.lego.train --k-max 6
 setup: uv sync --frozen                         # optional; runs first, phase=setup
 gpus: 1                                         # 0..N of the host's owned GPUs
 
-# Some boxes have cards gpuc owns outright and cards it only borrows -- see
-# `gpuc host set <name> --shared-gpus`. Off by default, because a shared card
-# is somebody else's. Turned on (here or with `gpuc submit --use-shared`), this
-# job is dispatched to the owned cards first and borrows only the shortfall,
-# and only while nvidia-smi says the borrowed card holds no memory and is doing
-# no work. That is what lets a `gpus: 4` job run on a host that owns 2 and
-# shares 2 -- it waits for the other two to go quiet.
+# Also let this job onto the host's shared cards (ones gpuc borrows while
+# nobody else is on them); see docs/usage.md "Shared GPUs".
 use_shared: false
 
 env:                                            # plain environment, stored in the spec
@@ -33,10 +28,8 @@ secrets:
   - HF_TOKEN
   - WANDB_API_KEY
 
-# Before `main`, the runner proves it can write every destination below (a
-# small `.preflight` object) and fails the job as `sync-preflight` in seconds if
-# it cannot. Files already under an output path in the checkout are recorded
-# first and never uploaded as this job's results.
+# Proven writable before `main` (`failed: sync-preflight` otherwise). Files the
+# checkout already had under a path are never uploaded as this job's results.
 outputs:
   - path: results                               # relative to the workdir
     s3: s3://my-bucket/lego/{job_id}/results
@@ -54,26 +47,16 @@ max_runtime_min: 600                            # null for no limit
 # between queueing behind this job and paying for another host.
 estimated_runtime_min: 480
 
-# Optional, and better than the guess above: run every `progress_interval_s` of
-# phase `main`, in the workdir, with this job's environment. gpuc reads the last
-# line of its stdout as how far along the job is, and turns it into a live end
-# time. Exactly two forms, so it is never ambiguous: a fraction of one, written
-# with a decimal point (`0.42` -- which is what `step / total` prints), or a
-# percentage written with a `%` (`42%`). A bare `42` is refused rather than
-# guessed at. A command that fails, hangs or prints nonsense is recorded in
-# `status` and ignored; it can never fail the job.
-#
-# Left commented out because it only works if your job really does write that
-# file: enabled by mistake it is a `progress_error` every minute for the life
-# of every job.
+# Optional, and better than the guess above: run during phase `main`, its last
+# stdout line is how far along the job is -- `0.42` or `42%`, never a bare
+# integer. It can never fail the job. Commented out because it only works if
+# the job really writes that file. See docs/usage.md "Job length estimates".
 # progress_command: "tail -1 results/progress.txt"
 # progress_interval_s: 60                       # minimum 5
 
-# Let the host stop this job whenever that lets a job queued at a LOWER priority
-# number start right away, and queue it again as the next attempt. It re-runs
-# from the start in the workdir the stopped attempt left, so mark work that is
-# cheap to repeat -- and expect it to wait for ever on a busy host, which is
-# what asking for this means.
+# Let the host stop this job whenever that lets a more important queued job
+# start, and queue it again to re-run from the start. For work that is cheap
+# to repeat; see docs/usage.md "Automatic preemption".
 auto_preempt: false
 
 low_util:                                       # kill a job that is not using the GPU
