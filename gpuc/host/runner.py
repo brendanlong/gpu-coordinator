@@ -380,7 +380,7 @@ class JobRunner:
         sampler = deps.util_sampler()
         # Utilization is sampled for `gpuc status` only, and only in `main`:
         # setup is downloads and compiles, and a 0% there says nothing.
-        record_util = phase == "main" and bool(self.assigned)
+        record_util = phase == "main"
         phase_start = deps.now()
         next_sample = phase_start + deps.sample_interval_s
         max_runtime_s = (
@@ -598,6 +598,8 @@ class JobRunner:
         is resolved here and everything after this -- `CUDA_VISIBLE_DEVICES`,
         the utilization watchdog -- sees UUIDs.
         """
+        if not self.assigned:
+            return "no GPUs assigned; every job runs on at least one"
         before = list(self.assigned)
         try:
             self.assigned = gpus.resolve_present(self.assigned, "assigned GPUs", smi=self.deps.smi)
@@ -651,7 +653,7 @@ class JobRunner:
             if code != 0 or self.kill_reason:
                 return self._finalize(code, *self._classify(code, "setup"), sync_loop, log)
 
-        if self.assigned and self.deps.preflight:
+        if self.deps.preflight:
             cancelled = self._cancelled_before("preflight", sync_loop, log)
             if cancelled is not None:
                 return cancelled

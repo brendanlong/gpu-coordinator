@@ -150,7 +150,9 @@ def test_a_running_job_names_the_cards_it_holds_by_index() -> None:
     )
 
 
-def test_a_cpu_only_job_says_it_holds_no_card() -> None:
+def test_a_running_job_the_host_names_no_cards_for_still_renders() -> None:
+    """Every job holds a card now, but a state file from an older build may
+    not say so, and a file another build wrote is never a reason to fail."""
     assert "gpu=none" in render(busy(running_job(gpus=[])))
 
 
@@ -449,42 +451,6 @@ def test_zero_percent_is_labelled_as_the_guess_it_still_is() -> None:
     assert "eta 1h30m (est)" in text
 
 
-def test_a_cpu_only_job_is_never_named_as_the_next_card_to_free_up() -> None:
-    """`gpus: 0` jobs run but hold nothing, so a five-minute preprocessing job
-    must not be offered as the reason a card frees up in five minutes."""
-    text = render(
-        busy(
-            running_job(job_id="j-train", gpus=[GPU, "GPU-b"]),
-            running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)),
-        )
-    )
-    assert "free    " not in text
-    text = render(
-        busy(
-            running_job(job_id="j-train", gpus=[GPU, "GPU-b"], eta=in_minutes(200)),
-            running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)),
-        )
-    )
-    assert "free    next card in ~3h20m (j-train)" in text
-
-
-def test_a_cpu_only_job_is_not_counted_among_the_ones_that_gave_no_estimate() -> None:
-    """It cannot free a card, so it is not a reason the real answer is sooner."""
-    text = render(
-        busy(
-            running_job(job_id="j-known", gpus=[GPU, "GPU-b"], eta=in_minutes(200)),
-            running_job(job_id="j-cpu", gpus=[]),
-        )
-    )
-    assert "free    next card in ~3h20m (j-known)" in text
-    assert "gave no end time" not in text
-
-
-def test_a_host_running_only_cpu_jobs_has_no_next_card_line() -> None:
-    view = busy(running_job(job_id="j-cpu", gpus=[], eta=in_minutes(5)))
-    assert "free    " not in render(view)
-
-
 def test_a_multi_day_estimate_is_shown_in_days() -> None:
     queued = JobView(job_id="j-queued", priority=10, estimated_runtime_min=3 * 24 * 60 + 120)
     assert "est 3d02h" in render(busy(running_job(), queued=[queued]))
@@ -759,12 +725,11 @@ def test_a_job_that_gave_no_estimate_hides_only_the_jobs_behind_it() -> None:
     view = busy(
         running_job(gpus=[GPU], eta=in_minutes(20)),
         running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(130)),
-        queued=[waiting("j-silent"), waiting("j-behind"), waiting("j-cpu", gpus_requested=0)],
+        queued=[waiting("j-silent"), waiting("j-behind")],
     )
     starts = queue_start_estimates(view)
     assert 19 * 60 < starts["j-silent"] < 21 * 60
     assert 129 * 60 < starts["j-behind"] < 131 * 60
-    assert starts["j-cpu"] == 0.0
 
 
 def test_a_two_card_job_holds_up_the_one_card_job_behind_it() -> None:
@@ -813,14 +778,6 @@ def test_a_job_behind_one_that_can_never_be_placed_says_which_job() -> None:
     )
     assert queue_start_estimates(view) == {}
     assert "j-wide is ahead of it" in no_start_reason(view, view.queue[1])
-
-
-def test_a_cpu_job_is_not_described_as_needing_no_cards() -> None:
-    """`gpus: 0` is ignored everywhere else here -- it holds no card and never
-    waits for one -- and `needs 0 gpus` is a line to stop and re-read."""
-    view = busy(running_job(gpus=[GPU, "GPU-b"]), queued=[waiting("j-cpu", gpus_requested=0)])
-    assert "needs" not in render(view)
-    assert "queued  j-cpu prio=50 starts now" in render(view)
 
 
 def test_nothing_starts_on_a_draining_host() -> None:

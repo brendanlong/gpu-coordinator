@@ -971,6 +971,8 @@ class Dispatcher:
         not fail one the host is perfectly well set up to run), and
         `use_shared`, which nothing changes after submit.
         """
+        if spec.gpus < 1:
+            return f"needs at least 1 GPU, asked for {spec.gpus}"
         config = self.config
         shared = config.borrowable(spec)
         if spec.gpus <= len(config.gpus) + len(shared):
@@ -1028,16 +1030,12 @@ class Dispatcher:
         It costs utilization: a card waiting for the rest of a job's cards runs
         nothing, and on a rented pod that is billed. So a job only holds cards
         when this host can supply the *whole* of it from what it owns and can
-        currently see. That rules out two jobs, and both of them would be
-        holding a card against something nobody here controls:
-
-        * a job asking for more cards than are visible, whether because one has
-          dropped off nvidia-smi or because it can only run by borrowing. A
-          borrowed card comes free when somebody else's job ends, which is not
-          ours to wait on -- and failing the job would be wrong too, since
-          `config.gpus` says the host owns enough.
-        * a `gpus: 0` job, which holds no card and so can never be the reason
-          anything is short of one. It still never waits.
+        currently see. That rules out a job asking for more cards than are
+        visible, whether because one has dropped off nvidia-smi or because it
+        can only run by borrowing: it would be holding a card against something
+        nobody here controls. A borrowed card comes free when somebody else's
+        job ends, which is not ours to wait on -- and failing the job would be
+        wrong too, since `config.gpus` says the host owns enough.
 
         A job that *is* held for holds what it could take this pass, borrowed
         cards included: having taken one of somebody else's spare cards towards

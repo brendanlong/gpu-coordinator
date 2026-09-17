@@ -1,7 +1,10 @@
 """The whole control side against this machine as a `local` host, no GPU needed.
 
-Everything is redirected: GPUC_CONFIG_DIR, GPUC_STATE_DIR and the host's
-GPUC_HOME, so the real ~/.gpuc and the real registry are never touched.
+Every job needs a card, so the host is given one: a fake `nvidia-smi` on PATH
+answers for it, and a stand-in `torch.py` in the checkout passes the runner's
+GPU preflight. Everything else is redirected too: GPUC_CONFIG_DIR,
+GPUC_STATE_DIR and the host's GPUC_HOME, so the real ~/.gpuc and the real
+registry are never touched.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import pytest
 from gpuc.control.cli import main
 from gpuc.control.config import load_registry
 from gpuc.host import scope
+from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
 
@@ -67,6 +71,7 @@ def workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     (root / "hello.txt").write_text("hello\n")
+    install_fake_torch(root)
     for argv in (
         ["git", "init", "-q"],
         ["git", "config", "user.email", "t@example.com"],
@@ -106,6 +111,10 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     (fake_home / ".local" / "bin").mkdir(parents=True)
     patch = pytest.MonkeyPatch()
     patch.setenv("HOME", str(fake_home))
+    # The host's one card. This machine's own, if it has any, are not this
+    # suite's to use.
+    install_fake_nvidia_smi(fake_home / ".local" / "bin", [FAKE_GPUS[0]])
+    patch.setenv("PATH", f"{fake_home / '.local' / 'bin'}{os.pathsep}{os.environ['PATH']}")
     patch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
     patch.setenv("XDG_DATA_HOME", str(fake_home / ".local" / "share"))
     patch.setenv("XDG_CACHE_HOME", str(fake_home / ".cache"))
@@ -118,9 +127,6 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
 
     home = root / "gpuc-home"
     try:
-        # `--gpus ''` because this machine's cards are not this suite's to use:
-        # every job here asks for none. A host with no config of its own has to
-        # be told, one way or the other.
         assert (
             main(
                 [
@@ -132,7 +138,7 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
                     "--cache-dir",
                     SHARED_UV_CACHE,
                     "--gpus",
-                    "",
+                    FAKE_GPUS[0],
                 ]
             )
             == 0
@@ -212,7 +218,7 @@ def test_submit_runs_a_job_and_logs_and_status_find_it(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = bootstrapped_home
-    job_id = submit(workdir, "name: hi\ncommand: cat hello.txt\ngpus: 0\ncleanup: never\n")
+    job_id = submit(workdir, "name: hi\ncommand: cat hello.txt\ncleanup: never\n")
     capsys.readouterr()
 
     wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
@@ -239,11 +245,12 @@ def test_submit_says_where_in_the_queue_the_job_landed(
     # Long enough that it is still queued or running when the placement is
     # looked up: a job that had already *finished* would be neither, and this
     # test would pass on an empty line.
-    job_id = submit(workdir, "name: placed\ncommand: sleep 300\ngpus: 0\n")
+    job_id = submit(workdir, "name: placed\ncommand: sleep 300\n")
     out = capsys.readouterr().out
     assert f"job {job_id} queued on host local" in out
-    # A `gpus: 0` job is dispatchable the moment it is queued, so both answers
-    # are honest: the dispatcher the enqueue started may have taken it already.
+    # The card is free, so the job is dispatchable the moment it is queued and
+    # both answers are honest: the dispatcher the enqueue started may have
+    # taken it already.
     assert "queue: position 1 of 1; starts now" in out or "dispatched already" in out
     # The host is shared with every other test in this module: leave it idle.
     assert main(["cancel", job_id]) == 0
@@ -254,7 +261,7 @@ def test_a_running_job_can_be_cancelled(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = bootstrapped_home
-    job_id = submit(workdir, "name: sleepy\ncommand: sleep 300\ngpus: 0\npriority: 50\n")
+    job_id = submit(workdir, "name: sleepy\ncommand: sleep 300\npriority: 50\n")
     capsys.readouterr()
 
     wait_until(
@@ -272,7 +279,7 @@ def test_preempt_refuses_when_it_would_only_re_run_the_same_job(
     losing everything it had done, to no end. (Where it *is* worth doing needs
     a card to contend over: see the GPU end-to-end module.)"""
     home = bootstrapped_home
-    job_id = submit(workdir, "name: lonely\ncommand: sleep 300\ngpus: 0\n")
+    job_id = submit(workdir, "name: lonely\ncommand: sleep 300\n")
     wait_until(
         lambda: state_of(home, job_id).get("status") == "running", 60, "the job to start running"
     )
@@ -295,7 +302,7 @@ def test_estimate_reaches_a_running_job_and_status_and_json_agree(
     a scripted caller seeing an estimate the operator cannot is the worst of it.
     """
     home = bootstrapped_home
-    job_id = submit(workdir, "name: sleepy\ncommand: sleep 300\ngpus: 0\n")
+    job_id = submit(workdir, "name: sleepy\ncommand: sleep 300\n")
     wait_until(
         lambda: state_of(home, job_id).get("status") == "running", 60, "the job to start running"
     )
@@ -323,7 +330,7 @@ def test_estimate_reaches_a_running_job_and_status_and_json_agree(
 
 def test_a_failing_job_keeps_its_exit_code(bootstrapped_home: Path, workdir: Path) -> None:
     home = bootstrapped_home
-    job_id = submit(workdir, "name: nope\ncommand: exit 23\ngpus: 0\n")
+    job_id = submit(workdir, "name: nope\ncommand: exit 23\n")
     wait_until(lambda: finished(home, job_id), 120, "the job to fail")
     state = state_of(home, job_id)
     assert (state["status"], state["exit_code"]) == ("failed", 23)
@@ -363,7 +370,7 @@ def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
     monkeypatch.setattr("boto3.client", lambda service, **_: fake)
 
     home = bootstrapped_home
-    first = submit(workdir, "name: hi\ncommand: cat hello.txt\ngpus: 0\n")
+    first = submit(workdir, "name: hi\ncommand: cat hello.txt\n")
     wait_until(lambda: finished(home, first), 120, f"job {first} to finish")
     assert f"bkt/gpuc/specs/{first}.json" in fake.objects
 
@@ -397,7 +404,6 @@ def test_a_secret_never_reaches_the_log_or_gpuc_logs(
         workdir,
         "name: secretive\n"
         'command: test -n "$WANDB_API_KEY" && echo the job saw its secret\n'
-        "gpus: 0\n"
         "secrets: [WANDB_API_KEY]\n",
     )
     capsys.readouterr()
@@ -433,7 +439,7 @@ def big_file_job(home: Path, workdir: Path, *, cleanup: str = "never") -> str:
     job_id = submit(
         workdir,
         f"name: bulky\ncommand: dd if=/dev/zero of=blob.bin bs=1M count=4 2>/dev/null\n"
-        f"gpus: 0\ncleanup: {cleanup}\n",
+        f"cleanup: {cleanup}\n",
     )
     wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
     return job_id
@@ -470,7 +476,7 @@ def test_status_mentions_leftover_workdirs_and_clean_clears_it(
     job_id = submit(
         workdir,
         "name: hog\ncommand: dd if=/dev/zero of=blob.bin bs=1M count=1100 2>/dev/null\n"
-        "gpus: 0\ncleanup: never\n",
+        "cleanup: never\n",
     )
     wait_until(lambda: finished(home, job_id), 300, f"job {job_id} to finish")
     capsys.readouterr()
@@ -488,7 +494,7 @@ def test_clean_removes_a_leftover_staged_spec(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = bootstrapped_home
-    job_id = submit(workdir, 'name: ok\ncommand: "true"\ngpus: 0\n')
+    job_id = submit(workdir, 'name: ok\ncommand: "true"\n')
     wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
     staged = home / "incoming" / f"{job_id}.json"
     staged.parent.mkdir(parents=True, exist_ok=True)

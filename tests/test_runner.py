@@ -15,10 +15,16 @@ import pytest
 from gpuc.host import jobs, paths, queue, runner, sync
 from gpuc.host.jobs import HostConfig, JobState
 from gpuc.host.runner import RunnerDeps
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import (
+    FAKE_GPUS,
+    fake_smi,
+    install_fake_nvidia_smi,
+    install_fake_torch,
+    make_spec,
+)
 
 
-def prepare(gpus: Sequence[str] = (), **overrides: object) -> str:
+def prepare(gpus: Sequence[str] = (FAKE_GPUS[0],), **overrides: object) -> str:
     spec = make_spec(**overrides)
     job_id = queue.enqueue(spec)
     queue.remove_marker(job_id)
@@ -79,12 +85,6 @@ def test_cuda_visible_devices_is_the_assigned_uuids(gpuc_home: Path) -> None:
     assert f"CVD={FAKE_GPUS[0]},{FAKE_GPUS[1]}" in log_of(job_id)
 
 
-def test_zero_gpu_job_gets_an_empty_cuda_visible_devices(gpuc_home: Path) -> None:
-    job_id = prepare(command='echo "CVD=[$CUDA_VISIBLE_DEVICES]"')
-    assert runner.run_job(job_id, deps()) == 0
-    assert "CVD=[]" in log_of(job_id)
-
-
 def test_spec_env_cannot_override_the_gpu_assignment(gpuc_home: Path) -> None:
     job_id = prepare(
         gpus=[FAKE_GPUS[0]],
@@ -128,6 +128,17 @@ def test_a_stale_assigned_uuid_fails_the_job_before_it_starts(gpuc_home: Path) -
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("failed", "gpu-assert")
     assert "SHOULD-NOT-RUN" not in log_of(job_id)
+
+
+def test_a_job_with_no_gpu_assigned_never_runs(gpuc_home: Path) -> None:
+    """Every job runs on at least one card. A state with none was written by a
+    build that still allowed it, and the job fails the way a missing card does."""
+    job_id = prepare(gpus=[], command="echo SHOULD-NOT-RUN")
+    assert runner.run_job(job_id, deps()) == 1
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "gpu-assert")
+    assert "SHOULD-NOT-RUN" not in log_of(job_id)
+    assert "no GPUs assigned" in log_of(job_id)
 
 
 def test_failed_final_sync_turns_a_succeeded_job_into_failed_sync(
@@ -200,14 +211,6 @@ def test_an_idle_gpu_is_reported_and_never_a_reason_to_kill(gpuc_home: Path) -> 
     state = jobs.read_state(job_id)
     assert state.status == "succeeded"
     assert state.util_recent and set(state.util_recent) == {0.0}
-
-
-def test_utilization_is_never_sampled_for_a_zero_gpu_job(gpuc_home: Path) -> None:
-    def explode(uuids: Sequence[str]) -> float:
-        raise AssertionError("sampled utilization for a gpus:0 job")
-
-    job_id = prepare(command="sleep 0.4")
-    assert runner.run_job(job_id, deps(sampler=explode)) == 0
 
 
 def test_cancel_kills_the_whole_process_group_including_grandchildren(
@@ -337,9 +340,13 @@ def test_build_env_exposes_job_paths(gpuc_home: Path) -> None:
 
 def run_detached(job_id: str, home: Path) -> subprocess.Popen[bytes]:
     """The runner as the dispatcher really starts it: its own session, so a
-    signal to it is not also a signal to the test process."""
+    signal to it is not also a signal to the test process. It asks the real
+    `nvidia-smi` and runs the real preflight, so both are faked on the machine."""
+    install_fake_nvidia_smi(home / "fake-bin")
+    install_fake_torch(paths.workdir(job_id))
     env = dict(os.environ)
     env["GPUC_HOME"] = str(home)
+    env["PATH"] = f"{home / 'fake-bin'}{os.pathsep}{env['PATH']}"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     return subprocess.Popen(
         [sys.executable, "-m", "gpuc.host", "run", job_id],

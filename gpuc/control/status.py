@@ -560,9 +560,7 @@ def _fmt_cards(job: JobView) -> str:
     job waiting for three is the answer to "there is a card free, why is it
     still queued".
     """
-    # `<= 1` and not `== 1`: a `gpus: 0` job holds no card and never waits for
-    # one, which is why it is ignored everywhere else here too.
-    if job.gpus_requested is None or job.gpus_requested <= 1:
+    if job.gpus_requested is None or job.gpus_requested == 1:
         return ""
     return f" needs {job.gpus_requested} gpus"
 
@@ -593,8 +591,7 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
     comes free at the eta of the job holding it, and the queue is taken in
     order, because that is what the dispatcher does -- a job that does not fit
     holds the free cards it is waiting for, and nothing behind it may take
-    them. A `gpus: 0` job is the exception at both ends: it holds no card and
-    is never held up by one, so it starts now wherever it sits in the queue.
+    them.
 
     A job is in the answer or it is not: one whose turn depends on a job that
     gave no estimate is absent, never guessed at. That is why a *later* job can
@@ -617,13 +614,7 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
         return {}
     cards = _card_releases(view)
     starts: dict[str, float] = {}
-    pending: list[JobView] = []
-    for job in view.queue:
-        if job.gpus_requested == 0:
-            # It holds no card and waits for none, wherever it sits in the queue.
-            starts[job.job_id] = 0.0
-        else:
-            pending.append(job)
+    pending = list(view.queue)
     clock = 0.0
     while pending:
         # Cards a job that could not start is waiting for, which the host holds
@@ -845,20 +836,16 @@ def next_free_line(view: HostView) -> str | None:
     anything has no answer to give, and saying so under a `free` label, next to
     a gpu list that already says every card is busy, is a line to scan past.
     """
-    # `gpus: 0` jobs are running but hold no card, so they can never be the
-    # reason one comes free -- and naming a five-minute CPU job as the next
-    # card would answer the one question this line exists for with a lie.
-    holding = [job for job in view.running if job.gpus]
-    if not view.owned or view.free or not holding:
+    if not view.owned or view.free or not view.running:
         return None
     known: list[tuple[float, JobView]] = []
-    for job in holding:
+    for job in view.running:
         remaining = job.eta_seconds
         if remaining is not None:
             known.append((remaining, job))
     if not known:
         return None
-    silent = len(holding) - len(known)
+    silent = len(view.running) - len(known)
     remaining, job = min(known, key=lambda pair: pair[0])
     when = "overdue" if remaining < 0 else f"in ~{format_duration(remaining)}"
     # "no end time", not "no estimate": a job whose host has an estimate it has

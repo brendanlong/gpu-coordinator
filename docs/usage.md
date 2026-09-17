@@ -15,7 +15,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `command` | **required** | run in `workdir/` as phase `main`; a blank one is refused at submit |
 | `name` | `""` | a label for `status`; not an identifier |
 | `setup` | none | run first, as phase `setup` |
-| `gpus` | `1` | how many of the host's GPUs to assign (>= 0). `0` never waits for a card. More than the host can ever provide is refused at submit |
+| `gpus` | `1` | how many of the host's GPUs to assign, at least 1. More than the host can ever provide is refused at submit |
 | `use_shared` | `false` | also let this job onto the host's **shared** GPUs — cards gpuc does not own and takes only while nobody else is on them. See [shared GPUs](#shared-gpus). `gpuc submit --use-shared` sets it from the command line |
 | `env` | `{}` | plain environment for the job, applied after the host's `--env` |
 | `secrets` | `[]` | names read from *your* shell at submit time and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600). Missing from your shell is a refused submit |
@@ -76,19 +76,15 @@ queue it at a **higher** number than the work you want to keep the host busy
 with; priority is the only knob, and it decides both questions at once.
 
 A job only holds cards when the host can supply the **whole** of it from the
-cards it owns and can see right now. These are walked past instead, because
-holding a card for them would mean waiting on something the host does not
-control:
-
-- **`gpus: 0`** — it holds no card, so it can never be the reason anything is
-  short of one. It still never waits.
-- **a job asking for more cards than the host can currently see** — either a
-  card has dropped off `nvidia-smi`, and idling the host until it comes back
-  (if it comes back) is worse than letting the queue run; or the job can only
-  fit by [borrowing](#shared-gpus), and a shared card comes free when somebody
-  else's job ends, which is not this host's to wait for. Neither is failed: the
-  host's `config.gpus` says it owns enough. A job bigger than the *configured*
-  host, shared cards included, is failed at dispatch as it always was.
+cards it owns and can see right now. A job asking for more cards than the host
+can currently see is walked past instead, because holding a card for it would
+mean waiting on something the host does not control: either a card has dropped
+off `nvidia-smi`, and idling the host until it comes back (if it comes back) is
+worse than letting the queue run; or the job can only fit by
+[borrowing](#shared-gpus), and a shared card comes free when somebody else's
+job ends, which is not this host's to wait for. Neither is failed: the host's
+`config.gpus` says it owns enough. A job bigger than the *configured* host,
+shared cards included, is failed at dispatch as it always was.
 
 ## Shared GPUs
 
@@ -225,9 +221,8 @@ is it still queued".
 
 Where some of the jobs holding a card offered no end time, the `free` line
 appends a count of them, because the real answer can only ever be *sooner* than
-it: one of those could finish in a minute. Jobs with `gpus: 0` are ignored throughout —
-they hold no card, so they can neither free one nor make the answer sooner. If
-*nothing* holding a card estimated an end time there is no line at all, since
+it: one of those could finish in a minute. If *nothing* holding a card
+estimated an end time there is no line at all, since
 the gpu lines above it already say every card is busy.
 
 ## Automatic preemption
@@ -438,9 +433,10 @@ it again as attempt+1, with the workdir re-synced from your *current* directory.
 It therefore **needs `s3_bucket`** (without it, submit the job file again) and
 cannot rebuild a `--no-git` workdir. `--host H` sends it somewhere else;
 `--runpod` provisions for it; with neither, it goes back to the host the local
-index says it ran on. It is the other half of the pair with `gpuc preempt`: a
-new job id from the mirror, on whichever host you name, for a job that has
-already finished.
+index says it ran on. The mirrored spec is checked exactly as a job file is, so
+one an older build wrote with `gpus: 0` is refused here rather than queued to
+fail. It is the other half of the pair with `gpuc preempt`: a new job id from
+the mirror, on whichever host you name, for a job that has already finished.
 
 `--host` is optional on `logs`, `cancel`, `preempt`, `reorder`, `estimate` and `requeue`:
 the local job index is tried first, then every registered host is asked whether it knows the
@@ -647,7 +643,7 @@ Every `failed: <reason>`:
 | --- | --- |
 | `exit <N>` | `command` exited non-zero and nothing else killed it |
 | `setup` | the `setup` phase exited non-zero |
-| `gpu-assert` | an assigned GPU (index or UUID) is not present in the host's `nvidia-smi` |
+| `gpu-assert` | an assigned GPU (index or UUID) is not present in the host's `nvidia-smi`, or the job was started with no GPU assigned at all |
 | `gpu-preflight` | a real GPU op inside the job's venv failed, or `device_count()` did not match `gpus:` — usually a CPU-only torch |
 | `sync-preflight` | the uploads the job would do at the end cannot work (no `aws`/`hf`, a missing secret, an unwritable bucket or repo) |
 | `timeout` | `max_runtime_min` elapsed |
@@ -657,6 +653,7 @@ Every `failed: <reason>`:
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. Appends `+no-outputs` the same way |
 | `bad-spec` | the queued spec could not be read |
 | `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued. On a host with [shared cards](#shared-gpus) it counts the ones this job asked for, and says so when it asked for none |
+| `needs at least 1 GPU, asked for 0` | the spec on the host asks for no card, which a job cannot do. `gpuc submit` refuses this, so it is a spec an older build queued or one edited by hand |
 | `spawn-failed` | the dispatcher could not start a runner process |
 | `incomplete-submit` | `gpuc submit` was interrupted before it finished queueing the job, so this host was never asked to run it. Submit it again |
 | `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind before freeing its GPUs. A job whose state never recorded a pid is not automatically this: the dispatcher looks for the runner itself first, and fails the job only when there is none |

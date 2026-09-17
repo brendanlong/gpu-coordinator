@@ -20,8 +20,8 @@ contract the code keeps is [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - `ssh` and `rsync`, an account you can log into with that key, and outbound
   HTTPS (bootstrap fetches uv, a Python, the `aws` CLI and `hf`).
-- The NVIDIA driver and `nvidia-smi` for any host that should run GPU work. A
-  host without it is registered fine and can only run `gpus: 0` jobs.
+- The NVIDIA driver and `nvidia-smi`. A host without them can be registered
+  and probed, but every job needs a GPU, so nothing can be submitted to it.
 - Nothing else installed by hand: `gpuc host bootstrap` puts uv, a Python
   (floor 3.11, it installs 3.12), the `gpuc.host` package, the `aws` CLI v2
   bundle and `hf` into `$HOME` over ssh, and starts the dispatcher.

@@ -167,7 +167,7 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "name": "lego-s4",                    # human label, not an identifier
   "command": "uv run python -m experiments.lego.train --k-max 6",
   "setup": "uv sync --frozen",          # optional; runs before command, phase=setup
-  "gpus": 1,                            # 0..N owned GPUs
+  "gpus": 1,                            # at least 1
   "use_shared": false,                  # may this job also be dispatched to `shared_gpus`?
                                         # see Shared GPUs
   "env": {"REQUIRE_CUDA": "1"},
@@ -242,11 +242,12 @@ queue's lexical order, not submission order below one second.
 - **The queue is taken in order** (`launch_ready`): a job that does not fit
   holds the cards it is waiting for, owned and borrowed alike, and nothing
   behind it may take them. Only a job the host could supply *whole* from what
-  it owns and can currently see holds; a `gpus: 0` job and a job that needs a
-  card the host cannot see (dropped off nvidia-smi, or shared and in use) are
-  walked past instead, and neither is failed -- `_capacity_failure` fails a
-  job bigger than the configured host, shared cards included. Why the obvious
-  rule (dispatch whatever fits) is wrong is [usage.md](usage.md#priority-is-not-advisory).
+  it owns and can currently see holds; a job that needs a card the host cannot
+  see (dropped off nvidia-smi, or shared and in use) is walked past instead,
+  and is not failed -- `_capacity_failure` fails a job that asks for no GPU at
+  all, or for more than the configured host has, shared cards included. Why
+  the obvious rule (dispatch whatever fits) is wrong is
+  [usage.md](usage.md#priority-is-not-advisory).
 - **A job is submitted when its queue marker exists, and not before.**
   `enqueue` writes the spec, then the state, then the marker, so an interrupted
   `gpuc submit` leaves a job dir this host was never asked to run. It is not
@@ -357,9 +358,9 @@ queue's lexical order, not submission order below one second.
 
 1. Resolve the assignment against `nvidia-smi --query-gpu=index,uuid` --
    indices and UUIDs both, since either form may be recorded -- and fail the
-   job (`gpu-assert`) if an entry names no card that is here. Export
-   `CUDA_VISIBLE_DEVICES=<resolved UUIDs comma-joined>` (empty string when
-   `gpus: 0`), the spec `env`, and the secrets file.
+   job (`gpu-assert`) if it is empty or an entry names no card that is here.
+   Export `CUDA_VISIBLE_DEVICES=<resolved UUIDs comma-joined>`, the spec
+   `env`, and the secrets file.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json`
    (relative path, size, mtime) -- a checkout routinely ships committed files
    where the outputs go. Before `setup`, because a setup step writing there
@@ -371,7 +372,7 @@ queue's lexical order, not submission order below one second.
 2. `phase=setup`: run `spec.setup` in `workdir` with `bash -eo pipefail`.
 3. `phase=preflight`: GPU preflight **inside the job's environment**. A named
    phase, not a step of `setup`, so `gpuc status` can tell "still installing
-   torch" from "proving the card works". If `gpus > 0`, run
+   torch" from "proving the card works". Run
    `uv run --no-sync python -c "<real op>"` (the `shared/gpu.py` probe:
    `is_available()` then a tensor add + `.item()`), and assert
    `device_count()` equals `gpus`. Failure -> `failed: gpu-preflight`.

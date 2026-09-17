@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 from collections.abc import Iterator
@@ -126,10 +127,104 @@ def make_spec(**overrides: object) -> JobSpec:
         "job_id": jobs.new_job_id(),
         "name": "t",
         "command": "true",
-        "gpus": 0,
+        "gpus": 1,
     }
     document.update(overrides)
     return JobSpec.from_dict(document)
+
+
+FAKE_SMI_SCRIPT = """\
+import sys
+
+UUIDS = {uuids!r}
+VALUES = {{"name": "Fake A40", "memory.total": "46068", "memory.used": "0",
+          "utilization.gpu": "0", "driver_version": "580.173.02"}}
+UNITS = {{"memory.total": " MiB", "memory.used": " MiB", "utilization.gpu": " %"}}
+
+args = sys.argv[1:]
+query = next((a for a in args if a.startswith("--query-gpu=")), None)
+if query is None:
+    sys.exit("fake nvidia-smi: only --query-gpu is supported")
+fields = query.split("=", 1)[1].split(",")
+fmt = next((a for a in args if a.startswith("--format=")), "--format=csv")
+nounits = "nounits" in fmt
+wanted = args[args.index("-i") + 1].split(",") if "-i" in args else UUIDS
+for index, uuid in enumerate(UUIDS):
+    if uuid not in wanted:
+        continue
+    cells = []
+    for field in fields:
+        if field == "index":
+            cells.append(str(index))
+        elif field == "uuid":
+            cells.append(uuid)
+        else:
+            cells.append(VALUES.get(field, "") + ("" if nounits else UNITS.get(field, "")))
+    print(", ".join(cells))
+"""
+
+
+def install_fake_nvidia_smi(bin_dir: Path, uuids: list[str] | None = None) -> None:
+    """Put an `nvidia-smi` for `uuids` (default `FAKE_GPUS`) in `bin_dir`.
+
+    For the tests that run the real dispatcher and runner as subprocesses on a
+    machine with no card: those find nvidia-smi on PATH, so `fake_smi` cannot
+    reach them. It answers the `--query-gpu` queries gpus.py makes and nothing
+    else.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "fake-nvidia-smi.py"
+    script.write_text(FAKE_SMI_SCRIPT.format(uuids=list(FAKE_GPUS if uuids is None else uuids)))
+    wrapper = bin_dir / "nvidia-smi"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+    wrapper.chmod(0o755)
+
+
+FAKE_TORCH = """\
+# A torch that passes the runner's GPU preflight on a machine with no card. It
+# sees as many devices as CUDA_VISIBLE_DEVICES names, as the real one does.
+import os
+
+__version__ = "0.0-fake"
+
+
+class version:
+    cuda = "0.0"
+
+
+class _Tensor:
+    def __add__(self, other):
+        return self
+
+    def sum(self):
+        return self
+
+    def item(self):
+        return 8.0
+
+
+def zeros(n, device=None):
+    return _Tensor()
+
+
+class cuda:
+    @staticmethod
+    def is_available():
+        return True
+
+    @staticmethod
+    def device_count():
+        return len([d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d])
+
+    @staticmethod
+    def get_device_name(index):
+        return "Fake A40"
+"""
+
+
+def install_fake_torch(workdir: Path) -> None:
+    """A `torch.py` the preflight's `python -c` finds first, being run from `workdir`."""
+    (workdir / "torch.py").write_text(FAKE_TORCH)
 
 
 def fake_smi(

@@ -90,7 +90,7 @@ def test_a_host_with_nothing_still_renders() -> None:
     assert not report.has_nvidia_smi
     assert report.gpu_rows == []
     rendered = report.render()
-    assert "only run gpus: 0 jobs" in rendered
+    assert "no nvidia-smi, so this host cannot run jobs" in rendered
     assert "cannot time a download" in rendered
 
 
@@ -189,7 +189,7 @@ def test_a_host_with_no_assignment_sees_every_card_and_is_told_to_assign_some() 
     rendered = parse_probe("gpubox", SAMPLE).render()
     assert "  gpus:\n" in rendered
     assert TI in rendered and A40 in rendered
-    assert "no GPUs are assigned to gpubox, so it can only run gpus: 0 jobs" in rendered
+    assert "no GPUs are assigned to gpubox, so nothing can be submitted to it" in rendered
 
 
 def test_an_assigned_card_the_host_cannot_see_is_called_out() -> None:

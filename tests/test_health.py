@@ -138,7 +138,7 @@ def test_run_checks_emits_json_with_every_check(gpuc_home: Path) -> None:
     json.dumps(report)
 
 
-def test_run_checks_is_not_red_on_a_cpu_only_host(gpuc_home: Path) -> None:
+def test_run_checks_is_not_red_on_a_host_with_no_cards(gpuc_home: Path) -> None:
     jobs.write_config(HostConfig(host="cpu-box", gpus=[]))
     report = health.run_checks(
         smi=fake_smi(uuids=[]), downloader=fast_downloader, min_free_gb=0.0, url="http://x"

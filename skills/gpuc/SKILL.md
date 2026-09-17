@@ -61,7 +61,7 @@ the job, never from the checkout.
 name: lego-s4                      # label only
 setup: uv sync --frozen            # phase "setup"; venv is cached across jobs on the host
 command: uv run --no-sync python -m experiments.lego.train --k-max 6 --device cuda
-gpus: 1                            # 0 never waits for a GPU
+gpus: 1                            # at least 1
 use_shared: false                  # also use cards the host borrows rather than owns
 env:
   REQUIRE_CUDA: "1"

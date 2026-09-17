@@ -116,6 +116,7 @@ def test_unknown_fields_are_rejected_by_name() -> None:
     [
         ({"command": "  "}, "command"),
         ({"gpus": -1}, "gpus"),
+        ({"gpus": 0}, "gpus"),
         ({"priority": 200}, "priority"),
         ({"outputs": [{"path": "r", "bucket": "x"}]}, "outputs.0.bucket"),
     ],
@@ -126,11 +127,17 @@ def test_bad_values_point_at_the_field(overrides: dict[str, Any], needle: str) -
     assert needle in str(exc.value)
 
 
+def test_a_job_must_ask_for_at_least_one_gpu() -> None:
+    with pytest.raises(SubmitError) as exc:
+        validate(job_document(gpus=0), "job.yaml")
+    assert "gpus: Input should be greater than or equal to 1" in str(exc.value)
+
+
 def test_yaml_and_json_both_load(tmp_path: Path) -> None:
     yaml_file = tmp_path / "job.yaml"
-    yaml_file.write_text("name: t\ncommand: echo hi\ngpus: 0\n")
+    yaml_file.write_text("name: t\ncommand: echo hi\ngpus: 2\n")
     json_file = tmp_path / "job.json"
-    json_file.write_text('{"name": "t", "command": "echo hi", "gpus": 0}')
+    json_file.write_text('{"name": "t", "command": "echo hi", "gpus": 2}')
     assert load_document(yaml_file) == load_document(json_file)
 
 
@@ -416,7 +423,7 @@ def test_submitting_from_a_non_repository_says_what_to_do(
     with pytest.raises(SubmitError, match="git init"):
         submit_spec(
             host_entry(name="gpubox", gpus=["GPU-a"]),
-            validate(job_document(gpus=0)),
+            validate(job_document(gpus=1)),
             Settings(),
             workdir=tmp_path,
             session=session(FakeHost()),
@@ -426,7 +433,7 @@ def test_submitting_from_a_non_repository_says_what_to_do(
 
 
 def test_submit_file_reads_yaml(control_env: Path, repo: Path) -> None:
-    (repo / "job.yaml").write_text("name: t\ncommand: echo hi\ngpus: 0\n")
+    (repo / "job.yaml").write_text("name: t\ncommand: echo hi\ngpus: 1\n")
     result = submit_file(
         host_entry(name="gpubox", gpus=["GPU-a"]),
         repo / "job.yaml",

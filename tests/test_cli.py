@@ -1225,7 +1225,7 @@ def test_submit_json_is_the_queued_job_and_its_notes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\ngpus: 0\n')
+    job.write_text('command: "true"\n')
     register_host(name="local", gpus=GPU)
 
     def fake_submit_file(entry: HostEntry, *args: object, **kwargs: object) -> SubmitResult:
@@ -1268,7 +1268,7 @@ def test_requeue_json_names_the_job_it_came_from(
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     s3 = FakeS3Client()
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
-        {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 0}
+        {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 1}
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
@@ -1296,7 +1296,7 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
         {
             "job_id": "20260101-000000-aaaaaa",
             "command": "true",
-            "gpus": 0,
+            "gpus": 1,
             "low_util": {"enabled": False, "window_min": 25, "floor_pct": 5, "grace_min": 10},
             "from_the_future": {"unknown": True},
         }
@@ -1314,6 +1314,28 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
     assert [m.command for m in submitted] == ["true"]
+
+
+def test_requeue_refuses_a_mirrored_spec_that_asks_for_no_gpu(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requeue is a submit. An older build mirrored `gpus: 0` specs, and one
+    of those is refused the way a job file would be, not queued to fail."""
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
+        {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 0}
+    ).encode()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    monkeypatch.setattr(
+        "gpuc.control.cli.submit_spec",
+        lambda *a, **k: pytest.fail("a spec asking for no GPU must not be submitted"),
+    )
+    register_host(name="local", gpus=GPU)
+    capsys.readouterr()
+
+    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
+    assert "gpus: Input should be greater than or equal to 1" in capsys.readouterr().err
 
 
 def test_cancel_json_is_the_hosts_own_answer(

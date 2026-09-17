@@ -11,7 +11,7 @@ from typing import IO
 import pytest
 
 from gpuc.host import jobs, paths, progress, queue, runner
-from tests.conftest import make_spec
+from tests.conftest import FAKE_GPUS, fake_smi, make_spec
 
 
 @pytest.mark.parametrize(
@@ -141,13 +141,13 @@ def prepare(**overrides: object) -> str:
     spec = make_spec(**overrides)
     job_id = queue.enqueue(spec)
     queue.remove_marker(job_id)
-    jobs.update_state(job_id, status="running")
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     paths.ensure_job_layout(job_id)
     return job_id
 
 
 def deps(**overrides: object) -> runner.RunnerDeps:
-    base: dict[str, object] = {"poll_interval_s": 0.02, "preflight": False}
+    base: dict[str, object] = {"smi": fake_smi(), "poll_interval_s": 0.02, "preflight": False}
     base.update(overrides)
     return runner.RunnerDeps(**base)  # type: ignore[arg-type]
 

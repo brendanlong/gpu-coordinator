@@ -138,28 +138,18 @@ def test_a_wide_job_is_not_starved_by_a_stream_of_narrow_ones(gpuc_home: Path) -
     assert jobs.read_state(wide).gpus == FAKE_GPUS
 
 
-def test_a_zero_gpu_job_is_never_held_up_by_a_job_waiting_for_cards(gpuc_home: Path) -> None:
-    """It holds no card, so it can never be the reason anything is short of
-    one -- and making it wait would buy the job ahead of it nothing."""
-    dispatcher, _ = make_dispatcher()
-    holding = queue.enqueue(make_spec(gpus=1, priority=50))
+def test_a_job_asking_for_no_gpus_fails_at_dispatch(gpuc_home: Path) -> None:
+    """`gpuc submit` refuses `gpus: 0`, so a spec that has it was queued by an
+    older build or written by hand. It is failed, with the reason, rather than
+    run on no card -- and it holds nothing up on its way out."""
+    none = queue.enqueue(make_spec(gpus=0, priority=10))
+    runnable = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=10))  # waiting for both cards
-    cpu_job = queue.enqueue(make_spec(gpus=0, priority=90))
-    dispatcher.run_once()
-    assert jobs.read_state(cpu_job).status == "running"
-    assert jobs.read_state(cpu_job).gpus == []
-    assert holding in dispatcher.running
-
-
-def test_a_zero_gpu_job_never_waits(gpuc_home: Path) -> None:
-    hog = queue.enqueue(make_spec(gpus=2, priority=10))
-    cpu_job = queue.enqueue(make_spec(gpus=0, priority=90))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert jobs.read_state(hog).status == "running"
-    assert jobs.read_state(cpu_job).status == "running"
-    assert jobs.read_state(cpu_job).gpus == []
+    state = jobs.read_state(none)
+    assert (state.status, state.reason) == ("failed", "needs at least 1 GPU, asked for 0")
+    assert none not in spawned
+    assert jobs.read_state(runnable).status == "running"
 
 
 def test_a_job_larger_than_the_host_fails_instead_of_blocking(gpuc_home: Path) -> None:
