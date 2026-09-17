@@ -52,7 +52,7 @@ def _wait_for_cmdline(pid: int) -> str:
     return procinfo.cmdline(pid)
 
 
-def test_a_runner_is_found_by_the_job_it_was_started_for() -> None:
+def test_a_live_runner_is_found_by_the_job_it_was_started_for() -> None:
     """How a job whose state names no runner is told from one that has none."""
     job_id = "20250101-000000-abcdef"
     proc = subprocess.Popen(
@@ -60,10 +60,27 @@ def test_a_runner_is_found_by_the_job_it_was_started_for() -> None:
     )
     try:
         _wait_for_cmdline(proc.pid)
-        assert procinfo.find_runner_pid(job_id) == proc.pid
-        # Another job's runner is not this job's, and neither is a dispatcher.
-        assert procinfo.find_runner_pid("20250101-000000-fedcba") is None
+        assert procinfo.live_runner_pids().get(job_id) == proc.pid
     finally:
         proc.kill()
         proc.wait(timeout=10)
-    assert procinfo.find_runner_pid(job_id) is None
+    assert job_id not in procinfo.live_runner_pids()
+
+
+def test_a_runner_is_named_from_argv_not_from_a_string_of_words() -> None:
+    """A job's own command reaches /proc as one argument however many words it
+    holds, and `bash -c <script>` is how every phase is run."""
+    assert procinfo.runner_job_id([sys.executable, "-m", "gpuc.host", "run", "J"]) == "J"
+    assert procinfo.runner_job_id([sys.executable, "-m", "gpuc.host", "dispatch"]) is None
+    assert procinfo.runner_job_id(["bash", "-c", "python train.py gpuc.host run J"]) is None
+
+
+def test_cmdline_argv_keeps_an_argument_that_contains_spaces() -> None:
+    proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)", "a b c"])
+    try:
+        _wait_for_cmdline(proc.pid)
+        assert procinfo.cmdline_argv(proc.pid)[-1] == "a b c"
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    assert procinfo.cmdline_argv(2**30) == []

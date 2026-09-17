@@ -250,20 +250,24 @@ queue's lexical order, not submission order below one second.
 - **Adoption at startup** (`adopt_orphans`): every job whose `state.json` says
   `running` is either taken over or failed `runner-died`, and the GPUs of a
   failed one go straight back in the free pool -- so anything it left behind is
-  killed first (its `cgroup_unit`, else its `pgid`). "Still running" is the
+  killed first (its `cgroup_unit`, then its `pgid`). "Still running" is the
   recorded `runner_pid` *plus* the boot id and start time recorded with it: a
   bare pid means nothing across a reboot and little after a rollover.
-  - A `running` job that names no live runner is **not** failed on that alone.
+  - A job that names no live runner is **not** judged on that alone.
     `launch_ready` writes `running` before there is a process to name and the
     pid only after the spawn, so a dispatcher killed in that window -- every
     first takeover by a newer build, and both SIGKILL paths -- leaves a live
     runner nothing points at. Failing it would lose the job *and* free the
     cards underneath a process still training on them, with no pgid recorded to
-    kill. So /proc is scanned for a live `gpuc.host run <id>`
-    (`runner.find_runner_pid`), that runner is adopted, and its identity is
-    written to the state the dead dispatcher never got to. The same answer
-    covers a second attempt still carrying the dead pid of the attempt before
-    it.
+    kill. So /proc is walked once for every live `gpuc.host run <id>`
+    (`runner.live_runner_pids`) and those runners are adopted. The same
+    lookup answers the preempted-and-still-syncing case below, where the cost
+    of getting it wrong is attempt 2 starting in the workdir attempt 1 is
+    uploading from.
+  - What is found is deliberately *not* written back to `state.json`: the
+    runner records its own `runner_pid` moments later, and a read-modify-write
+    from the dispatcher would race the one `_resolve_assigned` makes in
+    between, whose resolved UUIDs would be the loss.
 - Cancel: `queue.cancel(jobid)` writes `jobs/<id>/cancel`. The **runner** owns
   the kill (see Runner); the dispatcher escalates only once `state.json`
   publishes a `cgroup_unit`, or a pgid that is not the runner's own -- during

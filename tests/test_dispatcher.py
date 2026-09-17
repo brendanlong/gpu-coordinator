@@ -582,37 +582,36 @@ def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(
     job_id = queue.enqueue(make_spec(gpus=1))
     queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], started_at=jobs.utc_now())
-    monkeypatch.setattr(
-        host_dispatcher, "find_runner_pid", lambda wanted: os.getpid() if wanted == job_id else None
-    )
-
-    dispatcher, _ = make_dispatcher()
-    dispatcher.adopt_orphans()
-
-    state = jobs.read_state(job_id)
-    assert state.status == "running"
-    # Recorded, so the next dispatcher does not have to go looking either.
-    assert state.runner_pid == os.getpid()
-    assert state.runner_starttime == procinfo.starttime(os.getpid())
-    assert job_id in dispatcher.running
-    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
-
-
-def test_a_new_attempts_runner_beats_the_dead_pid_of_the_attempt_before_it(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A re-queued job keeps the runner pid of the attempt that was stopped
-    until its new runner records its own, so "the recorded pid is dead" is not
-    the same question as "this job has no runner"."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=2**30)
-    monkeypatch.setattr(host_dispatcher, "find_runner_pid", lambda _wanted: os.getpid())
+    monkeypatch.setattr(host_dispatcher, "live_runner_pids", lambda: {job_id: os.getpid()})
 
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
 
     assert jobs.read_state(job_id).status == "running"
+    assert dispatcher.running[job_id].pid == os.getpid()
+    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
+
+
+def test_a_preempted_job_syncing_under_an_unrecorded_runner_is_not_queued_again(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same window on the way out: a runner signalled before it recorded
+    itself still writes its final state and then spends the whole output sync
+    alive. Queued on that evidence, attempt 2 would start in the workdir
+    attempt 1 is still uploading from."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    queue.enqueue(make_spec(gpus=2, priority=1))
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
+    queue.preempt(job_id)
+    jobs.update_state(job_id, status="failed", reason="preempted", ended_at=jobs.utc_now())
+    monkeypatch.setattr(host_dispatcher, "live_runner_pids", lambda: {job_id: os.getpid()})
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+
+    assert jobs.read_state(job_id).status == "failed"
+    assert queue.is_preempted(job_id)
     assert job_id in dispatcher.running
 
 
@@ -622,13 +621,34 @@ def test_a_running_job_with_no_runner_anywhere_still_fails(
     job_id = queue.enqueue(make_spec(gpus=1))
     queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
-    monkeypatch.setattr(host_dispatcher, "find_runner_pid", lambda _wanted: None)
+    monkeypatch.setattr(host_dispatcher, "live_runner_pids", dict)
 
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
 
     assert jobs.read_state(job_id).reason == "runner-died"
     assert dispatcher.free_gpus() == [FAKE_GPUS[0], FAKE_GPUS[1]]
+
+
+def test_the_runner_the_dispatcher_spawns_is_one_the_scan_recognises(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The command is built here and read back in `runner`: two modules, one
+    fact. A runner the spawner starts and the scan cannot name is adopted by
+    nobody, and nothing else would notice the two had drifted apart."""
+    job_id = "20250101-000000-abcdef"
+    captured: list[list[str]] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, argv: list[str], **_kwargs: object) -> None:
+            captured.append(argv)
+
+    monkeypatch.setattr(host_dispatcher.subprocess, "Popen", FakePopen)
+    host_dispatcher.default_spawn_runner(job_id)
+
+    assert procinfo.runner_job_id(captured[0]) == job_id
 
 
 def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path) -> None:
