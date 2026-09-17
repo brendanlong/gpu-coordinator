@@ -184,6 +184,108 @@ def test_submit_expands_job_id_in_output_destinations(control_env: Path, repo: P
     assert "{job_id}" not in json.dumps(spec["outputs"])
 
 
+def test_the_mirror_keeps_the_job_id_unexpanded_so_a_requeue_gets_its_own_namespace(
+    control_env: Path, repo: Path
+) -> None:
+    """The mirror is what `gpuc requeue` submits: the expanded spec there
+    would point every re-run at the outputs of the run it came from."""
+    client = FakeS3Client()
+    host = FakeHost()
+    result = submit_spec(
+        host_entry(name="gpubox", gpus=["GPU-a"]),
+        validate(job_document(outputs=[{"path": "results", "s3": "s3://b/exp/{job_id}/results"}])),
+        Settings(s3_bucket="bkt"),
+        workdir=repo,
+        session=session(host),
+        environ={},
+        s3=S3Index("bkt", client),
+        report=lambda _: None,
+    )
+    mirrored = json.loads(client.objects[f"bkt/{spec_key(result.job_id)}"])
+    assert mirrored["outputs"][0]["s3"] == "s3://b/exp/{job_id}/results"
+    assert (mirrored["job_id"], mirrored["attempt"]) == (result.job_id, 1)
+    shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"][0])
+    assert shipped["outputs"][0]["s3"] == f"s3://b/exp/{result.job_id}/results"
+
+
+@pytest.mark.parametrize(
+    ("output", "key"),
+    [
+        ({"path": "results", "s3": "s3://b/exp/results"}, "s3"),
+        ({"path": "ckpt", "hf": "org/repo-{job_id}", "hf_path": "runs/latest"}, "hf_path"),
+    ],
+)
+def test_submit_refuses_an_output_destination_without_the_job_id(
+    control_env: Path, repo: Path, output: dict[str, Any], key: str
+) -> None:
+    """Every output location includes the job id, so runs never overwrite each
+    other; for HF that means `hf_path`, since the repo is shared by every run."""
+    host = FakeHost()
+    with pytest.raises(SubmitError) as exc:
+        submit_spec(
+            host_entry(name="gpubox", gpus=["GPU-a"]),
+            validate(job_document(outputs=[output])),
+            Settings(),
+            workdir=repo,
+            session=session(host),
+            environ={},
+            report=lambda _: None,
+        )
+    message = str(exc.value)
+    assert f"output {output['path']}: `{key}: {output[key]}` does not include the job id" in message
+    assert "{job_id}" in message
+    assert not host.puts and not host.rsyncs
+
+
+def test_a_destination_carrying_this_jobs_literal_id_is_accepted(
+    control_env: Path, repo: Path
+) -> None:
+    """The expanded string is what is judged, so the id itself is as good as
+    the placeholder -- and an *earlier* run's id is not (see the requeue tests)."""
+    host = FakeHost()
+    job_id = "20260917-000000-abcdef"
+    result = submit_spec(
+        host_entry(name="gpubox", gpus=["GPU-a"]),
+        validate(job_document(outputs=[{"path": "results", "s3": f"s3://b/{job_id}/results"}])),
+        Settings(),
+        workdir=repo,
+        session=session(host),
+        environ={},
+        job_id=job_id,
+        report=lambda _: None,
+    )
+    assert result.job_id == job_id
+    assert f"{REMOTE_HOME}/incoming/{job_id}.json" in host.puts
+
+
+def test_an_hf_output_without_hf_path_uploads_under_the_job_id_itself(
+    control_env: Path, repo: Path
+) -> None:
+    host = FakeHost()
+    result = submit_spec(
+        host_entry(name="gpubox", gpus=["GPU-a"]),
+        validate(job_document(outputs=[{"path": "ckpt", "hf": "org/repo"}])),
+        Settings(),
+        workdir=repo,
+        session=session(host),
+        environ={},
+        report=lambda _: None,
+    )
+    spec = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"][0])
+    assert spec["outputs"][0]["hf_path"] is None
+
+
+def test_precheck_refuses_an_output_without_the_job_id_before_a_pod_is_bought(
+    repo: Path,
+) -> None:
+    with pytest.raises(SubmitError, match="does not include the job id"):
+        precheck_local(
+            validate(job_document(outputs=[{"path": "results", "s3": "s3://b/results"}])),
+            repo,
+            gpu_count=1,
+        )
+
+
 def test_submit_ships_tracked_and_untracked_files_but_not_ignored_ones(
     control_env: Path, repo: Path
 ) -> None:

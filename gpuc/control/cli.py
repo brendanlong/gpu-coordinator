@@ -96,7 +96,6 @@ from gpuc.control.submit import (
     JobSpecModel,
     Reporter,
     SubmitResult,
-    expand_job_id,
     load_document,
     precheck_local,
     submit_file,
@@ -770,7 +769,8 @@ def mirror_spec_first(
     """Put the spec in S3 before spending any money, so a lost pod is still requeueable.
 
     Returns the uri it landed at, so the submit that follows does not PUT the
-    same object a second time.
+    same object a second time. `{job_id}` goes up unexpanded: the mirror is
+    what `requeue` submits, and that run must land in its own namespace.
     """
     s3 = S3Index.from_settings(settings)
     if s3 is None:
@@ -779,7 +779,7 @@ def mirror_spec_first(
             "`gpuc requeue` will need the job file again"
         ]
     try:
-        return s3.put_spec(expand_job_id(model.to_spec(job_id))), []
+        return s3.put_spec(model.to_spec(job_id)), []
     except S3IndexError as exc:
         return None, [f"could not mirror the spec to S3 before provisioning: {exc}"]
 

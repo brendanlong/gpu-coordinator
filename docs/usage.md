@@ -19,7 +19,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `use_shared` | `false` | also let this job onto the host's **shared** GPUs — cards gpuc does not own and takes only while nobody else is on them. See [shared GPUs](#shared-gpus). `gpuc submit --use-shared` sets it from the command line |
 | `env` | `{}` | plain environment for the job, applied after the host's `--env` |
 | `secrets` | `[]` | names read from *your* shell at submit time and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600). Missing from your shell is a refused submit |
-| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir |
+| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir. `s3` and `hf_path` **must contain `{job_id}`** or the submit is refused; `hf_path` left out is the job id itself |
 | `sync_interval_s` | `180` | background upload cadence; **minimum 10** |
 | `priority` | `50` | `0`–`99`, lower dispatches first, and the queue is taken strictly in that order — see [priority is not advisory](#priority-is-not-advisory) |
 | `max_runtime_min` | none | wall clock from the runner's start; over it the job is `failed: timeout` |
@@ -33,8 +33,12 @@ commented example; `-` as the file name reads the spec from stdin.
 
 Unknown keys are refused at submit, so a typo is an error rather than silence.
 
-`{job_id}` expands in `s3`, `hf` and `hf_path`. Output namespaces are unique by
-construction and nothing guards against overwriting a destination you reuse.
+`{job_id}` expands in `s3`, `hf` and `hf_path` to the id `submit` assigns, and
+every destination must carry it: an `s3` uri or an `hf_path` whose expanded
+form does not contain the job id is refused at submit, naming the output. An
+`hf` output with no `hf_path` uploads under the id itself. Output namespaces
+are therefore unique by construction, which is the only overwrite guard there
+is: nothing looks at what a destination already holds.
 `hf_create: true` lets the sync preflight create a Hugging Face repo that does
 not exist; without it a missing repo fails the job in seconds instead of
 creating `org/typo`.
@@ -435,10 +439,14 @@ it again as attempt+1, with the workdir re-synced from your *current* directory.
 It therefore **needs `s3_bucket`** (without it, submit the job file again) and
 cannot rebuild a `--no-git` workdir. `--host H` sends it somewhere else;
 `--runpod` provisions for it; with neither, it goes back to the host the local
-index says it ran on. The mirrored spec is checked exactly as a job file is, so
-one an older build wrote with `gpus: 0` is refused here rather than queued to
-fail. It is the other half of the pair with `gpuc preempt`: a new job id from
-the mirror, on whichever host you name, for a job that has already finished.
+index says it ran on. The mirror holds the spec with `{job_id}` unexpanded, so
+the new run gets its own output namespace. The mirrored spec is checked exactly
+as a job file is, so one an older build wrote with `gpus: 0` is refused here
+rather than queued to fail, and so is one that carries an earlier run's literal
+id in an output destination (older builds mirrored the expanded spec): the new
+job must not write over the old one's outputs, so submit the job file again. It
+is the other half of the pair with `gpuc preempt`: a new job id from the
+mirror, on whichever host you name, for a job that has already finished.
 
 `--host` is optional on `logs`, `cancel`, `preempt`, `reorder`, `estimate` and `requeue`:
 the local job index is tried first, then every registered host is asked whether it knows the

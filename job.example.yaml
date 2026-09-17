@@ -32,10 +32,10 @@ secrets:
 # checkout already had under a path are never uploaded as this job's results.
 outputs:
   - path: results                               # relative to the workdir
-    s3: s3://my-bucket/lego/{job_id}/results
+    s3: s3://my-bucket/lego/{job_id}/results    # {job_id} is required: runs never share a prefix
   - path: checkpoints
     hf: my-org/lego-checkpoints
-    hf_path: "{job_id}"
+    hf_path: "{job_id}"                         # required in hf_path too; left out, it is the id itself
     hf_create: false                            # true: create the repo if it is missing
 
 sync_interval_s: 180                            # background upload cadence

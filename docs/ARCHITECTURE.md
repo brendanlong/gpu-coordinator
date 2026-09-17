@@ -194,8 +194,12 @@ All state writes are atomic (write temp in same dir, `os.replace`).
 }
 ```
 
-`{job_id}` is expanded in output destinations. Output namespaces are unique
-by construction; there is no overwrite guard anywhere.
+`gpuc submit` expands `{job_id}` in output destinations and refuses an `s3` or
+`hf_path` whose expanded form does not contain the id (no `hf_path` means the
+id itself). Output namespaces are unique by construction; there is no other
+overwrite guard anywhere. The S3 mirror holds the spec with `{job_id}`
+unexpanded, so `gpuc requeue` expands it with the new id; a mirrored spec
+carrying an earlier run's literal id fails the same check.
 
 Job id: `YYYYMMDD-HHMMSS-<6 hex>`, assigned by `gpuc submit`. The
 timestamp is second-granular, so two jobs submitted inside the same second

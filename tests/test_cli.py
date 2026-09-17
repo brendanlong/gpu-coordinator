@@ -29,7 +29,7 @@ from gpuc.control.config import (
 from gpuc.control.providers.base import Constraints
 from gpuc.control.remote import HostSession, RemoteError
 from gpuc.control.status import placement_unknown
-from gpuc.control.submit import JobSpecModel, SubmitResult
+from gpuc.control.submit import JobSpecModel, SubmitResult, expand_job_id
 from tests.conftest import host_entry, register_host
 from tests.fakehost import FakeHost
 from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
@@ -1336,6 +1336,88 @@ def test_requeue_refuses_a_mirrored_spec_that_asks_for_no_gpu(
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
     assert "gpus: Input should be greater than or equal to 1" in capsys.readouterr().err
+
+
+def test_requeue_refuses_a_mirrored_spec_carrying_the_earlier_runs_output_id(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Older builds mirrored the spec with `{job_id}` already expanded, so what
+    they left behind names the first run's outputs. A requeue is a new job, and
+    a new job never writes over an old one's outputs: refused, nothing shipped."""
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
+        {
+            "job_id": "20260101-000000-aaaaaa",
+            "command": "true",
+            "gpus": 1,
+            "outputs": [{"path": "results", "s3": "s3://b/exp/20260101-000000-aaaaaa/results"}],
+        }
+    ).encode()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
+    monkeypatch.setattr(
+        "gpuc.control.submit.open_session",
+        lambda *a, **k: pytest.fail("a spec pointed at an earlier run's outputs must not ship"),
+    )
+    register_host(name="local", gpus=GPU)
+    capsys.readouterr()
+
+    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
+    err = capsys.readouterr().err
+    assert "s3://b/exp/20260101-000000-aaaaaa/results` does not include the job id" in err
+
+
+def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
+        {
+            "job_id": "20260101-000000-aaaaaa",
+            "command": "true",
+            "gpus": 1,
+            "outputs": [{"path": "results", "s3": "s3://b/exp/20260101-000000-aaaaaa/results"}],
+        }
+    ).encode()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    monkeypatch.setattr(
+        "gpuc.control.cli.runpod_host",
+        lambda *a, **k: pytest.fail("no pod may be bought for a spec that is refused"),
+    )
+    assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 1
+    assert "does not include the job id" in capsys.readouterr().err
+
+
+def test_requeue_expands_the_mirrored_template_with_the_new_id(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
+        {
+            "job_id": "20260101-000000-aaaaaa",
+            "command": "true",
+            "gpus": 1,
+            "outputs": [{"path": "results", "s3": "s3://b/exp/{job_id}/results"}],
+        }
+    ).encode()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    submitted: list[JobSpecModel] = []
+
+    def fake_submit(entry: Any, model: JobSpecModel, *a: Any, **k: Any) -> SubmitResult:
+        submitted.append(model)
+        return SubmitResult(job_id="new", host=entry.name, attempt=2)
+
+    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    register_host(name="local", gpus=GPU)
+    capsys.readouterr()
+
+    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
+    spec = submitted[0].to_spec("20260102-000000-bbbbbb")
+    assert expand_job_id(spec).outputs[0].s3 == "s3://b/exp/20260102-000000-bbbbbb/results"
 
 
 def test_cancel_json_is_the_hosts_own_answer(

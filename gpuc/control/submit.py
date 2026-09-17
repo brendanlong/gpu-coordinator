@@ -141,6 +141,16 @@ def validate(document: Mapping[str, Any], origin: str = "job spec") -> JobSpecMo
 
 
 def expand_job_id(spec: JobSpec) -> JobSpec:
+    """Fill `{job_id}` into the output destinations, and refuse any that would
+    not carry the id.
+
+    Every output location includes the job id, so runs never overwrite each
+    other. The expanded string is what is judged, not the template: a
+    destination with a literal id pasted in passes when it is this job's, and
+    a mirrored spec an older build wrote with the *previous* run's id in it is
+    refused at requeue rather than pointed at that run's outputs. An `hf`
+    output with no `hf_path` uploads under the id itself, so it needs nothing.
+    """
     for output in spec.outputs:
         if output.s3:
             output.s3 = output.s3.format(job_id=spec.job_id)
@@ -148,6 +158,15 @@ def expand_job_id(spec: JobSpec) -> JobSpec:
             output.hf = output.hf.format(job_id=spec.job_id)
         if output.hf_path:
             output.hf_path = output.hf_path.format(job_id=spec.job_id)
+        for key, destination in (("s3", output.s3), ("hf_path", output.hf_path)):
+            if destination and spec.job_id not in destination:
+                raise SubmitError(
+                    f"output {output.path}: `{key}: {destination}` does not include the job id "
+                    f"({spec.job_id}), so a second run would write over the first.\n"
+                    f"Put {{job_id}} in it, for example `{key}: {destination.rstrip('/')}/"
+                    f"{{job_id}}`. A mirrored spec that carries an earlier run's id is "
+                    f"refused for the same reason; edit it out and submit the file again."
+                )
     return spec
 
 
@@ -191,6 +210,9 @@ def precheck_local(
             f"the spec asks for {model.gpus} GPU(s) but this request would create a pod with "
             f"{gpu_count}.\nRaise --gpu-count, or lower `gpus:` in the spec."
         )
+    # The id the job will get is not assigned yet; any id shows whether the
+    # destinations would carry one.
+    expand_job_id(model.to_spec(jobs.new_job_id()))
     gather_secrets(model.secrets, environ)
     if not use_git:
         return
@@ -450,9 +472,11 @@ def submit_spec(
         )
     elif spec_uri is None:
         # `submit --runpod` mirrors the spec *before* it buys a pod, and passes
-        # the uri back in; the same object twice is a wasted round trip.
+        # the uri back in; the same object twice is a wasted round trip. The
+        # mirror holds `{job_id}` unexpanded, so a requeue gets its own
+        # namespace rather than the one this run wrote into.
         try:
-            spec_uri = s3.put_spec(spec)
+            spec_uri = s3.put_spec(spec_model.to_spec(spec.job_id, attempt))
         except S3IndexError as exc:
             notes.append(f"could not mirror the spec to S3: {exc}")
 
