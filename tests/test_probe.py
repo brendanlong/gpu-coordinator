@@ -115,20 +115,24 @@ def test_the_script_asks_df_for_the_filesystem_type() -> None:
     assert "stat -f" in PROBE_SCRIPT
 
 
-def test_an_overlay_home_is_detected_and_suggests_a_persistent_root() -> None:
+def test_an_overlay_home_is_reported_but_never_argued_with() -> None:
+    """An ephemeral queue is how gpuc works -- a rented pod has nowhere durable
+    to put one either -- so the probe reports the filesystem and stops there."""
     report = parse_probe("gpubox", OVERLAY_HOME)
     assert report.home_fs_type == "overlay"
     assert report.home_is_overlay
     rendered = report.render()
-    assert "wiped on every restart" in rendered
-    assert "gpuc host set gpubox --persistent-root /mnt/<volume>/$USER" in rendered
+    # Named on its own line: `disk:` here is an overlay too, so a bare
+    # substring would pass with home_fs dropped from the report entirely.
+    assert "home_fs: overlay overlay" in rendered
+    assert "persistent-root" not in rendered
+    assert "wiped on every restart" not in rendered
 
 
-def test_a_real_filesystem_gets_no_persistent_root_note() -> None:
+def test_a_real_filesystem_is_reported_as_itself() -> None:
     report = parse_probe("desk", DISK_HOME)
     assert report.home_fs_type == "ext4"
     assert not report.home_is_overlay
-    assert "persistent-root" not in report.render()
 
 
 def test_the_stat_fallback_form_is_parsed_too() -> None:
@@ -140,15 +144,6 @@ def test_a_host_that_answered_nothing_is_not_called_an_overlay() -> None:
     report = parse_probe("gpubox", SAMPLE)
     assert report.home_fs_type is None
     assert not report.home_is_overlay
-    assert "persistent-root" not in report.render()
-
-
-def test_a_host_that_already_has_a_root_is_told_how_to_recover_instead() -> None:
-    rendered = parse_probe("gpubox", OVERLAY_HOME, "/mnt/ssd-2/brendan").render()
-    assert "wiped on every restart" in rendered
-    assert "--persistent-root /mnt/ssd-2/brendan, so the queue" in rendered
-    assert "recover with: gpuc host bootstrap gpubox" in rendered
-    assert "/mnt/<volume>" not in rendered
 
 
 TI = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -218,14 +213,6 @@ def test_the_document_flags_every_card_assigned_or_not() -> None:
     assert document["assigned_missing"] == []
 
 
-def test_the_persistent_root_note_says_what_actually_moves() -> None:
-    """uv's *cache* follows gpuc home; uv itself is reinstalled into $HOME."""
-    rendered = parse_probe("gpubox", OVERLAY_HOME).render()
-    assert "the queue and every job dir" in rendered
-    assert "uv's cache follows only to stay on gpuc home's" in rendered
-    assert "uv itself stays in $HOME" in rendered
-
-
 class OneAnswerTransport:
     """Says the same thing to every command: the probe only asks once."""
 
@@ -265,7 +252,10 @@ def test_probe_host_carries_the_registered_persistent_root_too() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", persistent_root="/mnt/ssd-2/me/")
     report: Any = probe_host(entry, transport=OneAnswerTransport(OVERLAY_HOME))
     assert report.persistent_root == "/mnt/ssd-2/me"
-    assert "recover with: gpuc host bootstrap gpubox" in report.render()
+    assert report.document()["persistent_root"] == "/mnt/ssd-2/me"
+    # An overlay $HOME that already has a root is the other half of the note
+    # that used to be here: it says nothing about it either.
+    assert "persistent-root" not in report.render()
 
 
 def test_two_entries_naming_one_card_is_called_out() -> None:

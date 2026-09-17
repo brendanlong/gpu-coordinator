@@ -296,8 +296,6 @@ class ProbeReport:
                 "logind kills user processes at logout; the dispatcher will not "
                 "survive your SSH session ending"
             )
-        if self.home_is_overlay:
-            notes.append(self._overlay_note())
         if self.sections.get("uv") == "not installed":
             notes.append(f"uv is missing; `gpuc host bootstrap {self.host}` installs it")
         if self.cache_shares_gpuc_home_fs is False:
@@ -349,26 +347,6 @@ class ProbeReport:
                 f"`gpuc host bootstrap {self.host}` fails rather than promise a card twice"
             )
         return notes
-
-    def _overlay_note(self) -> str:
-        overlay = (
-            f"$HOME is on an {self.home_fs_type} filesystem, so it is a container's "
-            f"throwaway upper layer and is wiped on every restart.\n"
-        )
-        if self.persistent_root:
-            return overlay + (
-                f"        This host is registered with --persistent-root "
-                f"{self.persistent_root}, so the queue and every job dir are already "
-                f"off it.\n        After a restart, recover with: "
-                f"gpuc host bootstrap {self.host}"
-            )
-        return overlay + (
-            f"        Point this host at a volume that survives:\n"
-            f"        gpuc host set {self.host} --persistent-root /mnt/<volume>/$USER\n"
-            f"        (then `gpuc host bootstrap {self.host}`: the queue and every job dir\n"
-            f"        move there, and uv's cache follows only to stay on gpuc home's\n"
-            f"        filesystem; uv itself stays in $HOME and bootstrap reinstalls it)"
-        )
 
     def document(self) -> dict[str, Any]:
         """`gpuc host probe --json`.
