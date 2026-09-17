@@ -222,14 +222,11 @@ def test_a_cancelled_job_in_the_queue_does_not_count_as_something_waiting(
         queue.preempt(job_id)
 
 
-@pytest.mark.parametrize(("marker", "match"), [("paused", "paused"), ("draining", "draining")])
-def test_preempt_refuses_on_a_host_that_is_dispatching_nothing(
-    gpuc_home: Path, marker: str, match: str
-) -> None:
+def test_preempt_refuses_on_a_draining_host(gpuc_home: Path) -> None:
     waiting_job()
     job_id = running_job()
-    (paths.paused_file() if marker == "paused" else paths.draining_file()).touch()
-    with pytest.raises(ValueError, match=match):
+    paths.draining_file().touch()
+    with pytest.raises(ValueError, match="draining"):
         queue.preempt(job_id)
     assert not queue.is_preempted(job_id)
 
@@ -355,7 +352,7 @@ def test_a_job_whose_workdir_is_gone_has_nothing_to_re_run(gpuc_home: Path) -> N
 
 @pytest.mark.parametrize(
     ("status", "reason"),
-    [("succeeded", None), ("failed", "exit 1"), ("failed", "timeout"), ("failed", "low-util")],
+    [("succeeded", None), ("failed", "exit 1"), ("failed", "timeout"), ("failed", "sync")],
 )
 def test_a_job_that_ended_on_its_own_before_the_kill_landed_is_not_re_run(
     gpuc_home: Path, status: str, reason: str | None

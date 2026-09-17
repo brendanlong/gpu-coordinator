@@ -26,7 +26,6 @@ commented example; `-` as the file name reads the spec from stdin.
 | `estimated_runtime_min` | none | roughly how long you expect it to take, measured the same way. Nothing enforces it; see [job length estimates](#job-length-estimates) |
 | `progress_command` | none | run in the workdir during phase `main`; its last line of stdout is how far along the job is |
 | `progress_interval_s` | `60` | how often to run it; **minimum 5** |
-| `low_util` | on | `{enabled: true, window_min: 25, floor_pct: 5, grace_min: 10}` — the idle-GPU watchdog |
 | `auto_preempt` | `false` | let the host stop this job whenever that lets a job queued at a **lower** `priority` number start right away; see [automatic preemption](#automatic-preemption) |
 | `requires` | `{}` | e.g. `cuda_min: "12.8"`. **Informs provisioning only**; the host never checks it |
 | `cleanup` | `on_success` | when the runner deletes `workdir/`: `on_success`, `always`, `never` |
@@ -219,7 +218,7 @@ estimates it has: cards come free at the eta of whatever holds them and the
 queue is taken in order, because a job that does not fit
 [holds the cards it is waiting for](#priority-is-not-advisory). It is evidence
 or it is absent: a job whose turn depends on a job that
-estimated nothing has no `starts` at all, and a paused or draining host projects
+estimated nothing has no `starts` at all, and a draining host projects
 nothing, because nothing is being dispatched. A job waiting for more than one
 card says so (`needs 2 gpus`), which is the answer to "there is a card free, why
 is it still queued".
@@ -260,7 +259,7 @@ The host only does it when it is worth it, and the rules are the command's:
   job that just gave it up. That is the ordinary dispatch rule, not something
   preemption does for itself: see [priority is not
   advisory](#priority-is-not-advisory).
-- **The host has to be dispatching.** Paused or draining, nothing is stopped:
+- **The host has to be dispatching.** Draining, nothing is stopped:
   the cards would go to nobody, and a job stopped on a pod that is about to
   terminate may never be queued again at all.
 
@@ -313,7 +312,7 @@ job 20260915-233000-112233 queued on host spar (attempt 1)
 
 The start time is [projected](#job-length-estimates) from what the jobs ahead
 estimated. Where it cannot be projected the line says so *and why* — `start time
-unknown (host spar is paused, so nothing is being dispatched)`, or a job ahead
+unknown (host spar is draining, so nothing more will be dispatched)`, or a job ahead
 that gave no estimate, or a job asking for more cards than the host has — and
 the whole line is absent when the host could not be asked again, since the job
 is queued either way. A dispatcher that got there first prints `dispatched
@@ -331,11 +330,7 @@ is `name (job-id)`. It is the at-a-glance view: card UUIDs are in
 `--recent N` (default 5) and `--since 24h|7d|90m` (a bare number means hours)
 choose how much of the finished list to show; `--all` adds jobs only the local
 index and the S3 index know, which is how you find what was on a host that lost
-its state; `--json` is [below](#exit-codes-and---json). `--suspects` lists running
-jobs that are billing but idle and **never kills anything**: a job is a suspect
-only in phase `main`, judged by **its own `low_util` settings** as the host
-reports them, so a job that raised its floor is judged by what it asked for and
-one with `enabled: false` is never listed.
+its state; `--json` is [below](#exit-codes-and---json).
 
 ```
 host local [local]  gpus 0/1 free (driver 580.173.02)
@@ -422,8 +417,8 @@ all. See [automatic preemption](#automatic-preemption).
 everything it has done, so a preempt that would just re-run the same job is
 refused (exit 1) rather than quietly doing that: nothing else queued, nothing
 queued that sorts ahead of where this job would land (pass `--priority` above
-that job, and the refusal says which one), or a host that is paused or
-draining and so is dispatching nothing at all. **Queue the job you want to run
+that job, and the refusal says which one), or a host that is draining and so
+is dispatching nothing at all. **Queue the job you want to run
 first, then preempt.** Queued and finished jobs are refused too: `gpuc reorder`
 moves a queued one, `gpuc requeue` re-runs a finished one.
 
@@ -564,8 +559,8 @@ machines sharing one account still can, for the length of one `create`.
 satisfies *all* of: it has a `desired/` record; that record's offer still
 matches the request (GPU name, `--min-vram`, `--max-price`, tier, CUDA floor);
 it owns at least `--gpu-count` cards; the provider says the pod exists and is
-`RUNNING`; its dispatcher heartbeat is under 30 s old; it is not draining; it is
-not paused. A registered pod the provider no longer has is forgotten on the spot
+`RUNNING`; its dispatcher heartbeat is under 30 s old; it is not draining. A
+registered pod the provider no longer has is forgotten on the spot
 rather than dialled. Image, disk and `--idle-min` are *not* compared: a reused
 pod keeps the ones it was created with.
 
@@ -583,8 +578,7 @@ pod before unwinding.
 
 <a name="auto-down"></a>
 **Auto-down.** The pod terminates itself when nothing is running and the queue
-has been empty for `--idle-min`, or after two consecutive `low-util` failures.
-Either way it drains first: it retries any unconfirmed outputs, mirrors every
+has been empty for `--idle-min`. It drains first: it retries any unconfirmed outputs, mirrors every
 job's log and state, and then calls the provider. A failed mirror does **not**
 hold up the terminate — the state is already on disk here, and a bucket we
 cannot reach is not a reason to keep a paid pod billing. Only a failed
@@ -687,17 +681,12 @@ reads as `queued` again. The workdir and the job's secrets file are kept
 whatever `cleanup:` says, because the next attempt is that same job id and
 nothing delivers either a second time.
 
-The low-util watchdog samples the assigned cards every 30 s **during phase
-`main` only**, so downloads and compiles in `setup` can never look idle. Once
-`grace_min` minutes of `main` have passed, a rolling mean below `floor_pct` over
-a full `window_min` window kills the job as `failed: low-util`. A sample
-nvidia-smi could not produce is recorded as unknown and never counted as 0%.
-Two consecutive low-util failures **pause** the host: it stops dispatching and,
-if it is ephemeral, drains and terminates — but never out from under a job.
-With anything still running it asks those runners to stop (reason
-`low-util-pause`) and drains on a later pass, so their outputs are uploaded.
-The pause is a file on the host and survives a dispatcher restart; clearing it
-is `gpuc host resume <host>` (below).
+Utilization is sampled on the assigned cards every 30 s **during phase `main`
+only**, so downloads and compiles in `setup` never show as idle, and it is
+shown by `status` and nothing else: once the GPU check has passed, a job that
+leaves its cards idle is the job's business, never a reason to stop it or the
+host. A sample nvidia-smi could not produce is recorded as unknown and never
+counted as 0%.
 
 Every `failed: <reason>`:
 
@@ -708,8 +697,6 @@ Every `failed: <reason>`:
 | `gpu-assert` | an assigned GPU (index or UUID) is not present in the host's `nvidia-smi` |
 | `gpu-preflight` | a real GPU op inside the job's venv failed, or `device_count()` did not match `gpus:` — usually a CPU-only torch |
 | `sync-preflight` | the uploads the job would do at the end cannot work (no `aws`/`hf`, a missing secret, an unwritable bucket or repo) |
-| `low-util` | the GPU sat under `floor_pct` for a full `window_min` of `main` |
-| `low-util-pause` | the host paused after two low-util failures and asked this job to stop so it could drain |
 | `timeout` | `max_runtime_min` elapsed |
 | `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt; the job is queued again as the next one, and this is the record of the attempt that was stopped |
 | `terminated` | the runner itself was signalled (and the job was not cancelled) |
@@ -807,15 +794,14 @@ fields. Beyond what the example shows:
   job is finished. `progress_pct` survives the job so you can see how far it
   got; `progress_error` is why the last poll produced nothing.
 - `attempt`, `started_at`, `exit_code`, `outputs_lost`, `workdir_bytes`,
-  `suspect` (the `--suspects` judgement), `outputs` (the spec's, as the host
-  holds them) and `links` — one `{kind, path, target, url}` per place the
+  `outputs` (the spec's, as the host holds them) and `links` — one `{kind, path, target, url}` per place the
   results, W&B run or mirrored log can be opened (`kind` is `s3`, `hf`,
   `wandb` or `mirror`), derived from what the job declared and never checked.
 - A job's `util` is its **last** sample from the host's own nvidia-smi; a
   pod's `provider_util` is the provider's per-GPU reading for the whole pod,
   null for any other host. Two measurements that will differ.
 
-Per host: `target`, `draining`, `paused`, `pod_gone`, `pod` (the provider's
+Per host: `target`, `draining`, `pod_gone`, `pod` (the provider's
 view of an ephemeral host's pod, null elsewhere) and `pkg_commit`, the host's
 own answer for the build it runs — `null` means the host did not say, never
 "up to date", and a reachable host that did not say is one on a build old
@@ -824,7 +810,7 @@ the host cannot see appears in `gpus` as `{"owned_as": "3", "available":
 false}`; `shared_gpus` has the same shape plus `unused` (the host's verdict:
 no memory held and no work running) and `busy_job` (one of *our* jobs has it),
 and a missing one is `{"shared_as": "5", "available": false}`. `--recent` and
-`--since` apply to `--json`; `--suspects` and `--all` do not.
+`--since` apply to `--json`; `--all` does not.
 
 Rules for anything automated:
 
@@ -862,7 +848,7 @@ survived, which never implies a non-zero exit by itself (`clean` and
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued. The queue fields are the host's answer a moment *after* the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, `starts_unknown` says why there is no start time (a paused or draining host, a job ahead that estimated nothing, a job that asks for more cards than the host has) and is null when there is one, and every one of them is null when the host could not be asked again — never a reason to think the job was not queued |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued. The queue fields are the host's answer a moment *after* the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, `starts_unknown` says why there is no start time (a draining host, a job ahead that estimated nothing, a job that asks for more cards than the host has) and is null when there is one, and every one of them is null when the host could not be asked again — never a reason to think the job was not queued |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
@@ -1071,12 +1057,10 @@ looks like it is saying.
 | symptom | what it means | what to do |
 | --- | --- | --- |
 | `status` says `dispatcher DOWN` | nothing holds the host's lock, or its heartbeat is over 30 s old | `gpuc host bootstrap <host>` (idempotent); any `gpuc submit` also restarts it |
-| `status` says `PAUSED (low-util)` | two consecutive jobs failed `low-util`, so the host stopped dispatching until told otherwise | fix the jobs (or their `low_util`), then `gpuc host resume <host>`. Re-bootstrapping restarts the dispatcher but does not clear the pause |
 | provisioning gives up with "no direct SSH endpoint" | RunPod never exposed port 22 within the 15-minute ceiling — usually a bad placement | the pod was already terminated; re-run the submit, or widen `--gpu` / `--cloud any` |
 | `ssh ... cannot create its ControlMaster socket` | the socket path would be over the 100-byte limit gpuc enforces | point `XDG_RUNTIME_DIR` at a short directory, or unset it to use `/tmp/gpuc-<uid>` |
 | bootstrap fails with "host health failed" | the driver, disk or network check on the host said no | read the named check; fix the host (free disk, load the driver) and re-run bootstrap |
 | job is `failed: gpu-preflight` | torch in the job's venv has no working CUDA, or sees the wrong number of devices | check the torch build against the host's driver (`gpuc host probe`), and that `gpus:` matches what the job expects |
-| job is `failed: low-util` | the GPU sat under `floor_pct` for a full `window_min` of phase `main` | raise `low_util.grace_min`, lower `floor_pct`, or set `low_util.enabled: false` for genuinely CPU-bound work |
 | job is `failed: sync` (or `...+sync`) | the final upload failed; the run itself may have been fine | check the tail of `gpuc logs <job-id>`; usually a missing `secrets:` entry for the destination, or no `aws`/`hf` on the host (re-run bootstrap) |
 | job is `failed: sync-preflight` | the uploads the job would do at the end cannot work | the log names the exact command and error; fix the credential or destination, or add `hf_create: true`, then re-submit |
 | job is `failed: no-outputs` | the `outputs:` path was never written, or holds only what came with the checkout | check the job writes there, relative to the workdir; use a `{job_id}` subdirectory |

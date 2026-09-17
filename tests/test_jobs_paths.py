@@ -65,7 +65,6 @@ def test_spec_round_trip_applies_defaults(gpuc_home: Path) -> None:
     loaded = jobs.read_spec("j1")
     assert loaded.gpus == 1
     assert loaded.priority == 50
-    assert loaded.low_util.window_min == 25.0
     assert loaded.outputs[0].s3 == "s3://b/{job_id}/results"
     assert loaded == spec
 

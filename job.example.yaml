@@ -59,12 +59,6 @@ estimated_runtime_min: 480
 # to repeat; see docs/usage.md "Automatic preemption".
 auto_preempt: false
 
-low_util:                                       # kill a job that is not using the GPU
-  enabled: true
-  window_min: 25                                # rolling mean over this window
-  floor_pct: 5                                  # below this is "idle"
-  grace_min: 10                                 # no killing before this much of phase=main
-
 requires:
   cuda_min: "12.8"                              # informs provisioning only
 

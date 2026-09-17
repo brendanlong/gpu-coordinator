@@ -57,15 +57,6 @@ class OutputModel(BaseModel):
     """Let the sync preflight create this Hugging Face repo if it is missing."""
 
 
-class LowUtilModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    window_min: float = 25.0
-    floor_pct: float = 5.0
-    grace_min: float = 10.0
-
-
 class JobSpecModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -90,7 +81,6 @@ class JobSpecModel(BaseModel):
     line of stdout is how far along the job is, as a fraction of one (`0.42`) or
     a percentage written with a `%` (`42%`)."""
     progress_interval_s: float = Field(default=progress.DEFAULT_INTERVAL_S, ge=5)
-    low_util: LowUtilModel = Field(default_factory=LowUtilModel)
     auto_preempt: bool = False
     """Let the host stop this job, as often as it takes, whenever that lets a
     job queued at a lower `priority` number start right away. It re-runs from

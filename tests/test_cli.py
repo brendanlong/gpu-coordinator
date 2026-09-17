@@ -31,7 +31,7 @@ from gpuc.control.config import (
 from gpuc.control.providers.base import Constraints
 from gpuc.control.remote import HostSession, RemoteError
 from gpuc.control.status import placement_unknown
-from gpuc.control.submit import SubmitResult
+from gpuc.control.submit import JobSpecModel, SubmitResult
 from tests.conftest import host_entry, register_host
 from tests.fakehost import FakeHost
 from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
@@ -1314,6 +1314,38 @@ def test_requeue_json_names_the_job_it_came_from(
     document = one_document(capsys)
     assert document["requeued_from"] == "20260101-000000-aaaaaa"
     assert (document["job_id"], document["attempt"]) == ("new", 2)
+
+
+def test_requeue_ignores_spec_keys_an_older_build_mirrored(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror holds what some build wrote; `low_util` was in every spec
+    before the watchdog went, and a submit's typo check is the wrong tool for
+    a file no person typed."""
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
+        {
+            "job_id": "20260101-000000-aaaaaa",
+            "command": "true",
+            "gpus": 0,
+            "low_util": {"enabled": False, "window_min": 25, "floor_pct": 5, "grace_min": 10},
+            "from_the_future": {"unknown": True},
+        }
+    ).encode()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    submitted: list[JobSpecModel] = []
+
+    def fake_submit(entry: Any, model: JobSpecModel, *a: Any, **k: Any) -> SubmitResult:
+        submitted.append(model)
+        return SubmitResult(job_id="new", host=entry.name, attempt=2)
+
+    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    register_host(name="local", gpus=GPU)
+    capsys.readouterr()
+
+    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
+    assert [m.command for m in submitted] == ["true"]
 
 
 def test_cancel_json_is_the_hosts_own_answer(

@@ -103,7 +103,6 @@ def gpu_job(command: str, name: str = "gpu-e2e", priority: int = 50) -> str:
         f"priority: {priority}\n"
         "gpus: 1\n"
         "setup: uv sync --frozen --quiet\n"
-        "low_util:\n  enabled: false\n"
     )
 
 

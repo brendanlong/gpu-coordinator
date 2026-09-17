@@ -675,20 +675,6 @@ def test_reuse_skips_a_draining_host(
     assert any("draining" in line for line in reports)
 
 
-def test_reuse_skips_a_paused_host(
-    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
-    provider.adopt(pod)
-    _register_reusable(pod)
-    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(2.0, paused=True))
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=lambda _: None)
-        is None
-    )
-
-
 def test_reuse_skips_a_host_with_too_few_gpus(
     control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -348,7 +348,7 @@ function section(label, headers, rows) {
 
 function runningTable(host) {
   if (!host.running.length) return null;
-  const rows = host.running.map((job) => el("tr", { class: job.suspect ? "suspect" : null },
+  const rows = host.running.map((job) => el("tr", {},
     el("td", {}, jobLabel(job)),
     el("td", {}, job.phase || "-"),
     el("td", { class: "num" }, fmtElapsed(job)),
@@ -431,7 +431,6 @@ function hostHeader(host, entry) {
   );
   const flags = el("div", { class: "flags" },
     host.draining ? badge("DRAINING", "warn") : null,
-    host.paused ? badge(`PAUSED (low-util); resume with gpuc host resume ${host.name}`, "warn") : null,
   );
   return [
     el("header", {},

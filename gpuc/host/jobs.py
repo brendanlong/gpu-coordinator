@@ -231,23 +231,6 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 
 @dataclass
-class LowUtil:
-    enabled: bool = True
-    window_min: float = 25.0
-    floor_pct: float = 5.0
-    grace_min: float = 10.0
-
-    @staticmethod
-    def from_dict(d: Any) -> LowUtil:
-        return LowUtil(
-            enabled=as_bool(d, "enabled", True),
-            window_min=as_float(d, "window_min", 25.0),
-            floor_pct=as_float(d, "floor_pct", 5.0),
-            grace_min=as_float(d, "grace_min", 10.0),
-        )
-
-
-@dataclass
 class Output:
     path: str
     s3: str | None = None
@@ -304,7 +287,6 @@ class JobSpec:
     percentage written with a `%` (`42%`). It replaces the submitter's estimate
     with a measured one. A failure is recorded and ignored; see `progress.py`."""
     progress_interval_s: float = progress.DEFAULT_INTERVAL_S
-    low_util: LowUtil = field(default_factory=LowUtil)
     auto_preempt: bool = False
     """Let the dispatcher stop this job whenever that starts a more important
     one right away, as often as it takes: see `dispatcher.preempt_for_waiting`.
@@ -347,7 +329,6 @@ class JobSpec:
             estimated_runtime_min=as_opt_float(fields, "estimated_runtime_min"),
             progress_command=as_opt_str(fields, "progress_command"),
             progress_interval_s=_polling_interval(fields),
-            low_util=LowUtil.from_dict(fields.get("low_util")),
             auto_preempt=as_bool(fields, "auto_preempt"),
             requires=dict(fields.get("requires") or {})
             if isinstance(fields.get("requires"), dict)

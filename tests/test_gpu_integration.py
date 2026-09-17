@@ -81,7 +81,6 @@ def spec_for(command: str, **overrides: object) -> JobSpec:
         "command": command,
         "gpus": 1,
         "setup": "uv sync --frozen --quiet",
-        "low_util": {"enabled": False},
     }
     document.update(overrides)
     return JobSpec.from_dict(document)

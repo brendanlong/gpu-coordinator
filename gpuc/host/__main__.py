@@ -130,10 +130,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             continue
         spec = _spec(job_id)
         entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
-        # The watchdog rule this job is actually being judged by, so
-        # `gpuc status --suspects` names the jobs the host is about to kill
-        # rather than applying a constant of its own.
-        entry["low_util"] = asdict(spec.low_util) if spec else None
         # From the spec, not the state: a *queued* job has no eta yet, and its
         # estimate is exactly what somebody deciding whether to queue behind it
         # needs. The control side never sees the spec.
@@ -195,7 +191,6 @@ def cmd_status(args: argparse.Namespace) -> int:
                 **_gpu_table(config),
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),
-                "paused": paths.paused_file().exists(),
                 "dispatcher_heartbeat_age_s": None if heartbeat is None else round(heartbeat, 1),
                 "queue": [
                     {"priority": e.priority, "job_id": e.job_id} for e in queue.list_queued()
@@ -399,12 +394,6 @@ def cmd_purge(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_resume(_: argparse.Namespace) -> int:
-    paths.paused_file().unlink(missing_ok=True)
-    print(json.dumps({"paused": False, "dispatcher_pid": dispatcher.spawn_detached_dispatcher()}))
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m gpuc.host")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -493,10 +482,6 @@ def build_parser() -> argparse.ArgumentParser:
         "the horizon",
     )
     purge.set_defaults(func=cmd_purge)
-
-    sub.add_parser("resume", help="clear a low-util pause and restart dispatching").set_defaults(
-        func=cmd_resume
-    )
 
     sub.add_parser("dispatch", help="run the dispatcher loop").set_defaults(func=dispatcher.main)
 

@@ -229,9 +229,6 @@ def test_submit_runs_a_job_and_logs_and_status_find_it(
     assert job_id in status
     assert "succeeded" in status
 
-    assert main(["status", "--suspects"]) == 0
-    assert "no suspects" in capsys.readouterr().out
-
 
 def test_submit_says_where_in_the_queue_the_job_landed(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]

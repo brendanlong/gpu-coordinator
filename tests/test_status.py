@@ -37,7 +37,6 @@ def payload(**overrides: Any) -> dict[str, Any]:
         "gpus": [GPU, "GPU-b"],
         "ephemeral": False,
         "draining": False,
-        "paused": False,
         "dispatcher_heartbeat_age_s": 2.0,
         "queue": [{"priority": 10, "job_id": "j-queued"}],
         "jobs": [
@@ -117,87 +116,16 @@ def test_free_gpus_exclude_the_ones_a_running_job_holds() -> None:
     assert view().free == ["GPU-b"]
 
 
-def test_a_busy_job_is_not_a_suspect() -> None:
-    assert view().suspects == []
+def test_the_idle_line_survives_gpu_and_pod_lines() -> None:
+    """The "nothing here" line is about the jobs, not about the host block.
 
-
-def test_a_full_window_of_floor_utilization_in_main_is_a_suspect() -> None:
-    idle = view()
-    idle.running[0].util_recent = [0.0] * 40
-    assert [j.job_id for j in idle.suspects] == ["j-running"]
-    assert "SUSPECT train (j-running)" in render(idle, suspects_only=True)
-
-
-def test_the_suspect_rule_is_the_jobs_own_low_util_settings() -> None:
-    """The host's watchdog is per job, so `--suspects` has to be too."""
-    off = view()
-    off.running[0].util_recent = [0.0] * 40
-    off.running[0].low_util.enabled = False
-    assert off.suspects == []
-
-    raised = view()
-    raised.running[0].util_recent = [30.0] * 40
-    assert raised.suspects == []
-    raised.running[0].low_util.floor_pct = 50.0
-    assert [j.job_id for j in raised.suspects] == ["j-running"]
-
-    short_window = view()
-    short_window.running[0].util_recent = [0.0] * 6
-    assert short_window.suspects == []
-    short_window.running[0].low_util.window_min = 1.0
-    short_window.running[0].low_util.grace_min = 1.0
-    assert [j.job_id for j in short_window.suspects] == ["j-running"]
-
-
-def test_low_util_settings_come_from_the_hosts_payload() -> None:
-    running = job_views(
-        payload(
-            jobs=[
-                {
-                    "job_id": "j",
-                    "status": "running",
-                    "phase": "main",
-                    "gpus": [GPU],
-                    "util_recent": [0.0] * 40,
-                    "low_util": {"enabled": False},
-                }
-            ]
-        )
-    )[1]
-    assert running[0].low_util.enabled is False
-    assert running[0].suspect is False
-
-
-def test_the_idle_and_no_suspect_lines_survive_gpu_and_pod_lines() -> None:
-    """The "nothing here" lines are about the jobs, not about the host block.
-
-    A host with GPUs (every real host) printed neither, because the sentinel
+    A host with GPUs (every real host) never printed it, because the sentinel
     compared against the whole rendered block rather than the job body.
     """
     empty = view(jobs=[], queue=[])
     empty.pod = Pod(id="pod1", name="gpuc-x", status="RUNNING", cost_usd_hr=0.4)
     assert "  gpu     " in render(empty)
     assert "idle; nothing queued, running or finished" in render(empty)
-    assert "no suspects" in render(empty, suspects_only=True)
-
-
-def test_a_long_setup_phase_is_never_a_suspect() -> None:
-    setup = view()
-    setup.running[0].phase = "setup"
-    setup.running[0].util_recent = [0.0] * 40
-    assert setup.suspects == []
-    assert "no suspects" in render(setup, suspects_only=True)
-
-
-def test_a_job_with_too_few_samples_is_not_yet_a_suspect() -> None:
-    fresh = view()
-    fresh.running[0].util_recent = [0.0] * 5
-    assert fresh.suspects == []
-
-
-def test_a_cpu_only_job_is_never_a_suspect() -> None:
-    cpu = JobView(job_id="j", status="running", phase="main", gpus=[], util_recent=[0.0] * 30)
-    assert not cpu.suspect
 
 
 def test_render_shows_the_host_line_queue_running_and_recent() -> None:
@@ -281,7 +209,6 @@ def test_null_utilization_samples_are_dropped() -> None:
         }
     )
     assert running[0].util_recent == [90.0, 80.0]
-    assert not running[0].suspect
 
 
 class _GoneProvider:
@@ -896,11 +823,9 @@ def test_a_cpu_job_is_not_described_as_needing_no_cards() -> None:
     assert "queued  j-cpu prio=50 starts now" in render(view)
 
 
-def test_nothing_starts_on_a_paused_or_draining_host() -> None:
+def test_nothing_starts_on_a_draining_host() -> None:
     view = busy(running_job(gpus=[GPU]), queued=[waiting("j-next")])
-    view.paused = True
-    assert queue_start_estimates(view) == {}
-    view.paused, view.draining = False, True
+    view.draining = True
     assert queue_start_estimates(view) == {}
     assert "starts" not in render(view)
 
@@ -962,16 +887,14 @@ def test_an_unreachable_host_places_nothing_rather_than_reporting_an_empty_queue
 
 def test_a_queued_job_whose_turn_cannot_be_dated_says_why() -> None:
     """Each reason is a different thing to do about it, and "a job ahead of it"
-    is a lie to tell the only job in the queue of a host that is paused."""
+    is a lie to tell the only job in the queue of a host that is draining."""
     view = busy(running_job(gpus=[GPU, "GPU-b"]), queued=[waiting("j-next")])
     note = queue_note(queue_placement(view, "j-next"))
     assert note is not None and note.endswith(
         "start time unknown (the jobs holding the cards it needs gave no end time)"
     )
 
-    view.paused = True
-    assert "host gpubox is paused" in str(queue_note(queue_placement(view, "j-next")))
-    view.paused, view.draining = False, True
+    view.draining = True
     assert "host gpubox is draining" in str(queue_note(queue_placement(view, "j-next")))
 
     view.draining = False

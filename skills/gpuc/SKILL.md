@@ -86,8 +86,6 @@ auto_preempt: false                # true: the host stops this job whenever that
                                    # queued at a LOWER priority number start now, and queues it
                                    # again as attempt+1. It RE-RUNS FROM THE START, any number
                                    # of times, and may wait for ever on a busy host
-low_util:                          # kills a job whose GPU sits idle; defaults are conservative
-  enabled: true                    # {window_min: 25, floor_pct: 5, grace_min: 10}
 cleanup: on_success                # workdir deleted after a successful run
 ```
 
@@ -139,8 +137,6 @@ gpuc status                      # every host: free cards, queue, running job + 
 gpuc status --json               # the same, machine-readable; --json is on every command
                                  # that has an answer (see "Exit codes" below). A human
                                  # wants `gpuc web serve`: the same in a browser
-gpuc status --suspects           # running jobs that are billing but idle, judged by each job's
-                                 # own low_util window/floor/grace; it never kills anything
 gpuc status --all                # adds jobs only the index knows (a host that lost its state)
 gpuc logs <jobid> [-f]           # tails the host; falls back to the S3 mirror only if that job
                                  # has an s3_prefix (its own or the host's) and s3_bucket is set
@@ -171,9 +167,7 @@ gpuc pods                        # RunPod: every pod we own, cost, age, util, wa
 
 A job's status is its exit code. `failed: <reason>` reasons you will see:
 `gpu-preflight` (no working CUDA in the venv), `sync-preflight` (aws/hf or
-credentials missing), `low-util` (idle GPU), `low-util-pause` (the host paused
-after two low-util failures and stopped this job so it could drain), `timeout`
-(`max_runtime_min`), `preempted`
+credentials missing), `timeout` (`max_runtime_min`), `preempted`
 (`gpuc preempt` -- or the job's own `auto_preempt` -- stopped that attempt; the job is
 queued again as the next one), `sync`
 (final upload failed; results exist only on the host), `no-outputs` (the output
@@ -186,7 +180,8 @@ results are gone, and only re-running the job brings them back.
 
 Never fire-and-forget. After submitting, confirm the job reaches phase `main`
 and that its first log lines look right, then check back on a timer. Do not kill
-a job on a wall-clock guess; `--suspects` shows the signals to judge from.
+a job on a wall-clock guess; `gpuc status` shows the phase, utilization and
+estimate to judge from.
 
 ## Exit codes and `--json` (read this before scripting anything)
 
@@ -229,7 +224,7 @@ scraping any of the text output.
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a paused host, a job ahead that estimated nothing — and is null when there is one |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a draining host, a job ahead that estimated nothing — and is null when there is one |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `cancel` | `{job_id, host, status}` |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`; `status` is `preempting` and `priority` is what it will be queued again at |
@@ -276,8 +271,7 @@ Rules, and they are not optional:
 - An existing gpuc pod is reused instead of a new one when its recorded offer
   still matches the request (GPU name, VRAM, price, tier, CUDA floor), it owns
   enough cards, the provider says it is RUNNING, its dispatcher heartbeat is
-  under 30 s old, and it is neither draining nor paused. `--no-reuse` forces a
-  new one.
+  under 30 s old, and it is not draining. `--no-reuse` forces a new one.
 - There is **no overall pod lifetime**; per-job `max_runtime_min` is the cap,
   and the idle timer (`--idle-min`) is the only thing that ends a healthy pod.
 - A pod that stops answering (dead dispatcher, no ssh) with nothing running is

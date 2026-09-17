@@ -303,14 +303,14 @@ def test_job_spec_tolerates_nulls_and_unknown_keys() -> None:
             "secrets": None,
             "outputs": None,
             "max_runtime_min": None,
-            "low_util": None,
             "cleanup": None,
             "telemetry": {"unknown": True},
+            # What every build before the watchdog was removed wrote.
+            "low_util": {"enabled": True, "window_min": 25, "floor_pct": 5, "grace_min": 10},
         }
     )
     assert (spec.gpus, spec.priority, spec.sync_interval_s) == (1, 50, 180)
     assert spec.max_runtime_min is None  # optional: no cap
-    assert spec.low_util.window_min == 25.0
     assert spec.cleanup == "on_success"
 
 

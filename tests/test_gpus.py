@@ -105,8 +105,7 @@ def test_mean_utilization_propagates_the_parse_error() -> None:
 def test_no_samples_for_real_gpus_is_an_error_not_zero_percent() -> None:
     """0% is a claim about an idle card; "nvidia-smi said nothing" is not.
 
-    Returning 0.0 here fed the low-util watchdog a floor-breaking sample every
-    tick and killed jobs that were perfectly busy.
+    Returning 0.0 here showed jobs that were perfectly busy as idle.
     """
     with pytest.raises(gpus.GpuError, match="failed sample"):
         gpus.mean_utilization(["GPU-x"], lambda args: "")

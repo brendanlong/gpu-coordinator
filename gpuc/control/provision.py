@@ -720,9 +720,6 @@ def pick_reusable_host(
             # It is terminating itself; a job enqueued now dies with the pod.
             report(f"reuse: skipping {entry.name}, it is draining (terminating itself)")
             continue
-        if status.get("paused"):
-            report(f"reuse: skipping {entry.name}, its queue is paused after two low-util failures")
-            continue
         report(f"reusing host {entry.name} ({pod.id}, heartbeat {age:.0f}s old)")
         return entry
     return None

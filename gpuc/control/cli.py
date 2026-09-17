@@ -500,14 +500,6 @@ def cmd_host_remove(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_host_resume(args: argparse.Namespace) -> int:
-    entry = named_registry().require(args.name)
-    payload = open_session(entry, load_settings()).host_json("resume")
-    pid = payload.get("dispatcher_pid") if isinstance(payload, dict) else None
-    print(f"host {args.name}: low-util pause cleared, dispatcher pid {pid or '?'}")
-    return 0
-
-
 def cmd_host_list(args: argparse.Namespace) -> int:
     read = read_registry_warned()
     registry = read.registry
@@ -1036,19 +1028,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(NO_HOSTS)
         # ...but `--all` still has something to say: the index remembers jobs
         # whose host has since been removed.
-        if args.all and not args.suspects:
+        if args.all:
             _print_unhosted(settings, set(), args.host)
         return EXIT_OK
     provider = provider_for_status(entries, settings)
     seen: set[str] = set()
     for view in gather_all(entries, settings, provider):
         seen.update(job.job_id for job in view.queue + view.running + view.finished)
-        print(
-            status_mod.render(
-                view, recent=args.recent, suspects_only=args.suspects, since_s=since_s
-            )
-        )
-    if args.all and not args.suspects:
+        print(status_mod.render(view, recent=args.recent, since_s=since_s))
+    if args.all:
         _print_unhosted(settings, seen, args.host)
     return EXIT_OK
 
@@ -1301,8 +1289,9 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             f"Check the id with `gpuc status --all`; only jobs submitted with s3_bucket "
             f"set can be requeued."
         ) from exc
-    for key in ("job_id", "attempt"):
-        document.pop(key, None)
+    # The mirror holds what some build wrote: the id and attempt are this
+    # run's to assign, and a key this build does not know is not a typo.
+    document = {k: v for k, v in document.items() if k in JobSpecModel.model_fields}
     attempt = (index.attempt if index else 1) + 1
     model = validate(document, f"spec for {args.job_id}")
     use_git = not args.no_git
@@ -1590,11 +1579,6 @@ def build_parser() -> argparse.ArgumentParser:
     host_list = host.add_parser("list", help="list registered hosts")
     add_json_flag(host_list)
     host_list.set_defaults(func=cmd_host_list)
-    resume = host.add_parser(
-        "resume", help="clear a low-util pause on a host and restart its dispatcher"
-    )
-    resume.add_argument("name")
-    resume.set_defaults(func=cmd_host_resume)
     remove = host.add_parser("remove", help="forget a host")
     remove.add_argument("name")
     remove.set_defaults(func=cmd_host_remove)
@@ -1623,7 +1607,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--host", metavar="NAME", help="only this host; omit for every registered host"
     )
     status.add_argument("--all", action="store_true", help="also list jobs only the index knows")
-    status.add_argument("--suspects", action="store_true", help="billing but idle; never kills")
     status.add_argument(
         "--recent",
         type=int,

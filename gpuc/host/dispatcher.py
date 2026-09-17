@@ -549,7 +549,6 @@ class Dispatcher:
     _last_submit_sweep_at: float | None = None
     _kill_sent: dict[str, float] = field(default_factory=dict)
     _kill_escalated: set[str] = field(default_factory=set)
-    _pause_drain_pending: bool = False
     _config: jobs.HostConfig | None = None
     _owned: list[str] | None = None
     _unavailable: tuple[str, ...] = ()
@@ -816,11 +815,10 @@ class Dispatcher:
     def escalate_kills(self) -> None:
         """Make a kill *request* stick when the runner never acts on it.
 
-        A low-util pause asks the runner to stop its job and sync,
-        which is right when the runner is healthy and is nothing at all when it
-        is wedged: the marker sits there, the job keeps running, and an
-        ephemeral host that should have died hours ago keeps billing with a
-        fresh heartbeat. So the ask gets the same ladder a cancel gets.
+        A preempt asks the runner to stop its job and sync, which is right
+        when the runner is healthy and is nothing at all when it is wedged: the
+        marker sits there, the job keeps running, and the job waiting for its
+        cards never starts. So the ask gets the same ladder a cancel gets.
         """
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
@@ -1045,7 +1043,7 @@ class Dispatcher:
         cards included: having taken one of somebody else's spare cards towards
         its total, giving it to the job behind would leave it short again.
         """
-        if self.paused() or paths.draining_file().exists():
+        if paths.draining_file().exists():
             return
         visible = len(self.owned_gpus())
         free = self.free_gpus()
@@ -1175,7 +1173,7 @@ class Dispatcher:
         it would rather start over than hold a card something better wants, and
         a host with a steady supply of better work may never run it at all.
         """
-        if self.paused() or self._going_away() is not None:
+        if self._going_away() is not None:
             return
         candidates = self.auto_preemptable()
         if not candidates:
@@ -1286,49 +1284,7 @@ class Dispatcher:
         )
         return True
 
-    # -- pause / terminate ----------------------------------------------
-    def paused(self) -> bool:
-        return paths.paused_file().exists()
-
-    def recent_low_util_failures(self, count: int = 2) -> bool:
-        finished: list[tuple[str, jobs.JobState]] = []
-        for job_id in jobs.list_job_ids():
-            try:
-                state = jobs.read_state(job_id)
-            except RuntimeError:
-                continue
-            if state.finished and state.ended_at:
-                finished.append((state.ended_at, state))
-        finished.sort(key=lambda pair: pair[0], reverse=True)
-        latest = [state for _, state in finished[:count]]
-        return len(latest) == count and all(
-            s.status == "failed" and s.reason == "low-util" for s in latest
-        )
-
-    def check_pause(self) -> None:
-        """Pause on two consecutive low-util failures, and on an ephemeral host
-        go away afterwards -- but never out from under a job that is still
-        running. Draining there terminated the pod with the other jobs' runners
-        still working: no kill marker, no final sync, outputs gone with the pod.
-        We ask; the drain happens on a later pass with nothing left running.
-        """
-        if not self.paused():
-            if not self.recent_low_util_failures():
-                return
-            jobs.atomic_write_text(
-                paths.paused_file(),
-                "two consecutive jobs failed with reason low-util; queue paused\n",
-            )
-            self.log("PAUSED: two consecutive low-util failures; not dispatching further jobs")
-            self._pause_drain_pending = self.config.ephemeral
-        if not self._pause_drain_pending:
-            return
-        if self.running:
-            self._request_kills("low-util-pause", "the queue paused on low utilization")
-            return
-        self._pause_drain_pending = False
-        self.drain_and_terminate("two consecutive low-util failures")
-
+    # -- terminate ------------------------------------------------------
     def maybe_terminate(self) -> None:
         config = self.config
         if not config.ephemeral:
@@ -1347,28 +1303,6 @@ class Dispatcher:
         idle_s = now - self._queue_empty_since
         if idle_s >= config.idle_minutes * 60.0:
             self.drain_and_terminate(f"idle for {idle_s / 60.0:.1f} min")
-
-    def _request_kills(self, reason: str, why: str) -> None:
-        """Stop the running jobs so their runners can sync before we terminate.
-
-        The runner owns the kill and the final sync, so this asks rather than
-        signals: each job ends `failed: <reason>` with its outputs uploaded, and
-        the next pass -- with nothing running -- drains and terminates. When the
-        ask goes unanswered `escalate_kills` stops being polite.
-        """
-        now = self.deps.monotonic()
-        for job_id in sorted(self.running):
-            if queue.kill_reason(job_id):
-                # A marker from before this dispatcher took over still needs a
-                # clock, or nothing would ever escalate it.
-                self._kill_sent.setdefault(job_id, now)
-                continue
-            queue.request_kill(job_id, reason)
-            self._kill_sent[job_id] = now
-            self.log(
-                f"{why} with job {job_id} running: asked its runner to stop it "
-                f"(reason {reason}) and sync before this host terminates"
-            )
 
     def drain_and_terminate(self, why: str) -> bool:
         config = self.config
@@ -1586,7 +1520,6 @@ class Dispatcher:
         self.reap()
         self.handle_cancels()
         self.escalate_kills()
-        self.check_pause()
         self.launch_ready()
         self.preempt_for_waiting()
         self.maybe_reclaim()

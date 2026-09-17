@@ -102,7 +102,6 @@ table { border-collapse: collapse; width: 100%; margin: 6px 0 2px; }
 th, td { text-align: left; padding: 3px 8px 3px 0; vertical-align: top; border-top: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 td.num, th.num { text-align: right; }
-tr.suspect td { color: var(--warn); }
 .job-name { font-weight: 500; }
 .job-id { color: var(--muted); font-family: var(--mono); font-size: 12px; }
 .links a + a::before { content: " · "; color: var(--muted); text-decoration: none; display: inline-block; }

@@ -171,41 +171,11 @@ def test_max_runtime_kills_with_reason_timeout(gpuc_home: Path) -> None:
     assert (state.status, state.reason) == ("failed", "timeout")
 
 
-def test_low_util_watchdog_kills_only_after_grace_and_window(gpuc_home: Path) -> None:
-    samples: list[float] = []
-
-    def sampler(uuids: Sequence[str]) -> float:
-        samples.append(time.monotonic())
-        return 1.0
-
-    job_id = prepare(
-        gpus=[FAKE_GPUS[0]],
-        command="sleep 60",
-        low_util={"enabled": True, "window_min": 0.005, "floor_pct": 5, "grace_min": 0.002},
-    )
-    code = runner.run_job(job_id, deps(sampler=sampler))
-    assert code != 0
-    state = jobs.read_state(job_id)
-    assert (state.status, state.reason) == ("failed", "low-util")
-    assert len(samples) >= 2
-    assert "low-util watchdog" in log_of(job_id)
-
-
-def test_a_zero_util_setup_phase_can_never_trip_the_watchdog(gpuc_home: Path) -> None:
-    """The failure this rules out: a job killed for the hour its setup spent
-    downloading a checkpoint at 0% util.
-
-    Two separate rules do it. Sampling happens in `main` only, so nothing a
-    setup phase does can reach `util_recent` at all; and inside `main` the kill
-    window does not open until `grace_min` has passed, so a slow start is not
-    evidence either.
-    """
-    job_id = prepare(
-        gpus=[FAKE_GPUS[0]],
-        setup="sleep 0.3",
-        command="sleep 0.3",
-        low_util={"enabled": True, "window_min": 0.001, "floor_pct": 50, "grace_min": 60.0},
-    )
+def test_utilization_is_sampled_in_main_only(gpuc_home: Path) -> None:
+    """Setup is the hour spent downloading a checkpoint at 0% util, and a
+    sample from there would show `gpuc status` an idle job that has not
+    started its work yet. Nothing a setup phase does reaches `util_recent`."""
+    job_id = prepare(gpus=[FAKE_GPUS[0]], setup="sleep 0.3", command="sleep 0.3")
     seen: list[tuple[str | None, int]] = []
 
     def idle(uuids: Sequence[str]) -> float:
@@ -216,7 +186,6 @@ def test_a_zero_util_setup_phase_can_never_trip_the_watchdog(gpuc_home: Path) ->
     assert runner.run_job(job_id, deps(sampler=idle)) == 0
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("succeeded", None)
-    assert "low-util watchdog" not in log_of(job_id)
 
     assert seen, "the sampler was never called, so this proved nothing"
     assert {phase for phase, _ in seen} == {"main"}
@@ -225,33 +194,19 @@ def test_a_zero_util_setup_phase_can_never_trip_the_watchdog(gpuc_home: Path) ->
     assert state.util_recent and set(state.util_recent) == {0.0}
 
 
-def test_busy_gpu_is_never_killed_by_the_watchdog(gpuc_home: Path) -> None:
-    job_id = prepare(
-        gpus=[FAKE_GPUS[0]],
-        command="sleep 0.5",
-        low_util={"enabled": True, "window_min": 0.002, "floor_pct": 5, "grace_min": 0.0},
-    )
-    assert runner.run_job(job_id, deps(sampler=lambda uuids: 97.0)) == 0
-    assert jobs.read_state(job_id).status == "succeeded"
-
-
-def test_watchdog_can_be_disabled_per_job(gpuc_home: Path) -> None:
-    job_id = prepare(
-        gpus=[FAKE_GPUS[0]],
-        command="sleep 0.5",
-        low_util={"enabled": False, "window_min": 0.002, "floor_pct": 5, "grace_min": 0.0},
-    )
+def test_an_idle_gpu_is_reported_and_never_a_reason_to_kill(gpuc_home: Path) -> None:
+    job_id = prepare(gpus=[FAKE_GPUS[0]], command="sleep 0.5")
     assert runner.run_job(job_id, deps(sampler=lambda uuids: 0.0)) == 0
+    state = jobs.read_state(job_id)
+    assert state.status == "succeeded"
+    assert state.util_recent and set(state.util_recent) == {0.0}
 
 
-def test_watchdog_never_runs_for_a_zero_gpu_job(gpuc_home: Path) -> None:
+def test_utilization_is_never_sampled_for_a_zero_gpu_job(gpuc_home: Path) -> None:
     def explode(uuids: Sequence[str]) -> float:
         raise AssertionError("sampled utilization for a gpus:0 job")
 
-    job_id = prepare(
-        command="sleep 0.4",
-        low_util={"enabled": True, "window_min": 0.001, "floor_pct": 99, "grace_min": 0.0},
-    )
+    job_id = prepare(command="sleep 0.4")
     assert runner.run_job(job_id, deps(sampler=explode)) == 0
 
 
@@ -371,17 +326,6 @@ def test_runner_uses_the_s3_prefix_for_log_and_state(
     assert f"s3://b/gpuc/h/jobs/{job_id}/state.json" in destinations
 
 
-def test_window_needs_a_full_window_before_it_fires() -> None:
-    window = runner._Window(window_s=10.0)
-    window.add(0.0, 1.0)
-    assert not window.full(0.0)
-    window.add(5.0, 1.0)
-    assert not window.full(5.0)
-    window.add(10.0, 1.0)
-    assert window.full(10.0)
-    assert window.mean() == 1.0
-
-
 def test_build_env_exposes_job_paths(gpuc_home: Path) -> None:
     spec = make_spec(job_id="j1")
     jobs.write_state("j1", JobState())
@@ -475,11 +419,7 @@ def test_a_failed_utilization_sample_is_recorded_as_unknown_not_as_idle(
             raise runner.gpus.GpuError("nvidia-smi reported utilization.gpu='[N/A]'")
         return 90.0
 
-    job_id = prepare(
-        gpus=[FAKE_GPUS[0]],
-        command="sleep 0.6",
-        low_util={"enabled": True, "window_min": 0.001, "floor_pct": 50, "grace_min": 0.0},
-    )
+    job_id = prepare(gpus=[FAKE_GPUS[0]], command="sleep 0.6")
     assert runner.run_job(job_id, deps(sampler=flaky)) == 0
     recent = jobs.read_state(job_id).util_recent
     assert recent and recent[0] is None

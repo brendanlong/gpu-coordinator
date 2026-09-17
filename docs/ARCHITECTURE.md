@@ -142,7 +142,7 @@ jobs/<jobid>/
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
-  kill               # a kill request with its reason (`low-util-pause`, `preempted`)
+  kill               # a kill request with its reason (`preempted`)
   preempt            # this job is coming back: `gpuc preempt` wrote it beside the kill request,
                      # and the dispatcher queues the job again once its runner has stopped it.
                      # Removed by whichever of the two decides the job is not coming back
@@ -153,8 +153,6 @@ dispatcher.lock      # fd flock held by the running dispatcher
 dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
 draining             # present while the host is shutting itself down
-paused               # present after two consecutive low-util failures; an ephemeral host
-                     # then drains once nothing is running, any other host just stops dispatching
 ```
 
 All state writes are atomic (write temp in same dir, `os.replace`).
@@ -184,7 +182,6 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "progress_command": null,             # run in workdir/ every progress_interval_s of phase main;
                                         # its last line of stdout is a percentage. See Estimates
   "progress_interval_s": 60,
-  "low_util": {"enabled": true, "window_min": 25, "floor_pct": 5, "grace_min": 10},
   "auto_preempt": false,                # let the dispatcher stop this job, as often as it
                                         # takes, whenever that starts a strictly more
                                         # important queued one right away
@@ -306,9 +303,9 @@ queue's lexical order, not submission order below one second.
   are cancelled by removing the marker and setting state.
 - Stop with a reason: `queue.request_kill(jobid, reason)` writes
   `jobs/<id>/kill`; the runner kills the job the same way and ends it
-  `failed: <reason>` after a final sync. Low-util pause and preempt use this;
-  cancel stays its own marker, because a stop the host decided on is not a
-  cancellation anyone asked for.
+  `failed: <reason>` after a final sync. Preempt uses this; cancel stays its
+  own marker, because a stop the host decided on is not a cancellation anyone
+  asked for.
 - Preempt: `queue.preempt(jobid[, prio])` writes `jobs/<id>/preempt` and then
   a `kill` marker with reason `preempted`, for a *running* job only, and only
   when something else could run instead (`refuse_if_nothing_else_can_run`).
@@ -326,8 +323,8 @@ queue's lexical order, not submission order below one second.
   queued job that does not fit, stop the set of running `auto_preempt` jobs
   that together cover the *whole* gap (`enough_to_start`), least important
   first and most recently started among equals, and only at a strictly higher
-  priority number than the waiting job. Nothing runs on a host that is paused
-  or `_going_away`. The stop is `queue.preempt`, so it is the ordinary preempt
+  priority number than the waiting job. Nothing runs on a host that is
+  `_going_away`. The stop is `queue.preempt`, so it is the ordinary preempt
   path; cards held by a job that is already stopping count as available, and
   once one stop in a set fails the rest are left alone. Nothing counts how
   often a job has given way.
@@ -350,11 +347,6 @@ queue's lexical order, not submission order below one second.
   `terminate.self_terminate()`. Only a failed *terminate* stops the shutdown:
   remove `draining`, log loudly, keep dispatching, retry every 10 minutes. A
   failed final sync is logged and the host terminates anyway.
-- Two consecutive `failed: low-util` jobs: write `paused`, stop dispatching,
-  and (if ephemeral) drain and terminate -- never out from under a job: with
-  anything still running, a `kill` marker with reason `low-util-pause` for
-  each, and drain on a later pass. A runner that has not acted on the marker
-  after `kill_grace_s` is escalated exactly like a cancel.
 - Exit when the queue is empty, nothing is running, and the host is not
   ephemeral. Ephemeral hosts keep the dispatcher alive until terminate.
 
@@ -401,12 +393,13 @@ queue's lexical order, not submission order below one second.
 5. `phase=main`: run `spec.command`, stdout+stderr appended to `log.txt`.
    Each phase runs inside its own transient scope where one is available (see
    Process isolation), and in its own process group where it is not.
-   Start the low-util watchdog after `grace_min`: sample assigned GPUs'
-   utilization every 30 s; if the rolling mean over `window_min` is below
-   `floor_pct`, SIGTERM the process group, then SIGKILL after 15 s, status
-   `failed: low-util`. `max_runtime_min` is enforced the same way with
-   reason `timeout`. In the same loop, run `spec.progress_command` every
-   `progress_interval_s` and record what it says; see Job length estimates.
+   Sample the assigned GPUs' utilization every 30 s into `util_recent`, for
+   `gpuc status` to show; nothing acts on it, since once the GPU check has
+   passed a job that leaves its cards idle is the job's business. Enforce
+   `max_runtime_min`: SIGTERM the process group, then SIGKILL after 15 s,
+   status `failed: timeout`. In the same loop, run `spec.progress_command`
+   every `progress_interval_s` and record what it says; see Job length
+   estimates.
 6. Capture the exit code **before** any cleanup. Stop the sync loop and run
    one final sync; a failed final sync makes a succeeded job `failed: sync`,
    and an output path that was never written makes it `failed: no-outputs`.
@@ -458,7 +451,7 @@ the mechanics.
   them, and the queue is taken in order, with the same two exemptions as
   `launch_ready`. A card held by a job that published no eta is not
   schedulable, so a job whose turn depends on it is reported as unknown; a
-  paused or draining host projects nothing.
+  draining host projects nothing.
 
 ## Process isolation (cgroup scope, else process group)
 
@@ -885,7 +878,7 @@ for a host that came back empty is in setup.md.
 2. Unless `--no-reuse`: pick an existing desired host whose recorded offer
    still satisfies the constraints, which owns enough cards, whose pod the
    provider reports RUNNING, whose dispatcher heartbeat is fresh, and which is
-   neither draining nor paused; enqueue there. A registered pod the provider no
+   not draining; enqueue there. A registered pod the provider no
    longer has is forgotten rather than dialled.
 3. Else for each offer in order: check caps -- offers are price-ascending, so
    a cap this one trips every later one trips too, and `CapsExceeded` aborts
@@ -1039,8 +1032,6 @@ What `status` prints, and every flag, is usage.md. The invariants:
 - A pod's `provider_util` is the provider's reading for the whole pod; a job's
   `util` is the host's own nvidia-smi sampler over that job's cards. They are
   labelled separately and never merged.
-- `--suspects` judges each running job by *its own* `low_util` window, floor and
-  grace as the host reports them, and never kills anything.
 - Every job carries the `priority` it is (or was) ordered by. While a job is
   queued that is its marker's, which is what the dispatcher reads; once the
   marker is gone it is the spec's, which `reorder` keeps current. A host too old
