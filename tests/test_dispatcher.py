@@ -1181,19 +1181,27 @@ def test_an_owned_index_the_host_cannot_see_is_not_handed_out(gpuc_home: Path) -
     assert "does not report" in paths.dispatcher_log().read_text()
 
 
-def test_a_job_wider_than_what_the_host_can_see_holds_no_cards(gpuc_home: Path) -> None:
-    """It is not waiting for a card that is coming back, so holding one for it
-    would idle the host for as long as a card stays missing -- possibly for
-    ever. The job is not failed either: `config.gpus` says the host owns
-    enough, and the card may be back on the next pass."""
-    configure_indices(["0", "7"])  # only index 0 is real
+def test_a_job_waiting_for_a_missing_owned_card_holds_like_any_other(gpuc_home: Path) -> None:
+    """`config.gpus` says the host has the card, so a host that cannot see it
+    is misconfigured or broken. The job holds the card it can see and the
+    queue behind it waits, which is how that gets noticed; it is not failed,
+    since the configured host is big enough, and it runs once the card is
+    back."""
+    configure_indices(["0", "1"])
     dispatcher, _ = make_dispatcher()
-    dispatcher.deps.smi = fake_smi()
-    wider_than_visible = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.deps.smi = fake_smi([FAKE_GPUS[0]])  # index 1 has dropped off
+    wide = queue.enqueue(make_spec(gpus=2, priority=10))
     behind = queue.enqueue(make_spec(gpus=1, priority=50))
     dispatcher.run_once()
-    assert jobs.read_state(wider_than_visible).status == "queued"
-    assert jobs.read_state(behind).status == "running"
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(behind).status == "queued"
+    assert "does not report" in paths.dispatcher_log().read_text()
+
+    dispatcher.deps.smi = fake_smi()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "running"
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+    assert jobs.read_state(behind).status == "queued"
 
 
 def test_a_preempted_job_goes_back_in_the_queue_when_its_runner_stops(gpuc_home: Path) -> None:
@@ -1885,8 +1893,9 @@ def test_a_borrowed_card_is_freed_for_a_job_that_asked_to_borrow(gpuc_home: Path
 
 
 def test_a_job_that_can_only_run_by_borrowing_holds_no_owned_card(gpuc_home: Path) -> None:
-    """The card it is short of comes free when somebody else's job ends, which
-    is not this host's to wait for -- so the queue behind it runs."""
+    """The one job the strict order steps over. The card it is short of comes
+    free when somebody else's job ends, which is not this host's to wait for
+    -- so the queue behind it runs."""
     dispatcher, _ = shared_host(
         shared=[SHARED_GPUS[0]],
         utilization={SHARED_GPUS[0]: 90.0},

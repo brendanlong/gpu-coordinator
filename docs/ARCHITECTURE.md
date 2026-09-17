@@ -241,12 +241,14 @@ queue's lexical order, not submission order below one second.
   from the shared cards that are idle right now (see Shared GPUs).
 - **The queue is taken in order** (`launch_ready`): a job that does not fit
   holds the cards it is waiting for, owned and borrowed alike, and nothing
-  behind it may take them. Only a job the host could supply *whole* from what
-  it owns and can currently see holds; a job that needs a card the host cannot
-  see (dropped off nvidia-smi, or shared and in use) is walked past instead,
-  and is not failed -- `_capacity_failure` fails a job that asks for no GPU at
-  all, or for more than the configured host has, shared cards included. Why
-  the obvious rule (dispatch whatever fits) is wrong is
+  behind it may take them. The one exemption is a job that can only fit by
+  borrowing (it asks for more than `config.gpus` owns) and is short a shared
+  card somebody else is on: it is stepped over, not failed. A job waiting for
+  an owned card that has dropped off nvidia-smi holds like any other, since the
+  host is misconfigured or broken and a stalled queue says so.
+  `_capacity_failure` fails a job that asks for no GPU at all, or for more
+  than the configured host has, shared cards included. Why the obvious rule
+  (dispatch whatever fits) is wrong is
   [usage.md](usage.md#priority-is-not-advisory).
 - **A job is submitted when its queue marker exists, and not before.**
   `enqueue` writes the spec, then the state, then the marker, so an interrupted
@@ -452,7 +454,7 @@ the mechanics.
   ends; `progress_pct` is not.
 - `status.queue_start_estimates` projects a queued job's *start* by replaying
   the dispatcher's own rule: cards come free at the eta of whatever holds
-  them, and the queue is taken in order, with the same two exemptions as
+  them, and the queue is taken in order, with the same one exemption as
   `launch_ready`. A card held by a job that published no eta is not
   schedulable, so a job whose turn depends on it is reported as unknown; a
   draining host projects nothing.

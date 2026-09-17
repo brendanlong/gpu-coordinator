@@ -75,16 +75,18 @@ billed. If you would rather a big job waited than have a card sit idle for it,
 queue it at a **higher** number than the work you want to keep the host busy
 with; priority is the only knob, and it decides both questions at once.
 
-A job only holds cards when the host can supply the **whole** of it from the
-cards it owns and can see right now. A job asking for more cards than the host
-can currently see is walked past instead, because holding a card for it would
-mean waiting on something the host does not control: either a card has dropped
-off `nvidia-smi`, and idling the host until it comes back (if it comes back) is
-worse than letting the queue run; or the job can only fit by
-[borrowing](#shared-gpus), and a shared card comes free when somebody else's
-job ends, which is not this host's to wait for. Neither is failed: the host's
-`config.gpus` says it owns enough. A job bigger than the *configured* host,
-shared cards included, is failed at dispatch as it always was.
+The one job that does not hold is one that can only fit by
+[borrowing](#shared-gpus) and is waiting for a shared card somebody else is on:
+that card comes free when their job ends, which is not this host's to wait for,
+so the queue behind it runs. It is not failed either: the host's configuration,
+shared cards included, says it fits. A job bigger than the *configured* host is
+failed at dispatch as it always was.
+
+A job waiting for an owned card that has dropped off `nvidia-smi` holds like
+any other. The host is configured with that card, so a host that cannot see it
+is misconfigured or broken, and a queue that stops behind the job is how you
+find out: `gpuc status` marks the card `UNAVAILABLE`, and the job's
+`starts_unknown` names it.
 
 ## Shared GPUs
 

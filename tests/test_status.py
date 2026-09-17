@@ -768,6 +768,24 @@ def test_a_job_behind_a_wide_one_starts_when_the_wide_one_is_done() -> None:
     assert 119 * 60 < starts["j-narrow"] < 121 * 60
 
 
+def test_a_job_waiting_for_a_missing_owned_card_holds_up_the_queue() -> None:
+    """The host holds for a job whose owned card has dropped off nvidia-smi,
+    so the projection may not hand the card that comes back at 45m to the job
+    behind it -- and the reason has to name the missing card, since the host
+    is the thing to fix."""
+    view = busy(
+        running_job(gpus=[GPU], eta=in_minutes(45)),
+        queued=[waiting("j-wide", gpus_requested=2), waiting("j-narrow")],
+    )
+    view.owned = [GPU]
+    view.unavailable = ["7"]
+    assert queue_start_estimates(view) == {}
+    reason = no_start_reason(view, view.queue[0])
+    assert "only 1 of the 2 this host owns answer to nvidia-smi (7 missing)" in reason
+    assert "j-wide is ahead of it" in no_start_reason(view, view.queue[1])
+    assert "a job waiting for it holds the queue" in render(view)
+
+
 def test_a_job_behind_one_that_can_never_be_placed_says_which_job() -> None:
     """Not "the cards it needs": this job is waiting on the queue, not on a
     card, and the job ahead of it is the whole reason."""

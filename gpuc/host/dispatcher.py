@@ -1028,22 +1028,24 @@ class Dispatcher:
         offered straight to the job that had just given it up.
 
         It costs utilization: a card waiting for the rest of a job's cards runs
-        nothing, and on a rented pod that is billed. So a job only holds cards
-        when this host can supply the *whole* of it from what it owns and can
-        currently see. That rules out a job asking for more cards than are
-        visible, whether because one has dropped off nvidia-smi or because it
-        can only run by borrowing: it would be holding a card against something
-        nobody here controls. A borrowed card comes free when somebody else's
-        job ends, which is not ours to wait on -- and failing the job would be
-        wrong too, since `config.gpus` says the host owns enough.
+        nothing, and on a rented pod that is billed. The one job that does not
+        hold is one that can only run by borrowing -- it asks for more cards
+        than `config.gpus` owns -- and is short: the card it is waiting for is
+        a shared one somebody else is on, which comes free when *their* job
+        ends, and that is not ours to wait on. Failing it would be wrong too,
+        since the configured host is big enough for it.
 
-        A job that *is* held for holds what it could take this pass, borrowed
-        cards included: having taken one of somebody else's spare cards towards
-        its total, giving it to the job behind would leave it short again.
+        A job waiting for an owned card that has dropped off nvidia-smi holds
+        like any other: `config.gpus` says the host has that card, so the host
+        is misconfigured or broken, and idling the queue behind the job is how
+        that gets noticed rather than quietly worked around.
+
+        A job that holds holds what it could take this pass, borrowed cards
+        included: having taken one of somebody else's spare cards towards its
+        total, giving it to the job behind would leave it short again.
         """
         if paths.draining_file().exists():
             return
-        visible = len(self.owned_gpus())
         free = self.free_gpus()
         # Sampled at most once per pass, and only if a job actually needs it:
         # see `borrowable_gpus`.
@@ -1091,7 +1093,7 @@ class Dispatcher:
                 shared_part = borrowable[: min(short, max(0, len(borrowable) - held_shared))]
                 short -= len(shared_part)
             if short:
-                if spec.gpus <= visible:
+                if spec.gpus <= len(self.config.gpus):
                     held += len(owned_part)
                     held_shared += len(shared_part)
                 continue
