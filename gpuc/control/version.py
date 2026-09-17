@@ -16,6 +16,8 @@ from pathlib import Path
 
 import gpuc
 from gpuc._version import __version__ as __version__
+from gpuc._version import is_other_build
+from gpuc._version import same_commit as same_commit
 
 DIST_NAME = "gpu-coordinator"
 SHORT = 12
@@ -94,26 +96,14 @@ def dirty() -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
-def same_commit(local: str | None, host: str | None) -> bool:
-    """Compare two commits that may be recorded at different lengths."""
-    if not local or not host:
-        return True  # nothing recorded is not evidence of a mismatch
-    return local.startswith(host) or host.startswith(local)
-
-
 def needs_package_sync(local: str | None, host: str | None) -> bool:
     """Should this host be shipped the package again before it runs anything?
 
-    Stricter than `same_commit` in one place that matters: a host with *no*
-    recorded commit counts as out of date. Those are the hosts bootstrapped by
-    a build old enough not to record one, so they are running the oldest code
-    of all -- treating "unknown" as "probably fine" is how a job ends up
-    dispatched by last month's runner. An unknown *local* commit is different:
-    nothing can be compared and nothing would be recorded, so it is left alone.
+    `is_other_build`, which is stricter than `same_commit` in the one place
+    that matters: a host with no recorded commit was bootstrapped by a build
+    from before the field existed, so it cannot be running this one.
     """
-    if not local:
-        return False
-    return not host or not same_commit(local, host)
+    return is_other_build(host, local)
 
 
 def host_build_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
@@ -153,4 +143,25 @@ def shipped_commit_note(name: str, recorded: str | None, local: str | None) -> s
     return (
         f"host {name} was last seen running gpuc {short(recorded)} and this machine has "
         f"{short(local)}; run gpuc host bootstrap {name} (`gpuc status` asks the host itself)"
+    )
+
+
+def dispatcher_build_warning(name: str, running: str | None, shipped: str | None) -> str | None:
+    """The dispatcher on this host is serving the queue with other code.
+
+    Both sides are the host's own answers: the commit recorded by the
+    dispatcher holding the lock, and the commit of the package now on disk.
+    They come apart because a dispatcher imports its code once and then lives
+    for days -- so a host re-bootstrapped underneath one goes on dispatching
+    with whatever was there when it started, and everything shipped since is
+    simply not running. A dispatcher started from the package on disk takes
+    over from one that was not; this is for the host where that did not happen.
+    """
+    if not is_other_build(running, shipped):
+        return None
+    was = f"gpuc {short(running)}" if running else "a build too old to say which"
+    return (
+        f"host {name} has gpuc {short(shipped)} on disk but its running dispatcher was "
+        f"started on {was}; nothing shipped since is in effect. Restart it with "
+        f"gpuc host bootstrap {name}"
     )

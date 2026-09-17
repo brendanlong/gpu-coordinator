@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -10,9 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import dispatcher, paths
+from gpuc.host import dispatcher, jobs, paths, queue
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import DispatcherLock, LockBody
+from gpuc.host.jobs import HostConfig
+from tests.conftest import FAKE_GPUS, make_spec
+from tests.test_dispatcher import make_dispatcher
 
 # A holder that takes the lock, writes a dispatcher-shaped lock body and a
 # heartbeat of our choosing, and then wedges forever with a child in the same
@@ -20,14 +24,21 @@ from gpuc.host.dispatcher import DispatcherLock, LockBody
 # survive. The trailing argv marker is what makes it look like `gpuc.host` in
 # /proc, which is the only kind of process a takeover is allowed to kill.
 WEDGED_HOLDER = r"""
-import fcntl, json, os, sys, time
+import fcntl, json, os, signal, sys, time
 lock_path, heartbeat_path, age = sys.argv[1], sys.argv[2], float(sys.argv[3])
+pkg_commit, on_term = sys.argv[4] or None, sys.argv[5]
+if on_term == "ignore":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+else:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 stat = open(f"/proc/{os.getpid()}/stat").read()
 starttime = stat.rpartition(")")[2].split()[19]
 boot_id = open("/proc/sys/kernel/random/boot_id").read().strip()
 body = {"pid": os.getpid(), "pgid": os.getpgid(0), "starttime": starttime, "boot_id": boot_id}
+if pkg_commit:
+    body["pkg_commit"] = pkg_commit
 os.ftruncate(fd, 0)
 os.write(fd, (json.dumps(body, sort_keys=True) + "\n").encode())
 os.fsync(fd)
@@ -41,7 +52,9 @@ while True:
 """
 
 
-def start_wedged_holder(heartbeat_age_s: float) -> subprocess.Popen[str]:
+def start_wedged_holder(
+    heartbeat_age_s: float, pkg_commit: str = "", on_term: str = "exit"
+) -> subprocess.Popen[str]:
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -50,6 +63,8 @@ def start_wedged_holder(heartbeat_age_s: float) -> subprocess.Popen[str]:
             str(paths.lock_file()),
             str(paths.heartbeat_file()),
             str(heartbeat_age_s),
+            pkg_commit,
+            on_term,
             "gpuc.host",
         ],
         stdout=subprocess.PIPE,
@@ -263,3 +278,204 @@ def test_the_heartbeat_is_fresh_before_the_lock_body_is_written(
     assert lock.acquire()
     lock.release()
     assert ages and ages[0] is not None and ages[0] < 5
+
+
+# -- a dispatcher older than the package it is dispatching ---------------------
+#
+# The failure these cover: a dispatcher imports its code once and then lives for
+# days, so re-shipping the package under a live one changes nothing at all about
+# what it dispatches with. `gpuc host bootstrap` looked like it fixed that, and
+# did not -- the dispatcher it started found a fresh heartbeat and exited, and a
+# job asking for a feature shipped that morning waited on a host that had never
+# heard of it.
+
+SHIPPED = "b" * 40
+RUNNING = "a" * 40
+
+
+def on_this_host(pkg_commit: str | None) -> None:
+    jobs.write_config(HostConfig(host="test-host", gpus=list(FAKE_GPUS), pkg_commit=pkg_commit))
+
+
+def test_a_holder_on_the_build_this_host_has_replaced_is_asked_to_stand_down(
+    gpuc_home: Path,
+) -> None:
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING)
+    try:
+        lock = DispatcherLock()
+        assert lock.acquire(takeover_wait_s=10.0, handoff_wait_s=20.0)
+        assert holder.wait(timeout=10) == 0  # it stopped on its own, not killed
+        assert LockBody.parse(paths.lock_file().read_text()).pkg_commit == SHIPPED
+        lock.release()
+        log = paths.dispatcher_log().read_text()
+        assert "SIGTERMing" in log and RUNNING[:12] in log and SHIPPED[:12] in log
+    finally:
+        kill_tree(holder)
+
+
+def test_a_holder_too_old_to_record_a_commit_counts_as_replaced(gpuc_home: Path) -> None:
+    """The case that actually happened: every dispatcher started before the lock
+    carried a commit. "It did not say" is the oldest build of all, not a maybe."""
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0)
+    try:
+        lock = DispatcherLock()
+        assert lock.acquire(takeover_wait_s=10.0, handoff_wait_s=20.0)
+        assert holder.wait(timeout=10) == 0
+        lock.release()
+    finally:
+        kill_tree(holder)
+
+
+def test_a_holder_that_will_not_stand_down_is_killed(gpuc_home: Path) -> None:
+    """A dispatcher running code this host no longer has is worse than none at
+    all: nothing else here can work around it, so it does not get a veto."""
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING, on_term="ignore")
+    try:
+        lock = DispatcherLock()
+        assert lock.acquire(takeover_wait_s=10.0, handoff_wait_s=2.0)
+        assert holder.wait(timeout=10) == -9
+        lock.release()
+    finally:
+        kill_tree(holder)
+
+
+def test_a_holder_on_the_same_build_is_left_alone(gpuc_home: Path) -> None:
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=SHIPPED)
+    try:
+        assert not DispatcherLock().acquire(takeover_wait_s=1.0, handoff_wait_s=1.0)
+        assert holder.poll() is None
+    finally:
+        kill_tree(holder)
+
+
+def test_a_host_that_records_no_commit_never_evicts_anybody(gpuc_home: Path) -> None:
+    """Nothing to compare against is not evidence of anything, and a host where
+    no commit is ever known must not restart its dispatcher on every enqueue."""
+    on_this_host(None)
+    holder = start_wedged_holder(heartbeat_age_s=1.0)
+    try:
+        assert not DispatcherLock().acquire(takeover_wait_s=1.0, handoff_wait_s=1.0)
+        assert holder.poll() is None
+    finally:
+        kill_tree(holder)
+
+
+def test_acquire_records_the_commit_this_dispatcher_is_running(gpuc_home: Path) -> None:
+    on_this_host(SHIPPED)
+    lock = DispatcherLock()
+    assert lock.acquire()
+    lock.release()
+    assert LockBody.parse(paths.lock_file().read_text()).pkg_commit == SHIPPED
+    assert dispatcher.holder_pkg_commit() == SHIPPED
+
+
+def test_sigterm_lets_the_loop_finish_its_pass_before_it_exits(gpuc_home: Path) -> None:
+    """The whole value of asking rather than killing: the pass that was in
+    flight completes, and the lock is released rather than dropped."""
+    on_this_host(SHIPPED)
+    loop, _ = make_dispatcher()
+    passes: list[int] = []
+
+    def run_once() -> None:
+        passes.append(1)
+        os.kill(os.getpid(), signal.SIGTERM)  # mid-pass, as a takeover sends it
+        passes.append(2)
+
+    loop.run_once = run_once  # type: ignore[method-assign]
+    loop.deps.sleep = lambda _seconds: None
+    previous = signal.getsignal(signal.SIGTERM)
+    lock = DispatcherLock()
+    assert lock.acquire()
+    try:
+        dispatcher._stop_on_sigterm(loop)
+        assert loop.run(lock) == 0
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert passes == [1, 2], "the signal ended the loop, not the pass"
+    assert lock._fd is None, "the lock was released rather than dropped"
+    assert "dispatcher exiting" in paths.dispatcher_log().read_text()
+
+
+def test_a_holder_that_stands_down_is_never_killed_afterwards(gpuc_home: Path) -> None:
+    """The one that bit: escalation used to re-read the lock and SIGKILL
+    whoever held it *now*. Two dispatchers start within seconds on every `gpuc
+    submit`, so the process that inherits the lock during a handoff is
+    routinely a healthy newcomer on the very build we were trying to install --
+    and killing it is the worst outcome available here."""
+    on_this_host(SHIPPED)
+    old_build = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING)
+    successor: list[subprocess.Popen[str]] = []
+
+    lock = DispatcherLock()
+
+    # A loser that polls slowly: the incumbent stands down during its wait and
+    # a second dispatcher -- already on the shipped build -- wins the lock.
+    def hand_over(_seconds: float) -> None:
+        if not successor:
+            old_build.wait(timeout=10)
+            successor.append(start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=SHIPPED))
+        time.sleep(0.05)
+
+    lock._sleep = hand_over
+    try:
+        assert not lock.acquire(takeover_wait_s=1.0, handoff_wait_s=2.0)
+        assert successor and successor[0].poll() is None, "the successor was killed"
+        log = paths.dispatcher_log().read_text()
+        assert "SIGKILL" not in log
+    finally:
+        kill_tree(old_build)
+        for proc in successor:
+            kill_tree(proc)
+
+
+def test_a_superseded_holder_we_may_not_signal_is_left_alone_at_once(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to signal means nothing will stand down, so waiting out the
+    handoff would cost every enqueue on this host 40s for as long as that
+    holder lives."""
+    on_this_host(SHIPPED)
+    monkeypatch.setattr(dispatcher, "is_gpuc_process", lambda _pid: False)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING)
+    slept: list[float] = []
+    lock = DispatcherLock()
+    lock._sleep = slept.append
+    try:
+        assert not lock.acquire(takeover_wait_s=10.0, handoff_wait_s=30.0)
+        assert holder.poll() is None
+        assert slept == [], "it waited for a handoff nobody was asked for"
+        assert "is not a gpuc dispatcher" in paths.dispatcher_log().read_text()
+    finally:
+        kill_tree(holder)
+
+
+def test_a_takeover_adopts_the_running_jobs_rather_than_failing_them(gpuc_home: Path) -> None:
+    """What a handoff has to be worth: the queue changes hands and the work
+    does not notice."""
+    on_this_host(SHIPPED)
+    job_id = queue.enqueue(make_spec(gpus=1))
+    outgoing, _ = make_dispatcher()
+    lock = DispatcherLock()
+    assert lock.acquire()
+    outgoing.run_once()
+    assert jobs.read_state(job_id).status == "running"
+    # This process stands in for the runner the outgoing dispatcher spawned:
+    # what the successor has to find is a pid that is really still there.
+    jobs.update_state(job_id, runner_pid=os.getpid(), runner_boot_id=None, runner_starttime=None)
+    lock.release()  # as a dispatcher standing down does
+
+    incoming, _ = make_dispatcher()
+    successor = DispatcherLock()
+    assert successor.acquire()
+    try:
+        incoming.adopt_orphans()
+    finally:
+        successor.release()
+    assert jobs.read_state(job_id).status == "running"
+    assert job_id in incoming.running
+    assert incoming.running[job_id].gpus == [FAKE_GPUS[0]]

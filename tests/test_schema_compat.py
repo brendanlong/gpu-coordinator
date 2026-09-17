@@ -333,6 +333,10 @@ def test_the_lock_body_reads_a_pid_however_it_was_written() -> None:
     assert LockBody.parse('{"pid": null, "starttime": null}').pid is None
     assert LockBody.parse("[]").pid is None
     assert LockBody.parse("not json").pid is None
+    # A lock written before the commit was recorded reads as "not said", which
+    # is what makes the next dispatcher treat it as the older build.
+    assert LockBody.parse('{"pid": 42, "pgid": 42}').pkg_commit is None
+    assert LockBody.parse('{"pkg_commit": ""}').pkg_commit is None
 
 
 def test_job_state_coerces_the_types_it_acts_on() -> None:
