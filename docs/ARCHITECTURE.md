@@ -777,7 +777,10 @@ itself, and only when the host's config names none; `--cache-dir` is that same
 key by another name.
 
 `gpuc host probe` reports `$HOME`'s filesystem type (`df -T`, `stat -f`
-fallback) and suggests `--persistent-root` when it is an overlay. The health
+fallback) as a fact and draws no conclusion from it: an ephemeral queue is what
+gpuc is built around -- a rented pod has nowhere durable to put one -- so an
+overlay `$HOME` is not a misconfiguration to warn about. `--persistent-root` is
+there for the host where somebody decides the trade is worth it. The health
 check's disk floor is measured on `paths.home()`, so it is `R`'s volume when a
 root is set. The operator runbook for a host that came back empty is in
 setup.md.

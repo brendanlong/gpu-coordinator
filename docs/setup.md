@@ -233,8 +233,12 @@ chose is in `gpuc host list --json` and `gpuc host probe`.
 ### Hosts whose `$HOME` is wiped on restart
 
 A container-backed host (a Kubernetes pod, most cloud notebooks) usually has
-`$HOME` on the image's throwaway upper layer: `gpuc host probe` reports
-`home_fs: overlay` and says so. `--persistent-root R` moves **gpuc home and only
+`$HOME` on the image's throwaway upper layer, which `gpuc host probe` reports as
+`home_fs: overlay`. That is not by itself a problem to fix: a host's queue is
+expected to be disposable (S3 is the mirror, `gpuc requeue` the recovery), and
+moving gpuc home puts every job's venv and workdir on a network volume, which
+uv's cache then has to follow to keep linking wheels instead of copying them.
+Where that trade is worth it, `--persistent-root R` moves **gpuc home and only
 gpuc home** to `R/gpuc`: `config.json`, `queue/` and every `jobs/<id>/` with its
 spec, state, log and workdir — the things that cannot be reinstalled. uv, its
 Pythons and the `aws` bundle stay in `$HOME`, because bootstrap puts them back
