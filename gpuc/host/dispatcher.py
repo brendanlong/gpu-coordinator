@@ -591,6 +591,25 @@ class Dispatcher:
         log_line(message, self.deps.utcnow())
 
     # -- startup ---------------------------------------------------------
+    def reconcile_queue(self) -> None:
+        """Make the queue directory and the job states agree again.
+
+        The other half of startup recovery, and the one that runs first: what
+        a job's state says is only trustworthy once the queue it was read
+        against is. See `queue.reconcile` for what the two disagreements mean.
+        """
+        for repair in queue.reconcile():
+            if repair.requeued:
+                self.log(
+                    f"job {repair.job_id} is queued but had no queue marker: a dispatcher "
+                    f"was killed on its way out of the queue. Queued again"
+                )
+            else:
+                self.log(
+                    f"job {repair.job_id} is {repair.status} but was still in the queue; "
+                    f"marker removed, so it is not dispatched a second time"
+                )
+
     def adopt_orphans(self) -> None:
         """Reconcile jobs left `running` by a dispatcher that died."""
         # Walked at most once, and only for a job whose state names no live
@@ -1046,25 +1065,22 @@ class Dispatcher:
         for entry in queue.list_queued():
             job_id = entry.job_id
             if queue.is_cancelled(job_id):
-                entry.marker.unlink(missing_ok=True)
-                jobs.update_state(
-                    job_id, status="cancelled", reason="cancelled", ended_at=jobs.utc_now()
+                queue.leave_queue(
+                    entry, status="cancelled", reason="cancelled", ended_at=jobs.utc_now()
                 )
                 continue
             try:
                 spec = jobs.read_spec(job_id)
             except (RuntimeError, ValueError) as exc:
                 self.log(f"job {job_id} has an unreadable spec ({exc}); dropping from queue")
-                entry.marker.unlink(missing_ok=True)
-                jobs.update_state(
-                    job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
+                queue.leave_queue(
+                    entry, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
                 )
                 continue
             too_big = self._capacity_failure(spec)
             if too_big is not None:
-                entry.marker.unlink(missing_ok=True)
-                jobs.update_state(
-                    job_id,
+                queue.leave_queue(
+                    entry,
                     status="failed",
                     reason=too_big,
                     exit_code=1,
@@ -1090,9 +1106,8 @@ class Dispatcher:
             assigned = [*owned_part, *shared_part]
             free = free[len(owned_part) :]
             borrowable = borrowable[len(shared_part) :] if borrowable is not None else None
-            entry.marker.unlink(missing_ok=True)
-            jobs.update_state(
-                job_id,
+            queue.leave_queue(
+                entry,
                 status="running",
                 gpus=assigned,
                 phase="setup",
@@ -1597,6 +1612,7 @@ class Dispatcher:
         self.log(f"dispatcher started (pid {os.getpid()}, pgid {os.getpgid(0)})")
         code = 0
         try:
+            self._guard(self.reconcile_queue)
             self._guard(self.adopt_orphans)
             while not self.should_exit:
                 lock.beat()

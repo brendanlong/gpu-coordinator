@@ -247,6 +247,29 @@ queue's lexical order, not submission order below one second.
   walked past instead, and neither is failed -- `_capacity_failure` fails a
   job bigger than the configured host, shared cards included. Why the obvious
   rule (dispatch whatever fits) is wrong is [usage.md](usage.md#priority-is-not-advisory).
+- **Startup recovery is two passes, and this is the general answer to "a
+  process was killed between two writes".** Every such window in the host falls
+  into one of two families, and each has one mechanism:
+  - *Two files that must agree* -- the queue marker and `state.json`. Every
+    move in or out of the queue writes both (`enqueue`, `requeue_preempted`,
+    `cancel`, and the four in `launch_ready`), so a process killed between them
+    leaves the pair disagreeing. **`queue.reconcile()`, run first at startup,
+    makes `state.json` win**: a `queued` job with no marker gets one back (it
+    was otherwise invisible to every later pass -- `list_queued` cannot see it
+    and `adopt_orphans` only looks at `running` and finished jobs, so an
+    ephemeral host would idle-terminate with it unrun), and a marker for a job
+    that is not queued is removed (it would otherwise launch a second runner
+    into the first one's workdir). A marker naming a job the host no longer has
+    goes too. Because the repair is symmetric, **the order of the two writes no
+    longer matters**, which is why all seven sites can share one helper,
+    `queue.leave_queue`, instead of each getting the ordering right by hand.
+  - *A file versus reality* -- `state.runner_pid` against the process table.
+    A record cannot be made atomic with a `fork`, so nothing concludes a runner
+    is gone from a missing pid; `adopt_orphans` asks /proc instead (below).
+
+  What this does **not** cover is a window whose intermediate state no reader
+  visits. That is the question to ask of any new multi-write sequence here:
+  *if this is interrupted halfway, which pass looks at what is left?*
 - **Adoption at startup** (`adopt_orphans`): every job whose `state.json` says
   `running` is either taken over or failed `runner-died`, and the GPUs of a
   failed one go straight back in the free pool -- so anything it left behind is

@@ -384,3 +384,71 @@ def test_every_way_the_stop_itself_can_end_the_attempt_comes_back(
     queue.preempt(job_id)
     stopped(job_id, reason=reason)
     assert queue.requeue_preempted(job_id) == 2
+
+
+@pytest.mark.parametrize("marked", [True, False])
+@pytest.mark.parametrize("status", ["queued", "running", "succeeded", "failed", "cancelled"])
+def test_reconcile_marks_exactly_the_queued_jobs(
+    gpuc_home: Path, status: str, marked: bool
+) -> None:
+    """One invariant, every combination of the two files that can disagree: a
+    job has a queue marker if and only if its state says it is queued.
+
+    Written as the whole product rather than as the two interesting cases,
+    because the way this is got wrong is a combination nobody thought of --
+    which is exactly what leaves a job that no reader will ever look at again.
+    """
+    job_id = queue.enqueue(make_spec())
+    if not marked:
+        queue.remove_marker(job_id)
+    jobs.update_state(job_id, status=status)
+
+    queue.reconcile()
+
+    assert (queue.find_marker(job_id) is not None) == (status == "queued")
+
+
+def test_reconcile_reports_only_what_it_had_to_change(gpuc_home: Path) -> None:
+    consistent = queue.enqueue(make_spec())
+    lost = queue.enqueue(make_spec())
+    queue.remove_marker(lost)
+
+    repairs = queue.reconcile()
+
+    assert [(r.job_id, r.requeued) for r in repairs] == [(lost, True)]
+    assert queue.find_marker(consistent) is not None
+
+
+def test_reconcile_puts_a_lost_job_back_at_its_own_priority(gpuc_home: Path) -> None:
+    """Not merely back in the queue: a job restored at the default would be
+    dispatched ahead of, or behind, everything it was queued against."""
+    job_id = queue.enqueue(make_spec(priority=7))
+    queue.remove_marker(job_id)
+
+    queue.reconcile()
+
+    assert [(e.priority, e.job_id) for e in queue.list_queued()] == [(7, job_id)]
+
+
+def test_reconcile_restores_a_job_whose_spec_is_unreadable(gpuc_home: Path) -> None:
+    """It cannot run, but `launch_ready` is what says so: with no marker it is
+    never spoken of again, and with one it fails `bad-spec` on the next pass."""
+    job_id = queue.enqueue(make_spec())
+    queue.remove_marker(job_id)
+    paths.spec_file(job_id).write_text("{ not json")
+
+    queue.reconcile()
+
+    assert queue.find_marker(job_id) is not None
+
+
+def test_reconcile_drops_a_marker_for_a_job_that_is_gone(gpuc_home: Path) -> None:
+    """An interrupted purge. Left alone, `launch_ready` writes a state file for
+    a job that does not exist."""
+    job_id = queue.enqueue(make_spec())
+    shutil.rmtree(paths.job_dir(job_id))
+
+    repairs = queue.reconcile()
+
+    assert [(r.job_id, r.status) for r in repairs] == [(job_id, "gone")]
+    assert queue.list_queued() == []

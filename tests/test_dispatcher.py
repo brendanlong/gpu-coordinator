@@ -572,6 +572,38 @@ def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).reason == "runner-died"
 
 
+def test_a_job_dropped_on_the_way_out_of_the_queue_is_not_lost(gpuc_home: Path) -> None:
+    """`launch_ready` unlinks the marker and then writes `running`. Killed
+    between the two, the job is `queued` with nothing left to dispatch it:
+    `list_queued` cannot see it and `adopt_orphans` only looks at jobs that are
+    `running` or finished, so on an ephemeral host the idle timer would
+    terminate the box with the job unrun and no reason recorded anywhere."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)  # the crash
+
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.reconcile_queue()
+    dispatcher.run_once()
+
+    assert jobs.read_state(job_id).status == "running"
+    assert job_id in spawned
+
+
+def test_a_marker_left_behind_does_not_launch_a_second_runner(gpuc_home: Path) -> None:
+    """The same window the other way round: the state write landed and the
+    unlink did not. `launch_ready` walks markers without consulting status, so
+    nothing else stops it starting a second runner in the first one's workdir."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])  # the crash
+
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.reconcile_queue()
+    dispatcher.run_once()
+
+    assert spawned == {}
+    assert queue.list_queued() == []
+
+
 def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
