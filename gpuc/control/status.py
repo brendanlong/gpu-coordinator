@@ -1187,6 +1187,8 @@ def job_json(
     host will actually take them in. `starts_in_s` and `starts_at` are when a
     queued job's turn is expected to come, and are null for anything that is
     not queued -- or whose turn depends on a job that gave no estimate.
+    `use_shared` is the other half of that explanation: `shared_gpus` says
+    which cards the host may borrow, and this says which jobs may have them.
 
     `links` is the one thing here the text view has no room for: where the
     job's outputs, its W&B run and its mirrored log can be opened, for a
@@ -1212,6 +1214,7 @@ def job_json(
         "progress_error": job.progress_error,
         "gpus": list(job.gpus),
         "gpus_requested": job.gpus_requested,
+        "use_shared": job.use_shared,
         "starts_in_s": None if starts_in_s is None else round(starts_in_s, 1),
         "starts_at": _at(starts_in_s),
         "iso": job.isolation,

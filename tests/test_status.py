@@ -1113,6 +1113,26 @@ def test_the_json_carries_the_shared_cards_and_their_verdict() -> None:
     ]
 
 
+def test_the_json_says_which_jobs_may_have_a_shared_card() -> None:
+    """`shared_gpus` says which cards the host may borrow and this says which
+    jobs may have them; without it the document shows an idle shared card
+    beside two queued jobs and cannot say why only one of them starts."""
+    document = host_json(
+        shared_view(
+            jobs=[
+                {"job_id": "j-borrower", "status": "queued", "use_shared": True},
+                {"job_id": "j-purist", "status": "queued"},
+                {"job_id": "j-running", "status": "running", "gpus": [GPU], "use_shared": True},
+            ]
+        )
+    )
+    assert {j["job_id"]: j["use_shared"] for j in document["queued"]} == {
+        "j-borrower": True,
+        "j-purist": False,
+    }
+    assert document["running"][0]["use_shared"] is True
+
+
 def test_a_job_waiting_for_a_shared_card_is_told_that_and_not_called_impossible() -> None:
     """The host owns two cards and the job wants three: without the shared one
     that reads "it will never be dispatched", which would be a lie."""
