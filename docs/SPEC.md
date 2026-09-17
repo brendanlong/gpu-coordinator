@@ -16,12 +16,11 @@ down when its work is done and nobody watching.
 ## Terms
 
 - **Client**: the machine `gpuc` is run from. A user may have several, and any
-  of them may drive any host.
+  of them may drive any host. A client need not have a GPU of its own.
 - **Host**: a machine that runs jobs. Three kinds: **local** (the client
   itself), **ssh** (a machine reached over SSH, typically shared with other
   people and with no sudo), and **rental** (a machine rented from a provider
-  for as long as there is work; RunPod today, others later). A local host may
-  have no GPU at all.
+  for as long as there is work).
 - **Dispatcher**: the process on a host that owns its queue.
 - **Owned GPU**: a card the host may use unconditionally. **Shared GPU**: a
   card the host may borrow under the conditions in *Queueing*. Both are named
@@ -29,10 +28,13 @@ down when its work is done and nobody watching.
   and is reported only where the user is choosing cards or debugging.
 - **Job**: one spec (command, GPU count, priority, options) submitted to one
   host, identified by an id that is unique across all hosts.
-- **Backup destination**: S3 or Hugging Face today; others may be added.
+- **Backup destination**: a remote store a job's outputs are copied to.
 - **Mirror**: an S3 location holding a copy of what must survive a host: job
   specs, the job index, and each job's log and state. It is a copy, never the
   queue.
+
+RunPod is the first rental provider, and S3 and Hugging Face the first backup
+destinations. Adding another of either changes nothing else in this document.
 
 ## Preconditions
 
@@ -48,8 +50,8 @@ down when its work is done and nobody watching.
   no virtual environment.
 - A client needs Python 3.11 or newer and the system `ssh` and `rsync`.
 - The tool is built around Python but does not dictate what a job runs, with
-  one exception: a job that asks for GPUs is assumed to be a uv project with
-  torch installed, which is what the runner's GPU check exercises.
+  one exception: the GPU check at job start runs inside the job's own
+  environment and expects a uv project with torch.
 
 ## Hosts and provisioning
 
@@ -103,9 +105,9 @@ down when its work is done and nobody watching.
   discard work for nothing.
 - **Shared GPUs** are used only by jobs that opt in, only after every free
   owned card, and only while nvidia-smi reports zero memory and zero
-  utilization on the card. Owned cards are assumed to have no other users and
-  this is never verified. A borrowed card is treated as owned until the job
-  ends; a later collision with other users is not detected.
+  utilization on the card. Owned cards are trusted to have no other users;
+  nothing checks. A borrowed card is treated as owned until the job ends;
+  nothing detects a later collision with other users.
 
 ## Running a job
 
@@ -191,8 +193,8 @@ down when its work is done and nobody watching.
 - Multi-node jobs, spot or interruptible instances, running jobs in
   containers.
 - A guaranteed rental teardown. A rental ends itself when idle; one whose
-  container never starts, or whose dispatcher dies after handoff, bills until
-  a person ends it.
+  provisioning client died before terminating it, or whose dispatcher dies
+  after handoff, bills until a person ends it.
 - Watching a running job for misuse of its GPU, or pausing a host because
   of it.
 - Spending limits across rentals.
