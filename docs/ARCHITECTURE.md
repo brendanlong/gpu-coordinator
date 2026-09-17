@@ -225,7 +225,8 @@ queue's lexical order, not submission order below one second.
   - The SIGTERM is polite only to a holder that has the handler
     (`_stop_on_sigterm`, which finishes the pass and releases the lock). The
     *first* takeover on any host is against a build without it, which dies
-    where it stands; `adopt_orphans` picks its jobs back up.
+    where it stands; `adopt_orphans` picks its jobs back up, including one
+    killed mid-launch (see Adoption at startup).
   - Before escalating to SIGKILL the lock is re-read and the holder's pid and
     start time must be unchanged. Two dispatchers start within seconds on every
     `gpuc submit` (the resync starts one, the enqueue another), so "somebody
@@ -246,6 +247,23 @@ queue's lexical order, not submission order below one second.
   walked past instead, and neither is failed -- `_capacity_failure` fails a
   job bigger than the configured host, shared cards included. Why the obvious
   rule (dispatch whatever fits) is wrong is [usage.md](usage.md#priority-is-not-advisory).
+- **Adoption at startup** (`adopt_orphans`): every job whose `state.json` says
+  `running` is either taken over or failed `runner-died`, and the GPUs of a
+  failed one go straight back in the free pool -- so anything it left behind is
+  killed first (its `cgroup_unit`, else its `pgid`). "Still running" is the
+  recorded `runner_pid` *plus* the boot id and start time recorded with it: a
+  bare pid means nothing across a reboot and little after a rollover.
+  - A `running` job that names no live runner is **not** failed on that alone.
+    `launch_ready` writes `running` before there is a process to name and the
+    pid only after the spawn, so a dispatcher killed in that window -- every
+    first takeover by a newer build, and both SIGKILL paths -- leaves a live
+    runner nothing points at. Failing it would lose the job *and* free the
+    cards underneath a process still training on them, with no pgid recorded to
+    kill. So /proc is scanned for a live `gpuc.host run <id>`
+    (`runner.find_runner_pid`), that runner is adopted, and its identity is
+    written to the state the dead dispatcher never got to. The same answer
+    covers a second attempt still carrying the dead pid of the attempt before
+    it.
 - Cancel: `queue.cancel(jobid)` writes `jobs/<id>/cancel`. The **runner** owns
   the kill (see Runner); the dispatcher escalates only once `state.json`
   publishes a `cgroup_unit`, or a pgid that is not the runner's own -- during

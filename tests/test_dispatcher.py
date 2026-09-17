@@ -572,6 +572,65 @@ def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).reason == "runner-died"
 
 
+def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`launch_ready` writes `running` before it has a process to name. A
+    dispatcher killed between that write and the runner pid leaves a job that
+    reads as abandoned while its runner is training: failing it would lose the
+    job and hand the card it is on to whatever starts next."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], started_at=jobs.utc_now())
+    monkeypatch.setattr(
+        host_dispatcher, "find_runner_pid", lambda wanted: os.getpid() if wanted == job_id else None
+    )
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+
+    state = jobs.read_state(job_id)
+    assert state.status == "running"
+    # Recorded, so the next dispatcher does not have to go looking either.
+    assert state.runner_pid == os.getpid()
+    assert state.runner_starttime == procinfo.starttime(os.getpid())
+    assert job_id in dispatcher.running
+    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
+
+
+def test_a_new_attempts_runner_beats_the_dead_pid_of_the_attempt_before_it(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-queued job keeps the runner pid of the attempt that was stopped
+    until its new runner records its own, so "the recorded pid is dead" is not
+    the same question as "this job has no runner"."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=2**30)
+    monkeypatch.setattr(host_dispatcher, "find_runner_pid", lambda _wanted: os.getpid())
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+
+    assert jobs.read_state(job_id).status == "running"
+    assert job_id in dispatcher.running
+
+
+def test_a_running_job_with_no_runner_anywhere_still_fails(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
+    monkeypatch.setattr(host_dispatcher, "find_runner_pid", lambda _wanted: None)
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+
+    assert jobs.read_state(job_id).reason == "runner-died"
+    assert dispatcher.free_gpus() == [FAKE_GPUS[0], FAKE_GPUS[1]]
+
+
 def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, spawned = make_dispatcher()

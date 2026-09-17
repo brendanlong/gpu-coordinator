@@ -72,6 +72,7 @@ print(f"gpu preflight ok: torch {torch.__version__} cuda {torch.version.cuda} "
 # running?" needs the boot id and the process start time as well.
 
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+PROC_PATH = Path("/proc")
 
 
 def boot_id() -> str | None:
@@ -125,6 +126,25 @@ def pid_alive(pid: int) -> bool:
 
 def is_gpuc_process(pid: int) -> bool:
     return "gpuc.host" in cmdline(pid)
+
+
+def find_runner_pid(job_id: str) -> int | None:
+    """The pid of a live `gpuc.host run <job_id>`, if this host has one.
+
+    The question a recorded pid cannot answer. `launch_ready` writes `running`
+    before there is a process to name and the pid only after the spawn, so a
+    dispatcher that died in between left a state naming no runner at all --
+    and /proc is the only remaining record of the runner it did start.
+    """
+    try:
+        pids = sorted(int(entry.name) for entry in PROC_PATH.iterdir() if entry.name.isdigit())
+    except OSError:
+        return None
+    for pid in pids:
+        argv = cmdline(pid).split()
+        if "gpuc.host" in argv and argv[-2:] == ["run", job_id]:
+            return pid
+    return None
 
 
 def recorded_process_alive(

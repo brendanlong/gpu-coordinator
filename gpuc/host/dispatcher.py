@@ -29,6 +29,7 @@ from gpuc.host.runner import (
     KILL_GRACE_S,
     boot_id,
     cmdline,
+    find_runner_pid,
     is_gpuc_process,
     pid_alive,
     process_group_alive,
@@ -622,17 +623,56 @@ class Dispatcher:
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
+            runner_pid = state.runner_pid
+            if not alive:
+                runner_pid = self._unrecorded_runner(job_id)
+                alive = runner_pid is not None
             if alive:
                 self.running[job_id] = _Running(
-                    job_id, state.runner_pid or 0, self._held_gpus(job_id, state)
+                    job_id, runner_pid or 0, self._held_gpus(job_id, state)
                 )
-                self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
+                self.log(f"adopted running job {job_id} (runner pid {runner_pid})")
             else:
                 self._mark_runner_died(job_id)
                 # A job stopped by `gpuc preempt` whose runner then died still
                 # asked to come back, and `reap` will never see this one: it
                 # belongs to a dispatcher that is gone.
                 self.requeue_if_preempted(job_id)
+
+    def _unrecorded_runner(self, job_id: str) -> int | None:
+        """The runner of a `running` job whose state does not name a live one.
+
+        The launch window. `launch_ready` writes `running` before it has a
+        process to name and the runner pid only after the spawn, so a
+        dispatcher killed between the two -- which is every first takeover by a
+        newer build, and both SIGKILL paths -- leaves a job that reads as
+        abandoned while its runner is training right now. Failing it there
+        would lose the job *and* put its cards back in the free pool underneath
+        a process still using them, with nothing recorded to kill: the pgid is
+        not written until the runner publishes the job's own group.
+
+        So the state is not the last word on it. A live `gpuc.host run <id>` is
+        that job's runner and nothing else's, and adopting it is what the
+        dispatcher that spawned it did not live to do.
+
+        The same answer covers a second attempt launched into a state that
+        still carries the dead pid of the attempt before it.
+        """
+        pid = find_runner_pid(job_id)
+        if pid is None:
+            return None
+        self.log(
+            f"job {job_id} records no live runner, but `gpuc.host run {job_id}` is alive at "
+            f"pid {pid}: its dispatcher died in the launch window. Adopting it"
+        )
+        # The write that dispatcher did not get to, so nothing after this has
+        # to go looking again -- including `gpuc status`, which would otherwise
+        # report a running job with no pid.
+        with contextlib.suppress(RuntimeError, OSError):
+            jobs.update_state(
+                job_id, runner_pid=pid, runner_boot_id=boot_id(), runner_starttime=starttime(pid)
+            )
+        return pid
 
     def _held_gpus(self, job_id: str, state: jobs.JobState) -> list[str]:
         """The cards an adopted job is holding, as UUIDs.

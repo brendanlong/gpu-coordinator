@@ -729,7 +729,7 @@ Every `failed: <reason>`:
 | `bad-spec` | the queued spec could not be read |
 | `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued. On a host with [shared cards](#shared-gpus) it counts the ones this job asked for, and says so when it asked for none |
 | `spawn-failed` | the dispatcher could not start a runner process |
-| `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind before freeing its GPUs |
+| `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind before freeing its GPUs. A job whose state simply never recorded a pid is not this: the dispatcher looks for the runner itself and adopts it |
 
 `cancelled` is a status of its own, not a failure.
 

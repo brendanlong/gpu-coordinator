@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 
 from gpuc.host import runner as procinfo
@@ -42,3 +43,27 @@ def test_cmdline_identifies_a_gpuc_process() -> None:
         proc.wait(timeout=10)
     assert procinfo.cmdline(2**30) == ""
     assert not procinfo.pid_alive(2**30)
+
+
+def _wait_for_cmdline(pid: int) -> str:
+    deadline = time.time() + 10
+    while not procinfo.cmdline(pid) and time.time() < deadline:
+        time.sleep(0.02)
+    return procinfo.cmdline(pid)
+
+
+def test_a_runner_is_found_by_the_job_it_was_started_for() -> None:
+    """How a job whose state names no runner is told from one that has none."""
+    job_id = "20250101-000000-abcdef"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time;time.sleep(30)", "gpuc.host", "run", job_id]
+    )
+    try:
+        _wait_for_cmdline(proc.pid)
+        assert procinfo.find_runner_pid(job_id) == proc.pid
+        # Another job's runner is not this job's, and neither is a dispatcher.
+        assert procinfo.find_runner_pid("20250101-000000-fedcba") is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    assert procinfo.find_runner_pid(job_id) is None
