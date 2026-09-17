@@ -415,7 +415,7 @@ def test_reconcile_reports_only_what_it_had_to_change(gpuc_home: Path) -> None:
 
     repairs = queue.reconcile()
 
-    assert [(r.job_id, r.requeued) for r in repairs] == [(lost, True)]
+    assert [(r.job_id, r.action) for r in repairs] == [(lost, "queued")]
     assert queue.find_marker(consistent) is not None
 
 
@@ -450,5 +450,42 @@ def test_reconcile_drops_a_marker_for_a_job_that_is_gone(gpuc_home: Path) -> Non
 
     repairs = queue.reconcile()
 
-    assert [(r.job_id, r.status) for r in repairs] == [(job_id, "gone")]
+    assert [(r.job_id, r.action, r.status) for r in repairs] == [(job_id, "dequeued", "gone")]
     assert queue.list_queued() == []
+
+
+def test_leave_queue_removes_a_marker_that_was_renamed_underneath_it(gpuc_home: Path) -> None:
+    """`launch_ready` holds the entries it listed at the top of the pass, and
+    `gpuc reorder` renames markers with no lock between them. Unlinking the
+    path that was listed removes nothing, and the marker left behind dispatches
+    a second runner into the workdir the first one is using."""
+    job_id = queue.enqueue(make_spec(priority=50))
+    entry = queue.list_queued()[0]
+    queue.reorder(job_id, 10)
+
+    queue.leave_queue(entry, status="running")
+
+    assert queue.list_queued() == []
+    assert jobs.read_state(job_id).status == "running"
+
+
+def test_reconcile_drops_a_duplicate_marker_keeping_the_better_priority(gpuc_home: Path) -> None:
+    """Two markers for one job is the double-launch state itself, and nothing
+    else would ever notice it."""
+    job_id = queue.enqueue(make_spec(priority=10))
+    (paths.queue_dir() / queue.marker_name(60, job_id)).touch()
+
+    repairs = queue.reconcile()
+
+    assert [(r.job_id, r.action) for r in repairs] == [(job_id, "deduplicated")]
+    assert [(e.priority, e.job_id) for e in queue.list_queued()] == [(10, job_id)]
+
+
+def test_reconcile_skips_a_job_dir_that_has_no_state_yet(gpuc_home: Path) -> None:
+    """An enqueue interrupted between the job dir and the state file. Asking
+    `read_state` costs most of a second of retries, and nothing purges such a
+    dir, so it would be paid at every startup forever."""
+    paths.ensure_layout()
+    paths.ensure_job_layout("20250101-000000-abcdef")
+
+    assert queue.reconcile() == []

@@ -572,6 +572,77 @@ def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).reason == "runner-died"
 
 
+class FakeLock:
+    """Enough of `DispatcherLock` for `run` to get through a pass."""
+
+    def start_heartbeat(self) -> None: ...
+
+    def beat(self) -> None: ...
+
+    def release(self) -> None: ...
+
+
+def test_startup_reconciles_the_queue_before_it_adopts_anything(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both passes, in that order, and from `run` rather than from a test
+    calling them: a job's state is only worth reading against a queue that has
+    been made to agree with it."""
+    dispatcher, _ = make_dispatcher()
+    calls: list[str] = []
+    monkeypatch.setattr(dispatcher, "reconcile_queue", lambda: calls.append("reconcile"))
+    monkeypatch.setattr(dispatcher, "adopt_orphans", lambda: calls.append("adopt"))
+    dispatcher.should_exit = True
+
+    dispatcher.run(cast("host_dispatcher.DispatcherLock", FakeLock()))
+
+    assert calls == ["reconcile", "adopt"]
+
+
+def test_a_job_lost_by_an_interrupted_submit_stops_the_idle_shutdown(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`enqueue` writes the job's state, then its marker, and spawns a
+    dispatcher only after both -- so an ssh that dies mid-submit leaves a
+    queued job no marker names and no new dispatcher to notice it. The
+    incumbent reconciled at startup, before the job existed, so without a last
+    look the pod terminates with the job unrun."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=15.0)
+    clock = FakeClock()
+    terminated: list[str] = []
+    dispatcher, spawned = make_dispatcher(
+        clock=clock, terminate_call=lambda pod, key: terminated.append(pod) or ""
+    )
+    dispatcher.run_once()
+
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)  # the submit dies here, before spawning anything
+    clock.advance(16 * 60)
+    dispatcher.run_once()
+
+    assert terminated == []
+    # Put back too late in the pass for that one to dispatch it; the next one
+    # does, which is the whole difference between a delay and a lost job.
+    dispatcher.run_once()
+    assert job_id in spawned
+    assert jobs.read_state(job_id).status == "running"
+
+
+def test_the_last_dispatcher_does_not_exit_on_a_queue_that_only_looks_empty(
+    gpuc_home: Path,
+) -> None:
+    """A host with no idle timer gets no second chance: this dispatcher exits,
+    and the next one starts only when somebody submits something else."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)  # an interrupted submit or cancel
+
+    dispatcher, _ = make_dispatcher()
+
+    assert not dispatcher.idle_and_not_ephemeral()
+    assert queue.find_marker(job_id) is not None
+
+
 def test_a_job_dropped_on_the_way_out_of_the_queue_is_not_lost(gpuc_home: Path) -> None:
     """`launch_ready` unlinks the marker and then writes `running`. Killed
     between the two, the job is `queued` with nothing left to dispatch it:

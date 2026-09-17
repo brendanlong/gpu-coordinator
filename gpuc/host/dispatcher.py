@@ -594,21 +594,43 @@ class Dispatcher:
     def reconcile_queue(self) -> None:
         """Make the queue directory and the job states agree again.
 
-        The other half of startup recovery, and the one that runs first: what
-        a job's state says is only trustworthy once the queue it was read
-        against is. See `queue.reconcile` for what the two disagreements mean.
+        At startup, and again before this dispatcher stops serving the queue
+        (`_nothing_waiting`). See `queue.reconcile` for what a disagreement
+        between the two means and why the state wins.
         """
         for repair in queue.reconcile():
-            if repair.requeued:
+            if repair.action == "queued":
                 self.log(
-                    f"job {repair.job_id} is queued but had no queue marker: a dispatcher "
-                    f"was killed on its way out of the queue. Queued again"
+                    f"job {repair.job_id} is queued but had no queue marker, so nothing "
+                    f"would have dispatched it: a submit, a cancel or a dispatcher was "
+                    f"interrupted between the two. Queued again"
                 )
+            elif repair.action == "deduplicated":
+                self.log(f"job {repair.job_id} had two queue markers; dropped the later one")
             else:
                 self.log(
                     f"job {repair.job_id} is {repair.status} but was still in the queue; "
                     f"marker removed, so it is not dispatched a second time"
                 )
+
+    def _nothing_waiting(self) -> bool:
+        """Whether the queue is empty -- asked only where that ends something.
+
+        A last reconcile before this dispatcher acts on having nothing to do,
+        because the emptiness may not be real. `enqueue` writes the job's state
+        first, its marker second, and spawns a dispatcher only after both, so
+        an ssh that dies mid-submit leaves a queued job that no marker names
+        *and* no new dispatcher to notice it: the incumbent reconciled at
+        startup, before that job existed. Acted on, that emptiness drains an
+        ephemeral pod or exits the last dispatcher, and the job is gone with
+        the host.
+
+        Only at the two moments the answer is final, never per pass: a job lost
+        this way on a busy host waits for the queue to run dry, which is the
+        first moment anything would have run it anyway.
+        """
+        self.reconcile_queue()
+        return not queue.list_queued()
 
     def adopt_orphans(self) -> None:
         """Reconcile jobs left `running` by a dispatcher that died."""
@@ -1361,6 +1383,9 @@ class Dispatcher:
             self._queue_empty_since = now
         idle_s = now - self._queue_empty_since
         if idle_s >= config.idle_minutes * 60.0:
+            if not self._nothing_waiting():
+                self._queue_empty_since = None
+                return
             self.drain_and_terminate(f"idle for {idle_s / 60.0:.1f} min")
 
     def _request_kills(self, reason: str, why: str) -> None:
@@ -1605,7 +1630,12 @@ class Dispatcher:
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:
-        return not self.running and not queue.list_queued() and not self.config.ephemeral
+        if self.running or self.config.ephemeral or queue.list_queued():
+            return False
+        # Exiting is this dispatcher's last act, and on a host with no
+        # `idle_minutes` there is no second chance: give the queue the same
+        # last look the terminate path gives it.
+        return self._nothing_waiting()
 
     def run(self, lock: DispatcherLock) -> int:
         lock.start_heartbeat()

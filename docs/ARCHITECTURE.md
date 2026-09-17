@@ -247,29 +247,40 @@ queue's lexical order, not submission order below one second.
   walked past instead, and neither is failed -- `_capacity_failure` fails a
   job bigger than the configured host, shared cards included. Why the obvious
   rule (dispatch whatever fits) is wrong is [usage.md](usage.md#priority-is-not-advisory).
-- **Startup recovery is two passes, and this is the general answer to "a
-  process was killed between two writes".** Every such window in the host falls
-  into one of two families, and each has one mechanism:
-  - *Two files that must agree* -- the queue marker and `state.json`. Every
-    move in or out of the queue writes both (`enqueue`, `requeue_preempted`,
-    `cancel`, and the four in `launch_ready`), so a process killed between them
-    leaves the pair disagreeing. **`queue.reconcile()`, run first at startup,
-    makes `state.json` win**: a `queued` job with no marker gets one back (it
-    was otherwise invisible to every later pass -- `list_queued` cannot see it
-    and `adopt_orphans` only looks at `running` and finished jobs, so an
-    ephemeral host would idle-terminate with it unrun), and a marker for a job
-    that is not queued is removed (it would otherwise launch a second runner
-    into the first one's workdir). A marker naming a job the host no longer has
-    goes too. Because the repair is symmetric, **the order of the two writes no
-    longer matters**, which is why all seven sites can share one helper,
-    `queue.leave_queue`, instead of each getting the ordering right by hand.
+- **Recovery from "a process was killed between two writes".** Which mechanism
+  applies depends on what the two records are:
+  - *Two files that must agree* -- the queue marker and `state.json`. Seven
+    paths move a job in or out of the queue (`enqueue`, `requeue_preempted`,
+    `cancel`, and four in `launch_ready`) and each writes both, so a process
+    killed between them leaves the pair disagreeing. **`queue.reconcile()`
+    makes `state.json` win**: a `queued` job with no marker gets one back, a
+    marker for a job that is not queued is removed, a marker naming no job goes,
+    and a job with two markers keeps the better-priority one. Because the repair
+    is symmetric the *order* of the two writes stops mattering, which is what
+    lets `launch_ready`'s four ways out share one helper, `queue.leave_queue`,
+    rather than each arguing its ordering. (The other three move a job *in*, or
+    need to know whether it was queued at all, and keep their own ordering
+    arguments -- `enqueue`'s marker-last comment is still load-bearing, since a
+    marker written before the spec would have the job failed `bad-spec`.)
+    - `state.json` is authoritative for *status*, not for priority: `reorder`
+      renames the marker and then writes the spec, and deliberately keeps the
+      move when the second write fails. A marker lost from that state comes
+      back at the spec's priority.
+    - **Run wherever the dispatcher would stop serving the queue**, not just at
+      startup: before an ephemeral host drains on the idle timer, and before a
+      non-ephemeral one exits (`_nothing_waiting`). Startup alone is not enough
+      because `enqueue` spawns its dispatcher *after* writing both files, so an
+      interrupted submit leaves a job no marker names and starts nothing that
+      would look for it -- and the incumbent has long since reconciled.
   - *A file versus reality* -- `state.runner_pid` against the process table.
     A record cannot be made atomic with a `fork`, so nothing concludes a runner
     is gone from a missing pid; `adopt_orphans` asks /proc instead (below).
 
-  What this does **not** cover is a window whose intermediate state no reader
-  visits. That is the question to ask of any new multi-write sequence here:
-  *if this is interrupted halfway, which pass looks at what is left?*
+  Neither covers a window whose intermediate state no reader visits, which is
+  the question to ask of any new multi-write sequence here: *if this is
+  interrupted halfway, which pass looks at what is left?* `requeue_preempted`
+  is the one three-file sequence, and answers it with its own ordering and
+  `_finish_interrupted_requeue`.
 - **Adoption at startup** (`adopt_orphans`): every job whose `state.json` says
   `running` is either taken over or failed `runner-died`, and the GPUs of a
   failed one go straight back in the free pool -- so anything it left behind is
