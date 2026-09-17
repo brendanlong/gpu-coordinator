@@ -31,6 +31,7 @@ from gpuc.control.config import (
     config_file,
     hosts_file,
     load_registry,
+    pod_known_hosts_file,
     read_registry,
 )
 from gpuc.control.status import HostView
@@ -817,11 +818,17 @@ def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
 ) -> None:
     register_host(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1")
     register_host(name="local", gpus=GPU)
+    pinned = pod_known_hosts_file("pod")
+    pinned.parent.mkdir(parents=True, exist_ok=True)
+    pinned.write_text("[1.2.3.4]:22 ssh-ed25519 AAAA\n")
     capsys.readouterr()
     assert main(["host", "remove", "pod", "--json"]) == EXIT_OK
     document = document_of(capsys)
     assert (document["host"], document["kind"], document["pod_id"]) == ("pod", "runpod", "p1")
     assert any("p1" in text and "not terminated" in text for text in document["notes"])
+    # RunPod recycles host:port, so the next pod under this name must not be
+    # checked against this one's key.
+    assert not pinned.exists()
     assert main(["host", "remove", "local", "--json"]) == EXIT_OK
     document = document_of(capsys)
     assert (document["host"], document["kind"], document["pod_id"]) == ("local", "local", None)
@@ -956,24 +963,21 @@ def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register_host(name="local", gpus=GPU)
-    host = PruningTransport(
-        "before=18G\nbefore_bytes=19327352832\nafter=11G\nafter_bytes=11811160064\n"
-        "dir=/home/u/.cache/uv\n"
-    )
+    host = PruningTransport("before_kib=18874368\nafter_kib=11534336\ndir=/home/u/.cache/uv\n")
     monkeypatch.setattr("gpuc.control.clean.transport_for", lambda entry, settings=None: host)
     assert main(["host", "clean", "local", "--uv-cache"]) == EXIT_OK
-    assert "pruned 18G -> 11G" in capsys.readouterr().out
+    assert "pruned 18.0 GiB -> 11.0 GiB" in capsys.readouterr().out
     assert main(["host", "clean", "local", "--uv-cache", "--json"]) == EXIT_OK
     document = document_of(capsys)
     assert document == {
         "schema_version": 1,
         "host": "local",
         "cache_dir": "/home/u/.cache/uv",
-        "before": "18G",
-        "after": "11G",
-        "before_bytes": 19327352832,
-        "after_bytes": 11811160064,
-        "freed_bytes": 7516192768,
+        "before": "18.0 GiB",
+        "after": "11.0 GiB",
+        "before_bytes": 18874368 * 1024,
+        "after_bytes": 11534336 * 1024,
+        "freed_bytes": (18874368 - 11534336) * 1024,
     }
 
 

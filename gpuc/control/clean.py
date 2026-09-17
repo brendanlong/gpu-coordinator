@@ -415,11 +415,9 @@ def verify_mirror(
 
 UV_CACHE_PRUNE = """\
 cache=$({env}{uv} cache dir 2>/dev/null || echo "$HOME/.cache/uv")
-echo "before=$(du -sh "$cache" 2>/dev/null | cut -f1)"
-echo "before_bytes=$(du -sb "$cache" 2>/dev/null | cut -f1)"
+echo "before_kib=$(du -sk "$cache" 2>/dev/null | cut -f1)"
 {env}{uv} cache prune
-echo "after=$(du -sh "$cache" 2>/dev/null | cut -f1)"
-echo "after_bytes=$(du -sb "$cache" 2>/dev/null | cut -f1)"
+echo "after_kib=$(du -sk "$cache" 2>/dev/null | cut -f1)"
 echo "dir=$cache"
 """
 
@@ -430,11 +428,17 @@ class PruneReport:
 
     host: str
     cache_dir: str | None
-    before: str | None
-    """`du -sh` of the cache before the prune, as the host printed it."""
-    after: str | None
-    before_bytes: int | None = None
-    after_bytes: int | None = None
+    before_bytes: int | None
+    """`du -sk` of the cache before the prune, in bytes; null if `du` failed."""
+    after_bytes: int | None
+
+    @property
+    def before(self) -> str | None:
+        return None if self.before_bytes is None else human_bytes(self.before_bytes)
+
+    @property
+    def after(self) -> str | None:
+        return None if self.after_bytes is None else human_bytes(self.after_bytes)
 
     @property
     def freed_bytes(self) -> int | None:
@@ -460,8 +464,8 @@ class PruneReport:
         }
 
 
-def _int_or_none(raw: str | None) -> int | None:
-    return int(raw) if raw is not None and raw.isdigit() else None
+def _kib_to_bytes(raw: str | None) -> int | None:
+    return int(raw) * 1024 if raw is not None and raw.isdigit() else None
 
 
 def prune_uv_cache(
@@ -489,8 +493,6 @@ def prune_uv_cache(
     return PruneReport(
         host=entry.name,
         cache_dir=values.get("dir") or None,
-        before=values.get("before") or None,
-        after=values.get("after") or None,
-        before_bytes=_int_or_none(values.get("before_bytes")),
-        after_bytes=_int_or_none(values.get("after_bytes")),
+        before_bytes=_kib_to_bytes(values.get("before_kib")),
+        after_bytes=_kib_to_bytes(values.get("after_kib")),
     )

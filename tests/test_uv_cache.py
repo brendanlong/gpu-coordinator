@@ -239,7 +239,7 @@ def test_probe_says_unknown_rather_than_guessing() -> None:
 class PruningHost(ScriptedHost):
     def _answer(self, command: str) -> tuple[int, str]:
         if "cache prune" in command:
-            return 0, "before=18G\nafter=11G\ndir=/home/u/.cache/uv\n"
+            return 0, "before_kib=18874368\nafter_kib=absent\ndir=/home/u/.cache/uv\n"
         return super()._answer(command)
 
 
@@ -248,15 +248,14 @@ def test_host_clean_prunes_rather_than_cleans(control_env: Path) -> None:
 
     host = PruningHost()
     report = prune_uv_cache(entry(uv="/home/u/.local/bin/uv"), transport=host)
-    assert "pruned 18G -> 11G" in report.render()
-    # Sizes in bytes are what a script wants, and a host that printed none
-    # (an older prune script, a `du` that failed) leaves them null, not zero.
+    assert "pruned 18.0 GiB -> ?" in report.render()
+    # A side whose `du` failed is null, not zero, and so is what was freed.
     assert report.document() == {
         "host": "h",
         "cache_dir": "/home/u/.cache/uv",
-        "before": "18G",
-        "after": "11G",
-        "before_bytes": None,
+        "before": "18.0 GiB",
+        "after": None,
+        "before_bytes": 18874368 * 1024,
         "after_bytes": None,
         "freed_bytes": None,
     }

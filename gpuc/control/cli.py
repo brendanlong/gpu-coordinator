@@ -326,12 +326,12 @@ def _owns_nothing_warning(entry: HostEntry, args: argparse.Namespace, report: Pr
     """A first config that owns no card is legal and useless; say which it was."""
     if args.gpus is not None:
         why = "--gpus '' asked for none"
+    elif not report.has_nvidia_smi:
+        why = "it has no nvidia-smi"
     elif entry.config.shared_gpus:
         why = "every card it has is shared"
-    elif report.has_nvidia_smi:
-        why = "nvidia-smi found no cards on it"
     else:
-        why = "it has no nvidia-smi"
+        why = "nvidia-smi found no cards on it"
     return (
         f"it owns no GPUs ({why}), so nothing can be submitted to it: "
         f"`gpuc host set {entry.name} --gpus <list>` assigns some"

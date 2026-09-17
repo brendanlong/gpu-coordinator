@@ -31,6 +31,7 @@ from gpuc.control.config import (
     Settings,
     config_file,
     hosts_file,
+    pod_known_hosts_file,
     read_registry,
     registry_transaction,
     state_dir,
@@ -310,6 +311,7 @@ def remove_host(name: str) -> dict[str, Any]:
     with registry_transaction() as registry:
         entry = registry.require(name)
         del registry.hosts[name]
+        pod_known_hosts_file(name).unlink(missing_ok=True)
     notes = []
     if entry.ephemeral:
         pod = f"pod {entry.pod_id}" if entry.pod_id else "pod"

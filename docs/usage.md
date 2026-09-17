@@ -440,9 +440,10 @@ It therefore **needs `s3_bucket`** (without it, submit the job file again) and
 cannot rebuild a `--no-git` workdir. `--host H` sends it somewhere else;
 `--runpod` provisions for it; with neither, it goes back to the host the local
 index says it ran on. The mirror holds the spec with `{job_id}` unexpanded, so
-the new run gets its own output namespace. The mirrored spec is checked exactly
-as a job file is, so one an older build wrote with `gpus: 0` is refused here
-rather than queued to fail, and so is one that carries an earlier run's literal
+the new run gets its own output namespace. The mirrored spec is checked as
+a job file is, except that keys this build does not know are dropped rather
+than refused (an older build may have mirrored them), so one an older build
+wrote with `gpus: 0` is refused here rather than queued to fail, and so is one that carries an earlier run's literal
 id in an output destination (older builds mirrored the expanded spec): the new
 job must not write over the old one's outputs, so submit the job file again. It
 is the other half of the pair with `gpuc preempt`: a new job id from the
@@ -812,7 +813,7 @@ that exits 1 on its own `errors`).
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued. The queue fields are the host's answer a moment *after* the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, `starts_unknown` says why there is no start time (a draining host, a job ahead that estimated nothing, a job that asks for more cards than the host has) and is null when there is one, and every one of them is null when the host could not be asked again — never a reason to think the job was not queued |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is the id this run came from, null on `submit`; `notes` are the text output's `note:` lines and do not mean the job was not queued. The queue fields are the host's answer a moment *after* the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, `starts_unknown` says why there is no start time (a draining host, a job ahead that estimated nothing, a job that asks for more cards than the host has, an owned card the job needs that nvidia-smi no longer reports) and is null when there is one, and every one of them is null when the host could not be asked again — never a reason to think the job was not queued |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
@@ -827,7 +828,7 @@ that exits 1 on its own `errors`).
 | `host add`, `host set` | the host as `host list --json` reports one entry (the address, the host's own config flattened beside it, `cache`, `remote_home`, `ephemeral`), as the registry holds it once the command is done, plus `adopted` (the host already had a config, which `add` took as it stood), `config_path` (that config on the host), `changes[]` (one line per config field this command wrote through to the host, empty when it held that already) and `warnings[]` (`host list`'s re-bootstrap note, and for `add` a host that owns no card or a pod nothing has bootstrapped). `host set` adds `address{}`: the fields it changed here rather than on the host (`persistent_root`, `gpuc_home`), by name and new value |
 | `host remove` | `{host, kind, pod_id, notes[]}` — what was forgotten here. Nothing on the host changes, and a rental is **not** terminated: `notes` says so for an ephemeral host, since it goes on billing until it idles out |
 | `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}` — the gpuc home the package went to, how many files, the commit it now runs, the dispatcher started, and every warning the run printed. With `--all`: `{hosts[], total, bootstrapped[], failed[], unreadable[], interrupted, errors[]}`, the tally as data — one `hosts[]` entry per registered host, `{name, outcome, error, ephemeral}` plus the single-host fields (null unless it was bootstrapped), where `outcome` is `bootstrapped`, `failed` (with `error` saying why), `interrupted` (the host a Ctrl-C landed in) or `not_attempted` (the ones after it); `unreadable` names the registry entries this build could not read and so never tried, and `errors` is what it said about them. Exit 1 if any host failed or the run was interrupted, exactly as without the flag; a registry that stops being readable mid-run is the error document and exit 3 |
-| `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` — the cache pruned and its size either side, as the host's `du -sh` printed it and in bytes. The byte fields are null when the host did not report them |
+| `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` — the cache pruned and its size either side, in bytes and as a human-readable string derived from them. All four size fields are null when `du` on the host failed |
 | `config init` | `{config_file, existed}` — the path written, and whether a file was already there (only ever true with `--force`; without it an existing file is refused, exit 1) |
 
 ```sh

@@ -166,7 +166,7 @@ gpuc estimate <jobid> --minutes 150
 gpuc requeue <jobid> --host <host>
                                  # re-run from the mirrored spec, attempt+1; needs s3_bucket set,
                                  # and re-syncs the workdir from your current directory
-gpuc pods                        # RunPod: every pod we own, cost, age, util, wanted?
+gpuc pods                        # RunPod: every pod we own, cost, age, util, host name
 ```
 
 A job's status is its exit code. `failed: <reason>` reasons you will see:
@@ -228,7 +228,7 @@ scraping any of the text output.
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a draining host, a job ahead that estimated nothing — and is null when there is one |
+| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a draining host, a job ahead that estimated nothing, a job wider than the host, an owned card it needs that nvidia-smi no longer reports — and is null when there is one |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `cancel` | `{job_id, host, status}` |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`; `status` is `preempting` and `priority` is what it will be queued again at |

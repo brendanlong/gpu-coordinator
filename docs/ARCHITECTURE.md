@@ -35,7 +35,7 @@ gpuc/
     jobs.py        # job ids, HostConfig/JobSpec/JobState, tolerant readers, atomic writes
     queue.py       # enqueue, list, reorder, cancel, preempt and kill markers
     dispatcher.py  # lock+heartbeat, pick next runnable, launch runner, idle terminate
-    runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, watchdog, sync, exit code
+    runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, wall-clock limit, sync, exit code
     scope.py       # systemd --user scope probe/wrap/stop; the cgroup kill path
     preflight.py   # sync preflight: prove `aws`/`hf` can write before the job runs
     baseline.py    # what was already under `outputs:` before the job started

@@ -1,4 +1,4 @@
-"""Runs exactly one job: environment, preflight, watchdogs, sync, exit code.
+"""Runs exactly one job: environment, preflight, wall-clock limit, sync, exit code.
 
 Exit-code discipline (measured in the shell implementation this replaces):
 the job's exit code is captured before *any* cleanup, and a failed final sync
@@ -596,7 +596,7 @@ class JobRunner:
         assignment was resolved host-side hands the index straight through. An
         index is only meaningful against the host's numbering right now, so it
         is resolved here and everything after this -- `CUDA_VISIBLE_DEVICES`,
-        the utilization watchdog -- sees UUIDs.
+        the utilization samples -- sees UUIDs.
         """
         if not self.assigned:
             return "no GPUs assigned; every job runs on at least one"
