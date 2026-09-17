@@ -298,6 +298,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "progress_error",
         "gpus",
         "gpus_requested",
+        "use_shared",
         "starts_in_s",
         "starts_at",
         "iso",
@@ -841,9 +842,9 @@ def test_status_json_says_what_order_the_queue_runs_in(
     # The card is held for another hour, which is what gives the jobs waiting
     # for it a start time at all.
     jobs.update_state(RUNNING_JOB, eta=(datetime.now(UTC) + timedelta(hours=1)).isoformat())
-    for job_id, name, priority, gpus in (
-        ("20260915-140000-bbbbbb", "sweep", 90, 1),
-        ("20260915-140100-cccccc", "urgent", 10, 2),
+    for job_id, name, priority, gpus, use_shared in (
+        ("20260915-140000-bbbbbb", "sweep", 90, 1, False),
+        ("20260915-140100-cccccc", "urgent", 10, 2, True),
     ):
         queue.enqueue(
             JobSpec.from_dict(
@@ -853,6 +854,7 @@ def test_status_json_says_what_order_the_queue_runs_in(
                     "command": "train",
                     "priority": priority,
                     "gpus": gpus,
+                    "use_shared": use_shared,
                     "estimated_runtime_min": 30.0,
                 }
             )
@@ -864,6 +866,9 @@ def test_status_json_says_what_order_the_queue_runs_in(
     assert [(job["name"], job["priority"]) for job in queued] == [("urgent", 10), ("sweep", 90)]
     assert queued == sorted(queued, key=lambda job: job["priority"])
     assert (queued[0]["gpus_requested"], queued[1]["gpus_requested"]) == (2, 1)
+    # Which of them may be dispatched onto a card the host only borrows: the
+    # spec's own answer, and the other half of explaining this queue.
+    assert (queued[0]["use_shared"], queued[1]["use_shared"]) == (True, False)
     # `urgent` wants two cards and the host owns one, so it never fits; `sweep`
     # takes the card the running job gives back in an hour.
     assert queued[0]["starts_in_s"] is None

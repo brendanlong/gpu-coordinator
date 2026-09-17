@@ -775,7 +775,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
       ],
       "queued": [
         { "job_id": "20260915-130000-d4e5f6", "name": "sweep", "status": "queued",
-          "priority": 50, "gpus_requested": 2, "gpus": [],
+          "priority": 50, "gpus_requested": 2, "use_shared": true, "gpus": [],
           "estimated_runtime_min": 360.0,
           "starts_in_s": 12060.0, "starts_at": "2026-09-15T16:31:00+00:00" }
       ],
@@ -784,7 +784,8 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
           "reason": null, "phase": "main", "priority": 50, "elapsed_s": 4210.5, "util": 96.0,
           "progress_pct": 37.0, "eta": "2026-09-15T16:31:00+00:00", "eta_s": 12060.0,
           "estimated_runtime_min": 480.0, "progress_error": null,
-          "gpus": ["GPU-8064..."], "gpus_requested": 1, "iso": "pgid", "ended_at": null,
+          "gpus": ["GPU-8064..."], "gpus_requested": 1, "use_shared": false,
+          "iso": "pgid", "ended_at": null,
           "outputs_pending": false }
       ],
       "finished": [],
@@ -803,7 +804,11 @@ fields. Beyond what the example shows:
   the order the host will take them in. Null only when the host did not say
   (a build too old to report it, or a spec it could not read).
 - `gpus_requested` is how many cards the spec asked for; a queued job holds
-  none yet, so its `gpus` is empty. `use_shared` is whether it may borrow one.
+  none yet, so its `gpus` is empty. `use_shared` is whether it may take one of
+  `shared_gpus`: with both, two jobs queued on one host can be told apart when
+  only one of them is waiting for a card the host owns. Null, like `priority`
+  and `auto_preempt`, only when the host did not say — never as a stand-in for
+  `false`.
 - `starts_in_s` / `starts_at` are when a queued job's turn is expected (see
   [job length estimates](#job-length-estimates)); null for anything not
   queued, and for a queued job whose turn cannot be dated.

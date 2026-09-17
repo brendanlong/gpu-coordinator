@@ -325,6 +325,23 @@ function gpuLabels(host, job) {
   }).join(",");
 }
 
+// The GPU table above can show a shared card sitting free while a job below it
+// stays queued, and the missing half of that is whether the job is allowed on
+// it at all. Only said on a host that has shared cards: everywhere else it is
+// a line about borrowing on a host that never borrows.
+function borrowLabel(host, job) {
+  if (!(host.shared_gpus || []).length) return null;
+  // Dotted off rather than run on: ` needs 2 gpus owned cards only` reads as
+  // one phrase about the two cards.
+  if (job.use_shared === null || job.use_shared === undefined) {
+    return el("span", { class: "muted", title: "this host did not report whether the job may borrow -- it could not read the spec" },
+      " · borrowing unknown");
+  }
+  return job.use_shared
+    ? el("span", { class: "muted", title: "may run on the host's shared cards, while nobody else is on them" }, " · may borrow")
+    : el("span", { class: "muted", title: "waits for the host's own cards; submit with use_shared to let it borrow" }, " · owned cards only");
+}
+
 function section(label, headers, rows) {
   return el("div", {}, el("div", { class: "section-label" }, label), table(headers, rows));
 }
@@ -351,7 +368,8 @@ function queuedTable(host) {
     el("td", {}, jobLabel(job),
       // The usual job wants one card; a job waiting for three is the answer to
       // "there is a card free, why is it still queued".
-      job.gpus_requested > 1 ? el("span", { class: "muted" }, ` needs ${job.gpus_requested} gpus`) : null),
+      job.gpus_requested > 1 ? el("span", { class: "muted" }, ` needs ${job.gpus_requested} gpus`) : null,
+      borrowLabel(host, job)),
     el("td", {}, priorityControl(host, job)),
     el("td", {}, job.estimated_runtime_min === null ? "" : `est ${fmtDuration(job.estimated_runtime_min * 60)}`),
     el("td", {}, fmtStarts(job)),
