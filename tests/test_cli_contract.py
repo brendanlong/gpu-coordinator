@@ -44,7 +44,6 @@ GOOD_ENTRY = {
     "kind": "local",
     "gpus": [GPU],
     "idle_minutes": 15.0,
-    "ttl_hours": None,
 }
 BAD_ENTRY = {"name": "bad", "kind": "a kind that does not exist", "port": "twenty-two"}
 

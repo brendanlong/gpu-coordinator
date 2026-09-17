@@ -50,15 +50,6 @@ Once at startup and then hourly: deleting day-old venvs is not urgent, and
 on a non-ephemeral host the dispatcher only lives while there is work, so the
 startup pass is the one that usually fires.
 """
-AUTO_PREEMPT_TTL_MARGIN_S = 300.0
-"""How close to an ephemeral host's TTL automatic preemption stops.
-
-A job stopped inside this window may never come back: the runner's final sync
-takes as long as it takes, and `requeue_if_preempted` refuses to queue anything
-onto a host that is by then draining or past its cap. A human typing `gpuc
-preempt` is there to see that happen; this fires unattended, so it stops early
-rather than spending an attempt for nothing.
-"""
 OUTPUT_RETRY_ATTEMPTS = 3
 OUTPUT_RETRY_INTERVAL_S = 60.0
 OUTPUT_RETRY_BUDGET_S = 300.0
@@ -579,7 +570,7 @@ class Dispatcher:
     def config(self) -> jobs.HostConfig:
         """The host config, read once per loop pass.
 
-        One pass asks for it a dozen times (free GPUs, the TTL, the idle timer,
+        One pass asks for it a dozen times (free GPUs, the idle timer,
         the drain); re-reading and re-parsing the file each time bought nothing
         but syscalls, and a mid-pass change is not something any of those
         decisions should straddle.
@@ -781,16 +772,9 @@ class Dispatcher:
         self.log(f"job {job_id} was preempted; queued again as attempt {attempt}")
 
     def _going_away(self) -> str | None:
-        """Why this host will not be running anything else, or None.
-
-        The TTL is a hard cap, so a host past it must not start a fresh attempt
-        of anything -- least of all one this dispatcher would launch itself,
-        seconds before the same pass drains and terminates.
-        """
+        """Why this host will not be running anything else, or None."""
         if paths.draining_file().exists():
             return "draining"
-        if self.config.ephemeral and self._ttl_expired(self.config):
-            return f"past its ttl of {self.config.ttl_hours:g} h"
         return None
 
     def handle_cancels(self) -> None:
@@ -832,7 +816,7 @@ class Dispatcher:
     def escalate_kills(self) -> None:
         """Make a kill *request* stick when the runner never acts on it.
 
-        A TTL (or a low-util pause) asks the runner to stop its job and sync,
+        A low-util pause asks the runner to stop its job and sync,
         which is right when the runner is healthy and is nothing at all when it
         is wedged: the marker sits there, the job keeps running, and an
         ephemeral host that should have died hours ago keeps billing with a
@@ -1191,7 +1175,7 @@ class Dispatcher:
         it would rather start over than hold a card something better wants, and
         a host with a steady supply of better work may never run it at all.
         """
-        if self.paused() or self._going_away() is not None or self._ttl_is_near():
+        if self.paused() or self._going_away() is not None:
             return
         candidates = self.auto_preemptable()
         if not candidates:
@@ -1326,8 +1310,7 @@ class Dispatcher:
         go away afterwards -- but never out from under a job that is still
         running. Draining there terminated the pod with the other jobs' runners
         still working: no kill marker, no final sync, outputs gone with the pod.
-        Like the TTL, we ask; the drain happens on a later pass with nothing
-        left running.
+        We ask; the drain happens on a later pass with nothing left running.
         """
         if not self.paused():
             if not self.recent_low_util_failures():
@@ -1352,16 +1335,6 @@ class Dispatcher:
             return
         now = self.deps.monotonic()
         if self._terminate_retry_at is not None and now < self._terminate_retry_at:
-            return
-        # The TTL is a hard cap, so it is checked before anything that returns
-        # early on a busy host: the reaper used to be the only thing that
-        # enforced it, and it terminates a pod out from under a running job
-        # without a final sync.
-        if self._ttl_expired(config):
-            if self.running:
-                self._request_kills("ttl", f"the ttl of {config.ttl_hours:g} h elapsed")
-                return
-            self.drain_and_terminate(f"ttl of {config.ttl_hours:g} h elapsed")
             return
         if self.running:
             self._queue_empty_since = None
@@ -1396,32 +1369,6 @@ class Dispatcher:
                 f"{why} with job {job_id} running: asked its runner to stop it "
                 f"(reason {reason}) and sync before this host terminates"
             )
-
-    def _ttl_expired(self, config: jobs.HostConfig) -> bool:
-        left = self._ttl_seconds_left(config)
-        return left is not None and left <= 0.0
-
-    def _ttl_seconds_left(self, config: jobs.HostConfig) -> float | None:
-        """Seconds until this host's hard cap, or None if it has none.
-
-        Null `ttl_hours` -- the default -- never expires. An overall TTL is
-        opt-in precisely because the failure it causes (a training run killed
-        at hour 24) is worse than the one it prevents.
-        """
-        if config.ttl_hours is None or not config.created_at:
-            return None
-        try:
-            created = datetime.fromisoformat(config.created_at)
-        except ValueError:
-            return None
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=UTC)
-        age_s = (self.deps.utcnow() - created).total_seconds()
-        return config.ttl_hours * 3600.0 - age_s
-
-    def _ttl_is_near(self) -> bool:
-        left = self._ttl_seconds_left(self.config)
-        return self.config.ephemeral and left is not None and left <= AUTO_PREEMPT_TTL_MARGIN_S
 
     def drain_and_terminate(self, why: str) -> bool:
         config = self.config
@@ -1493,9 +1440,9 @@ class Dispatcher:
         """One last attempt to upload what a terminating host is still holding.
 
         Bounded on purpose: three tries a minute apart, five minutes in total.
-        A pod that cannot reach S3 now is billing while it tries, and the TTL
-        that sent us here does not pause -- so a job whose outputs still will
-        not go up is marked `outputs_lost` and the host terminates anyway.
+        A pod that cannot reach S3 now is billing while it tries -- so a job
+        whose outputs still will not go up is marked `outputs_lost` and the
+        host terminates anyway.
         """
         pending = self.unconfirmed_output_jobs()
         if not pending:

@@ -198,7 +198,6 @@ def initial_config(
     *,
     gpus: list[str],
     idle_minutes: float,
-    ttl_hours: float | None,
     created_at: str,
     provider: dict[str, Any],
 ) -> dict[str, Any]:
@@ -214,7 +213,6 @@ def initial_config(
     return {
         "gpus": gpus,
         "idle_minutes": idle_minutes,
-        "ttl_hours": ttl_hours,
         "s3_prefix": default_s3_prefix(settings, name),
         "created_at": created_at,
         "provider": provider,
@@ -285,7 +283,6 @@ def provision(
     *,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
-    ttl_hours: float | None = None,
     disk_gb: int = DEFAULT_DISK_GB,
     image: str = DEFAULT_IMAGE,
     provider: Provider,
@@ -325,7 +322,6 @@ def provision(
                 provider=provider,
                 name_hint=name_hint,
                 idle_minutes=idle_minutes,
-                ttl_hours=ttl_hours,
                 disk_gb=disk_gb,
                 image=image,
                 cuda_min=cuda_min,
@@ -372,7 +368,6 @@ def _try_offer(
     provider: Provider,
     name_hint: str,
     idle_minutes: float,
-    ttl_hours: float | None,
     disk_gb: int,
     image: str,
     cuda_min: str,
@@ -390,7 +385,6 @@ def _try_offer(
         disk_gb=disk_gb,
         cuda_min=cuda_min,
         idle_minutes=idle_minutes,
-        ttl_hours=ttl_hours,
         progress=progress,
         deps=deps,
     )
@@ -420,7 +414,6 @@ def _try_offer(
                 settings,
                 gpus=uuids,
                 idle_minutes=idle_minutes,
-                ttl_hours=ttl_hours,
                 created_at=created_at,
                 provider=rented.pod_record(address, offer, created_at),
             ),
@@ -440,8 +433,7 @@ def _try_offer(
             write_desired(desired.model_copy(update={"bootstrapped_at": utc_now()}))
         progress(
             f"host {name} ready: dispatcher pid {result.dispatcher_pid}, "
-            f"idle terminate {idle_minutes:g} min, "
-            f"ttl {'none' if ttl_hours is None else f'{ttl_hours:g} h'}"
+            f"idle terminate {idle_minutes:g} min"
         )
         return entry
     except BaseException as exc:
@@ -467,7 +459,6 @@ def _create_and_record(
     disk_gb: int,
     cuda_min: str,
     idle_minutes: float,
-    ttl_hours: float | None,
     progress: _Progress,
     deps: ProvisionDeps,
 ) -> tuple[Pod, str]:
@@ -503,7 +494,6 @@ def _create_and_record(
                     offer=offer,
                     created_at=created_at,
                     ceiling_at=ceiling.isoformat(timespec="seconds"),
-                    ttl_hours=ttl_hours,
                 )
             )
         except BaseException as exc:
@@ -746,7 +736,6 @@ def runpod_host(
     reuse: bool = True,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
-    ttl_hours: float | None = None,
     disk_gb: int = DEFAULT_DISK_GB,
     image: str = DEFAULT_IMAGE,
     report: Reporter = print,
@@ -763,7 +752,6 @@ def runpod_host(
         provider=provider,
         name_hint=name_hint,
         idle_minutes=idle_minutes,
-        ttl_hours=ttl_hours,
         disk_gb=disk_gb,
         image=image,
         report=report,

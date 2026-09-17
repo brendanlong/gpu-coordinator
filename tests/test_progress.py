@@ -109,7 +109,7 @@ def test_poll_kills_a_command_that_hangs(tmp_path: Path) -> None:
 
 def test_poll_is_not_wedged_by_a_grandchild_that_left_the_session(tmp_path: Path) -> None:
     """`setsid` escapes the killpg, and with a pipe it would also hold stdout
-    open and block the reap for ever -- taking the runner's cancel, TTL and
+    open and block the reap for ever -- taking the runner's cancel and
     timeout checks down with it. Output goes to a file for exactly this."""
     started = time.monotonic()
     with pytest.raises(progress.ProgressError, match="longer than"):

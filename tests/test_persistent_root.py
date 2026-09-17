@@ -379,11 +379,10 @@ def test_host_set_replaces_the_whole_env(control_env: Path, fake_host: FakeHost)
     assert fake_host.config is not None and fake_host.config["env"] == {}
 
 
-def test_host_set_changes_the_timers(control_env: Path, fake_host: FakeHost) -> None:
+def test_host_set_changes_the_idle_timer(control_env: Path, fake_host: FakeHost) -> None:
     add()
-    main(["host", "set", "gpubox", "--idle-min", "3", "--ttl-hours", "0.5"])
-    entry = load_registry().require("gpubox")
-    assert (entry.idle_minutes, entry.ttl_hours) == (3.0, 0.5)
+    main(["host", "set", "gpubox", "--idle-min", "3"])
+    assert load_registry().require("gpubox").idle_minutes == 3.0
 
 
 def test_host_set_with_no_flags_says_so(

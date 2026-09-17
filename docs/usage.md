@@ -198,7 +198,7 @@ A progress command that exits non-zero, prints nonsense, or takes longer than
 in `log.txt` and in `gpuc status --json` as `progress_error`, and the job runs
 on. Only the last 64 KiB of its output is read, so pointing it at a whole log
 by mistake costs a bounded read. The runner polls it from the same loop that
-watches for a cancel, a TTL and `max_runtime_min`, which is why the timeout is
+watches for a cancel and `max_runtime_min`, which is why the timeout is
 short: 10 of the 15 seconds the runner gets before the dispatcher escalates a
 kill, so a wedged progress command eats most of that budget but never the
 whole of it.
@@ -260,10 +260,9 @@ The host only does it when it is worth it, and the rules are the command's:
   job that just gave it up. That is the ordinary dispatch rule, not something
   preemption does for itself: see [priority is not
   advisory](#priority-is-not-advisory).
-- **The host has to be dispatching.** Paused, draining, past its
-  `--ttl-hours` or within five minutes of it, nothing is stopped: the cards
-  would go to nobody, and a job stopped that close to the end of a pod's life
-  may never be queued again at all.
+- **The host has to be dispatching.** Paused or draining, nothing is stopped:
+  the cards would go to nobody, and a job stopped on a pod that is about to
+  terminate may never be queued again at all.
 
 There is **no limit on how often** one job gives way, and none on how long it
 then waits. A host with a steady supply of more important work may never run it
@@ -336,8 +335,7 @@ its state; `--json` is [below](#exit-codes-and---json). `--suspects` lists runni
 jobs that are billing but idle and **never kills anything**: a job is a suspect
 only in phase `main`, judged by **its own `low_util` settings** as the host
 reports them, so a job that raised its floor is judged by what it asked for and
-one with `enabled: false` is never listed. It also flags a pod past a TTL it
-actually has.
+one with `enabled: false` is never listed.
 
 ```
 host local [local]  gpus 0/1 free (driver 580.173.02)
@@ -433,8 +431,7 @@ The host decides the re-queue when the attempt actually stops, and there are
 four cases where it does not happen — the job finished, or failed for a reason
 of its own, in the seconds before the kill reached it (a re-run would be a
 retry nobody asked for); it was cancelled while it was stopping; its workdir is
-gone; or the host is draining or past its `--ttl-hours` and is about to stop
-existing. In all four the job stays finished, with `gpuc requeue` as the way to
+gone; or the host is draining and is about to stop existing. In all four the job stays finished, with `gpuc requeue` as the way to
 re-run it, and the dispatcher log says which case it was.
 
 **`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or
@@ -527,7 +524,7 @@ the job's own index entry recorded.
 export RUNPOD_API_KEY=...
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60
 gpuc pods                   # every pod with our prefix: cost, util, age, is it wanted?
-gpuc reconcile --once       # forget pods that are gone, enforce TTLs, report what nothing claims
+gpuc reconcile --once       # forget pods that are gone, reap dead ones, report what nothing claims
 gpuc host add rented --pod <pod-id>   # drive a pod another machine rented
 ```
 
@@ -542,7 +539,6 @@ The same flags work on `gpuc submit` and `gpuc requeue`:
 | `--cloud secure\|community\|any` | `secure` | which tier to buy from; community is cheaper and less reliable; `any` merges both and sorts by price |
 | `--cuda-min X.Y` | `12.8` | the floor sent to `create`; passing it explicitly also filters the catalog query |
 | `--idle-min N` | `15` | terminate the pod once its queue has been empty this long |
-| `--ttl-hours N` | none (`-1`) | opt-in hard cap on the pod's life |
 | `--disk GB` / `--image REF` | `config.toml` | container disk and pod image |
 | `--no-reuse` | reuse is on | always create a new pod |
 | `--name-hint TEXT` | `job` | goes into the pod name after the prefix |
@@ -570,11 +566,11 @@ matches the request (GPU name, `--min-vram`, `--max-price`, tier, CUDA floor);
 it owns at least `--gpu-count` cards; the provider says the pod exists and is
 `RUNNING`; its dispatcher heartbeat is under 30 s old; it is not draining; it is
 not paused. A registered pod the provider no longer has is forgotten on the spot
-rather than dialled. Image, disk, `--idle-min` and `--ttl-hours` are *not*
-compared: a reused pod keeps the ones it was created with.
+rather than dialled. Image, disk and `--idle-min` are *not* compared: a reused
+pod keeps the ones it was created with.
 
 **The pod is not tied to the machine that bought it.** What it is — its cards,
-its mirror, its TTL, and the record of what it was rented as — lives in its own
+its mirror, its idle timer, and the record of what it was rented as — lives in its own
 `config.json`, so `gpuc host add <name> --pod <pod-id>` on a second machine
 registers it from the pod itself and needs nothing the first machine has. That
 is also how `gpuc reconcile` tells a pod from a leak wherever it runs
@@ -595,14 +591,10 @@ cannot reach is not a reason to keep a paid pod billing. Only a failed
 *terminate* stops the shutdown: it logs loudly, keeps dispatching, and retries in
 10 minutes.
 
-**There is no overall TTL by default**, because a wall clock that kills a
+**There is no overall pod lifetime**, because a wall clock that kills a
 training run at hour 24 is a worse failure than a pod that idles for fifteen
-minutes first. `--ttl-hours` is opt-in and **does kill a running job**: past the
-cap the dispatcher asks each runner to stop with reason `ttl`, lets it sync, then
-drains and terminates, and `gpuc reconcile` enforces the same cap from the
-provider's own `createdAt` as a backstop. `gpuc submit --runpod` refuses a job
-whose `max_runtime_min` is longer than the TTL you asked for. `--ttl-hours -1`
-means no cap, on `submit`, `host add` and `host set` alike.
+minutes first. The idle timer is the only thing that ends a healthy pod; the
+cap on a job's own run is its `max_runtime_min`.
 
 <a name="reconcile"></a>
 **What stops a forgotten pod.** `gpuc reconcile` (see the timer in
@@ -616,7 +608,6 @@ means no cap, on `submit`, `host add` and `host set` alike.
   every host gets the full allowance again. A machine that was asleep for three
   days did not see anything, and the pass where it wakes up is the one where its
   own ssh is likeliest to fail;
-- a pod past a TTL its host actually has;
 - a pod *this machine created* that never bootstrapped by its 15-minute ceiling.
   An adopted pod has a config on it, which is all this machine can see, so the
   dead-dispatcher rule is what judges it instead — including a pod you adopt
@@ -624,10 +615,9 @@ means no cap, on `submit`, `host add` and `host set` alike.
   terminated after `dead_dispatcher_minutes`. `gpuc host add --pod` says so
   when it registers one.
 
-Those are the three states a pod cannot get itself out of. Everything else it
+Those are the two states a pod cannot get itself out of. Everything else it
 handles alone: a healthy pod drains and terminates itself once its queue has
-been empty for `--idle-min`, and enforces its own TTL, with nothing local
-involved.
+been empty for `--idle-min`, with nothing local involved.
 
 **Nothing is terminated for the absence of a record.** A pod with our prefix
 that this machine has no record of and cannot get an answer out of is reported
@@ -650,8 +640,8 @@ can run on the desktop while the laptop that queued the job is switched off, and
 neither machine is special.
 
 A pod with a job running per the host's own state is never touched by the
-dead-dispatcher rule, however old it is — but a TTL you set overrides that and
-kills the job. The reaper otherwise fails closed in every direction: it never
+dead-dispatcher rule, however old it is. The reaper otherwise fails closed in
+every direction: it never
 touches a pod without the configured prefix, it terminates nothing at all if
 `desired/` is unreadable, and a terminate that fails keeps its record (so the
 next pass retries it) and makes `gpuc reconcile --once` exit non-zero.
@@ -721,7 +711,6 @@ Every `failed: <reason>`:
 | `low-util` | the GPU sat under `floor_pct` for a full `window_min` of `main` |
 | `low-util-pause` | the host paused after two low-util failures and asked this job to stop so it could drain |
 | `timeout` | `max_runtime_min` elapsed |
-| `ttl` | the host's opt-in `--ttl-hours` cap elapsed |
 | `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt; the job is queued again as the next one, and this is the record of the attempt that was stopped |
 | `terminated` | the runner itself was signalled (and the job was not cancelled) |
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`, and any other reason gains `+sync` |
@@ -882,7 +871,7 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` here is the commit the host was running when this machine last read it, not what it runs now — that is `status --json`'s `pkg_commit`. Exit 3 if the registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}` — the effective settings, file or not |
-| `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `ttl_hours`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at` saying when that was, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]` (a re-bootstrap note: nothing here asks the host). The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
+| `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at` saying when that was, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]` (a re-bootstrap note: nothing here asks the host). The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
 | `reconcile --once` | `{terminated[], forgotten[], kept[], unclaimed[], errors[]}`, host names in the order they were judged — except `unclaimed`, which is *pod* names this machine has no record of and will not terminate. `--json` needs `--once` and nothing else: neither the loop nor `--install` has a document to print |
@@ -1090,7 +1079,6 @@ looks like it is saying.
 | job is `failed: low-util` | the GPU sat under `floor_pct` for a full `window_min` of phase `main` | raise `low_util.grace_min`, lower `floor_pct`, or set `low_util.enabled: false` for genuinely CPU-bound work |
 | job is `failed: sync` (or `...+sync`) | the final upload failed; the run itself may have been fine | check the tail of `gpuc logs <job-id>`; usually a missing `secrets:` entry for the destination, or no `aws`/`hf` on the host (re-run bootstrap) |
 | job is `failed: sync-preflight` | the uploads the job would do at the end cannot work | the log names the exact command and error; fix the credential or destination, or add `hf_create: true`, then re-submit |
-| job is `failed: ttl` | this host has an opt-in `--ttl-hours` cap and it ran out; the outputs were synced first | raise or drop the cap (`gpuc host set <host> --ttl-hours -1`), then `gpuc requeue <id>` |
 | job is `failed: no-outputs` | the `outputs:` path was never written, or holds only what came with the checkout | check the job writes there, relative to the workdir; use a `{job_id}` subdirectory |
 | a host is out of disk, or `status` shows a `disk` line | finished jobs' workdirs (usually venvs) are still there | `gpuc clean --host <host> --all-finished`, and set `cleanup: always` on jobs you never need to inspect |
 | one job dir is stuck and the rest of the host is fine | that job's mirror genuinely failed, so an age-based purge either misses it or sweeps up everything else | `gpuc clean --host <host> --purge --only <job-id>` (add `--force` to accept losing its only copy); it leaves every other job alone |

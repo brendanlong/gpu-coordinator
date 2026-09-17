@@ -111,9 +111,9 @@ def cancel_file(job_id: str) -> Path:
 def kill_file(job_id: str) -> Path:
     """A kill request with a reason in it, written by the dispatcher.
 
-    Separate from `cancel`: a TTL or an operator stop must end as
-    `failed: ttl`, not as a cancellation nobody asked for, and the runner is
-    still the process that does the killing and the final sync."""
+    Separate from `cancel`: a low-util pause or a preempt must end as
+    `failed: <reason>`, not as a cancellation nobody asked for, and the runner
+    is still the process that does the killing and the final sync."""
     return job_dir(job_id) / "kill"
 
 

@@ -29,7 +29,6 @@ def config_document(**overrides: Any) -> dict[str, Any]:
     document: dict[str, Any] = {
         "host": "gpuc-a-111",
         "gpus": ["GPU-1111"],
-        "ttl_hours": 4.0,
         "idle_minutes": 5.0,
         "provider": {
             "kind": "runpod",
@@ -55,7 +54,6 @@ def test_the_desired_record_is_read_back_off_the_pods_config() -> None:
     record = desired_from("pod1", config_document())
     assert (record.name, record.pod_id) == ("gpuc-a-111", "pod1")
     assert record.offer.name == "A40" and record.offer.price_usd_hr == 0.49
-    assert record.ttl_hours == 4.0
     assert record.created_at == "2026-09-15T12:00:00+00:00"
     assert record.bootstrapped_at == "2026-09-15T12:09:00+00:00"
 
@@ -95,7 +93,7 @@ def pod_host(monkeypatch: pytest.MonkeyPatch) -> FakeHost:
 def test_a_pod_holding_a_gpuc_config_is_ours_whoever_created_it(pod_host: FakeHost) -> None:
     pod_host.files[f"{HOME}/.gpuc/config.json"] = json.dumps(config_document())
     answer = ask_pod(running_pod("gpuc-a-111", "pod1"), Settings())
-    assert answer.desired is not None and answer.desired.ttl_hours == 4.0
+    assert answer.desired is not None and answer.desired.offer.name == "A40"
     assert answer.entry is not None and answer.entry.ssh == "root@1.2.3.4"
 
 

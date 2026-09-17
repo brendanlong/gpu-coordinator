@@ -139,7 +139,6 @@ def desired_from(
         pod_id=pod_id,
         offer=_offer(provider.get("offer")),
         created_at=created,
-        ttl_hours=config.ttl_hours,
         bootstrapped_at=_text(provider.get("bootstrapped_at")) or created,
         last_seen_at=seen_at or None,
     )

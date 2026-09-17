@@ -94,13 +94,13 @@ def test_config_merge_keeps_the_keys_this_build_does_not_know(
 def test_config_merge_can_clear_a_nullable_field(
     gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    jobs.write_config(HostConfig(host="test-host", ttl_hours=24.0, s3_prefix="s3://b/p"))
+    jobs.write_config(HostConfig(host="test-host", retention_days=14.0, s3_prefix="s3://b/p"))
     patch = tmp_path / "patch.json"
-    patch.write_text(json.dumps({"ttl_hours": None, "s3_prefix": None}))
+    patch.write_text(json.dumps({"retention_days": None, "s3_prefix": None}))
     _, payload = run(capsys, "config", "--merge", str(patch))
     assert isinstance(payload, dict)
-    assert payload["ttl_hours"] is None and payload["s3_prefix"] is None
-    assert jobs.read_config().ttl_hours is None
+    assert payload["retention_days"] is None and payload["s3_prefix"] is None
+    assert jobs.read_config().retention_days is None
 
 
 def test_config_merge_on_a_host_with_no_config_writes_one(

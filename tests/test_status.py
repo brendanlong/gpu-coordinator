@@ -242,15 +242,6 @@ def test_a_stale_heartbeat_reads_as_a_dead_dispatcher() -> None:
     assert "dispatcher DOWN" in render(stale)
 
 
-def test_an_ephemeral_host_past_its_ttl_is_a_suspect() -> None:
-    old = view()
-    old.entry = host_entry(
-        name="pod", kind="runpod", ttl_hours=1.0, created_at=minutes_ago(180), gpus=[GPU]
-    )
-    assert old.past_ttl
-    assert "older than 1.0h" in render(old, suspects_only=True)
-
-
 def test_the_two_utilizations_say_where_they_came_from() -> None:
     """The provider's number and the host sampler's legitimately differ; an
     unlabelled pair of percentages reads as a bug."""
@@ -336,23 +327,6 @@ def test_a_terminated_pod_reads_as_gone_too() -> None:
     assert view.pod_gone
     assert "TERMINATED" in render(view)
     assert "gpuc reconcile --once" in (view.error or "")
-
-
-def test_ttl_is_measured_from_the_pod_createdat_not_the_registry() -> None:
-    """The registry's created_at is when we heard of the pod; the reaper uses the provider's."""
-    fresh_registration = view()
-    fresh_registration.entry = host_entry(
-        name="pod", kind="runpod", ttl_hours=1.0, created_at=minutes_ago(5), gpus=[GPU]
-    )
-    fresh_registration.pod = Pod(
-        id="pod1",
-        name="gpuc-pod",
-        status="RUNNING",
-        cost_usd_hr=0.49,
-        created_at=datetime.now(UTC) - timedelta(hours=3),
-    )
-    assert fresh_registration.past_ttl
-    assert "PAST TTL" in render(fresh_registration)
 
 
 # -- leftover workdirs --------------------------------------------------------

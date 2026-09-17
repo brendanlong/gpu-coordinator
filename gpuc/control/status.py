@@ -426,23 +426,6 @@ class HostView:
         """
         return sum(job.workdir_bytes or 0 for job in self.finished)
 
-    @property
-    def past_ttl(self) -> bool:
-        """Age from the provider's own createdAt when we have it.
-
-        The registry's created_at is when *this* machine recorded the host,
-        which is not the same clock the reaper's TTL uses; a pod adopted or
-        re-registered later would read as young here and be terminated there.
-        """
-        if not self.entry.ephemeral or self.entry.ttl_hours is None:
-            return False
-        if self.pod is not None and self.pod.age is not None:
-            return self.pod.age.total_seconds() / 3600.0 > self.entry.ttl_hours
-        created = parse_timestamp(self.entry.created_at)
-        if created is None:
-            return False
-        return (datetime.now(UTC) - created).total_seconds() / 3600.0 > self.entry.ttl_hours
-
 
 def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], list[JobView]]:
     """Every field is treated as untrusted: this is another build's JSON.
@@ -1089,7 +1072,7 @@ def render(
         lines += _gpu_lines(view)
     pod = pod_line(view.pod)
     if pod:
-        lines.append(pod + ("  PAST TTL" if view.past_ttl else ""))
+        lines.append(pod)
     # Where the per-job body starts. The header, the gpu lines and the pod line
     # are about the host, not about what is on it, so "nothing here" has to be
     # measured from here -- a host with GPUs printed neither `idle` nor `no
@@ -1102,8 +1085,6 @@ def render(
                 f"  SUSPECT {_job_label(job)} phase={job.phase} {_fmt_elapsed(job)} "
                 f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             )
-        if view.past_ttl:
-            lines.append(f"  SUSPECT pod for host {entry.name} is older than {entry.ttl_hours}h")
         if len(lines) == body_start:
             lines.append("  no suspects")
         return "\n".join(lines)
@@ -1413,7 +1394,6 @@ def pod_json(view: HostView) -> dict[str, Any] | None:
         "cost_usd_hr": pod.cost_usd_hr,
         "cuda_version": pod.cuda_version,
         "age_s": None if pod.age is None else round(pod.age.total_seconds(), 1),
-        "past_ttl": view.past_ttl,
     }
 
 

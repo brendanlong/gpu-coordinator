@@ -110,7 +110,7 @@ def test_empty_account_renders_a_hint(control_env: Path) -> None:
 
 
 def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
-    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", ttl_hours=1.0)
+    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
     view = HostView(
         entry=entry,
         reachable=True,

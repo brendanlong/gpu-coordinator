@@ -290,9 +290,7 @@ def test_a_non_provider_host_never_self_terminates(gpuc_home: Path) -> None:
     assert dispatcher.idle_and_not_ephemeral()
 
 
-def configure_pod(
-    idle_minutes: float = 15.0, ttl_hours: float | None = None, age_h: float = 0.0
-) -> None:
+def configure_pod(idle_minutes: float = 15.0, age_h: float = 0.0) -> None:
     created = datetime.now(UTC) - timedelta(hours=age_h)
     jobs.write_config(
         HostConfig(
@@ -300,7 +298,6 @@ def configure_pod(
             gpus=list(FAKE_GPUS),
             provider={"kind": "runpod", "pod_id": "pod-1"},
             idle_minutes=idle_minutes,
-            ttl_hours=ttl_hours,
             s3_prefix="s3://b/gpuc/pod",
             created_at=created.isoformat(),
         )
@@ -352,17 +349,6 @@ def test_a_running_job_resets_the_idle_timer(
     dispatcher.run_once()
     assert terminated == []
     clock.advance(40)
-    dispatcher.run_once()
-    assert terminated == ["pod-1"]
-
-
-def test_ttl_terminates_an_old_but_idle_pod(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
-    terminated: list[str] = []
-    dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
     dispatcher.run_once()
     assert terminated == ["pod-1"]
 
@@ -1025,8 +1011,8 @@ def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     state = jobs.read_state(job_id)
     assert state.outputs_lost is True
     assert state.sync_error and "AccessDenied" in state.sync_error
-    # The pod still goes away: it is billing, and the TTL that sent us here
-    # does not pause for a bucket we cannot reach.
+    # The pod still goes away: it is billing, and a bucket we cannot reach is
+    # no reason to keep paying for it.
     assert terminated == ["pod-1"]
 
 
@@ -1045,14 +1031,11 @@ def test_the_drain_records_the_meta_backup_for_every_job(
     assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/pod"
 
 
-# -- the TTL is opt-in, and when it is on the dispatcher enforces it ------------
-
-
-def test_without_a_ttl_an_ancient_idle_pod_waits_for_its_idle_timer(
+def test_an_ancient_idle_pod_is_only_ever_stopped_by_its_idle_timer(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=None, age_h=500.0)
+    configure_pod(idle_minutes=600.0, age_h=500.0)
     terminated: list[str] = []
     dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
 
@@ -1061,40 +1044,16 @@ def test_without_a_ttl_an_ancient_idle_pod_waits_for_its_idle_timer(
     assert terminated == []
 
 
-def test_a_ttl_kills_the_running_job_with_reason_ttl_then_terminates(
+def test_a_pause_kill_is_only_asked_for_once(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
-    terminated: list[str] = []
-    dispatcher, spawned = make_dispatcher(
-        terminate_call=lambda pod, key: terminated.append(pod) or ""
-    )
+    configure_pod(idle_minutes=600.0)
+    dispatcher, spawned = make_dispatcher()
     job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
     dispatcher.run_once()
-    assert job_id in dispatcher.running
-
-    dispatcher.run_once()
-    # The runner owns the kill: the dispatcher asks, with the reason recorded.
-    assert queue.kill_reason(job_id) == "ttl"
-    assert terminated == []
-
-    spawned[job_id].finish(status="failed", reason="ttl")
-    dispatcher.run_once()
-    assert terminated == ["pod-1"]
-    assert paths.draining_file().exists()
-
-
-def test_a_ttl_kill_is_only_asked_for_once(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
-    dispatcher, _ = make_dispatcher()
-    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
-    dispatcher.run_once()
-    dispatcher.run_once()
+    _finish_low_util(dispatcher, spawned)
+    _finish_low_util(dispatcher, spawned)
     written = paths.kill_file(job_id).stat().st_mtime_ns
     dispatcher.run_once()
     assert paths.kill_file(job_id).stat().st_mtime_ns == written
@@ -1152,15 +1111,15 @@ def test_a_low_util_pause_stops_the_other_jobs_before_it_drains(
     assert terminated == ["pod-1"]
 
 
-def test_a_ttl_kill_the_runner_ignores_is_escalated_then_the_pod_drains(
+def test_a_pause_kill_the_runner_ignores_is_escalated_then_the_pod_drains(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The kill marker is an ask, and a wedged runner never answers it. Without
-    an escalation the TTL'd pod stayed up -- billing, heartbeat fresh -- with
+    an escalation the paused pod stayed up -- billing, heartbeat fresh -- with
     the job it was told to stop still running."""
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    configure_pod(idle_minutes=600.0)
     clock = FakeClock()
     terminated: list[str] = []
     dispatcher, spawned = make_dispatcher(
@@ -1175,8 +1134,9 @@ def test_a_ttl_kill_the_runner_ignores_is_escalated_then_the_pod_drains(
     monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
 
-    dispatcher.run_once()
-    assert queue.kill_reason(job_id) == "ttl"
+    _finish_low_util(dispatcher, spawned)
+    _finish_low_util(dispatcher, spawned)
+    assert queue.kill_reason(job_id) == "low-util-pause"
     assert signals == []
 
     clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
@@ -1192,7 +1152,7 @@ def test_a_ttl_kill_the_runner_ignores_is_escalated_then_the_pod_drains(
     assert signals[-1] == (spawned[job_id].pid, signal.SIGKILL)
     assert "escalating" in paths.dispatcher_log().read_text()
 
-    spawned[job_id].finish(status="failed", reason="ttl")
+    spawned[job_id].finish(status="failed", reason="low-util-pause")
     dispatcher.run_once()
     assert terminated == ["pod-1"]
 
@@ -1403,20 +1363,21 @@ def test_a_preempted_job_is_not_queued_again_on_a_host_that_is_going_away(
     and the drain would stop counting its outputs as unconfirmed, because that
     list is finished jobs. Left finished, it keeps both."""
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    configure_pod(idle_minutes=600.0)
     dispatcher, spawned = make_dispatcher()
     job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
     dispatcher.run_once()
     queue.enqueue(make_spec(gpus=1, priority=1))
     queue.preempt(job_id)
     spawned[job_id].finish(status="failed", reason="preempted")
+    paths.draining_file().write_text("idle\n")
     dispatcher.run_once()
 
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("failed", "preempted")
     assert queue.find_marker(job_id) is None
     assert not queue.is_preempted(job_id)
-    assert "past its ttl" in paths.dispatcher_log().read_text()
+    assert "this host is draining" in paths.dispatcher_log().read_text()
 
 
 def test_a_preempt_the_runner_ignores_is_escalated(
@@ -1858,22 +1819,6 @@ def test_a_host_that_is_dispatching_nothing_preempts_nothing(gpuc_home: Path, ma
     assert not queue.is_preempted(cheap)
 
 
-def test_a_pod_past_its_ttl_preempts_nothing(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """It is about to terminate, so the waiting job would never be dispatched
-    and the stopped one would not even be queued again."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
-    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=10))
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
-    dispatcher.run_once()
-    assert not queue.is_preempted(cheap)
-
-
 def test_the_cards_freed_for_a_waiting_job_are_not_handed_back_to_the_stopped_ones(
     gpuc_home: Path,
 ) -> None:
@@ -1970,22 +1915,6 @@ def test_cards_held_for_a_job_that_is_cancelled_are_handed_out_again(gpuc_home: 
     dispatcher.run_once()
     assert jobs.read_state(cheap).status == "running"
     assert jobs.read_state(cheap).attempt == 2
-
-
-def test_nothing_is_stopped_in_the_last_minutes_of_a_pods_ttl(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A job stopped here may never come back: the final sync takes as long as
-    it takes, and by then the host refuses to queue anything at all."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
-    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=10))
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.96)  # ~2.5 min left
-    dispatcher.run_once()
-    assert not queue.is_preempted(cheap)
 
 
 def test_a_borrowed_card_is_not_freed_for_a_job_that_may_not_borrow(gpuc_home: Path) -> None:

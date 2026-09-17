@@ -30,7 +30,7 @@ gpuc/
     paths.py       # the ~/.gpuc layout
     jobs.py        # job ids, HostConfig/JobSpec/JobState, tolerant readers, atomic writes
     queue.py       # enqueue, list, reorder, cancel, preempt and kill markers
-    dispatcher.py  # lock+heartbeat, pick next runnable, launch runner, idle/TTL terminate
+    dispatcher.py  # lock+heartbeat, pick next runnable, launch runner, idle terminate
     runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, watchdog, sync, exit code
     scope.py       # systemd --user scope probe/wrap/stop; the cgroup kill path
     preflight.py   # sync preflight: prove `aws`/`hf` can write before the job runs
@@ -47,7 +47,7 @@ gpuc/
     status.py      # gather a host's status, render it, project queue start times
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
     provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse, caps
-    reconcile.py   # the reaper: desired state vs provider, TTL, dead dispatcher, unclaimed pods
+    reconcile.py   # the reaper: desired state vs provider, dead dispatcher, unclaimed pods
     rented.py      # a pod is its own record: read `config.json` off any prefixed pod
     pods.py        # `gpuc pods`
     config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
@@ -101,7 +101,7 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uui
                      #  "shared_gpus": ["<index>" | "GPU-uuid", ...],  # cards it may borrow while
                      #                              # nobody else is on them; see Shared GPUs
                      #  "provider": null | {"kind":"runpod","pod_id":..},
-                     #  "idle_minutes": 15, "ttl_hours": null | N, "s3_prefix": "s3://bucket/gpuc/<host>",
+                     #  "idle_minutes": 15, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
                      #  "workdir_days": null | N,     # auto workdir sweep horizon; see Retention
                      #  "created_at": str,            # when this config was first written
@@ -142,7 +142,7 @@ jobs/<jobid>/
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
-  kill               # a kill request with its reason (`ttl`, `low-util-pause`, `preempted`)
+  kill               # a kill request with its reason (`low-util-pause`, `preempted`)
   preempt            # this job is coming back: `gpuc preempt` wrote it beside the kill request,
                      # and the dispatcher queues the job again once its runner has stopped it.
                      # Removed by whichever of the two decides the job is not coming back
@@ -306,9 +306,9 @@ queue's lexical order, not submission order below one second.
   are cancelled by removing the marker and setting state.
 - Stop with a reason: `queue.request_kill(jobid, reason)` writes
   `jobs/<id>/kill`; the runner kills the job the same way and ends it
-  `failed: <reason>` after a final sync. TTL, low-util pause and preempt use
-  this; cancel stays its own marker, because a TTL stop is not a cancellation
-  anyone asked for.
+  `failed: <reason>` after a final sync. Low-util pause and preempt use this;
+  cancel stays its own marker, because a stop the host decided on is not a
+  cancellation anyone asked for.
 - Preempt: `queue.preempt(jobid[, prio])` writes `jobs/<id>/preempt` and then
   a `kill` marker with reason `preempted`, for a *running* job only, and only
   when something else could run instead (`refuse_if_nothing_else_can_run`).
@@ -326,11 +326,11 @@ queue's lexical order, not submission order below one second.
   queued job that does not fit, stop the set of running `auto_preempt` jobs
   that together cover the *whole* gap (`enough_to_start`), least important
   first and most recently started among equals, and only at a strictly higher
-  priority number than the waiting job. Nothing runs on a host that is paused,
-  `_going_away`, or within `AUTO_PREEMPT_TTL_MARGIN_S` of its TTL. The stop is
-  `queue.preempt`, so it is the ordinary preempt path; cards held by a job that
-  is already stopping count as available, and once one stop in a set fails the
-  rest are left alone. Nothing counts how often a job has given way.
+  priority number than the waiting job. Nothing runs on a host that is paused
+  or `_going_away`. The stop is `queue.preempt`, so it is the ordinary preempt
+  path; cards held by a job that is already stopping count as available, and
+  once one stop in a set fails the rest are left alone. Nothing counts how
+  often a job has given way.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.
@@ -350,15 +350,11 @@ queue's lexical order, not submission order below one second.
   `terminate.self_terminate()`. Only a failed *terminate* stops the shutdown:
   remove `draining`, log loudly, keep dispatching, retry every 10 minutes. A
   failed final sync is logged and the host terminates anyway.
-- TTL (`ttl_hours`, **null by default**): checked before the idle logic, so a
-  busy host cannot dodge it. Past the cap, a `kill` marker with reason `ttl`
-  for each running job; a runner that has not acted after `kill_grace_s` is
-  escalated exactly like a cancel. With nothing running it drains and
-  terminates as above.
 - Two consecutive `failed: low-util` jobs: write `paused`, stop dispatching,
   and (if ephemeral) drain and terminate -- never out from under a job: with
   anything still running, a `kill` marker with reason `low-util-pause` for
-  each, and drain on a later pass.
+  each, and drain on a later pass. A runner that has not acted on the marker
+  after `kill_grace_s` is escalated exactly like a cancel.
 - Exit when the queue is empty, nothing is running, and the host is not
   ephemeral. Ephemeral hosts keep the dispatcher alive until terminate.
 
@@ -445,8 +441,8 @@ the mechanics.
   fraction with a decimal point or a percentage with a `%`. Above 0% the
   runner replaces `eta` with `now + elapsed_main * (100 - pct) / pct`; at 0%
   the submitter's estimate stands.
-- The poll is synchronous, in the same loop that watches for a cancel, a TTL
-  and `max_runtime_min`, with a 10 s timeout and a `killpg` of the whole
+- The poll is synchronous, in the same loop that watches for a cancel and
+  `max_runtime_min`, with a 10 s timeout and a `killpg` of the whole
   session behind it: a wedged progress command delays a kill by at most 10 s
   of the 15 s the runner gets before the dispatcher escalates, which is why the
   timeout is fixed rather than a spec field. Output goes to a temp file, not a
@@ -611,9 +607,8 @@ file the two halves share obeys the same two rules, on both sides:
 - an unknown key is ignored (a newer writer may add fields);
 - an explicit `null` for a field that is **not** declared optional is dropped,
   so the field's default applies. A `null` for a field that *is* optional is a
-  real value and round-trips unchanged: `ttl_hours: null` is "never expires",
-  `retention_days: null` is "never auto-purge", `s3_prefix: null` is "no
-  mirror".
+  real value and round-trips unchanged: `retention_days: null` is "never
+  auto-purge", `s3_prefix: null` is "no mirror".
 
 Control side that means `extra="ignore"`, a default on every field, and a
 `model_validator(mode="before")` that consults the annotation (`HostEntry`,
@@ -692,7 +687,7 @@ touch argv.
   anything that decides something reads the host.
 
 What the host **is** -- `gpus`, `s3_prefix`, `env`, `idle_minutes`,
-`ttl_hours`, `retention_days`, `provider`, `pkg_commit` -- lives in
+`retention_days`, `provider`, `pkg_commit` -- lives in
 `config.json` on the host and nowhere else. One box driven from a desktop and a
 laptop therefore has one configuration, not two, and nothing about the machine
 that bootstrapped it first matters afterwards.
@@ -918,8 +913,7 @@ gives up on the lock after two minutes, and a create that cannot write its `desi
 record is a leaked, billing pod. Each mutation re-reads the record it is about
 to change. For each `desired/` host, `get` its pod; if
 missing or TERMINATED, mark the desired entry gone and note any jobs that
-were running there (for `requeue`). A pod older than its TTL -- only when that
-host has one; the default is none -- is terminated and logged.
+were running there (for `requeue`).
 
 **The pod is the record** (`rented.py`). `desired/<host>.json` exists only on
 the machine that ran `gpuc submit --runpod`, so a reaper that trusts it alone
@@ -958,9 +952,9 @@ name on the record comes off the config document rather than the parsed config,
 whose default `host` is `local` — a record called `local` would be matched
 against this machine's own host on the next pass.
 
-**The dead-dispatcher rule**, which is what replaced the overall TTL: a
-bootstrapped desired host is asked for its pulse each pass (a 20 s ssh
-timeout, so one wedged pod cannot stall the pass) -- the dispatcher heartbeat's
+**The dead-dispatcher rule**: a bootstrapped desired host is asked for its
+pulse each pass (a 20 s ssh timeout, so one wedged pod cannot stall the pass)
+-- the dispatcher heartbeat's
 mtime and a count of the jobs whose `state.json` says `running`, read with
 `stat` and `grep` rather than by running the host's package, because the machine
 reconciling a pod may never have bootstrapped it and knows no interpreter there.
@@ -981,11 +975,9 @@ that has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) 
 including one whose ssh never answers, since that never updates `last_seen_at`
 either -- is terminated with a loud report: it cannot idle-terminate itself, it
 is doing nothing we can see, and it is still billing. A long training run keeps
-its host alive indefinitely *under this rule* -- a TTL the host actually has is
-checked first and does terminate a pod with a job on it, which is exactly why a
-TTL is opt-in. The 15-minute pre-healthy ceiling is unchanged, and it only
-applies to a record that says the pod was never bootstrapped -- which an adopted
-one never does.
+its host alive indefinitely: nothing terminates a pod with a job on it. The
+15-minute pre-healthy ceiling only applies to a record that says the pod was
+never bootstrapped -- which an adopted one never does.
 Never touch a pod without the prefix. If `desired/` is unreadable, do nothing
 and log an error (fail closed). `--install` writes a `systemd --user` service
 and timer but does not enable them, and prints the `systemctl` lines and the
@@ -1106,9 +1098,8 @@ by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
   queue whose GPU tests are the ones nobody runs is how they rot; two of them
   had, asserting on a `gpuc status` line that had since gained a job name.
 - RunPod integration: A40 only, `--max-price 0.60`, a job whose command
-  is under two minutes, `--idle-min 2`, `--ttl-hours 1` (a TTL is opt-in, and a
-  test that creates a billable pod is exactly where opting in is right), and the test
-  asserts teardown via `list()` and prints the final `GET /billing/pods`
+  is under two minutes, `--idle-min 2`, and the test asserts teardown via
+  `list()` and prints the final `GET /billing/pods`
   for the pod. A pod whose name lacks the `runpod_pod_prefix` belongs to
   someone else: read it in `list()`, never act on it. Every test that creates
   a pod has a `finally` that terminates it.

@@ -21,7 +21,7 @@ from typing import IO
 
 TIMEOUT_S = 10.0
 """Short on purpose. The runner polls this from the same loop that watches for
-a cancel, a TTL and `max_runtime_min`, so a wedged progress command delays a
+a cancel and `max_runtime_min`, so a wedged progress command delays a
 kill by at most this. The runner's own grace before the dispatcher escalates a
 kill is 15 s, so this is most of that budget rather than a rounding error on
 it -- which is why it is not configurable and why the reap below is

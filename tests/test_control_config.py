@@ -84,12 +84,12 @@ def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:
         kind="runpod",
         pod_id="abc",
         gpus=["GPU-a"],
-        ttl_hours=1.0,
+        retention_days=1.0,
         s3_prefix="s3://bucket/gpuc/pod1",
         env={"HF_HOME": "/big"},
         cache_dir="/vol/uv",
     )
-    assert (entry.gpus, entry.ttl_hours, entry.s3_prefix) == (
+    assert (entry.gpus, entry.retention_days, entry.s3_prefix) == (
         ["GPU-a"],
         1.0,
         "s3://bucket/gpuc/pod1",
@@ -125,14 +125,14 @@ def test_a_pre_split_registry_entry_becomes_a_cache_of_the_hosts_config() -> Non
             "python": "/usr/bin/python3.12",
             "cache_dir": "/mnt/ssd/uv",
             "env": {"HF_HOME": "/big"},
-            "ttl_hours": 24.0,
+            "retention_days": 24.0,
             "pkg_commit": "a" * 40,
         }
     )
     assert entry.gpus == ["2", "3"]
     assert entry.python == "/usr/bin/python3.12"
     assert entry.env == {"HF_HOME": "/big", "UV_CACHE_DIR": "/mnt/ssd/uv"}
-    assert entry.ttl_hours == 24.0
+    assert entry.retention_days == 24.0
     assert entry.pkg_commit == "a" * 40
     assert entry.config.host == "gpubox"
     # It is a cache now, and one that nothing has confirmed.
@@ -184,7 +184,7 @@ def test_config_drift_ignores_the_commit_and_names_env_without_its_values() -> N
 
 def test_config_drift_reports_the_settings_that_change_what_a_host_does() -> None:
     drift = config_drift(
-        {"host": "laptop-box", "s3_prefix": None, "retention_days": 30.0, "ttl_hours": None},
+        {"host": "laptop-box", "s3_prefix": None, "retention_days": 30.0},
         config_of(s3_prefix="s3://mine/gpuc/gpubox", retention_days=7.0),
     )
     assert drift == [

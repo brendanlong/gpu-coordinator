@@ -188,7 +188,6 @@ def precheck_local(
     gpu_count: int | None = None,
     environ: Mapping[str, str] | None = None,
     use_git: bool = True,
-    ttl_hours: float | None = None,
     report: Reporter = print,
 ) -> None:
     """Everything a submit can fail on without a host, checked before we buy one.
@@ -201,31 +200,6 @@ def precheck_local(
         raise SubmitError(
             f"the spec asks for {model.gpus} GPU(s) but this request would create a pod with "
             f"{gpu_count}.\nRaise --gpu-count, or lower `gpus:` in the spec."
-        )
-    if (
-        ttl_hours is not None
-        and model.max_runtime_min is not None
-        and model.max_runtime_min > ttl_hours * 60.0
-    ):
-        raise SubmitError(
-            f"the job's max_runtime_min ({model.max_runtime_min:g} min) is longer than the "
-            f"pod's --ttl-hours ({ttl_hours:g} h = {ttl_hours * 60.0:g} min), so the TTL would "
-            f"kill the job before it could finish.\n"
-            f"Raise --ttl-hours, drop it (the default is no TTL at all), or lower "
-            f"max_runtime_min."
-        )
-    if (
-        ttl_hours is not None
-        and model.estimated_runtime_min is not None
-        and model.estimated_runtime_min > ttl_hours * 60.0
-    ):
-        # A warning and not a refusal: `max_runtime_min` above is a cap the job
-        # asked to be held to, while this is a guess, and a guess must not stop
-        # somebody submitting a job they are willing to have cut short.
-        report(
-            f"WARNING: the job estimates {model.estimated_runtime_min:g} min but the pod's "
-            f"--ttl-hours is {ttl_hours:g} h ({ttl_hours * 60.0:g} min), so the TTL will very "
-            f"likely kill it before it finishes"
         )
     gather_secrets(model.secrets, environ)
     if not use_git:

@@ -189,7 +189,7 @@ gpuc host add rented --pod <pod-id>        # its address from the provider, its 
 ```
 
 That is what makes a pod the laptop queued usable from the desktop: the pod owns
-its `config.json` — cards, mirror, TTL, and the record of what it was rented as —
+its `config.json` — cards, mirror, idle timer, and the record of what it was rented as —
 so nothing about the machine that created it matters afterwards. It is also
 recorded in `desired/` here, so this machine's `gpuc reconcile` watches it.
 
@@ -212,7 +212,6 @@ host has to answer) and reports each change as `host <- …`.
 | `--retention-days N` | none | auto-purge whole job dirs this old, only ones whose log and state are confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` turns it off |
 | `--workdir-days N` | `1` on a host being configured for the first time | auto-sweep a finished job's `workdir/` (never its log or state) once it ended this long ago; no mirror needed. `''` turns it off. A host whose config already exists keeps whatever it says |
 | `--idle-min N` | `15` | how long an ephemeral host may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |
-| `--ttl-hours N` | none | opt-in hard cap on the host's life; past it the dispatcher kills the running job with reason `ttl`, syncs, and terminates. `-1` means no TTL; `0` is refused |
 
 On a box you share, `--gpus` is the whole of what gpuc may touch, so `host
 probe` lists only those cards and says how many it hid (`2 of 8 assigned to
@@ -278,8 +277,8 @@ gpuc host bootstrap gpubox
 ## The reconcile timer
 
 `gpuc reconcile` is the safety net for the states a pod cannot get itself out
-of -- it never bootstrapped, its dispatcher died, or it is past a TTL its own
-config carries -- and it only runs when something runs it. (A healthy pod needs
+of -- it never bootstrapped, or its dispatcher died -- and it only runs when
+something runs it. (A healthy pod needs
 none of this: it drains and terminates itself once its queue has been empty for
 `--idle-min`.) Install it as a `systemd --user` timer
 (60 s by default, `--interval` to change it):
@@ -394,14 +393,14 @@ the pod instead — it is the thing that can stop itself:
 ```sh
 gpuc pods                                       # confirm the name and that it is idle
 gpuc host set <name> --idle-min 0               # stop as soon as the queue is empty
-gpuc host set <name> --ttl-hours 0.1            # or: stop in six minutes, killing a running job
+gpuc cancel <job-id>                            # and end a job you are not waiting for
 ```
 
 `--idle-min 0` reaches the host's own `config.json`, so the dispatcher drains
 (retrying unconfirmed outputs, mirroring every job's log and state) and
-terminates on its next pass with nothing running. `--ttl-hours` is the one that
-does not wait for the job — it asks each runner to stop with reason `ttl`, lets
-it sync, and then terminates. For a pod that has stopped answering ssh
+terminates on its next pass with nothing running. Nothing stops a pod out from
+under a running job: cancel the job first if you do not want to wait for it.
+For a pod that has stopped answering ssh
 altogether, the reaper gets it after `dead_dispatcher_minutes`; for one that
 answers nothing at all and belongs to nobody, the RunPod console is the tool.
 

@@ -204,10 +204,6 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
         fields["workdir_days"] = _days(args.workdir_days, "--workdir-days")
     if args.idle_min is not None:
         fields["idle_minutes"] = args.idle_min
-    if args.ttl_hours is not None:
-        # argparse cannot express "given but empty" for a float flag, and a TTL
-        # that can be set but never unset is a trap.
-        fields["ttl_hours"] = _ttl_hours(args.ttl_hours)
     return fields
 
 
@@ -327,10 +323,7 @@ def _watch_pod(entry: HostEntry, settings: Settings, bootstrapped: bool) -> str:
             return f"desired/{record.name}.json is already here; left as it is"
     except (ConfigError, OSError) as exc:
         return f"WARNING: could not record {record.name} in desired/: {exc}"
-    line = (
-        f"recorded it in desired/{record.name}.json, so `gpuc reconcile` here watches it too "
-        f"(TTL {'none' if record.ttl_hours is None else f'{record.ttl_hours:g} h'})"
-    )
+    line = f"recorded it in desired/{record.name}.json, so `gpuc reconcile` here watches it too"
     if bootstrapped:
         return line
     return (
@@ -394,30 +387,13 @@ def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str
     return "\n".join(lines)
 
 
-def _ttl_hours(raw: float | None) -> float | None:
-    """`--ttl-hours`: hours, or a negative sentinel meaning "no TTL at all".
-
-    A stored -1 would be a host that is *already* past its TTL, so the next
-    reaper pass terminates it -- the opposite of what anyone types it for, and
-    the same rule `gpuc host set` has always used for clearing one.
-    """
-    if raw is None or raw < 0:
-        return None
-    if raw == 0:
-        raise UsageError(
-            "--ttl-hours 0 would expire the host the moment it exists; "
-            "pass -1 (or omit it) for no TTL"
-        )
-    return raw
-
-
 def _days(raw: str | None, flag: str) -> float | None:
     """A horizon flag: a number of days, or '' to go back to keeping everything.
 
     A string, not `type=float`, because argparse cannot express "given but
     empty" for a float -- and a horizon that can be set but never unset is a
-    trap. Zero is a real answer here, unlike `--ttl-hours`: "reclaim it as soon
-    as it finishes" is what `cleanup: always` says per job.
+    trap. Zero is a real answer: "reclaim it as soon as it finishes" is what
+    `cleanup: always` says per job.
     """
     if raw is None or raw == "":
         return None
@@ -458,7 +434,6 @@ _SET_FIELDS = (
     "retention_days",
     "workdir_days",
     "idle_min",
-    "ttl_hours",
 )
 
 
@@ -794,7 +769,6 @@ def runpod_target(args: argparse.Namespace, settings: Settings) -> HostEntry:
         reuse=not args.no_reuse,
         name_hint=args.name_hint,
         idle_minutes=args.idle_min,
-        ttl_hours=args.ttl_hours,
         disk_gb=args.disk if args.disk is not None else settings.disk_gb,
         image=args.image or settings.image,
         health_args=args.health_args,
@@ -850,7 +824,6 @@ def check_runpod_args(args: argparse.Namespace) -> None:
             f"--runpod creates a pod and --host {args.host} names a host that already "
             f"exists, so they cannot be combined. Drop one."
         )
-    args.ttl_hours = _ttl_hours(args.ttl_hours)
 
 
 def reporter(args: argparse.Namespace) -> Reporter:
@@ -968,7 +941,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
             Path.cwd(),
             gpu_count=args.gpu_count,
             use_git=use_git,
-            ttl_hours=args.ttl_hours,
             report=report,
         )
         job_id = jobs.new_job_id()
@@ -1341,7 +1313,6 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             Path.cwd(),
             gpu_count=args.gpu_count,
             use_git=use_git,
-            ttl_hours=args.ttl_hours,
             report=report,
         )
     entry = runpod_target(args, settings) if target is None else registry.require(target)
@@ -1538,13 +1509,6 @@ def build_parser() -> argparse.ArgumentParser:
         "itself (default 15); ignored for hosts that are not ephemeral",
     )
     add.add_argument(
-        "--ttl-hours",
-        type=float,
-        default=None,
-        help="hard cap on the host's life; omit or pass -1 for none (the default). When "
-        "set, the dispatcher kills the running job with reason ttl, syncs, and terminates",
-    )
-    add.add_argument(
         "--force",
         action="store_true",
         help="allow a --gpus that claims some but not all of the cards the host is already "
@@ -1589,9 +1553,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="MINUTES",
         help="idle minutes before an ephemeral host terminates itself",
-    )
-    edit.add_argument(
-        "--ttl-hours", type=float, help="hard cap in hours; -1 clears it (no TTL, the default)"
     )
     edit.set_defaults(func=cmd_host_set)
 
@@ -2000,13 +1961,6 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
         default=15.0,
         metavar="MINUTES",
         help="terminate the pod once its queue has been empty this long (default 15)",
-    )
-    parser.add_argument(
-        "--ttl-hours",
-        type=float,
-        default=None,
-        help="hard cap on the pod's life; omit or pass -1 for none (the default), leaving "
-        "--idle-min and `gpuc reconcile` to stop it",
     )
     parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
     parser.add_argument("--image", help="pod image; default from config")

@@ -130,7 +130,7 @@ def as_float(d: Any, key: str, default: float) -> float:
 
     A field another build made optional arrives as an explicit `null`; a
     hand-edited file arrives as a string. Neither may take the dispatcher down
-    -- it crashed 20 times on one `"ttl_hours": null` and gave up -- so an
+    -- it crashed 20 times on one `"retention_days": null` and gave up -- so an
     unusable value means the default, which is what the field meant before the
     key existed at all.
     """
@@ -568,12 +568,6 @@ class HostConfig:
     """
     provider: dict[str, Any] | None = None
     idle_minutes: float = 15.0
-    ttl_hours: float | None = None
-    """Hard cap on this host's life, in hours. Null (the default) never
-    terminates on age: the idle timer is what stops an ephemeral host, and a
-    wall clock that kills a running job at hour 24 is a worse failure than a
-    pod that idles for fifteen minutes. When set, the dispatcher kills the
-    running job with reason `ttl`, syncs, and terminates."""
     s3_prefix: str | None = None
     created_at: str | None = None
     retention_days: float | None = None
@@ -621,7 +615,6 @@ class HostConfig:
             shared_gpus=as_str_list(fields, "shared_gpus"),
             provider=provider if isinstance(provider, dict) else None,
             idle_minutes=as_float(fields, "idle_minutes", 15.0),
-            ttl_hours=as_opt_float(fields, "ttl_hours"),
             s3_prefix=as_opt_str(fields, "s3_prefix"),
             created_at=as_opt_str(fields, "created_at"),
             retention_days=as_opt_float(fields, "retention_days"),
@@ -702,7 +695,7 @@ def merge_config(patch: dict[str, Any]) -> dict[str, Any]:
     read what is there, replace the named keys, write the whole file back
     atomically. A key this build does not know is carried through untouched --
     it belongs to whichever build wrote it, not to us -- and the keys it does
-    know are normalised, so a hand-written `"ttl_hours": "24"` cannot leave a
+    know are normalised, so a hand-written `"idle_minutes": "30"` cannot leave a
     string where the dispatcher reads a number.
 
     `env` is replaced wholesale rather than merged: "set it to exactly this" is

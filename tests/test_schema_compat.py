@@ -2,13 +2,14 @@
 
 Two sessions of one user share `~/.local/share/gpu-coordinator/hosts.json`, and
 a host's `~/.gpuc/config.json` outlives the build that wrote it. When
-`ttl_hours` became `float | None` and a `null` reached both files, the other
-session's older build failed validation on *every* subcommand and the host's
-dispatcher died 20 times in `float(None)`.
+`ttl_hours` (a field since removed altogether) became `float | None` and a
+`null` reached both files, the other session's older build failed validation
+on *every* subcommand and the host's dispatcher died 20 times in `float(None)`.
 
 So: every shape of those files -- today's, an older build's, a newer build's --
 must parse under today's models, nulls for optional fields must survive
-unchanged, and nulls for non-optional ones must mean the default.
+unchanged, nulls for non-optional ones must mean the default, and a key this
+build no longer has -- `ttl_hours` is in every fixture -- is ignored.
 """
 
 from __future__ import annotations
@@ -65,12 +66,13 @@ def test_every_committed_host_config_shape_parses(name: str) -> None:
     assert isinstance(config.idle_minutes, float)
 
 
-def test_the_older_registry_keeps_its_ttl_and_defaults_what_it_never_had(
+def test_the_older_registry_drops_its_ttl_and_defaults_what_it_never_had(
     control_env: Path,
 ) -> None:
     (control_env / "state" / "hosts.json").write_text((FIXTURES / "hosts.older.json").read_text())
     entry = read_registry().registry.hosts["gpubox"]
-    assert entry.ttl_hours == 24.0
+    assert not hasattr(entry, "ttl_hours")
+    assert entry.idle_minutes == 15.0
     assert entry.retention_days is None
     assert entry.gpu_info == {}
     assert entry.pkg_commit is None
@@ -98,7 +100,6 @@ def test_the_newer_registry_ignores_what_it_does_not_know(control_env: Path) -> 
     read = read_registry()
     assert set(read.registry.hosts) == {"local", "pod-a40"}
     local = read.registry.hosts["local"]
-    assert local.ttl_hours is None  # a real value: never expires
     assert local.idle_minutes == 15.0  # a null for a non-optional field: the default
     assert local.port == 22
     assert local.env == {}
@@ -107,11 +108,12 @@ def test_the_newer_registry_ignores_what_it_does_not_know(control_env: Path) -> 
     # A key only the newer build knows survives the round trip through here,
     # because the cached config is kept verbatim and written back as it came.
     assert local.cache.config["power_cap_watts"] == 220
+    assert local.cache.config["ttl_hours"] is None
 
 
 def test_the_older_host_config_survives_the_null_that_crashed_the_dispatcher() -> None:
     older = HostConfig.from_dict(load("config.older.json"))
-    assert older.ttl_hours == 24.0
+    assert "ttl_hours" not in older.to_dict()
     assert older.retention_days is None
     # A host whose config predates the key sweeps nothing until something
     # rewrites that file: shipping a package may not start deleting on its own.
@@ -119,7 +121,6 @@ def test_the_older_host_config_survives_the_null_that_crashed_the_dispatcher() -
     assert older.schema_version == SCHEMA_VERSION  # missing means 1
 
     newer = HostConfig.from_dict(load("config.newer.json"))
-    assert newer.ttl_hours is None
     assert newer.retention_days is None
     assert newer.idle_minutes == 15.0
     assert newer.env == {}
@@ -134,9 +135,14 @@ def test_todays_files_carry_a_schema_version(control_env: Path) -> None:
 # -- null means default, except where null is the value -----------------------
 
 
-def test_a_null_ttl_in_the_registry_is_no_ttl_not_the_old_default() -> None:
-    entry = HostEntry.model_validate({"name": "gpubox", "ttl_hours": None})
-    assert entry.ttl_hours is None
+def test_a_ttl_from_a_build_that_still_had_one_is_ignored_on_both_sides() -> None:
+    """`ttl_hours` was a config key until the cap was removed; a file another
+    build wrote still carries it, as a number or as an explicit null."""
+    for value in (24.0, None, "24"):
+        entry = HostEntry.model_validate({"name": "gpubox", "ttl_hours": value})
+        assert entry.name == "gpubox" and not hasattr(entry, "ttl_hours")
+        config = HostConfig.from_dict({"host": "gpubox", "ttl_hours": value})
+        assert config.host == "gpubox" and "ttl_hours" not in config.to_dict()
 
 
 def test_a_null_non_optional_field_falls_back_to_its_default() -> None:
@@ -208,7 +214,6 @@ def test_an_explicit_null_optional_field_survives_a_populated_registry_entry() -
 
 
 OPTIONAL_CONFIG_FIELDS = [
-    "ttl_hours",
     "retention_days",
     "workdir_days",
     "s3_prefix",
@@ -223,7 +228,6 @@ def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> N
         host="gpubox",
         gpus=["GPU-a"],
         idle_minutes=30.0,
-        ttl_hours=24.0,
         s3_prefix="s3://bucket/gpuc/gpubox",
         retention_days=14.0,
         workdir_days=1.0,
@@ -278,15 +282,14 @@ def test_host_config_from_a_null_or_junk_document_never_raises() -> None:
     )
     assert junk.host == "local"
     assert junk.idle_minutes == 15.0
-    assert junk.ttl_hours is None
     assert junk.retention_days is None
     assert junk.provider is None
     assert junk.env == {}
 
 
 def test_a_string_number_is_still_a_number() -> None:
-    config = HostConfig.from_dict({"host": "gpubox", "idle_minutes": "30", "ttl_hours": "6"})
-    assert (config.idle_minutes, config.ttl_hours) == (30.0, 6.0)
+    config = HostConfig.from_dict({"host": "gpubox", "idle_minutes": "30", "retention_days": "6"})
+    assert (config.idle_minutes, config.retention_days) == (30.0, 6.0)
 
 
 def test_job_spec_tolerates_nulls_and_unknown_keys() -> None:

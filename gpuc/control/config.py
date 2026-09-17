@@ -77,7 +77,7 @@ class TolerantModel(BaseModel):
     an unknown key is ignored (a newer writer may add fields), and an explicit
     `null` for a field that is not nullable is dropped so the field's default
     applies (a newer writer may make a field optional). Without the second
-    rule, one `"ttl_hours": null` in the shared registry made every subcommand
+    rule, one `"retention_days": null` in the shared registry made every subcommand
     of the other session -- including `status` and `logs` -- fail validation.
     """
 
@@ -173,7 +173,7 @@ class Settings(TolerantModel):
     dead_dispatcher_minutes: float = 30.0
     """How long an ephemeral host may be silent before the reaper terminates it.
 
-    With no overall TTL, this is what stops a pod nobody is watching: a
+    This is what stops a pod nobody is watching: a
     dispatcher that has not beaten -- or a pod that has not answered ssh -- for
     this long, with nothing running, is billing for nothing."""
 
@@ -211,7 +211,7 @@ max_total_usd_per_hour = 3.0
 
 # An ephemeral host whose dispatcher has not beaten (or whose ssh has not
 # answered) for this long, with nothing running, is terminated by
-# `gpuc reconcile`. There is no overall TTL unless you pass --ttl-hours.
+# `gpuc reconcile`.
 dead_dispatcher_minutes = 30.0
 
 # Defaults for `gpuc submit --runpod`; override per submit with --disk.
@@ -286,7 +286,6 @@ LEGACY_CONFIG_KEYS = (
     "s3_prefix",
     "env",
     "idle_minutes",
-    "ttl_hours",
     "retention_days",
     "created_at",
     "pkg_commit",
@@ -455,10 +454,6 @@ class HostEntry(TolerantModel):
     @property
     def idle_minutes(self) -> float:
         return self.config.idle_minutes
-
-    @property
-    def ttl_hours(self) -> float | None:
-        return self.config.ttl_hours
 
     @property
     def retention_days(self) -> float | None:
@@ -816,7 +811,6 @@ class DesiredHost(TolerantModel):
     offer: Offer = Field(default_factory=Offer)
     created_at: str = ""
     ceiling_at: str = ""
-    ttl_hours: float | None = None
     bootstrapped_at: str | None = None
     last_seen_at: str | None = None
     """When this host last proved it was alive: a fresh dispatcher heartbeat, or

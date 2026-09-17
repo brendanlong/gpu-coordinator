@@ -140,8 +140,7 @@ gpuc status --json               # the same, machine-readable; --json is on ever
                                  # that has an answer (see "Exit codes" below). A human
                                  # wants `gpuc web serve`: the same in a browser
 gpuc status --suspects           # running jobs that are billing but idle, judged by each job's
-                                 # own low_util window/floor/grace, plus pods past a TTL they have;
-                                 # it never kills anything
+                                 # own low_util window/floor/grace; it never kills anything
 gpuc status --all                # adds jobs only the index knows (a host that lost its state)
 gpuc logs <jobid> [-f]           # tails the host; falls back to the S3 mirror only if that job
                                  # has an s3_prefix (its own or the host's) and s3_bucket is set
@@ -174,7 +173,7 @@ A job's status is its exit code. `failed: <reason>` reasons you will see:
 `gpu-preflight` (no working CUDA in the venv), `sync-preflight` (aws/hf or
 credentials missing), `low-util` (idle GPU), `low-util-pause` (the host paused
 after two low-util failures and stopped this job so it could drain), `timeout`
-(`max_runtime_min`), `ttl` (the host's opt-in lifetime cap ran out), `preempted`
+(`max_runtime_min`), `preempted`
 (`gpuc preempt` -- or the job's own `auto_preempt` -- stopped that attempt; the job is
 queued again as the next one), `sync`
 (final upload failed; results exist only on the host), `no-outputs` (the output
@@ -279,12 +278,12 @@ Rules, and they are not optional:
   enough cards, the provider says it is RUNNING, its dispatcher heartbeat is
   under 30 s old, and it is neither draining nor paused. `--no-reuse` forces a
   new one.
-- There is **no overall pod lifetime by default**; per-job `max_runtime_min` is
-  the cap. `--ttl-hours` is opt-in and *does* kill a running job when it expires.
+- There is **no overall pod lifetime**; per-job `max_runtime_min` is the cap,
+  and the idle timer (`--idle-min`) is the only thing that ends a healthy pod.
 - A pod that stops answering (dead dispatcher, no ssh) with nothing running is
   terminated after 30 minutes by `gpuc reconcile`.
 - `gpuc reconcile --once` cleans up registry entries for gone pods and enforces
-  TTLs and the dead-dispatcher rule. Run it if `status` says `POD GONE`. It asks
+  the dead-dispatcher rule. Run it if `status` says `POD GONE`. It asks
   each pod with our prefix what it is, so a pod another machine rented is taken
   on, not reaped. **It never terminates a pod it has no record of** -- one it
   cannot place is reported with its hourly cost for a person to deal with.

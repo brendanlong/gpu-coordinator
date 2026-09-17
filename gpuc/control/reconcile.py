@@ -11,10 +11,10 @@ Nothing is ever terminated for the *absence* of a record. A pod with our prefix
 that this machine has no record of and cannot get an answer out of is reported
 every pass and left running: it may be wedged, it may hold no key of ours, or it
 may be another machine's create still bootstrapping, and those look identical
-from here. What the reaper terminates is a pod whose own record says it is past
-its TTL, one that never bootstrapped by its ceiling, and one that has stopped
-beating with nothing running -- the three states a host cannot get itself out
-of, since a healthy pod drains and terminates itself when its queue goes quiet.
+from here. What the reaper terminates is a pod that never bootstrapped by its
+ceiling, and one that has stopped beating with nothing running -- the two
+states a host cannot get itself out of, since a healthy pod drains and
+terminates itself when its queue goes quiet.
 
 Fails closed in every other direction too. If `desired/` cannot be read we do
 nothing at all, because "no state" must never be read as "terminate everything
@@ -449,20 +449,6 @@ def _reconcile_desired(
             continue
 
         age_h = _age_hours(pod, host)
-        if host.ttl_hours is not None and age_h is not None and age_h > host.ttl_hours:
-            # Only forget a host whose pod is confirmed gone: while a terminate
-            # is failing, the record is what keeps retrying it (and what still
-            # tells `gpuc logs` where that host's jobs ran).
-            _terminate_and_forget(
-                provider,
-                pod,
-                host,
-                f"host {host.name} is {age_h:.1f} h old, past its {host.ttl_hours:g} h TTL",
-                report,
-                result,
-            )
-            continue
-
         ceiling = parse_timestamp(host.ceiling_at)
         if not host.bootstrapped and ceiling is not None and datetime.now(UTC) > ceiling:
             _terminate_and_forget(
@@ -483,8 +469,7 @@ def _reconcile_desired(
         report(
             f"{host.name} ({pod.id}): {pod.status}, ${pod.cost_usd_hr:.3f}/h, "
             f"{'' if host.bootstrapped else 'not yet bootstrapped, '}"
-            f"{'age unknown' if age_h is None else f'age {age_h:.1f} h'}, "
-            f"{'no TTL' if host.ttl_hours is None else f'{host.ttl_hours:g} h TTL'}"
+            f"{'age unknown' if age_h is None else f'age {age_h:.1f} h'}"
         )
         result.kept.append(host.name)
 
@@ -501,11 +486,10 @@ def _reap_if_silent(
 ) -> bool:
     """Terminate a bootstrapped host that has stopped answering for too long.
 
-    This is what replaces the overall TTL. A pod whose dispatcher has died, or
-    which has stopped answering ssh entirely, cannot self-terminate on idle and
-    cannot be seen to be doing anything -- and it bills all the same. A job
-    running per the host's own state resets the clock, so a long training run is
-    never touched.
+    A pod whose dispatcher has died, or which has stopped answering ssh
+    entirely, cannot self-terminate on idle and cannot be seen to be doing
+    anything -- and it bills all the same. A job running per the host's own
+    state resets the clock, so a long training run is never touched.
     """
     host = rented.desired
     state = liveness(host, rented.entry, settings)
@@ -586,8 +570,8 @@ def _report_unclaimed(
     is worth a line every pass and a person's judgement, not a guess that can
     cost a running job.
 
-    The machine that *does* hold a pod's record still reaps it on TTL and on a
-    dead dispatcher, and `gpuc host add <name> --pod <id>` moves that duty here.
+    The machine that *does* hold a pod's record still reaps it on a dead
+    dispatcher, and `gpuc host add <name> --pod <id>` moves that duty here.
     """
     for answer in unclaimed:
         pod = answer.pod

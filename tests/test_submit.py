@@ -440,20 +440,15 @@ def test_submit_file_reads_yaml(control_env: Path, repo: Path) -> None:
     assert result.attempt == 1
 
 
-def test_a_job_longer_than_the_pods_ttl_is_refused_before_anything_is_created() -> None:
-    model = validate(job_document(max_runtime_min=180))
+def test_the_gpu_count_of_a_pod_to_be_is_checked_before_it_is_bought() -> None:
+    model = validate(job_document(gpus=2))
     with pytest.raises(SubmitError) as caught:
-        precheck_local(model, Path.cwd(), ttl_hours=1.0)
-    assert "max_runtime_min" in str(caught.value)
-    assert "--ttl-hours" in str(caught.value)
+        precheck_local(model, Path.cwd(), gpu_count=1)
+    assert "--gpu-count" in str(caught.value)
 
 
-def test_without_a_ttl_a_long_job_is_fine(repo: Path) -> None:
-    precheck_local(validate(job_document(max_runtime_min=6000)), repo, ttl_hours=None)
-
-
-def test_a_job_that_fits_its_ttl_is_fine(repo: Path) -> None:
-    precheck_local(validate(job_document(max_runtime_min=30)), repo, ttl_hours=1.0)
+def test_a_long_job_is_fine_on_a_pod(repo: Path) -> None:
+    precheck_local(validate(job_document(max_runtime_min=6000)), repo, gpu_count=1)
 
 
 def test_submit_warns_about_files_already_under_an_output_path(
@@ -551,15 +546,3 @@ def test_an_estimate_inside_the_timeout_is_not_warned_about(control_env: Path, r
         report=lines.append,
     )
     assert not any("timeout" in line for line in lines)
-
-
-def test_an_estimate_longer_than_the_pods_ttl_warns_but_does_not_refuse(repo: Path) -> None:
-    """A guess must not stop a submit the way `max_runtime_min` does."""
-    lines: list[str] = []
-    precheck_local(
-        validate(job_document(estimated_runtime_min=180)),
-        repo,
-        ttl_hours=1.0,
-        report=lines.append,
-    )
-    assert any("--ttl-hours" in line and "WARNING" in line for line in lines)

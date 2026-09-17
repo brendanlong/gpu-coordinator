@@ -90,7 +90,6 @@ def run(
         provider=provider,
         name_hint="e2e",
         idle_minutes=2.0,
-        ttl_hours=1.0,
         report=(reports.append if reports is not None else lambda _: None),
         deps=deps(transport),
         **kwargs,  # type: ignore[arg-type]
@@ -109,7 +108,7 @@ def test_happy_path_registers_a_bootstrapped_host(control_env: Path, ssh_key: Pa
     assert entry.port == 22000
     assert entry.gpus == ["GPU-1111", "GPU-2222"]
     assert entry.python and entry.bootstrapped_at
-    assert entry.idle_minutes == 2.0 and entry.ttl_hours == 1.0
+    assert entry.idle_minutes == 2.0
 
     assert load_registry().hosts[entry.name].pod_id == entry.pod_id
     desired = read_desired(entry.name)

@@ -210,8 +210,6 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
                         "any",
                         "--idle-min",
                         "2",
-                        "--ttl-hours",
-                        "1",
                         "--disk",
                         "20",
                         "--name-hint",

@@ -427,12 +427,11 @@ function hostHeader(host, entry) {
     entry && entry.s3_prefix ? el("span", { class: "mono" }, `mirror ${entry.s3_prefix}`) : null,
     entry && entry.retention_days !== null && entry.retention_days !== undefined ? el("span", {}, `retention ${entry.retention_days}d`) : null,
     entry && entry.workdir_days !== null && entry.workdir_days !== undefined ? el("span", {}, `workdirs ${entry.workdir_days}d`) : null,
-    host.kind === "runpod" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`, entry.ttl_hours !== null && entry.ttl_hours !== undefined ? `, ttl ${entry.ttl_hours}h` : "") : null,
+    host.kind === "runpod" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`) : null,
   );
   const flags = el("div", { class: "flags" },
     host.draining ? badge("DRAINING", "warn") : null,
     host.paused ? badge(`PAUSED (low-util); resume with gpuc host resume ${host.name}`, "warn") : null,
-    host.pod && host.pod.past_ttl ? badge("PAST TTL", "warn") : null,
   );
   return [
     el("header", {},

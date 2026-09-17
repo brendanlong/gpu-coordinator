@@ -164,9 +164,9 @@ def kill_reason(job_id: str) -> str | None:
 PREEMPTED = "preempted"
 """The kill reason of a job stopped so that something else can have its GPUs.
 
-Its own reason, like `ttl` and `low-util-pause` are: a preempted job is not a
-failure of the job, and the log of the attempt that was stopped should say
-which of the three ended it.
+Its own reason, like `low-util-pause` is: a preempted job is not a failure of
+the job, and the log of the attempt that was stopped should say which of the
+two ended it.
 """
 
 

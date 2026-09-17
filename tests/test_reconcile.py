@@ -53,7 +53,6 @@ def desire(
     name: str,
     pod_id: str,
     *,
-    ttl_hours: float | None = None,
     created_hours_ago: float = 0.5,
     ceiling_minutes: float = 15.0,
     bootstrapped: bool = True,
@@ -64,7 +63,6 @@ def desire(
         offer=make_offer(),
         created_at=stamp(hours=-created_hours_ago),
         ceiling_at=stamp(hours=-created_hours_ago, minutes=ceiling_minutes),
-        ttl_hours=ttl_hours,
         bootstrapped_at=stamp(hours=-created_hours_ago) if bootstrapped else None,
     )
     write_desired(host)
@@ -196,13 +194,13 @@ def test_a_record_written_while_the_pass_was_probing_is_not_clobbered(control_en
     def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
         current = read_desired("gpuc-a-111")
         assert current is not None
-        write_desired(current.model_copy(update={"ttl_hours": 99.0}))
+        write_desired(current.model_copy(update={"ceiling_at": "2099-01-01T00:00:00+00:00"}))
         return Liveness(reachable=True, heartbeat_age_s=5.0)
 
     reconcile_once(Settings(), provider, lambda _: None, liveness=probe)
     current = read_desired("gpuc-a-111")
     assert current is not None
-    assert current.ttl_hours == 99.0
+    assert current.ceiling_at == "2099-01-01T00:00:00+00:00"
     assert current.last_seen_at
 
 
@@ -213,20 +211,6 @@ def test_missing_pod_says_host_gone(control_env: Path) -> None:
     result = reconcile_once(Settings(), provider, reports.append)
     assert result.forgotten == ["gpuc-a-111"]
     assert any("no jobs are recorded" in line for line in reports)
-
-
-def test_host_past_its_ttl_is_terminated(control_env: Path) -> None:
-    pod = running_pod("gpuc-a-111", "pod1", age_minutes=130)
-    provider = provider_with(pod)
-    desire("gpuc-a-111", "pod1", ttl_hours=1.0, created_hours_ago=2.2)
-    reports: list[str] = []
-
-    result = reconcile_once(Settings(), provider, reports.append)
-
-    assert provider.terminated == ["pod1"]
-    assert result.terminated == ["gpuc-a-111"] and result.forgotten == ["gpuc-a-111"]
-    assert not desired_file("gpuc-a-111").exists()
-    assert any("past its 1 h TTL" in line for line in reports)
 
 
 def test_host_past_its_ceiling_without_bootstrap_is_terminated(control_env: Path) -> None:
@@ -338,7 +322,7 @@ def test_terminate_failure_is_loud_and_keeps_the_record(control_env: Path) -> No
 
     provider = Stubborn()
     provider.adopt(running_pod("gpuc-a-111", "pod1", age_minutes=600))
-    desire("gpuc-a-111", "pod1", ttl_hours=1.0, created_hours_ago=10)
+    desire("gpuc-a-111", "pod1", created_hours_ago=10, bootstrapped=False)
     reports: list[str] = []
 
     result = reconcile_once(Settings(), provider, reports.append)
@@ -403,7 +387,7 @@ def test_a_desired_record_naming_a_foreign_pod_is_refused_not_terminated(
     """The never-touch-others rule rests on code here, so it is checked at the call."""
     foreign = running_pod(FOREIGN, "podF", age_minutes=600)
     provider = provider_with(foreign)
-    desire("gpuc-a-111", "podF", ttl_hours=1.0, created_hours_ago=10)
+    desire("gpuc-a-111", "podF", created_hours_ago=10, bootstrapped=False)
     reports: list[str] = []
 
     result = reconcile_once(Settings(), provider, reports.append)
@@ -414,7 +398,7 @@ def test_a_desired_record_naming_a_foreign_pod_is_refused_not_terminated(
     assert desired_file("gpuc-a-111").exists()
 
 
-# -- the dead-dispatcher safety net that replaced the overall TTL --------------
+# -- the dead-dispatcher safety net ----------------------------------------------
 
 
 def dead(**overrides: object) -> HostLiveness:
@@ -424,9 +408,9 @@ def dead(**overrides: object) -> HostLiveness:
     return lambda host, entry, settings: state
 
 
-def test_a_host_with_no_ttl_is_never_terminated_for_age(control_env: Path) -> None:
+def test_a_host_is_never_terminated_for_age(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 200))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=200)
+    desire("gpuc-a-111", "pod1", created_hours_ago=200)
 
     result = reconcile_once(Settings(), provider, lambda _: None, liveness=alive())
 
@@ -435,7 +419,7 @@ def test_a_host_with_no_ttl_is_never_terminated_for_age(control_env: Path) -> No
 
 def test_a_long_running_job_keeps_an_old_host_alive(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 50))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=50)
+    desire("gpuc-a-111", "pod1", created_hours_ago=50)
     # The dispatcher is silent, but the host's own state says a job is running.
     liveness = alive(heartbeat_age_s=None, running_jobs=1)
 
@@ -446,7 +430,7 @@ def test_a_long_running_job_keeps_an_old_host_alive(control_env: Path) -> None:
 
 def test_a_dead_dispatcher_past_the_limit_is_terminated_loudly(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    desire("gpuc-a-111", "pod1", created_hours_ago=2)
     watching()
     reports: list[str] = []
 
@@ -467,7 +451,7 @@ def test_an_unreachable_host_is_terminated_once_it_has_been_silent_long_enough(
     control_env: Path,
 ) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=120))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=2)
+    desire("gpuc-a-111", "pod1", created_hours_ago=2)
     watching()
     reports: list[str] = []
 
@@ -481,7 +465,7 @@ def test_an_unreachable_host_is_terminated_once_it_has_been_silent_long_enough(
 
 def test_a_host_that_has_only_just_gone_quiet_is_left_alone(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=10))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=0.1)
+    desire("gpuc-a-111", "pod1", created_hours_ago=0.1)
 
     result = reconcile_once(
         Settings(dead_dispatcher_minutes=30.0), provider, lambda _: None, liveness=dead()
@@ -492,7 +476,7 @@ def test_a_host_that_has_only_just_gone_quiet_is_left_alone(control_env: Path) -
 
 def test_a_healthy_pass_records_that_the_host_was_seen(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=10))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=1)
+    desire("gpuc-a-111", "pod1", created_hours_ago=1)
 
     reconcile_once(Settings(), provider, lambda _: None, liveness=alive())
 
@@ -504,7 +488,7 @@ def test_a_never_bootstrapped_host_still_gets_the_ceiling_not_the_silence_rule(
     control_env: Path,
 ) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=1, bootstrapped=False)
+    desire("gpuc-a-111", "pod1", created_hours_ago=1, bootstrapped=False)
     reports: list[str] = []
 
     result = reconcile_once(Settings(), provider, reports.append, liveness=dead())
@@ -524,7 +508,6 @@ def pod_config(
     name: str,
     pod_id: str,
     *,
-    ttl_hours: float | None = None,
     created_hours_ago: float = 2.0,
     bootstrapped: bool = True,
 ) -> dict[str, Any]:
@@ -541,7 +524,6 @@ def pod_config(
     return {
         "host": name,
         "gpus": ["GPU-1111"],
-        "ttl_hours": ttl_hours,
         "created_at": created,
         "provider": provider,
     }
@@ -568,24 +550,6 @@ def test_a_pod_another_machine_created_is_adopted_not_terminated(control_env: Pa
     cached = read_desired("gpuc-a-111")
     assert cached is not None
     assert (cached.pod_id, cached.offer.name) == ("pod1", "A40")
-
-
-def test_an_adopted_pod_is_judged_by_the_ttl_it_carries(control_env: Path) -> None:
-    provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=130))
-    desired_dir().mkdir(parents=True, exist_ok=True)
-    reports: list[str] = []
-
-    result = reconcile_once(
-        Settings(),
-        provider,
-        reports.append,
-        liveness=alive(),
-        ask=asked(config=pod_config("gpuc-a-111", "pod1", ttl_hours=1.0, created_hours_ago=2.2)),
-    )
-
-    assert provider.terminated == ["pod1"]
-    assert result.terminated == ["gpuc-a-111"]
-    assert any("past its 1 h TTL" in line for line in reports)
 
 
 def test_an_adopted_pod_that_has_gone_silent_is_reaped_from_here(control_env: Path) -> None:
@@ -685,7 +649,7 @@ def test_a_pod_answering_to_a_name_already_taken_is_left_alone(control_env: Path
         running_pod("gpuc-a-111", "pod1", age_minutes=120),
         running_pod("gpuc-a-222", "pod2", age_minutes=120),
     )
-    desire("gpuc-a-111", "pod1", ttl_hours=None)
+    desire("gpuc-a-111", "pod1")
     reports: list[str] = []
 
     # The second pod says it is called `gpuc-a-111` too (a hand-set `host`).
@@ -797,7 +761,7 @@ def test_a_machine_back_from_a_long_absence_does_not_reap_on_its_first_pass(
     own ssh is most likely to fail -- the timer fires two minutes after boot.
     """
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 72))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=72)
+    desire("gpuc-a-111", "pod1", created_hours_ago=72)
     reports: list[str] = []
 
     result = reconcile_once(
@@ -813,7 +777,7 @@ def test_a_machine_back_from_a_long_absence_does_not_reap_on_its_first_pass(
 
 def test_it_reaps_once_it_has_watched_for_the_whole_limit(control_env: Path) -> None:
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=60 * 72))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=72)
+    desire("gpuc-a-111", "pod1", created_hours_ago=72)
     watching(minutes=31.0)
 
     result = reconcile_once(
@@ -847,7 +811,7 @@ def test_an_unwritable_watch_file_reaps_nothing_rather_than_everything(
 
     monkeypatch.setattr("gpuc.control.reconcile._write_watch", refuse)
     provider = provider_with(running_pod("gpuc-a-111", "pod1", age_minutes=600))
-    desire("gpuc-a-111", "pod1", ttl_hours=None, created_hours_ago=10)
+    desire("gpuc-a-111", "pod1", created_hours_ago=10)
     reports: list[str] = []
 
     result = reconcile_once(Settings(), provider, reports.append, liveness=dead())

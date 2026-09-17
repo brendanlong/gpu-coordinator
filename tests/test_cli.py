@@ -386,8 +386,6 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
                 "12.8",
                 "--idle-min",
                 "2",
-                "--ttl-hours",
-                "1",
                 "--disk",
                 "20",
                 "--no-reuse",
@@ -402,7 +400,7 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
     assert constraints.gpu_names == ["A40", "RTX4090"]
     assert (constraints.min_vram_gb, constraints.max_price_usd_hr) == (24, 0.60)
     assert constraints.clouds == ["SECURE", "COMMUNITY"]
-    assert (seen["idle_minutes"], seen["ttl_hours"], seen["disk_gb"]) == (2.0, 1.0, 20)
+    assert (seen["idle_minutes"], seen["disk_gb"]) == (2.0, 20)
     assert (seen["reuse"], seen["name_hint"]) == (False, "e2e")
     mirrored = seen["mirrored_before_provisioning"]
     assert isinstance(mirrored, list) and mirrored == [f"bucket/gpuc/specs/{seen['job_id']}.json"]
@@ -916,20 +914,6 @@ def test_submit_and_requeue_both_take_no_git() -> None:
     assert not parser.parse_args(["submit", "job.yaml", "--host", "h"]).no_git
 
 
-def test_ttl_is_unset_unless_asked_for() -> None:
-    parser = build_parser()
-    assert parser.parse_args(["host", "add", "h"]).ttl_hours is None
-    assert parser.parse_args(["submit", "j", "--runpod", "--gpu", "A40"]).ttl_hours is None
-    assert parser.parse_args(["host", "add", "h", "--ttl-hours", "6"]).ttl_hours == 6.0
-
-
-def test_a_negative_ttl_clears_the_cap(control_env: Path) -> None:
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="h", gpus=[], ttl_hours=6.0))
-    assert main(["host", "set", "h", "--ttl-hours", "-1"]) == 0
-    assert load_registry().hosts["h"].ttl_hours is None
-
-
 def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | None) -> list[str]:
     """Answer `submit`'s "what build is this host running" with `config`.
 
@@ -1196,16 +1180,6 @@ def _set_host(
         if config:
             entry = entry.with_config({**entry.cache.config, **config})
         registry.put(entry)
-
-
-def test_a_negative_ttl_on_add_means_no_ttl_not_an_expired_host(
-    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """-1 stored as a TTL is a host the next reaper pass terminates."""
-    assert main(["host", "add", "h", "--ssh", "me@box", "--gpus", "", "--ttl-hours", "-1"]) == 0
-    assert load_registry().hosts["h"].ttl_hours is None
-    assert main(["host", "add", "z", "--ssh", "me@box", "--ttl-hours", "0"]) == EXIT_USAGE
-    assert "would expire the host the moment it exists" in capsys.readouterr().err
 
 
 def test_runpod_and_host_together_are_a_usage_error(
@@ -1999,7 +1973,7 @@ def adoptable(monkeypatch: pytest.MonkeyPatch, fake_host: FakeHost) -> FakeProvi
             {
                 "host": "gpuc-e2e-aaa",
                 "gpus": ["GPU-1111"],
-                "ttl_hours": 4.0,
+                "idle_minutes": 4.0,
                 "provider": {"kind": "runpod", "pod_id": "pod1", "created_at": "2026-09-15T12:00"},
             }
         ),
@@ -2025,7 +1999,7 @@ def test_host_add_pod_adopts_a_pod_another_machine_created(
         "root@1.2.3.4",
         22000,
     )
-    assert entry.gpus == ["GPU-1111"] and entry.ttl_hours == 4.0
+    assert entry.gpus == ["GPU-1111"] and entry.idle_minutes == 4.0
     out = capsys.readouterr().out
     assert "adopted the config on the host" in out
     # This machine now watches it too, without having created it.
