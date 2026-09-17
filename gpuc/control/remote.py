@@ -15,28 +15,32 @@ from dataclasses import dataclass
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, transport_for
-from gpuc.control.transport import CommandResult, Transport, TransportError
+from gpuc.control.transport import DEFAULT_TIMEOUT_S, CommandResult, Transport, TransportError
 from gpuc.host import jobs
-
-DEFAULT_TIMEOUT_S = 120.0
 
 
 class RemoteError(RuntimeError):
     def __init__(self, host: str, command: str, detail: str) -> None:
         super().__init__(f"{detail}\n  host: {host}\n  command: {command}")
-        self.host = host
-        self.command = command
+
+
+def env_prefix(env: Mapping[str, str] | None) -> str:
+    """``K="v" `` assignments for a remote command, or ``""`` for most hosts.
+
+    ``env`` is the host's own `HostConfig.env`. Everything started on the host
+    gets it -- the package (whose dispatcher's environment every job inherits)
+    and bootstrap's installs, so `uv tool install` populates the cache this
+    host uses.
+    """
+    return "".join(f'{key}="{value}" ' for key, value in sorted((env or {}).items()))
 
 
 def host_command(python: str, home: str, args: str, env: Mapping[str, str] | None = None) -> str:
-    """One invocation of the on-host package, with its environment pinned.
-
-    ``env`` is the host's own `HostEntry.env`. Every host-package invocation
-    gets it, because `enqueue` spawns the dispatcher and the dispatcher's
-    environment is what every job on the host inherits.
-    """
-    assignments = "".join(f'{key}="{value}" ' for key, value in sorted((env or {}).items()))
-    return f'{assignments}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" "{python}" -m gpuc.host {args}'
+    """One invocation of the on-host package, with its environment pinned."""
+    return (
+        f'{env_prefix(env)}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" "{python}" '
+        f"-m gpuc.host {args}"
+    )
 
 
 @dataclass

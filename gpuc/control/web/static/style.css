@@ -36,7 +36,7 @@ body {
 }
 h1, h2, h3 { margin: 0; font-weight: 600; }
 h1 { font-size: 16px; }
-h2 { font-size: 15px; margin: 0 0 8px; }
+h2 { font-size: 15px; margin-bottom: 8px; }
 h3 { font-size: 14px; }
 a { color: var(--accent); }
 code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
@@ -52,7 +52,9 @@ code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
 }
 .topbar { position: sticky; top: 0; z-index: 2; }
 main { padding: 16px; max-width: 1400px; margin: 0 auto; }
-section { margin-bottom: 24px; }
+section, details { margin-bottom: 24px; }
+summary { cursor: pointer; }
+summary h2 { display: inline; }
 
 button, input[type="number"], input[type="password"] {
   font: inherit; color: var(--ink);
@@ -105,8 +107,8 @@ tr.suspect td { color: var(--warn); }
 .job-id { color: var(--muted); font-family: var(--mono); font-size: 12px; }
 .links a + a::before { content: " · "; color: var(--muted); text-decoration: none; display: inline-block; }
 .actions { white-space: nowrap; }
-.actions button + button, .actions form + button, .actions input + button { margin-left: 4px; }
-.gpu-state { font-family: var(--mono); }
+.actions button + button, .actions input + button { margin-left: 4px; }
+.gpu-index { font-family: var(--mono); }
 .empty { color: var(--muted); font-style: italic; }
 .section-label { color: var(--muted); font-size: 12px; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
 

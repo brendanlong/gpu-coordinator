@@ -9,33 +9,31 @@ from __future__ import annotations
 
 import json
 import shlex
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import gpuc
 from gpuc._version import user_agent
-from gpuc.control.config import HostEntry, Settings, transport_for, utc_now
+from gpuc.control import probe as probe_mod
+from gpuc.control.config import HostEntry, Reporter, Settings, transport_for, utc_now
 from gpuc.control.gpuinfo import discover, summarize
 from gpuc.control.remote import (
     HostSession,
+    env_prefix,
     parse_last_json,
     read_remote_config,
     resolve_home,
     write_remote_config,
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
-from gpuc.control.version import local_commit
+from gpuc.control.version import local_commit, package_root
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
-PYTHON_FLOOR = "3.11"
+PYTHON_FLOOR = ".".join(str(part) for part in probe_mod.PYTHON_FLOOR)
 PYTHON_INSTALL = "3.12"
 INSTALL_TIMEOUT_S = 900.0
 HEALTH_TIMEOUT_S = 300.0
-
-Reporter = Callable[[str], None]
 
 
 class BootstrapError(RuntimeError):
@@ -45,19 +43,12 @@ class BootstrapError(RuntimeError):
 @dataclass
 class BootstrapResult:
     host: str
-    uv: str
-    python: str
     home: str
     files: int
-    health: dict[str, Any]
     dispatcher_pid: int
     pkg_commit: str | None = None
     """The gpuc commit this bootstrap shipped, as `gpuc version` reports it."""
     warnings: list[str] = field(default_factory=list)
-
-
-def package_root() -> Path:
-    return Path(gpuc.__file__).resolve().parents[1]
 
 
 def package_files(root: Path | None = None) -> list[str]:
@@ -84,15 +75,6 @@ def package_files(root: Path | None = None) -> list[str]:
 
 def _first_line(text: str) -> str:
     return text.strip().splitlines()[0].strip() if text.strip() else ""
-
-
-def env_prefix(entry: HostEntry) -> str:
-    """``K="v" `` assignments for a remote command, or ``""`` for most hosts.
-
-    This is the host's own env, out of the `config.json` bootstrap read on the
-    way in, so `uv tool install` already populates the cache this host uses.
-    """
-    return "".join(f'{key}="{value}" ' for key, value in sorted(entry.env.items()))
 
 
 def remote_path(entry: HostEntry) -> str:
@@ -166,7 +148,7 @@ def find_python(transport: Transport, uv: str, entry: HostEntry) -> str | None:
     # control side was invoked from (`uv run gpuc ...` exports VIRTUAL_ENV),
     # and the host would be pinned to an interpreter that can disappear.
     result = transport.run(
-        f'cd "$HOME" && {env_prefix(entry)}env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT '
+        f'cd "$HOME" && {env_prefix(entry.env)}env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT '
         f"{shlex.quote(uv)} python find --no-project '>={PYTHON_FLOOR}' 2>/dev/null",
         check=False,
     )
@@ -180,7 +162,7 @@ def ensure_python(transport: Transport, uv: str, entry: HostEntry, report: Repor
         return python
     report(f"installing Python {PYTHON_INSTALL} with uv (no interpreter >= {PYTHON_FLOOR} found)")
     result = transport.run(
-        f"{env_prefix(entry)}{shlex.quote(uv)} python install {PYTHON_INSTALL}",
+        f"{env_prefix(entry.env)}{shlex.quote(uv)} python install {PYTHON_INSTALL}",
         timeout=INSTALL_TIMEOUT_S,
         check=False,
     )
@@ -262,7 +244,7 @@ def ensure_hf_cli(transport: Transport, uv: str, entry: HostEntry, report: Repor
         return None
     report("installing huggingface_hub as a uv tool")
     result = transport.run(
-        f"{env_prefix(entry)}{shlex.quote(uv)} tool install huggingface_hub",
+        f"{env_prefix(entry.env)}{shlex.quote(uv)} tool install huggingface_hub",
         timeout=INSTALL_TIMEOUT_S,
         check=False,
     )
@@ -323,7 +305,7 @@ def resolve_cache_dir(
         report(f"uv cache: {pinned} (set for this host; left alone)")
         return None
     script = UV_CACHE_PROBE.format(
-        home=shlex.quote(home), env=env_prefix(entry), uv=shlex.quote(uv)
+        home=shlex.quote(home), env=env_prefix(entry.env), uv=shlex.quote(uv)
     )
     result = transport.run(script, check=False)
     if result.returncode != 0:
@@ -352,7 +334,7 @@ def resolve_cache_dir(
 def ensure_layout(transport: Transport, entry: HostEntry, home: str, python: str) -> None:
     """Create gpuc home and its subdirectories 0700, using the host's own code."""
     transport.run(
-        f'{env_prefix(entry)}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" '
+        f'{env_prefix(entry.env)}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" '
         f'"{python}" '
         f'-c "from gpuc.host import paths; paths.ensure_layout()"',
         check=True,
@@ -393,7 +375,7 @@ def start_dispatcher(session: HostSession) -> int:
     # setting them here means the very first process in the chain already has
     # them, before it has read anything.
     command = (
-        f"{remote_path(session.entry)} {env_prefix(session.entry)}"
+        f"{remote_path(session.entry)} {env_prefix(session.entry.env)}"
         f'GPUC_HOME="{session.home}" PYTHONPATH="{session.home}/pkg" '
         f'"{session.python}" '
         f'-c "from gpuc.host import dispatcher; print(dispatcher.spawn_detached_dispatcher())"'
@@ -591,12 +573,9 @@ def bootstrap_host(
     ).model_copy(update={"bootstrapped_at": utc_now()})
     return updated, BootstrapResult(
         host=entry.name,
-        uv=uv,
-        python=python,
         home=home,
         files=files,
         pkg_commit=commit,
-        health=health,
         dispatcher_pid=pid,
         warnings=warnings,
     )

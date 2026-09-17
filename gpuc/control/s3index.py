@@ -93,8 +93,14 @@ def default_s3_prefix(settings: Settings, host: str) -> str | None:
     return f"s3://{settings.s3_bucket}/gpuc/{host}"
 
 
+def job_uri(s3_prefix: str, job_id: str, name: str = "") -> str:
+    """Where a host mirrors one job under its `s3_prefix`, or one file of it."""
+    uri = f"{s3_prefix.rstrip('/')}/jobs/{job_id}"
+    return f"{uri}/{name}" if name else uri
+
+
 def job_log_uri(s3_prefix: str, job_id: str) -> str:
-    return f"{s3_prefix.rstrip('/')}/jobs/{job_id}/log.txt"
+    return job_uri(s3_prefix, job_id, "log.txt")
 
 
 def split_uri(uri: str) -> tuple[str, str]:

@@ -26,14 +26,17 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.control.providers.base import DEFAULT_IMAGE, Caps, Offer
+from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX, Caps, Offer
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
 HostKind = Literal["local", "ssh", "runpod"]
 
-DEFAULT_POD_PREFIX = "gpuc-"
 DEFAULT_DISK_GB = 50
+
+
+Reporter = Callable[[str], None]
+"""Where a step's progress goes: `print`, or stderr when stdout is a document."""
 
 
 class ConfigError(RuntimeError):
@@ -161,7 +164,7 @@ class Settings(TolerantModel):
     """
 
     s3_bucket: str | None = None
-    runpod_pod_prefix: str = DEFAULT_POD_PREFIX
+    runpod_pod_prefix: str = DEFAULT_PREFIX
     max_pods: int = 3
     max_total_usd_per_hour: float = 3.0
     ssh_key: str | None = None
@@ -196,7 +199,7 @@ CONFIG_TEMPLATE = f"""\
 # s3_bucket = "my-experiments"
 
 # Only pods whose name starts with this are ever read, reaped or terminated.
-runpod_pod_prefix = "{DEFAULT_POD_PREFIX}"
+runpod_pod_prefix = "{DEFAULT_PREFIX}"
 
 # Refuse to create a pod that would push us past either cap.
 max_pods = 3
@@ -273,6 +276,10 @@ class HostCache(TolerantModel):
     """
 
 
+# The address/config split landed on 2026-09-16 (518bc9b). A registry written
+# before it carries each host's config flat beside its address; `save_registry`
+# rewrites the folded shape, so this can go once every control machine has run
+# a writing command on a build past that commit.
 LEGACY_CACHE_KEYS = ("python", "uv", "gpu_info", "driver_version")
 LEGACY_CONFIG_KEYS = (
     "gpus",
@@ -613,7 +620,7 @@ class Registry(TolerantModel):
             known = ", ".join(sorted(self.hosts)) or "(none)"
             raise HostNotFound(
                 f"no host named {name!r}. Known hosts: {known}.\n"
-                f"Add it with: gpuc host add {name} --ssh user@host --gpus GPU-uuid"
+                f"Add it with: gpuc host add {name} --ssh user@host --gpus 0"
             )
         return entry
 
@@ -715,7 +722,7 @@ def warn_stderr(message: str) -> None:
     print(f"warning: {message}", file=sys.stderr)
 
 
-def load_registry(warn: Callable[[str], None] = warn_stderr) -> Registry:
+def load_registry() -> Registry:
     """The salvaged registry, with every problem reported and none of them fatal.
 
     Callers that need to tell "nothing registered" from "nothing readable" use
@@ -723,7 +730,7 @@ def load_registry(warn: Callable[[str], None] = warn_stderr) -> Registry:
     """
     read = read_registry()
     for error in read.errors:
-        warn(error)
+        warn_stderr(error)
     return read.registry
 
 
@@ -809,9 +816,7 @@ class DesiredHost(TolerantModel):
     offer: Offer = Field(default_factory=Offer)
     created_at: str = ""
     ceiling_at: str = ""
-    idle_minutes: float = 15.0
     ttl_hours: float | None = None
-    image: str | None = None
     bootstrapped_at: str | None = None
     last_seen_at: str | None = None
     """When this host last proved it was alive: a fresh dispatcher heartbeat, or
@@ -886,6 +891,20 @@ def forget_host(name: str, pod_id: str | None = None) -> None:
     save_registry(read.registry, read.skipped)
 
 
+def forget_host_locked(name: str, pod_id: str | None, report: Reporter) -> None:
+    """`forget_host` under the state lock, taken for just that mutation.
+
+    Never held across the provider and ssh calls that decide *whether* to
+    forget: a terminate polls for up to five minutes, and a concurrent `gpuc
+    submit --runpod` gives up on the lock after two.
+    """
+    try:
+        with state_lock():
+            forget_host(name, pod_id)
+    except ConfigError as exc:
+        report(f"WARNING: could not remove host {name} from the registry: {exc}")
+
+
 def load_desired() -> list[DesiredHost]:
     """Every desired host, or raise: a partial answer would reap live pods."""
     directory = desired_dir()
@@ -928,10 +947,22 @@ def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transpo
         ssh=entry.ssh,
         port=entry.port,
         key=settings.ssh_key_path,
-        state_dir=state_dir(),
-        known_hosts=pod_known_hosts_file(entry.name) if entry.kind == "runpod" else None,
+        known_hosts=(
+            pod_known_hosts_file(entry.name) if entry.kind == "runpod" else known_hosts_file()
+        ),
     )
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def parse_timestamp(stamp: str | None) -> datetime | None:
+    """An ISO stamp from any file the two halves share, as an aware datetime, or None."""
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)

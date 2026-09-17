@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from gpuc.host import baseline, jobs, paths, queue
-from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS
+from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS, JobState
 
 DEFAULT_WORKDIR_DAYS = 1.0
 """What a host with no config of its own is given for `workdir_days`.
@@ -497,23 +497,15 @@ def candidates(
             if wanted is not None:
                 skipped.append(Skipped(job_id, "workdir already gone"))
             continue
-        try:
-            state = jobs.read_state(job_id)
-        except (RuntimeError, FileNotFoundError, OSError):
-            # No state means we cannot know this is not a live job.
-            skipped.append(Skipped(job_id, "no readable state.json"))
+        finished = _finished_age(job_id, moment)
+        if isinstance(finished, Skipped):
+            skipped.append(finished)
             continue
-        if not state.finished:
-            skipped.append(Skipped(job_id, f"status {state.status}"))
-            continue
-        ended = _parse(state.ended_at)
-        age_days = None if ended is None else (moment - ended).total_seconds() / 86400.0
+        state, age_days = finished
         if older_than_days is not None:
-            if age_days is None:
-                skipped.append(Skipped(job_id, "finished but records no usable ended_at"))
-                continue
-            if age_days < older_than_days:
-                skipped.append(Skipped(job_id, f"only {age_days:.1f} days old"))
+            too_young = _too_young(job_id, age_days, older_than_days)
+            if too_young:
+                skipped.append(too_young)
                 continue
         elif not all_finished:
             skipped.append(Skipped(job_id, "no selection given"))
@@ -521,7 +513,7 @@ def candidates(
         if automatic:
             try:
                 policy = jobs.read_spec(job_id).cleanup
-            except (RuntimeError, FileNotFoundError, OSError, ValueError):
+            except (RuntimeError, ValueError):
                 # An unreadable spec cannot say it wanted this kept, but it
                 # cannot say it did not either.
                 skipped.append(Skipped(job_id, "no readable spec.json"))
@@ -545,6 +537,29 @@ def candidates(
             )
         )
     return picked, skipped
+
+
+def _finished_age(job_id: str, moment: datetime) -> tuple[JobState, float | None] | Skipped:
+    """A finished job's state and its age in days, or why it is not a candidate.
+
+    No readable state means we cannot know this is not a live job.
+    """
+    try:
+        state = jobs.read_state(job_id)
+    except RuntimeError:
+        return Skipped(job_id, "no readable state.json")
+    if not state.finished:
+        return Skipped(job_id, f"status {state.status}")
+    ended = _parse(state.ended_at)
+    return state, None if ended is None else (moment - ended).total_seconds() / 86400.0
+
+
+def _too_young(job_id: str, age_days: float | None, older_than_days: float) -> Skipped | None:
+    if age_days is None:
+        return Skipped(job_id, "finished but records no usable ended_at")
+    if age_days < older_than_days:
+        return Skipped(job_id, f"only {age_days:.1f} days old")
+    return None
 
 
 def stale_incoming(now: float | None = None) -> list[Path]:
@@ -574,7 +589,7 @@ def stale_incoming(now: float | None = None) -> list[Path]:
             try:
                 if jobs.read_state(job_id).finished:
                     stale.append(path)
-            except (RuntimeError, FileNotFoundError, OSError):
+            except RuntimeError:
                 continue
             continue
         if moment - mtime > INCOMING_STALE_S:
@@ -708,7 +723,7 @@ def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | No
         return True, None
     try:
         spec = jobs.read_spec(job_id)
-    except (RuntimeError, FileNotFoundError, OSError):
+    except RuntimeError:
         return False, "spec.json is unreadable, so its outputs cannot be checked"
     if not spec.outputs:
         return True, None
@@ -749,26 +764,19 @@ def purge_candidates(
     for job_id in jobs.list_job_ids():
         if wanted is not None and job_id not in wanted:
             continue
-        try:
-            state = jobs.read_state(job_id)
-        except (RuntimeError, FileNotFoundError, OSError):
-            skipped.append(Skipped(job_id, "no readable state.json"))
+        finished = _finished_age(job_id, moment)
+        if isinstance(finished, Skipped):
+            skipped.append(finished)
             continue
-        if not state.finished:
-            skipped.append(Skipped(job_id, f"status {state.status}"))
-            continue
-        ended = _parse(state.ended_at)
-        age_days = None if ended is None else (moment - ended).total_seconds() / 86400.0
+        state, age_days = finished
         # The age gate is how an unnamed job is chosen, so naming ids replaces
         # it rather than adding to it -- including for a job whose `ended_at`
         # never got written, which is exactly the stuck kind somebody names.
         # The preconditions below are not waived by naming anything.
         if wanted is None:
-            if age_days is None:
-                skipped.append(Skipped(job_id, "finished but records no usable ended_at"))
-                continue
-            if age_days < older_than_days:
-                skipped.append(Skipped(job_id, f"only {age_days:.1f} days old"))
+            too_young = _too_young(job_id, age_days, older_than_days)
+            if too_young:
+                skipped.append(too_young)
                 continue
         reasons: list[str] = []
         if not state.meta_synced_at:

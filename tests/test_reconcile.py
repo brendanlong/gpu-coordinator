@@ -196,13 +196,13 @@ def test_a_record_written_while_the_pass_was_probing_is_not_clobbered(control_en
     def probe(host: DesiredHost, entry: HostEntry | None, settings: Settings) -> Liveness:
         current = read_desired("gpuc-a-111")
         assert current is not None
-        write_desired(current.model_copy(update={"image": "written:by-another-session"}))
+        write_desired(current.model_copy(update={"ttl_hours": 99.0}))
         return Liveness(reachable=True, heartbeat_age_s=5.0)
 
     reconcile_once(Settings(), provider, lambda _: None, liveness=probe)
     current = read_desired("gpuc-a-111")
     assert current is not None
-    assert current.image == "written:by-another-session"
+    assert current.ttl_hours == 99.0
     assert current.last_seen_at
 
 

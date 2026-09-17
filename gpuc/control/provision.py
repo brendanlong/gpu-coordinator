@@ -27,17 +27,17 @@ from typing import Any, Protocol
 from gpuc.control import rented
 from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_host
 from gpuc.control.config import (
+    DEFAULT_DISK_GB,
     ConfigError,
     DesiredHost,
     HostEntry,
+    Reporter,
     Settings,
     config_file,
-    forget_host,
+    forget_host_locked,
     load_registry,
-    pod_known_hosts_file,
     read_desired,
     registry_transaction,
-    remove_desired,
     state_lock,
     transport_for,
     utc_now,
@@ -61,29 +61,28 @@ from gpuc.control.transport import SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
 CREATE_LOCK_TIMEOUT_S = 120.0
-DEFAULT_DISK_GB = 50
 DEFAULT_CUDA_MIN = "12.8"
 POLL_INTERVAL_S = 5.0
 SSH_MAX_INTERVAL_S = 15.0
 LOG_CHECK_INTERVAL_S = 30.0
 SSH_REPORT_INTERVAL_S = 60.0
-HEARTBEAT_FRESH_S = 30.0
+REUSE_HEARTBEAT_MAX_S = 30.0
+"""How stale a pod's heartbeat may be for `submit` to reuse it rather than buy another."""
 AWS_KEY_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 DEAD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
 
 SSH_MISCONFIGURED = re.compile(
-    r"ControlPath too long|unix_listener|Bad configuration option|no such identity file|"
-    r"WARNING: UNPROTECTED PRIVATE KEY",
+    r"Bad configuration option|no such identity file|WARNING: UNPROTECTED PRIVATE KEY",
     re.IGNORECASE,
 )
-"""Local ssh problems that no amount of waiting can fix: fail before the ceiling."""
+"""Local ssh problems that no amount of waiting can fix: fail before the ceiling.
+(A ControlMaster socket that cannot bind is `transport.SshUnusable`, raised
+before this is consulted.)"""
 
 BROKEN_HOST = re.compile(
     r"card[0-9]|device nodes|OCI runtime|runc create|failed to create shim", re.IGNORECASE
 )
 """Signatures of a host whose GPU device nodes are broken: re-place, never retry."""
-
-Reporter = Callable[[str], None]
 
 
 class ProvisionError(RuntimeError):
@@ -475,7 +474,7 @@ def _create_and_record(
     """Check caps, create, and write `desired/` with the state lock held.
 
     The lock is what makes the account caps mean anything across the several
-    local sessions that share this account (requirements-review 2.9): without
+    local sessions that share this account: without
     it two `gpuc submit --runpod` can both read "one pod running" and both
     create. It also hides the create-to-record gap from the reaper, which takes
     the same lock, so a pod is never visible as a stray it might reap.
@@ -491,7 +490,6 @@ def _create_and_record(
             name,
             image=image,
             disk_gb=disk_gb,
-            env={"HF_HUB_ENABLE_HF_TRANSFER": "0"},
             cuda_min=cuda_min,
             gpu_count=constraints.gpu_count,
         )
@@ -505,9 +503,7 @@ def _create_and_record(
                     offer=offer,
                     created_at=created_at,
                     ceiling_at=ceiling.isoformat(timespec="seconds"),
-                    idle_minutes=idle_minutes,
                     ttl_hours=ttl_hours,
-                    image=image,
                 )
             )
         except BaseException as exc:
@@ -550,13 +546,7 @@ def _abandon(provider: Provider, name: str, pod_id: str, progress: _Progress, re
             f"`gpuc reconcile` retries the terminate of {pod_id}"
         )
         return
-    remove_desired(name)
-    pod_known_hosts_file(name).unlink(missing_ok=True)
-    try:
-        with registry_transaction() as registry:
-            registry.hosts.pop(name, None)
-    except ConfigError as exc:
-        progress(f"WARNING: could not remove host {name} from the registry: {exc}")
+    forget_host_locked(name, pod_id, progress)
 
 
 def _wait_for_ssh_direct(
@@ -628,13 +618,13 @@ def _wait_for_ssh(
             last = result.output.strip().splitlines()[-1] if result.output.strip() else "no output"
         except SshUnusable as exc:
             # Never retried: the socket path cannot get shorter while we wait.
-            raise ProvisionError(
-                f"ssh to {transport.host} cannot work as configured, so waiting would only "
-                f"burn the pod's clock: {exc}"
-            ) from exc
+            last, misconfigured = str(exc), True
         except TransportError as exc:
             last = str(exc).splitlines()[-1]
-        if SSH_MISCONFIGURED.search(last):
+            misconfigured = bool(SSH_MISCONFIGURED.search(last))
+        else:
+            misconfigured = bool(SSH_MISCONFIGURED.search(last))
+        if misconfigured:
             raise ProvisionError(
                 f"ssh to {transport.host} cannot work as configured, so waiting would only "
                 f"burn the pod's clock: {last}"
@@ -722,15 +712,14 @@ def pick_reusable_host(
                 f"reuse: forgetting {entry.name}, its pod "
                 f"{'is gone' if pod is None else 'is TERMINATED'}"
             )
-            with state_lock():
-                forget_host(entry.name, entry.pod_id)
+            forget_host_locked(entry.name, entry.pod_id, report)
             continue
         if pod.status != "RUNNING":
             report(f"reuse: skipping {entry.name}, its pod is {pod.status}")
             continue
         status = host_status(entry, settings)
         age = status.get("dispatcher_heartbeat_age_s") if status else None
-        if not isinstance(age, (int, float)) or age >= HEARTBEAT_FRESH_S:
+        if not isinstance(age, (int, float)) or age >= REUSE_HEARTBEAT_MAX_S:
             report(
                 f"reuse: skipping {entry.name}, dispatcher heartbeat is "
                 f"{'unreachable' if not isinstance(age, (int, float)) else f'{age:.0f}s old'}"

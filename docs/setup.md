@@ -26,12 +26,10 @@ contract the code keeps is [ARCHITECTURE.md](ARCHITECTURE.md).
 - Nothing else installed by hand: `gpuc host bootstrap` puts uv, a Python
   (floor 3.11, it installs 3.12), the `gpuc.host` package, the `aws` CLI v2
   bundle and `hf` into `$HOME` over ssh, and starts the dispatcher.
-- **systemd is optional and buys one thing**: with a `systemd --user` session
-  that has cgroup delegation, each job phase runs in a transient scope, so
-  stopping it reaps the whole tree — including a grandchild that double-forked
-  out of the process group and would otherwise sit on a GPU. Without it (every
-  RunPod pod, most shared boxes and containers) the kill is by process group and
-  that hole is real. `gpuc host probe` reports which you get.
+- **systemd is optional**: with a `systemd --user` session a cancel reaps
+  the whole process tree, without one a double-forked grandchild can escape
+  (see [how a job is killed](usage.md#how-a-job-is-killed)). `gpuc host probe`
+  reports which you get.
 
 ## Install
 
@@ -63,7 +61,7 @@ gpuc config show      # the effective settings, file or not
 | `ssh_key` | unset | private key for ssh and rsync; its `.pub` goes to the RunPod account |
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | default pod image (`--image` per submit) |
 | `disk_gb` | `50` | default container disk (`--disk` per submit) |
-| `dead_dispatcher_minutes` | `30.0` | how long an ephemeral host may be silent, with nothing running, before `gpuc reconcile` terminates it — counted from silence this machine watched, so a suspend or a reboot starts it again rather than cashing in the time it was away. It is also the margin a pod being bootstrapped *by another machine* has, since installing uv, a Python and the package takes about ten minutes and nothing beats until that is done — so lowering it much below 30 on a machine that reconciles other machines' pods is how you shoot one down mid-setup |
+| `dead_dispatcher_minutes` | `30.0` | how long an ephemeral host may be silent, with nothing running, before `gpuc reconcile` terminates it ([usage.md](usage.md#reconcile)). Bootstrapping a pod takes about ten minutes and nothing beats until it is done, so much below 30 shoots down a pod another machine is still setting up |
 
 **`s3_bucket` and `--s3-prefix` are two different mirrors.** `s3_bucket` is
 written by *this machine*: job specs to `s3://<bucket>/gpuc/specs/<job-id>.json`
@@ -98,8 +96,8 @@ journalctl --user -u gpuc-web.service -f
 ```
 
 The unit pins `GPUC_CONFIG_DIR` and `GPUC_STATE_DIR` to this user's
-directories and reads `RUNPOD_API_KEY` from the same `config_dir()/env` file
-the [reconcile timer](#the-reconcile-timer) uses, so RunPod hosts show their
+directories and reads `RUNPOD_API_KEY` from the same
+`~/.config/gpu-coordinator/env` file the [reconcile timer](#the-reconcile-timer) uses, so RunPod hosts show their
 pod line; without it they still render. It restarts on failure, and it needs
 `loginctl enable-linger` to outlive your session, exactly like the timer.
 `--install` refuses nothing: with no password set the service starts, logs
@@ -145,7 +143,7 @@ gpuc host add local --gpus 0                               # this machine
 gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach over ssh
 gpuc host add gpubox --ssh me@gpubox                       # …one somebody already set up: adopt it
 gpuc host set gpubox --shared-gpus 4,5                     # two more it may borrow while nobody else is on them
-gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] uuid name`,
+gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] name vram uuid`,
                              # disk, $HOME's filesystem, systemd --user, uv cache, network speed
 gpuc host probe gpubox --all-gpus   # every card in the box, `(assigned)` on the ones this host owns
 gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idempotent
@@ -195,24 +193,26 @@ its `config.json` — cards, mirror, TTL, and the record of what it was rented a
 so nothing about the machine that created it matters afterwards. It is also
 recorded in `desired/` here, so this machine's `gpuc reconcile` watches it.
 
-The address is the top two rows; every other flag is the host's own config,
-which `host set` writes through to it.
+The address is the top two rows, kept here (`here <- …`) and applied to the
+host by the next `gpuc host bootstrap`. Every other flag is the host's own
+config: `host set` writes it through to the host's `config.json` at once (the
+host has to answer) and reports each change as `host <- …`.
 
 | flag (`host add`, and `host set` to change one) | default | meaning |
 | --- | --- | --- |
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
 | `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting instead of naming an ssh target; the provider says where it is. Needs `RUNPOD_API_KEY`. Add `--gpuc-home` if that pod keeps gpuc somewhere other than `$HOME/.gpuc` — `gpuc reconcile` only ever looks there, so such a pod is reported unclaimed rather than taken on |
-| `--gpus 2,3` or `--gpus GPU-8064…,3` | none | what this host may use: nvidia-smi **indices**, UUIDs, or a mix, stored exactly as typed. Indices are how a share of a shared box is agreed; the host re-resolves them to UUIDs on every dispatch pass and pins jobs with `CUDA_VISIBLE_DEVICES=<uuid>`, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is reported `UNAVAILABLE` and jobs wait for it |
-| `--shared-gpus 4,5` | none | cards on this box gpuc may **borrow** but does not own, spelled like `--gpus` and never overlapping it. A job reaches one only if its spec says `use_shared: true`, only after the owned cards are full, and only while nvidia-smi says the card holds no memory and is doing no work. See [shared GPUs](usage.md#shared-gpus) |
+| `--gpus 2,3` or `--gpus GPU-8064…,3` | none | nvidia-smi **indices**, UUIDs, or a mix, stored as typed; the host re-resolves indices to UUIDs on every dispatch pass, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is `UNAVAILABLE` and jobs wait for it |
+| `--shared-gpus 4,5` | none | cards gpuc may **borrow** but does not own, spelled like `--gpus` and never overlapping it; see [shared GPUs](usage.md#shared-gpus) |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
-| `--cache-dir PATH` | bootstrap decides | uv's cache for this host, which is `UV_CACHE_DIR` in its `env`. Bootstrap sets one on gpuc home's filesystem when they differ, because uv only reflinks or hardlinks a venv out of its cache within one filesystem — but only when the host's config names none, however it got there |
+| `--cache-dir PATH` | bootstrap decides | `UV_CACHE_DIR` in the host's `env`. Bootstrap sets one on gpuc home's filesystem when they differ (uv only links a venv out of its cache within one filesystem), and never overrides one the config already names |
 | `--persistent-root R` | none | gpuc home moves to `R/gpuc` (below) |
 | `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. Nothing populates it automatically. It replaces the whole set, except `UV_CACHE_DIR`, which is bootstrap's and `--cache-dir`'s |
 | `--s3-prefix s3://…` | none | this host's own log/state mirror |
-| `--retention-days N` | none | the host's dispatcher auto-purges job dirs older than this, but only ones whose log and state it has confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` goes back to keeping everything |
-| `--workdir-days N` | `1` on a host being configured for the first time | the host's dispatcher reclaims a finished job's `workdir/` — the checkout and the venv, never its log or state — once it ended this long ago. No mirror needed: `gpuc requeue` rebuilds a workdir from git, so this is the horizon worth having short. `''` keeps workdirs until you run `gpuc clean`. A host whose config already exists keeps whatever it says, including nothing |
+| `--retention-days N` | none | auto-purge whole job dirs this old, only ones whose log and state are confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` turns it off |
+| `--workdir-days N` | `1` on a host being configured for the first time | auto-sweep a finished job's `workdir/` (never its log or state) once it ended this long ago; no mirror needed. `''` turns it off. A host whose config already exists keeps whatever it says |
 | `--idle-min N` | `15` | how long an ephemeral host may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |
-| `--ttl-hours N` | none | opt-in hard cap on the host's life; past it the dispatcher kills the running job with reason `ttl`, syncs, and terminates. `-1` means no TTL, on `host add` and `host set` alike (a stored `-1` would be a host already past its TTL). `0` is refused |
+| `--ttl-hours N` | none | opt-in hard cap on the host's life; past it the dispatcher kills the running job with reason `ttl`, syncs, and terminates. `-1` means no TTL; `0` is refused |
 
 On a box you share, `--gpus` is the whole of what gpuc may touch, so `host
 probe` lists only those cards and says how many it hid (`2 of 8 assigned to
@@ -221,14 +221,6 @@ records **every** card's name and VRAM, so `gpuc host set gpubox --gpus 5` names
 something already known. An assigned entry no card answers to is
 called out, as are two entries naming one card: `gpuc host bootstrap` fails its
 `gpu_uuids` check on both, so the probe is where you want to find them.
-
-`gpuc host set` changes one field at a time, and where it writes depends on
-which field: `--gpus`, `--shared-gpus`, `--env`, `--cache-dir`, `--s3-prefix`,
-`--retention-days`, `--workdir-days`, `--idle-min` and `--ttl-hours` are the **host's own**
-config, so they are written through to its `config.json` immediately — the host
-has to answer, and every change is reported as `host <- …`. `--persistent-root`
-and `--gpuc-home` are *addresses*, kept here (`here <- …`) and applied to the
-host by the next `gpuc host bootstrap`.
 
 `gpuc host list` shows what is registered, one block per host, with each card
 as `gpu [index] name vram uuid` and a `pkg` line naming the commit the host was
@@ -356,51 +348,19 @@ keeps the lock and finishes on its own (older) code; every new runner uses the
 new package, and whichever dispatcher takes over adopts the running jobs from
 their `state.json`. Only the dispatcher is ever replaced, never a runner.
 
-Before you push a change: `./check.sh` runs ruff, pyright and the test suite,
-which is exactly what CI runs on every pull request (`--fast` skips the sync).
-The GPU tests are part of it and run on whatever card this machine has (tiny
-tensors; they skip themselves where there is none). The tests that **rent** a
-RunPod pod are the one thing left out, of `check.sh` and of a bare `pytest`
-alike: run `uv run pytest -m runpod` when you mean to spend money.
-
 Two sessions on different builds are fine as long as both are recent: every file
 the two sides share is read with unknown keys ignored and a `null` for a
 non-optional field taken as that field's default.
 
 ### The same host from two machines
 
-A host is the host's own: its queue, its job state and its logs live there, so
-registering one box from a desktop *and* a laptop works — each machine's
-`gpuc status`, `logs` and `cancel` see every job on it, whoever submitted it,
-and the dispatcher orders them all by priority as usual.
-
-What the host **is** — its cards, its mirror, its env, its timers — lives in
-`config.json` on the host and nowhere else, so there is nothing to keep in
-step: on the second machine,
-
-```sh
-gpuc host add gpubox --ssh me@gpubox     # reads what the host already says it is
-```
-
-and that is all. `gpuc host set` on either machine writes through to the same
-file; `gpuc submit` reads it before it enqueues, so the cards a job is judged
-against are always the host's own answer.
-
-What is per-machine is the **address**: `--ssh`, `--port`, and `--gpuc-home` /
-`--persistent-root`, which is how this machine reaches the host and finds that
-config. Get the last two wrong and you have pointed at a second, empty gpuc
-home on the same box rather than at the host — the one thing worth copying from
-`gpuc host list --json` on the first machine.
-
-Everything else the registry holds is a **cache** of what the host last said,
-kept so `gpuc host list` and `gpuc version` have something to print offline.
-They label it with its age (`as of 3m ago`); anything that decides something
-reads the host.
-
-The exception is the reconcile timer: until [#36](https://github.com/brendanlong/gpu-coordinator/issues/36)
-lands, running `gpuc reconcile` on a second machine can terminate a pod the
-first one created, because "is this pod ours" is still answered from local
-state only.
+A host is the host's own -- queue, job state, logs and `config.json` all live
+there -- so registering one box from a desktop *and* a laptop is the ordinary
+`gpuc host add gpubox --ssh me@gpubox` on the second machine, and every command
+on either sees every job. The one thing to get right is the **address**: get
+`--gpuc-home` / `--persistent-root` wrong and you have pointed at a second,
+empty gpuc home on the same box -- copy them from `gpuc host list --json` on
+the first machine.
 
 ## Teardown
 

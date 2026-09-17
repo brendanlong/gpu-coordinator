@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shlex
 import signal
 import subprocess
-import sys
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
@@ -195,7 +195,7 @@ def kill_process_group(
 
 
 def preflight_command() -> str:
-    return f"uv run --no-sync python -c {_shell_quote(PREFLIGHT_SOURCE)}"
+    return f"uv run --no-sync python -c {shlex.quote(PREFLIGHT_SOURCE)}"
 
 
 @dataclass
@@ -477,7 +477,6 @@ class JobRunner:
         self._progress_error = None
         fields: dict[str, object] = {
             "progress_pct": percent,
-            "progress_at": jobs.utc_now(),
             "progress_error": None,
         }
         if percent > 0:
@@ -492,7 +491,7 @@ class JobRunner:
     def _record_util(self, util: float | None) -> None:
         sample = None if util is None else round(util, 1)
         recent = [*jobs.read_state(self.job_id).util_recent, sample][-UTIL_SAMPLES_KEPT:]
-        jobs.update_state(self.job_id, util_recent=recent, util_sampled_at=jobs.utc_now())
+        jobs.update_state(self.job_id, util_recent=recent)
 
     def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
         self.kill_reason = reason
@@ -774,10 +773,10 @@ class JobRunner:
         self._preempting = queue.is_preempted(self.job_id)
         jobs.update_state(self.job_id, phase="sync")
         if skip_output_sync:
-            # The preflight already proved these uploads cannot work, and the
-            # job never ran, so a second failure would only add a confusing
-            # `+no-outputs` to a reason that is already exact.
-            self._log(log, "skipping the final output sync after a failed sync preflight")
+            # The job never ran (a failed preflight, a card that is not here),
+            # so a second failure would only add a confusing `+no-outputs` to a
+            # reason that is already exact.
+            self._log(log, "skipping the final output sync: the job never ran")
         else:
             try:
                 sync_loop.final()
@@ -898,17 +897,5 @@ class JobRunner:
         return status, f"{reason}+{sync_reason}" if reason else sync_reason, exit_code
 
 
-def _shell_quote(text: str) -> str:
-    return "'" + text.replace("'", "'\"'\"'") + "'"
-
-
 def run_job(job_id: str, deps: RunnerDeps | None = None) -> int:
     return JobRunner(job_id, deps).run()
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = list(argv) if argv is not None else sys.argv[1:]
-    if len(args) != 1:
-        print("usage: python -m gpuc.host run <job-id>", file=sys.stderr)
-        return 2
-    return run_job(args[0])

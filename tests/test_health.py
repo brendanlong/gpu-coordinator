@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from gpuc.host import __main__ as cli
 from gpuc.host import health, jobs
 from gpuc.host.jobs import HostConfig
 from tests.conftest import FAKE_GPUS, fake_smi
@@ -150,7 +151,7 @@ def test_health_main_exit_code_follows_the_report(
 ) -> None:
     monkeypatch.setattr(health, "http_download", fast_downloader)
     monkeypatch.setattr(health.gpus, "run_nvidia_smi", fake_smi())
-    code = health.main(["--min-free-gb", "0", "--download-url", "http://x"])
+    code = cli.main(["health", "--min-free-gb", "0", "--download-url", "http://x"])
     report = json.loads(capsys.readouterr().out)
     assert code == 0
     assert report["host"] == "test-host"

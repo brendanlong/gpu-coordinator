@@ -177,7 +177,9 @@ def test_git_tracked_files_lists_the_repo() -> None:
 
 def test_make_transport_picks_the_right_kind(tmp_path: Path) -> None:
     assert isinstance(transport.make_transport("local"), LocalTransport)
-    remote = transport.make_transport("gpubox", ssh="u@h", port=2200, state_dir=tmp_path)
+    remote = transport.make_transport(
+        "gpubox", ssh="u@h", port=2200, known_hosts=tmp_path / "known_hosts"
+    )
     assert isinstance(remote, SshTransport)
     assert remote.control_dir == transport.control_socket_dir()
     assert remote.known_hosts == tmp_path / "known_hosts"
@@ -362,9 +364,7 @@ def test_rsync_excludes_reach_the_command_line(tmp_path: Path) -> None:
 
 def test_make_transport_takes_a_per_pod_known_hosts_file(tmp_path: Path) -> None:
     per_pod = tmp_path / "pods" / "pod-1.known_hosts"
-    remote = transport.make_transport(
-        "pod-1", ssh="root@1.2.3.4", state_dir=tmp_path, known_hosts=per_pod
-    )
+    remote = transport.make_transport("pod-1", ssh="root@1.2.3.4", known_hosts=per_pod)
     assert isinstance(remote, SshTransport)
     assert remote.known_hosts == per_pod
     assert remote.control_dir == transport.control_socket_dir()

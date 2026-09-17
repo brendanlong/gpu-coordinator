@@ -6,12 +6,11 @@ from __future__ import annotations
 import re
 import shutil
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from gpuc.control.bootstrap import package_root
-
-Reporter = Callable[[str], None]
+from gpuc.control.config import Reporter
+from gpuc.control.version import package_root
 
 
 def systemd_dir() -> Path:

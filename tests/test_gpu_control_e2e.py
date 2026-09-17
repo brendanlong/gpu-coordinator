@@ -198,7 +198,7 @@ def test_preempting_a_gpu_job_hands_the_card_to_the_one_waiting(
     capsys.readouterr()
 
     assert main(["preempt", hog]) == 0
-    assert "run from the start" in capsys.readouterr().out
+    assert "queued again at priority" in capsys.readouterr().out
     wait_until(
         lambda: state_of(home, waiting).get("status") == "running",
         300,

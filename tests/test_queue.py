@@ -80,7 +80,7 @@ def test_cancel_of_a_running_job_only_marks(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec())
     queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running")
-    assert queue.cancel(job_id) == "running"
+    assert queue.cancel(job_id) == "cancelling"
     assert queue.is_cancelled(job_id)
     assert jobs.read_state(job_id).status == "running"
 

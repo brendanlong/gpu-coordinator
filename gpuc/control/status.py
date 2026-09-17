@@ -13,11 +13,12 @@ from typing import Any
 from urllib.parse import quote
 
 from gpuc.control import version
-from gpuc.control.config import HostEntry, Settings
+from gpuc.control.config import HostEntry, Settings, parse_timestamp
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.remote import HostSession, RemoteError, open_session
+from gpuc.control.s3index import job_uri
 from gpuc.control.transport import TransportError
 from gpuc.host.cleanup import human_bytes
 from gpuc.host.jobs import SCHEMA_VERSION
@@ -155,7 +156,8 @@ class JobView:
     isolation: str | None = None
     """`cgroup` if this job's phases run in a systemd scope (a cancel reaps the
     whole tree), `pgid` if only a process group (a daemonised grandchild
-    escapes). Shown on running jobs because it changes what a kill guarantees."""
+    escapes). In `--json` only: what a kill reaps is asked while debugging one
+    job, not while scanning a host."""
     low_util: LowUtilView = field(default_factory=LowUtilView)
     """This job's own watchdog settings, so `--suspects` names the jobs the host
     is actually about to kill -- and stays quiet about the ones that turned the
@@ -171,8 +173,8 @@ class JobView:
     def minutes(self) -> float | None:
         if not self.started_at:
             return None
-        end = _parse(self.ended_at) if self.ended_at else datetime.now(UTC)
-        start = _parse(self.started_at)
+        end = parse_timestamp(self.ended_at) if self.ended_at else datetime.now(UTC)
+        start = parse_timestamp(self.started_at)
         if start is None or end is None:
             return None
         return (end - start).total_seconds() / 60.0
@@ -188,7 +190,7 @@ class JobView:
         Read here rather than on the host so a `status` of a host whose clock
         or whose last report is minutes old still counts down.
         """
-        when = _parse(self.eta)
+        when = parse_timestamp(self.eta)
         return None if when is None else (when - datetime.now(UTC)).total_seconds()
 
     @property
@@ -238,7 +240,7 @@ def parse_duration(text: str) -> float:
 
 def format_age(stamp: str | None, now: datetime | None = None) -> str:
     """`3m ago`, `2d ago`: enough to tell last night's run from last month's."""
-    when = _parse(stamp)
+    when = parse_timestamp(stamp)
     if when is None:
         return "age unknown"
     seconds = ((now or datetime.now(UTC)) - when).total_seconds()
@@ -298,16 +300,6 @@ def _str_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, str)}
-
-
-def _parse(stamp: str | None) -> datetime | None:
-    if not stamp:
-        return None
-    try:
-        parsed = datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 @dataclass
@@ -418,7 +410,7 @@ class HostView:
             return False
         if self.pod is not None and self.pod.age is not None:
             return self.pod.age.total_seconds() / 3600.0 > self.entry.ttl_hours
-        created = _parse(self.entry.created_at)
+        created = parse_timestamp(self.entry.created_at)
         if created is None:
             return False
         return (datetime.now(UTC) - created).total_seconds() / 3600.0 > self.entry.ttl_hours
@@ -559,7 +551,7 @@ def pod_line(pod: Pod | None) -> str | None:
     """
     if pod is None:
         return None
-    age = "age ?" if pod.age is None else f"age {pod.age.total_seconds() / 60.0:.0f}m"
+    age = "age ?" if pod.age is None else f"age {format_duration(pod.age.total_seconds())}"
     util = ",".join(f"{u}%" for u in pod.gpu_utils) if pod.gpu_utils else "--"
     return (
         f"  pod     {pod.id} {pod.status} {pod.gpu_name or '?'} "
@@ -595,8 +587,8 @@ def _fmt_gpus(view: HostView, job: JobView) -> str:
     return "gpu=" + ",".join(view.gpu_label(uuid) for uuid in job.gpus)
 
 
-def _fmt_minutes(job: JobView) -> str:
-    return "--" if job.minutes is None else f"{job.minutes:.1f}m"
+def _fmt_elapsed(job: JobView) -> str:
+    return "--" if job.minutes is None else format_duration(job.minutes * 60.0)
 
 
 def _fmt_eta(job: JobView) -> str:
@@ -1003,7 +995,7 @@ def _shared_gpu_lines(view: HostView) -> list[str]:
 def within(job: JobView, since_s: float | None, now: datetime | None = None) -> bool:
     if since_s is None:
         return True
-    ended = _parse(job.ended_at)
+    ended = parse_timestamp(job.ended_at)
     if ended is None:
         return False
     return ((now or datetime.now(UTC)) - ended).total_seconds() <= since_s
@@ -1071,7 +1063,7 @@ def render(
     if suspects_only:
         for job in view.suspects:
             lines.append(
-                f"  SUSPECT {_job_label(job)} phase={job.phase} {_fmt_minutes(job)} "
+                f"  SUSPECT {_job_label(job)} phase={job.phase} {_fmt_elapsed(job)} "
                 f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             )
         if view.past_ttl:
@@ -1083,7 +1075,7 @@ def render(
     for job in view.running:
         mark = "  running" if not job.suspect else "  running!"
         lines.append(
-            f"{mark} {_job_label(job)} phase={job.phase or '-'} {_fmt_minutes(job)} "
+            f"{mark} {_job_label(job)} phase={job.phase or '-'} {_fmt_elapsed(job)} "
             f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             f"{_fmt_eta(job)}{_fmt_auto_preempt(job)}"
         )
@@ -1098,7 +1090,10 @@ def render(
         lines.append(free)
     finished = [job for job in view.finished if within(job, since_s)]
     for job in finished[:recent]:
-        detail = job.reason or (f"exit {job.exit_code}" if job.exit_code else "")
+        # `cancelled (cancelled)` says nothing twice: only a reason that adds
+        # to the status is worth the parenthesis.
+        reason = job.reason if job.reason != job.status else None
+        detail = reason or (f"exit {job.exit_code}" if job.exit_code else "")
         flag = ""
         if job.outputs_lost and job.outputs_pending:
             # `outputs_lost` is written once and never cleared, so it outlives
@@ -1181,6 +1176,7 @@ def job_json(
         "name": job.name,
         "status": job.status,
         "reason": job.reason,
+        "exit_code": job.exit_code,
         "phase": job.phase,
         "priority": job.priority,
         "attempt": job.attempt,
@@ -1265,7 +1261,7 @@ def job_links(job: JobView, mirror_prefix: str | None = None) -> list[dict[str, 
         # The host's *current* prefix. A job mirrored under a prefix the host
         # has since been re-registered without gets a link to an empty
         # listing; `gpuc logs` reads the job's own index entry, this does not.
-        mirror = f"{mirror_prefix.rstrip('/')}/jobs/{job.job_id}"
+        mirror = job_uri(mirror_prefix, job.job_id)
         links.append(
             {"kind": "mirror", "path": None, "target": mirror, "url": s3_console_url(mirror)}
         )

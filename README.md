@@ -42,7 +42,6 @@ gpuc web set-password && gpuc web serve   # the same, in a browser at http://127
 | [`docs/setup.md`](docs/setup.md) | install, config keys, credentials, registering hosts, the reconcile timer, upgrading, teardown |
 | [`docs/usage.md`](docs/usage.md) | the job spec, every command, RunPod, how a job is killed, exit codes and `--json`, cleanup and retention, troubleshooting |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | the contract: on-host state, dispatcher and runner behaviour, transport, reconcile rules, testing rules |
-| [`docs/requirements-review.md`](docs/requirements-review.md) | the 2026-09-14 reasoning behind it (a snapshot; ARCHITECTURE wins where they differ) |
 | [`skills/gpuc/SKILL.md`](skills/gpuc/SKILL.md) | the agent-facing quick guide, self-contained |
 | [`job.example.yaml`](job.example.yaml) | a fully commented job spec |
 

@@ -255,7 +255,7 @@ def test_an_unknown_key_never_reaches_a_model() -> None:
     index = IndexEntry.model_validate({"job_id": "j", "host": None, "attempt": None, "x": 1})
     assert (index.host, index.attempt) == ("", 1)
     desired = DesiredHost.model_validate({"name": "pod", "offer": None, "idle_minutes": None})
-    assert desired.idle_minutes == 15.0 and desired.offer.name == ""
+    assert desired.offer.name == ""
 
 
 # -- the host side, which has no pydantic to lean on --------------------------

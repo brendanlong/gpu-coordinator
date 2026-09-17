@@ -23,7 +23,6 @@ function el(tag, attrs, ...children) {
   for (const [key, value] of Object.entries(attrs || {})) {
     if (value === null || value === undefined || value === false) continue;
     if (key === "class") node.className = value;
-    else if (key === "text") node.textContent = value;
     else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
     else node.setAttribute(key, value === true ? "" : value);
   }
@@ -34,13 +33,8 @@ function el(tag, attrs, ...children) {
   return node;
 }
 
-function clear(node) {
-  while (node.firstChild) node.removeChild(node.firstChild);
-}
-
 function replace(node, ...children) {
-  clear(node);
-  node.append(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+  node.replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
 }
 
 // -- formatting: the same words `gpuc status` uses ---------------------------
@@ -67,8 +61,8 @@ function fmtAge(stamp) {
   return `${Math.floor(seconds)}s ago`;
 }
 
-function fmtMinutes(job) {
-  return job.elapsed_s === null ? "--" : `${(job.elapsed_s / 60).toFixed(1)}m`;
+function fmtElapsed(job) {
+  return job.elapsed_s === null ? "--" : fmtDuration(job.elapsed_s);
 }
 
 function fmtUtil(job) {
@@ -85,9 +79,13 @@ function fmtEta(job) {
   return job.eta_s < 0 ? `overdue (${source})` : `${fmtDuration(job.eta_s)} (${source})`;
 }
 
+function fmtWait(seconds) {
+  return seconds < 60 ? "now" : `in ~${fmtDuration(seconds)}`;
+}
+
 function fmtStarts(job) {
   if (job.starts_in_s === null || job.starts_in_s === undefined) return "";
-  return job.starts_in_s < 60 ? "now" : `in ~${fmtDuration(job.starts_in_s)}`;
+  return fmtWait(job.starts_in_s);
 }
 
 function fmtBytes(n) {
@@ -99,6 +97,16 @@ function fmtBytes(n) {
 
 function short(commit) {
   return commit ? commit.slice(0, 12) : "unknown";
+}
+
+// The line `gpuc submit` and `gpuc reorder` print about where the job landed.
+function queueNote(result) {
+  if (result.dispatched) return "dispatched already; it is running now";
+  if (result.queue_position === null || result.queue_position === undefined) return "";
+  const starts = result.starts_in_s === null
+    ? `start time unknown (${result.starts_unknown})`
+    : `starts ${fmtWait(result.starts_in_s)}`;
+  return `position ${result.queue_position} of ${result.queue_length}; ${starts}`;
 }
 
 // -- the API ----------------------------------------------------------------
@@ -127,6 +135,10 @@ function post(path, body) {
   });
 }
 
+function jobPath(job, action) {
+  return `/api/jobs/${encodeURIComponent(job.job_id)}/${action}`;
+}
+
 // -- notices ----------------------------------------------------------------
 
 function notify(message, level) {
@@ -136,10 +148,26 @@ function notify(message, level) {
   setTimeout(() => note.remove(), 12000);
 }
 
+// One shape for every action button: disable it, POST, report what the CLI
+// would have printed, and redraw. A failure re-enables the button so the
+// action can be retried without waiting for the next refresh.
+async function act(button, path, body, describe) {
+  button.disabled = true;
+  try {
+    const result = await post(path, body);
+    for (const warning of result.warnings || []) notify(warning, "warn");
+    notify(describe(result));
+    await load();
+  } catch (err) {
+    notify(err.message, "bad");
+    button.disabled = false;
+  }
+}
+
 // -- rendering --------------------------------------------------------------
 
-function badge(text, level) {
-  return el("span", { class: `badge ${level || ""}` }, text);
+function badge(text, level, title) {
+  return el("span", { class: `badge ${level || ""}`, title }, text);
 }
 
 function jobLabel(job) {
@@ -159,7 +187,7 @@ const LINK_LABELS = { s3: "S3", hf: "HF", wandb: "W&B", mirror: "log mirror" };
 
 function links(job) {
   const items = (job.links || []).filter((l) => l.url);
-  if (!items.length) return el("span", { class: "muted" }, "");
+  if (!items.length) return null;
   return el("span", { class: "links" },
     items.map((link) => el("a", {
       href: link.url, target: "_blank", rel: "noopener",
@@ -173,68 +201,50 @@ function logsButton(host, job) {
 }
 
 function cancelButton(host, job) {
-  return el("button", {
+  const button = el("button", {
     type: "button", class: "danger",
-    onclick: async (event) => {
+    onclick: () => {
       if (!window.confirm(`Cancel ${job.name || job.job_id} on ${host.name}?`)) return;
-      event.target.disabled = true;
-      try {
-        const result = await post(`/api/jobs/${encodeURIComponent(job.job_id)}/cancel`, { host: host.name });
-        notify(`job ${job.job_id} on ${result.host}: ${result.status}`);
-        await load();
-      } catch (err) {
-        notify(err.message, "bad");
-        event.target.disabled = false;
-      }
+      act(button, jobPath(job, "cancel"), { host: host.name },
+        (r) => `job ${job.job_id} on ${r.host}: ${r.status}`);
     },
   }, "Cancel");
+  return button;
 }
 
 function preemptButton(host, job) {
-  return el("button", {
+  const button = el("button", {
     type: "button",
-    onclick: async (event) => {
+    onclick: () => {
       if (!window.confirm(`Stop ${job.name || job.job_id} on ${host.name} and queue it again? It re-runs from the start.`)) return;
-      event.target.disabled = true;
-      try {
-        const result = await post(`/api/jobs/${encodeURIComponent(job.job_id)}/preempt`, { host: host.name });
-        for (const warning of result.warnings || []) notify(warning, "warn");
-        notify(`job ${job.job_id} on ${result.host}: ${result.status}; it will be queued again at priority ${result.priority}`);
-        await load();
-      } catch (err) {
-        notify(err.message, "bad");
-        event.target.disabled = false;
-      }
+      act(button, jobPath(job, "preempt"), { host: host.name },
+        (r) => `job ${job.job_id} on ${r.host}: ${r.status}`
+          + (r.priority === null ? "" : `; it will be queued again at priority ${r.priority}`));
     },
   }, "Preempt");
+  return button;
 }
 
 function priorityControl(host, job) {
   const input = el("input", { type: "number", min: 0, max: 99, value: job.priority ?? 50, "aria-label": "priority" });
   const button = el("button", {
     type: "button",
-    onclick: async () => {
+    onclick: () => {
       const priority = Number.parseInt(input.value, 10);
       if (Number.isNaN(priority)) return;
-      button.disabled = true;
-      try {
-        const result = await post(`/api/jobs/${encodeURIComponent(job.job_id)}/reorder`, { host: host.name, priority });
-        for (const warning of result.warnings || []) notify(warning, "warn");
-        notify(`job ${job.job_id} moved to priority ${result.priority}`);
-        await load();
-      } catch (err) {
-        notify(err.message, "bad");
-        button.disabled = false;
-      }
+      act(button, jobPath(job, "reorder"), { host: host.name, priority }, (r) => {
+        const note = queueNote(r);
+        return `job ${job.job_id} on ${r.host} moved to priority ${r.priority}${note ? `; ${note}` : ""}`;
+      });
     },
-  }, "Set");
+  }, "Reorder");
   return el("span", { class: "actions" }, input, button);
 }
 
 function estimateButton(host, job) {
-  return el("button", {
+  const button = el("button", {
     type: "button",
-    onclick: async () => {
+    onclick: () => {
       const raw = window.prompt(`Estimated runtime for ${job.name || job.job_id}, in minutes (blank clears it):`,
         job.estimated_runtime_min ?? "");
       if (raw === null) return;
@@ -249,23 +259,17 @@ function estimateButton(host, job) {
         }
         body.minutes = minutes;
       }
-      try {
-        const result = await post(`/api/jobs/${encodeURIComponent(job.job_id)}/estimate`, body);
-        for (const warning of result.warnings || []) notify(warning, "warn");
-        notify(result.estimated_runtime_min === null
-          ? `job ${job.job_id} no longer estimates a runtime`
-          : `job ${job.job_id} now estimates ${result.estimated_runtime_min} min`);
-        await load();
-      } catch (err) {
-        notify(err.message, "bad");
-      }
+      act(button, jobPath(job, "estimate"), body, (r) => (r.estimated_runtime_min === null
+        ? `job ${job.job_id} on ${r.host} no longer estimates a runtime`
+        : `job ${job.job_id} on ${r.host} now estimates ${r.estimated_runtime_min} min`));
     },
   }, "Estimate");
+  return button;
 }
 
 function table(headers, rows) {
   return el("table", {},
-    el("thead", {}, el("tr", {}, headers.map((h) => el("th", { class: h.num ? "num" : null }, h.text)))),
+    el("thead", {}, el("tr", {}, headers.map((h) => el("th", { class: h.num ? "num" : null, title: h.title }, h.text)))),
     el("tbody", {}, rows),
   );
 }
@@ -274,26 +278,28 @@ function model(gpu) {
   return [gpu.name || "?", gpu.vram_mib ? ` ${Math.round(gpu.vram_mib / 1024)} GB` : ""];
 }
 
+function gpuRow(index, state, model) {
+  return el("tr", {}, el("td", { class: "gpu-index" }, `[${index ?? "?"}]`), el("td", {}, state), el("td", {}, model));
+}
+
 function missingRow(entry, as, what) {
-  return el("tr", {},
-    el("td", { class: "gpu-state" }, `[${entry[as]}]`),
-    el("td", {}, badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`),
-    el("td", {}), el("td", {}),
-  );
+  return gpuRow(entry[as], [badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`], "");
+}
+
+// `?` and not `0` for a reading the host could not take: that card is out
+// *because* nothing is known about it, and "0 MiB, 0% util" beside IN USE
+// reads as a bug.
+function reading(v) {
+  return v === null || v === undefined ? "?" : Math.round(v);
 }
 
 function gpuTable(host) {
   const shared = host.shared_gpus || [];
   if (!host.gpus.length && !shared.length) return el("p", { class: "empty" }, "no GPUs");
-  const rows = host.gpus.map((gpu) => {
-    if (gpu.available === false) return missingRow(gpu, "owned_as", "dispatched to");
-    return el("tr", {},
-      el("td", { class: "gpu-state" }, `[${gpu.index ?? "?"}]`),
-      el("td", {}, gpu.busy_job ? badge("busy", "warn") : badge("free", "good")),
-      el("td", {}, ...model(gpu)),
-      el("td", { class: "job-id" }, gpu.busy_job || ""),
-    );
-  });
+  // No holder column: the running table below names each job's cards.
+  const rows = host.gpus.map((gpu) => (gpu.available === false
+    ? missingRow(gpu, "owned_as", "dispatched to")
+    : gpuRow(gpu.index, gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), model(gpu))));
   // Shared cards are somebody else's, and `IN USE` is theirs, not ours: the
   // numbers beside it are why a job that asked for one is still queued.
   for (const gpu of shared) {
@@ -304,20 +310,10 @@ function gpuTable(host) {
     let state;
     if (gpu.busy_job) state = badge("shared, busy", "warn");
     else if (gpu.unused) state = badge("shared, free", "good");
-    else state = badge("shared, IN USE", "bad");
-    // `?` and not `0` for a reading the host could not take: that card is out
-    // *because* nothing is known about it, and "0 MiB, 0% util" beside IN USE
-    // reads as a bug.
-    const num = (v) => (v === null || v === undefined ? "?" : Math.round(v));
-    const held = gpu.busy_job || (gpu.unused ? "" : `${num(gpu.memory_mib)} MiB, ${num(gpu.utilization_pct)}% util`);
-    rows.push(el("tr", {},
-      el("td", { class: "gpu-state" }, `[${gpu.index ?? "?"}]`),
-      el("td", {}, state),
-      el("td", {}, ...model(gpu)),
-      el("td", { class: gpu.busy_job ? "job-id" : "muted" }, held),
-    ));
+    else state = [badge("shared, IN USE", "bad"), el("span", { class: "muted" }, ` somebody else: ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`)];
+    rows.push(gpuRow(gpu.index, state, model(gpu)));
   }
-  return table([{ text: "card" }, { text: "state" }, { text: "model" }, { text: "held by" }], rows);
+  return table([{ text: "card" }, { text: "state" }, { text: "model" }], rows);
 }
 
 function gpuLabels(host, job) {
@@ -329,45 +325,50 @@ function gpuLabels(host, job) {
   }).join(",");
 }
 
+function section(label, headers, rows) {
+  return el("div", {}, el("div", { class: "section-label" }, label), table(headers, rows));
+}
+
 function runningTable(host) {
   if (!host.running.length) return null;
   const rows = host.running.map((job) => el("tr", { class: job.suspect ? "suspect" : null },
     el("td", {}, jobLabel(job)),
     el("td", {}, job.phase || "-"),
-    el("td", { class: "num" }, fmtMinutes(job)),
+    el("td", { class: "num" }, fmtElapsed(job)),
     el("td", { class: "num" }, fmtUtil(job)),
     el("td", { class: "mono" }, gpuLabels(host, job)),
     el("td", {}, fmtEta(job), job.progress_error ? el("span", { class: "muted", title: job.progress_error }, " (progress error)") : null),
     el("td", {}, links(job)),
     el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), preemptButton(host, job), cancelButton(host, job)),
   ));
-  return el("div", {},
-    el("div", { class: "section-label" }, "running"),
-    table([{ text: "job" }, { text: "phase" }, { text: "elapsed", num: true }, { text: "util", num: true },
-      { text: "gpu" }, { text: "eta" }, { text: "links" }, { text: "" }], rows),
-  );
+  return section("running", [{ text: "job" }, { text: "phase" }, { text: "elapsed", num: true }, { text: "util", num: true },
+    { text: "gpu" }, { text: "eta" }, { text: "links" }, { text: "" }], rows);
 }
 
 function queuedTable(host) {
   if (!host.queued.length) return null;
   const rows = host.queued.map((job) => el("tr", {},
-    el("td", {}, jobLabel(job)),
+    el("td", {}, jobLabel(job),
+      // The usual job wants one card; a job waiting for three is the answer to
+      // "there is a card free, why is it still queued".
+      job.gpus_requested > 1 ? el("span", { class: "muted" }, ` needs ${job.gpus_requested} gpus`) : null),
     el("td", {}, priorityControl(host, job)),
     el("td", {}, job.estimated_runtime_min === null ? "" : `est ${fmtDuration(job.estimated_runtime_min * 60)}`),
     el("td", {}, fmtStarts(job)),
     el("td", {}, links(job)),
     el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), cancelButton(host, job)),
   ));
-  return el("div", {},
-    el("div", { class: "section-label" }, "queued (lower priority dispatches first)"),
-    table([{ text: "job" }, { text: "priority" }, { text: "estimate" }, { text: "starts" }, { text: "links" }, { text: "" }], rows),
-  );
+  return section("queued", [{ text: "job" }, { text: "priority", title: "lower dispatches first" }, { text: "estimate" },
+    { text: "starts" }, { text: "links" }, { text: "" }], rows);
 }
 
 function finishedTable(host) {
   if (!host.finished.length) return null;
   const rows = host.finished.map((job) => {
-    const detail = job.reason || "";
+    const reason = job.reason === job.status ? null : job.reason;
+    const detail = reason || (job.exit_code ? `exit ${job.exit_code}` : "");
+    // How far a job had got when it ended is the useful part of a failure.
+    const progress = job.progress_pct !== null && job.status !== "succeeded" ? ` (${Math.round(job.progress_pct)}%)` : "";
     let level = "good";
     if (job.status === "failed") level = "bad";
     else if (job.status === "cancelled") level = "warn";
@@ -376,18 +377,24 @@ function finishedTable(host) {
     else if (job.outputs_pending) flag = badge("outputs not uploaded", "warn");
     return el("tr", {},
       el("td", {}, jobLabel(job)),
-      el("td", {}, badge(job.status, level), detail ? ` ${detail}` : ""),
+      el("td", {}, badge(job.status, level), detail ? ` ${detail}` : "", progress),
       el("td", {}, fmtAge(job.ended_at)),
-      el("td", {}, job.progress_pct !== null ? `${Math.round(job.progress_pct)}%` : ""),
       el("td", {}, flag, job.workdir_bytes ? el("span", { class: "muted" }, ` workdir ${fmtBytes(job.workdir_bytes)}`) : null),
       el("td", {}, links(job)),
       el("td", { class: "actions" }, logsButton(host, job)),
     );
   });
-  return el("div", {},
-    el("div", { class: "section-label" }, "finished"),
-    table([{ text: "job" }, { text: "result" }, { text: "ended" }, { text: "progress" }, { text: "outputs" }, { text: "links" }, { text: "" }], rows),
-  );
+  return section("finished", [{ text: "job" }, { text: "result" }, { text: "ended" }, { text: "outputs" }, { text: "links" }, { text: "" }], rows);
+}
+
+function cardsSummary(host) {
+  const available = host.gpus.filter((g) => g.available !== false);
+  const shared = (host.shared_gpus || []).filter((g) => g.available !== false);
+  // A host that owns nothing and borrows something is a real configuration,
+  // and `no GPUs` above a list of shared cards contradicts itself.
+  if (available.length) return `gpus ${available.filter((g) => !g.busy_job).length}/${available.length} free`;
+  if (shared.length) return `shared ${shared.filter((g) => g.unused && !g.busy_job).length}/${shared.length} free, none owned`;
+  return "no GPUs";
 }
 
 function hostHeader(host, entry) {
@@ -396,15 +403,10 @@ function hostHeader(host, entry) {
   if (host.pod_gone) stateBadge = badge("POD GONE", "bad");
   else if (!host.reachable) stateBadge = badge("UNREACHABLE", "bad");
   else if (host.dispatcher.alive) stateBadge = badge(`dispatcher ${Math.round(host.dispatcher.heartbeat_age_s)}s ago`, "good");
-  else stateBadge = badge("dispatcher DOWN", "bad");
-  const free = host.gpus.filter((g) => g.available !== false && !g.busy_job).length;
-  const owned = host.gpus.filter((g) => g.available !== false).length;
+  else stateBadge = badge("dispatcher DOWN", "bad", "submit or bootstrap restarts it");
   const meta = el("div", { class: "meta" },
-    host.reachable ? el("span", {}, host.gpus.length ? `gpus ${free}/${owned} free` : "no GPUs") : null,
-    entry && entry.driver_version ? el("span", {}, `driver ${entry.driver_version}`) : null,
-    el("span", {}, `pkg ${short(host.pkg_commit)}`),
+    host.reachable ? el("span", {}, cardsSummary(host)) : null,
     entry && entry.s3_prefix ? el("span", { class: "mono" }, `mirror ${entry.s3_prefix}`) : null,
-    entry && entry.persistent_root ? el("span", { class: "mono" }, `root ${entry.persistent_root}`) : null,
     entry && entry.retention_days !== null && entry.retention_days !== undefined ? el("span", {}, `retention ${entry.retention_days}d`) : null,
     entry && entry.workdir_days !== null && entry.workdir_days !== undefined ? el("span", {}, `workdirs ${entry.workdir_days}d`) : null,
     host.kind === "runpod" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`, entry.ttl_hours !== null && entry.ttl_hours !== undefined ? `, ttl ${entry.ttl_hours}h` : "") : null,
@@ -436,7 +438,7 @@ function podLine(host) {
     el("span", {}, pod.gpu_name || "?"),
     el("span", {}, `$${pod.cost_usd_hr.toFixed(3)}/h`),
     el("span", {}, `cuda ${pod.cuda_version || "?"}`),
-    el("span", {}, pod.age_s === null ? "age ?" : `age ${Math.round(pod.age_s / 60)}m`),
+    el("span", {}, pod.age_s === null ? "age ?" : `age ${fmtDuration(pod.age_s)}`),
     el("span", {}, `provider util ${util}`),
   );
 }
@@ -446,13 +448,10 @@ function hostCard(host, entry) {
   for (const error of host.errors) card.append(el("div", { class: "notice bad" }, error));
   if (!host.reachable) {
     if (!host.pod_gone) card.append(el("p", { class: "muted" }, `try: gpuc host probe ${host.name}`));
-    const pod = podLine(host);
-    if (pod) card.append(pod);
+    card.append(podLine(host) || []);
     return card;
   }
-  card.append(gpuTable(host));
-  const pod = podLine(host);
-  if (pod) card.append(pod);
+  card.append(gpuTable(host), podLine(host) || []);
   const sections = [runningTable(host), queuedTable(host), finishedTable(host)].filter(Boolean);
   if (!sections.length) card.append(el("p", { class: "empty" }, "idle; nothing queued, running or finished"));
   card.append(...sections);
@@ -468,6 +467,9 @@ function hostCard(host, entry) {
 function renderHosts(status, hosts) {
   const list = document.getElementById("host-list");
   const entries = new Map((hosts.hosts || []).map((h) => [h.name, h]));
+  // Registry trouble persists until it is fixed, so it is drawn in place and
+  // redrawn on every refresh rather than toasted again each time.
+  replace(document.getElementById("errors"), status.errors.map((error) => el("div", { class: "notice bad" }, error)));
   if (!status.hosts.length) {
     replace(list, el("p", { class: "empty" }, "no hosts registered. Add one: gpuc host add local --gpus 0"));
     return;
@@ -481,14 +483,11 @@ function renderConfig(config, version) {
     el("td", {}, key),
     el("td", { class: "mono" }, value === null ? el("span", { class: "muted" }, "unset") : String(value)),
   ));
-  const versionText = version
-    ? `gpuc ${version.version} · commit ${short(version.commit)} [${version.source}]${version.dirty ? " +uncommitted" : ""}`
-    : "";
   replace(body,
     el("div", { class: "meta" },
       el("span", { class: "mono" }, `config file ${config.config_file}${config.config_file_exists ? "" : " (does not exist; using defaults)"}`),
       el("span", { class: "mono" }, `state dir ${config.state_dir}`),
-      versionText ? el("span", {}, versionText) : null,
+      el("span", {}, `gpuc ${version.version} · commit ${short(version.commit)} [${version.source}]${version.dirty ? " +uncommitted" : ""}`),
     ),
     table([{ text: "setting" }, { text: "value" }], rows),
     config.notes.map((note) => el("p", { class: "muted" }, `note: ${note}`)),
@@ -509,8 +508,7 @@ async function load() {
     // A refresh must not pull a half-typed priority out from under someone.
     if (!editingInHosts()) renderHosts(status, hosts);
     renderConfig(config, version);
-    for (const error of status.errors) notify(error, "bad");
-    state.gatheredAt = Date.now();
+    state.gatheredAt = status.gathered_at;
     tickUpdated();
   } catch (err) {
     updated.textContent = `refresh failed: ${err.message}`;
@@ -526,7 +524,7 @@ function editingInHosts() {
 
 function tickUpdated() {
   if (state.gatheredAt === null) return;
-  document.getElementById("updated").textContent = `updated ${fmtAge(new Date(state.gatheredAt).toISOString())}`;
+  document.getElementById("updated").textContent = `updated ${fmtAge(state.gatheredAt)}`;
 }
 
 function schedule() {
@@ -561,8 +559,8 @@ async function fetchLog() {
 function openLog(jobId, host) {
   closeLog();
   state.log = { jobId, host, timer: null, busy: false, firstLoad: true };
-  document.getElementById("log-title").textContent = `log \u00b7 ${jobId} \u00b7 ${host}`;
-  document.getElementById("log-text").textContent = "loading\u2026";
+  document.getElementById("log-title").textContent = `log · ${jobId} · ${host}`;
+  document.getElementById("log-text").textContent = "loading…";
   document.getElementById("log-panel").hidden = false;
   document.body.classList.add("log-open");
   fetchLog();

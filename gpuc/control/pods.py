@@ -7,29 +7,19 @@ someone else and this command is the place that habit is most easily broken.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Any
 
 from gpuc.control.config import (
     DesiredUnreadable,
-    Registry,
     Settings,
     load_desired,
     load_registry,
 )
 from gpuc.control.providers.base import Pod, Provider, owned_pods
 from gpuc.control.provision import dispatcher_heartbeat_age
+from gpuc.control.status import format_duration
 
 COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "DESIRED", "HEARTBEAT")
-
-
-def format_age(age: timedelta | None) -> str:
-    if age is None:
-        return "?"
-    minutes = age.total_seconds() / 60.0
-    if minutes < 90:
-        return f"{minutes:.0f}m"
-    return f"{minutes / 60.0:.1f}h"
 
 
 @dataclass
@@ -51,7 +41,7 @@ class PodRow:
             gpu,
             f"{self.pod.cost_usd_hr:.3f}",
             self.pod.cuda_version or "?",
-            format_age(self.pod.age),
+            "?" if self.pod.age is None else format_duration(self.pod.age.total_seconds()),
             util,
             "yes" if self.desired else "NO",
             heartbeat,
@@ -111,14 +101,13 @@ def gather(
     provider: Provider,
     *,
     heartbeats: bool = True,
-    registry: Registry | None = None,
 ) -> PodsView:
     view = PodsView()
     pods = provider.list()
     ours = owned_pods(pods, provider.caps.prefix)
     ours_ids = {pod.id for pod in ours}
     others = [pod for pod in pods if pod.id not in ours_ids]
-    registry = registry if registry is not None else load_registry()
+    registry = load_registry()
     try:
         desired_ids = {host.pod_id for host in load_desired()}
     except DesiredUnreadable as exc:

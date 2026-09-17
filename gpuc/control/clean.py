@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, load_settings, transport_for
-from gpuc.control.remote import HostSession, open_session
+from gpuc.control.remote import HostSession, env_prefix, open_session
 from gpuc.control.s3index import S3Index, job_log_uri, make_s3_client, split_uri
 from gpuc.control.transport import Transport
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS, human_bytes
@@ -431,12 +431,10 @@ def prune_uv_cache(
     unreachable entries, while `uv cache clean` would throw away exactly the
     wheels the next job wants to link out of.
     """
-    from gpuc.control.bootstrap import env_prefix
-
     transport = transport or transport_for(entry, settings)
     uv = entry.uv or "uv"
     result = transport.run(
-        UV_CACHE_PRUNE.format(env=env_prefix(entry), uv=shlex.quote(uv)),
+        UV_CACHE_PRUNE.format(env=env_prefix(entry.env), uv=shlex.quote(uv)),
         timeout=900.0,
         check=False,
     )

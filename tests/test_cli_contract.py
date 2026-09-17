@@ -285,6 +285,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "name",
         "status",
         "reason",
+        "exit_code",
         "phase",
         "elapsed_s",
         "util",

@@ -297,7 +297,7 @@ def test_use_shared_is_an_override_of_the_spec_and_only_when_it_is_passed(
 
     monkeypatch.setattr("gpuc.control.cli.submit_file", capture)
     monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
-    monkeypatch.setattr("gpuc.control.cli.queue_placement", lambda *a, **k: placement_unknown())
+    monkeypatch.setattr("gpuc.control.cli.placement_after", lambda *a, **k: placement_unknown())
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
@@ -1456,10 +1456,9 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
     moved = "20260101-000000-aaaaaa"
 
     class Moved:
-        def host_cli(self, args: str, *, check: bool = True) -> object:
-            return type("Result", (), {"returncode": 0})()
-
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": moved, "status": "queued", "priority": 10}
             return {
                 "host": "local",
                 "gpus": [GPU],
@@ -1579,10 +1578,9 @@ def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     from gpuc.control.s3index import S3Index
 
     class Moved:
-        def host_cli(self, args: str, *, check: bool = True) -> object:
-            return type("Result", (), {"returncode": 0})()
-
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
             raise RemoteError("local", "status", "host is busy")
 
     main(["host", "add", "local", "--gpus", GPU])
@@ -1609,10 +1607,9 @@ def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Moved:
-        def host_cli(self, args: str, *, check: bool = True) -> object:
-            return type("Result", (), {"returncode": 0})()
-
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
             raise RemoteError("local", "status", "host is busy")
 
     main(["host", "add", "local", "--gpus", GPU])
@@ -1806,7 +1803,7 @@ def test_host_probe_shows_only_assigned_gpus_unless_all_gpus_is_asked_for(
     assert main(["host", "probe", "gpubox", "--all-gpus"]) == 0
     everything = capsys.readouterr().out
     assert "GPU-1111" in everything
-    assert "GPU-2222  NVIDIA A40  46068 MiB  (assigned)" in everything
+    assert "NVIDIA A40  46068 MiB  GPU-2222  (assigned)" in everything
 
     # Both cards are recorded either way, so `host set --gpus 0` can name one.
     assert set(load_registry().hosts["gpubox"].gpu_info) == {"GPU-1111", "GPU-2222"}
@@ -2091,3 +2088,23 @@ def test_an_existing_gpu_overlap_does_not_block_every_other_host_set(
     assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
     assert main(["host", "set", "gpubox", "--idle-min", "30"]) == 0
     assert fake_host.config is not None and fake_host.config["idle_minutes"] == 30.0
+
+
+def test_reorder_accepts_the_answer_of_a_host_build_from_before_the_verdict_shape(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older host prints `{"reordered": true}` and exits 0. The move happened,
+    and reporting failure would leave the mirror at the old priority."""
+
+    class Older:
+        def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": "20260101-000000-aaaaaa", "reordered": True}
+            raise RemoteError("local", "status", "host is busy")
+
+    register_host(name="local", gpus=GPU)
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Older())
+    capsys.readouterr()
+    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
+    assert main(argv) == 0
+    assert one_document(capsys)["priority"] == 5

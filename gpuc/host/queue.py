@@ -92,7 +92,8 @@ def reorder(job_id: str, priority: int) -> bool:
 
 
 def cancel(job_id: str) -> str:
-    """Request cancellation. Returns the resulting status.
+    """Request cancellation. Returns `cancelled` for a job that was queued,
+    `cancelling` for a running one, and a finished job's own status.
 
     A queued job is cancelled here and now, so cancel works with no dispatcher
     running. A running job gets a marker that the runner (and, as a backstop,
@@ -108,7 +109,7 @@ def cancel(job_id: str) -> str:
     if was_queued or state.status == "queued":
         jobs.update_state(job_id, status="cancelled", reason="cancelled", ended_at=jobs.utc_now())
         return "cancelled"
-    return state.status
+    return "cancelling"
 
 
 def is_cancelled(job_id: str) -> bool:

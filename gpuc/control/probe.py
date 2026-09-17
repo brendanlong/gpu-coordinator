@@ -108,7 +108,7 @@ OVERLAY_FS_TYPES = frozenset({"overlay", "overlayfs", "aufs"})
 """Filesystem types that mean "this is a container's throwaway upper layer"."""
 
 PYTHON_FLOOR = (3, 11)
-"""What the on-host package needs, as `bootstrap.PYTHON_FLOOR` spells it."""
+"""What the on-host package needs; bootstrap spells the same tuple for `uv`."""
 
 
 @dataclass
@@ -281,7 +281,7 @@ class ProbeReport:
                 mine = "  (assigned)" if everything and partly else ""
             else:
                 mine = "  (shared)" if self.shares(cells) else ""
-            lines.append(f"    [{index}] {uuid}  {name}{memory}{mine}")
+            lines.append(f"    [{index}] {name}{memory}  {uuid}{mine}")
         return lines
 
     @property

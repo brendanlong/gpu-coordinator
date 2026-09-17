@@ -127,7 +127,7 @@ def test_create_uses_the_spec_defaults(control_env: Path, ssh_key: Path) -> None
     assert created["image"] == "runpod/pytorch:test"
     assert created["disk_gb"] == 20
     assert created["cuda_min"] == "12.8"
-    assert created["env"] == {"HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    assert created["env"] is None  # the provider fills its own default
     assert created["name"].startswith("gpuc-")
 
 

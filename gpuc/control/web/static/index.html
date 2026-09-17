@@ -17,14 +17,15 @@
 </header>
 <main>
   <div id="notices" class="notices" role="status"></div>
+  <div id="errors" class="notices"></div>
   <section id="hosts" aria-labelledby="hosts-heading">
     <h2 id="hosts-heading">Hosts</h2>
     <div id="host-list" class="host-list"></div>
   </section>
-  <section id="config" aria-labelledby="config-heading">
-    <h2 id="config-heading">Config</h2>
+  <details id="config">
+    <summary><h2>Config</h2></summary>
     <div id="config-body"></div>
-  </section>
+  </details>
 </main>
 <aside id="log-panel" class="log-panel" hidden aria-labelledby="log-title">
   <header>

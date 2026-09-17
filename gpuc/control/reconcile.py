@@ -37,15 +37,18 @@ from gpuc.control.config import (
     ConfigError,
     DesiredHost,
     HostEntry,
+    Reporter,
     Settings,
     config_dir,
-    forget_host,
+    forget_host_locked,
     load_desired,
     load_registry,
+    parse_timestamp,
     read_desired,
     state_dir,
     state_lock,
     transport_for,
+    utc_now,
     write_desired,
 )
 from gpuc.control.providers.base import Pod, Provider, ProviderError
@@ -67,14 +70,9 @@ WATCH_GAP_MINUTES = 5.0
 in between: suspended, rebooted, or the timer disabled. Comfortably longer than
 the 60 s timer interval, and far shorter than the silence a host is allowed."""
 
-PROVISIONING_MINUTES = CEILING_MINUTES
-"""How long a pod another machine has just created may have no config on it
-yet. Only ever used to word a report: nothing here acts on it."""
-
 HostLiveness = Callable[[DesiredHost, "HostEntry | None", Settings], Liveness]
 PodQuestion = Callable[[Pod, Settings], PodAnswer]
 
-Reporter = Callable[[str], None]
 
 SERVICE_NAME = "gpuc-reconcile.service"
 TIMER_NAME = "gpuc-reconcile.timer"
@@ -137,7 +135,7 @@ def _last_watch() -> tuple[datetime | None, datetime | None]:
         return None, None
     if not isinstance(document, dict):
         return None, None
-    return _parse(document.get("pass_at")), _parse(document.get("since"))
+    return parse_timestamp(document.get("pass_at")), parse_timestamp(document.get("since"))
 
 
 def _write_watch(now: datetime, since: datetime) -> None:
@@ -210,18 +208,8 @@ class ReconcileResult:
         }
 
 
-def _parse(stamp: str | None) -> datetime | None:
-    if not stamp:
-        return None
-    try:
-        parsed = datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
 def _age_hours(pod: Pod, desired: DesiredHost | None) -> float | None:
-    created = pod.created_at or _parse(desired.created_at if desired else None)
+    created = pod.created_at or parse_timestamp(desired.created_at if desired else None)
     if created is None:
         return None
     return (datetime.now(UTC) - created).total_seconds() / 3600.0
@@ -248,21 +236,25 @@ def _describe_lost_jobs(host: str, settings: Settings) -> str:
     )
 
 
-def _forget(name: str, pod_id: str, report: Reporter) -> None:
-    """Drop every local trace of a host, taking the state lock for just that.
+def _terminate_and_forget(
+    provider: Provider,
+    pod: Pod,
+    host: DesiredHost,
+    why: str,
+    report: Reporter,
+    result: ReconcileResult,
+) -> bool:
+    """Terminate, and forget the host only once the pod is confirmed gone.
 
-    The lock is per mutation, never held across the provider and ssh calls that
-    decide *whether* to mutate: a terminate polls for up to five minutes, and a
-    concurrent `gpuc submit --runpod` gives up on the lock after two.
-
-    `pod_id` keeps this to the pod it is about: a registry entry under the same
-    name that belongs to some other host of this machine's is left alone.
+    While a terminate is failing, the record is what keeps retrying it (and
+    what still tells `gpuc logs` where that host's jobs ran).
     """
-    try:
-        with state_lock():
-            forget_host(name, pod_id)
-    except ConfigError as exc:
-        report(f"WARNING: could not remove host {name} from the registry: {exc}")
+    if not _terminate(provider, pod, why, report, result):
+        return False
+    result.terminated.append(host.name)
+    forget_host_locked(host.name, host.pod_id, report)
+    result.forgotten.append(host.name)
+    return True
 
 
 def _terminate(
@@ -452,7 +444,7 @@ def _reconcile_desired(
                 continue
         if pod is None or pod.status == "TERMINATED":
             report(f"{host.name} ({host.pod_id}): {_describe_lost_jobs(host.name, settings)}")
-            _forget(host.name, host.pod_id, report)
+            forget_host_locked(host.name, host.pod_id, report)
             result.forgotten.append(host.name)
             continue
 
@@ -461,30 +453,26 @@ def _reconcile_desired(
             # Only forget a host whose pod is confirmed gone: while a terminate
             # is failing, the record is what keeps retrying it (and what still
             # tells `gpuc logs` where that host's jobs ran).
-            if _terminate(
+            _terminate_and_forget(
                 provider,
                 pod,
+                host,
                 f"host {host.name} is {age_h:.1f} h old, past its {host.ttl_hours:g} h TTL",
                 report,
                 result,
-            ):
-                result.terminated.append(host.name)
-                _forget(host.name, host.pod_id, report)
-                result.forgotten.append(host.name)
+            )
             continue
 
-        ceiling = _parse(host.ceiling_at)
+        ceiling = parse_timestamp(host.ceiling_at)
         if not host.bootstrapped and ceiling is not None and datetime.now(UTC) > ceiling:
-            if _terminate(
+            _terminate_and_forget(
                 provider,
                 pod,
+                host,
                 f"host {host.name} never bootstrapped by its ceiling at {host.ceiling_at}",
                 report,
                 result,
-            ):
-                result.terminated.append(host.name)
-                _forget(host.name, host.pod_id, report)
-                result.forgotten.append(host.name)
+            )
             continue
 
         if host.bootstrapped and _reap_if_silent(
@@ -554,12 +542,7 @@ def _reap_if_silent(
         f"billing ${pod.cost_usd_hr:.3f}/h"
     )
     report(f"DEAD DISPATCHER: {why}")
-    if _terminate(provider, pod, why, report, result):
-        result.terminated.append(host.name)
-        _forget(host.name, host.pod_id, report)
-        result.forgotten.append(host.name)
-        return True
-    return False
+    return _terminate_and_forget(provider, pod, host, why, report, result)
 
 
 def _remember_seen(host: DesiredHost, report: Reporter) -> None:
@@ -576,17 +559,13 @@ def _remember_seen(host: DesiredHost, report: Reporter) -> None:
                 # Another session forgot this host while we were probing it.
                 # Writing the record back would resurrect a pod nothing owns.
                 return
-            write_desired(current.model_copy(update={"last_seen_at": _now_text()}))
+            write_desired(current.model_copy(update={"last_seen_at": utc_now()}))
     except (ConfigError, OSError) as exc:
         report(f"WARNING: could not record that {host.name} is alive: {exc}")
 
 
-def _now_text() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
-
-
 def _minutes_since(stamp: str | None) -> float | None:
-    parsed = _parse(stamp)
+    parsed = parse_timestamp(stamp)
     if parsed is None:
         return None
     return (datetime.now(UTC) - parsed).total_seconds() / 60.0
@@ -615,7 +594,7 @@ def _report_unclaimed(
         result.unclaimed.append(pod.name)
         age = pod.age
         minutes = None if age is None else age.total_seconds() / 60.0
-        if minutes is not None and minutes < PROVISIONING_MINUTES:
+        if minutes is not None and minutes < CEILING_MINUTES:
             report(
                 f"{pod.name} ({pod.id}) is {minutes:.0f} min old and nothing here wants it yet "
                 f"({answer.detail}); another session may still be provisioning it"
@@ -653,11 +632,6 @@ def run_loop(
     return last
 
 
-def gpuc_argv() -> str:
-    """An absolute command line for `gpuc reconcile --once`, for systemd."""
-    return gpuc_command(["reconcile", "--once"])
-
-
 def unit_files(interval_s: float = DEFAULT_INTERVAL_S) -> dict[str, str]:
     service = f"""[Unit]
 Description=gpuc reconcile: terminate leaked or expired GPU pods
@@ -672,7 +646,7 @@ Type=oneshot
 Environment=GPUC_CONFIG_DIR={config_dir()}
 Environment=GPUC_STATE_DIR={state_dir()}
 EnvironmentFile=-{config_dir()}/env
-ExecStart={gpuc_argv()}
+ExecStart={gpuc_command(["reconcile", "--once"])}
 """
     timer = f"""[Unit]
 Description=Run gpuc reconcile every {interval_s:.0f}s
