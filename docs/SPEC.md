@@ -132,9 +132,8 @@ destinations. Adding another of either changes nothing else in this document.
   expensive machine is not kept alive for a bucket we cannot reach. A job
   whose outputs are not confirmed backed up is never deleted automatically on
   a host that persists.
-- A job may set a wall-clock limit. Nothing else judges a running job: once
-  the GPU check has passed, a job that misuses its cards is the job's
-  problem, and never a reason to stop the host.
+- A job may set a wall-clock limit and will be terminated if it exceeds that
+  time.
 - Cancel, preempt and every other kill reap the job's whole process tree,
   using a cgroup where the host provides one and a process group otherwise.
 - A finished or lost job can be resubmitted from the mirror as a new job on
@@ -195,8 +194,8 @@ destinations. Adding another of either changes nothing else in this document.
 - A guaranteed rental teardown. A rental ends itself when idle; one whose
   provisioning client died before terminating it, or whose dispatcher dies
   after handoff, bills until a person ends it.
-- Watching a running job for misuse of its GPU, or pausing a host because
-  of it.
+- Detecting whether a running job is using its GPU efficiently, or pausing a
+  host because of it.
 - Spending limits across rentals.
 - Automatic re-placement of a job after it has started running: a failure at
   that point is more likely the job's than the host's.
