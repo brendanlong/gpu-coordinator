@@ -14,8 +14,7 @@ contract the code keeps is [ARCHITECTURE.md](ARCHITECTURE.md).
 - An ssh key that reaches your hosts. Point `ssh_key` in `config.toml` at the
   private key; its `.pub` is what gets uploaded to the RunPod account before the
   first pod is created. Unset means ssh picks its own key.
-- `systemd --user`, only if you want `gpuc reconcile` on a timer or the web
-  dashboard as a service.
+- `systemd --user`, only if you want the web dashboard as a service.
 
 **Each host**
 
@@ -55,13 +54,15 @@ gpuc config show      # the effective settings, file or not
 | key | default | meaning |
 | --- | --- | --- |
 | `s3_bucket` | unset | the mirror's bucket. Unset means no mirror at all, so no `gpuc requeue` and no `gpuc logs` after a host is gone |
-| `runpod_pod_prefix` | `"gpuc-"` | only pods whose name starts with this are ever read, reaped or terminated |
+| `runpod_pod_prefix` | `"gpuc-"` | only pods whose name starts with this are ever read or terminated |
 | `max_pods` | `3` | refuse to create a pod past this count (account-wide, every pod with the prefix) |
 | `max_total_usd_per_hour` | `3.0` | the same for the summed hourly cost |
 | `ssh_key` | unset | private key for ssh and rsync; its `.pub` goes to the RunPod account |
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | default pod image (`--image` per submit) |
 | `disk_gb` | `50` | default container disk (`--disk` per submit) |
-| `dead_dispatcher_minutes` | `30.0` | how long an ephemeral host may be silent, with nothing running, before `gpuc reconcile` terminates it ([usage.md](usage.md#reconcile)). Bootstrapping a pod takes about ten minutes and nothing beats until it is done, so much below 30 shoots down a pod another machine is still setting up |
+
+A `dead_dispatcher_minutes` key left over from a build that had a client-side
+reaper is ignored.
 
 **`s3_bucket` and `--s3-prefix` are two different mirrors.** `s3_bucket` is
 written by *this machine*: job specs to `s3://<bucket>/gpuc/specs/<job-id>.json`
@@ -96,15 +97,16 @@ journalctl --user -u gpuc-web.service -f
 ```
 
 The unit pins `GPUC_CONFIG_DIR` and `GPUC_STATE_DIR` to this user's
-directories and reads `RUNPOD_API_KEY` from the same
-`~/.config/gpu-coordinator/env` file the [reconcile timer](#the-reconcile-timer) uses, so RunPod hosts show their
-pod line; without it they still render. It restarts on failure, and it needs
-`loginctl enable-linger` to outlive your session, exactly like the timer.
-`--install` refuses nothing: with no password set the service starts, logs
-the `gpuc web set-password` line and exits, systemd retries it five times
-over five minutes and then leaves it `failed`, and `--install` says so.
-Disabling it again is `systemctl --user disable --now gpuc-web.service` and
-removing the unit file, exactly as for the timer below.
+directories and reads `RUNPOD_API_KEY` from `~/.config/gpu-coordinator/env`
+if that file exists, so RunPod hosts show their pod line; without it they
+still render. Create it as
+`install -m 600 /dev/null ~/.config/gpu-coordinator/env` and add one
+`RUNPOD_API_KEY=...` line; `--install` does not create it. The service
+restarts on failure, and it needs `loginctl enable-linger` to outlive your
+session. `--install` refuses nothing: with no password set the service
+starts, logs the `gpuc web set-password` line and exits, systemd retries it
+five times over five minutes and then leaves it `failed`, and `--install`
+says so. Disabling it again is under [teardown](#teardown) below.
 
 ## Credentials
 
@@ -127,10 +129,9 @@ an `s3_prefix`, with the region from `AWS_REGION`, `AWS_DEFAULT_REGION`, else
 `us-east-1`.
 
 **RunPod.** Export `RUNPOD_API_KEY`. `gpuc submit --runpod`, `gpuc pods` and
-`gpuc reconcile` check it first and exit 1 with one line if it is missing
-(`gpuc reconcile --install` and `gpuc web serve --install`, which only write
-unit files, do not). The key is
-delivered to each pod as `~/.gpuc/secrets/runpod` so it can terminate itself.
+`gpuc host add --pod` check it first and exit 1 with one line if it is
+missing. The key is delivered to each pod as `~/.gpuc/secrets/runpod` so it
+can terminate itself.
 
 **Hugging Face.** Put `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) in the job's
 `secrets:`. The sync preflight runs `hf auth whoami` with it and fails the job
@@ -190,8 +191,9 @@ gpuc host add rented --pod <pod-id>        # its address from the provider, its 
 
 That is what makes a pod the laptop queued usable from the desktop: the pod owns
 its `config.json` — cards, mirror, idle timer, and the record of what it was rented as —
-so nothing about the machine that created it matters afterwards. It is also
-recorded in `desired/` here, so this machine's `gpuc reconcile` watches it.
+so nothing about the machine that created it matters afterwards. A pod nobody
+has bootstrapped has no dispatcher and so will never end itself; `host add`
+says so, and `gpuc host bootstrap <name>` gives it one.
 
 The address is the top two rows, kept here (`here <- …`) and applied to the
 host by the next `gpuc host bootstrap`. Every other flag is the host's own
@@ -201,7 +203,7 @@ host has to answer) and reports each change as `host <- …`.
 | flag (`host add`, and `host set` to change one) | default | meaning |
 | --- | --- | --- |
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
-| `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting instead of naming an ssh target; the provider says where it is. Needs `RUNPOD_API_KEY`. Add `--gpuc-home` if that pod keeps gpuc somewhere other than `$HOME/.gpuc` — `gpuc reconcile` only ever looks there, so such a pod is reported unclaimed rather than taken on |
+| `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting instead of naming an ssh target; the provider says where it is. Needs `RUNPOD_API_KEY`. Add `--gpuc-home` if that pod keeps gpuc somewhere other than `$HOME/.gpuc` |
 | `--gpus 2,3` or `--gpus GPU-8064…,3` | none | nvidia-smi **indices**, UUIDs, or a mix, stored as typed; the host re-resolves indices to UUIDs on every dispatch pass, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is `UNAVAILABLE` and jobs wait for it |
 | `--shared-gpus 4,5` | none | cards gpuc may **borrow** but does not own, spelled like `--gpus` and never overlapping it; see [shared GPUs](usage.md#shared-gpus) |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
@@ -274,42 +276,6 @@ gpuc host bootstrap gpubox
    `requeue` re-reads the spec from the S3 mirror, so this needs `s3_bucket`
    set; without one, submit the job file again by hand.
 
-## The reconcile timer
-
-`gpuc reconcile` is the safety net for the states a pod cannot get itself out
-of -- it never bootstrapped, or its dispatcher died -- and it only runs when
-something runs it. (A healthy pod needs
-none of this: it drains and terminates itself once its queue has been empty for
-`--idle-min`.) Install it as a `systemd --user` timer
-(60 s by default, `--interval` to change it):
-
-```sh
-gpuc reconcile --install     # writes the units; deliberately does not enable them
-install -m 600 /dev/null ~/.config/gpu-coordinator/env
-echo RUNPOD_API_KEY=... >> ~/.config/gpu-coordinator/env
-systemctl --user daemon-reload
-systemctl --user enable --now gpuc-reconcile.timer
-systemctl --user list-timers gpuc-reconcile.timer
-journalctl --user -u gpuc-reconcile.service -f
-```
-
-The service runs `gpuc reconcile --once` with `GPUC_CONFIG_DIR` and
-`GPUC_STATE_DIR` pinned to this user's directories and reads `RUNPOD_API_KEY`
-from that env file, which `--install` does not create. What it terminates, and
-what it refuses to touch, is in [usage.md](usage.md#reconcile).
-
-**On more than one machine is fine.** Each pass asks every pod with your prefix
-what it is, and a pod holding a gpuc config is left alone whichever machine
-created it — so the desktop can watch the pod the laptop queued, with the laptop
-shut. To *watch* a pod (rather than only report it) that machine needs an ssh
-key the pod accepts, and RunPod injects the account's keys when the pod is
-**created**: a key you register later is not on a pod that already exists. So
-put both machines' keys on the account before you provision, or accept that each
-pod is watched from the machines whose keys it was born with. Nothing is lost
-either way — a pod this machine cannot place is reported every pass and never
-terminated. To drive a pod as well as watch it, adopt it: `gpuc host add <name>
---pod <pod-id>`.
-
 ## Upgrading
 
 A host's package is a *copy*, not a link, so upgrading here does not upgrade it.
@@ -338,7 +304,7 @@ come apart.
 
 `--all` takes every registered host in turn, including ephemeral ones. A host
 that fails does not stop the others — a pod that has already gone away is the
-ordinary case, and `gpuc reconcile --once` is what forgets it — so the run ends
+ordinary case, and `gpuc host remove <name>` is what forgets it — so the run ends
 with a tally naming each failure and exits 1, while the hosts that did upgrade
 stay upgraded. The tally also counts any host entry this build could not read
 (skipped with a warning), because that host was not upgraded either.
@@ -400,19 +366,16 @@ gpuc cancel <job-id>                            # and end a job you are not wait
 (retrying unconfirmed outputs, mirroring every job's log and state) and
 terminates on its next pass with nothing running. Nothing stops a pod out from
 under a running job: cancel the job first if you do not want to wait for it.
-For a pod that has stopped answering ssh
-altogether, the reaper gets it after `dead_dispatcher_minutes`; for one that
-answers nothing at all and belongs to nobody, the RunPod console is the tool.
+**Nothing on this machine watches a pod after it is set up.** One whose
+dispatcher has died, or that has stopped answering ssh altogether, bills until
+you end it: `gpuc pods` shows it, with its hourly cost and how long ago its
+dispatcher last beat, and the RunPod console terminates it. Check `gpuc pods`
+before you walk away.
 
-**Disabling the timer, or the dashboard service.**
+**Disabling the dashboard service.**
 
 ```sh
-systemctl --user disable --now gpuc-reconcile.timer
-rm ~/.config/systemd/user/gpuc-reconcile.{timer,service}
-systemctl --user disable --now gpuc-web.service      # if you installed the dashboard
+systemctl --user disable --now gpuc-web.service
 rm ~/.config/systemd/user/gpuc-web.service
 systemctl --user daemon-reload
 ```
-
-With the timer off, nothing reaps a leaked pod: run `gpuc reconcile --once` by
-hand, and check `gpuc pods` before you walk away.

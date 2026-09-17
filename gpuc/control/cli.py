@@ -15,7 +15,6 @@ from typing import Any
 
 from gpuc.control import jsonout, rented
 from gpuc.control import pods as pods_mod
-from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
 from gpuc.control import version as version_mod
@@ -299,39 +298,15 @@ def cmd_host_add(args: argparse.Namespace) -> int:
             )
         registry.put(entry)
     lines = [_added_line(entry, connection, args.name)]
-    if args.pod:
-        lines.append(_watch_pod(entry, settings, bootstrapped=connection.adopted))
+    if args.pod and not connection.adopted:
+        # A pod nobody has set up has no dispatcher, so nothing will ever idle
+        # it out: it bills until bootstrap gives it one or a person ends it.
+        lines.append(
+            f"  nothing has bootstrapped this pod, so nothing on it will ever terminate it: "
+            f"`gpuc host bootstrap {entry.name}` gives it a dispatcher that does"
+        )
     print("\n".join(lines))
     return 0
-
-
-def _watch_pod(entry: HostEntry, settings: Settings, bootstrapped: bool) -> str:
-    """Cache what an adopted pod said in `desired/`, so this machine watches it too.
-
-    `gpuc reconcile` here would ask the pod and reach the same record on its
-    next pass; writing it now is what makes `gpuc pods` say straight away that
-    this pod is wanted, and what keeps it watched if it stops answering before
-    that pass.
-
-    Watching a pod means being willing to terminate it, so a pod nobody has
-    installed gpuc on is told the deadline it has just been given: it has no
-    dispatcher to beat, so the silence rule starts now.
-    """
-    record = rented.desired_from_entry(entry)
-    try:
-        if not rented.remember(record):
-            return f"desired/{record.name}.json is already here; left as it is"
-    except (ConfigError, OSError) as exc:
-        return f"WARNING: could not record {record.name} in desired/: {exc}"
-    line = f"recorded it in desired/{record.name}.json, so `gpuc reconcile` here watches it too"
-    if bootstrapped:
-        return line
-    return (
-        f"{line}\n"
-        f"  nothing has bootstrapped this pod, so it has no dispatcher to beat: "
-        f"`gpuc reconcile` here terminates it in {settings.dead_dispatcher_minutes:.0f} min "
-        f"unless `gpuc host bootstrap {entry.name}` gets there first"
-    )
 
 
 def _refuse_a_taken_name(current: HostEntry | None, entry: HostEntry, asked_for: str) -> None:
@@ -574,7 +549,7 @@ def bootstrap_tally(total: int, done: int, failed: Sequence[HostEntry], skipped:
         if any(entry.ephemeral for entry in failed):
             lines.append(
                 "an ephemeral host whose pod is already gone is forgotten by "
-                "`gpuc reconcile --once`"
+                "`gpuc host remove <name>`"
             )
     if skipped:
         lines.append(f"{skipped} host(s) in the registry could not be read (warnings above)")
@@ -1318,34 +1293,6 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     return _queued(result, args, entry, settings, requeued_from=args.job_id)
 
 
-def cmd_reconcile(args: argparse.Namespace) -> int:
-    if args.json and (args.install or not args.once):
-        raise UsageError(
-            "reconcile --json needs --once and nothing else: the loop and --install have "
-            "no document to print, only a running commentary."
-        )
-    if args.install:
-        reconcile_mod.install(args.interval)
-        return EXIT_OK
-    settings = load_settings()
-    provider = make_provider(settings)
-    if args.once:
-        # Every pod it judges is a line of commentary, and under --json stdout
-        # belongs to the document.
-        result = reconcile_mod.reconcile_once(settings, provider, report=reporter(args))
-        if args.json:
-            jsonout.emit(result.document())
-        else:
-            print(result.render())
-        return EXIT_ERROR if result.errors else EXIT_OK
-    print(f"reconciling every {args.interval:.0f}s; Ctrl-C to stop", file=sys.stderr)
-    try:
-        reconcile_mod.run_loop(settings, provider, interval_s=args.interval)
-    except KeyboardInterrupt:
-        print("stopped", file=sys.stderr)
-    return EXIT_OK
-
-
 def cmd_pods(args: argparse.Namespace) -> int:
     settings = load_settings()
     view = pods_mod.gather(settings, make_provider(settings), heartbeats=not args.no_heartbeat)
@@ -1807,25 +1754,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
-    reconcile = sub.add_parser(
-        "reconcile", help="terminate leaked or expired pods; --install for a systemd timer"
+    pods = sub.add_parser(
+        "pods", help="every pod with our prefix: cost, util, age, which host it is here"
     )
-    reconcile.add_argument("--once", action="store_true", help="one pass, then exit")
-    reconcile.add_argument(
-        "--interval",
-        type=float,
-        default=reconcile_mod.DEFAULT_INTERVAL_S,
-        metavar="SECONDS",
-        help=f"seconds between passes of the loop, and of the installed timer "
-        f"(default {reconcile_mod.DEFAULT_INTERVAL_S:.0f})",
-    )
-    reconcile.add_argument(
-        "--install", action="store_true", help="write (but do not enable) systemd --user units"
-    )
-    add_json_flag(reconcile, f"{JSON_HELP}; needs --once")
-    reconcile.set_defaults(func=cmd_reconcile)
-
-    pods = sub.add_parser("pods", help="every pod with our prefix, cost, util, age, desired?")
     pods.add_argument(
         "--no-heartbeat", action="store_true", help="skip the per-pod dispatcher ssh check"
     )
@@ -1953,11 +1884,9 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def wants_runpod(args: argparse.Namespace) -> bool:
-    if getattr(args, "install", False):
-        return False  # `reconcile --install` only writes unit files
     if getattr(args, "pod", None):
         return True  # `gpuc host add --pod` asks the provider where that pod is
-    return bool(getattr(args, "runpod", False)) or args.command in ("pods", "reconcile")
+    return bool(getattr(args, "runpod", False)) or args.command == "pods"
 
 
 def first_run_note() -> None:
@@ -1999,7 +1928,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return failed(
             args,
             "RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc host add --pod`, `gpuc pods` or `gpuc reconcile`",
+            "`gpuc host add --pod` or `gpuc pods`",
             EXIT_ERROR,
         )
     if args.command not in ("config", "skill"):

@@ -1,8 +1,7 @@
 """`gpuc web serve --install`: a `systemd --user` service for the dashboard.
 
-Written, never enabled, like `reconcile --install`: turning on something that
-listens on a port is the user's call, and the printed lines are the whole of
-it.
+Written, never enabled: turning on something that listens on a port is the
+user's call, and the printed lines are the whole of it.
 """
 
 from __future__ import annotations

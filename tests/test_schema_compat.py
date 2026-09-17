@@ -20,7 +20,6 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.config import (
-    DesiredHost,
     HostEntry,
     Registry,
     Settings,
@@ -258,8 +257,13 @@ def test_an_unknown_key_never_reaches_a_model() -> None:
     assert settings.s3_bucket is None and settings.max_pods == 3
     index = IndexEntry.model_validate({"job_id": "j", "host": None, "attempt": None, "x": 1})
     assert (index.host, index.attempt) == ("", 1)
-    desired = DesiredHost.model_validate({"name": "pod", "offer": None, "idle_minutes": None})
-    assert desired.offer.name == ""
+
+
+def test_settings_a_build_with_the_reaper_wrote_still_load() -> None:
+    """`dead_dispatcher_minutes` was a key until the client-side reaper went;
+    a config.toml that still has it is not an error."""
+    settings = Settings.model_validate({"dead_dispatcher_minutes": 30.0, "disk_gb": 20})
+    assert settings.disk_gb == 20
 
 
 # -- the host side, which has no pydantic to lean on --------------------------

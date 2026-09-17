@@ -238,7 +238,7 @@ def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
     assert "missing" in (view.error or "")
     text = render(view)
     assert "POD GONE" in text
-    assert "gpuc reconcile --once" in text
+    assert "gpuc host remove gpuc-e2e-1" in text
     assert "host probe" not in text
 
 
@@ -253,7 +253,7 @@ def test_a_terminated_pod_reads_as_gone_too() -> None:
     view = gather(_runpod_entry(), provider=cast(Any, _GoneProvider(terminated)))
     assert view.pod_gone
     assert "TERMINATED" in render(view)
-    assert "gpuc reconcile --once" in (view.error or "")
+    assert "gpuc host remove gpuc-e2e-1" in (view.error or "")
 
 
 # -- leftover workdirs --------------------------------------------------------

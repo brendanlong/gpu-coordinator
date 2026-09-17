@@ -440,7 +440,7 @@ def gather(
         status = "missing" if view.pod is None else view.pod.status
         view.error = (
             f"pod {entry.pod_id} is {status}; the registry entry is stale. "
-            f"Run `gpuc reconcile --once` to forget it."
+            f"Run `gpuc host remove {entry.name}` to forget it."
         )
         return view
     try:
@@ -470,9 +470,9 @@ def gather(
     # Into the one numbering table, because it is what names a card everywhere
     # it is mentioned -- including `gpu=4` on the line of a job that borrowed it.
     view.indices.update({c.uuid: c.index for c in view.shared if c.index is not None})
-    # Validated like `reconcile.probe_liveness` does: a host on another build
-    # could answer with a string here, and formatting it would take out the
-    # whole `gpuc status`, not just this host's line.
+    # Validated rather than trusted: a host on another build could answer with
+    # a string here, and formatting it would take out the whole `gpuc status`,
+    # not just this host's line.
     view.heartbeat_age_s = _as_float(payload.get("dispatcher_heartbeat_age_s"))
     view.draining = bool(payload.get("draining"))
     view.queue, view.running, view.finished = job_views(payload)

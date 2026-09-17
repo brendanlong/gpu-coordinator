@@ -16,7 +16,11 @@ path.
 
 Non-goals for the prototype: Vast, multi-node, spot, S3 as the
 authoritative queue (host is authoritative, S3 is the mirror; `gpuc requeue`
-resubmits from the S3 spec if a host dies).
+resubmits from the S3 spec if a host dies), and a guaranteed rental teardown.
+Nothing on a client watches a pod after handoff: a rental whose dispatcher
+dies after it was set up, or whose provisioning client was killed uncleanly
+mid-create, bills until a person ends it, and `gpuc pods` is how a person sees
+that.
 
 ## Package layout
 
@@ -47,8 +51,7 @@ gpuc/
     status.py      # gather a host's status, render it, project queue start times
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
     provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse, caps
-    reconcile.py   # the reaper: desired state vs provider, dead dispatcher, unclaimed pods
-    rented.py      # a pod is its own record: read `config.json` off any prefixed pod
+    rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
     config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
     connect.py     # `host add` / `host set`: read or write the host's own config.json
@@ -63,7 +66,7 @@ gpuc/
     version.py     # this build's commit, and comparing it with a host's
     jsonout.py     # the `--json` rules
     skill.py       # `gpuc skill`: the agent guide, from the wheel or the checkout
-    systemd.py     # what `reconcile --install` and `web serve --install` share
+    systemd.py     # what `web serve --install` needs of systemd: unit dir, ExecStart, write
     web/           # `gpuc web`: stdlib http.server, bcrypt login, a static page over the same documents
     providers/
       base.py      # Provider interface: offers(constraints), create, get, logs, terminate, list
@@ -574,22 +577,23 @@ hold to, whatever the flags:
 
 - `gpuc` runs with no config file at all: every setting has a default, there is
   simply no S3 mirror, and one line on stderr points at `gpuc config init`.
-- Anything that talks to RunPod (`--runpod`, `pods`, `reconcile`) checks
+- Anything that talks to RunPod (`--runpod`, `pods`, `host add --pod`) checks
   `RUNPOD_API_KEY` first and exits 1 with a single line if it is unset, before
-  mirroring a spec or picking a host. `reconcile --install` does not, since it
-  only writes unit files.
+  mirroring a spec or picking a host.
 - A host name is looked up locally; `logs`, `cancel`, `preempt`, `reorder`,
   `estimate` and `requeue` fall back to the job index and then to asking each host, and an id nothing
   knows is exit 4, never a guess.
-- Nothing runs in the background on this side except the optional
-  `gpuc reconcile` timer and, if installed, the web dashboard's service.
+- Nothing runs in the background on this side except, if installed, the web
+  dashboard's service.
 
-Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`,
-`desired/<host>.json` for ephemeral hosts, `jobs/` (the local job index),
-`known_hosts` plus `known_hosts.d/<pod>`, `watch.json` (the reconcile clock),
-and `state.lock`, which serialises every registry read-modify-write across
-concurrent sessions. `Settings` (`~/.config/gpu-coordinator/config.toml`) is
-all optional and every key is in [setup.md](setup.md#settings).
+Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`, `jobs/`
+(the local job index), `known_hosts` plus `known_hosts.d/<pod>`, and
+`state.lock`, which serialises every registry read-modify-write across
+concurrent sessions. A `desired/` directory or `watch.json` left there by a
+build that had a client-side reaper is ignored. `Settings`
+(`~/.config/gpu-coordinator/config.toml`) is all optional and every key is in
+[setup.md](setup.md#settings); `dead_dispatcher_minutes`, the reaper's key,
+is ignored like any other unknown one.
 
 ## Shared state is read tolerantly, always
 
@@ -605,7 +609,7 @@ file the two halves share obeys the same two rules, on both sides:
 
 Control side that means `extra="ignore"`, a default on every field, and a
 `model_validator(mode="before")` that consults the annotation (`HostEntry`,
-`HostCache`, `Registry`, `DesiredHost`, `Settings`, `IndexEntry`, `Offer`). The
+`HostCache`, `Registry`, `Settings`, `IndexEntry`, `Offer`). The
 host config a registry entry caches is kept **verbatim** on top of that, so a
 key some newer build wrote survives a round trip through this one. Host side, with
 no pydantic, the same rules are spelled out in `jobs.from_dict` for
@@ -875,106 +879,28 @@ for a host that came back empty is in setup.md.
 ## Provisioning flow (`gpuc submit --runpod`)
 
 1. Write the spec to S3 (`s3://bucket/gpuc/specs/<jobid>.json`) first.
-2. Unless `--no-reuse`: pick an existing desired host whose recorded offer
-   still satisfies the constraints, which owns enough cards, whose pod the
-   provider reports RUNNING, whose dispatcher heartbeat is fresh, and which is
-   not draining; enqueue there. A registered pod the provider no
-   longer has is forgotten rather than dialled.
+2. Unless `--no-reuse`: pick an existing registered pod whose own config
+   records an offer that still satisfies the constraints, which owns enough
+   cards, whose pod the provider reports RUNNING, whose dispatcher heartbeat
+   is fresh, and which is not draining; enqueue there. A registered pod the
+   provider no longer has is forgotten rather than dialled.
 3. Else for each offer in order: check caps -- offers are price-ascending, so
    a cap this one trips every later one trips too, and `CapsExceeded` aborts
-   the whole submit instead of walking the list; then `create`; record
-   `desired/<host>.json` with pod id, offer, created_at, ceiling; poll
-   `get` until RUNNING **and** `ssh.direct` present; poll SSH until a
-   trivial command succeeds; run bootstrap (which runs host health and
-   starts the dispatcher); deliver the RunPod key as
-   `~/.gpuc/secrets/runpod` (0600) for self-terminate. Enqueue. On any
-   broken-host signature in `logs`, or the 15-minute ceiling, or a health
-   failure: `terminate`, wait for TERMINATED, try the next offer. The
-   `desired/` record is removed only once the terminate is *confirmed*; a
-   terminate that failed leaves the record (and the registry entry) in place,
-   because it is the only thing that makes the reaper retry a pod that is
-   still billing.
+   the whole submit instead of walking the list; then `create`, both under
+   the state lock; poll `get` until RUNNING **and** `ssh.direct` present;
+   poll SSH until a trivial command succeeds; write the pod its config,
+   whose `provider` block carries the offer and `created_at` (`rented.py`:
+   the pod is its own record, and this machine keeps none); run bootstrap
+   (which runs host health and starts the dispatcher); deliver the RunPod
+   key as `~/.gpuc/secrets/runpod` (0600) for self-terminate. Enqueue. On
+   any broken-host signature in `logs`, or the 15-minute ceiling, or a
+   health failure -- or a Ctrl-C, or a bug: `terminate`, wait for
+   TERMINATED, try the next offer. A terminate that failed is reported
+   loudly and leaves the registry entry in place, so `gpuc status` and
+   `gpuc pods` keep showing the pod; nothing retries it.
 4. The pod-scoped key delivered as `~/.gpuc/secrets/runpod` does terminate
    its own pod; `tests/test_runpod_e2e.py` proves it on every opt-in run.
-
-## Reconcile loop
-
-Every 60 s: the state lock is taken to *read* `desired/` and then for each
-local mutation, never across the provider and ssh calls in between -- a
-terminate polls for up to five minutes and a concurrent `gpuc submit --runpod`
-gives up on the lock after two minutes, and a create that cannot write its `desired/`
-record is a leaked, billing pod. Each mutation re-reads the record it is about
-to change. For each `desired/` host, `get` its pod; if
-missing or TERMINATED, mark the desired entry gone and note any jobs that
-were running there (for `requeue`).
-
-**The pod is the record** (`rented.py`). `desired/<host>.json` exists only on
-the machine that ran `gpuc submit --runpod`, so a reaper that trusts it alone
-terminates another machine's healthy pod at the ceiling. A pod therefore carries
-its own copy: `config.json` -- the file the host owns -- holds `offer`,
-`created_at` and `bootstrapped_at` under the `provider` block that already named
-its `kind` and `pod_id`. Every pass asks each prefixed pod it has no record of
-(one ssh session: expand gpuc home, then read `config.json`), and a pod holding
-a gpuc config is *ours*
-whoever created it: it is judged by the rules above, and the answer is cached in
-this machine's `desired/`, which is what keeps it watched on a later pass that
-cannot reach it. So the timer is a watchdog role that any machine holding the
-API key can run, and none of them is special.
-
-**Nothing is terminated for the absence of a record**: a prefixed pod this
-machine cannot get an answer out of is reported every pass and left running
-(`reconcile.py`'s module docstring has the reasoning; the user-facing rule is
-[usage.md](usage.md#reconcile)).
-
-**Adoption is permanent and one-way**, and this is the sharpest edge in the
-design. After one successful read, this machine holds a `desired/` record for
-that pod for as long as the pod exists -- nothing evicts it but a terminate or
-the pod going away -- so it will terminate that pod after
-`dead_dispatcher_minutes` of it not answering *this* machine, with the machine
-that created it never consulted. That is the trade for having a watchdog at all:
-the alternative is a wedged pod that bills until a human notices. The half of it
-worth knowing is the ssh key (a machine whose key the pod does not hold can
-never adopt it, and reports it forever instead), which setup.md says under the
-reconcile timer.
-
-Adopting stamps `last_seen_at` on the cached record, because the pod answered in
-that same pass: a machine that has only just met a pod
-gives it the same `dead_dispatcher_minutes` allowance as one it provisioned
-itself, rather than measuring silence from a `bootstrapped_at` days old. The
-name on the record comes off the config document rather than the parsed config,
-whose default `host` is `local` — a record called `local` would be matched
-against this machine's own host on the next pass.
-
-**The dead-dispatcher rule**: a bootstrapped desired host is asked for its
-pulse each pass (a 20 s ssh timeout, so one wedged pod cannot stall the pass)
--- the dispatcher heartbeat's
-mtime and a count of the jobs whose `state.json` says `running`, read with
-`stat` and `grep` rather than by running the host's package, because the machine
-reconciling a pod may never have bootstrapped it and knows no interpreter there.
-A heartbeat under
-`rented.HEARTBEAT_FRESH_S = 120` s, or any job the host says is running,
-counts as alive and records `last_seen_at` in its `desired/` record. That
-constant is the reaper's own and deliberately looser than the dispatcher's 30 s
-staleness or the 30 s freshness reuse demands: this one decides whether to
-terminate a pod. The clock is capped by this machine's own
-watching: `reconcile` keeps `watch.json` in the state directory with the time of
-the last pass and the start of the current unbroken stretch, and a gap of more
-than `WATCH_GAP_MINUTES` (5) resets the stretch. Silence that nothing observed
-is not evidence -- a desktop resuming from three days asleep would otherwise
-terminate every pod on the first pass whose ssh had not come up yet, and the
-timer fires two minutes after boot. The service therefore also `Wants=` the
-network target it is `After=`, since `After=` alone does not pull it in. A host
-that has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) --
-including one whose ssh never answers, since that never updates `last_seen_at`
-either -- is terminated with a loud report: it cannot idle-terminate itself, it
-is doing nothing we can see, and it is still billing. A long training run keeps
-its host alive indefinitely: nothing terminates a pod with a job on it. The
-15-minute pre-healthy ceiling only applies to a record that says the pod was
-never bootstrapped -- which an adopted one never does.
-Never touch a pod without the prefix. If `desired/` is unreadable, do nothing
-and log an error (fail closed). `--install` writes a `systemd --user` service
-and timer but does not enable them, and prints the `systemctl` lines and the
-`config_dir()/env` file the service reads `RUNPOD_API_KEY` from.
+   From bootstrap on, that is the only thing that ends the pod.
 
 ## Web dashboard (`gpuc web serve`)
 
@@ -1008,12 +934,12 @@ parallel (`actions.gather_all`, also what the text `gpuc status` uses), so one
 wedged host costs its own timeout, not the sum.
 
 `gpuc web serve --install` writes `gpuc-web.service` to `~/.config/systemd/user`
-the way `reconcile --install` writes its timer -- the two share
-`control/systemd.py` for the unit directory, an absolute `gpuc` for
+through `control/systemd.py`: the unit directory, an absolute `gpuc` for
 `ExecStart` (quoted the way systemd reads it) and writing without enabling.
-The unit pins the config and state dirs, reads the timer's env file if it
-exists, and restarts on failure under a start limit, so a service with no
-password fails after five tries rather than looping for ever.
+The unit pins the config and state dirs, reads `RUNPOD_API_KEY` from
+`config_dir()/env` if that file exists, and restarts on failure under a start
+limit, so a service with no password fails after five tries rather than
+looping for ever.
 
 Anything the dashboard gains lands in `actions` first and the dashboard calls
 it.
@@ -1023,8 +949,8 @@ it.
 What `status` prints, and every flag, is usage.md. The invariants:
 
 - An ephemeral host whose pod the provider reports missing or TERMINATED is
-  `POD GONE`: no ssh is attempted, and the line says to run `gpuc reconcile
-  --once` rather than printing a connection error.
+  `POD GONE`: no ssh is attempted, and the line says to run `gpuc host remove
+  <name>` rather than printing a connection error.
 - A finished job that produced `outputs:` which never reached S3/HF is flagged
   (`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
   those are the jobs a purge -- or a pod going away -- would take with them. One

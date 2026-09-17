@@ -452,8 +452,8 @@ repo is. `--install [DIR]` writes it to `DIR/.claude/skills/gpuc/SKILL.md`
 instead (`DIR` defaults to the current directory) and refuses to overwrite an
 existing copy without `--force`.
 
-**`gpuc clean`**, **`gpuc pods`**, **`gpuc reconcile`** and the host commands
-have their own sections below and in [setup.md](setup.md). `gpuc version` prints
+**`gpuc clean`**, **`gpuc pods`** and the host commands have their own
+sections below and in [setup.md](setup.md). `gpuc version` prints
 this build, its commit, and the commit this machine last shipped to each
 bootstrapped host, marking the ones to re-bootstrap; it reads the registry's
 cache and never touches a host, so what a host is *running* is `gpuc status` (see
@@ -518,8 +518,7 @@ the job's own index entry recorded.
 ```sh
 export RUNPOD_API_KEY=...
 gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60
-gpuc pods                   # every pod with our prefix: cost, util, age, is it wanted?
-gpuc reconcile --once       # forget pods that are gone, reap dead ones, report what nothing claims
+gpuc pods                   # every pod with our prefix: cost, util, age, which host it is here
 gpuc host add rented --pod <pod-id>   # drive a pod another machine rented
 ```
 
@@ -556,7 +555,7 @@ list. Two submits on this machine cannot both slip past the caps; two different
 machines sharing one account still can, for the length of one `create`.
 
 **Reuse** is the default, and picks the first registered `runpod` host that
-satisfies *all* of: it has a `desired/` record; that record's offer still
+satisfies *all* of: the offer its own config says it was bought on still
 matches the request (GPU name, `--min-vram`, `--max-price`, tier, CUDA floor);
 it owns at least `--gpu-count` cards; the provider says the pod exists and is
 `RUNNING`; its dispatcher heartbeat is under 30 s old; it is not draining. A
@@ -567,14 +566,13 @@ pod keeps the ones it was created with.
 **The pod is not tied to the machine that bought it.** What it is — its cards,
 its mirror, its idle timer, and the record of what it was rented as — lives in its own
 `config.json`, so `gpuc host add <name> --pod <pod-id>` on a second machine
-registers it from the pod itself and needs nothing the first machine has. That
-is also how `gpuc reconcile` tells a pod from a leak wherever it runs
-([below](#reconcile)).
+registers it from the pod itself and needs nothing the first machine has.
 
-**A pod is never created without a record of it.** `desired/<host>.json` is
-written under the same lock as the create, and every exit from provisioning
-between `create` and the final registry write — Ctrl-C included — terminates the
-pod before unwinding.
+**This machine owns a pod only until it proves healthy.** Every exit from
+provisioning between `create` and the final registry write — Ctrl-C included —
+terminates the pod before unwinding and moves to the next offer, inside the
+15-minute ceiling. A terminate that fails is reported loudly and the entry
+kept, so `gpuc status` and `gpuc pods` still show the pod.
 
 <a name="auto-down"></a>
 **Auto-down.** The pod terminates itself when nothing is running and the queue
@@ -590,63 +588,25 @@ training run at hour 24 is a worse failure than a pod that idles for fifteen
 minutes first. The idle timer is the only thing that ends a healthy pod; the
 cap on a job's own run is its `max_runtime_min`.
 
-<a name="reconcile"></a>
-**What stops a forgotten pod.** `gpuc reconcile` (see the timer in
-[setup.md](setup.md#the-reconcile-timer)) terminates:
+<a name="pods"></a>
+**After that, the pod owns itself, and nothing here watches it.** There is no
+reaper on this machine: a pod whose dispatcher dies after it was set up, or
+whose provisioning client was killed so hard it never ran its cleanup, bills
+until a person ends it. **`gpuc pods`** is how you see that: every pod in the
+account with our prefix (name, id, status, GPU, `$/h`, CUDA, age, util, the
+`HOST` name it is registered under here or `-`, and how long ago its dispatcher
+last beat) with the hourly total, and other people's pods by name only, never
+touched. A pod with a fresh heartbeat will end itself; one with none, and
+nothing running, will not. `gpuc host set <host> --idle-min 0` hurries a pod
+that still has a dispatcher; the RunPod console ends one that does not.
+`--no-heartbeat` skips the per-pod dispatcher ssh check, which is what makes
+the command slow when a pod is wedged. A pod registered nowhere here is named
+at the bottom with how to take it on (`gpuc host add <name> --pod <id>`), and
+`gpuc pods` never terminates anything.
 
-- a bootstrapped pod that has neither beaten its heartbeat nor been seen running
-  a job for `dead_dispatcher_minutes` (30 by default) — including one whose ssh
-  stopped answering, since that never refreshes `last_seen_at` either. **The
-  clock counts silence this machine watched**, not wall clock it was away for:
-  after a suspend, a reboot, or a gap of more than five minutes between passes,
-  every host gets the full allowance again. A machine that was asleep for three
-  days did not see anything, and the pass where it wakes up is the one where its
-  own ssh is likeliest to fail;
-- a pod *this machine created* that never bootstrapped by its 15-minute ceiling.
-  An adopted pod has a config on it, which is all this machine can see, so the
-  dead-dispatcher rule is what judges it instead — including a pod you adopt
-  with `--pod` and never bootstrap, which has no dispatcher to beat and is
-  terminated after `dead_dispatcher_minutes`. `gpuc host add --pod` says so
-  when it registers one.
-
-Those are the two states a pod cannot get itself out of. Everything else it
-handles alone: a healthy pod drains and terminates itself once its queue has
-been empty for `--idle-min`, with nothing local involved.
-
-**Nothing is terminated for the absence of a record.** A pod with our prefix
-that this machine has no record of and cannot get an answer out of is reported
-every pass, with its age and its hourly cost, and left running — it may be
-wedged, it may hold no key of yours, or it may be another machine's `create`
-still bootstrapping, and those look identical from here. The report says how to
-take it over (`gpuc host add <name> --pod <id>`) or where to end it. That is the
-one case that needs you: a pod that never got a config *and* whose creating
-machine is never coming back bills until somebody kills it.
-
-**Which pods are "ours" is asked of the pods, not of this machine.**
-`desired/<host>.json` is written by whichever machine ran `gpuc submit
---runpod`, so a pod carries the same record itself: its `config.json` holds the
-offer it was bought on, when it was created and when it was bootstrapped, under
-the `provider` block. Every pass asks each prefixed pod it has no record of what
-it is (one ssh session: expand gpuc home, read `config.json`), and a pod holding
-a gpuc config is ours whoever created it — it is judged
-by the rules above, and its answer is cached in `desired/` here. So the timer
-can run on the desktop while the laptop that queued the job is switched off, and
-neither machine is special.
-
-A pod with a job running per the host's own state is never touched by the
-dead-dispatcher rule, however old it is. The reaper otherwise fails closed in
-every direction: it never
-touches a pod without the configured prefix, it terminates nothing at all if
-`desired/` is unreadable, and a terminate that fails keeps its record (so the
-next pass retries it) and makes `gpuc reconcile --once` exit non-zero.
-
-**`gpuc pods`** lists every pod in the account: ours (name, id, status, GPU,
-`$/h`, CUDA, age, util, `DESIRED`, heartbeat) with the hourly total, and other
-people's by name only, never touched. `DESIRED=NO` means nothing *here* wants it
-yet — `gpuc reconcile` asks each of those what it is before deciding.
-`--no-heartbeat` skips the per-pod dispatcher ssh check, which is what makes the
-command slow when a pod is wedged. Nothing here terminates a `DESIRED=NO` pod:
-reconcile takes on the ones running gpuc, and the rest are yours to end.
+A registry entry whose pod is gone shows as `POD GONE` in `gpuc status`;
+`gpuc host remove <name>` forgets it, and the next `submit --runpod` does so
+on its own when it looks for a pod to reuse.
 
 ## How a job is killed
 
@@ -826,8 +786,8 @@ Rules for anything automated:
 ### `--json` everywhere else
 
 `status`, `submit`, `requeue`, `logs`, `cancel`, `preempt`, `reorder`, `estimate`,
-`pods`, `version`, `clean`, `config show`, `host list`, `host probe` and
-`reconcile --once` take `--json`, under the same rules: **stdout is exactly one JSON object**, it carries `schema_version`,
+`pods`, `version`, `clean`, `config show`, `host list` and `host probe` take
+`--json`, under the same rules: **stdout is exactly one JSON object**, it carries `schema_version`,
 and everything the text output would print alongside it — progress, warnings,
 `note:` lines — goes to stderr instead. The exit codes are the table above,
 unchanged by the flag.
@@ -843,8 +803,8 @@ never handed nothing at all:
 `error` (singular) is the whole answer: the command did not do what it was
 asked. A command line argparse itself rejects (a bad flag, a missing required
 one) gets the same document, with the reason on stderr where argparse wrote it. `errors` (plural) is different — per-host or per-job trouble a command
-survived, which never implies a non-zero exit by itself (`clean` and
-`reconcile --once` are the two that exit 1 on their own `errors`).
+survived, which never implies a non-zero exit by itself (`clean` is the one
+that exits 1 on its own `errors`).
 
 | command | the document |
 | --- | --- |
@@ -854,18 +814,17 @@ survived, which never implies a non-zero exit by itself (`clean` and
 | `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
-| `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], desired, heartbeat_age_s}`; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
+| `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], host, heartbeat_age_s}`; `host` is the registry name this machine drives it under, null if none; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` here is the commit the host was running when this machine last read it, not what it runs now — that is `status --json`'s `pkg_commit`. Exit 3 if the registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}` — the effective settings, file or not |
 | `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at` saying when that was, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]` (a re-bootstrap note: nothing here asks the host). The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
-| `reconcile --once` | `{terminated[], forgotten[], kept[], unclaimed[], errors[]}`, host names in the order they were judged — except `unclaimed`, which is *pod* names this machine has no record of and will not terminate. `--json` needs `--once` and nothing else: neither the loop nor `--install` has a document to print |
 
 ```sh
 gpuc submit job.yaml --host gpubox --json | jq -r .job_id
 gpuc logs "$id" --json | jq -r '.lines[-20:][]'
-gpuc pods --json | jq '[.pods[] | select(.desired | not) | .name]'
+gpuc pods --json | jq '[.pods[] | select(.host == null) | .name]'
 gpuc clean --host gpubox --all-finished --dry-run --json | jq .freed_bytes
 ```
 
@@ -1079,7 +1038,6 @@ looks like it is saying.
 | a warning names one skipped host entry | that entry did not validate; every other host still works and is written back untouched | fix it by hand, or `gpuc host add <name> --ssh ...` to connect to that host again |
 | `status` warns `host X is running gpuc <sha> and this machine has <sha>` | the host was last bootstrapped from a different build than this one, in either direction | `gpuc host bootstrap X`, or `gpuc host bootstrap --all` for every host at once — safe while jobs run; the new dispatcher adopts them |
 | `status` warns `host X has gpuc <sha> on disk but its running dispatcher was started on <sha>` | the dispatcher outlived the package under it, so nothing shipped since is in effect. A newer dispatcher normally takes over by itself | `gpuc host bootstrap X` — safe while jobs run; the new dispatcher adopts them |
-| `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc reconcile --once` |
-| `reconcile` reports `DEAD DISPATCHER` and terminates a pod | it stopped beating (or answering ssh) for `dead_dispatcher_minutes` with nothing running | expected: that pod could no longer stop itself. Raise `dead_dispatcher_minutes` if your hosts go quiet legitimately |
-| `reconcile` says a pod is "silent for 0 min" that has been dead for days | the clock counts silence *this machine watched*, and it has just started (a reboot, a resume, or a hand-run after a gap). The line says so | leave the timer running and it goes on the next pass past the limit; to end a pod now, tell the pod — `gpuc host set <host> --idle-min 0` |
+| `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc host remove <name>` |
+| `gpuc pods` shows a pod with no heartbeat and nothing running | its dispatcher died, or the machine that was provisioning it was killed before it could clean up; nothing here will end it | terminate it in the RunPod console. A pod that still answers ssh can be re-bootstrapped instead (`gpuc host add <name> --pod <id>`, then `gpuc host bootstrap <name>`) |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | the runbook in [setup.md](setup.md#hosts-whose-home-is-wiped-on-restart) |

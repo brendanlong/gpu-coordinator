@@ -19,8 +19,8 @@ is a **mirror**, never the queue — with `s3_bucket` set, specs and the job ind
 go up from here and each host mirrors its own logs and state, which is what
 makes `gpuc requeue`, `gpuc logs` after a pod is gone, and `gpuc clean --purge`
 possible. Nothing runs in the background on the control side except the
-optional `gpuc reconcile` timer, which ends rented pods that can no longer end
-themselves.
+optional web dashboard; a rented pod ends itself once its queue has been idle,
+and `gpuc pods` shows what is still billing.
 
 ## Quick start
 
@@ -40,9 +40,9 @@ gpuc web set-password && gpuc web serve   # the same, in a browser at http://127
 | | |
 | --- | --- |
 | [`docs/SPEC.md`](docs/SPEC.md) | the goals and non-goals every change is checked against |
-| [`docs/setup.md`](docs/setup.md) | install, config keys, credentials, registering hosts, the reconcile timer, upgrading, teardown |
+| [`docs/setup.md`](docs/setup.md) | install, config keys, credentials, registering hosts, upgrading, teardown |
 | [`docs/usage.md`](docs/usage.md) | the job spec, every command, RunPod, how a job is killed, exit codes and `--json`, cleanup and retention, troubleshooting |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | the contract: on-host state, dispatcher and runner behaviour, transport, reconcile rules, testing rules |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | the contract: on-host state, dispatcher and runner behaviour, transport, provisioning rules, testing rules |
 | [`skills/gpuc/SKILL.md`](skills/gpuc/SKILL.md) | the agent-facing quick guide, self-contained |
 | [`job.example.yaml`](job.example.yaml) | a fully commented job spec |
 

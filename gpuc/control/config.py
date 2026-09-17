@@ -26,7 +26,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX, Caps, Offer
+from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX, Caps
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
@@ -54,10 +54,6 @@ class LocalStateUnreadable(ConfigError):
 
 class HostNotFound(ConfigError):
     """A named host is not in the registry (CLI exit 4, not a generic failure)."""
-
-
-class DesiredUnreadable(ConfigError):
-    """The reaper's fail-closed signal: we cannot tell which pods are ours."""
 
 
 def _allows_none(annotation: Any) -> bool:
@@ -142,10 +138,6 @@ def lock_file() -> Path:
     return state_dir() / "state.lock"
 
 
-def desired_dir() -> Path:
-    return state_dir() / "desired"
-
-
 def index_dir() -> Path:
     return state_dir() / "jobs"
 
@@ -170,12 +162,6 @@ class Settings(TolerantModel):
     ssh_key: str | None = None
     image: str = DEFAULT_IMAGE
     disk_gb: int = DEFAULT_DISK_GB
-    dead_dispatcher_minutes: float = 30.0
-    """How long an ephemeral host may be silent before the reaper terminates it.
-
-    This is what stops a pod nobody is watching: a
-    dispatcher that has not beaten -- or a pod that has not answered ssh -- for
-    this long, with nothing running, is billing for nothing."""
 
     @property
     def ssh_key_path(self) -> str | None:
@@ -198,7 +184,7 @@ CONFIG_TEMPLATE = f"""\
 # cannot work.
 # s3_bucket = "my-experiments"
 
-# Only pods whose name starts with this are ever read, reaped or terminated.
+# Only pods whose name starts with this are ever read or terminated.
 runpod_pod_prefix = "{DEFAULT_PREFIX}"
 
 # Refuse to create a pod that would push us past either cap.
@@ -208,11 +194,6 @@ max_total_usd_per_hour = 3.0
 # Private key for ssh and rsync to hosts and pods; its ".pub" is uploaded to
 # the RunPod account. Unset means ssh picks its own.
 # ssh_key = "~/.ssh/id_ed25519"
-
-# An ephemeral host whose dispatcher has not beaten (or whose ssh has not
-# answered) for this long, with nothing running, is terminated by
-# `gpuc reconcile`.
-dead_dispatcher_minutes = 30.0
 
 # Defaults for `gpuc submit --runpod`; override per submit with --disk.
 image = "{DEFAULT_IMAGE}"
@@ -798,78 +779,20 @@ def registry_transaction() -> Iterator[Registry]:
         save_registry(read.registry, read.skipped)
 
 
-class DesiredHost(TolerantModel):
-    """What we asked the provider for, written before the pod can be lost.
-
-    This file is the only thing that distinguishes a pod we are waiting on from
-    a leaked one, so it is written immediately after `create` returns and
-    removed only once the pod is gone.
-    """
-
-    name: str = ""
-    pod_id: str = ""
-    offer: Offer = Field(default_factory=Offer)
-    created_at: str = ""
-    ceiling_at: str = ""
-    bootstrapped_at: str | None = None
-    last_seen_at: str | None = None
-    """When this host last proved it was alive: a fresh dispatcher heartbeat, or
-    a job running on it. The reaper terminates a pod that has not managed either
-    for `dead_dispatcher_minutes`, which is also how an unreachable pod is
-    caught -- an ssh that never answers never updates this."""
-
-    @property
-    def bootstrapped(self) -> bool:
-        return self.bootstrapped_at is not None
-
-    def silent_since(self) -> str | None:
-        """The most recent moment we know this host was alive."""
-        return self.last_seen_at or self.bootstrapped_at or self.created_at
-
-
-def desired_file(name: str) -> Path:
-    return desired_dir() / f"{name}.json"
-
-
-def write_desired(desired: DesiredHost) -> Path:
-    directory = desired_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    path = desired_file(desired.name)
-    tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
-    tmp.write_text(desired.model_dump_json(indent=2) + "\n")
-    os.replace(tmp, path)
-    return path
-
-
-def read_desired(name: str) -> DesiredHost | None:
-    path = desired_file(name)
-    if not path.exists():
-        return None
-    try:
-        return DesiredHost.model_validate_json(path.read_text())
-    except (OSError, ValidationError):
-        return None
-
-
-def remove_desired(name: str) -> None:
-    desired_file(name).unlink(missing_ok=True)
-
-
 def forget_host(name: str, pod_id: str | None = None) -> None:
     """Drop every local trace of one host. The caller must hold the state lock.
 
     `pod_id` names the pod the caller is forgetting, and the registry entry is
-    only removed if it is that pod's. A desired record and a registry entry can
-    disagree about what a name means -- a hand-set `host`, a pod that answers
-    to a name this machine already uses for a box of its own -- and dropping
-    somebody's registered host because a *pod* under that name went away is not
-    something this should be able to do.
+    only removed if it is that pod's. A pod and a registry entry can disagree
+    about what a name means -- a hand-set `host`, a pod that answers to a name
+    this machine already uses for a box of its own -- and dropping somebody's
+    registered host because a *pod* under that name went away is not something
+    this should be able to do.
 
     Deliberately not a `registry_transaction`: both callers already hold the
     lock, and flock is per open file description, so re-taking it in the same
     process would deadlock until the timeout.
     """
-    remove_desired(name)
     pod_known_hosts_file(name).unlink(missing_ok=True)
     read = read_registry()
     if read.unreadable:
@@ -879,7 +802,7 @@ def forget_host(name: str, pod_id: str | None = None) -> None:
         return
     if pod_id is not None and entry.pod_id != pod_id:
         # Not this pod's entry -- a box of this machine's that answers to the
-        # same name, or another pod under it. Only the record goes.
+        # same name, or another pod under it.
         return
     del read.registry.hosts[name]
     save_registry(read.registry, read.skipped)
@@ -897,33 +820,6 @@ def forget_host_locked(name: str, pod_id: str | None, report: Reporter) -> None:
             forget_host(name, pod_id)
     except ConfigError as exc:
         report(f"WARNING: could not remove host {name} from the registry: {exc}")
-
-
-def load_desired() -> list[DesiredHost]:
-    """Every desired host, or raise: a partial answer would reap live pods."""
-    directory = desired_dir()
-    if not directory.is_dir():
-        raise DesiredUnreadable(
-            f"{directory} does not exist, so nothing is known about which pods are ours.\n"
-            f"That is not the same as `no pods`, so nothing will be terminated. "
-            f"It is created by `gpuc submit --runpod`."
-        )
-    try:
-        paths = sorted(directory.glob("*.json"))
-    except OSError as exc:
-        raise DesiredUnreadable(
-            f"cannot list {directory}: {exc}\nFix its permissions; nothing was terminated."
-        ) from exc
-    hosts: list[DesiredHost] = []
-    for path in paths:
-        try:
-            hosts.append(DesiredHost.model_validate_json(path.read_text()))
-        except (OSError, ValidationError) as exc:
-            raise DesiredUnreadable(
-                f"{path} is not a readable desired-host record: {exc}\n"
-                f"Nothing was terminated. Check `gpuc pods`, then fix or delete that file."
-            ) from exc
-    return hosts
 
 
 def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transport:

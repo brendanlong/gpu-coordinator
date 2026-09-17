@@ -5,11 +5,10 @@ failure path here ends in `terminate` plus a wait for TERMINATED before the
 next offer is tried: a `draining` marker or an unreachable pod is never enough
 to justify a second create (that is how you double-bill).
 
-`desired/<host>.json` is written the instant `create` returns, under the same
-state lock as the create itself, because it is the only record that separates
-a pod we are waiting on from a leaked one. If it cannot be written the pod is
-terminated immediately; if anything else goes wrong before the host is
-registered -- including a Ctrl-C -- the pod is terminated on the way out.
+Nothing outside this process watches a pod it is bringing up: if anything
+goes wrong before the host is registered -- including a Ctrl-C -- the pod is
+terminated on the way out, and a terminate that fails is reported loudly for
+`gpuc pods` to show, because from then on it bills until a person ends it.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -29,19 +28,16 @@ from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_ho
 from gpuc.control.config import (
     DEFAULT_DISK_GB,
     ConfigError,
-    DesiredHost,
     HostEntry,
     Reporter,
     Settings,
     config_file,
     forget_host_locked,
     load_registry,
-    read_desired,
     registry_transaction,
     state_lock,
     transport_for,
     utc_now,
-    write_desired,
 )
 from gpuc.control.connect import Connection, connect_host
 from gpuc.control.gpuinfo import GpuInfo, discover, summarize
@@ -207,8 +203,8 @@ def initial_config(
     that created a host also decides what it is. Everything after this reads
     the host's copy, including the next machine to connect to it -- which is
     why the `provider` block (`rented.pod_record`) is written here rather than
-    left in this machine's `desired/`: it is the pod's own copy of that record,
-    and it is what any other machine reconciles the pod from.
+    kept on this machine: it is the pod's own record of what it was bought as,
+    and it is what any other machine reads it from.
     """
     return {
         "gpus": gpus,
@@ -333,8 +329,8 @@ def provision(
             # Offers are price-ascending, so a cap that this one trips, all trip.
             raise ProvisionError(
                 f"account caps refuse a new pod at {label}: {exc}\n"
-                f"Terminate a pod (`gpuc pods`, `gpuc reconcile --once`) or raise max_pods / "
-                f"max_total_usd_per_hour in ~/.config/gpu-coordinator/config.toml."
+                f"End a pod (`gpuc pods`, then `gpuc host set <host> --idle-min 0`) or raise "
+                f"max_pods / max_total_usd_per_hour in ~/.config/gpu-coordinator/config.toml."
             ) from exc
         except (ProvisionError, ProviderError, BootstrapError, RemoteError, TransportError) as exc:
             first = str(exc).splitlines()[0]
@@ -376,7 +372,7 @@ def _try_offer(
     deps: ProvisionDeps,
 ) -> HostEntry:
     name = pod_name(provider.caps.prefix, name_hint)
-    pod, created_at = _create_and_record(
+    pod, created_at = _create(
         offer,
         constraints,
         provider=provider,
@@ -384,7 +380,6 @@ def _try_offer(
         image=image,
         disk_gb=disk_gb,
         cuda_min=cuda_min,
-        idle_minutes=idle_minutes,
         progress=progress,
         deps=deps,
     )
@@ -428,9 +423,6 @@ def _try_offer(
         )
         with registry_transaction() as registry:
             registry.put(entry)
-        desired = read_desired(name)
-        if desired is not None:
-            write_desired(desired.model_copy(update={"bootstrapped_at": utc_now()}))
         progress(
             f"host {name} ready: dispatcher pid {result.dispatcher_pid}, "
             f"idle terminate {idle_minutes:g} min"
@@ -449,7 +441,7 @@ def _first_line(exc: BaseException) -> str:
     return lines[0] if lines else f"{type(exc).__name__} (interrupted)"
 
 
-def _create_and_record(
+def _create(
     offer: Offer,
     constraints: Constraints,
     *,
@@ -458,17 +450,14 @@ def _create_and_record(
     image: str,
     disk_gb: int,
     cuda_min: str,
-    idle_minutes: float,
     progress: _Progress,
     deps: ProvisionDeps,
 ) -> tuple[Pod, str]:
-    """Check caps, create, and write `desired/` with the state lock held.
+    """Check caps and create with the state lock held.
 
     The lock is what makes the account caps mean anything across the several
-    local sessions that share this account: without
-    it two `gpuc submit --runpod` can both read "one pod running" and both
-    create. It also hides the create-to-record gap from the reaper, which takes
-    the same lock, so a pod is never visible as a stray it might reap.
+    local sessions that share this account: without it two `gpuc submit
+    --runpod` can both read "one pod running" and both create.
     """
     with state_lock(timeout_s=CREATE_LOCK_TIMEOUT_S):
         check_caps(provider.caps, provider.list(), offer.price_usd_hr)
@@ -485,26 +474,8 @@ def _create_and_record(
             gpu_count=constraints.gpu_count,
         )
         created_at = utc_now()
-        ceiling = datetime.now(UTC) + timedelta(minutes=deps.ceiling_minutes)
-        try:
-            write_desired(
-                DesiredHost(
-                    name=name,
-                    pod_id=pod.id,
-                    offer=offer,
-                    created_at=created_at,
-                    ceiling_at=ceiling.isoformat(timespec="seconds"),
-                )
-            )
-        except BaseException as exc:
-            # No record means nothing local will ever reap this pod. Give it back
-            # now, from inside the lock (so no registry call re-enters it).
-            progress(f"could not record desired state for {name}: {_first_line(exc)}")
-            _terminate_now(provider, name, pod.id, progress, "its desired/ record was not written")
-            raise
     progress(
-        f"pod {pod.id} created ({pod.status}); desired state recorded, "
-        f"ceiling {deps.ceiling_minutes:.0f} min from now"
+        f"pod {pod.id} created ({pod.status}); ceiling {deps.ceiling_minutes:.0f} min from now"
     )
     return pod, created_at
 
@@ -519,7 +490,8 @@ def _terminate_now(
     except ProviderError as exc:
         progress(
             f"WARNING: could not terminate {name} ({pod_id}): {exc}\n"
-            f"  It may still be billing. Run `gpuc pods`, then `gpuc reconcile --once`."
+            f"  It is still billing until you end it: `gpuc pods` shows it, and the "
+            f"provider's console terminates it."
         )
         return False
     progress(f"{name} terminated and confirmed gone")
@@ -528,13 +500,9 @@ def _terminate_now(
 
 def _abandon(provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str) -> None:
     if not _terminate_now(provider, name, pod_id, progress, reason):
-        # A pod that is still billing must stay visible. `desired/<name>.json`
-        # is the only record that makes the reaper retry the terminate, so
-        # removing it here would leak the pod for good.
-        progress(
-            f"keeping the desired/ record and registry entry for {name} so "
-            f"`gpuc reconcile` retries the terminate of {pod_id}"
-        )
+        # A pod that is still billing must stay visible: its registry entry, if
+        # it got one, is what `gpuc status` shows a POD line for.
+        progress(f"keeping the registry entry for {name} until {pod_id} is confirmed gone")
         return
     forget_host_locked(name, pod_id, progress)
 
@@ -676,15 +644,12 @@ def pick_reusable_host(
     for entry in list(load_registry().hosts.values()):
         if entry.kind != "runpod" or not entry.pod_id:
             continue
-        desired = read_desired(entry.name)
-        if desired is None:
-            report(f"reuse: skipping {entry.name}, it has no desired/ record")
-            continue
-        if not offer_satisfies(desired.offer, constraints):
+        offer = rented.offer_of(entry.config.provider)
+        if not offer_satisfies(offer, constraints):
             report(
-                f"reuse: skipping {entry.name}, its {desired.offer.name}/"
-                f"{desired.offer.cloud.lower()} ${desired.offer.price_usd_hr:.3f}/h offer does "
-                f"not match this request"
+                f"reuse: skipping {entry.name}, its {offer.name or 'unrecorded'}/"
+                f"{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h offer does not match "
+                f"this request"
             )
             continue
         if len(entry.gpus) < constraints.gpu_count:

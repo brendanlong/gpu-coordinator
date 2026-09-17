@@ -37,9 +37,9 @@ class Constraints(BaseModel):
 
 
 class Offer(BaseModel):
-    """One catalog entry. Every field has a default so a `desired/<host>.json`
-    written by another build still parses: losing track of a billing pod is a
-    worse failure than an offer record we cannot reuse."""
+    """One catalog entry. Every field has a default so the `offer` a pod's own
+    config records, written by another build, still parses: a pod we cannot
+    reuse is a smaller failure than one we cannot read."""
 
     gpu_id: str = ""
     name: str = ""

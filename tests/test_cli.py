@@ -7,7 +7,6 @@ from typing import Any, cast
 
 import pytest
 
-from gpuc.control import reconcile as reconcile_mod
 from gpuc.control.clean import purge_host
 from gpuc.control.cli import (
     EXIT_ERROR,
@@ -25,7 +24,6 @@ from gpuc.control.config import (
     hosts_file,
     load_registry,
     load_settings,
-    read_desired,
     registry_transaction,
 )
 from gpuc.control.providers.base import Constraints
@@ -406,17 +404,6 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
     assert isinstance(mirrored, list) and mirrored == [f"bucket/gpuc/specs/{seen['job_id']}.json"]
 
 
-def test_reconcile_once_fails_closed_without_desired_state(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    provider = FakeProvider()
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
-    assert main(["reconcile", "--once"]) == 1
-    assert "does not exist" in capsys.readouterr().out
-    assert provider.terminated == []
-
-
 def test_pods_lists_ours_and_counts_the_others(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -526,14 +513,13 @@ def test_runpod_commands_fail_fast_without_an_api_key(
     for argv in (
         ["submit", "job.yaml", "--runpod", "--gpu", "A40"],
         ["pods"],
-        ["reconcile", "--once"],
         ["host", "add", "rented", "--pod", "pod1"],
     ):
         assert main(argv) == 1
         err = capsys.readouterr().err
         assert err.strip().splitlines() == [
             "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc host add --pod`, `gpuc pods` or `gpuc reconcile`"
+            "`gpuc host add --pod` or `gpuc pods`"
         ]
 
 
@@ -542,22 +528,6 @@ def test_a_non_runpod_command_does_not_need_the_api_key(
 ) -> None:
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     assert main(["host", "list"]) == 0
-
-
-def test_reconcile_install_does_not_need_the_api_key(
-    control_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Writing unit files is setup, not a provider call."""
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    # systemd_dir() is $HOME-relative, so it has to be redirected explicitly or
-    # the test would install units into the developer's real session.
-    units = tmp_path / "systemd"
-    monkeypatch.setattr(reconcile_mod, "systemd_dir", lambda: units)
-    assert main(["reconcile", "--install"]) == 0
-    assert {p.name for p in units.iterdir()} == {
-        "gpuc-reconcile.service",
-        "gpuc-reconcile.timer",
-    }
 
 
 def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
@@ -1677,41 +1647,9 @@ def test_pods_json_separates_ours_from_everyone_elses(
     document = one_document(capsys)
     (pod,) = document["pods"]  # type: ignore[misc]
     assert pod["name"] == "gpuc-e2e-aaa"
-    assert pod["desired"] is False
+    assert pod["host"] is None
     assert pod["heartbeat_age_s"] is None
     assert document["others"] == [{"id": "podF", "name": "subrep-other", "status": "RUNNING"}]
-
-
-def test_reconcile_once_json_reports_the_error_it_exits_one_for(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The commentary it would print goes to stderr; stdout is the document."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: FakeProvider())
-    capsys.readouterr()
-    assert main(["reconcile", "--once", "--json"]) == 1
-    captured = capsys.readouterr()
-    document = json.loads(captured.out)
-    assert document["terminated"] == []
-    assert "does not exist" in document["errors"][0]
-    assert "does not exist" in captured.err
-
-
-@pytest.mark.parametrize("extra", [[], ["--install"], ["--once", "--install"]])
-def test_reconcile_json_needs_once_and_nothing_else(
-    control_env: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    extra: list[str],
-) -> None:
-    """`--install` writes unit files and a systemd blurb, which is not a document."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    units = tmp_path / "systemd"
-    monkeypatch.setattr(reconcile_mod, "systemd_dir", lambda: units)
-    assert main(["reconcile", "--json", *extra]) == EXIT_USAGE
-    assert "--once" in json.loads(capsys.readouterr().out)["error"]
-    assert not units.exists()
 
 
 def test_clean_json_carries_what_went_and_what_was_kept(
@@ -1917,7 +1855,7 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
     assert "2/3 host(s) bootstrapped" in captured.out
     assert "failed: pod" in captured.out
     # The one failure that is somebody else's job to clean up says whose.
-    assert "gpuc reconcile --once" in captured.out
+    assert "gpuc host remove <name>" in captured.out
     registry = load_registry()
     assert all(registry.require(name).bootstrapped_at for name in ("gpubox", "zbox"))
     assert registry.require("pod").bootstrapped_at is None
@@ -2034,10 +1972,8 @@ def test_host_add_pod_adopts_a_pod_another_machine_created(
     assert entry.gpus == ["GPU-1111"] and entry.idle_minutes == 4.0
     out = capsys.readouterr().out
     assert "adopted the config on the host" in out
-    # This machine now watches it too, without having created it.
-    assert "recorded it in desired/gpuc-e2e-aaa.json" in out
-    desired = read_desired("gpuc-e2e-aaa")
-    assert desired is not None and desired.pod_id == "pod1"
+    # A pod with a dispatcher ends itself; there is nothing to warn about.
+    assert "nothing has bootstrapped this pod" not in out
 
 
 def test_host_add_pod_refuses_a_pod_that_is_gone(
@@ -2059,14 +1995,14 @@ def test_host_add_pod_and_ssh_are_the_same_question_twice(
     assert main(["host", "add", "rented", "--pod", "pod1", "--ssh", "me@box"]) == EXIT_USAGE
 
 
-def test_host_add_pod_says_what_watching_an_unbootstrapped_pod_means(
+def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(
     control_env: Path,
     fake_host: FakeHost,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Adopting a pod nobody has set up arms the silence rule against it: it has
-    no dispatcher to beat, so `reconcile` here will end it. Say so."""
+    """A pod nobody has set up has no dispatcher, so nothing idles it out: it
+    bills until bootstrap gives it one or a person ends it. Say so."""
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
@@ -2077,7 +2013,6 @@ def test_host_add_pod_says_what_watching_an_unbootstrapped_pod_means(
     out = capsys.readouterr().out
     assert "wrote its first config" in out
     assert "nothing has bootstrapped this pod" in out
-    assert "terminates it in 30 min" in out
     assert "gpuc host bootstrap rented" in out
 
 

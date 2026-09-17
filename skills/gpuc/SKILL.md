@@ -235,7 +235,6 @@ scraping any of the text output.
 | `host list` | `{hosts[], errors[]}` |
 | `host probe` | `{host, sections{}, driver_version, gpus[] each with assigned, assigned_gpus[], uv_cache{}, notes[], ...}` |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
-| `reconcile --once` | `{terminated[], forgotten[], kept[], unclaimed[], errors[]}` |
 
 ```bash
 id=$(gpuc submit job.yaml --host gpubox --json | jq -r .job_id)
@@ -274,13 +273,14 @@ Rules, and they are not optional:
   under 30 s old, and it is not draining. `--no-reuse` forces a new one.
 - There is **no overall pod lifetime**; per-job `max_runtime_min` is the cap,
   and the idle timer (`--idle-min`) is the only thing that ends a healthy pod.
-- A pod that stops answering (dead dispatcher, no ssh) with nothing running is
-  terminated after 30 minutes by `gpuc reconcile`.
-- `gpuc reconcile --once` cleans up registry entries for gone pods and enforces
-  the dead-dispatcher rule. Run it if `status` says `POD GONE`. It asks
-  each pod with our prefix what it is, so a pod another machine rented is taken
-  on, not reaped. **It never terminates a pod it has no record of** -- one it
-  cannot place is reported with its hourly cost for a person to deal with.
+- **Nothing on this machine watches or terminates a pod after it is set up.**
+  A pod whose dispatcher dies bills until a person ends it: `gpuc pods` shows
+  every pod with our prefix, its hourly cost and its heartbeat, and the pod
+  ends in the RunPod console. `gpuc host set <host> --idle-min 0` hurries a
+  pod that still has a dispatcher.
+- `status` says `POD GONE` for a registry entry whose pod is terminated:
+  `gpuc host remove <name>` forgets it (the next `submit --runpod` does so on
+  its own).
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
   create, reading the config the pod already has.
 - Only act on pods named `gpuc-*`. Others belong to other people.

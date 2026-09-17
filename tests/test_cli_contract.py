@@ -659,7 +659,6 @@ JSON_COMMANDS = [
     ["pods"],
     ["version"],
     ["clean"],
-    ["reconcile"],
     ["host", "list"],
     ["host", "probe"],
 ]

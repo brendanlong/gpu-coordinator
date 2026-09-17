@@ -393,11 +393,10 @@ def start_dispatcher(session: HostSession) -> int:
 def bootstrapped_provider(entry: HostEntry) -> dict[str, Any]:
     """`{"provider": ...}` with this moment stamped on it, for a rented host.
 
-    A pod carries its own desired record (`rented`), and this is the stamp that
-    says it got past the provisioning ceiling. Written by whichever machine
-    bootstraps it, so a second one reconciling that pod does not have to have
-    been there. Empty for a host nobody is renting: inventing a provider block
-    for one would make `gpuc pods` claim it.
+    A pod carries its own record of what it was bought as (`rented`), and this
+    is the stamp that says it was set up, written by whichever machine did so.
+    Empty for a host nobody is renting: inventing a provider block for one
+    would make it read as a pod.
 
     The question is whether this host is *rented*, not whether its config
     already says so: a pod set up before the block existed has none, and it is

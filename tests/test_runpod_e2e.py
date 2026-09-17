@@ -27,8 +27,6 @@ from gpuc.control.cli import main
 from gpuc.control.config import (
     HostEntry,
     Settings,
-    desired_dir,
-    load_desired,
     load_registry,
     load_settings,
 )
@@ -235,8 +233,6 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
                 f"pod {pod.id} {pod.name}: {pod.gpu_name} cuda {pod.cuda_version} "
                 f"${pod.cost_usd_hr:.3f}/h, {len(entry.gpus)} GPU(s) {entry.gpus}"
             )
-            assert [d.pod_id for d in load_desired()] == [pod.id]
-
             assert main(["status"]) == 0
             assert main(["pods"]) == 0
 
@@ -275,9 +271,10 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
             log(f"pod gone {idle:.0f}s after the job finished")
             assert pod.id not in [p.id for p in provider.list_ours()]
 
-            assert main(["reconcile", "--once"]) == 0
+            # Nothing here reaps: the next `submit` would forget the entry on
+            # its reuse pass, and a person does it by hand with `host remove`.
+            assert main(["host", "remove", entry.name]) == 0
             assert load_registry().hosts == {}
-            assert list(desired_dir().glob("*.json")) == []
             log(f"billing: {json.dumps(provider.billing(pod.id))[:400]}")
             log(f"total wall time {time.monotonic() - started:.0f}s")
     finally:
