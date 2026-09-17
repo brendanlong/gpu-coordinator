@@ -78,9 +78,10 @@ down when its work is done and nobody watching.
   bootstrapped, its dispatcher has been silent with nothing running, or it is
   past a lifetime cap. Any client holding the provider key may take on a
   rental it did not create by asking the rental what it is, and thereafter
-  judges it by those rules; a rental that answers nothing is reported, never
-  terminated. Rentals that are not ours are never touched, and unreadable
-  local state means the reaper does nothing.
+  judges it by those rules; a rental the client has no record of and cannot
+  get an answer from is reported, never terminated. Rentals that are not
+  ours are never touched, and unreadable local state means the reaper does
+  nothing.
 - Rentals are bounded by account-wide caps on count and hourly cost, and an
   existing matching rental is reused before a new one is created.
 
@@ -115,9 +116,10 @@ down when its work is done and nobody watching.
   utilization on the card. Owned cards are assumed to have no other users and
   this is never verified. A borrowed card is treated as owned until the job
   ends; a later collision with its real owner is not detected.
-- A job's GPU count is checked against the host at submit. A queued job that
-  can no longer fit, because the host's cards changed, fails rather than
-  waits; shared cards count only for a job that opted into them.
+- A queued job bigger than the host's configuration, because the
+  configuration shrank after submit, fails rather than waits; shared cards
+  count only for a job that opted into them. A card that is merely missing
+  right now makes a job wait.
 
 ## Running a job
 
