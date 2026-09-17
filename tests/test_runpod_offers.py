@@ -8,13 +8,10 @@ from typing import Any
 import pytest
 
 from gpuc.control.providers.base import (
-    Caps,
-    CapsExceeded,
     Constraints,
     Pod,
     PodStatus,
     ProviderError,
-    check_caps,
     owned_pods,
 )
 from gpuc.control.providers.runpod import RunPodProvider
@@ -129,37 +126,13 @@ def test_cuda_min_is_forwarded_to_the_catalog_query() -> None:
     }
 
 
-def test_caps_ignore_foreign_pods() -> None:
-    caps = Caps(max_pods=2, max_total_usd_per_hour=3.0)
+def test_owned_pods_ignore_foreign_pods() -> None:
     pods = [pod("other-p-head", 0.49), pod("other-d3-head", 0.49), pod("gpuc-a", 0.49)]
     assert [p.name for p in owned_pods(pods)] == ["gpuc-a"]
-    check_caps(caps, pods, 0.49)
 
 
-def test_caps_refuse_on_pod_count_and_on_hourly_total() -> None:
-    pods = [pod("gpuc-a", 0.49), pod("gpuc-b", 0.49)]
-    with pytest.raises(CapsExceeded, match="max_pods=2"):
-        check_caps(Caps(max_pods=2), pods, 0.49)
-    with pytest.raises(CapsExceeded, match=r"max_total_usd_per_hour=1\.0"):
-        check_caps(Caps(max_pods=5, max_total_usd_per_hour=1.0), pods, 0.49)
-
-
-def test_terminated_pods_do_not_count_against_caps() -> None:
-    pods = [pod("gpuc-a", 0.0, status="TERMINATED"), pod("gpuc-b", 0.49)]
-    check_caps(Caps(max_pods=2, max_total_usd_per_hour=1.0), pods, 0.49)
-
-
-def test_create_requires_our_prefix_and_leaves_caps_to_the_locked_check() -> None:
-    """Caps are enforced by `provision._create_and_record`, under the state lock.
-
-    That is the only place the check means anything when two sessions share the
-    account; a second, unlocked `GET /pods` here just cost an extra call that
-    two racing creates would both pass anyway.
-    """
-    provider = RecordedRunPod(
-        pods=[{"id": "x", "name": "gpuc-a", "status": "RUNNING", "cost": 0.49}]
-    )
-    provider.caps = Caps(max_pods=1)
+def test_create_requires_our_prefix() -> None:
+    provider = RecordedRunPod()
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
     with pytest.raises(ProviderError, match="must start with"):
         provider.create(offer, "scratch-pod")

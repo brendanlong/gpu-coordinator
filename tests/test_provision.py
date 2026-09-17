@@ -10,15 +10,13 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.config import (
-    ConfigError,
     HostEntry,
     Settings,
     load_registry,
     registry_transaction,
-    state_lock,
     utc_now,
 )
-from gpuc.control.providers.base import Caps, Constraints, Offer, Pod, ProviderError
+from gpuc.control.providers.base import Constraints, Pod, ProviderError
 from gpuc.control.provision import (
     ProvisionDeps,
     ProvisionError,
@@ -291,28 +289,6 @@ def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_pa
         public_key_path(Settings(ssh_key=str(key)))
 
 
-def test_caps_refusal_never_creates(control_env: Path, ssh_key: Path) -> None:
-    provider = FakeProvider(
-        [make_offer()],
-        caps=Caps(max_pods=1),
-        existing=[running_pod("gpuc-other-abc", "podX")],
-    )
-    with pytest.raises(ProvisionError) as error:
-        run(provider)
-    assert "max_pods=1" in str(error.value)
-    assert provider.created == []
-
-
-def test_caps_count_ignores_foreign_pods(control_env: Path, ssh_key: Path) -> None:
-    provider = FakeProvider(
-        [make_offer()],
-        caps=Caps(max_pods=1),
-        existing=[running_pod("other-someone-else", "podY")],
-    )
-    entry = run(provider)
-    assert entry.pod_id == "pod1"
-
-
 def test_no_offers_says_what_to_relax(control_env: Path, ssh_key: Path) -> None:
     with pytest.raises(ProvisionError) as error:
         run(FakeProvider([]))
@@ -485,27 +461,6 @@ def test_s3_credentials_are_skipped_without_a_prefix(control_env: Path) -> None:
     entry = host_entry(name="gpuc-x", kind="runpod")
     assert not deliver_s3_credentials(transport, entry, lambda m: None, {})  # type: ignore[arg-type]
     assert transport.files == {}
-
-
-class _LockWatchingProvider(FakeProvider):
-    """Records whether the state lock was held while `create` ran."""
-
-    lock_held_during_create: bool = False
-
-    def create(self, offer: Offer, name: str, **kwargs: object) -> Pod:
-        try:
-            with state_lock(timeout_s=0.2):
-                self.lock_held_during_create = False
-        except ConfigError:
-            self.lock_held_during_create = True
-        return super().create(offer, name, **kwargs)  # type: ignore[arg-type]
-
-
-def test_create_happens_under_the_state_lock(control_env: Path, ssh_key: Path) -> None:
-    """Caps are only account-wide if a second session cannot create in the gap."""
-    provider = _LockWatchingProvider([make_offer()])
-    run(provider)
-    assert provider.lock_held_during_create
 
 
 def test_ctrl_c_during_bootstrap_terminates_the_pod(control_env: Path, ssh_key: Path) -> None:

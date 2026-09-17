@@ -26,7 +26,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX, Caps
+from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
@@ -157,8 +157,6 @@ class Settings(TolerantModel):
 
     s3_bucket: str | None = None
     runpod_pod_prefix: str = DEFAULT_PREFIX
-    max_pods: int = 3
-    max_total_usd_per_hour: float = 3.0
     ssh_key: str | None = None
     image: str = DEFAULT_IMAGE
     disk_gb: int = DEFAULT_DISK_GB
@@ -166,13 +164,6 @@ class Settings(TolerantModel):
     @property
     def ssh_key_path(self) -> str | None:
         return str(Path(self.ssh_key).expanduser()) if self.ssh_key else None
-
-    def caps(self) -> Caps:
-        return Caps(
-            prefix=self.runpod_pod_prefix,
-            max_pods=self.max_pods,
-            max_total_usd_per_hour=self.max_total_usd_per_hour,
-        )
 
 
 CONFIG_TEMPLATE = f"""\
@@ -186,10 +177,6 @@ CONFIG_TEMPLATE = f"""\
 
 # Only pods whose name starts with this are ever read or terminated.
 runpod_pod_prefix = "{DEFAULT_PREFIX}"
-
-# Refuse to create a pod that would push us past either cap.
-max_pods = 3
-max_total_usd_per_hour = 3.0
 
 # Private key for ssh and rsync to hosts and pods; its ".pub" is uploaded to
 # the RunPod account. Unset means ssh picks its own.
@@ -751,9 +738,9 @@ def state_lock(timeout_s: float = 30.0) -> Iterator[None]:
                         f"another gpuc process has held {lock_file()} for more than "
                         f"{timeout_s:.0f}s. Wait for it, or delete the file if nothing is running."
                     ) from exc
-                # Waits here are measured in seconds (a provision holds the lock
-                # across a create), so sleeping is free; spinning on sched_yield
-                # burns a core for the whole wait and slows the holder down.
+                # Sleeping is free next to the ssh round trip the lock protects;
+                # spinning on sched_yield burns a core for the whole wait and
+                # slows the holder down.
                 time.sleep(LOCK_POLL_S)
         yield
     finally:
@@ -812,8 +799,8 @@ def forget_host_locked(name: str, pod_id: str | None, report: Reporter) -> None:
     """`forget_host` under the state lock, taken for just that mutation.
 
     Never held across the provider and ssh calls that decide *whether* to
-    forget: a terminate polls for up to five minutes, and a concurrent `gpuc
-    submit --runpod` gives up on the lock after two.
+    forget: a terminate polls for up to five minutes, and every other command
+    that touches the registry gives up on the lock after thirty seconds.
     """
     try:
         with state_lock():

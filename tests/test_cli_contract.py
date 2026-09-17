@@ -352,14 +352,14 @@ def test_status_json_is_one_document_with_the_promised_shape(
 def test_config_show_json_is_the_effective_settings(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    config_file().write_text('s3_bucket = "bucket"\nmax_pods = 5\n')
+    config_file().write_text('s3_bucket = "bucket"\ndisk_gb = 5\n')
     assert main(["config", "show", "--json"]) == EXIT_OK
     document = status_json(capsys)
     assert document["schema_version"] == 1
     assert document["config_file"] == str(config_file())
     assert document["config_file_exists"] is True
     assert document["settings"]["s3_bucket"] == "bucket"
-    assert document["settings"]["max_pods"] == 5
+    assert document["settings"]["disk_gb"] == 5
     assert document["notes"] == []
 
 

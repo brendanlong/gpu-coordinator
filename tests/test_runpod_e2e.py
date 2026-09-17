@@ -30,7 +30,7 @@ from gpuc.control.config import (
     load_registry,
     load_settings,
 )
-from gpuc.control.providers.base import Caps, Offer, Pod
+from gpuc.control.providers.base import Offer, Pod
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.s3index import LocalIndex
 
@@ -98,8 +98,8 @@ def wait_until(
 class RecordingProvider(RunPodProvider):
     """A real provider that remembers what it created, so `finally` can undo it."""
 
-    def __init__(self, caps: Caps) -> None:
-        super().__init__(caps=caps)
+    def __init__(self, prefix: str) -> None:
+        super().__init__(prefix=prefix)
         self.created_ids: list[str] = []
 
     def create(self, offer: Offer, name: str, **kwargs: Any) -> Pod:
@@ -156,9 +156,7 @@ def live_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[Settings]:
     monkeypatch.setenv("GPUC_STATE_DIR", str(root / "state"))
     monkeypatch.delenv("GPUC_HOME", raising=False)
     (root / "config").mkdir()
-    (root / "config/config.toml").write_text(
-        f's3_bucket = "{BUCKET}"\nmax_pods = 2\nmax_total_usd_per_hour = 1.5\n'
-    )
+    (root / "config/config.toml").write_text(f's3_bucket = "{BUCKET}"\n')
     yield load_settings()
     shutil.rmtree(root, ignore_errors=True)
 
@@ -186,7 +184,7 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
 ) -> None:
     if not os.environ.get("RUNPOD_API_KEY"):
         pytest.skip("RUNPOD_API_KEY is not set")
-    provider = RecordingProvider(live_settings.caps())
+    provider = RecordingProvider(live_settings.runpod_pod_prefix)
     monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
     monkeypatch.chdir(workdir)
     started = time.monotonic()

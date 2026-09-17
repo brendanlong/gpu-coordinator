@@ -547,13 +547,6 @@ ascending (then GPU id, then tier) and tried in that order: create, wait for a
 direct SSH endpoint, bootstrap, health check, enqueue. Any failure terminates
 that pod and moves to the next offer, all inside a **15-minute ceiling**.
 
-**Caps.** `max_pods` and `max_total_usd_per_hour` are account-wide — checked
-against every pod with our prefix, whoever created it, immediately before
-`create` and with the local state lock held. Because offers are price-ascending,
-a cap the cheapest offer trips aborts the whole submit rather than walking the
-list. Two submits on this machine cannot both slip past the caps; two different
-machines sharing one account still can, for the length of one `create`.
-
 **Reuse** is the default, and picks the first registered `runpod` host that
 satisfies *all* of: the offer its own config says it was bought on still
 matches the request (GPU name, `--min-vram`, `--max-price`, tier, CUDA floor);

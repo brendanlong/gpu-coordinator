@@ -103,7 +103,7 @@ def gather(
 ) -> PodsView:
     view = PodsView()
     pods = provider.list()
-    ours = owned_pods(pods, provider.caps.prefix)
+    ours = owned_pods(pods, provider.prefix)
     ours_ids = {pod.id for pod in ours}
     others = [pod for pod in pods if pod.id not in ours_ids]
     registry = load_registry()

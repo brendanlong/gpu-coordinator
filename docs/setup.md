@@ -55,14 +55,14 @@ gpuc config show      # the effective settings, file or not
 | --- | --- | --- |
 | `s3_bucket` | unset | the mirror's bucket. Unset means no mirror at all, so no `gpuc requeue` and no `gpuc logs` after a host is gone |
 | `runpod_pod_prefix` | `"gpuc-"` | only pods whose name starts with this are ever read or terminated |
-| `max_pods` | `3` | refuse to create a pod past this count (account-wide, every pod with the prefix) |
-| `max_total_usd_per_hour` | `3.0` | the same for the summed hourly cost |
 | `ssh_key` | unset | private key for ssh and rsync; its `.pub` goes to the RunPod account |
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | default pod image (`--image` per submit) |
 | `disk_gb` | `50` | default container disk (`--disk` per submit) |
 
-A `dead_dispatcher_minutes` key left over from a build that had a client-side
-reaper is ignored.
+Keys left over from older builds are ignored: `dead_dispatcher_minutes` (the
+client-side reaper) and `max_pods` / `max_total_usd_per_hour` (the account-wide
+caps). Nothing limits how many pods an account runs or what they cost;
+`gpuc pods` shows what is billing.
 
 **`s3_bucket` and `--s3-prefix` are two different mirrors.** `s3_bucket` is
 written by *this machine*: job specs to `s3://<bucket>/gpuc/specs/<job-id>.json`

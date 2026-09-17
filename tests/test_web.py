@@ -266,7 +266,7 @@ def test_login_sets_a_cookie_that_opens_the_page_and_the_api(client: Client) -> 
     assert status == 200 and b"/api/status" in body
     status, document = client.get_json("/api/config")
     assert status == 200
-    assert document["settings"]["max_pods"] == 3
+    assert document["settings"]["disk_gb"] == 50
     assert "config_file" in document
 
 

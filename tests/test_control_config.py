@@ -28,21 +28,21 @@ def test_settings_default_when_no_file(control_env: Path) -> None:
     settings = load_settings()
     assert settings.s3_bucket is None
     assert settings.runpod_pod_prefix == "gpuc-"
-    assert settings.max_pods == 3
+    assert settings.disk_gb == 50
 
 
 def test_settings_read_the_xdg_overridden_config(control_env: Path) -> None:
     config.config_file().write_text(
-        's3_bucket = "my-bucket"\nmax_pods = 1\nssh_key = "~/.ssh/id_ed25519"\n'
+        's3_bucket = "my-bucket"\ndisk_gb = 20\nssh_key = "~/.ssh/id_ed25519"\n'
     )
     settings = load_settings()
     assert settings.s3_bucket == "my-bucket"
-    assert settings.max_pods == 1
+    assert settings.disk_gb == 20
     assert settings.ssh_key_path is not None and settings.ssh_key_path.startswith("/")
 
 
 def test_bad_config_says_which_file_to_fix(control_env: Path) -> None:
-    config.config_file().write_text("max_pods = 'three'\n")
+    config.config_file().write_text("disk_gb = 'twenty'\n")
     with pytest.raises(ConfigError) as exc:
         load_settings()
     assert str(config.config_file()) in str(exc.value)

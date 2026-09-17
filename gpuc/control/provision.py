@@ -35,7 +35,6 @@ from gpuc.control.config import (
     forget_host_locked,
     load_registry,
     registry_transaction,
-    state_lock,
     transport_for,
     utc_now,
 )
@@ -43,20 +42,17 @@ from gpuc.control.connect import Connection, connect_host
 from gpuc.control.gpuinfo import GpuInfo, discover, summarize
 from gpuc.control.providers.base import (
     DEFAULT_IMAGE,
-    CapsExceeded,
     Constraints,
     Offer,
     Pod,
     Provider,
     ProviderError,
-    check_caps,
 )
 from gpuc.control.remote import RemoteError, open_session
 from gpuc.control.s3index import default_s3_prefix
 from gpuc.control.transport import SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
-CREATE_LOCK_TIMEOUT_S = 120.0
 DEFAULT_CUDA_MIN = "12.8"
 POLL_INTERVAL_S = 5.0
 SSH_MAX_INTERVAL_S = 15.0
@@ -325,13 +321,6 @@ def provision(
                 progress=progress,
                 deps=deps,
             )
-        except CapsExceeded as exc:
-            # Offers are price-ascending, so a cap that this one trips, all trip.
-            raise ProvisionError(
-                f"account caps refuse a new pod at {label}: {exc}\n"
-                f"End a pod (`gpuc pods`, then `gpuc host set <host> --idle-min 0`) or raise "
-                f"max_pods / max_total_usd_per_hour in ~/.config/gpu-coordinator/config.toml."
-            ) from exc
         except (ProvisionError, ProviderError, BootstrapError, RemoteError, TransportError) as exc:
             first = str(exc).splitlines()[0]
             failures.append(f"  - {label}: {first}")
@@ -371,7 +360,7 @@ def _try_offer(
     progress: _Progress,
     deps: ProvisionDeps,
 ) -> HostEntry:
-    name = pod_name(provider.caps.prefix, name_hint)
+    name = pod_name(provider.prefix, name_hint)
     pod, created_at = _create(
         offer,
         constraints,
@@ -453,27 +442,19 @@ def _create(
     progress: _Progress,
     deps: ProvisionDeps,
 ) -> tuple[Pod, str]:
-    """Check caps and create with the state lock held.
-
-    The lock is what makes the account caps mean anything across the several
-    local sessions that share this account: without it two `gpuc submit
-    --runpod` can both read "one pod running" and both create.
-    """
-    with state_lock(timeout_s=CREATE_LOCK_TIMEOUT_S):
-        check_caps(provider.caps, provider.list(), offer.price_usd_hr)
-        progress(
-            f"creating {name}: {offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
-            f"x{constraints.gpu_count}, disk {disk_gb}GB, cuda>={cuda_min}, image {image}"
-        )
-        pod = provider.create(
-            offer,
-            name,
-            image=image,
-            disk_gb=disk_gb,
-            cuda_min=cuda_min,
-            gpu_count=constraints.gpu_count,
-        )
-        created_at = utc_now()
+    progress(
+        f"creating {name}: {offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
+        f"x{constraints.gpu_count}, disk {disk_gb}GB, cuda>={cuda_min}, image {image}"
+    )
+    pod = provider.create(
+        offer,
+        name,
+        image=image,
+        disk_gb=disk_gb,
+        cuda_min=cuda_min,
+        gpu_count=constraints.gpu_count,
+    )
+    created_at = utc_now()
     progress(
         f"pod {pod.id} created ({pod.status}); ceiling {deps.ceiling_minutes:.0f} min from now"
     )

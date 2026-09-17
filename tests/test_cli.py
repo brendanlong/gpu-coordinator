@@ -456,8 +456,6 @@ def test_config_init_writes_a_commented_file_that_reloads_to_the_defaults(
     for key in (
         "s3_bucket",
         "runpod_pod_prefix",
-        "max_pods",
-        "max_total_usd_per_hour",
         "ssh_key",
         "image",
         "disk_gb",
@@ -469,11 +467,11 @@ def test_config_init_writes_a_commented_file_that_reloads_to_the_defaults(
 
 def test_config_init_refuses_to_clobber_without_force(control_env: Path) -> None:
     assert main(["config", "init"]) == 0
-    config_file().write_text("max_pods = 9\n")
+    config_file().write_text("disk_gb = 9\n")
     assert main(["config", "init"]) == 1
-    assert load_settings().max_pods == 9
+    assert load_settings().disk_gb == 9
     assert main(["config", "init", "--force"]) == 0
-    assert load_settings().max_pods == 3
+    assert load_settings().disk_gb == 50
 
 
 def test_config_show_works_without_a_config_file(

@@ -50,7 +50,7 @@ gpuc/
     actions.py     # one function per command returning its --json document; the CLI and the web call these
     status.py      # gather a host's status, render it, project queue start times
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
-    provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse, caps
+    provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse
     rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
     config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
@@ -871,10 +871,9 @@ for a host that came back empty is in setup.md.
   and a timeout). `terminate(id)`: `POST /pods/{id}/action {"action":"terminate"}`
   then poll `get` until `TERMINATED` or 404. `list()`:
   `GET /pods?includeClusterPods=true`.
-- Caps: count pods with our prefix and sum their `cost`; refuse if `max_pods`
-  or `max_total_usd_per_hour` would be exceeded. Checked once, in the
-  provisioning flow with the state lock held -- unlocked, two concurrent
-  sessions would both read "one pod running" and both create.
+- Nothing caps how many pods an account runs or what they cost per hour;
+  spending limits across rentals are a non-goal. `gpuc pods` is how a person
+  sees what is billing.
 
 ## Provisioning flow (`gpuc submit --runpod`)
 
@@ -884,11 +883,9 @@ for a host that came back empty is in setup.md.
    cards, whose pod the provider reports RUNNING, whose dispatcher heartbeat
    is fresh, and which is not draining; enqueue there. A registered pod the
    provider no longer has is forgotten rather than dialled.
-3. Else for each offer in order: check caps -- offers are price-ascending, so
-   a cap this one trips every later one trips too, and `CapsExceeded` aborts
-   the whole submit instead of walking the list; then `create`, both under
-   the state lock; poll `get` until RUNNING **and** `ssh.direct` present;
-   poll SSH until a trivial command succeeds; write the pod its config,
+3. Else for each offer in order: `create`; poll `get` until RUNNING **and**
+   `ssh.direct` present; poll SSH until a trivial command succeeds; write
+   the pod its config,
    whose `provider` block carries the offer and `created_at` (`rented.py`:
    the pod is its own record, and this machine keeps none); run bootstrap
    (which runs host health and starts the dispatcher); deliver the RunPod

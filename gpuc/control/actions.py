@@ -151,7 +151,7 @@ def named_registry() -> Registry:
 
 
 def make_provider(settings: Settings) -> Provider:
-    return RunPodProvider(caps=settings.caps())
+    return RunPodProvider(prefix=settings.runpod_pod_prefix)
 
 
 def provider_for_status(

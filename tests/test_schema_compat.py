@@ -253,16 +253,24 @@ def test_an_explicit_null_optional_field_survives_a_populated_host_config() -> N
 def test_an_unknown_key_never_reaches_a_model() -> None:
     entry = HostEntry.model_validate({"name": "gpubox", "favourite_colour": "blue"})
     assert entry.name == "gpubox"
-    settings = Settings.model_validate({"s3_bucket": None, "max_pods": None, "future": 1})
-    assert settings.s3_bucket is None and settings.max_pods == 3
+    settings = Settings.model_validate({"s3_bucket": None, "disk_gb": None, "future": 1})
+    assert settings.s3_bucket is None and settings.disk_gb == 50
     index = IndexEntry.model_validate({"job_id": "j", "host": None, "attempt": None, "x": 1})
     assert (index.host, index.attempt) == ("", 1)
 
 
-def test_settings_a_build_with_the_reaper_wrote_still_load() -> None:
-    """`dead_dispatcher_minutes` was a key until the client-side reaper went;
-    a config.toml that still has it is not an error."""
-    settings = Settings.model_validate({"dead_dispatcher_minutes": 30.0, "disk_gb": 20})
+def test_settings_an_older_build_wrote_still_load() -> None:
+    """`dead_dispatcher_minutes` was a key until the client-side reaper went,
+    and `max_pods` / `max_total_usd_per_hour` until the account caps did; a
+    config.toml that still has them is not an error."""
+    settings = Settings.model_validate(
+        {
+            "dead_dispatcher_minutes": 30.0,
+            "max_pods": 2,
+            "max_total_usd_per_hour": 1.5,
+            "disk_gb": 20,
+        }
+    )
     assert settings.disk_gb == 20
 
 
