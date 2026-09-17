@@ -805,8 +805,10 @@ fields. Beyond what the example shows:
   (a build too old to report it, or a spec it could not read).
 - `gpus_requested` is how many cards the spec asked for; a queued job holds
   none yet, so its `gpus` is empty. `use_shared` is whether it may take one of
-  `shared_gpus`, which is the rest of why two jobs waiting on the same host
-  can have different start times.
+  `shared_gpus`: with both, two jobs queued on one host can be told apart when
+  only one of them is waiting for a card the host owns. Null, like `priority`
+  and `auto_preempt`, only when the host did not say — never as a stand-in for
+  `false`.
 - `starts_in_s` / `starts_at` are when a queued job's turn is expected (see
   [job length estimates](#job-length-estimates)); null for anything not
   queued, and for a queued job whose turn cannot be dated.

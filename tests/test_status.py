@@ -13,6 +13,7 @@ from gpuc.control.status import (
     gather,
     host_json,
     host_warnings,
+    job_json,
     job_views,
     no_start_reason,
     owned_gpus,
@@ -780,7 +781,15 @@ def test_a_reachable_host_that_never_reported_a_commit_is_not_read_as_current() 
 
 
 def waiting(job_id: str, **overrides: Any) -> JobView:
-    document: dict[str, Any] = {"job_id": job_id, "priority": 50, "gpus_requested": 1}
+    # A job the host reported in full, so `use_shared` is the spec's own `false`
+    # and not the null it sends for a spec it could not read. The tests about
+    # that unknown pass `use_shared=None` and say so.
+    document: dict[str, Any] = {
+        "job_id": job_id,
+        "priority": 50,
+        "gpus_requested": 1,
+        "use_shared": False,
+    }
     document.update(overrides)
     return JobView(**document)
 
@@ -1116,12 +1125,18 @@ def test_the_json_carries_the_shared_cards_and_their_verdict() -> None:
 def test_the_json_says_which_jobs_may_have_a_shared_card() -> None:
     """`shared_gpus` says which cards the host may borrow and this says which
     jobs may have them; without it the document shows an idle shared card
-    beside two queued jobs and cannot say why only one of them starts."""
+    beside two queued jobs and cannot say why only one of them starts.
+
+    Three answers, not two: the host sends null for a job whose spec it could
+    not read, and `false` there would say "this one did not ask" about a job
+    nobody asked.
+    """
     document = host_json(
         shared_view(
             jobs=[
                 {"job_id": "j-borrower", "status": "queued", "use_shared": True},
-                {"job_id": "j-purist", "status": "queued"},
+                {"job_id": "j-purist", "status": "queued", "use_shared": False},
+                {"job_id": "j-unreadable", "status": "queued", "use_shared": None},
                 {"job_id": "j-running", "status": "running", "gpus": [GPU], "use_shared": True},
             ]
         )
@@ -1129,8 +1144,18 @@ def test_the_json_says_which_jobs_may_have_a_shared_card() -> None:
     assert {j["job_id"]: j["use_shared"] for j in document["queued"]} == {
         "j-borrower": True,
         "j-purist": False,
+        "j-unreadable": None,
     }
     assert document["running"][0]["use_shared"] is True
+
+
+def test_a_host_too_old_to_report_use_shared_says_null_not_false() -> None:
+    """The field is absent from the whole payload, which is a build predating
+    shared cards. It borrows nothing, and it must not claim these jobs asked
+    to borrow nothing either."""
+    queued, _, _ = job_views(payload(jobs=[{"job_id": "j-queued", "status": "queued"}]))
+    assert queued[0].use_shared is None
+    assert job_json(queued[0])["use_shared"] is None
 
 
 def test_a_job_waiting_for_a_shared_card_is_told_that_and_not_called_impossible() -> None:
@@ -1149,6 +1174,18 @@ def test_a_job_that_cannot_fit_even_with_shared_cards_is_still_called_impossible
     job = waiting("j-queued", gpus_requested=9, use_shared=True)
     got.queue = [job]
     assert "the host has 3 (shared included)" in no_start_reason(got, job)
+
+
+def test_a_job_whose_permission_to_borrow_is_unknown_is_not_called_impossible() -> None:
+    """`never be dispatched` turns on whether it may borrow, and the host did
+    not say. Reading the unknown as no would tell a submitter their job is
+    hopeless on the strength of a spec nobody could read."""
+    got = shared_view()
+    job = waiting("j-queued", gpus_requested=3, use_shared=None)
+    got.queue = [job]
+    reason = no_start_reason(got, job)
+    assert "never be dispatched" not in reason
+    assert "does not report whether a queued job may borrow" in reason
 
 
 def test_a_job_that_did_not_ask_is_not_credited_with_the_shared_card() -> None:

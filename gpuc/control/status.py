@@ -118,9 +118,11 @@ class JobView:
     """How many cards the spec asked for. A queued job holds none yet, so this
     is the only thing that says whether it is waiting for one card or eight.
     None from a host on a build that does not report it."""
-    use_shared: bool = False
+    use_shared: bool | None = None
     """The spec said this job may borrow the host's shared cards, so the ones
-    it is waiting for are not only the ones the host owns."""
+    it is waiting for are not only the ones the host owns. None from a host
+    that did not say -- a build older than shared cards, or a spec it could
+    not read."""
     reason: str | None = None
     exit_code: int | None = None
     attempt: int = 1
@@ -134,10 +136,10 @@ class JobView:
     where there is one, from the spec's `estimated_runtime_min` otherwise."""
     estimated_runtime_min: float | None = None
     """The submitter's own estimate, which is all a *queued* job has."""
-    auto_preempt: bool = False
+    auto_preempt: bool | None = None
     """This job asked to be stopped and queued again whenever that lets a more
     important one start, so a `running` line for it is not a promise that it
-    will still be running in a minute."""
+    will still be running in a minute. None from a host that did not say."""
     progress_error: str | None = None
     """Why this job's `progress_command` last produced nothing.
 
@@ -296,6 +298,16 @@ def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _as_bool(value: Any) -> bool | None:
+    """A flag the host sent, or None for a host that did not send one.
+
+    Not `bool(value)`: the host sends null for a spec it could not read, and
+    reporting that as `false` would answer a question we cannot answer -- "no,
+    this job did not ask for that" -- rather than saying we do not know.
+    """
+    return value if isinstance(value, bool) else None
+
+
 def _str_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -384,8 +396,14 @@ class HostView:
         `shared_unavailable` counts: the host judges a job against the cards it
         is *configured* with, and makes it wait for one that is missing this
         minute rather than failing it.
+
+        A `use_shared` of None reads as no, which is the conservative half of
+        it: an unknown is never credited with a shared card, so it cannot buy
+        a start time it may not get. The other half is not this function's to
+        give -- `no_start_reason` refuses to say `never` about an unknown
+        rather than reading it as no.
         """
-        return job.use_shared and bool(self.shared or self.shared_unavailable)
+        return bool(job.use_shared) and bool(self.shared or self.shared_unavailable)
 
     @property
     def borrowable(self) -> list[SharedGpu]:
@@ -455,7 +473,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             priority=_first_int(priorities.get(entry["job_id"]), entry.get("priority")),
             gpus=list(entry.get("gpus") or []),
             gpus_requested=_as_int(entry.get("gpus_requested")),
-            use_shared=bool(entry.get("use_shared")),
+            use_shared=_as_bool(entry.get("use_shared")),
             reason=entry.get("reason"),
             exit_code=entry.get("exit_code"),
             attempt=entry.get("attempt", 1),
@@ -469,7 +487,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
-            auto_preempt=bool(entry.get("auto_preempt")),
+            auto_preempt=_as_bool(entry.get("auto_preempt")),
             progress_error=_as_str(entry.get("progress_error")),
             workdir_bytes=_as_int(entry.get("workdir_bytes")),
             outputs_pending=bool(entry.get("outputs_pending")),
@@ -824,6 +842,13 @@ def no_start_reason(view: HostView, job: JobView) -> str:
     if borrows:
         capacity += len(view.shared) + len(view.shared_unavailable)
     if job.gpus_requested is not None and job.gpus_requested > capacity:
+        if job.use_shared is None and (view.shared or view.shared_unavailable):
+            # Whether it may borrow is the one thing that decides this, and the
+            # host did not say. `never` is an absolute; not knowing is not one.
+            return (
+                f"it asks for {job.gpus_requested} card(s) and this host does not report "
+                f"whether a queued job may borrow the shared ones it would need"
+            )
         shared = " (shared included)" if borrows else ""
         return (
             f"it asks for {job.gpus_requested} card(s) and the host has "
@@ -1187,8 +1212,11 @@ def job_json(
     host will actually take them in. `starts_in_s` and `starts_at` are when a
     queued job's turn is expected to come, and are null for anything that is
     not queued -- or whose turn depends on a job that gave no estimate.
-    `use_shared` is the other half of that explanation: `shared_gpus` says
-    which cards the host may borrow, and this says which jobs may have them.
+    `shared_gpus` says which cards the host may borrow and `use_shared` says
+    which jobs may have them, which is the rest of what dates a queued job's
+    turn. Like `auto_preempt` it is null rather than false when the host did
+    not say: "this job did not ask for that" is a different answer from "we
+    could not find out".
 
     `links` is the one thing here the text view has no room for: where the
     job's outputs, its W&B run and its mirrored log can be opened, for a
