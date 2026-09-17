@@ -113,6 +113,44 @@ def test_a_job_waits_when_not_enough_gpus_are_free(gpuc_home: Path) -> None:
     assert jobs.read_state(waiting).status == "running"
 
 
+def test_a_wide_job_is_not_starved_by_a_stream_of_narrow_ones(gpuc_home: Path) -> None:
+    """The dispatch rule the preempt livelock was a special case of. Priority
+    is advisory if a job that does not fit can be walked past for ever: each
+    one-card job fits the single card the two-card job is waiting for, so the
+    most important job in the queue never ran at all."""
+    dispatcher, spawned = make_dispatcher()
+    narrow = [queue.enqueue(make_spec(gpus=1, priority=50)) for _ in range(2)]
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=10))
+
+    done = narrow.pop(0)
+    spawned[done].finish()
+    later = queue.enqueue(make_spec(gpus=1, priority=50))  # and another arrives
+    dispatcher.run_once()
+    # The freed card is held for the job that is waiting for it, not handed to
+    # the job behind it.
+    assert jobs.read_state(later).status == "queued"
+
+    spawned[narrow[0]].finish()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "running"
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+
+
+def test_a_zero_gpu_job_is_never_held_up_by_a_job_waiting_for_cards(gpuc_home: Path) -> None:
+    """It holds no card, so it can never be the reason anything is short of
+    one -- and making it wait would buy the job ahead of it nothing."""
+    dispatcher, _ = make_dispatcher()
+    holding = queue.enqueue(make_spec(gpus=1, priority=50))
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))  # waiting for both cards
+    cpu_job = queue.enqueue(make_spec(gpus=0, priority=90))
+    dispatcher.run_once()
+    assert jobs.read_state(cpu_job).status == "running"
+    assert jobs.read_state(cpu_job).gpus == []
+    assert holding in dispatcher.running
+
+
 def test_a_zero_gpu_job_never_waits(gpuc_home: Path) -> None:
     hog = queue.enqueue(make_spec(gpus=2, priority=10))
     cpu_job = queue.enqueue(make_spec(gpus=0, priority=90))
@@ -1093,6 +1131,21 @@ def test_an_owned_index_the_host_cannot_see_is_not_handed_out(gpuc_home: Path) -
     assert "does not report" in paths.dispatcher_log().read_text()
 
 
+def test_a_job_wider_than_what_the_host_can_see_holds_no_cards(gpuc_home: Path) -> None:
+    """It is not waiting for a card that is coming back, so holding one for it
+    would idle the host for as long as a card stays missing -- possibly for
+    ever. The job is not failed either: `config.gpus` says the host owns
+    enough, and the card may be back on the next pass."""
+    configure_indices(["0", "7"])  # only index 0 is real
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi()
+    wider_than_visible = queue.enqueue(make_spec(gpus=2, priority=10))
+    behind = queue.enqueue(make_spec(gpus=1, priority=50))
+    dispatcher.run_once()
+    assert jobs.read_state(wider_than_visible).status == "queued"
+    assert jobs.read_state(behind).status == "running"
+
+
 def test_a_preempted_job_goes_back_in_the_queue_when_its_runner_stops(gpuc_home: Path) -> None:
     """The point of the command: the GPUs go to the job that was waiting, and
     the one that was stopped is queued again rather than lost."""
@@ -1518,3 +1571,317 @@ def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) 
     queue.enqueue(make_spec(gpus=1, use_shared=True))
     dispatcher.run_once()
     assert sum("memory.used" in " ".join(args) for args in asked) == 1
+
+
+# -- automatic preemption -----------------------------------------------------
+
+
+def test_an_auto_preempt_job_gives_its_cards_to_a_more_important_one(gpuc_home: Path) -> None:
+    """The whole feature: nobody ran a command, and the cheap job is queued
+    again rather than lost."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(cheap).status == "running"
+
+    urgent = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
+    assert queue.kill_reason(cheap) == "preempted"
+    assert f"auto_preempt: stopping so job {urgent}" in paths.log_file(cheap).read_text()
+
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(urgent).status == "running"
+    state = jobs.read_state(cheap)
+    assert (state.status, state.attempt) == ("queued", 2)
+
+
+@pytest.mark.parametrize("priority", [80, 50])
+def test_an_auto_preempt_job_keeps_its_cards_when_nothing_better_is_waiting(
+    gpuc_home: Path, priority: int
+) -> None:
+    """Equal priority counts as "not better": the stopped job's id is the older
+    one, so it would win the tie, take its own cards straight back, and be
+    preempted again for ever without either job getting anywhere."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=50, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=priority))
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+    assert queue.kill_reason(cheap) is None
+
+
+def test_a_job_that_never_asked_for_it_is_not_preempted(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=2, priority=80))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=1))
+    dispatcher.run_once()
+    assert not queue.is_preempted(job_id)
+
+
+def test_nothing_is_stopped_when_it_would_not_free_enough_cards(gpuc_home: Path) -> None:
+    """One of the two cards the waiting job needs starts nothing, and the
+    attempt it costs is thrown away for a job that still waits."""
+    cheap = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    queue.enqueue(make_spec(gpus=1, priority=80))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+def test_only_as_many_jobs_are_stopped_as_the_waiting_one_needs(gpuc_home: Path) -> None:
+    """And the second pass, with the first job still stopping, does not take
+    another: the cards it is about to hand back already cover the gap."""
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=70, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    # The least important of the two.
+    assert queue.is_preempted(first)
+    assert not queue.is_preempted(second)
+    dispatcher.run_once()
+    assert not queue.is_preempted(second)
+
+
+def test_the_shortest_running_of_two_equals_is_the_one_that_gives_way(gpuc_home: Path) -> None:
+    """What a preempt throws away is the work the attempt has already done."""
+    older = queue.enqueue(
+        make_spec(job_id="20260101-000000-aaaaaa", gpus=1, priority=80, auto_preempt=True)
+    )
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    younger = queue.enqueue(
+        make_spec(job_id="20260101-000001-bbbbbb", gpus=1, priority=80, auto_preempt=True)
+    )
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(younger)
+    assert not queue.is_preempted(older)
+
+
+def test_two_waiting_jobs_are_given_a_card_each(gpuc_home: Path) -> None:
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    queue.enqueue(make_spec(gpus=1, priority=11))
+    dispatcher.run_once()
+    assert queue.is_preempted(first)
+    assert queue.is_preempted(second)
+
+
+def test_a_cancelled_job_in_the_queue_is_not_worth_preempting_for(gpuc_home: Path) -> None:
+    """The marker alone, as `gpuc cancel` writes it before it takes the queue
+    marker off: for that instant the job is both queued and not coming back."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    doomed = queue.enqueue(make_spec(gpus=2, priority=10))
+    paths.cancel_file(doomed).touch()
+    dispatcher.preempt_for_waiting()
+    assert not queue.is_preempted(cheap)
+
+
+@pytest.mark.parametrize("marker", ["paused", "draining"])
+def test_a_host_that_is_dispatching_nothing_preempts_nothing(gpuc_home: Path, marker: str) -> None:
+    """The cards would go to nobody: the job is stopped and nothing replaces it."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    (paths.paused_file() if marker == "paused" else paths.draining_file()).touch()
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+def test_a_pod_past_its_ttl_preempts_nothing(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It is about to terminate, so the waiting job would never be dispatched
+    and the stopped one would not even be queued again."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+def test_the_cards_freed_for_a_waiting_job_are_not_handed_back_to_the_stopped_ones(
+    gpuc_home: Path,
+) -> None:
+    """The livelock this reserves cards to prevent. Two jobs give a card each
+    up for one that needs both; their runners stop a pass apart, so without a
+    reservation `launch_ready` -- which walks past a job that does not fit --
+    hands the first card straight back to the job that just gave it up, and the
+    next pass stops it again, for ever, with the waiting job still queued."""
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=70, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    waiting = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(first) and queue.is_preempted(second)
+
+    spawned[first].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    # Queued again, and *not* running on the card it just gave up: that card is
+    # being held for the job it was freed for.
+    assert jobs.read_state(first).status == "queued"
+    assert jobs.read_state(waiting).status == "queued"
+
+    spawned[second].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(waiting).status == "running"
+    assert jobs.read_state(waiting).gpus == FAKE_GPUS
+    for job_id in (first, second):
+        assert jobs.read_state(job_id).attempt == 2  # stopped once, not once a pass
+
+
+def test_a_manual_preempt_in_flight_does_not_donate_its_cards_twice(gpuc_home: Path) -> None:
+    """`gpuc preempt` puts a job back in the *queue*, so its card is not simply
+    coming free: the job is about to compete for it at its own priority, and it
+    stops a pass before the auto-preempted one does. Counting that card towards
+    the waiting job's gap and then letting its old holder take it back is how
+    an attempt gets spent on a job that still cannot start."""
+    manual = queue.enqueue(make_spec(gpus=1, priority=20))
+    cheap = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    waiting = queue.enqueue(make_spec(gpus=2, priority=5))
+    queue.preempt(manual)  # somebody wanted that one card back for the big job
+
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)  # the other card, so the big job can start
+    spawned[manual].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(manual).status == "queued"  # and not running again
+
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(waiting).status == "running"
+
+
+def test_one_stop_that_fails_does_not_take_the_rest_of_the_set_with_it(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`enough_to_start` picks a set that covers the whole gap; once one of them
+    cannot be stopped the gap is not covered any more, and stopping the others
+    would spend their attempts on a job that still cannot start."""
+    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+    second = queue.enqueue(make_spec(gpus=1, priority=70, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+
+    real = queue.preempt
+
+    def refuse_the_first(job_id: str, priority: int | None = None) -> str:
+        if job_id == first:  # the least important, so the one tried first
+            raise OSError("read-only file system")
+        return real(job_id, priority)
+
+    monkeypatch.setattr(host_dispatcher.queue, "preempt", refuse_the_first)
+    dispatcher.run_once()
+    assert not queue.is_preempted(first)
+    assert not queue.is_preempted(second)
+    assert "was not stopped" in paths.dispatcher_log().read_text()
+
+
+def test_cards_held_for_a_job_that_is_cancelled_are_handed_out_again(gpuc_home: Path) -> None:
+    """Otherwise they idle for the life of the dispatcher, waiting for a job
+    nobody is waiting on any more."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    waiting = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
+
+    queue.cancel(waiting)
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(cheap).status == "running"
+    assert jobs.read_state(cheap).attempt == 2
+
+
+def test_nothing_is_stopped_in_the_last_minutes_of_a_pods_ttl(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job stopped here may never come back: the final sync takes as long as
+    it takes, and by then the host refuses to queue anything at all."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.96)  # ~2.5 min left
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+
+
+def test_a_borrowed_card_is_not_freed_for_a_job_that_may_not_borrow(gpuc_home: Path) -> None:
+    """Stopping it would hand back somebody else's card, which the waiting job
+    cannot be dispatched onto: an attempt spent to start nothing."""
+    dispatcher, _ = shared_host(shared=[SHARED_GPUS[0]])
+    *_, borrower = enqueue_in_order(
+        *filling_the_owned_cards(),
+        {"gpus": 1, "priority": 80, "auto_preempt": True, "use_shared": True},
+    )
+    dispatcher.run_once()
+    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
+
+    # Queued once every card is taken, or it would simply be dispatched onto one.
+    waiting = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    assert not queue.is_preempted(borrower)
+    assert jobs.read_state(waiting).status == "queued"
+
+
+def test_a_borrowed_card_is_freed_for_a_job_that_asked_to_borrow(gpuc_home: Path) -> None:
+    dispatcher, _ = shared_host(shared=[SHARED_GPUS[0]])
+    *_, borrower = enqueue_in_order(
+        *filling_the_owned_cards(),
+        {"gpus": 1, "priority": 80, "auto_preempt": True, "use_shared": True},
+    )
+    dispatcher.run_once()
+    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
+
+    waiting = queue.enqueue(make_spec(gpus=1, priority=10, use_shared=True))
+    dispatcher.run_once()
+    assert queue.is_preempted(borrower)
+    assert f"auto_preempt: stopping so job {waiting}" in paths.log_file(borrower).read_text()
+
+
+def test_a_job_that_can_only_run_by_borrowing_holds_no_owned_card(gpuc_home: Path) -> None:
+    """The card it is short of comes free when somebody else's job ends, which
+    is not this host's to wait for -- so the queue behind it runs."""
+    dispatcher, _ = shared_host(
+        shared=[SHARED_GPUS[0]],
+        utilization={SHARED_GPUS[0]: 90.0},
+        memory_used={SHARED_GPUS[0]: 8000.0},
+    )
+    holding, wide, narrow = enqueue_in_order(
+        {"gpus": 1, "priority": 50},
+        {"gpus": 3, "priority": 10, "use_shared": True},  # needs the busy shared card
+        {"gpus": 1, "priority": 90},
+    )
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(holding).status == "running"
+    # The free owned card goes to the job behind it rather than idling for a
+    # card somebody else is training on.
+    assert jobs.read_state(narrow).status == "running"

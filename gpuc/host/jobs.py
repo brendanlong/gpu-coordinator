@@ -305,6 +305,13 @@ class JobSpec:
     with a measured one. A failure is recorded and ignored; see `progress.py`."""
     progress_interval_s: float = progress.DEFAULT_INTERVAL_S
     low_util: LowUtil = field(default_factory=LowUtil)
+    auto_preempt: bool = False
+    """Let the dispatcher stop this job whenever that starts a more important
+    one right away, as often as it takes: see `dispatcher.preempt_for_waiting`.
+
+    It costs everything the attempt has done, so it is opt-in and belongs to
+    jobs that are cheap to re-run from the start.
+    """
     requires: dict[str, Any] = field(default_factory=dict)
     cleanup: str = DEFAULT_CLEANUP
     """`on_success` | `always` | `never`: when the runner deletes `workdir/`.
@@ -341,6 +348,7 @@ class JobSpec:
             progress_command=as_opt_str(fields, "progress_command"),
             progress_interval_s=_polling_interval(fields),
             low_util=LowUtil.from_dict(fields.get("low_util")),
+            auto_preempt=as_bool(fields, "auto_preempt"),
             requires=dict(fields.get("requires") or {})
             if isinstance(fields.get("requires"), dict)
             else {},

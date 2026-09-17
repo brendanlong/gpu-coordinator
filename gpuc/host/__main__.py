@@ -158,6 +158,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         # is the priority the job was dispatched at, not the one it was
         # submitted with.
         entry["priority"] = spec.priority if spec else None
+        # Whether this job gives its cards up to anything more important. It
+        # changes what "running" promises, and only the spec knows.
+        entry["auto_preempt"] = spec.auto_preempt if spec else None
         # How many cards this job asked for. A queued job holds none, so its
         # `gpus` is empty and nothing else says whether it is waiting for one
         # card or for eight.

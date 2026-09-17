@@ -43,9 +43,11 @@ for step in "${steps[@]}"; do
       run uv run --frozen pyright gpuc tests
       ;;
     test)
-      # `gpu` needs a local NVIDIA card and `runpod` creates billable pods:
-      # neither may ever run unattended.
-      run uv run --frozen pytest -q -m "not gpu and not runpod" --durations=10
+      # No `-m` here: `pyproject.toml` already excludes the `runpod` tests,
+      # which rent hardware and are opt-in (`uv run pytest -m runpod`). The
+      # `gpu` tests run when this machine has the card they name and skip
+      # themselves when it does not, which is every CI runner.
+      run uv run --frozen pytest -q --durations=10
       ;;
   esac
 done

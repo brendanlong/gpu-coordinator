@@ -74,11 +74,18 @@ outputs:
     hf: my-org/lego-checkpoints
     hf_path: "{job_id}"
 sync_interval_s: 180               # upload cadence while running, and at the end; minimum 10
-priority: 50                       # 0 first, 99 last
+priority: 50                       # 0 first, 99 last. The queue is taken strictly in this
+                                   # order: a job that does not fit HOLDS the free cards it is
+                                   # waiting for, so a wide job at the front idles a card rather
+                                   # than losing it to a narrow job behind it
 max_runtime_min: 720               # optional wall-clock cap
 estimated_runtime_min: 480         # optional; what `gpuc status` shows the next person
 progress_command: "tail -1 results/progress.txt"   # optional; last stdout line is a percentage
 progress_interval_s: 60            # prints `0.42` or `42%`; a bare `42` is refused; min 5
+auto_preempt: false                # true: the host stops this job whenever that lets a job
+                                   # queued at a LOWER priority number start now, and queues it
+                                   # again as attempt+1. It RE-RUNS FROM THE START, any number
+                                   # of times, and may wait for ever on a busy host
 low_util:                          # kills a job whose GPU sits idle; defaults are conservative
   enabled: true                    # {window_min: 25, floor_pct: 5, grace_min: 10}
 cleanup: on_success                # workdir deleted after a successful run
@@ -168,7 +175,8 @@ A job's status is its exit code. `failed: <reason>` reasons you will see:
 credentials missing), `low-util` (idle GPU), `low-util-pause` (the host paused
 after two low-util failures and stopped this job so it could drain), `timeout`
 (`max_runtime_min`), `ttl` (the host's opt-in lifetime cap ran out), `preempted`
-(`gpuc preempt` stopped that attempt; the job is queued again as the next one), `sync`
+(`gpuc preempt` -- or the job's own `auto_preempt` -- stopped that attempt; the job is
+queued again as the next one), `sync`
 (final upload failed; results exist only on the host), `no-outputs` (the output
 path was never written), `terminated`, `runner-died`.
 
@@ -208,10 +216,12 @@ verdict on whether gpuc would borrow that card right now.
 
 `priority` (0-99, **lower runs first**) is the field that explains queue order,
 and it is on running jobs too. `queued` is already in dispatch order, so
-`jq '.hosts[].queued | sort_by(.priority)'` reproduces it. `starts_in_s` is when
-that job's turn is expected to come, projected from the estimates of the jobs
-ahead of it; it is null when one of them estimated nothing, so absent means
-"not known", never "not soon".
+`jq '.hosts[].queued | sort_by(.priority)'` reproduces it, and the host takes it
+strictly in that order -- a job that does not fit holds the cards it is waiting
+for, so a free card next to a queued job does not mean that job is next.
+`starts_in_s` is when that job's turn is expected to come, projected from the
+estimates of the jobs ahead of it; it is null when one of them estimated
+nothing, so absent means "not known", never "not soon".
 
 **Every command that has an answer takes `--json`**, and means the same thing by
 it: stdout is one object with `schema_version`, everything else the command says

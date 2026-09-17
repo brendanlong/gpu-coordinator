@@ -69,6 +69,13 @@ estimated_runtime_min: 480
 # progress_command: "tail -1 results/progress.txt"
 # progress_interval_s: 60                       # minimum 5
 
+# Let the host stop this job whenever that lets a job queued at a LOWER priority
+# number start right away, and queue it again as the next attempt. It re-runs
+# from the start in the workdir the stopped attempt left, so mark work that is
+# cheap to repeat -- and expect it to wait for ever on a busy host, which is
+# what asking for this means.
+auto_preempt: false
+
 low_util:                                       # kill a job that is not using the GPU
   enabled: true
   window_min: 25                                # rolling mean over this window

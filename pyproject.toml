@@ -52,3 +52,12 @@ typeCheckingMode = "standard"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["gpu: needs a local NVIDIA GPU", "runpod: creates a billable RunPod pod"]
+# The `runpod` tests rent hardware, so a bare `pytest` must never run them: the
+# default here is what protects somebody who types `pytest tests/` instead of
+# `./check.sh`, which is how a stray A40 got created once. Opt in explicitly
+# with `pytest -m runpod` (a command-line `-m` replaces this one).
+#
+# `gpu` is *not* excluded: those tests use tiny tensors on whatever local card
+# the machine has and skip themselves when it has none, so they cost nothing to
+# leave on -- and a GPU queue's GPU tests should not be the ones nobody runs.
+addopts = ["-m", "not runpod"]

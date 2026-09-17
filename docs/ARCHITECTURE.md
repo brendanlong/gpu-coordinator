@@ -178,6 +178,9 @@ All state writes are atomic (write temp in same dir, `os.replace`).
                                         # its last line of stdout is a percentage. See Estimates
   "progress_interval_s": 60,
   "low_util": {"enabled": true, "window_min": 25, "floor_pct": 5, "grace_min": 10},
+  "auto_preempt": false,                # let the dispatcher stop this job, as often as it
+                                        # takes, whenever that starts a strictly more
+                                        # important queued one right away
   "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
   "attempt": 1                          # set by `gpuc requeue` and `gpuc preempt`, not by the submitter
@@ -204,9 +207,25 @@ queue's lexical order, not submission order below one second.
   owned UUIDs, assign UUIDs, remove the queue
   marker, set state running, spawn the runner in its own process group
   (`start_new_session=True`), record pid/pgid. Multiple jobs may run at
-  once if GPUs allow; a `gpus: 0` job never waits. A job that asked to
-  (`use_shared`) and does not fit in the free owned cards makes up the
-  shortfall from the shared ones that are idle right now -- see Shared GPUs.
+  once if GPUs allow. A job that asked to (`use_shared`) and does not fit in the
+  free owned cards makes up the shortfall from the shared ones that are idle
+  right now -- see Shared GPUs.
+- **A job that does not fit holds the cards it is waiting for**, owned and
+  borrowed alike, and nothing behind it in the queue may take them. Without
+  that, priority is advisory the moment the job at the front is wider than the
+  free pool: a two-card job at priority 10 starved indefinitely behind one-card
+  jobs at 50, each of which fit the single card it was waiting for, and
+  automatic preemption livelocked because the card a stopped job handed back
+  was offered straight back to it. The cost is a card that runs nothing while
+  the rest of a job's cards are assembled -- billed, on a rented pod.
+  A job only holds when the host could supply the *whole* of it from what it
+  owns and can currently see (`spec.gpus <= len(owned_gpus())`). The two that
+  are walked past instead would be holding a card against something nobody here
+  controls: a `gpus: 0` job (it holds none and waits for none) and a job that
+  needs a card the host cannot see -- one that has dropped off nvidia-smi, or a
+  shared one, which comes free when somebody else's job ends. Neither is
+  failed; `_capacity_failure` is what fails a job bigger than the configured
+  host, shared cards included.
 - Cancel: `queue.cancel(jobid)` writes `jobs/<id>/cancel`. The **runner**
   owns the kill: it checks the marker before each phase and on every poll, and
   stops the phase's scope (`systemctl --user stop <unit>`) or, with no systemd,
@@ -258,6 +277,30 @@ queue's lexical order, not submission order below one second.
   A kill marker the dispatcher did not write gets a clock in `escalate_kills`
   the first pass it sees one, so a runner that ignores a preempt is escalated
   like any other kill.
+- Automatic preemption: after `launch_ready` -- so everything still queued is
+  something the free cards could not take -- `preempt_for_waiting` walks the
+  queue and, for each job that does not fit, asks whether stopping the running
+  jobs whose spec says `auto_preempt` would let it start. `enough_to_start`
+  picks a set only if together they cover the *whole* gap (freeing one of two
+  cards costs an attempt and starts nothing), and only jobs at a strictly
+  higher priority number than the waiting one (at equal priority the stopped
+  job's older id wins the tie and it would take its own cards straight back,
+  for ever). Candidates go least important first, and among equals the one that
+  started most recently, since what a preempt throws away is the work already
+  done. Nothing runs on a host that is paused, `_going_away`, or within
+  `AUTO_PREEMPT_TTL_MARGIN_S` of its TTL -- a job stopped there may never be
+  queued again, and unlike the command nobody is watching. The stop itself is
+  `queue.preempt`, so all of it is the ordinary preempt path, including the
+  re-queue at the job's own priority. Nothing counts how often a job has given
+  way: `auto_preempt` accepts being starved.
+  What stops a preempted job from taking its own cards straight back is the
+  dispatch rule above: it is queued again at its own priority, behind the job
+  that is waiting, and a job that does not fit holds its cards. Cards held by a
+  job that is *already* stopping count as available to the job at the front, or
+  the next pass preempts a second job for a gap the first already covers. Once
+  one stop in a set fails the rest are left alone -- the gap is no longer
+  coverable, so their attempts would buy nothing -- and the next pass stops
+  only the remainder.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.
@@ -437,18 +480,20 @@ it gets no `free` line rather than one saying so.
 
 The same estimates are what `status.queue_start_estimates` projects a queued
 job's *start* from (`starts_in_s` / `starts_at`, and ` starts in ~2h10m` on the
-queued line). It replays the dispatcher's own rule rather than assuming
-strict head-of-queue order -- cards come free at the eta of whatever holds
-them, the whole queue is walked at each release, and a job that fits into what
-is free before the job ahead of it does starts first, exactly as
-`launch_ready` backfills. A card held by a job that published no eta is not
+queued line). It replays the dispatcher's own rule -- cards come free at
+the eta of whatever holds them and the queue is taken in order, because
+`launch_ready` holds a card for the job at the front rather than handing it to
+a job behind. The same two exemptions apply, or the projection would contradict
+the host: a `gpus: 0` job starts now wherever it sits, and a job asking for more
+cards than the host has is skipped entirely (it will never be dispatched, so it
+holds nothing up). A card held by a job that published no eta is not
 schedulable at all, so a job whose turn depends on one is reported as *unknown*
-rather than guessed; that is why a later job can have a start time when an
-earlier one does not. A paused or draining host projects nothing, because
+rather than guessed. A paused or draining host projects nothing, because
 nothing is being dispatched. `submit`, `requeue` and `reorder` print the
 projection for the job they just touched, alongside its queue position, and say
-*why* there is no time when there is none -- "the host is paused" and "a job
-ahead of it gave no estimate" are different things to do about it.
+*why* there is no time when there is none -- "the host is paused", "the job ahead of it
+has no start time yet" and "the jobs holding the cards it needs gave no end
+time" are different things to do about it.
 
 ## Process isolation (cgroup scope, else process group)
 
@@ -1270,9 +1315,17 @@ reconcile by hand.
 
 ## Testing rules
 
+- `./check.sh` is the whole suite, and what CI runs. A bare `pytest` is safe
+  too: `addopts` in `pyproject.toml` excludes the `runpod` marker, so the tests
+  that rent hardware never run by accident -- opt in with `pytest -m runpod`.
+  Nothing else is excluded by default.
 - Unit tests run without a GPU (mock `nvidia-smi` output, temp `~/.gpuc`).
-- Local GPU integration tests use tiny tensors (`torch.zeros(8)`), never
-  more than ~100 MB VRAM; other people's jobs share the card.
+- Local GPU integration tests (`gpu`) **run by default**: they use tiny tensors
+  (`torch.zeros(8)`), never more than ~100 MB VRAM because other people's jobs
+  share the card, and they skip themselves on a machine whose `nvidia-smi` does
+  not report `tests.conftest.LOCAL_GPU_UUID` -- which is every CI runner. A GPU
+  queue whose GPU tests are the ones nobody runs is how they rot; two of them
+  had, asserting on a `gpuc status` line that had since gained a job name.
 - RunPod integration: A40 only, `--max-price 0.60`, a job whose command
   is under two minutes, `--idle-min 2`, `--ttl-hours 1` (a TTL is opt-in, and a
   test that creates a billable pod is exactly where opting in is right), and the test

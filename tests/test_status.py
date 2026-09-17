@@ -857,9 +857,10 @@ def test_a_job_that_gave_no_estimate_hides_only_the_jobs_behind_it() -> None:
     assert starts["j-cpu"] == 0.0
 
 
-def test_a_two_card_job_does_not_hold_up_the_one_card_job_behind_it() -> None:
-    """The dispatcher walks the whole queue every pass rather than blocking on
-    the head of it, so the estimate has to as well."""
+def test_a_two_card_job_holds_up_the_one_card_job_behind_it() -> None:
+    """The dispatcher takes the queue in order and a job that does not fit
+    holds the free cards it is waiting for, so the estimate has to as well: the
+    card that comes back at 45m is not the narrow job's to take."""
     view = busy(
         running_job(gpus=[GPU], eta=in_minutes(45)),
         running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(90)),
@@ -869,11 +870,39 @@ def test_a_two_card_job_does_not_hold_up_the_one_card_job_behind_it() -> None:
         ],
     )
     starts = queue_start_estimates(view)
-    # The one-card job takes the first card back at 45m and is done with it by
-    # 55m; the two-card job still waits for the second card, at 90m.
-    assert 44 * 60 < starts["j-narrow"] < 46 * 60
     assert 89 * 60 < starts["j-wide"] < 91 * 60
+    # And the job behind it has no turn anyone can name: the wide job takes
+    # both cards at 90m and never said when it would be done with them.
+    assert "j-narrow" not in starts
+    assert "gave no end time" in no_start_reason(view, view.queue[1])
     assert "needs 2 gpus" in render(view)
+
+
+def test_a_job_behind_a_wide_one_starts_when_the_wide_one_is_done() -> None:
+    view = busy(
+        running_job(gpus=[GPU], eta=in_minutes(45)),
+        running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(90)),
+        queued=[
+            waiting("j-wide", gpus_requested=2, estimated_runtime_min=30.0),
+            waiting("j-narrow", estimated_runtime_min=10.0),
+        ],
+    )
+    starts = queue_start_estimates(view)
+    # Both cards at 90m, held for the wide job's own half hour.
+    assert 89 * 60 < starts["j-wide"] < 91 * 60
+    assert 119 * 60 < starts["j-narrow"] < 121 * 60
+
+
+def test_a_job_behind_one_that_can_never_be_placed_says_which_job() -> None:
+    """Not "the cards it needs": this job is waiting on the queue, not on a
+    card, and the job ahead of it is the whole reason."""
+    view = busy(
+        running_job(gpus=[GPU]),  # no eta, so its card is not schedulable
+        running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(90)),
+        queued=[waiting("j-wide", gpus_requested=2), waiting("j-narrow")],
+    )
+    assert queue_start_estimates(view) == {}
+    assert "j-wide is ahead of it" in no_start_reason(view, view.queue[1])
 
 
 def test_a_cpu_job_is_not_described_as_needing_no_cards() -> None:
