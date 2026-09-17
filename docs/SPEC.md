@@ -194,8 +194,7 @@ destinations. Adding another of either changes nothing else in this document.
 - A guaranteed rental teardown. A rental ends itself when idle; one whose
   provisioning client died before terminating it, or whose dispatcher dies
   after handoff, bills until a person ends it.
-- Detecting whether a running job is using its GPU efficiently, or pausing a
-  host because of it.
+- Detecting whether a running job is using its GPU efficiently.
 - Spending limits across rentals.
 - Automatic re-placement of a job after it has started running: a failure at
   that point is more likely the job's than the host's.
