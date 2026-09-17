@@ -26,7 +26,7 @@ from gpuc.control.remote import (
     write_remote_config,
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
-from gpuc.control.version import local_commit, package_root
+from gpuc.control.version import local_commit, package_root, short
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
@@ -49,6 +49,26 @@ class BootstrapResult:
     pkg_commit: str | None = None
     """The gpuc commit this bootstrap shipped, as `gpuc version` reports it."""
     warnings: list[str] = field(default_factory=list)
+
+    def render(self) -> str:
+        line = (
+            f"host {self.host} ready: {self.files} package files at {self.home}/pkg "
+            f"({short(self.pkg_commit)}), dispatcher pid {self.dispatcher_pid}"
+        )
+        if self.warnings:
+            line += f"\n{len(self.warnings)} warning(s) above"
+        return line
+
+    def document(self) -> dict[str, Any]:
+        """`gpuc host bootstrap --json`, and one entry of `--all`'s `hosts[]`."""
+        return {
+            "host": self.host,
+            "home": self.home,
+            "files": self.files,
+            "pkg_commit": self.pkg_commit,
+            "dispatcher_pid": self.dispatcher_pid,
+            "warnings": list(self.warnings),
+        }
 
 
 def package_files(root: Path | None = None) -> list[str]:

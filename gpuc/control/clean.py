@@ -416,15 +416,57 @@ def verify_mirror(
 UV_CACHE_PRUNE = """\
 cache=$({env}{uv} cache dir 2>/dev/null || echo "$HOME/.cache/uv")
 echo "before=$(du -sh "$cache" 2>/dev/null | cut -f1)"
+echo "before_bytes=$(du -sb "$cache" 2>/dev/null | cut -f1)"
 {env}{uv} cache prune
 echo "after=$(du -sh "$cache" 2>/dev/null | cut -f1)"
+echo "after_bytes=$(du -sb "$cache" 2>/dev/null | cut -f1)"
 echo "dir=$cache"
 """
 
 
+@dataclass
+class PruneReport:
+    """What `uv cache prune` on a host did: the cache, and its size either side."""
+
+    host: str
+    cache_dir: str | None
+    before: str | None
+    """`du -sh` of the cache before the prune, as the host printed it."""
+    after: str | None
+    before_bytes: int | None = None
+    after_bytes: int | None = None
+
+    @property
+    def freed_bytes(self) -> int | None:
+        if self.before_bytes is None or self.after_bytes is None:
+            return None
+        return max(self.before_bytes - self.after_bytes, 0)
+
+    def render(self) -> str:
+        return (
+            f"host {self.host}: uv cache {self.cache_dir or '?'} "
+            f"pruned {self.before or '?'} -> {self.after or '?'}"
+        )
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "host": self.host,
+            "cache_dir": self.cache_dir,
+            "before": self.before,
+            "after": self.after,
+            "before_bytes": self.before_bytes,
+            "after_bytes": self.after_bytes,
+            "freed_bytes": self.freed_bytes,
+        }
+
+
+def _int_or_none(raw: str | None) -> int | None:
+    return int(raw) if raw is not None and raw.isdigit() else None
+
+
 def prune_uv_cache(
     entry: HostEntry, settings: Settings | None = None, *, transport: Transport | None = None
-) -> str:
+) -> PruneReport:
     """`uv cache prune` on the host: drop cache entries no venv can link to.
 
     Deliberately `prune` and not `clean`: pruning removes unused and
@@ -444,7 +486,11 @@ def prune_uv_cache(
             f"{result.output.strip()[-800:]}"
         )
     values = dict(line.split("=", 1) for line in result.stdout.splitlines() if line.count("=") == 1)
-    return (
-        f"host {entry.name}: uv cache {values.get('dir', '?')} "
-        f"pruned {values.get('before', '?')} -> {values.get('after', '?')}"
+    return PruneReport(
+        host=entry.name,
+        cache_dir=values.get("dir") or None,
+        before=values.get("before") or None,
+        after=values.get("after") or None,
+        before_bytes=_int_or_none(values.get("before_bytes")),
+        after_bytes=_int_or_none(values.get("after_bytes")),
     )

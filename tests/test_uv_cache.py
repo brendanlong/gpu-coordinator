@@ -247,8 +247,19 @@ def test_host_clean_prunes_rather_than_cleans(control_env: Path) -> None:
     from gpuc.control.clean import prune_uv_cache
 
     host = PruningHost()
-    line = prune_uv_cache(entry(uv="/home/u/.local/bin/uv"), transport=host)
-    assert "pruned 18G -> 11G" in line
+    report = prune_uv_cache(entry(uv="/home/u/.local/bin/uv"), transport=host)
+    assert "pruned 18G -> 11G" in report.render()
+    # Sizes in bytes are what a script wants, and a host that printed none
+    # (an older prune script, a `du` that failed) leaves them null, not zero.
+    assert report.document() == {
+        "host": "h",
+        "cache_dir": "/home/u/.cache/uv",
+        "before": "18G",
+        "after": "11G",
+        "before_bytes": None,
+        "after_bytes": None,
+        "freed_bytes": None,
+    }
     pruned = next(e for e in host.events if "cache prune" in e)
     # `uv cache clean` would throw away the wheels the next job wants to link.
     assert "cache clean" not in pruned

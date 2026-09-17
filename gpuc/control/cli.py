@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from gpuc.control.actions import (
     cancel_job,
     check_estimate,
     config_document,
+    connection_document,
     estimate_job,
     exit_code_for,
     failure_message,
@@ -38,6 +40,7 @@ from gpuc.control.actions import (
     gather_all,
     hosts_document,
     hosts_for,
+    init_config,
     job_log_path,
     make_provider,
     named_registry,
@@ -47,19 +50,26 @@ from gpuc.control.actions import (
     provider_for_status,
     read_log,
     read_registry_warned,
+    remove_host,
     reorder_job,
     shipped_note,
     status_document,
     version_document,
     warn,
 )
-from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_package
+from gpuc.control.bootstrap import (
+    BootstrapError,
+    BootstrapResult,
+    bootstrap_host,
+    resync_package,
+)
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
+    Reporter,
     Settings,
     config_file,
     hosts_file,
@@ -68,7 +78,6 @@ from gpuc.control.config import (
     registry_transaction,
     state_dir,
     transport_for,
-    write_config_template,
 )
 from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import rows as gpu_rows
@@ -94,7 +103,6 @@ from gpuc.control.s3index import (
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import (
     JobSpecModel,
-    Reporter,
     SubmitResult,
     load_document,
     precheck_local,
@@ -295,21 +303,26 @@ def cmd_host_add(args: argparse.Namespace) -> int:
                 update={"bootstrapped_at": current.bootstrapped_at}
             )
         registry.put(entry)
-    lines = [_added_line(entry, connection, args.name)]
+    warnings: list[str] = []
     if not connection.adopted and not entry.gpus:
-        lines.append(_owns_nothing_line(entry, args, report))
+        warnings.append(_owns_nothing_warning(entry, args, report))
     if args.pod and not connection.adopted:
         # A pod nobody has set up has no dispatcher, so nothing will ever idle
         # it out: it bills until bootstrap gives it one or a person ends it.
-        lines.append(
-            f"  nothing has bootstrapped this pod, so nothing on it will ever terminate it: "
+        warnings.append(
+            f"nothing has bootstrapped this pod, so nothing on it will ever terminate it: "
             f"`gpuc host bootstrap {entry.name}` gives it a dispatcher that does"
         )
+    if args.json:
+        jsonout.emit(connection_document(entry, connection, warnings=warnings))
+        return EXIT_OK
+    lines = [_added_line(entry, connection, args.name)]
+    lines += [f"  {warning}" for warning in warnings]
     print("\n".join(lines))
-    return 0
+    return EXIT_OK
 
 
-def _owns_nothing_line(entry: HostEntry, args: argparse.Namespace, report: ProbeReport) -> str:
+def _owns_nothing_warning(entry: HostEntry, args: argparse.Namespace, report: ProbeReport) -> str:
     """A first config that owns no card is legal and useless; say which it was."""
     if args.gpus is not None:
         why = "--gpus '' asked for none"
@@ -320,7 +333,7 @@ def _owns_nothing_line(entry: HostEntry, args: argparse.Namespace, report: Probe
     else:
         why = "it has no nvidia-smi"
     return (
-        f"  it owns no GPUs ({why}), so nothing can be submitted to it: "
+        f"it owns no GPUs ({why}), so nothing can be submitted to it: "
         f"`gpuc host set {entry.name} --gpus <list>` assigns some"
     )
 
@@ -457,38 +470,53 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     # `--persistent-root` in the same command moves gpuc home, and writing the
     # config to where the host is not would leave the real one behind.
     config: dict[str, Any] | None = None
+    settings = load_settings()
     if fields or env_updates:
-        connection = push_config(entry, load_settings(), fields=fields, env_updates=env_updates)
+        connection = push_config(entry, settings, fields=fields, env_updates=env_updates)
         entry, config = connection.entry, connection.entry.cache.config
         lines += [f"  host <- {change}" for change in connection.changes] or [
             "  host already holds that config; nothing changed"
         ]
+    else:
+        # The address alone changed, so the host was not asked: the document
+        # still says which config it holds, from the cache, dated as such.
+        connection = Connection(entry=entry, home=entry.remote_home, adopted=True)
     entry = entry.model_copy(update=address)
     lines += [f"  here <- {key}={value!r}" for key, value in sorted(address.items())]
+    warnings: list[str] = []
     # Re-read under the lock: the entry above was read before an ssh round
     # trip, and writing it back whole would undo whatever a concurrent `gpuc
     # host probe` or submit learned about the same host in between.
     with registry_transaction() as registry:
         current = registry.hosts.get(entry.name)
         if current is None:
-            warn(f"host {entry.name} was removed while this ran; nothing was registered")
+            warnings.append(f"host {entry.name} was removed while this ran; nothing was registered")
         else:
             updated = current.model_copy(update=address)
             registry.put(updated if config is None else updated.with_config(config))
+    for warning in warnings:
+        warn(warning)
     home = _home_line(entry)
     if home:
         lines.append(home)
         lines.append(f"the host moves there on: gpuc host bootstrap {entry.name}")
+    if args.json:
+        document = connection_document(entry, connection, warnings=warnings)
+        jsonout.emit({**document, "address": address})
+        return EXIT_OK
     print("\n".join(lines))
-    return 0
+    return EXIT_OK
 
 
 def cmd_host_remove(args: argparse.Namespace) -> int:
-    with registry_transaction() as registry:
-        registry.require(args.name)
-        del registry.hosts[args.name]
+    document = remove_host(args.name)
+    if args.json:
+        jsonout.emit(document)
+        return EXIT_OK
     print(f"removed host {args.name}")
-    return 0
+    for text in document["notes"]:
+        print(f"  {text}")
+    return EXIT_OK
 
 
 def cmd_host_list(args: argparse.Namespace) -> int:
@@ -538,41 +566,99 @@ def cmd_host_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def bootstrap_and_record(entry: HostEntry, settings: Settings, health_args: str) -> None:
+def bootstrap_and_record(
+    entry: HostEntry, settings: Settings, health_args: str, report: Reporter = print
+) -> BootstrapResult:
     """Bootstrap one host, persist what it told us about itself, and say so."""
-    updated, result = bootstrap_host(entry, settings, health_args=health_args)
+    updated, result = bootstrap_host(entry, settings, health_args=health_args, report=report)
     with registry_transaction() as registry:
         registry.put(updated)
-    print(
-        f"host {result.host} ready: {result.files} package files at {result.home}/pkg "
-        f"({version_mod.short(result.pkg_commit)}), dispatcher pid {result.dispatcher_pid}"
-    )
-    if result.warnings:
-        print(f"{len(result.warnings)} warning(s) above")
+    report(result.render())
+    return result
 
 
-def bootstrap_tally(total: int, done: int, failed: Sequence[HostEntry], skipped: int) -> str:
+@dataclass
+class BootstrapTally:
     """The last word of a `--all` run: what worked, what did not, what was never read.
 
     Counted rather than claimed, because the run this ends can be long enough
     that nobody reads the middle of it: a host this build could not parse out
     of the registry was never bootstrapped either, and saying "all of them"
-    over the top of that warning is how one gets missed for a month.
+    over the top of that warning is how one gets missed for a month. One
+    entry per registered host, in the order they were taken, so the `--json`
+    form is the tally as data rather than as a sentence.
     """
-    lines = [f"{done}/{total} host(s) bootstrapped"]
-    if failed:
-        lines.append(f"failed: {', '.join(entry.name for entry in failed)}")
-        if any(entry.ephemeral for entry in failed):
+
+    hosts: list[HostEntry]
+    unreadable: list[str]
+    """Registry entries this build could not read, by name: never attempted."""
+    errors: list[str]
+    outcomes: list[dict[str, Any]] = field(default_factory=list)
+    interrupted: bool = False
+
+    def record(
+        self,
+        entry: HostEntry,
+        outcome: str,
+        result: BootstrapResult | None = None,
+        *,
+        error: str | None = None,
+    ) -> None:
+        self.outcomes.append(
+            {
+                "name": entry.name,
+                "outcome": outcome,
+                "error": error,
+                "ephemeral": entry.ephemeral,
+                "home": result.home if result else None,
+                "files": result.files if result else None,
+                "pkg_commit": result.pkg_commit if result else None,
+                "dispatcher_pid": result.dispatcher_pid if result else None,
+                "warnings": list(result.warnings) if result else [],
+            }
+        )
+
+    @property
+    def done(self) -> list[str]:
+        return [o["name"] for o in self.outcomes if o["outcome"] == "bootstrapped"]
+
+    @property
+    def failed(self) -> list[dict[str, Any]]:
+        return [o for o in self.outcomes if o["outcome"] == "failed"]
+
+    def render(self) -> str:
+        lines = [f"{len(self.done)}/{len(self.hosts)} host(s) bootstrapped"]
+        if self.failed:
+            lines.append(f"failed: {', '.join(o['name'] for o in self.failed)}")
+            if any(o["ephemeral"] for o in self.failed):
+                lines.append(
+                    "an ephemeral host whose pod is already gone is forgotten by "
+                    "`gpuc host remove <name>`"
+                )
+        if self.unreadable:
             lines.append(
-                "an ephemeral host whose pod is already gone is forgotten by "
-                "`gpuc host remove <name>`"
+                f"{len(self.unreadable)} host(s) in the registry could not be read (warnings above)"
             )
-    if skipped:
-        lines.append(f"{skipped} host(s) in the registry could not be read (warnings above)")
-    return "\n".join(lines)
+        return "\n".join(lines)
+
+    def document(self) -> dict[str, Any]:
+        """`gpuc host bootstrap --all --json`: every registered host and what became of it."""
+        attempted = {o["name"] for o in self.outcomes}
+        for entry in self.hosts:
+            if entry.name not in attempted:
+                self.record(entry, "not_attempted")
+        return {
+            "hosts": self.outcomes,
+            "total": len(self.hosts),
+            "bootstrapped": self.done,
+            "failed": [o["name"] for o in self.failed],
+            "unreadable": list(self.unreadable),
+            "interrupted": self.interrupted,
+            "errors": list(self.errors),
+        }
 
 
-def bootstrap_every_host(settings: Settings, health_args: str) -> int:
+def bootstrap_every_host(settings: Settings, health_args: str, *, as_json: bool) -> int:
     """`gpuc host bootstrap --all`: the upgrade loop, one command.
 
     A host that fails does not stop the others: an ephemeral host whose pod is
@@ -584,35 +670,47 @@ def bootstrap_every_host(settings: Settings, health_args: str) -> int:
     if read.unreadable:
         raise LocalStateUnreadable("\n".join(read.errors))
     hosts = list(read.registry.hosts.values())
+    report: Reporter = jsonout.note if as_json else print
+    tally = BootstrapTally(hosts, sorted(read.skipped), list(read.errors))
     if not hosts:
-        print(NO_HOSTS)
+        if as_json:
+            jsonout.emit(tally.document())
+        else:
+            print(NO_HOSTS)
         return EXIT_OK
-    done = 0
-    failed: list[HostEntry] = []
+    code = EXIT_OK
     for index, entry in enumerate(hosts, start=1):
         if index > 1:
-            print()
-        print(f"== {entry.name} ({index}/{len(hosts)}) ==")
+            report("")
+        report(f"== {entry.name} ({index}/{len(hosts)}) ==")
         try:
-            bootstrap_and_record(entry, settings, health_args)
-            done += 1
+            tally.record(
+                entry, "bootstrapped", bootstrap_and_record(entry, settings, health_args, report)
+            )
         except KeyboardInterrupt:
             # Health alone allows five minutes a host, so this is a command
             # somebody does give up on; what it got through is still true.
-            print(f"\ninterrupted during {entry.name}")
-            print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
-            return EXIT_ERROR
+            report(f"\ninterrupted during {entry.name}")
+            tally.record(entry, "interrupted")
+            tally.interrupted = True
+            code = EXIT_ERROR
+            break
         except LocalStateUnreadable:
             # The registry stopped being readable mid-run, so the next host's
-            # write would be a guess: say how far this got, and exit 3.
-            print(f"\n{bootstrap_tally(len(hosts), done, failed, len(read.skipped))}")
+            # write would be a guess: say how far this got, and exit 3. Under
+            # --json the error document is the one stdout gets.
+            report(f"\n{tally.render()}")
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
             print(f"error: host {entry.name}: {exc}", file=sys.stderr)
-            failed.append(entry)
+            tally.record(entry, "failed", error=str(exc))
+            code = EXIT_ERROR
+    if as_json:
+        jsonout.emit(tally.document())
+        return code
     print()
-    print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
-    return EXIT_ERROR if failed else EXIT_OK
+    print(tally.render())
+    return code
 
 
 def cmd_host_bootstrap(args: argparse.Namespace) -> int:
@@ -622,10 +720,13 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
             raise UsageError(
                 f"host bootstrap takes a host name or --all, not both (got {args.name!r})"
             )
-        return bootstrap_every_host(settings, args.health_args)
+        return bootstrap_every_host(settings, args.health_args, as_json=args.json)
     if not args.name:
         raise UsageError("host bootstrap wants a host name, or --all for every registered host")
-    bootstrap_and_record(named_registry().require(args.name), settings, args.health_args)
+    entry = named_registry().require(args.name)
+    result = bootstrap_and_record(entry, settings, args.health_args, reporter(args))
+    if args.json:
+        jsonout.emit(result.document())
     return EXIT_OK
 
 
@@ -669,8 +770,12 @@ def cmd_host_clean(args: argparse.Namespace) -> int:
     if not args.uv_cache:
         raise UsageError("host clean needs --uv-cache (job workdirs are `gpuc clean --host H`)")
     entry = named_registry().require(args.name)
-    print(prune_uv_cache(entry, load_settings()))
-    return 0
+    report = prune_uv_cache(entry, load_settings())
+    if args.json:
+        jsonout.emit(report.document())
+    else:
+        print(report.render())
+    return EXIT_OK
 
 
 def cmd_host_probe(args: argparse.Namespace) -> int:
@@ -759,9 +864,15 @@ def runpod_target(args: argparse.Namespace, settings: Settings) -> HostEntry:
 
 
 def cmd_config_init(args: argparse.Namespace) -> int:
-    path = write_config_template(force=args.force)
-    print(f"wrote {path}\nEvery key is commented with its default; edit what you need.")
-    return 0
+    document = init_config(force=args.force)
+    if args.json:
+        jsonout.emit(document)
+        return EXIT_OK
+    print(
+        f"wrote {document['config_file']}\n"
+        f"Every key is commented with its default; edit what you need."
+    )
+    return EXIT_OK
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
@@ -1468,6 +1579,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow a --gpus that claims some but not all of the cards the host is already "
         "configured with",
     )
+    add_json_flag(add, "the host as `host list --json` reports it, plus what this wrote to it")
     add.set_defaults(func=cmd_host_add)
 
     edit = host.add_parser(
@@ -1508,6 +1620,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MINUTES",
         help="idle minutes before an ephemeral host terminates itself",
     )
+    add_json_flag(edit, "the host as `host list --json` reports it, plus what this changed")
     edit.set_defaults(func=cmd_host_set)
 
     bootstrap = host.add_parser("bootstrap", help="install uv, the package and the dispatcher")
@@ -1520,6 +1633,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bootstrap.add_argument(
         "--health-args", default="", help="extra flags for `gpuc.host health`, e.g. --min-mbps 0.1"
+    )
+    add_json_flag(
+        bootstrap,
+        "what the bootstrap left on the host; with --all, one entry per registered host "
+        "saying whether it was bootstrapped, failed (and why) or was never reached. "
+        "Progress goes to stderr, and the exit code is the same as without it",
     )
     bootstrap.set_defaults(func=cmd_host_bootstrap)
 
@@ -1539,6 +1658,7 @@ def build_parser() -> argparse.ArgumentParser:
     host_clean.add_argument(
         "--uv-cache", action="store_true", help="run `uv cache prune` on the host"
     )
+    add_json_flag(host_clean, "the cache directory and its size before and after the prune")
     host_clean.set_defaults(func=cmd_host_clean)
 
     host_list = host.add_parser("list", help="list registered hosts")
@@ -1546,6 +1666,7 @@ def build_parser() -> argparse.ArgumentParser:
     host_list.set_defaults(func=cmd_host_list)
     remove = host.add_parser("remove", help="forget a host")
     remove.add_argument("name")
+    add_json_flag(remove, "what was forgotten: the entry's name, kind and pod id")
     remove.set_defaults(func=cmd_host_remove)
 
     submit = sub.add_parser("submit", help="submit a job file to a host")
@@ -1786,6 +1907,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_init = config.add_parser("init", help="write a commented config.toml")
     config_init.add_argument("--force", action="store_true", help="overwrite an existing file")
+    add_json_flag(config_init, "the path written, and whether a file was already there")
     config_init.set_defaults(func=cmd_config_init)
     config_show = config.add_parser("show", help="print the effective settings")
     add_json_flag(config_show)

@@ -238,6 +238,11 @@ scraping any of the text output.
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
 | `host list` | `{hosts[], errors[]}` |
 | `host probe` | `{host, sections{}, driver_version, gpus[] each with assigned, assigned_gpus[], uv_cache{}, notes[], ...}` |
+| `host add`, `host set` | one `host list` entry as the registry now holds it, plus `adopted`, `config_path`, `changes[]`, `warnings[]` (`set` adds `address{}`) |
+| `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}`; with `--all`, `{hosts[], total, bootstrapped[], failed[], unreadable[], interrupted, errors[]}` where each of `hosts[]` is `{name, outcome, error, ...}` and `outcome` is `bootstrapped`, `failed`, `interrupted` or `not_attempted` |
+| `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` |
+| `host remove` | `{host, kind, pod_id, notes[]}`; a rental is not terminated by this, and `notes` says so |
+| `config init` | `{config_file, existed}` |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
 
 ```bash

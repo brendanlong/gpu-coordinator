@@ -314,7 +314,9 @@ that fails does not stop the others — a pod that has already gone away is the
 ordinary case, and `gpuc host remove <name>` is what forgets it — so the run ends
 with a tally naming each failure and exits 1, while the hosts that did upgrade
 stay upgraded. The tally also counts any host entry this build could not read
-(skipped with a warning), because that host was not upgraded either.
+(skipped with a warning), because that host was not upgraded either. `--json`
+prints that tally as one entry per host with its outcome and, for a failure,
+the reason ([usage.md](usage.md#--json-everywhere-else)).
 
 A host nothing has ever installed gpuc on -- registered with `gpuc host add`
 and not bootstrapped, by this machine or any other -- is refused by `gpuc

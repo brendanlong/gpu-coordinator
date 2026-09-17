@@ -786,11 +786,15 @@ Rules for anything automated:
 ### `--json` everywhere else
 
 `status`, `submit`, `requeue`, `logs`, `cancel`, `preempt`, `reorder`, `estimate`,
-`pods`, `version`, `clean`, `config show`, `host list` and `host probe` take
+`pods`, `version`, `clean`, `config show`, `config init`, `host list`, `host probe`,
+`host add`, `host set`, `host bootstrap`, `host clean` and `host remove` take
 `--json`, under the same rules: **stdout is exactly one JSON object**, it carries `schema_version`,
 and everything the text output would print alongside it — progress, warnings,
 `note:` lines — goes to stderr instead. The exit codes are the table above,
-unchanged by the flag.
+unchanged by the flag. The commands without it have no answer to give: `ssh`
+opens a shell or returns the remote command's own output, `skill` prints the
+guide itself, `web serve` runs a server, and `web set-password` and `skill
+--install` write one file and print instructions for the person who asked.
 
 **A command that failed prints a document too**, so a caller parsing stdout is
 never handed nothing at all:
@@ -820,12 +824,18 @@ that exits 1 on its own `errors`).
 | `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at` saying when that was, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]` (a re-bootstrap note: nothing here asks the host). The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`), because `--env` is free-form and this document travels. A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. The job objects are the host's own: `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
+| `host add`, `host set` | the host as `host list --json` reports one entry (the address, the host's own config flattened beside it, `cache`, `remote_home`, `ephemeral`), as the registry holds it once the command is done, plus `adopted` (the host already had a config, which `add` took as it stood), `config_path` (that config on the host), `changes[]` (one line per config field this command wrote through to the host, empty when it held that already) and `warnings[]` (`host list`'s re-bootstrap note, and for `add` a host that owns no card or a pod nothing has bootstrapped). `host set` adds `address{}`: the fields it changed here rather than on the host (`persistent_root`, `gpuc_home`), by name and new value |
+| `host remove` | `{host, kind, pod_id, notes[]}` — what was forgotten here. Nothing on the host changes, and a rental is **not** terminated: `notes` says so for an ephemeral host, since it goes on billing until it idles out |
+| `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}` — the gpuc home the package went to, how many files, the commit it now runs, the dispatcher started, and every warning the run printed. With `--all`: `{hosts[], total, bootstrapped[], failed[], unreadable[], interrupted, errors[]}`, the tally as data — one `hosts[]` entry per registered host, `{name, outcome, error, ephemeral}` plus the single-host fields (null unless it was bootstrapped), where `outcome` is `bootstrapped`, `failed` (with `error` saying why), `interrupted` (the host a Ctrl-C landed in) or `not_attempted` (the ones after it); `unreadable` names the registry entries this build could not read and so never tried, and `errors` is what it said about them. Exit 1 if any host failed or the run was interrupted, exactly as without the flag; a registry that stops being readable mid-run is the error document and exit 3 |
+| `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` — the cache pruned and its size either side, as the host's `du -sh` printed it and in bytes. The byte fields are null when the host did not report them |
+| `config init` | `{config_file, existed}` — the path written, and whether a file was already there (only ever true with `--force`; without it an existing file is refused, exit 1) |
 
 ```sh
 gpuc submit job.yaml --host gpubox --json | jq -r .job_id
 gpuc logs "$id" --json | jq -r '.lines[-20:][]'
 gpuc pods --json | jq '[.pods[] | select(.host == null) | .name]'
 gpuc clean --host gpubox --all-finished --dry-run --json | jq .freed_bytes
+gpuc host bootstrap --all --json | jq -r '.hosts[] | "\(.name) \(.outcome) \(.error // "")"'
 ```
 
 ## Cleanup and retention

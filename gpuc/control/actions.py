@@ -32,8 +32,11 @@ from gpuc.control.config import (
     config_file,
     hosts_file,
     read_registry,
+    registry_transaction,
     state_dir,
+    write_config_template,
 )
+from gpuc.control.connect import Connection
 from gpuc.control.providers.base import Provider, ProviderError
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.provision import ProvisionError
@@ -272,6 +275,57 @@ def hosts_document(read: RegistryRead) -> dict[str, Any]:
         "hosts": [host_document(entry) for entry in read.registry.hosts.values()],
         "errors": list(read.errors),
     }
+
+
+def connection_document(
+    entry: HostEntry, connection: Connection, *, warnings: Sequence[str] = ()
+) -> dict[str, Any]:
+    """`gpuc host add --json` and `gpuc host set --json`: the host as it now is.
+
+    The same shape as one entry of `host list --json`, since that is what the
+    registry now holds, plus what this command did to get there: `adopted` is
+    whether the host already had a config, `config_path` where that config
+    lives on the host, and `changes` the per-field lines the text output prints
+    for what was written through to it. `warnings` carries what the text output
+    says beside the result -- a host that owns no card, a pod nothing has
+    bootstrapped -- on top of the re-bootstrap note `host list` gives.
+    """
+    document = host_document(entry)
+    return {
+        **document,
+        "adopted": connection.adopted,
+        "config_path": f"{connection.home}/config.json",
+        "changes": list(connection.changes),
+        "warnings": [*document["warnings"], *warnings],
+    }
+
+
+def remove_host(name: str) -> dict[str, Any]:
+    """Forget a host here. Nothing on the host, or at its provider, changes.
+
+    A rental in particular is not terminated: after handoff it ends itself
+    when idle, and nothing on a client watches it. The document says so for an
+    ephemeral host, so a caller does not take "removed" for "stopped billing".
+    """
+    with registry_transaction() as registry:
+        entry = registry.require(name)
+        del registry.hosts[name]
+    notes = []
+    if entry.ephemeral:
+        pod = f"pod {entry.pod_id}" if entry.pod_id else "pod"
+        notes.append(
+            f"its {pod} is not terminated by this: it ends itself once its queue has been "
+            f"idle, and `gpuc pods` shows it until then"
+        )
+    return {"host": entry.name, "kind": entry.kind, "pod_id": entry.pod_id, "notes": notes}
+
+
+def init_config(*, force: bool) -> dict[str, Any]:
+    """`gpuc config init`: write the commented settings file, and say where."""
+    path = config_file()
+    existed = path.exists()
+    write_config_template(force=force)
+    return {"config_file": str(path), "existed": existed}
 
 
 def config_document(settings: Settings) -> dict[str, Any]:
