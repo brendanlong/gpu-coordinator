@@ -1090,7 +1090,10 @@ def render(
         lines.append(free)
     finished = [job for job in view.finished if within(job, since_s)]
     for job in finished[:recent]:
-        detail = job.reason or (f"exit {job.exit_code}" if job.exit_code else "")
+        # `cancelled (cancelled)` says nothing twice: only a reason that adds
+        # to the status is worth the parenthesis.
+        reason = job.reason if job.reason != job.status else None
+        detail = reason or (f"exit {job.exit_code}" if job.exit_code else "")
         flag = ""
         if job.outputs_lost and job.outputs_pending:
             # `outputs_lost` is written once and never cleared, so it outlives

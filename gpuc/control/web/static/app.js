@@ -61,8 +61,8 @@ function fmtAge(stamp) {
   return `${Math.floor(seconds)}s ago`;
 }
 
-function fmtMinutes(job) {
-  return job.elapsed_s === null ? "--" : `${(job.elapsed_s / 60).toFixed(1)}m`;
+function fmtElapsed(job) {
+  return job.elapsed_s === null ? "--" : fmtDuration(job.elapsed_s);
 }
 
 function fmtUtil(job) {
@@ -278,13 +278,12 @@ function model(gpu) {
   return [gpu.name || "?", gpu.vram_mib ? ` ${Math.round(gpu.vram_mib / 1024)} GB` : ""];
 }
 
-function gpuRow(index, state, ...rest) {
-  return el("tr", {}, el("td", { class: "gpu-index" }, `[${index ?? "?"}]`), el("td", {}, state, ...rest));
+function gpuRow(index, state, model) {
+  return el("tr", {}, el("td", { class: "gpu-index" }, `[${index ?? "?"}]`), el("td", {}, state), el("td", {}, model));
 }
 
 function missingRow(entry, as, what) {
-  return gpuRow(entry[as], badge("UNAVAILABLE", "bad"),
-    ` nvidia-smi does not report this card, so nothing is ${what} it`, el("td", {}));
+  return gpuRow(entry[as], [badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`], "");
 }
 
 // `?` and not `0` for a reading the host could not take: that card is out
@@ -300,7 +299,7 @@ function gpuTable(host) {
   // No holder column: the running table below names each job's cards.
   const rows = host.gpus.map((gpu) => (gpu.available === false
     ? missingRow(gpu, "owned_as", "dispatched to")
-    : gpuRow(gpu.index, gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), el("td", {}, ...model(gpu)))));
+    : gpuRow(gpu.index, gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), model(gpu))));
   // Shared cards are somebody else's, and `IN USE` is theirs, not ours: the
   // numbers beside it are why a job that asked for one is still queued.
   for (const gpu of shared) {
@@ -312,7 +311,7 @@ function gpuTable(host) {
     if (gpu.busy_job) state = badge("shared, busy", "warn");
     else if (gpu.unused) state = badge("shared, free", "good");
     else state = [badge("shared, IN USE", "bad"), el("span", { class: "muted" }, ` somebody else: ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`)];
-    rows.push(gpuRow(gpu.index, state, el("td", {}, ...model(gpu))));
+    rows.push(gpuRow(gpu.index, state, model(gpu)));
   }
   return table([{ text: "card" }, { text: "state" }, { text: "model" }], rows);
 }
@@ -335,7 +334,7 @@ function runningTable(host) {
   const rows = host.running.map((job) => el("tr", { class: job.suspect ? "suspect" : null },
     el("td", {}, jobLabel(job)),
     el("td", {}, job.phase || "-"),
-    el("td", { class: "num" }, fmtMinutes(job)),
+    el("td", { class: "num" }, fmtElapsed(job)),
     el("td", { class: "num" }, fmtUtil(job)),
     el("td", { class: "mono" }, gpuLabels(host, job)),
     el("td", {}, fmtEta(job), job.progress_error ? el("span", { class: "muted", title: job.progress_error }, " (progress error)") : null),
@@ -366,7 +365,8 @@ function queuedTable(host) {
 function finishedTable(host) {
   if (!host.finished.length) return null;
   const rows = host.finished.map((job) => {
-    const detail = job.reason || (job.exit_code ? `exit ${job.exit_code}` : "");
+    const reason = job.reason === job.status ? null : job.reason;
+    const detail = reason || (job.exit_code ? `exit ${job.exit_code}` : "");
     // How far a job had got when it ended is the useful part of a failure.
     const progress = job.progress_pct !== null && job.status !== "succeeded" ? ` (${Math.round(job.progress_pct)}%)` : "";
     let level = "good";
