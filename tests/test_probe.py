@@ -122,16 +122,17 @@ def test_an_overlay_home_is_reported_but_never_argued_with() -> None:
     assert report.home_fs_type == "overlay"
     assert report.home_is_overlay
     rendered = report.render()
-    assert "overlay" in rendered
+    # Named on its own line: `disk:` here is an overlay too, so a bare
+    # substring would pass with home_fs dropped from the report entirely.
+    assert "home_fs: overlay overlay" in rendered
     assert "persistent-root" not in rendered
     assert "wiped on every restart" not in rendered
 
 
-def test_a_real_filesystem_gets_no_persistent_root_note() -> None:
+def test_a_real_filesystem_is_reported_as_itself() -> None:
     report = parse_probe("desk", DISK_HOME)
     assert report.home_fs_type == "ext4"
     assert not report.home_is_overlay
-    assert "persistent-root" not in report.render()
 
 
 def test_the_stat_fallback_form_is_parsed_too() -> None:
@@ -143,7 +144,6 @@ def test_a_host_that_answered_nothing_is_not_called_an_overlay() -> None:
     report = parse_probe("gpubox", SAMPLE)
     assert report.home_fs_type is None
     assert not report.home_is_overlay
-    assert "persistent-root" not in report.render()
 
 
 TI = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -253,6 +253,9 @@ def test_probe_host_carries_the_registered_persistent_root_too() -> None:
     report: Any = probe_host(entry, transport=OneAnswerTransport(OVERLAY_HOME))
     assert report.persistent_root == "/mnt/ssd-2/me"
     assert report.document()["persistent_root"] == "/mnt/ssd-2/me"
+    # An overlay $HOME that already has a root is the other half of the note
+    # that used to be here: it says nothing about it either.
+    assert "persistent-root" not in report.render()
 
 
 def test_two_entries_naming_one_card_is_called_out() -> None:
