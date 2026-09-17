@@ -583,7 +583,7 @@ class Registry(TolerantModel):
             known = ", ".join(sorted(self.hosts)) or "(none)"
             raise HostNotFound(
                 f"no host named {name!r}. Known hosts: {known}.\n"
-                f"Add it with: gpuc host add {name} --ssh user@host --gpus 0"
+                f"Add it with: gpuc host add {name} --ssh user@host"
             )
         return entry
 

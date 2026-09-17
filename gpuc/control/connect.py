@@ -89,6 +89,15 @@ def connect_host(
         # somebody's host.
         before_write(entry)
     else:
+        if "gpus" not in patch and "shared_gpus" not in patch and not address.gpu_info:
+            # An empty default is a driver that is still coming up, or an
+            # nvidia-smi that is missing, as often as a box with no cards.
+            # Writing "owns nothing" as the host's first config would stick.
+            raise ConnectError(
+                f"{address.name} reports no GPUs (nvidia-smi is missing there, or found no "
+                f"cards), so there is nothing for it to own by default. Pass --gpus '' to "
+                f"register it with none, or fix nvidia-smi on it and add it again."
+            )
         patch.setdefault("gpus", _every_card_but_the_shared(address, patch))
         patch.setdefault("host", address.name)
         patch.setdefault("created_at", utc_now())

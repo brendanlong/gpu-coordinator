@@ -245,11 +245,15 @@ queue's lexical order, not submission order below one second.
   from the shared cards that are idle right now (see Shared GPUs).
 - **The queue is taken in order** (`launch_ready`): a job that does not fit
   holds the cards it is waiting for, owned and borrowed alike, and nothing
-  behind it may take them. The one exemption is a job that can only fit by
-  borrowing (it asks for more than `config.gpus` owns) and is short a shared
-  card somebody else is on: it is stepped over, not failed. A job waiting for
-  an owned card that has dropped off nvidia-smi holds like any other, since the
-  host is misconfigured or broken and a stalled queue says so.
+  behind it may take them. The one exemption is a job that could not fit even
+  once every job of ours ends: it asks for more than `config.gpus` owns plus
+  the shared cards nobody else is on (per the pass's one nvidia-smi reading),
+  so what it is short of is a shared card somebody else is using, and it is
+  stepped over, not failed. Width alone is not the test: a job wider than the
+  owned pool that is short an owned card of ours, with the shared card it wants
+  idle, holds like any other. So does a job waiting for an owned card that has
+  dropped off nvidia-smi, since the host is misconfigured or broken and a
+  stalled queue says so.
   `_capacity_failure` fails a job that asks for no GPU at all, or for more
   than the configured host has, shared cards included. Why the obvious rule
   (dispatch whatever fits) is wrong is

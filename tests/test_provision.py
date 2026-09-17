@@ -241,22 +241,25 @@ def test_health_failure_terminates_and_forgets(control_env: Path, ssh_key: Path)
 
 
 def test_a_failed_terminate_keeps_the_pod_visible(control_env: Path, ssh_key: Path) -> None:
-    """Nothing retries a terminate this process could not do: the pod bills
-    until a person ends it, so it must stay in the registry for `gpuc status`
-    to show and the report must say where to look."""
+    """A terminate is retried, and one that still fails is not retried by
+    anything after this process moves on: the pod bills until a person ends
+    it, so it must stay in the registry for `gpuc status` to show, the report
+    must say where to look, and the final error must not claim it was ended."""
     from gpuc.control.bootstrap import BootstrapError
 
     def failing_bootstrap(entry: HostEntry, *args: object, **kwargs: object):
         raise BootstrapError("health failed")
 
     provider = FakeProvider([make_offer()])
+    attempts: list[str] = []
 
     def refuse(pod_id: str) -> None:
+        attempts.append(pod_id)
         raise ProviderError("502 Bad Gateway")
 
     provider.terminate = refuse  # type: ignore[method-assign]
     reports: list[str] = []
-    with pytest.raises(ProvisionError):
+    with pytest.raises(ProvisionError) as error:
         provision(
             CONSTRAINTS,
             Settings(),
@@ -272,7 +275,49 @@ def test_a_failed_terminate_keeps_the_pod_visible(control_env: Path, ssh_key: Pa
         )
     (name,) = load_registry().hosts  # still known, so `gpuc status` shows its pod
     assert name.startswith("gpuc-")
+    assert attempts == ["pod1"] * 3
     assert any("still billing" in line and "gpuc pods" in line for line in reports)
+    assert "pod1 could NOT be terminated and are still billing" in str(error.value)
+    assert "All pods created here were terminated" not in str(error.value)
+
+
+def test_a_terminate_that_fails_once_is_retried_and_confirmed(
+    control_env: Path, ssh_key: Path
+) -> None:
+    from gpuc.control.bootstrap import BootstrapError
+
+    def failing_bootstrap(entry: HostEntry, *args: object, **kwargs: object):
+        raise BootstrapError("health failed")
+
+    provider = FakeProvider([make_offer()])
+    real_terminate = provider.terminate
+    attempts: list[str] = []
+
+    def flaky(pod_id: str) -> None:
+        attempts.append(pod_id)
+        if len(attempts) == 1:
+            raise ProviderError("502 Bad Gateway")
+        real_terminate(pod_id)
+
+    provider.terminate = flaky  # type: ignore[method-assign]
+    with pytest.raises(ProvisionError) as error:
+        provision(
+            CONSTRAINTS,
+            Settings(),
+            provider=provider,
+            report=lambda _: None,
+            deps=ProvisionDeps(
+                sleep=lambda _: None,
+                bootstrap=failing_bootstrap,  # type: ignore[arg-type]
+                transport_factory=lambda entry, settings: FakeTransport(),
+                poll_interval_s=0.0,
+                log_check_interval_s=0.0,
+            ),
+        )
+    assert attempts == ["pod1", "pod1"]
+    assert provider.terminated == ["pod1"]
+    assert load_registry().hosts == {}
+    assert "All pods created here were terminated" in str(error.value)
 
 
 def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_path: Path) -> None:

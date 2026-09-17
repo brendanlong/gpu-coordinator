@@ -286,16 +286,22 @@ def test_host_add_registers_a_host_with_no_cards_and_says_so(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No nvidia-smi is a host that can hold a config and nothing else; the
-    same line says so when `--gpus ''` or an all-covering `--shared-gpus` is
-    what left it with nothing."""
+    """A host that reports no cards is not given "owns nothing" as its first
+    config by default: a driver still coming up would make that stick. Said
+    explicitly with `--gpus ''` it is a host that can hold a config and
+    nothing else, and the same line says so when an all-covering
+    `--shared-gpus` is what left it with nothing."""
     monkeypatch.setitem(PROBE_SECTIONS, "driver", "sh: 1: nvidia-smi: not found")
     monkeypatch.setitem(PROBE_SECTIONS, "gpus", "sh: 1: nvidia-smi: not found")
-    assert main(["host", "add", "cpubox", "--ssh", "me@cpu"]) == 0
+    assert main(["host", "add", "cpubox", "--ssh", "me@cpu"]) == 1
+    assert fake_host.config is None
+    assert "cpubox" not in load_registry().hosts
+    assert "reports no GPUs" in capsys.readouterr().err
+    assert main(["host", "add", "cpubox", "--ssh", "me@cpu", "--gpus", ""]) == 0
     assert fake_host.config is not None and fake_host.config["gpus"] == []
     assert load_registry().require("cpubox").gpus == []
     out = capsys.readouterr().out
-    assert "owns no GPUs (it has no nvidia-smi)" in out
+    assert "owns no GPUs (--gpus '' asked for none)" in out
     assert "gpuc host set cpubox --gpus <list>" in out
 
     monkeypatch.setitem(PROBE_SECTIONS, "driver", "580.173.02")
@@ -1359,6 +1365,7 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
             "gpus": 1,
             "low_util": {"enabled": False, "window_min": 25, "floor_pct": 5, "grace_min": 10},
             "from_the_future": {"unknown": True},
+            "outputs": [{"path": "out", "s3": "s3://b/{job_id}/out", "hf_private": True}],
         }
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
@@ -1398,12 +1405,13 @@ def test_requeue_refuses_a_mirrored_spec_that_asks_for_no_gpu(
     assert "gpus: Input should be greater than or equal to 1" in capsys.readouterr().err
 
 
-def test_requeue_refuses_a_mirrored_spec_carrying_the_earlier_runs_output_id(
+def test_requeue_gives_a_mirror_an_older_build_expanded_its_own_namespace(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Older builds mirrored the spec with `{job_id}` already expanded, so what
-    they left behind names the first run's outputs. A requeue is a new job, and
-    a new job never writes over an old one's outputs: refused, nothing shipped."""
+    they left behind names the first run's outputs. A build never fails on a
+    file another build wrote: the first run's id is put back as the placeholder
+    and the new job gets its own namespace, never the old one's."""
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     s3 = FakeS3Client()
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
@@ -1411,21 +1419,27 @@ def test_requeue_refuses_a_mirrored_spec_carrying_the_earlier_runs_output_id(
             "job_id": "20260101-000000-aaaaaa",
             "command": "true",
             "gpus": 1,
-            "outputs": [{"path": "results", "s3": "s3://b/exp/20260101-000000-aaaaaa/results"}],
+            "outputs": [
+                {"path": "results", "s3": "s3://b/exp/20260101-000000-aaaaaa/results"},
+                {"path": "ckpt", "hf": "org/run-20260101-000000-aaaaaa", "hf_path": "w"},
+            ],
         }
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
-    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
-    monkeypatch.setattr(
-        "gpuc.control.submit.open_session",
-        lambda *a, **k: pytest.fail("a spec pointed at an earlier run's outputs must not ship"),
-    )
+    submitted: list[JobSpecModel] = []
+
+    def fake_submit(entry: Any, model: JobSpecModel, *a: Any, **k: Any) -> SubmitResult:
+        submitted.append(model)
+        return SubmitResult(job_id="new", host=entry.name, attempt=2)
+
+    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
-    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
-    err = capsys.readouterr().err
-    assert "s3://b/exp/20260101-000000-aaaaaa/results` does not include the job id" in err
+    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
+    outputs = submitted[0].outputs
+    assert outputs[0].s3 == "s3://b/exp/{job_id}/results"
+    assert outputs[1].hf == "org/run-{job_id}"
 
 
 def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning(
@@ -1439,7 +1453,7 @@ def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning
             "job_id": "20260101-000000-aaaaaa",
             "command": "true",
             "gpus": 1,
-            "outputs": [{"path": "results", "s3": "s3://b/exp/20260101-000000-aaaaaa/results"}],
+            "outputs": [{"path": "results", "s3": "s3://b/exp/results"}],
         }
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))

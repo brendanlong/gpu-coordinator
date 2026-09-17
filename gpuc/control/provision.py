@@ -303,6 +303,7 @@ def provision(
     )
 
     failures: list[str] = []
+    billing: list[str] = []
     for offer in offers:
         label = f"{offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h"
         try:
@@ -319,16 +320,22 @@ def provision(
                 health_args=health_args,
                 progress=progress,
                 deps=deps,
+                billing=billing,
             )
         except (ProvisionError, ProviderError, BootstrapError, RemoteError, TransportError) as exc:
             first = str(exc).splitlines()[0]
             failures.append(f"  - {label}: {first}")
             progress(f"offer {label} failed: {first}")
+    cleanup = (
+        f"Pod(s) {', '.join(billing)} could NOT be terminated and are still billing: "
+        f"`gpuc pods` shows them, and the provider's console ends them."
+        if billing
+        else "All pods created here were terminated."
+    )
     raise ProvisionError(
         "every offer failed to produce a healthy pod:\n"
         + "\n".join(failures)
-        + "\nAll pods created here were terminated. Try again later, widen --gpu, "
-        "or raise --max-price."
+        + f"\n{cleanup} Try again later, widen --gpu, or raise --max-price."
     )
 
 
@@ -358,18 +365,26 @@ def _try_offer(
     health_args: str,
     progress: _Progress,
     deps: ProvisionDeps,
+    billing: list[str],
 ) -> HostEntry:
+    """One offer, start to finish. A pod this could not terminate on the way
+    out is appended to `billing`, so the caller's report can name it."""
     name = pod_name(provider.prefix, name_hint)
-    pod, created_at = _create(
+    progress(
+        f"creating {name}: {offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
+        f"x{constraints.gpu_count}, disk {disk_gb}GB, cuda>={cuda_min}, image {image}"
+    )
+    pod = provider.create(
         offer,
-        constraints,
-        provider=provider,
-        name=name,
+        name,
         image=image,
         disk_gb=disk_gb,
         cuda_min=cuda_min,
-        progress=progress,
-        deps=deps,
+        gpu_count=constraints.gpu_count,
+    )
+    created_at = utc_now()
+    progress(
+        f"pod {pod.id} created ({pod.status}); ceiling {deps.ceiling_minutes:.0f} min from now"
     )
 
     deadline = deps.now() + deps.ceiling_minutes * 60.0
@@ -419,7 +434,8 @@ def _try_offer(
         # Everything from `create` to the last registry write owns a live pod, so
         # *every* way out of here terminates first: a Ctrl-C, a full disk, or a
         # bug none of the narrow except clauses name still costs money otherwise.
-        _abandon(provider, name, pod.id, progress, _first_line(exc))
+        if not _abandon(provider, name, pod.id, progress, deps, _first_line(exc)):
+            billing.append(pod.id)
         raise
 
 
@@ -428,62 +444,60 @@ def _first_line(exc: BaseException) -> str:
     return lines[0] if lines else f"{type(exc).__name__} (interrupted)"
 
 
-def _create(
-    offer: Offer,
-    constraints: Constraints,
-    *,
-    provider: Provider,
-    name: str,
-    image: str,
-    disk_gb: int,
-    cuda_min: str,
-    progress: _Progress,
-    deps: ProvisionDeps,
-) -> tuple[Pod, str]:
-    progress(
-        f"creating {name}: {offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
-        f"x{constraints.gpu_count}, disk {disk_gb}GB, cuda>={cuda_min}, image {image}"
-    )
-    pod = provider.create(
-        offer,
-        name,
-        image=image,
-        disk_gb=disk_gb,
-        cuda_min=cuda_min,
-        gpu_count=constraints.gpu_count,
-    )
-    created_at = utc_now()
-    progress(
-        f"pod {pod.id} created ({pod.status}); ceiling {deps.ceiling_minutes:.0f} min from now"
-    )
-    return pod, created_at
+TERMINATE_ATTEMPTS = 3
+TERMINATE_RETRY_S = 5.0
 
 
 def _terminate_now(
-    provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str
+    provider: Provider,
+    name: str,
+    pod_id: str,
+    progress: _Progress,
+    deps: ProvisionDeps,
+    reason: str,
 ) -> bool:
-    """True only when the provider confirmed the pod is gone."""
+    """True only when the provider confirmed the pod is gone.
+
+    Retried a few times: a 5xx or a rate limit on the one call that stops the
+    bill is the worst place to give up after one try, and nothing else will
+    try again once this process has moved on to the next offer.
+    """
     progress(f"terminating {name} ({pod_id}): {reason}")
-    try:
-        provider.terminate(pod_id)
-    except ProviderError as exc:
-        progress(
-            f"WARNING: could not terminate {name} ({pod_id}): {exc}\n"
-            f"  It is still billing until you end it: `gpuc pods` shows it, and the "
-            f"provider's console terminates it."
-        )
-        return False
-    progress(f"{name} terminated and confirmed gone")
-    return True
+    for attempt in range(1, TERMINATE_ATTEMPTS + 1):
+        try:
+            provider.terminate(pod_id)
+        except ProviderError as exc:
+            if attempt < TERMINATE_ATTEMPTS:
+                progress(f"terminate {pod_id} failed ({exc}); retrying in {TERMINATE_RETRY_S:g}s")
+                deps.sleep(TERMINATE_RETRY_S)
+                continue
+            progress(
+                f"WARNING: could not terminate {name} ({pod_id}) in {attempt} attempts: {exc}\n"
+                f"  It is still billing until you end it: `gpuc pods` shows it, and the "
+                f"provider's console terminates it."
+            )
+            return False
+        progress(f"{name} terminated and confirmed gone")
+        return True
+    return False
 
 
-def _abandon(provider: Provider, name: str, pod_id: str, progress: _Progress, reason: str) -> None:
-    if not _terminate_now(provider, name, pod_id, progress, reason):
+def _abandon(
+    provider: Provider,
+    name: str,
+    pod_id: str,
+    progress: _Progress,
+    deps: ProvisionDeps,
+    reason: str,
+) -> bool:
+    """Terminate and forget a pod this run gave up on; False if it still bills."""
+    if not _terminate_now(provider, name, pod_id, progress, deps, reason):
         # A pod that is still billing must stay visible: its registry entry, if
         # it got one, is what `gpuc status` shows a POD line for.
         progress(f"keeping the registry entry for {name} until {pod_id} is confirmed gone")
-        return
+        return False
     forget_host_locked(name, pod_id, progress)
+    return True
 
 
 def _wait_for_ssh_direct(
@@ -624,6 +638,12 @@ def pick_reusable_host(
         if entry.kind != "runpod" or not entry.pod_id:
             continue
         offer = rented.offer_of(entry.config.provider)
+        if offer is None:
+            report(
+                f"reuse: skipping {entry.name}, its config records no offer to compare "
+                f"with this request"
+            )
+            continue
         if not offer_satisfies(offer, constraints):
             report(
                 f"reuse: skipping {entry.name}, its {offer.name or 'unrecorded'}/"

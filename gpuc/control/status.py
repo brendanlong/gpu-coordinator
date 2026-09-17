@@ -339,6 +339,21 @@ class HostView:
         """Shared cards nobody is on: neither one of ours nor anybody else's."""
         return [c for c in self.shared if c.unused and not self.gpu_holder(c.uuid)]
 
+    def cards_ours_to_wait_for(self, job: JobView) -> int:
+        """How many cards this job could have once every job of ours ends.
+
+        What decides whether the host holds for a job that does not fit,
+        repeated from the dispatcher's `launch_ready`: the owned cards as
+        configured, missing ones included, plus, if the job may borrow, the
+        shared cards nobody else is on -- idle, or held by one of ours. A
+        shared card somebody else is using is left out, because when they stop
+        is not this host's to wait for: a job short of one is stepped over.
+        """
+        count = len(self.owned) + len(self.unavailable)
+        if self.may_borrow(job):
+            count += sum(1 for c in self.shared if c.unused or self.gpu_holder(c.uuid))
+        return count
+
     @property
     def outputs_at_risk(self) -> list[JobView]:
         """Finished jobs holding the only copy of what they produced."""
@@ -595,12 +610,12 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
 
     A job is in the answer or it is not: one whose turn depends on a job that
     gave no estimate is absent, never guessed at. That is why a *later* job can
-    have a start time when an earlier one does not: the earlier one can only
-    run by borrowing, and the host steps over that rather than hold cards for
-    a shared one somebody else is on. A job waiting for an owned card that has
-    dropped off nvidia-smi is the other way round: it holds, exactly as the
-    dispatcher holds for it, so it and everything behind it are absent until
-    the card is back.
+    have a start time when an earlier one does not: the earlier one could not
+    fit even once every job of ours ends, so it is short a shared card somebody
+    else is on, and the host steps over that rather than hold cards for it. A
+    job waiting for an owned card that has dropped off nvidia-smi is the other
+    way round: it holds, exactly as the dispatcher holds for it, so it and
+    everything behind it are absent until the card is back.
 
     Shared cards are in the model, but only the ones that are idle *now* and
     only for the jobs allowed onto them. A card somebody else is using is left
@@ -640,10 +655,11 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
             take_shared = free_shared[: job.gpus_requested - len(take_owned)]
             if len(take_owned) + len(take_shared) < job.gpus_requested:
                 # It does not fit. The host holds what it could take unless the
-                # job can only run by borrowing: that one waits on somebody
-                # else and is stepped over. Counted against the configured
-                # owned cards, missing ones included, as the dispatcher does.
-                if job.gpus_requested <= len(view.owned) + len(view.unavailable):
+                # job could not fit even once every job of ours ends: that one
+                # waits on somebody else's shared card and is stepped over.
+                # Counted against the configured owned cards, missing ones
+                # included, as the dispatcher does.
+                if job.gpus_requested <= view.cards_ours_to_wait_for(job):
                     held += len(take_owned)
                     held_shared += len(take_shared)
                 continue
@@ -759,23 +775,15 @@ def no_start_reason(view: HostView, job: JobView) -> str:
         )
     if any(ahead.gpus_requested is None for ahead in view.queue):
         return "this host does not report how many cards a queued job asked for"
-    owned = len(view.owned) + len(view.unavailable)
-    if job.gpus_requested is not None and len(view.owned) < job.gpus_requested <= owned:
-        # The host holds for this job, and the card it holds for is one the
-        # host is configured with but cannot see: that is the host's problem
-        # to fix, not a wait, and the first thing the submitter should hear.
-        return (
-            f"it needs {job.gpus_requested} card(s) and only {len(view.owned)} of the "
-            f"{owned} this host owns answer to nvidia-smi ({', '.join(view.unavailable)} "
-            f"missing), so it is held until they do"
-        )
-    if borrows and job.gpus_requested is not None and job.gpus_requested > len(view.owned):
-        # Not an omission: a shared card comes free when its real owner stops
+    ours = view.cards_ours_to_wait_for(job)
+    if borrows and job.gpus_requested is not None and job.gpus_requested > ours:
+        # The job the host steps over: not an omission, and not the queue's
+        # doing either. A shared card comes free when its real owner stops
         # using it, and nothing here can know when that is. Saying so is the
         # honest answer, and the only alternative is a number we made up.
         return (
-            f"it needs {job.gpus_requested - len(view.owned)} shared card(s), and when "
-            f"somebody else stops using one is not something this host can predict"
+            f"it needs {job.gpus_requested - ours} shared card(s) somebody else is using, "
+            f"and when they stop is not something this host can predict"
         )
     order = [queued.job_id for queued in view.queue]
     blocking = next(
@@ -791,6 +799,18 @@ def no_start_reason(view: HostView, job: JobView) -> str:
         # knowable until that one's is -- and saying "the cards it needs" of a
         # job that is waiting on the queue rather than on a card is a lie.
         return f"job {blocking.job_id} is ahead of it and has no start time yet"
+    owned = len(view.owned) + len(view.unavailable)
+    if job.gpus_requested is not None and len(view.owned) < job.gpus_requested <= owned:
+        # The host holds for this job, and the card it holds for is one the
+        # host is configured with but cannot see: that is the host's problem
+        # to fix, not a wait, and what the submitter should hear. After the
+        # queue check, so only the job at the front says it, and a job behind
+        # it is told which job it is waiting on.
+        return (
+            f"it needs {job.gpus_requested} card(s) and only {len(view.owned)} of the "
+            f"{owned} this host owns answer to nvidia-smi ({', '.join(view.unavailable)} "
+            f"missing), so it is held until they do"
+        )
     # Running or queued: either way, the cards this job is waiting for are
     # spoken for by something that never said when it would be done with them.
     return "the jobs holding the cards it needs gave no end time"

@@ -775,7 +775,11 @@ def test_a_job_waiting_for_a_missing_owned_card_holds_up_the_queue() -> None:
     is the thing to fix."""
     view = busy(
         running_job(gpus=[GPU], eta=in_minutes(45)),
-        queued=[waiting("j-wide", gpus_requested=2), waiting("j-narrow")],
+        queued=[
+            waiting("j-wide", gpus_requested=2),
+            waiting("j-narrow"),
+            waiting("j-wide-too", gpus_requested=2),
+        ],
     )
     view.owned = [GPU]
     view.unavailable = ["7"]
@@ -783,6 +787,10 @@ def test_a_job_waiting_for_a_missing_owned_card_holds_up_the_queue() -> None:
     reason = no_start_reason(view, view.queue[0])
     assert "only 1 of the 2 this host owns answer to nvidia-smi (7 missing)" in reason
     assert "j-wide is ahead of it" in no_start_reason(view, view.queue[1])
+    # The job at the front is the one holding the queue for the missing card;
+    # a second two-card job behind it is waiting on the queue, not the card.
+    assert "j-wide is ahead of it" in no_start_reason(view, view.queue[2])
+    assert "missing" not in no_start_reason(view, view.queue[2])
     assert "a job waiting for it holds the queue" in render(view)
 
 
@@ -1031,13 +1039,14 @@ def test_a_host_too_old_to_report_use_shared_says_null_not_false() -> None:
 
 
 def test_a_job_waiting_for_a_shared_card_is_told_that_and_not_called_impossible() -> None:
-    """The host owns two cards and the job wants three: without the shared one
-    that reads "it will never be dispatched", which would be a lie."""
-    got = shared_view()
+    """The host owns two cards and the job wants three, and the shared one is
+    somebody else's for now: without it that reads "it will never be
+    dispatched", which would be a lie."""
+    got = shared_view(shared_gpus_resolved=[somebody_elses_shared_card()])
     job = waiting("j-queued", gpus_requested=3, use_shared=True)
     got.queue = [job]
     reason = no_start_reason(got, job)
-    assert "needs 1 shared card(s)" in reason
+    assert "needs 1 shared card(s) somebody else is using" in reason
     assert "not something this host can predict" in reason
 
 
@@ -1067,17 +1076,30 @@ def test_a_job_that_did_not_ask_is_not_credited_with_the_shared_card() -> None:
     assert "the host has 2, so it will never be dispatched" in no_start_reason(got, job)
 
 
-def busy_owned(eta_minutes: float) -> list[dict[str, Any]]:
-    """Both owned cards held by one job that says when it will be done."""
+def somebody_elses_shared_card() -> dict[str, Any]:
+    """The shared card as the host reports it while its real owner is on it."""
+    return {
+        "index": 4,
+        "uuid": SHARED,
+        "memory_mib": 21504.0,
+        "utilization_pct": 98.0,
+        "unused": False,
+    }
+
+
+def busy_owned(eta_minutes: float | None, gpus: list[str] | None = None) -> list[dict[str, Any]]:
+    """The owned cards (both by default) held by one job, with its eta if any."""
     return [
         {
             "job_id": "j-running",
             "name": "train",
             "status": "running",
             "phase": "main",
-            "gpus": [GPU, "GPU-b"],
+            "gpus": [GPU, "GPU-b"] if gpus is None else gpus,
             "started_at": minutes_ago(1),
-            "eta": (datetime.now(UTC) + timedelta(minutes=eta_minutes)).isoformat(),
+            "eta": None
+            if eta_minutes is None
+            else (datetime.now(UTC) + timedelta(minutes=eta_minutes)).isoformat(),
         }
     ]
 
@@ -1101,20 +1123,48 @@ def test_a_job_that_did_not_ask_still_waits_for_the_owned_cards() -> None:
 def test_a_shared_card_somebody_else_holds_is_not_scheduled_onto_at_all() -> None:
     """When they will stop is the one thing this host cannot know, so the card
     is left out rather than given a release time."""
-    got = shared_view(
-        jobs=busy_owned(360.0),
-        shared_gpus_resolved=[
-            {
-                "index": 4,
-                "uuid": SHARED,
-                "memory_mib": 21504.0,
-                "utilization_pct": 98.0,
-                "unused": False,
-            }
-        ],
-    )
+    got = shared_view(jobs=busy_owned(360.0), shared_gpus_resolved=[somebody_elses_shared_card()])
     got.queue = [waiting("j-queued", gpus_requested=1, use_shared=True)]
     assert queue_start_estimates(got)["j-queued"] == pytest.approx(360.0 * 60.0, abs=1.0)
+
+
+def test_a_wide_borrower_short_of_an_owned_card_holds_like_any_other() -> None:
+    """The dispatcher steps over a job only when it could not fit even once
+    every job of ours ends. This one wants more than the host owns, but the
+    shared card is idle and what it is short of is an owned card back at 45m:
+    it holds, so the projection may not hand that card to the job behind it."""
+    got = shared_view(jobs=busy_owned(45.0, gpus=[GPU]))
+    got.queue = [
+        waiting("j-wide", gpus_requested=3, use_shared=True, estimated_runtime_min=30.0),
+        waiting("j-narrow"),
+    ]
+    starts = queue_start_estimates(got)
+    assert starts["j-wide"] == pytest.approx(45.0 * 60.0, abs=1.0)
+    assert starts["j-narrow"] == pytest.approx(75.0 * 60.0, abs=1.0)
+
+
+def test_a_wide_borrower_that_holds_is_not_told_it_waits_on_somebody_else() -> None:
+    """Same shape, but the job holding our card gave no eta: the wide job is
+    waiting on that job, not on the idle shared card, and the reason says so."""
+    got = shared_view(jobs=busy_owned(None, gpus=[GPU]))
+    got.queue = [waiting("j-wide", gpus_requested=3, use_shared=True), waiting("j-narrow")]
+    assert queue_start_estimates(got) == {}
+    assert "gave no end time" in no_start_reason(got, got.queue[0])
+    assert "j-wide is ahead of it" in no_start_reason(got, got.queue[1])
+
+
+def test_a_borrower_short_of_somebody_elses_card_is_stepped_over() -> None:
+    """The exemption itself, from the client's side: the shared card is in use
+    and every card of ours would still leave this job short, so the host steps
+    over it and the one-card job behind it gets the card that frees at 45m."""
+    got = shared_view(
+        jobs=busy_owned(45.0, gpus=[GPU]), shared_gpus_resolved=[somebody_elses_shared_card()]
+    )
+    got.queue = [waiting("j-wide", gpus_requested=3, use_shared=True), waiting("j-narrow")]
+    starts = queue_start_estimates(got)
+    assert "j-wide" not in starts
+    assert starts["j-narrow"] == 0.0
+    assert "somebody else is using" in no_start_reason(got, got.queue[0])
 
 
 def test_there_is_only_one_shared_card_to_go_round() -> None:

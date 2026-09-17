@@ -212,14 +212,14 @@ def test_the_mirror_keeps_the_job_id_unexpanded_so_a_requeue_gets_its_own_namesp
     ("output", "key"),
     [
         ({"path": "results", "s3": "s3://b/exp/results"}, "s3"),
-        ({"path": "ckpt", "hf": "org/repo-{job_id}", "hf_path": "runs/latest"}, "hf_path"),
+        ({"path": "ckpt", "hf": "org/repo", "hf_path": "runs/latest"}, "hf_path"),
     ],
 )
 def test_submit_refuses_an_output_destination_without_the_job_id(
     control_env: Path, repo: Path, output: dict[str, Any], key: str
 ) -> None:
     """Every output location includes the job id, so runs never overwrite each
-    other; for HF that means `hf_path`, since the repo is shared by every run."""
+    other; for HF the location is the repo plus the path, and neither has it."""
     host = FakeHost()
     with pytest.raises(SubmitError) as exc:
         submit_spec(
@@ -235,6 +235,45 @@ def test_submit_refuses_an_output_destination_without_the_job_id(
     assert f"output {output['path']}: `{key}: {output[key]}` does not include the job id" in message
     assert "{job_id}" in message
     assert not host.puts and not host.rsyncs
+
+
+def test_an_hf_repo_per_run_with_a_fixed_path_is_a_unique_location(
+    control_env: Path, repo: Path
+) -> None:
+    host = FakeHost()
+    result = submit_spec(
+        host_entry(name="gpubox", gpus=["GPU-a"]),
+        validate(
+            job_document(outputs=[{"path": "ckpt", "hf": "org/run-{job_id}", "hf_path": "weights"}])
+        ),
+        Settings(),
+        workdir=repo,
+        session=session(host),
+        environ={},
+        report=lambda _: None,
+    )
+    shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"][0])
+    assert shipped["outputs"][0]["hf"] == f"org/run-{result.job_id}"
+    assert shipped["outputs"][0]["hf_path"] == "weights"
+
+
+@pytest.mark.parametrize("bad", ["s3://b/{job-id}/x", "s3://b/{jobid}/x", "s3://b/{}/x"])
+def test_a_placeholder_this_does_not_know_is_refused_not_a_traceback(
+    control_env: Path, repo: Path, bad: str
+) -> None:
+    host = FakeHost()
+    with pytest.raises(SubmitError) as exc:
+        submit_spec(
+            host_entry(name="gpubox", gpus=["GPU-a"]),
+            validate(job_document(outputs=[{"path": "results", "s3": bad}])),
+            Settings(),
+            workdir=repo,
+            session=session(host),
+            environ={},
+            report=lambda _: None,
+        )
+    assert "placeholder this does not know" in str(exc.value)
+    assert not host.puts
 
 
 def test_a_destination_carrying_this_jobs_literal_id_is_accepted(

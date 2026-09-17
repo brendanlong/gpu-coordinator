@@ -42,6 +42,7 @@ from gpuc.control.providers.base import Provider, ProviderError
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.provision import ProvisionError
 from gpuc.control.remote import HostSession, RemoteError, open_session
+from gpuc.control.remote import config_file as remote_config_file
 from gpuc.control.s3index import (
     IndexEntry,
     LocalIndex,
@@ -295,7 +296,7 @@ def connection_document(
     return {
         **document,
         "adopted": connection.adopted,
-        "config_path": f"{connection.home}/config.json",
+        "config_path": remote_config_file(connection.home),
         "changes": list(connection.changes),
         "warnings": [*document["warnings"], *warnings],
     }

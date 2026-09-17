@@ -19,7 +19,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `use_shared` | `false` | also let this job onto the host's **shared** GPUs — cards gpuc does not own and takes only while nobody else is on them. See [shared GPUs](#shared-gpus). `gpuc submit --use-shared` sets it from the command line |
 | `env` | `{}` | plain environment for the job, applied after the host's `--env` |
 | `secrets` | `[]` | names read from *your* shell at submit time and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600). Missing from your shell is a refused submit |
-| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir. `s3` and `hf_path` **must contain `{job_id}`** or the submit is refused; `hf_path` left out is the job id itself |
+| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir. `s3` **must contain `{job_id}`**, and so must `hf` or `hf_path`, or the submit is refused; `hf_path` left out is the job id itself |
 | `sync_interval_s` | `180` | background upload cadence; **minimum 10** |
 | `priority` | `50` | `0`–`99`, lower dispatches first, and the queue is taken strictly in that order — see [priority is not advisory](#priority-is-not-advisory) |
 | `max_runtime_min` | none | wall clock from the runner's start; over it the job is `failed: timeout` |
@@ -34,11 +34,14 @@ commented example; `-` as the file name reads the spec from stdin.
 Unknown keys are refused at submit, so a typo is an error rather than silence.
 
 `{job_id}` expands in `s3`, `hf` and `hf_path` to the id `submit` assigns, and
-every destination must carry it: an `s3` uri or an `hf_path` whose expanded
-form does not contain the job id is refused at submit, naming the output. An
-`hf` output with no `hf_path` uploads under the id itself. Output namespaces
-are therefore unique by construction, which is the only overwrite guard there
-is: nothing looks at what a destination already holds.
+every destination must carry it: an `s3` uri whose expanded form does not
+contain the job id is refused at submit, naming the output, and so is a
+Hugging Face output whose `hf` repo and `hf_path` both lack it (a repo per run
+with a fixed path is as unique as one repo with a path per run). An `hf`
+output with no `hf_path` uploads under the id itself. Any other `{...}` in a
+destination is refused too. Output namespaces are therefore unique by
+construction, which is the only overwrite guard there is: nothing looks at
+what a destination already holds.
 `hf_create: true` lets the sync preflight create a Hugging Face repo that does
 not exist; without it a missing repo fails the job in seconds instead of
 creating `org/typo`.
@@ -79,10 +82,14 @@ billed. If you would rather a big job waited than have a card sit idle for it,
 queue it at a **higher** number than the work you want to keep the host busy
 with; priority is the only knob, and it decides both questions at once.
 
-The one job that does not hold is one that can only fit by
-[borrowing](#shared-gpus) and is waiting for a shared card somebody else is on:
-that card comes free when their job ends, which is not this host's to wait for,
-so the queue behind it runs. It is not failed either: the host's configuration,
+The one job that does not hold is one that could not fit even once every job
+of ours ends: it needs more cards than the host owns plus the
+[shared cards](#shared-gpus) nobody else is on right now, so what it is short of
+is a shared card somebody else is using. That card comes free when their job
+ends, which is not this host's to wait for, so the queue behind it runs. Width
+alone does not do it: a job that asks for more than the host owns, but is only
+short a card of ours while the shared card it wants sits idle, holds like any
+other. The stepped-over job is not failed either: the host's configuration,
 shared cards included, says it fits. A job bigger than the *configured* host is
 failed at dispatch as it always was.
 
@@ -440,14 +447,15 @@ It therefore **needs `s3_bucket`** (without it, submit the job file again) and
 cannot rebuild a `--no-git` workdir. `--host H` sends it somewhere else;
 `--runpod` provisions for it; with neither, it goes back to the host the local
 index says it ran on. The mirror holds the spec with `{job_id}` unexpanded, so
-the new run gets its own output namespace. The mirrored spec is checked as
-a job file is, except that keys this build does not know are dropped rather
-than refused (an older build may have mirrored them), so one an older build
-wrote with `gpus: 0` is refused here rather than queued to fail, and so is one that carries an earlier run's literal
-id in an output destination (older builds mirrored the expanded spec): the new
-job must not write over the old one's outputs, so submit the job file again. It
-is the other half of the pair with `gpuc preempt`: a new job id from the
-mirror, on whichever host you name, for a job that has already finished.
+the new run gets its own output namespace; a mirror an older build wrote with
+the first run's id already expanded into a destination is read the same way,
+with that id put back as the placeholder. The mirrored spec is otherwise
+checked as a job file is, except that keys this build does not know, at the
+top or on an output, are dropped rather than refused (a newer or older build
+may have mirrored them); so one an older build wrote with `gpus: 0` is refused
+here rather than queued to fail. It is the other half of the pair with `gpuc
+preempt`: a new job id from the mirror, on whichever host you name, for a job
+that has already finished.
 
 `--host` is optional on `logs`, `cancel`, `preempt`, `reorder`, `estimate` and `requeue`:
 the local job index is tried first, then every registered host is asked whether it knows the

@@ -104,6 +104,7 @@ from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import (
     JobSpecModel,
     SubmitResult,
+    from_mirror,
     load_document,
     precheck_local,
     submit_file,
@@ -470,9 +471,8 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     # `--persistent-root` in the same command moves gpuc home, and writing the
     # config to where the host is not would leave the real one behind.
     config: dict[str, Any] | None = None
-    settings = load_settings()
     if fields or env_updates:
-        connection = push_config(entry, settings, fields=fields, env_updates=env_updates)
+        connection = push_config(entry, load_settings(), fields=fields, env_updates=env_updates)
         entry, config = connection.entry, connection.entry.cache.config
         lines += [f"  host <- {change}" for change in connection.changes] or [
             "  host already holds that config; nothing changed"
@@ -604,17 +604,15 @@ class BootstrapTally:
         *,
         error: str | None = None,
     ) -> None:
+        detail = result.document() if result else BootstrapResult.no_document()
+        detail.pop("host", None)
         self.outcomes.append(
             {
                 "name": entry.name,
                 "outcome": outcome,
                 "error": error,
                 "ephemeral": entry.ephemeral,
-                "home": result.home if result else None,
-                "files": result.files if result else None,
-                "pkg_commit": result.pkg_commit if result else None,
-                "dispatcher_pid": result.dispatcher_pid if result else None,
-                "warnings": list(result.warnings) if result else [],
+                **detail,
             }
         )
 
@@ -658,7 +656,9 @@ class BootstrapTally:
         }
 
 
-def bootstrap_every_host(settings: Settings, health_args: str, *, as_json: bool) -> int:
+def bootstrap_every_host(
+    settings: Settings, health_args: str, *, as_json: bool, report: Reporter
+) -> int:
     """`gpuc host bootstrap --all`: the upgrade loop, one command.
 
     A host that fails does not stop the others: an ephemeral host whose pod is
@@ -670,7 +670,6 @@ def bootstrap_every_host(settings: Settings, health_args: str, *, as_json: bool)
     if read.unreadable:
         raise LocalStateUnreadable("\n".join(read.errors))
     hosts = list(read.registry.hosts.values())
-    report: Reporter = jsonout.note if as_json else print
     tally = BootstrapTally(hosts, sorted(read.skipped), list(read.errors))
     if not hosts:
         if as_json:
@@ -720,7 +719,9 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
             raise UsageError(
                 f"host bootstrap takes a host name or --all, not both (got {args.name!r})"
             )
-        return bootstrap_every_host(settings, args.health_args, as_json=args.json)
+        return bootstrap_every_host(
+            settings, args.health_args, as_json=args.json, report=reporter(args)
+        )
     if not args.name:
         raise UsageError("host bootstrap wants a host name, or --all for every registered host")
     entry = named_registry().require(args.name)
@@ -1036,7 +1037,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
             Path.cwd(),
             gpu_count=args.gpu_count,
             use_git=use_git,
-            report=report,
         )
         job_id = jobs.new_job_id()
         spec_uri, notes = mirror_spec_first(model, job_id, settings)
@@ -1392,9 +1392,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             f"Check the id with `gpuc status --all`; only jobs submitted with s3_bucket "
             f"set can be requeued."
         ) from exc
-    # The mirror holds what some build wrote: the id and attempt are this
-    # run's to assign, and a key this build does not know is not a typo.
-    document = {k: v for k, v in document.items() if k in JobSpecModel.model_fields}
+    document = from_mirror(document, args.job_id)
     attempt = (index.attempt if index else 1) + 1
     model = validate(document, f"spec for {args.job_id}")
     use_git = not args.no_git
@@ -1405,7 +1403,6 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             Path.cwd(),
             gpu_count=args.gpu_count,
             use_git=use_git,
-            report=report,
         )
     entry = runpod_target(args, settings) if target is None else registry.require(target)
     entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap, report=report)

@@ -70,6 +70,18 @@ class BootstrapResult:
             "warnings": list(self.warnings),
         }
 
+    @classmethod
+    def no_document(cls) -> dict[str, Any]:
+        """The same keys as `document()`, for a host that was never bootstrapped."""
+        return {
+            "host": None,
+            "home": None,
+            "files": None,
+            "pkg_commit": None,
+            "dispatcher_pid": None,
+            "warnings": [],
+        }
+
 
 def package_files(root: Path | None = None) -> list[str]:
     """Paths under ``gpuc/`` to ship, relative to the repo root.

@@ -936,15 +936,18 @@ class Dispatcher:
         busy = self._busy_gpus()
         return [uuid for uuid in self.owned_gpus() if uuid not in busy]
 
-    def borrowable_gpus(self) -> list[str]:
-        """Shared cards nothing of ours holds *and* nobody else is using either.
+    def borrowable_gpus(self) -> tuple[list[str], int]:
+        """Shared cards nothing of ours holds *and* nobody else is using either,
+        and how many shared cards somebody else *is* on.
 
         The nvidia-smi read is the whole of the preflight, and it is the one
         thing standing between a borrowed card and somebody else's training
         run, so it is taken here rather than inferred from anything cached.
         `launch_ready` asks once per pass and only when a job actually needs to
         borrow: every job is then judged against one reading, which is also
-        what stops two of them being handed the same card.
+        what stops two of them being handed the same card. The count comes
+        from the same reading because it decides which short job is stepped
+        over, and a second sample could disagree with the first.
         """
         busy = self._busy_gpus()
         unused, in_use = gpus.unused_gpus(
@@ -959,7 +962,7 @@ class Dispatcher:
                 self.log(f"shared GPU {uuid} is in use ({why}), so it is not being borrowed")
             if unused:
                 self.log(f"shared GPU(s) free to borrow: {', '.join(unused)}")
-        return unused
+        return unused, len(in_use)
 
     def _capacity_failure(self, spec: jobs.JobSpec) -> str | None:
         """Why this host can *never* run this job, or None if it could.
@@ -1029,11 +1032,15 @@ class Dispatcher:
 
         It costs utilization: a card waiting for the rest of a job's cards runs
         nothing, and on a rented pod that is billed. The one job that does not
-        hold is one that can only run by borrowing -- it asks for more cards
-        than `config.gpus` owns -- and is short: the card it is waiting for is
-        a shared one somebody else is on, which comes free when *their* job
-        ends, and that is not ours to wait on. Failing it would be wrong too,
-        since the configured host is big enough for it.
+        hold is one that could not fit even once every job of ours ends: it
+        needs more cards than the host owns plus the shared cards nobody else
+        is on, so what it is short of is a shared card somebody else is using,
+        which comes free when *their* job ends, and that is not ours to wait
+        on. It is stepped over, not failed, since the configured host is big
+        enough for it. Width alone is not the test: a job wider than the owned
+        pool whose shortfall is an owned card of ours, with the shared card it
+        wants idle, holds like any other, or a stream of narrow jobs behind it
+        takes that owned card every time it frees and the job never runs.
 
         A job waiting for an owned card that has dropped off nvidia-smi holds
         like any other: `config.gpus` says the host has that card, so the host
@@ -1048,8 +1055,10 @@ class Dispatcher:
             return
         free = self.free_gpus()
         # Sampled at most once per pass, and only if a job actually needs it:
-        # see `borrowable_gpus`.
+        # see `borrowable_gpus`. `theirs` is how many shared cards that reading
+        # found somebody else on.
         borrowable: list[str] | None = None
+        theirs = 0
         # Cards spoken for by a job ahead in the queue that could not start.
         # Counts, not identities: one card of ours is as good as another.
         held = 0
@@ -1089,11 +1098,17 @@ class Dispatcher:
             short = spec.gpus - len(owned_part)
             if short and self.config.may_borrow(spec):
                 if borrowable is None:
-                    borrowable = self.borrowable_gpus()
+                    borrowable, theirs = self.borrowable_gpus()
                 shared_part = borrowable[: min(short, max(0, len(borrowable) - held_shared))]
                 short -= len(shared_part)
             if short:
-                if spec.gpus <= len(self.config.gpus):
+                # Owned cards as configured, missing ones included, plus the
+                # shared cards nobody else is on if it may borrow: what it could
+                # have once every job of ours ends.
+                ours = len(self.config.gpus)
+                if self.config.may_borrow(spec):
+                    ours += len(self.shared_gpus()) - theirs
+                if spec.gpus <= ours:
                     held += len(owned_part)
                     held_shared += len(shared_part)
                 continue

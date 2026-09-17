@@ -148,26 +148,74 @@ def expand_job_id(spec: JobSpec) -> JobSpec:
     other. The expanded string is what is judged, not the template: a
     destination with a literal id pasted in passes when it is this job's, and
     a mirrored spec an older build wrote with the *previous* run's id in it is
-    refused at requeue rather than pointed at that run's outputs. An `hf`
-    output with no `hf_path` uploads under the id itself, so it needs nothing.
+    refused at requeue rather than pointed at that run's outputs. A Hugging
+    Face location is the repo plus the path in it, so the id may sit in either;
+    an `hf` output with no `hf_path` uploads under the id itself.
     """
     for output in spec.outputs:
-        if output.s3:
-            output.s3 = output.s3.format(job_id=spec.job_id)
-        if output.hf:
-            output.hf = output.hf.format(job_id=spec.job_id)
-        if output.hf_path:
-            output.hf_path = output.hf_path.format(job_id=spec.job_id)
-        for key, destination in (("s3", output.s3), ("hf_path", output.hf_path)):
-            if destination and spec.job_id not in destination:
-                raise SubmitError(
-                    f"output {output.path}: `{key}: {destination}` does not include the job id "
-                    f"({spec.job_id}), so a second run would write over the first.\n"
-                    f"Put {{job_id}} in it, for example `{key}: {destination.rstrip('/')}/"
-                    f"{{job_id}}`. A mirrored spec that carries an earlier run's id is "
-                    f"refused for the same reason; edit it out and submit the file again."
-                )
+        output.s3 = _expand(output, "s3", output.s3, spec.job_id)
+        output.hf = _expand(output, "hf", output.hf, spec.job_id)
+        output.hf_path = _expand(output, "hf_path", output.hf_path, spec.job_id)
+        if output.s3 and spec.job_id not in output.s3:
+            raise _no_job_id(output, "s3", output.s3, spec.job_id)
+        if (
+            output.hf_path
+            and spec.job_id not in output.hf_path
+            and spec.job_id not in (output.hf or "")
+        ):
+            raise _no_job_id(output, "hf_path", output.hf_path, spec.job_id)
     return spec
+
+
+def _expand(output: jobs.Output, key: str, template: str | None, job_id: str) -> str | None:
+    if not template:
+        return template
+    try:
+        return template.format(job_id=job_id)
+    except (KeyError, IndexError, ValueError) as exc:
+        raise SubmitError(
+            f"output {output.path}: `{key}: {template}` has a placeholder this does not "
+            f"know ({exc}). The only one is {{job_id}}; a literal brace is written {{{{."
+        ) from exc
+
+
+def _no_job_id(output: jobs.Output, key: str, destination: str, job_id: str) -> SubmitError:
+    where = "it or in `hf`" if key == "hf_path" else "it"
+    return SubmitError(
+        f"output {output.path}: `{key}: {destination}` does not include the job id "
+        f"({job_id}), so a second run would write over the first.\n"
+        f"Put {{job_id}} in {where}, for example `{key}: {destination.rstrip('/')}/"
+        f"{{job_id}}`. A mirrored spec that carries an earlier run's id is "
+        f"refused for the same reason; edit it out and submit the file again."
+    )
+
+
+def from_mirror(document: dict[str, Any], previous_id: str) -> dict[str, Any]:
+    """A mirrored spec as `requeue` submits it: what this build knows, with the
+    earlier run's namespace made the new run's.
+
+    The mirror holds what some build wrote. The id and attempt are this run's
+    to assign, and a key this build does not know, at the top or on an output,
+    is not a typo. Builds before the mirror held the template stored the spec
+    with `{job_id}` expanded, so the previous id is put back as the placeholder
+    wherever it appears in a destination: the new job gets its own namespace
+    rather than a refusal over a file nobody can edit any more.
+    """
+    known = {k: v for k, v in document.items() if k in JobSpecModel.model_fields}
+    outputs = known.get("outputs")
+    if isinstance(outputs, list):
+        known["outputs"] = [_output_from_mirror(o, previous_id) for o in outputs]
+    return known
+
+
+def _output_from_mirror(output: Any, previous_id: str) -> Any:
+    if not isinstance(output, dict):
+        return output
+    pruned = {k: v for k, v in output.items() if k in OutputModel.model_fields}
+    for key in ("s3", "hf", "hf_path"):
+        if isinstance(pruned.get(key), str):
+            pruned[key] = pruned[key].replace(previous_id, "{job_id}")
+    return pruned
 
 
 def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -> str:
@@ -197,7 +245,6 @@ def precheck_local(
     gpu_count: int | None = None,
     environ: Mapping[str, str] | None = None,
     use_git: bool = True,
-    report: Reporter = print,
 ) -> None:
     """Everything a submit can fail on without a host, checked before we buy one.
 

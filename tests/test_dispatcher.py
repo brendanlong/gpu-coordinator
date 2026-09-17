@@ -1538,7 +1538,7 @@ def test_a_borrowed_card_is_busy_until_its_job_ends(gpuc_home: Path) -> None:
     spawned[first].finish()
     dispatcher.deps.smi = fake_smi(ALL_GPUS)
     dispatcher.run_once()
-    assert dispatcher.borrowable_gpus() == [SHARED_GPUS[0]]
+    assert dispatcher.borrowable_gpus() == ([SHARED_GPUS[0]], 0)
 
 
 def test_a_job_too_big_even_with_shared_cards_fails_with_what_would_help(
@@ -1893,9 +1893,10 @@ def test_a_borrowed_card_is_freed_for_a_job_that_asked_to_borrow(gpuc_home: Path
 
 
 def test_a_job_that_can_only_run_by_borrowing_holds_no_owned_card(gpuc_home: Path) -> None:
-    """The one job the strict order steps over. The card it is short of comes
-    free when somebody else's job ends, which is not this host's to wait for
-    -- so the queue behind it runs."""
+    """The one job the strict order steps over: it could not fit even once
+    every job of ours ends, because the card it is short of is a shared one
+    somebody else is on. That comes free when *their* job ends, which is not
+    this host's to wait for -- so the queue behind it runs."""
     dispatcher, _ = shared_host(
         shared=[SHARED_GPUS[0]],
         utilization={SHARED_GPUS[0]: 90.0},
@@ -1912,6 +1913,30 @@ def test_a_job_that_can_only_run_by_borrowing_holds_no_owned_card(gpuc_home: Pat
     # The free owned card goes to the job behind it rather than idling for a
     # card somebody else is training on.
     assert jobs.read_state(narrow).status == "running"
+
+
+def test_a_wide_borrower_short_of_an_owned_card_holds_like_any_other(gpuc_home: Path) -> None:
+    """The step-over is for a shared card somebody else is on, not for width.
+    This job asks for more than the host owns, but the shared card it wants is
+    idle and the card it is short of is an owned one our own job will free:
+    it holds what it took, or a steady stream of one-card jobs behind it takes
+    that owned card every time it frees and the job never runs."""
+    dispatcher, spawned = shared_host(shared=[SHARED_GPUS[0]])
+    holding = queue.enqueue(make_spec(gpus=1, priority=50))
+    dispatcher.run_once()
+    assert jobs.read_state(holding).gpus == [FAKE_GPUS[0]]
+
+    wide = queue.enqueue(make_spec(gpus=3, priority=10, use_shared=True))
+    narrow = queue.enqueue(make_spec(gpus=1, priority=50))
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(narrow).status == "queued"
+
+    spawned[holding].finish()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "running"
+    assert jobs.read_state(wide).gpus == [*FAKE_GPUS, SHARED_GPUS[0]]
+    assert jobs.read_state(narrow).status == "queued"
 
 
 def test_the_first_reading_of_the_shared_cards_is_logged_even_when_all_are_free(

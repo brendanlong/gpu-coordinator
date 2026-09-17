@@ -174,7 +174,10 @@ gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idem
   owning nothing, and `host add` says that nothing can be submitted to it until
   `gpuc host set <name> --gpus <list>` assigns some. Only this path has the
   default: an omitted `--gpus` on a host that already has a config keeps what
-  the host has (above), never resets it to every card.
+  the host has (above), never resets it to every card. A host that reports no
+  cards at all (no nvidia-smi, or a driver still coming up) is refused rather
+  than given "owns nothing" as its first config; `--gpus ''` says so on
+  purpose.
 
 So a host is registered by asking it what it is, and a second machine
 connecting to a box the first one set up is the ordinary path. Such a host is

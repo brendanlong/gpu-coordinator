@@ -47,16 +47,15 @@ def address_for(name: str, pod: Pod) -> HostEntry | None:
     )
 
 
-def offer_of(provider: Mapping[str, Any] | None) -> Offer:
-    """The offer a pod's own `provider` block says it was bought on.
-
-    An offer that is missing or unreadable is an empty one: it costs a reuse,
-    since `offer_satisfies` will not match it, and nothing more.
+def offer_of(provider: Mapping[str, Any] | None) -> Offer | None:
+    """The offer a pod's own `provider` block says it was bought on, or None
+    when the block has none this build can read: that costs a reuse, since
+    nothing is known to compare a request with, and nothing more.
     """
     value = (provider or {}).get("offer")
     if not isinstance(value, dict):
-        return Offer()
+        return None
     try:
         return Offer.model_validate(value)
     except ValidationError:
-        return Offer()
+        return None

@@ -97,9 +97,10 @@ Rules that avoid the classic failures:
   environment and are delivered to the host as a 0600 file. A job with S3 or HF
   outputs and no credentials fails at preflight, in seconds.
 - `{job_id}` in output destinations makes every run's namespace unique, and it
-  is required: an `s3` or `hf_path` without it is refused at submit (`hf_path`
-  left out means the job id itself). `gpuc requeue` gets a fresh id and a fresh
-  namespace from the same spec.
+  is required: an `s3` without it is refused at submit, and so is an `hf`
+  output with it in neither `hf` nor `hf_path` (`hf_path` left out means the
+  job id itself). `gpuc requeue` gets a fresh id and a fresh namespace from
+  the same spec.
 - Point `outputs:` at a directory the job creates. Files that were already there
   in the checkout are never uploaded as your results, and a path holding only
   those counts as `no-outputs`.

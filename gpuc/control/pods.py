@@ -14,7 +14,7 @@ from typing import Any
 
 from gpuc.control.config import Settings, load_registry
 from gpuc.control.providers.base import Pod, Provider, owned_pods
-from gpuc.control.provision import dispatcher_heartbeat_age
+from gpuc.control.provision import CEILING_MINUTES, dispatcher_heartbeat_age
 from gpuc.control.status import format_duration
 
 COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "HOST", "HEARTBEAT")
@@ -124,6 +124,11 @@ def gather(
     return view
 
 
+def _may_be_provisioning(pod: Pod) -> bool:
+    age = pod.age
+    return age is not None and age.total_seconds() < CEILING_MINUTES * 60.0
+
+
 def render(view: PodsView) -> str:
     lines: list[str] = []
     rows = [list(COLUMNS)] + [row.cells() for row in view.rows]
@@ -144,6 +149,14 @@ def render(view: PodsView) -> str:
             f"from this machine; nothing here ends a pod, so one whose dispatcher is gone "
             f"bills until you end it in the provider's console."
         )
+        young = [pod for pod in unregistered if _may_be_provisioning(pod)]
+        if young:
+            names = ", ".join(pod.name for pod in young)
+            lines.append(
+                f"{names}: younger than the {CEILING_MINUTES:.0f} min provisioning ceiling, "
+                f"so a `gpuc submit --runpod` elsewhere may still be setting it up; "
+                f"ending it now would cost that submit its pod."
+            )
     if view.others:
         names = ", ".join(f"{pod.name} ({pod.status})" for pod in view.others)
         lines.append(f"{len(view.others)} other pod(s) in the account, never touched: {names}")
