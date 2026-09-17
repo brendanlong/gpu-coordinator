@@ -12,7 +12,7 @@ commented example; `-` as the file name reads the spec from stdin.
 
 | field | default | meaning |
 | --- | --- | --- |
-| `command` | **required** | run in `workdir/` as phase `main` |
+| `command` | **required** | run in `workdir/` as phase `main`; a blank one is refused at submit |
 | `name` | `""` | a label for `status`; not an identifier |
 | `setup` | none | run first, as phase `setup` |
 | `gpus` | `1` | how many of the host's GPUs to assign (>= 0). `0` never waits for a card. More than the host can ever provide is refused at submit |

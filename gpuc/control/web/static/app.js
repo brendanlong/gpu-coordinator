@@ -438,7 +438,7 @@ function podLine(host) {
     el("span", {}, pod.gpu_name || "?"),
     el("span", {}, `$${pod.cost_usd_hr.toFixed(3)}/h`),
     el("span", {}, `cuda ${pod.cuda_version || "?"}`),
-    el("span", {}, pod.age_s === null ? "age ?" : `age ${Math.round(pod.age_s / 60)}m`),
+    el("span", {}, pod.age_s === null ? "age ?" : `age ${fmtDuration(pod.age_s)}`),
     el("span", {}, `provider util ${util}`),
   );
 }

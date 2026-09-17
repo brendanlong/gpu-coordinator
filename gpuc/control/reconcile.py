@@ -70,9 +70,6 @@ WATCH_GAP_MINUTES = 5.0
 in between: suspended, rebooted, or the timer disabled. Comfortably longer than
 the 60 s timer interval, and far shorter than the silence a host is allowed."""
 
-"""How long a pod another machine has just created may have no config on it
-yet. Only ever used to word a report: nothing here acts on it."""
-
 HostLiveness = Callable[[DesiredHost, "HostEntry | None", Settings], Liveness]
 PodQuestion = Callable[[Pod, Settings], PodAnswer]
 

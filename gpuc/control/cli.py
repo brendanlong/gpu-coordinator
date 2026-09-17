@@ -527,8 +527,9 @@ def cmd_host_remove(args: argparse.Namespace) -> int:
 
 def cmd_host_resume(args: argparse.Namespace) -> int:
     entry = named_registry().require(args.name)
-    open_session(entry, load_settings()).host_cli("resume")
-    print(f"host {args.name}: low-util pause cleared, dispatcher restarted")
+    payload = open_session(entry, load_settings()).host_json("resume")
+    pid = payload.get("dispatcher_pid") if isinstance(payload, dict) else None
+    print(f"host {args.name}: low-util pause cleared, dispatcher pid {pid or '?'}")
     return 0
 
 

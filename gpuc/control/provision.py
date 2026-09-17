@@ -474,7 +474,7 @@ def _create_and_record(
     """Check caps, create, and write `desired/` with the state lock held.
 
     The lock is what makes the account caps mean anything across the several
-    local sessions that share this account (requirements-review 2.9): without
+    local sessions that share this account: without
     it two `gpuc submit --runpod` can both read "one pod running" and both
     create. It also hides the create-to-record gap from the reaper, which takes
     the same lock, so a pod is never visible as a stray it might reap.

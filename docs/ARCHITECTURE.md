@@ -204,7 +204,8 @@ queue's lexical order, not submission order below one second.
 
 ## Dispatcher (`python -m gpuc.host dispatch`)
 
-- Started by every `enqueue` (and by bootstrap) with `setsid nohup ... &`.
+- Started by every `enqueue` (and by bootstrap) in its own session
+  (`dispatcher._spawn_host_process`), so it outlives the ssh session.
   Takes `flock(LOCK_EX|LOCK_NB)` on `dispatcher.lock`. If held **and** the
   heartbeat is younger than 30 s, exit 0 silently. If held and the heartbeat
   is stale, kill the holder's process group (pgid recorded in the lock file

@@ -2088,3 +2088,23 @@ def test_an_existing_gpu_overlap_does_not_block_every_other_host_set(
     assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
     assert main(["host", "set", "gpubox", "--idle-min", "30"]) == 0
     assert fake_host.config is not None and fake_host.config["idle_minutes"] == 30.0
+
+
+def test_reorder_accepts_the_answer_of_a_host_build_from_before_the_verdict_shape(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older host prints `{"reordered": true}` and exits 0. The move happened,
+    and reporting failure would leave the mirror at the old priority."""
+
+    class Older:
+        def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": "20260101-000000-aaaaaa", "reordered": True}
+            raise RemoteError("local", "status", "host is busy")
+
+    register_host(name="local", gpus=GPU)
+    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Older())
+    capsys.readouterr()
+    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
+    assert main(argv) == 0
+    assert one_document(capsys)["priority"] == 5

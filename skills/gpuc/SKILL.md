@@ -27,7 +27,7 @@ between machines and nothing to warn about.
 `gpuc skill` prints this file, and `gpuc skill --install [DIR]` writes a copy
 to `DIR/.claude/skills/gpuc/SKILL.md`.
 
-If `gpuc` is not on PATH, run it as `uv run gpuc` from a checkout. A host
+If `gpuc` is not on PATH, run it as `uv run gpuc` from a checkout. A host that
 `gpuc version` marks `DIFFERS: re-bootstrap` needs nothing from you: `gpuc submit` and `gpuc requeue`
 re-sync the package and restart that host's dispatcher before enqueueing (pass
 `--no-bootstrap` to skip it). Registering, bootstrapping and configuring hosts

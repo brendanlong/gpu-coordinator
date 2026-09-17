@@ -361,7 +361,13 @@ def check_priority(priority: int) -> None:
 
 
 def host_answer(
-    session: HostSession, entry: HostEntry, request: str, job_id: str, verb: str
+    session: HostSession,
+    entry: HostEntry,
+    request: str,
+    job_id: str,
+    verb: str,
+    *,
+    legacy_key: str | None = None,
 ) -> dict[str, Any]:
     """Run a host subcommand that answers with its own verdict, refusal included.
 
@@ -376,6 +382,10 @@ def host_answer(
     if document.get("error"):
         raise CliError(f"host {entry.name} did not {verb} {job_id}: {document['error']}")
     if not document.get("status"):
+        if legacy_key and document.get(legacy_key) is True:
+            # A build from before the command answered with a status: it did
+            # the thing, and said so in the shape it knew.
+            return document
         raise CliError(
             f"host {entry.name} did not say what it did with {job_id}: {json.dumps(payload)[:200]}"
         )
@@ -386,7 +396,14 @@ def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings
     check_priority(priority)
     entry, _ = find_job_host(job_id, named_registry(), host)
     session = open_session(entry, settings)
-    host_answer(session, entry, f"reorder {shlex.quote(job_id)} {priority}", job_id, "reorder")
+    host_answer(
+        session,
+        entry,
+        f"reorder {shlex.quote(job_id)} {priority}",
+        job_id,
+        "reorder",
+        legacy_key="reordered",
+    )
     # The mirror, for the same reason `estimate` updates it: `requeue` submits
     # what S3 holds, so a reorder left out of it would hand the re-run back at
     # the priority the job was first submitted with.
@@ -508,7 +525,8 @@ def estimate_job(
         session, entry, f"estimate {shlex.quote(job_id)} {request}", job_id, "set the estimate on"
     )
     recorded = document.get("estimated_runtime_min")
-    if wanted is not None and not isinstance(recorded, (int, float)):
+    expected = recorded is None if wanted is None else isinstance(recorded, (int, float))
+    if not expected:
         # Otherwise a host whose answer lacks the key reports a successful
         # *clear* of a job it never touched.
         raise CliError(
