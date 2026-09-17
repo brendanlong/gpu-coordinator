@@ -1885,3 +1885,19 @@ def test_a_job_that_can_only_run_by_borrowing_holds_no_owned_card(gpuc_home: Pat
     # The free owned card goes to the job behind it rather than idling for a
     # card somebody else is training on.
     assert jobs.read_state(narrow).status == "running"
+
+
+def test_the_first_reading_of_the_shared_cards_is_logged_even_when_all_are_free(
+    gpuc_home: Path,
+) -> None:
+    """The log line that says a job was allowed onto somebody else's card is the
+    first thing anybody looks for when one was not, and "they were all free" was
+    the one reading that never produced it."""
+    dispatcher, _ = shared_host()
+    *_, borrower = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
+    dispatcher.run_once()
+
+    assert jobs.read_state(borrower).status == "running"
+    assert f"shared GPU(s) free to borrow: {', '.join(SHARED_GPUS)}" in (
+        paths.dispatcher_log().read_text()
+    )

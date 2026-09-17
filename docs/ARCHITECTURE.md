@@ -210,6 +210,18 @@ queue's lexical order, not submission order below one second.
   heartbeat is younger than 30 s, exit 0 silently. If held and the heartbeat
   is stale, kill the holder's process group (pgid recorded in the lock file
   body), then take over.
+- **A newer build takes over from an older one**, fresh heartbeat or not. The
+  lock body records the `config.pkg_commit` its holder read at startup; a
+  dispatcher whose own is different SIGTERMs the holder (which finishes its
+  pass, releases the lock and exits), and SIGKILLs it if it has not gone in
+  30 s. Without this, a dispatcher outlived every re-bootstrap of its host:
+  it imports its code once, so `gpuc host bootstrap` replaced the package on
+  disk, started a dispatcher that saw a fresh heartbeat and exited, and left
+  the queue being served by whatever was shipped days ago. A holder that
+  recorded no commit counts as older -- that is every build before the field
+  existed. A host with no commit recorded at all evicts nobody: there is
+  nothing to compare. `gpuc status` reports the holder's commit as
+  `dispatcher.pkg_commit` and warns when it is behind the package on disk.
 - Loop every 2 s: resolve `config.gpus` to UUIDs (see GPU ownership), then
   walk `queue/` in lexical order. A job that fits the free owned cards gets
   UUIDs assigned, its marker removed, state `running`, and a runner spawned in

@@ -187,6 +187,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 # a laptop against the same box -- leaves that record
                 # describing a host it no longer matches.
                 "pkg_commit": config.pkg_commit,
+                # And the commit the dispatcher *now running* was started on,
+                # which is not the same question: a dispatcher imports its code
+                # once and keeps serving the queue from it however many times
+                # the package underneath is replaced.
+                "dispatcher_pkg_commit": dispatcher.holder_pkg_commit(),
                 **_gpu_table(config),
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),

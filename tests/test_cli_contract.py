@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -553,6 +554,49 @@ def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
     # commit has no business telling a host it is behind.
     monkeypatch.setattr(version_mod, "local_commit", lambda: None)
     assert status_mod.host_warnings(HostView(entry=entry, reachable=True)) == []
+
+
+def test_a_dispatcher_older_than_the_package_it_dispatches_is_a_warning(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host has this build on disk and a dispatcher from before it still
+    serving the queue, which is the one build mismatch nothing here can see
+    from `pkg_commit` alone -- and the one that had a `use_shared` job waiting
+    on two idle cards the running code did not know the host had."""
+    from gpuc.control import version as version_mod
+
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
+    view = HostView(
+        entry=entry,
+        reachable=True,
+        pkg_commit="a" * 40,
+        dispatcher_pkg_commit="b" * 40,
+        heartbeat_age_s=2.0,
+    )
+    (warning,) = status_mod.host_warnings(view)
+    assert "running dispatcher was started on gpuc " + "b" * 12 in warning
+    assert "gpuc host bootstrap gpubox" in warning
+    assert status_mod.host_json(view)["dispatcher"]["pkg_commit"] == "b" * 40
+
+    # The same build, and a host whose dispatcher is not running at all: the
+    # second has nothing to be behind.
+    same = replace(view, dispatcher_pkg_commit="a" * 40)
+    assert status_mod.host_warnings(same) == []
+    assert status_mod.host_warnings(replace(view, heartbeat_age_s=None)) == []
+
+
+def test_a_host_behind_on_its_package_is_told_that_once_not_twice(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host whose *package* is behind is already being told to re-bootstrap,
+    and which build its dispatcher happens to be on does not change the fix."""
+    from gpuc.control import version as version_mod
+
+    monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
+    view = HostView(entry=entry, reachable=True, pkg_commit="b" * 40, heartbeat_age_s=2.0)
+    assert len(status_mod.host_warnings(view)) == 1
 
 
 def test_a_config_this_machine_has_not_caught_up_with_is_not_a_warning(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -10,9 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import dispatcher, paths
+from gpuc.host import dispatcher, jobs, paths
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import DispatcherLock, LockBody
+from gpuc.host.jobs import HostConfig
 
 # A holder that takes the lock, writes a dispatcher-shaped lock body and a
 # heartbeat of our choosing, and then wedges forever with a child in the same
@@ -20,14 +22,21 @@ from gpuc.host.dispatcher import DispatcherLock, LockBody
 # survive. The trailing argv marker is what makes it look like `gpuc.host` in
 # /proc, which is the only kind of process a takeover is allowed to kill.
 WEDGED_HOLDER = r"""
-import fcntl, json, os, sys, time
+import fcntl, json, os, signal, sys, time
 lock_path, heartbeat_path, age = sys.argv[1], sys.argv[2], float(sys.argv[3])
+pkg_commit, on_term = sys.argv[4] or None, sys.argv[5]
+if on_term == "ignore":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+else:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 stat = open(f"/proc/{os.getpid()}/stat").read()
 starttime = stat.rpartition(")")[2].split()[19]
 boot_id = open("/proc/sys/kernel/random/boot_id").read().strip()
 body = {"pid": os.getpid(), "pgid": os.getpgid(0), "starttime": starttime, "boot_id": boot_id}
+if pkg_commit:
+    body["pkg_commit"] = pkg_commit
 os.ftruncate(fd, 0)
 os.write(fd, (json.dumps(body, sort_keys=True) + "\n").encode())
 os.fsync(fd)
@@ -41,7 +50,9 @@ while True:
 """
 
 
-def start_wedged_holder(heartbeat_age_s: float) -> subprocess.Popen[str]:
+def start_wedged_holder(
+    heartbeat_age_s: float, pkg_commit: str = "", on_term: str = "exit"
+) -> subprocess.Popen[str]:
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -50,6 +61,8 @@ def start_wedged_holder(heartbeat_age_s: float) -> subprocess.Popen[str]:
             str(paths.lock_file()),
             str(paths.heartbeat_file()),
             str(heartbeat_age_s),
+            pkg_commit,
+            on_term,
             "gpuc.host",
         ],
         stdout=subprocess.PIPE,
@@ -263,3 +276,107 @@ def test_the_heartbeat_is_fresh_before_the_lock_body_is_written(
     assert lock.acquire()
     lock.release()
     assert ages and ages[0] is not None and ages[0] < 5
+
+
+# -- a dispatcher older than the package it is dispatching ---------------------
+#
+# The failure these cover: a dispatcher imports its code once and then lives for
+# days, so re-shipping the package under a live one changes nothing at all about
+# what it dispatches with. `gpuc host bootstrap` looked like it fixed that, and
+# did not -- the dispatcher it started found a fresh heartbeat and exited, and a
+# job asking for a feature shipped that morning waited on a host that had never
+# heard of it.
+
+SHIPPED = "b" * 40
+RUNNING = "a" * 40
+
+
+def on_this_host(pkg_commit: str | None) -> None:
+    jobs.write_config(HostConfig(host="test-host", pkg_commit=pkg_commit))
+
+
+def test_a_holder_on_the_build_this_host_has_replaced_is_asked_to_stand_down(
+    gpuc_home: Path,
+) -> None:
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING)
+    try:
+        lock = DispatcherLock()
+        assert lock.acquire(takeover_wait_s=10.0, handoff_wait_s=20.0)
+        assert holder.wait(timeout=10) == 0  # it stopped on its own, not killed
+        assert LockBody.parse(paths.lock_file().read_text()).pkg_commit == SHIPPED
+        lock.release()
+        log = paths.dispatcher_log().read_text()
+        assert "SIGTERMing" in log and RUNNING[:12] in log and SHIPPED[:12] in log
+    finally:
+        kill_tree(holder)
+
+
+def test_a_holder_too_old_to_record_a_commit_counts_as_replaced(gpuc_home: Path) -> None:
+    """The case that actually happened: every dispatcher started before the lock
+    carried a commit. "It did not say" is the oldest build of all, not a maybe."""
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0)
+    try:
+        lock = DispatcherLock()
+        assert lock.acquire(takeover_wait_s=10.0, handoff_wait_s=20.0)
+        assert holder.wait(timeout=10) == 0
+        lock.release()
+    finally:
+        kill_tree(holder)
+
+
+def test_a_holder_that_will_not_stand_down_is_killed(gpuc_home: Path) -> None:
+    """A dispatcher running code this host no longer has is worse than none at
+    all: nothing else here can work around it, so it does not get a veto."""
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING, on_term="ignore")
+    try:
+        lock = DispatcherLock()
+        assert lock.acquire(takeover_wait_s=10.0, handoff_wait_s=2.0)
+        assert holder.wait(timeout=10) == -9
+        lock.release()
+    finally:
+        kill_tree(holder)
+
+
+def test_a_holder_on_the_same_build_is_left_alone(gpuc_home: Path) -> None:
+    on_this_host(SHIPPED)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=SHIPPED)
+    try:
+        assert not DispatcherLock().acquire(takeover_wait_s=1.0, handoff_wait_s=1.0)
+        assert holder.poll() is None
+    finally:
+        kill_tree(holder)
+
+
+def test_a_host_that_records_no_commit_never_evicts_anybody(gpuc_home: Path) -> None:
+    """Nothing to compare against is not evidence of anything, and a host where
+    no commit is ever known must not restart its dispatcher on every enqueue."""
+    on_this_host(None)
+    holder = start_wedged_holder(heartbeat_age_s=1.0)
+    try:
+        assert not DispatcherLock().acquire(takeover_wait_s=1.0, handoff_wait_s=1.0)
+        assert holder.poll() is None
+    finally:
+        kill_tree(holder)
+
+
+def test_acquire_records_the_commit_this_dispatcher_is_running(gpuc_home: Path) -> None:
+    on_this_host(SHIPPED)
+    lock = DispatcherLock()
+    assert lock.acquire()
+    lock.release()
+    assert LockBody.parse(paths.lock_file().read_text()).pkg_commit == SHIPPED
+    assert dispatcher.holder_pkg_commit() == SHIPPED
+
+
+def test_sigterm_asks_the_loop_to_finish_its_pass_and_exit(gpuc_home: Path) -> None:
+    loop = dispatcher.Dispatcher()
+    dispatcher._stop_on_sigterm(loop)
+    try:
+        assert not loop.should_exit
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert loop.should_exit
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)

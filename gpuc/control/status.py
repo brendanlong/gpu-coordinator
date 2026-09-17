@@ -328,6 +328,13 @@ class HostView:
     """The commit the *host* says its package came from, not the one this
     machine's registry remembers shipping. Null when the host was not asked or
     was bootstrapped by a build too old to record it."""
+    dispatcher_pkg_commit: str | None = None
+    """The commit the dispatcher that is *running* was started on.
+
+    A dispatcher imports its code once, so re-shipping the package under a live
+    one changes nothing about what it dispatches with. It takes itself off when
+    the next one starts, and this is how a host where that did not happen says
+    so. Null when the host is on a build too old to answer."""
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
@@ -515,6 +522,7 @@ def gather(
         return view
     view.reachable = True
     view.pkg_commit = _as_str(payload.get("pkg_commit"))
+    view.dispatcher_pkg_commit = _as_str(payload.get("dispatcher_pkg_commit"))
     view.owned, view.indices = owned_gpus(payload, entry)
     view.unavailable = [g for g in payload.get("gpus_unavailable") or [] if isinstance(g, str)]
     view.shared = [
@@ -1149,7 +1157,17 @@ def host_warnings(view: HostView) -> list[str]:
     if not view.reachable:
         return []
     stale = version.host_build_warning(view.entry.name, view.pkg_commit, version.local_commit())
-    return [stale] if stale else []
+    if stale:
+        # One problem, one fix. A host whose *package* is behind is already
+        # being told to re-bootstrap, and which of the two builds its
+        # dispatcher happens to be on does not change that.
+        return [stale]
+    if not view.dispatcher_alive:
+        return []
+    running = version.dispatcher_build_warning(
+        view.entry.name, view.dispatcher_pkg_commit, view.pkg_commit
+    )
+    return [running] if running else []
 
 
 def job_json(
@@ -1333,6 +1351,7 @@ def host_json(
         "dispatcher": {
             "alive": view.dispatcher_alive,
             "heartbeat_age_s": view.heartbeat_age_s,
+            "pkg_commit": view.dispatcher_pkg_commit,
         },
         "provider_util": list(view.pod.gpu_utils) if view.pod is not None else None,
         "pod": pod_json(view),

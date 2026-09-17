@@ -305,6 +305,24 @@ def test_status_reports_the_commit_the_host_was_bootstrapped_with(
     assert status["pkg_commit"] is None
 
 
+def test_status_reports_the_commit_the_running_dispatcher_was_started_on(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Not the same question as `pkg_commit`, and the difference is the bug it
+    exists for: a dispatcher imports its code once, so a host re-bootstrapped
+    under a live one has the new package on disk and the old one dispatching."""
+    jobs.write_config(HostConfig(host="test-host", pkg_commit="c" * 40))
+    lock = dispatcher.DispatcherLock()
+    assert lock.acquire()
+    try:
+        jobs.write_config(HostConfig(host="test-host", pkg_commit="d" * 40))
+        _, status = run(capsys, "status")
+    finally:
+        lock.release()
+    assert isinstance(status, dict)
+    assert (status["pkg_commit"], status["dispatcher_pkg_commit"]) == ("d" * 40, "c" * 40)
+
+
 def test_status_reports_each_jobs_priority_and_card_count_from_its_spec(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
