@@ -782,8 +782,8 @@ gpuc is built around: a pod gpuc rents gets no network volume, so it has nowhere
 durable to put one, and an overlay `$HOME` is not a misconfiguration to warn
 about. `--persistent-root` is there for the host where somebody decides the
 trade is worth it. The health check's disk floor is measured on
-`paths.home()`, so it is `R`'s volume when a root is set. The operator runbook for a host that came back empty is in
-setup.md.
+`paths.home()`, so it is `R`'s volume when a root is set. The operator runbook
+for a host that came back empty is in setup.md.
 
 ## RunPod provider (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
 
