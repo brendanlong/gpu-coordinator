@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gpuc._version import superseded
+from gpuc._version import is_other_build
 from gpuc.host import baseline, cleanup, gpus, jobs, paths, queue, scope, sync, terminate
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.runner import (
@@ -119,10 +119,18 @@ def running_pkg_commit() -> str | None:
     """The commit of the package a dispatcher starting now would be running.
 
     `config.pkg_commit` is written by whoever shipped the package, *before* the
-    dispatcher that serves it is started (`bootstrap.resync_package`), so at
-    exec time it names the code on disk. Read at acquire time and recorded in
-    the lock, never re-read: the point is to remember which build this process
-    is, and a later ship must not silently rewrite that answer.
+    dispatcher that serves it is started (`bootstrap.resync_package`), so it
+    names the code on disk. Read once, when the lock object is built -- which
+    is the first thing a dispatcher does -- and then recorded rather than
+    re-read: the point is to remember which build this process is, and a later
+    ship must not silently rewrite that answer.
+
+    What it cannot see is a *second* control machine shipping in the gap
+    between the config write and this read, an ssh round trip wide: this
+    dispatcher would then record that machine's commit while running the one it
+    was started from, and nothing would evict it. The alternative is threading
+    the shipped commit through the spawn, a second source of truth for the same
+    fact, and the trade is deliberate.
     """
     with contextlib.suppress(RuntimeError, OSError, ValueError):
         return jobs.read_config().pkg_commit
@@ -130,16 +138,15 @@ def running_pkg_commit() -> str | None:
 
 
 def holder_pkg_commit() -> str | None:
-    """The commit the dispatcher now holding the lock is running, if it said.
+    """The commit recorded by whoever last took the lock, if they said.
 
-    For `gpuc status`: a dispatcher older than the package on the host is
-    exactly the failure the takeover below exists to end, and one that somehow
-    survives it should be visible rather than silent.
+    For `gpuc status`, which pairs it with the heartbeat: the lock file outlives
+    the process that wrote it, so this answers "what was the last dispatcher
+    here built from", and only a fresh heartbeat makes that a fact about now.
     """
-    try:
+    with contextlib.suppress(OSError, ValueError):
         return LockBody.parse(paths.lock_file().read_text()).pkg_commit
-    except OSError:
-        return None
+    return None
 
 
 def heartbeat_age(now: Callable[[], float] = time.time) -> float | None:
@@ -190,10 +197,9 @@ class DispatcherLock:
         return age is not None and age < self.stale_after_s
 
     def holder(self) -> LockBody:
-        try:
+        with contextlib.suppress(OSError, ValueError):
             return LockBody.parse(self.lock_path.read_text())
-        except OSError:
-            return LockBody()
+        return LockBody()
 
     def acquire(self, takeover_wait_s: float = 10.0, handoff_wait_s: float = 30.0) -> bool:
         paths.ensure_layout()
@@ -201,24 +207,50 @@ class DispatcherLock:
         if self._try_flock(fd):
             self._adopt(fd)
             return True
+        incumbent = self.holder()
         if self.holder_is_fresh():
-            if not self._holder_is_superseded():
+            if not self._is_another_build(incumbent):
                 os.close(fd)
                 return False
-            self._ask_superseded_holder_to_stop()
+            if not self._ask_to_stand_down(incumbent):
+                # Nothing we are allowed to signal, so nothing is going to
+                # stand down: waiting out a handoff nobody was asked for would
+                # cost every enqueue 40s for as long as that holder lives.
+                os.close(fd)
+                return False
             if self._take_over(fd, handoff_wait_s):
                 return True
-            # It would not go. A dispatcher running code this host no longer
-            # has is worse than none at all -- it is the one thing nothing else
-            # here can work around -- so it gets the same SIGKILL a wedged one
-            # does, by the same rules about what may be signalled.
-            self._signal_holder(signal.SIGKILL, "it did not stop when it was asked to")
+            if not self._still_held_by(incumbent):
+                # Somebody else won the lock while we waited. Whatever it is,
+                # it is not the process we asked to stand down, and killing the
+                # dispatcher that just took over -- possibly the one running
+                # exactly the code we wanted -- is the worst thing we could do
+                # here. Two dispatchers start within seconds of each other on
+                # every `gpuc submit` (resync starts one, the enqueue another),
+                # so this is the ordinary case, not the exotic one.
+                os.close(fd)
+                return False
+            # It would not go. A dispatcher running a build this host does not
+            # have is worse than none at all -- it is the one thing nothing
+            # else here can work around -- so it gets the same SIGKILL a wedged
+            # one does, by the same rules about what may be signalled.
+            self._signal_holder(signal.SIGKILL, incumbent, "it did not stand down when asked")
         else:
             self._evict_stale_holder()
         if self._take_over(fd, takeover_wait_s):
             return True
         os.close(fd)
         return False
+
+    def _still_held_by(self, incumbent: LockBody) -> bool:
+        """Is the lock still held by the process we were negotiating with?
+
+        pid *and* start time: a pid alone is reused, and the whole question is
+        whether the thing on the other end of our SIGTERM is the thing about to
+        get our SIGKILL.
+        """
+        now = self.holder()
+        return now.pid == incumbent.pid and now.starttime == incumbent.starttime
 
     def _take_over(self, fd: int, wait_s: float) -> bool:
         deadline = self._now() + wait_s
@@ -229,39 +261,49 @@ class DispatcherLock:
             self._sleep(0.25)
         return False
 
-    def _holder_is_superseded(self) -> bool:
-        """Is the dispatcher holding the lock running a build this host replaced?
+    def _is_another_build(self, incumbent: LockBody) -> bool:
+        """Is the dispatcher holding the lock running a build other than ours?
 
         The heartbeat says a dispatcher is *alive*, which was the whole test
         until the package underneath one could change while it ran. It can: a
         host is re-bootstrapped whenever `gpuc submit` finds it behind, and the
-        incumbent goes on importing nothing, so it serves the queue with
-        whatever was on disk the day it started. That is not a stale lock and
-        it is not a wedged process; it is the wrong code, and only the process
-        starting from the new package can tell.
-        """
-        return superseded(self.holder().pkg_commit, self.pkg_commit)
+        incumbent re-imports nothing, so it serves the queue with whatever was
+        on disk the day it started. That is not a stale lock and it is not a
+        wedged process; it is the wrong code, and only a process starting from
+        the package now on disk can tell.
 
-    def _ask_superseded_holder_to_stop(self) -> None:
-        was = self.holder().pkg_commit
+        Other, not older -- see `is_other_build`. The code on disk is the code
+        that should be running, whichever direction it moved.
+        """
+        return is_other_build(incumbent.pkg_commit, self.pkg_commit)
+
+    def _ask_to_stand_down(self, incumbent: LockBody) -> bool:
+        """SIGTERM the incumbent. False when there was nothing safe to signal."""
+        was = incumbent.pkg_commit
         running = f"gpuc {was[:12]}" if was else "a build too old to say which"
-        self._signal_holder(
+        return self._signal_holder(
             signal.SIGTERM,
-            f"it is running {running} and this host has shipped "
-            f"{(self.pkg_commit or 'unknown')[:12]} since",
+            incumbent,
+            f"it is running {running} and this host now has "
+            f"{(self.pkg_commit or 'unknown')[:12]} on disk",
         )
 
-    def _signal_holder(self, sig: int, why: str) -> None:
-        """Signal the lock holder's process group, if that is provably safe."""
-        body = self.holder()
+    def _signal_holder(self, sig: int, body: LockBody, why: str) -> bool:
+        """Signal `body`'s process group if that is provably safe, and say so.
+
+        The body is passed in rather than re-read: every caller has already
+        decided something about a *particular* holder, and re-reading here
+        would let the signal land on whichever process happened to hold the
+        lock by the time it was sent.
+        """
         pgid = self._signalable_pgid(body)
         if pgid is None:
-            return
+            return False
         self.takeover_pgid = pgid
-        name = "SIGTERM" if sig == signal.SIGTERM else "SIGKILL"
-        log_line(f"{name}ing dispatcher process group {pgid}: {why}")
+        log_line(f"{signal.Signals(sig).name}ing dispatcher process group {pgid}: {why}")
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, sig)
+        return True
 
     def _signalable_pgid(self, body: LockBody) -> int | None:
         """The incumbent's process group, if signalling it is provably safe.
@@ -302,7 +344,9 @@ class DispatcherLock:
         `_signalable_pgid` is for: nothing is signalled until the pid in the
         lock file has been shown to still be the dispatcher that wrote it.
         """
-        self._signal_holder(signal.SIGKILL, "its heartbeat is stale, so it is wedged")
+        self._signal_holder(
+            signal.SIGKILL, self.holder(), "its heartbeat is stale, so it is wedged"
+        )
 
     def _try_flock(self, fd: int) -> bool:
         try:
@@ -424,8 +468,11 @@ def default_spawn_runner(job_id: str) -> subprocess.Popen[bytes]:
 def spawn_detached_dispatcher() -> int:
     """Start a dispatcher that outlives this process (and any SSH session).
 
-    Always safe to call: a second dispatcher exits silently when the incumbent
-    heartbeat is fresh, so enqueue can fire this unconditionally.
+    Always safe to call, so enqueue can fire it unconditionally: a second
+    dispatcher exits silently when the incumbent is alive and was started from
+    the same package. When it was not, this is the call that replaces it --
+    see `DispatcherLock.acquire` -- which is why it is worth firing even on a
+    host whose dispatcher is demonstrably healthy.
     """
     return _spawn_host_process("dispatch").pid
 
@@ -1571,13 +1618,21 @@ class Dispatcher:
 def _stop_on_sigterm(dispatcher: Dispatcher) -> None:
     """Finish the pass, then exit -- the polite half of a handoff.
 
-    A dispatcher superseded by a newer build is asked to stand down before it
+    A dispatcher asked to stand down for another build is SIGTERMed before it
     is killed (`DispatcherLock.acquire`), and this is what makes the asking
-    worth anything: the loop puts down whatever it is holding, releases the
-    lock, and the newcomer takes it without a SIGKILL landing in the middle of
-    a state write. Nothing is lost either way -- the runners are in their own
-    sessions and `adopt_orphans` reconciles them -- but "nothing is lost" is a
-    worse promise than "nothing was interrupted".
+    worth anything: the loop finishes what it is doing, releases the lock, and
+    the newcomer takes it without a signal landing between two writes. The
+    window that matters is in `launch_ready`, between the state that says a job
+    is running and the runner pid that proves it: a dispatcher killed there
+    leaves a job the next one reads as `runner-died`.
+
+    Installed before the lock is taken, not after: the several seconds
+    `acquire` can spend negotiating are exactly when the SIGTERM of a *third*
+    dispatcher may arrive, and dying there with the lock held helps nobody.
+    Setting a flag no loop is reading yet is harmless.
+
+    It cannot help on the first takeover of any host, whose incumbent is by
+    definition a build without this handler and dies where it stands.
     """
 
     def stop(_signum: int, _frame: object) -> None:
@@ -1588,9 +1643,9 @@ def _stop_on_sigterm(dispatcher: Dispatcher) -> None:
 
 
 def main(_: object = None) -> int:
+    dispatcher = Dispatcher()
+    _stop_on_sigterm(dispatcher)
     lock = DispatcherLock()
     if not lock.acquire():
         return 0
-    dispatcher = Dispatcher()
-    _stop_on_sigterm(dispatcher)
     return dispatcher.run(lock)

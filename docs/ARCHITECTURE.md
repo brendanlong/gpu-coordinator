@@ -210,18 +210,29 @@ queue's lexical order, not submission order below one second.
   heartbeat is younger than 30 s, exit 0 silently. If held and the heartbeat
   is stale, kill the holder's process group (pgid recorded in the lock file
   body), then take over.
-- **A newer build takes over from an older one**, fresh heartbeat or not. The
-  lock body records the `config.pkg_commit` its holder read at startup; a
-  dispatcher whose own is different SIGTERMs the holder (which finishes its
-  pass, releases the lock and exits), and SIGKILLs it if it has not gone in
-  30 s. Without this, a dispatcher outlived every re-bootstrap of its host:
-  it imports its code once, so `gpuc host bootstrap` replaced the package on
-  disk, started a dispatcher that saw a fresh heartbeat and exited, and left
-  the queue being served by whatever was shipped days ago. A holder that
-  recorded no commit counts as older -- that is every build before the field
-  existed. A host with no commit recorded at all evicts nobody: there is
-  nothing to compare. `gpuc status` reports the holder's commit as
-  `dispatcher.pkg_commit` and warns when it is behind the package on disk.
+- **A dispatcher started from the package on disk replaces one that was not**,
+  fresh heartbeat or not. The lock body records the `config.pkg_commit` its
+  holder read at startup; a dispatcher whose own differs SIGTERMs the holder
+  and SIGKILLs it if it has not gone in 30 s. Without this, a dispatcher
+  outlived every re-bootstrap of its host: it imports its code once, so `gpuc
+  host bootstrap` replaced the package on disk, started a dispatcher that saw
+  a fresh heartbeat and exited, and left the queue being served by whatever was
+  shipped days ago.
+  - *Different*, not newer: a commit id carries no ordering, and the code on
+    disk is the code that should be running either way. A holder that recorded
+    no commit counts as different -- that is every build from before the field.
+    A host with no commit recorded at all replaces nobody: nothing to compare.
+  - The SIGTERM is polite only to a holder that has the handler
+    (`_stop_on_sigterm`, which finishes the pass and releases the lock). The
+    *first* takeover on any host is against a build without it, which dies
+    where it stands; `adopt_orphans` picks its jobs back up.
+  - Before escalating to SIGKILL the lock is re-read and the holder's pid and
+    start time must be unchanged. Two dispatchers start within seconds on every
+    `gpuc submit` (the resync starts one, the enqueue another), so "somebody
+    else took over while we waited" is ordinary -- and SIGKILLing *them* would
+    take out the dispatcher running the code we wanted.
+  - `gpuc status` reports the holder's commit as `dispatcher.pkg_commit` and
+    warns when it differs from the package on disk.
 - Loop every 2 s: resolve `config.gpus` to UUIDs (see GPU ownership), then
   walk `queue/` in lexical order. A job that fits the free owned cards gets
   UUIDs assigned, its marker removed, state `running`, and a runner spawned in

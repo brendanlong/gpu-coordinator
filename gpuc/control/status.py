@@ -329,12 +329,15 @@ class HostView:
     machine's registry remembers shipping. Null when the host was not asked or
     was bootstrapped by a build too old to record it."""
     dispatcher_pkg_commit: str | None = None
-    """The commit the dispatcher that is *running* was started on.
+    """The commit recorded by whoever last took the host's dispatcher lock.
 
     A dispatcher imports its code once, so re-shipping the package under a live
-    one changes nothing about what it dispatches with. It takes itself off when
-    the next one starts, and this is how a host where that did not happen says
-    so. Null when the host is on a build too old to answer."""
+    one changes nothing about what it dispatches with. One started from the new
+    package replaces it, and this is how a host where that did not happen says
+    so. Read from a lock file that outlives its writer, so it is only a fact
+    about what is *running* next to a live heartbeat -- which is what
+    `host_warnings` checks before saying anything. Null when the host is on a
+    build too old to answer."""
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)

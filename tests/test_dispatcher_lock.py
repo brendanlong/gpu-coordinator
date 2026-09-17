@@ -11,10 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import dispatcher, jobs, paths
+from gpuc.host import dispatcher, jobs, paths, queue
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import DispatcherLock, LockBody
 from gpuc.host.jobs import HostConfig
+from tests.conftest import FAKE_GPUS, make_spec
+from tests.test_dispatcher import make_dispatcher
 
 # A holder that takes the lock, writes a dispatcher-shaped lock body and a
 # heartbeat of our choosing, and then wedges forever with a child in the same
@@ -292,7 +294,7 @@ RUNNING = "a" * 40
 
 
 def on_this_host(pkg_commit: str | None) -> None:
-    jobs.write_config(HostConfig(host="test-host", pkg_commit=pkg_commit))
+    jobs.write_config(HostConfig(host="test-host", gpus=list(FAKE_GPUS), pkg_commit=pkg_commit))
 
 
 def test_a_holder_on_the_build_this_host_has_replaced_is_asked_to_stand_down(
@@ -371,12 +373,109 @@ def test_acquire_records_the_commit_this_dispatcher_is_running(gpuc_home: Path) 
     assert dispatcher.holder_pkg_commit() == SHIPPED
 
 
-def test_sigterm_asks_the_loop_to_finish_its_pass_and_exit(gpuc_home: Path) -> None:
-    loop = dispatcher.Dispatcher()
-    dispatcher._stop_on_sigterm(loop)
+def test_sigterm_lets_the_loop_finish_its_pass_before_it_exits(gpuc_home: Path) -> None:
+    """The whole value of asking rather than killing: the pass that was in
+    flight completes, and the lock is released rather than dropped."""
+    on_this_host(SHIPPED)
+    loop, _ = make_dispatcher()
+    passes: list[int] = []
+
+    def run_once() -> None:
+        passes.append(1)
+        os.kill(os.getpid(), signal.SIGTERM)  # mid-pass, as a takeover sends it
+        passes.append(2)
+
+    loop.run_once = run_once  # type: ignore[method-assign]
+    loop.deps.sleep = lambda _seconds: None
+    previous = signal.getsignal(signal.SIGTERM)
+    lock = DispatcherLock()
+    assert lock.acquire()
     try:
-        assert not loop.should_exit
-        os.kill(os.getpid(), signal.SIGTERM)
-        assert loop.should_exit
+        dispatcher._stop_on_sigterm(loop)
+        assert loop.run(lock) == 0
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, previous)
+
+    assert passes == [1, 2], "the signal ended the loop, not the pass"
+    assert lock._fd is None, "the lock was released rather than dropped"
+    assert "dispatcher exiting" in paths.dispatcher_log().read_text()
+
+
+def test_a_holder_that_stands_down_is_never_killed_afterwards(gpuc_home: Path) -> None:
+    """The one that bit: escalation used to re-read the lock and SIGKILL
+    whoever held it *now*. Two dispatchers start within seconds on every `gpuc
+    submit`, so the process that inherits the lock during a handoff is
+    routinely a healthy newcomer on the very build we were trying to install --
+    and killing it is the worst outcome available here."""
+    on_this_host(SHIPPED)
+    old_build = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING)
+    successor: list[subprocess.Popen[str]] = []
+
+    lock = DispatcherLock()
+
+    # A loser that polls slowly: the incumbent stands down during its wait and
+    # a second dispatcher -- already on the shipped build -- wins the lock.
+    def hand_over(_seconds: float) -> None:
+        if not successor:
+            old_build.wait(timeout=10)
+            successor.append(start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=SHIPPED))
+        time.sleep(0.05)
+
+    lock._sleep = hand_over
+    try:
+        assert not lock.acquire(takeover_wait_s=1.0, handoff_wait_s=2.0)
+        assert successor and successor[0].poll() is None, "the successor was killed"
+        log = paths.dispatcher_log().read_text()
+        assert "SIGKILL" not in log
+    finally:
+        kill_tree(old_build)
+        for proc in successor:
+            kill_tree(proc)
+
+
+def test_a_superseded_holder_we_may_not_signal_is_left_alone_at_once(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to signal means nothing will stand down, so waiting out the
+    handoff would cost every enqueue on this host 40s for as long as that
+    holder lives."""
+    on_this_host(SHIPPED)
+    monkeypatch.setattr(dispatcher, "is_gpuc_process", lambda _pid: False)
+    holder = start_wedged_holder(heartbeat_age_s=1.0, pkg_commit=RUNNING)
+    slept: list[float] = []
+    lock = DispatcherLock()
+    lock._sleep = slept.append
+    try:
+        assert not lock.acquire(takeover_wait_s=10.0, handoff_wait_s=30.0)
+        assert holder.poll() is None
+        assert slept == [], "it waited for a handoff nobody was asked for"
+        assert "is not a gpuc dispatcher" in paths.dispatcher_log().read_text()
+    finally:
+        kill_tree(holder)
+
+
+def test_a_takeover_adopts_the_running_jobs_rather_than_failing_them(gpuc_home: Path) -> None:
+    """What a handoff has to be worth: the queue changes hands and the work
+    does not notice."""
+    on_this_host(SHIPPED)
+    job_id = queue.enqueue(make_spec(gpus=1))
+    outgoing, _ = make_dispatcher()
+    lock = DispatcherLock()
+    assert lock.acquire()
+    outgoing.run_once()
+    assert jobs.read_state(job_id).status == "running"
+    # This process stands in for the runner the outgoing dispatcher spawned:
+    # what the successor has to find is a pid that is really still there.
+    jobs.update_state(job_id, runner_pid=os.getpid(), runner_boot_id=None, runner_starttime=None)
+    lock.release()  # as a dispatcher standing down does
+
+    incoming, _ = make_dispatcher()
+    successor = DispatcherLock()
+    assert successor.acquire()
+    try:
+        incoming.adopt_orphans()
+    finally:
+        successor.release()
+    assert jobs.read_state(job_id).status == "running"
+    assert job_id in incoming.running
+    assert incoming.running[job_id].gpus == [FAKE_GPUS[0]]

@@ -16,8 +16,8 @@ from pathlib import Path
 
 import gpuc
 from gpuc._version import __version__ as __version__
+from gpuc._version import is_other_build
 from gpuc._version import same_commit as same_commit
-from gpuc._version import superseded
 
 DIST_NAME = "gpu-coordinator"
 SHORT = 12
@@ -99,11 +99,11 @@ def dirty() -> bool:
 def needs_package_sync(local: str | None, host: str | None) -> bool:
     """Should this host be shipped the package again before it runs anything?
 
-    `superseded`, which is stricter than `same_commit` in the one place that
-    matters: a host with no recorded commit was bootstrapped by a build too old
-    to record one, so it is running the oldest code of all.
+    `is_other_build`, which is stricter than `same_commit` in the one place
+    that matters: a host with no recorded commit was bootstrapped by a build
+    from before the field existed, so it cannot be running this one.
     """
-    return superseded(host, local)
+    return is_other_build(host, local)
 
 
 def host_build_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
@@ -147,17 +147,17 @@ def shipped_commit_note(name: str, recorded: str | None, local: str | None) -> s
 
 
 def dispatcher_build_warning(name: str, running: str | None, shipped: str | None) -> str | None:
-    """The dispatcher on this host is serving the queue with older code.
+    """The dispatcher on this host is serving the queue with other code.
 
     Both sides are the host's own answers: the commit recorded by the
     dispatcher holding the lock, and the commit of the package now on disk.
     They come apart because a dispatcher imports its code once and then lives
     for days -- so a host re-bootstrapped underneath one goes on dispatching
-    with whatever was there when it started, and every feature shipped since
-    is simply not running. A newer dispatcher takes over from an older one by
-    itself; this is for the host where that did not happen.
+    with whatever was there when it started, and everything shipped since is
+    simply not running. A dispatcher started from the package on disk takes
+    over from one that was not; this is for the host where that did not happen.
     """
-    if not superseded(running, shipped):
+    if not is_other_build(running, shipped):
         return None
     was = f"gpuc {short(running)}" if running else "a build too old to say which"
     return (
