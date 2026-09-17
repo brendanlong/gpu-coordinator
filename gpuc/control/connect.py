@@ -5,7 +5,8 @@ so `gpuc host add` is a *connect*: read that file, and if it is there, adopt
 it. A second control machine meeting a host the first one set up is therefore
 the ordinary path and not a special one, and nothing about the machine that
 bootstrapped a host first matters afterwards. Only a host that has no config at
-all is configured from the flags that registered it.
+all is configured from the flags that registered it, and by default it owns
+every card nvidia-smi reports there.
 
 `gpuc host set` writes through to the same file. There is no local copy to set,
 so it does not work offline, which is the point.
@@ -55,7 +56,6 @@ def connect_host(
     env_updates: Mapping[str, str | None] | None = None,
     transport: Transport | None = None,
     force: bool = False,
-    gpu_hint: str = "",
     before_write: Callable[[HostEntry], None] = lambda entry: None,
 ) -> Connection:
     """Read the host's config (or write its first one) and return its entry.
@@ -63,8 +63,9 @@ def connect_host(
     `fields` is the config the flags asked for, and only the keys that were
     given: on a host that already has a config each one is an explicit
     override, written through to the host and reported field by field; on a
-    host that has none they are its initial config, and `gpus` must be among
-    them because nothing else can know which of the cards in the box are ours.
+    host that has none they are its initial config, and a `gpus` left out of
+    them is every card the probe saw (`address.gpu_info`), less any it was
+    asked to share.
 
     `before_write` is judged once the host's own name is known and before
     anything is written to it, so a caller that refuses the result refuses it
@@ -88,12 +89,7 @@ def connect_host(
         # somebody's host.
         before_write(entry)
     else:
-        if "gpus" not in patch:
-            raise ConnectError(
-                f"host {address.name} has no config of its own yet ({home}/config.json does not "
-                f"exist), so this is the machine that decides what it is: pass --gpus with the "
-                f"cards gpuc may use there (--gpus '' for none).{gpu_hint}"
-            )
+        patch.setdefault("gpus", _every_card_but_the_shared(address, patch))
         patch.setdefault("host", address.name)
         patch.setdefault("created_at", utc_now())
         # The one timer with a default, and only for a host being configured
@@ -266,6 +262,19 @@ def _refuse_shared_overlap(
         f"and a card is either ours to hand out or somebody else's to borrow.\n"
         f"Owned: {', '.join(config.gpus) or 'none'}. Shared: {', '.join(config.shared_gpus)}."
     )
+
+
+def _every_card_but_the_shared(address: HostEntry, patch: Mapping[str, Any]) -> list[str]:
+    """What a host with no config owns when `--gpus` was not given: all of it.
+
+    By UUID, as a provisioned pod is, since nobody typed an index here to
+    preserve. `--shared-gpus` alone is then a way of saying "everything else
+    is mine": a card is either owned or borrowed, never both, so the shared
+    ones are taken out rather than refused.
+    """
+    cards = _by_uuid(address)
+    shared = {cards.get(str(item), str(item)) for item in patch.get("shared_gpus") or []}
+    return [uuid for uuid in address.gpu_info if uuid not in shared]
 
 
 def _by_uuid(address: HostEntry) -> dict[str, str]:

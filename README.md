@@ -26,8 +26,8 @@ and `gpuc pods` shows what is still billing.
 
 ```sh
 uv tool install "git+https://github.com/brendanlong/gpu-coordinator@main"
-gpuc host add local --gpus 0                 # nvidia-smi index or GPU-… UUID
-                                             # (omit --gpus for a host already set up)
+gpuc host add local                          # every card nvidia-smi reports; --gpus 0
+                                             # (an index or GPU-… UUID) narrows it
 gpuc host bootstrap local                    # installs uv, the package, the dispatcher
 gpuc submit job.example.yaml --host local    # or --runpod --gpu A40 --max-price 0.60
 gpuc status                                  # queues, running jobs, recent results

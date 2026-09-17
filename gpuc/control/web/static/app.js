@@ -487,7 +487,7 @@ function renderHosts(status, hosts) {
   // redrawn on every refresh rather than toasted again each time.
   replace(document.getElementById("errors"), status.errors.map((error) => el("div", { class: "notice bad" }, error)));
   if (!status.hosts.length) {
-    replace(list, el("p", { class: "empty" }, "no hosts registered. Add one: gpuc host add local --gpus 0"));
+    replace(list, el("p", { class: "empty" }, "no hosts registered. Add one: gpuc host add local"));
     return;
   }
   replace(list, status.hosts.map((host) => hostCard(host, entries.get(host.name))));

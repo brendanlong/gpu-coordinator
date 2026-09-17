@@ -48,7 +48,9 @@ holding them, is `gpuc status`.
 
 Prefer a host you already have over a pod you pay for, and check `gpuc status`
 first: a busy host queues your job behind the running one, which is usually
-fine.
+fine. If nothing is registered, `gpuc host add local` then `gpuc host bootstrap
+local` gives you this machine with every card nvidia-smi reports (`--gpus`
+narrows it); a host somebody else set up is adopted as it is.
 
 ## Write a job spec
 

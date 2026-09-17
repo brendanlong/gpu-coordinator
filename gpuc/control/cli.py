@@ -73,7 +73,7 @@ from gpuc.control.config import (
 from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.gpuinfo import summarize
-from gpuc.control.probe import probe_host
+from gpuc.control.probe import ProbeReport, probe_host
 from gpuc.control.providers.base import Cloud, Constraints
 from gpuc.control.provision import runpod_host
 from gpuc.control.remote import (
@@ -126,7 +126,7 @@ __all__ = [
     "main",
 ]
 
-NO_HOSTS = "no hosts registered. Add one: gpuc host add local --gpus 0"
+NO_HOSTS = "no hosts registered. Add one: gpuc host add local"
 
 GPUS_HELP = (
     "GPU UUIDs or nvidia-smi indices this host may use, comma-separated "
@@ -279,7 +279,6 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         fields=fields,
         env_updates=env_updates,
         force=args.force,
-        gpu_hint="\n" + "\n".join(report.render(all_gpus=True).splitlines()[1:]),
         before_write=lambda adopted: _refuse_a_taken_name(
             load_registry().hosts.get(adopted.name), adopted, args.name
         ),
@@ -297,6 +296,8 @@ def cmd_host_add(args: argparse.Namespace) -> int:
             )
         registry.put(entry)
     lines = [_added_line(entry, connection, args.name)]
+    if not connection.adopted and not entry.gpus:
+        lines.append(_owns_nothing_line(entry, args, report))
     if args.pod and not connection.adopted:
         # A pod nobody has set up has no dispatcher, so nothing will ever idle
         # it out: it bills until bootstrap gives it one or a person ends it.
@@ -306,6 +307,22 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         )
     print("\n".join(lines))
     return 0
+
+
+def _owns_nothing_line(entry: HostEntry, args: argparse.Namespace, report: ProbeReport) -> str:
+    """A first config that owns no card is legal and useless; say which it was."""
+    if args.gpus is not None:
+        why = "--gpus '' asked for none"
+    elif entry.config.shared_gpus:
+        why = "every card it has is shared"
+    elif report.has_nvidia_smi:
+        why = "nvidia-smi found no cards on it"
+    else:
+        why = "it has no nvidia-smi"
+    return (
+        f"  it owns no GPUs ({why}), so nothing can be submitted to it: "
+        f"`gpuc host set {entry.name} --gpus <list>` assigns some"
+    )
 
 
 def _refuse_a_taken_name(current: HostEntry | None, entry: HostEntry, asked_for: str) -> None:
@@ -1402,8 +1419,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add.add_argument(
         "--gpus",
-        help=f"required for a host with no config of its own; on a host that has one this "
-        f"reassigns its cards, and a list that overlaps the host's is refused. {GPUS_HELP}",
+        help=f"a host with no config of its own owns every card nvidia-smi reports unless "
+        f"this narrows it ('' for none); on a host that has one this reassigns its cards, "
+        f"and a list that overlaps the host's is refused. {GPUS_HELP}",
     )
     add.add_argument("--shared-gpus", help=SHARED_GPUS_HELP)
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")

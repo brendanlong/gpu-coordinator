@@ -111,8 +111,8 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     (fake_home / ".local" / "bin").mkdir(parents=True)
     patch = pytest.MonkeyPatch()
     patch.setenv("HOME", str(fake_home))
-    # The host's one card. This machine's own, if it has any, are not this
-    # suite's to use.
+    # The host's one card, which `host add` owns by default. This machine's
+    # own, if it has any, are not this suite's to use.
     install_fake_nvidia_smi(fake_home / ".local" / "bin", [FAKE_GPUS[0]])
     patch.setenv("PATH", f"{fake_home / '.local' / 'bin'}{os.pathsep}{os.environ['PATH']}")
     patch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
@@ -137,8 +137,6 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
                     str(home),
                     "--cache-dir",
                     SHARED_UV_CACHE,
-                    "--gpus",
-                    FAKE_GPUS[0],
                 ]
             )
             == 0
@@ -198,6 +196,8 @@ def test_bootstrap_installs_the_package_and_records_the_interpreter(
     assert (home / "pkg/gpuc/host/dispatcher.py").exists()
     config = json.loads((home / "config.json").read_text())
     assert config["host"] == "local"
+    # `host add` was given no `--gpus`: the card the probe's nvidia-smi listed.
+    assert config["gpus"] == [FAKE_GPUS[0]]
     assert (home / "secrets").stat().st_mode & 0o777 == 0o700
     entry = load_registry().require("local")
     assert entry.python and Path(entry.python).exists()

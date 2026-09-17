@@ -140,8 +140,8 @@ in seconds if it cannot write the repo.
 ## Registering hosts
 
 ```sh
-gpuc host add local --gpus 0                               # this machine
-gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach over ssh
+gpuc host add local                                        # this machine, every card it has
+gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach over ssh, two of its cards
 gpuc host add gpubox --ssh me@gpubox                       # …one somebody already set up: adopt it
 gpuc host set gpubox --shared-gpus 4,5                     # two more it may borrow while nobody else is on them
 gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] name vram uuid`,
@@ -166,8 +166,15 @@ gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idem
   calls itself, unless a *different* host is already registered here under that
   name, which is refused rather than replaced.
 - the host has **no** config — nothing has been set up there yet — so this is
-  where one is written, and `--gpus` is required (`--gpus ''` for a host whose
-  cards gpuc may not use). The probe's card list is printed if you leave it out.
+  where one is written, and by default it **owns every card** nvidia-smi
+  reports there, by UUID. `--gpus` narrows that to the cards named (`--gpus ''`
+  for a host whose cards gpuc may not use), and `--shared-gpus` takes its cards
+  out of the owned set, so `--shared-gpus 1` alone owns everything but card 1.
+  A host with no nvidia-smi, or nothing left after those flags, is registered
+  owning nothing, and `host add` says that nothing can be submitted to it until
+  `gpuc host set <name> --gpus <list>` assigns some. Only this path has the
+  default: an omitted `--gpus` on a host that already has a config keeps what
+  the host has (above), never resets it to every card.
 
 So a host is registered by asking it what it is, and a second machine
 connecting to a box the first one set up is the ordinary path. Such a host is
@@ -204,7 +211,7 @@ host has to answer) and reports each change as `host <- …`.
 | --- | --- | --- |
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
 | `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting instead of naming an ssh target; the provider says where it is. Needs `RUNPOD_API_KEY`. Add `--gpuc-home` if that pod keeps gpuc somewhere other than `$HOME/.gpuc` |
-| `--gpus 2,3` or `--gpus GPU-8064…,3` | none | nvidia-smi **indices**, UUIDs, or a mix, stored as typed; the host re-resolves indices to UUIDs on every dispatch pass, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is `UNAVAILABLE` and jobs wait for it |
+| `--gpus 2,3` or `--gpus GPU-8064…,3` | every card nvidia-smi reports, on a host with no config; what the host has, on one that does | nvidia-smi **indices**, UUIDs, or a mix, stored as typed; the host re-resolves indices to UUIDs on every dispatch pass, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is `UNAVAILABLE` and jobs wait for it |
 | `--shared-gpus 4,5` | none | cards gpuc may **borrow** but does not own, spelled like `--gpus` and never overlapping it; see [shared GPUs](usage.md#shared-gpus) |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
 | `--cache-dir PATH` | bootstrap decides | `UV_CACHE_DIR` in the host's `env`. Bootstrap sets one on gpuc home's filesystem when they differ (uv only links a venv out of its cache within one filesystem), and never overrides one the config already names |
@@ -215,8 +222,8 @@ host has to answer) and reports each change as `host <- …`.
 | `--workdir-days N` | `1` on a host being configured for the first time | auto-sweep a finished job's `workdir/` (never its log or state) once it ended this long ago; no mirror needed. `''` turns it off. A host whose config already exists keeps whatever it says |
 | `--idle-min N` | `15` | how long an ephemeral host may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |
 
-On a box you share, `--gpus` is the whole of what gpuc may touch, so `host
-probe` lists only those cards and says how many it hid (`2 of 8 assigned to
+On a box you share, pass `--gpus`: it is the whole of what gpuc may touch, so
+`host probe` lists only those cards and says how many it hid (`2 of 8 assigned to
 gpubox`); `--all-gpus` shows the box as nvidia-smi sees it. Either way the probe
 records **every** card's name and VRAM, so `gpuc host set gpubox --gpus 5` names
 something already known. An assigned entry no card answers to is

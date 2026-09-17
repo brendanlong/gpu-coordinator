@@ -31,7 +31,7 @@ from gpuc.control.remote import HostSession, RemoteError
 from gpuc.control.status import placement_unknown
 from gpuc.control.submit import JobSpecModel, SubmitResult, expand_job_id
 from tests.conftest import host_entry, register_host
-from tests.fakehost import FakeHost
+from tests.fakehost import GPU_ROWS, PROBE_SECTIONS, FakeHost
 from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
 from tests.fakes3 import FakeS3Client
 
@@ -239,14 +239,74 @@ def test_host_set_that_changes_nothing_does_not_rewrite_the_hosts_config(
     assert written == []
 
 
-def test_host_add_needs_gpus_for_a_host_with_no_config_and_lists_the_cards(
+def test_host_add_owns_every_card_by_default_on_a_host_with_no_config(
     control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == EXIT_ERROR
-    err = capsys.readouterr().err
-    assert "has no config of its own yet" in err
-    assert "GPU-a" in err  # the probe's own card list, to copy from
-    assert load_registry().hosts == {}
+    """The spec's default: a host owns every card it has. By UUID, as a
+    provisioned pod is, since nobody typed an index here to preserve."""
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert fake_host.config is not None
+    assert fake_host.config["gpus"] == ["GPU-a", "GPU-b"]
+    assert fake_host.config.get("shared_gpus", []) == []
+    assert load_registry().require("gpubox").gpus == ["GPU-a", "GPU-b"]
+    out = capsys.readouterr().out
+    assert "with 2 GPU(s)" in out
+    assert "wrote its first config" in out
+    assert "owns no GPUs" not in out
+
+
+def test_host_add_shared_gpus_alone_owns_everything_else(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    """A card is owned or borrowed, never both, so `--shared-gpus 1` on its own
+    is "everything else is mine" -- in either spelling of the card."""
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--shared-gpus", "1"]) == 0
+    assert fake_host.config is not None
+    assert (fake_host.config["gpus"], fake_host.config["shared_gpus"]) == (["GPU-a"], ["1"])
+    fake_host.files.clear()
+    assert main(["host", "add", "other", "--ssh", "me@other", "--shared-gpus", "GPU-a"]) == 0
+    assert (fake_host.config["gpus"], fake_host.config["shared_gpus"]) == (["GPU-b"], ["GPU-a"])
+
+
+def test_host_add_without_gpus_keeps_what_a_configured_host_has(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default is for a host with no config. One that has one is adopted as
+    it stands: an omitted `--gpus` there is not "reset to every card"."""
+    fake_host.put_file('{"host": "gpubox", "gpus": ["0"]}', "/home/u/.gpuc/config.json")
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert fake_host.config is not None and fake_host.config["gpus"] == ["0"]
+    assert load_registry().require("gpubox").gpus == ["0"]
+    assert "host <- gpus" not in capsys.readouterr().out
+
+
+def test_host_add_registers_a_host_with_no_cards_and_says_so(
+    control_env: Path,
+    fake_host: FakeHost,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No nvidia-smi is a host that can hold a config and nothing else; the
+    same line says so when `--gpus ''` or an all-covering `--shared-gpus` is
+    what left it with nothing."""
+    monkeypatch.setitem(PROBE_SECTIONS, "driver", "sh: 1: nvidia-smi: not found")
+    monkeypatch.setitem(PROBE_SECTIONS, "gpus", "sh: 1: nvidia-smi: not found")
+    assert main(["host", "add", "cpubox", "--ssh", "me@cpu"]) == 0
+    assert fake_host.config is not None and fake_host.config["gpus"] == []
+    assert load_registry().require("cpubox").gpus == []
+    out = capsys.readouterr().out
+    assert "owns no GPUs (it has no nvidia-smi)" in out
+    assert "gpuc host set cpubox --gpus <list>" in out
+
+    monkeypatch.setitem(PROBE_SECTIONS, "driver", "580.173.02")
+    monkeypatch.setitem(PROBE_SECTIONS, "gpus", "\n".join(GPU_ROWS))
+    fake_host.files.clear()
+    assert main(["host", "add", "none", "--ssh", "me@none", "--gpus", ""]) == 0
+    assert "owns no GPUs (--gpus '' asked for none)" in capsys.readouterr().out
+    fake_host.files.clear()
+    assert main(["host", "add", "lent", "--ssh", "me@lent", "--shared-gpus", "0,1"]) == 0
+    assert fake_host.config["gpus"] == []
+    assert "owns no GPUs (every card it has is shared)" in capsys.readouterr().out
 
 
 def test_host_add_ssh_records_the_target_and_port(control_env: Path) -> None:

@@ -91,7 +91,6 @@ class ConnectFn(Protocol):
         env_updates: Mapping[str, str | None] | None = ...,
         transport: Transport | None = ...,
         force: bool = ...,
-        gpu_hint: str = ...,
     ) -> Connection: ...
 
 
@@ -188,7 +187,6 @@ def initial_config(
     name: str,
     settings: Settings,
     *,
-    gpus: list[str],
     idle_minutes: float,
     created_at: str,
     provider: dict[str, Any],
@@ -200,10 +198,11 @@ def initial_config(
     the host's copy, including the next machine to connect to it -- which is
     why the `provider` block (`rented.pod_record`) is written here rather than
     kept on this machine: it is the pod's own record of what it was bought as,
-    and it is what any other machine reads it from.
+    and it is what any other machine reads it from. The cards are not here:
+    the pod owns every one it has, which is what `connect_host` gives a host
+    with no config, from the `gpu_info` the address carries.
     """
     return {
-        "gpus": gpus,
         "idle_minutes": idle_minutes,
         "s3_prefix": default_s3_prefix(settings, name),
         "created_at": created_at,
@@ -396,7 +395,6 @@ def _try_offer(
             fields=initial_config(
                 name,
                 settings,
-                gpus=uuids,
                 idle_minutes=idle_minutes,
                 created_at=created_at,
                 provider=rented.pod_record(address, offer, created_at),

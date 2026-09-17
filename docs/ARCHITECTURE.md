@@ -698,9 +698,11 @@ that bootstrapped it first matters afterwards.
 
 - `gpuc host add` is a **connect** (`connect_host`): probe, read
   `config.json`, adopt it if it is there under the name the host calls itself,
-  else write the initial one. Flags are per-field overrides written through
-  to the host; a `--gpus` that overlaps the existing set without matching it
-  is refused, because that one difference hands one card to two jobs.
+  else write the initial one -- owning every card the probe saw unless
+  `--gpus` says otherwise (see GPU ownership). Flags are per-field overrides
+  written through to the host; a `--gpus` that overlaps the existing set
+  without matching it is refused, because that one difference hands one card
+  to two jobs.
 - `gpuc host set <name> --gpus ... --env ...` **writes through** to
   `config.json` via `python -m gpuc.host config --merge` (one atomic
   read-modify-write on the host, by the code that reads the file; a host with
@@ -790,6 +792,12 @@ lookup at all: that mapping is the identity, and the host is not asked.
 
 Shared entries (`--shared-gpus`) go through exactly the same resolution, and
 are checked for overlap with the owned ones -- see Shared GPUs.
+
+A host given its first config with no `--gpus` owns every card the probe saw,
+as UUIDs, less any named by `--shared-gpus`: there is no typed index to
+preserve, and a provisioned pod gets its cards the same way, from the
+`gpu_info` on the address `connect_host` is handed. A host that already has a
+config is never defaulted; an omitted `--gpus` there keeps what it has.
 
 Every listing names a card `[index] name vram`; `gpuc host list` adds the
 UUID (it is where UUIDs are copied from), `gpuc status` adds free/busy and
