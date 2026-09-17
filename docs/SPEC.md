@@ -62,8 +62,8 @@ down when its work is done and nobody watching.
 - **After that the host owns itself**: its queue, its job state, its logs, its
   configuration (which cards it owns and shares, its mirror, its environment)
   and, for a rental, its own shutdown. A rental terminates itself once its
-  queue has been empty for a configured idle period, or past an opt-in
-  lifetime cap, after draining its uploads.
+  queue has been empty for a configured idle period, after draining its
+  uploads. Nothing on a client watches or terminates a rental after handoff.
 - **Any client whose SSH key reaches a host can connect to it without
   conflict** and sees the same queue, jobs and configuration. Nothing else
   about the client that set a host up matters afterwards. That includes a
@@ -71,72 +71,58 @@ down when its work is done and nobody watching.
 - The client's record of a host is an address plus a cache. Anything that
   decides something asks the host; output from the cache is labelled with its
   age.
-- Connecting selects which cards are owned and which are shared. A rental
-  owns every card it has.
-- **A client-side reaper is a safety net, not the owner.** It may terminate a
-  rental only in states the rental cannot leave on its own: it never
-  bootstrapped, its dispatcher has been silent with nothing running, or it is
-  past a lifetime cap. Any client holding the provider key may take on a
-  rental it did not create by asking the rental what it is, and thereafter
-  judges it by those rules; a rental the client has no record of and cannot
-  get an answer from is reported, never terminated. Rentals that are not
-  ours are never touched, and unreadable local state means the reaper does
-  nothing.
-- Rentals are bounded by account-wide caps on count and hourly cost, and an
-  existing matching rental is reused before a new one is created.
+- Connecting selects which cards are owned and which are shared. By default
+  a host owns every card it has.
+- An existing matching rental is reused before a new one is created. Rentals
+  that are not ours are never touched.
 
 ## Queueing
 
-- **A job is queued on the host the user names**, or on a rental provisioned
-  for it.
-- **The client owns the job until it is committed to the queue**, then the
-  host owns it: running, cleanup, and its record. There is one moment at
-  which a job becomes the host's; before it the host never runs the job, and
-  a submit that dies before it leaves a job the host eventually marks failed
-  and cleans up, never one it runs or holds forever.
-- A job states its requirements as a number of GPUs. Zero is allowed and
-  never waits for a card.
+- **A job is queued on the host the user names.**
+- **A job has exactly one owner at a time.** The client owns it until the
+  host has accepted it into its queue; from then on the host owns it. Before
+  acceptance the host never runs the job. A submit that dies before
+  acceptance leaves a job the host eventually marks failed and cleans up.
+- A job states its requirements as a number of GPUs, at least one. A job
+  asking for more cards than the host is configured with, counting shared
+  cards only if the job opted into them, is refused at submit and fails at
+  dispatch if the configuration shrinks afterwards.
 - **Priority is numeric, lower first, and strict.** The queue is taken in
   order: a job that does not yet fit holds the free cards it is waiting for,
-  and nothing behind it may take them, even at the cost of idle cards. Two
-  kinds of job are stepped over instead of holding cards: one that needs no
-  GPU, and one that needs a card the host cannot currently see, which
-  includes a shared card someone else is using.
+  and nothing behind it may take them, even at the cost of idle cards. The
+  one exception is a job waiting for a shared card someone else is using: it
+  is stepped over, because the host cannot know when that card frees.
 - Priorities of queued jobs can be changed, and the queue reorders
   accordingly.
 - **A running job can be preempted** so that a job ahead of it in dispatch
   order can run, by command or automatically for jobs that opt in. Automatic
-  preemption fires only for a strictly higher-priority job and only when the
-  cards it frees are enough to start it. Preemption restarts the job from the
-  beginning in its existing working tree; checkpointing is the job's
-  business. A preempt is refused when nothing waiting would be dispatched
-  ahead of the preempted job, because it would discard work for nothing.
+  preemption fires only for a strictly higher-priority job. Preemption
+  restarts the job from the beginning in its existing working tree;
+  checkpointing is the job's business. A preempt is refused when nothing
+  waiting would be dispatched ahead of the preempted job, because it would
+  discard work for nothing.
 - **Shared GPUs** are used only by jobs that opt in, only after every free
   owned card, and only while nvidia-smi reports zero memory and zero
   utilization on the card. Owned cards are assumed to have no other users and
   this is never verified. A borrowed card is treated as owned until the job
-  ends; a later collision with its real owner is not detected.
-- A queued job bigger than the host's configuration, because the
-  configuration shrank after submit, fails rather than waits; shared cards
-  count only for a job that opted into them. A card that is merely missing
-  right now makes a job wait.
+  ends; a later collision with other users is not detected.
 
 ## Running a job
 
 - The job's code is the working tree the user submits from, including
-  untracked and uncommitted changes. Large data comes from a backup
-  destination inside the job, never through the checkout.
+  untracked and uncommitted changes. The checkout is code, not data: a job
+  fetches datasets itself.
 - **Checks happen as early as they can.** At submit: the spec is valid, every
   secret it names is present, and its GPU count fits the host. At job start,
   before the main phase: the GPUs work inside the job's own environment, and
   every backup destination is writable with the job's own credentials.
 - A job runs as setup, those checks, main, and a final upload, and may
   report progress or an estimated remaining time. Estimates are informational
-  and never change a job's outcome; nothing infers a job's length.
+  and never change a job's outcome.
 - **Outputs are backed up continuously** during the run, not only at the end,
   and so are logs. Files that were already in the checkout are never uploaded
-  as results. Output locations can include the job id so runs do not
-  overwrite each other; the tool does not otherwise guard against reuse.
+  as results. Every output location includes the job id, so runs never
+  overwrite each other.
 - On success, uploads finish and the working tree is deleted. On failure or
   cancellation it is kept for a configurable period for debugging. On a
   rental, the rental's shutdown overrides that period, and a rental that has
@@ -144,13 +130,13 @@ down when its work is done and nobody watching.
   expensive machine is not kept alive for a bucket we cannot reach. A job
   whose outputs are not confirmed backed up is never deleted automatically on
   a host that persists.
-- A job whose GPUs sit idle for too long is killed. After repeated such
-  failures a host stops dispatching until told to resume, and a rental shuts
-  down. Jobs may opt out or tune this. A job may set a wall-clock limit.
+- A job may set a wall-clock limit. Nothing else judges a running job: once
+  the GPU check has passed, a job that misuses its cards is the job's
+  problem, and never a reason to stop the host.
 - Cancel, preempt and every other kill reap the job's whole process tree,
   using a cgroup where the host provides one and a process group otherwise.
 - A finished or lost job can be resubmitted from the mirror as a new job on
-  any host.
+  any host, with its secrets read from the submitter's shell again.
 
 ## Backups and secrets
 
@@ -187,24 +173,29 @@ down when its work is done and nobody watching.
 
 ## Deployment and agents
 
-- Nothing runs in the background on a client except the reaper and the web
-  app, both optional. Each ships as a systemd user unit (Linux) that the tool
-  writes but does not enable.
+- Nothing runs in the background on a client except the optional web app,
+  which ships as a systemd user unit (Linux) that the tool writes but does
+  not enable.
 - The repository includes a skill describing how to use the tool, and the
   tool can print it.
-- Tests never rent hardware unless explicitly asked to, and tests that need a
-  local GPU are not excluded by default.
+- Tests never rent hardware unless explicitly asked to, and tests that
+  require a local GPU skip if there is none available. Local GPU tests must
+  use minimal resources.
 
 ## Non-goals
 
 - A scheduler that picks a host for a job, or moves jobs between hosts.
 - Requirements beyond a GPU count: no VRAM, CPU or memory matching. A CUDA
   floor informs rental selection only.
+- Jobs that need no GPU.
 - Multi-node jobs, spot or interruptible instances, running jobs in
   containers.
-- A guaranteed rental teardown. Termination is best effort from the host,
-  backed by the client-side reaper; a rental whose container never starts
-  needs the reaper or a person.
+- A guaranteed rental teardown. A rental ends itself when idle; one whose
+  container never starts, or whose dispatcher dies after handoff, bills until
+  a person ends it.
+- Watching a running job for misuse of its GPU, or pausing a host because
+  of it.
+- Spending limits across rentals.
 - Automatic re-placement of a job after it has started running: a failure at
   that point is more likely the job's than the host's.
 - Multi-user or multi-tenant operation: one user's hosts, one password on the
