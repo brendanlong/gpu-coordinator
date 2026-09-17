@@ -386,72 +386,37 @@ def test_every_way_the_stop_itself_can_end_the_attempt_comes_back(
     assert queue.requeue_preempted(job_id) == 2
 
 
-@pytest.mark.parametrize("marked", [True, False])
-@pytest.mark.parametrize("status", ["queued", "running", "succeeded", "failed", "cancelled"])
-def test_reconcile_marks_exactly_the_queued_jobs(
-    gpuc_home: Path, status: str, marked: bool
-) -> None:
-    """One invariant, every combination of the two files that can disagree: a
-    job has a queue marker if and only if its state says it is queued.
+def _status_when_marker_went(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records a job's status at the moment its queue marker is dropped.
 
-    Written as the whole product rather than as the two interesting cases,
-    because the way this is got wrong is a combination nobody thought of --
-    which is exactly what leaves a job that no reader will ever look at again.
+    The order of those two writes is the whole design: interrupted between
+    them, a job has to land in a shape distinguishable from a submit that never
+    committed. `running` (or `cancelled`) with a stale marker is; `queued` with
+    no marker is not, because that is exactly what an interrupted `gpuc submit`
+    leaves behind.
     """
+    seen: list[str] = []
+    real = queue.remove_marker
+
+    def spy(job_id: str) -> bool:
+        seen.append(jobs.read_state(job_id).status)
+        return real(job_id)
+
+    monkeypatch.setattr(queue, "remove_marker", spy)
+    return seen
+
+
+def test_leave_queue_writes_the_state_before_it_drops_the_marker(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     job_id = queue.enqueue(make_spec())
-    if not marked:
-        queue.remove_marker(job_id)
-    jobs.update_state(job_id, status=status)
+    entry = queue.list_queued()[0]
+    went = _status_when_marker_went(monkeypatch)
 
-    queue.reconcile()
+    queue.leave_queue(entry, status="running")
 
-    assert (queue.find_marker(job_id) is not None) == (status == "queued")
-
-
-def test_reconcile_reports_only_what_it_had_to_change(gpuc_home: Path) -> None:
-    consistent = queue.enqueue(make_spec())
-    lost = queue.enqueue(make_spec())
-    queue.remove_marker(lost)
-
-    repairs = queue.reconcile()
-
-    assert [(r.job_id, r.action) for r in repairs] == [(lost, "queued")]
-    assert queue.find_marker(consistent) is not None
-
-
-def test_reconcile_puts_a_lost_job_back_at_its_own_priority(gpuc_home: Path) -> None:
-    """Not merely back in the queue: a job restored at the default would be
-    dispatched ahead of, or behind, everything it was queued against."""
-    job_id = queue.enqueue(make_spec(priority=7))
-    queue.remove_marker(job_id)
-
-    queue.reconcile()
-
-    assert [(e.priority, e.job_id) for e in queue.list_queued()] == [(7, job_id)]
-
-
-def test_reconcile_restores_a_job_whose_spec_is_unreadable(gpuc_home: Path) -> None:
-    """It cannot run, but `launch_ready` is what says so: with no marker it is
-    never spoken of again, and with one it fails `bad-spec` on the next pass."""
-    job_id = queue.enqueue(make_spec())
-    queue.remove_marker(job_id)
-    paths.spec_file(job_id).write_text("{ not json")
-
-    queue.reconcile()
-
-    assert queue.find_marker(job_id) is not None
-
-
-def test_reconcile_drops_a_marker_for_a_job_that_is_gone(gpuc_home: Path) -> None:
-    """An interrupted purge. Left alone, `launch_ready` writes a state file for
-    a job that does not exist."""
-    job_id = queue.enqueue(make_spec())
-    shutil.rmtree(paths.job_dir(job_id))
-
-    repairs = queue.reconcile()
-
-    assert [(r.job_id, r.action, r.status) for r in repairs] == [(job_id, "dequeued", "gone")]
-    assert queue.list_queued() == []
+    assert went == ["running"]
+    assert queue.find_marker(job_id) is None
 
 
 def test_leave_queue_removes_a_marker_that_was_renamed_underneath_it(gpuc_home: Path) -> None:
@@ -469,23 +434,27 @@ def test_leave_queue_removes_a_marker_that_was_renamed_underneath_it(gpuc_home: 
     assert jobs.read_state(job_id).status == "running"
 
 
-def test_reconcile_drops_a_duplicate_marker_keeping_the_better_priority(gpuc_home: Path) -> None:
-    """Two markers for one job is the double-launch state itself, and nothing
-    else would ever notice it."""
-    job_id = queue.enqueue(make_spec(priority=10))
-    (paths.queue_dir() / queue.marker_name(60, job_id)).touch()
+def test_cancelling_a_queued_job_writes_the_state_before_dropping_the_marker(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    went = _status_when_marker_went(monkeypatch)
 
-    repairs = queue.reconcile()
+    assert queue.cancel(job_id) == "cancelled"
 
-    assert [(r.job_id, r.action) for r in repairs] == [(job_id, "deduplicated")]
-    assert [(e.priority, e.job_id) for e in queue.list_queued()] == [(10, job_id)]
+    assert went == ["cancelled"]
+    assert queue.find_marker(job_id) is None
 
 
-def test_reconcile_skips_a_job_dir_that_has_no_state_yet(gpuc_home: Path) -> None:
-    """An enqueue interrupted between the job dir and the state file. Asking
-    `read_state` costs most of a second of retries, and nothing purges such a
-    dir, so it would be paid at every startup forever."""
-    paths.ensure_layout()
-    paths.ensure_job_layout("20250101-000000-abcdef")
+def test_cancelling_a_job_that_is_already_being_dispatched_does_not_undo_it(
+    gpuc_home: Path,
+) -> None:
+    """The dispatcher published `running` first; writing `cancelled` over it
+    would leave a live runner behind a state that says the job is over. From
+    here the runner owns the kill, which is what `cancelling` means."""
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, status="running")
 
-    assert queue.reconcile() == []
+    assert queue.cancel(job_id) == "cancelling"
+    assert jobs.read_state(job_id).status == "running"
+    assert queue.is_cancelled(job_id)

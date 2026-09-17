@@ -68,126 +68,27 @@ def find_marker(job_id: str) -> Path | None:
 def leave_queue(entry: QueueEntry, **state: Any) -> None:
     """Take a job out of the queue and record what became of it.
 
-    The one place `launch_ready`'s four ways out of the queue are written --
-    dispatched, cancelled, unreadable spec, too big for the host -- so a fifth
-    cannot make the two writes in some other order or forget one. The moves
-    *into* the queue (`enqueue`, `requeue_preempted`) are not these two writes
-    and do not come through here, and neither does `cancel`, which has to know
-    whether the job was queued at all.
+    The one place `launch_ready`'s four ways out are written -- dispatched,
+    cancelled, unreadable spec, too big for this host -- so a fifth cannot get
+    the two writes wrong.
 
-    By job id, not by `entry.marker`: nothing holds the queue lock, `gpuc
-    reorder` renames markers, and `launch_ready` can spend a whole pass between
-    listing the queue and reaching a late entry. Unlinking the path that was
-    listed would then remove nothing and leave a marker that dispatches the job
-    a second time.
+    **The state first, then the marker**, and the two orders are not
+    interchangeable. Interrupted between them this way, the job is `running`
+    (or `failed`) with a marker still naming it, and `launch_ready` checks a
+    job's status before it dispatches, so it drops that marker and moves on.
+    The other way round the job is `queued` with no marker -- which is exactly
+    what a `gpuc submit` killed mid-enqueue leaves behind, and that one must
+    never run. One state, two opposite right answers, and nothing able to tell
+    them apart: keeping the dispatcher's own interruptions out of that shape is
+    what makes an uncommitted submit unambiguous.
 
-    Which of the two writes goes first does not matter, which is the point of
-    `reconcile`: interrupted either way they disagree, and the next dispatcher
-    makes them agree again. Marker first only because the transient it leaves
-    is the harmless one -- a job still `queued` that nothing has started yet.
+    By job id, not by `entry.marker`: nothing holds a lock, `gpuc reorder`
+    renames markers, and `launch_ready` can spend a whole pass between listing
+    the queue and reaching a late entry. Unlinking the path that was listed
+    would remove nothing.
     """
-    remove_marker(entry.job_id)
     jobs.update_state(entry.job_id, **state)
-
-
-@dataclass
-class Repair:
-    """One disagreement `reconcile` found between the queue and a job state."""
-
-    job_id: str
-    action: str
-    """`queued` -- the marker was put back; `dequeued` -- it was taken away;
-    `deduplicated` -- one job had two of them."""
-    status: str
-    """What the job's state said, or `gone` for a marker naming no job."""
-
-
-def reconcile() -> list[Repair]:
-    """Make the queue directory agree with the job states again.
-
-    A job being queued is written down twice -- the marker and `state.json` --
-    and every move in or out of the queue writes both. A process killed between
-    the two leaves them disagreeing, and neither disagreement recovers by
-    itself:
-
-    * `queued` with no marker (the dispatcher unlinked and died before writing
-      `running`, an enqueue died before touching the marker, a cancel died
-      after removing it) is a job nothing will ever run. `gpuc status` still
-      lists it as queued, which is the worst part: nothing that can *act* on it
-      sees it, because `list_queued` cannot and `adopt_orphans` only looks at
-      jobs that are `running` or finished. On an ephemeral host the idle timer
-      then terminates the box with the job unrun and no reason recorded.
-    * a marker for a job that is not queued (the state was written and the
-      unlink did not happen) dispatches a second runner into the workdir the
-      first one is using. `launch_ready` walks markers and does not consult
-      status, so nothing else stops it.
-
-    `state.json` wins both, because it is the file every other reader believes;
-    the marker is an index of it. The one thing it is *not* an index of is the
-    priority: `reorder` renames the marker and then writes the spec, and its
-    own docstring keeps the marker authoritative when the second write fails.
-    A marker lost from that state comes back at the priority in the spec, which
-    undoes a move the user was told had happened -- unavoidable, since nothing
-    else recorded it, but not a case of the state being right.
-
-    Nothing here reasons about cancels or unreadable specs. A job put back that
-    should not run is failed or cancelled by `launch_ready` on the very next
-    pass, *with its reason recorded*, which is the outcome that was wanted
-    anyway; leaving it invisible is the only outcome that is not.
-    """
-    paths.ensure_layout()
-    repairs: list[Repair] = []
-    markers: dict[str, QueueEntry] = {}
-    for entry in list_queued():
-        if markers.setdefault(entry.job_id, entry) is entry:
-            continue
-        # Two markers for one job is the double-launch state itself, and this
-        # is the only code that would ever notice. The first wins: the listing
-        # is in dispatch order, so that is the better priority of the two.
-        entry.marker.unlink(missing_ok=True)
-        repairs.append(Repair(entry.job_id, "deduplicated", "queued"))
-    for job_id in jobs.list_job_ids():
-        entry = markers.pop(job_id, None)
-        if not paths.state_file(job_id).is_file():
-            # An enqueue interrupted after the job dir and before the state.
-            # Asking `read_state` costs most of a second of retries per job,
-            # and such a dir is never purged, so it would be paid at every
-            # startup forever.
-            continue
-        try:
-            status = jobs.read_state(job_id).status
-        except RuntimeError:
-            # `adopt_orphans` reports this one; a job whose status cannot be
-            # read is not one to move either way.
-            continue
-        if status == "queued" and entry is None:
-            (paths.queue_dir() / marker_name(_priority_or_default(job_id), job_id)).touch()
-            repairs.append(Repair(job_id, "queued", status))
-        elif status != "queued" and entry is not None:
-            remove_marker(job_id)
-            repairs.append(Repair(job_id, "dequeued", status))
-    for job_id, entry in markers.items():
-        # A marker naming a job this host no longer has: a purge interrupted
-        # between removing the job and removing its marker. Left alone,
-        # `launch_ready` reads its spec, fails, and takes the whole pass down
-        # with it -- once, since it drops the marker on the way.
-        entry.marker.unlink(missing_ok=True)
-        repairs.append(Repair(job_id, "dequeued", "gone"))
-    return repairs
-
-
-def _priority_or_default(job_id: str) -> int:
-    """The priority to put a lost job back at.
-
-    A spec that cannot be read still gets its marker back, at the default. The
-    job cannot run either way, and queued is the only state in which anything
-    says so: `launch_ready` fails it `bad-spec` on the next pass, where a job
-    left with no marker would simply never be spoken of again.
-    """
-    try:
-        return jobs.read_spec(job_id).priority
-    except (RuntimeError, ValueError):
-        return JobSpec.priority
+    remove_marker(entry.job_id)
 
 
 def remove_marker(job_id: str) -> bool:
@@ -228,12 +129,18 @@ def cancel(job_id: str) -> str:
     if not paths.job_dir(job_id).is_dir():
         raise FileNotFoundError(f"no such job: {job_id}")
     paths.cancel_file(job_id).touch()
-    was_queued = remove_marker(job_id)
     state = jobs.read_state(job_id)
     if state.finished:
+        remove_marker(job_id)
         return state.status
-    if was_queued or state.status == "queued":
+    if state.status == "queued":
+        # State before marker, like `leave_queue` and for the same reason -- and
+        # reading it before either write is what keeps a cancel that arrives
+        # while the job is being dispatched from writing `cancelled` over the
+        # `running` the dispatcher just published. A job already on its way out
+        # is `cancelling`: the runner owns the kill from there.
         jobs.update_state(job_id, status="cancelled", reason="cancelled", ended_at=jobs.utc_now())
+        remove_marker(job_id)
         return "cancelled"
     return "cancelling"
 

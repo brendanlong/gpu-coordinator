@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 from collections.abc import Callable
@@ -10,8 +11,8 @@ from typing import Any, cast
 
 import pytest
 
+from gpuc.host import cleanup, jobs, paths, queue, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
-from gpuc.host import jobs, paths, queue, sync, terminate
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig
@@ -572,107 +573,79 @@ def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).reason == "runner-died"
 
 
-class FakeLock:
-    """Enough of `DispatcherLock` for `run` to get through a pass."""
-
-    def start_heartbeat(self) -> None: ...
-
-    def beat(self) -> None: ...
-
-    def release(self) -> None: ...
-
-
-def test_startup_reconciles_the_queue_before_it_adopts_anything(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Both passes, in that order, and from `run` rather than from a test
-    calling them: a job's state is only worth reading against a queue that has
-    been made to agree with it."""
-    dispatcher, _ = make_dispatcher()
-    calls: list[str] = []
-    monkeypatch.setattr(dispatcher, "reconcile_queue", lambda: calls.append("reconcile"))
-    monkeypatch.setattr(dispatcher, "adopt_orphans", lambda: calls.append("adopt"))
-    dispatcher.should_exit = True
-
-    dispatcher.run(cast("host_dispatcher.DispatcherLock", FakeLock()))
-
-    assert calls == ["reconcile", "adopt"]
-
-
-def test_a_job_lost_by_an_interrupted_submit_stops_the_idle_shutdown(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`enqueue` writes the job's state, then its marker, and spawns a
-    dispatcher only after both -- so an ssh that dies mid-submit leaves a
-    queued job no marker names and no new dispatcher to notice it. The
-    incumbent reconciled at startup, before the job existed, so without a last
-    look the pod terminates with the job unrun."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=15.0)
-    clock = FakeClock()
-    terminated: list[str] = []
-    dispatcher, spawned = make_dispatcher(
-        clock=clock, terminate_call=lambda pod, key: terminated.append(pod) or ""
-    )
-    dispatcher.run_once()
-
-    job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)  # the submit dies here, before spawning anything
-    clock.advance(16 * 60)
-    dispatcher.run_once()
-
-    assert terminated == []
-    # Put back too late in the pass for that one to dispatch it; the next one
-    # does, which is the whole difference between a delay and a lost job.
-    dispatcher.run_once()
-    assert job_id in spawned
-    assert jobs.read_state(job_id).status == "running"
-
-
-def test_the_last_dispatcher_does_not_exit_on_a_queue_that_only_looks_empty(
-    gpuc_home: Path,
-) -> None:
-    """A host with no idle timer gets no second chance: this dispatcher exits,
-    and the next one starts only when somebody submits something else."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)  # an interrupted submit or cancel
-
-    dispatcher, _ = make_dispatcher()
-
-    assert not dispatcher.idle_and_not_ephemeral()
-    assert queue.find_marker(job_id) is not None
-
-
-def test_a_job_dropped_on_the_way_out_of_the_queue_is_not_lost(gpuc_home: Path) -> None:
-    """`launch_ready` unlinks the marker and then writes `running`. Killed
-    between the two, the job is `queued` with nothing left to dispatch it:
-    `list_queued` cannot see it and `adopt_orphans` only looks at jobs that are
-    `running` or finished, so on an ephemeral host the idle timer would
-    terminate the box with the job unrun and no reason recorded anywhere."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)  # the crash
-
-    dispatcher, spawned = make_dispatcher()
-    dispatcher.reconcile_queue()
-    dispatcher.run_once()
-
-    assert jobs.read_state(job_id).status == "running"
-    assert job_id in spawned
-
-
 def test_a_marker_left_behind_does_not_launch_a_second_runner(gpuc_home: Path) -> None:
-    """The same window the other way round: the state write landed and the
-    unlink did not. `launch_ready` walks markers without consulting status, so
-    nothing else stops it starting a second runner in the first one's workdir."""
+    """`leave_queue` writes the state and then drops the marker, so a
+    dispatcher killed between the two leaves a marker for a job that is already
+    running. Dispatching on the marker alone starts a second runner in the
+    workdir the first one is using."""
     job_id = queue.enqueue(make_spec(gpus=1))
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])  # the crash
 
     dispatcher, spawned = make_dispatcher()
-    dispatcher.reconcile_queue()
     dispatcher.run_once()
 
     assert spawned == {}
     assert queue.list_queued() == []
+
+
+def test_a_marker_whose_job_is_gone_is_dropped_rather_than_dispatched(gpuc_home: Path) -> None:
+    """A purge interrupted before `remove_job_dir` reached the marker."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    shutil.rmtree(paths.job_dir(job_id))
+
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+
+    assert spawned == {}
+    assert queue.list_queued() == []
+
+
+def test_a_submit_that_never_committed_is_not_run_and_does_not_stay_queued(
+    gpuc_home: Path,
+) -> None:
+    """`gpuc submit` writes the spec and state and *then* the queue marker, so
+    an ssh that dies between them leaves a job this host was never asked to
+    run. It must not be dispatched -- and it must not sit `queued` for ever
+    either, which is all anybody could see of it."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)  # the submit dies here
+    old = datetime.now(UTC).timestamp() - cleanup.INCOMING_STALE_S - 1
+    os.utime(paths.state_file(job_id), (old, old))
+
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+
+    assert spawned == {}
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "incomplete-submit")
+
+
+def test_a_submit_still_in_flight_is_not_swept(gpuc_home: Path) -> None:
+    """The gap between the two writes is two syscalls wide. A sweep that could
+    not tell it from an abandoned one would fail perfectly good submits."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+
+    assert jobs.read_state(job_id).status == "queued"
+
+
+def test_a_preempted_job_being_put_back_is_not_swept(gpuc_home: Path) -> None:
+    """`requeue_preempted` writes the queued state, then the marker, then drops
+    the preempt marker -- so mid-move it looks exactly like an abandoned
+    submit. The preempt marker is what says it is coming back."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    paths.preempt_file(job_id).touch()
+    old = datetime.now(UTC).timestamp() - cleanup.INCOMING_STALE_S - 1
+    os.utime(paths.state_file(job_id), (old, old))
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.sweep_abandoned_submits()
+
+    assert jobs.read_state(job_id).status == "queued"
 
 
 def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(

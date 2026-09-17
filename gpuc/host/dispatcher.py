@@ -555,6 +555,7 @@ class Dispatcher:
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
     _last_reclaim_at: float | None = None
+    _last_submit_sweep_at: float | None = None
     _kill_sent: dict[str, float] = field(default_factory=dict)
     _kill_escalated: set[str] = field(default_factory=set)
     _pause_drain_pending: bool = False
@@ -591,47 +592,6 @@ class Dispatcher:
         log_line(message, self.deps.utcnow())
 
     # -- startup ---------------------------------------------------------
-    def reconcile_queue(self) -> None:
-        """Make the queue directory and the job states agree again.
-
-        At startup, and again before this dispatcher stops serving the queue
-        (`_nothing_waiting`). See `queue.reconcile` for what a disagreement
-        between the two means and why the state wins.
-        """
-        for repair in queue.reconcile():
-            if repair.action == "queued":
-                self.log(
-                    f"job {repair.job_id} is queued but had no queue marker, so nothing "
-                    f"would have dispatched it: a submit, a cancel or a dispatcher was "
-                    f"interrupted between the two. Queued again"
-                )
-            elif repair.action == "deduplicated":
-                self.log(f"job {repair.job_id} had two queue markers; dropped the later one")
-            else:
-                self.log(
-                    f"job {repair.job_id} is {repair.status} but was still in the queue; "
-                    f"marker removed, so it is not dispatched a second time"
-                )
-
-    def _nothing_waiting(self) -> bool:
-        """Whether the queue is empty -- asked only where that ends something.
-
-        A last reconcile before this dispatcher acts on having nothing to do,
-        because the emptiness may not be real. `enqueue` writes the job's state
-        first, its marker second, and spawns a dispatcher only after both, so
-        an ssh that dies mid-submit leaves a queued job that no marker names
-        *and* no new dispatcher to notice it: the incumbent reconciled at
-        startup, before that job existed. Acted on, that emptiness drains an
-        ephemeral pod or exits the last dispatcher, and the job is gone with
-        the host.
-
-        Only at the two moments the answer is final, never per pass: a job lost
-        this way on a busy host waits for the queue to run dry, which is the
-        first moment anything would have run it anyway.
-        """
-        self.reconcile_queue()
-        return not queue.list_queued()
-
     def adopt_orphans(self) -> None:
         """Reconcile jobs left `running` by a dispatcher that died."""
         # Walked at most once, and only for a job whose state names no live
@@ -1043,6 +1003,34 @@ class Dispatcher:
             )
         return f"needs {spec.gpus} GPUs, {have}"
 
+    def _still_queued(self, entry: queue.QueueEntry) -> bool:
+        """Whether this marker still names a job that is waiting to run.
+
+        The marker says a job was submitted; the state says what has become of
+        it since, and only the state is allowed to start a runner. Without this
+        the queue is dispatched on the marker alone, so anything that leaves one
+        behind -- `leave_queue` interrupted between its two writes, a purge
+        interrupted before `remove_job_dir` got to the marker -- starts a second
+        runner in the workdir the first one is using, or a job with no spec.
+
+        Dropping the marker is the repair: the state has already said where the
+        job went, and a marker disagreeing with it is the stale half.
+        """
+        try:
+            status = jobs.read_state(entry.job_id).status
+        except RuntimeError:
+            self.log(f"job {entry.job_id} is queued but has no readable state; dropping it")
+            entry.marker.unlink(missing_ok=True)
+            return False
+        if status != "queued":
+            self.log(
+                f"job {entry.job_id} is {status} but was still in the queue; dropping its "
+                f"marker rather than dispatching it a second time"
+            )
+            entry.marker.unlink(missing_ok=True)
+            return False
+        return True
+
     def launch_ready(self) -> None:
         """Dispatch in queue order, and hold cards for a job that does not fit.
 
@@ -1086,6 +1074,8 @@ class Dispatcher:
         held_shared = 0
         for entry in queue.list_queued():
             job_id = entry.job_id
+            if not self._still_queued(entry):
+                continue
             if queue.is_cancelled(job_id):
                 queue.leave_queue(
                     entry, status="cancelled", reason="cancelled", ended_at=jobs.utc_now()
@@ -1383,9 +1373,6 @@ class Dispatcher:
             self._queue_empty_since = now
         idle_s = now - self._queue_empty_since
         if idle_s >= config.idle_minutes * 60.0:
-            if not self._nothing_waiting():
-                self._queue_empty_since = None
-                return
             self.drain_and_terminate(f"idle for {idle_s / 60.0:.1f} min")
 
     def _request_kills(self, reason: str, why: str) -> None:
@@ -1564,6 +1551,35 @@ class Dispatcher:
         )
 
     # -- retention -------------------------------------------------------
+    def sweep_abandoned_submits(self) -> None:
+        """Resolve jobs whose `gpuc submit` died before it committed them.
+
+        The client owns everything up to the queue marker, and a submit that
+        never wrote one asked this host for nothing. So this does not put the
+        job in the queue -- it records that the submit did not finish, which is
+        the only thing anybody can act on, and lets the ordinary retention
+        horizons take the job dir afterwards like any other finished job.
+        """
+        now = self.deps.monotonic()
+        if (
+            self._last_submit_sweep_at is not None
+            and now - self._last_submit_sweep_at < RETENTION_INTERVAL_S
+        ):
+            return
+        self._last_submit_sweep_at = now
+        for job_id in cleanup.abandoned_submits():
+            jobs.update_state(
+                job_id,
+                status="failed",
+                reason="incomplete-submit",
+                exit_code=1,
+                ended_at=jobs.utc_now(),
+            )
+            self.log(
+                f"job {job_id} was never submitted: its spec and state were written but its "
+                f"queue marker never was, so nothing here was asked to run it"
+            )
+
     def maybe_reclaim(self) -> None:
         """Run the two retention horizons at startup, then at most once an hour.
 
@@ -1627,22 +1643,17 @@ class Dispatcher:
         self.launch_ready()
         self.preempt_for_waiting()
         self.maybe_reclaim()
+        self.sweep_abandoned_submits()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:
-        if self.running or self.config.ephemeral or queue.list_queued():
-            return False
-        # Exiting is this dispatcher's last act, and on a host with no
-        # `idle_minutes` there is no second chance: give the queue the same
-        # last look the terminate path gives it.
-        return self._nothing_waiting()
+        return not self.running and not queue.list_queued() and not self.config.ephemeral
 
     def run(self, lock: DispatcherLock) -> int:
         lock.start_heartbeat()
         self.log(f"dispatcher started (pid {os.getpid()}, pgid {os.getpgid(0)})")
         code = 0
         try:
-            self._guard(self.reconcile_queue)
             self._guard(self.adopt_orphans)
             while not self.should_exit:
                 lock.beat()

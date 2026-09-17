@@ -247,40 +247,37 @@ queue's lexical order, not submission order below one second.
   walked past instead, and neither is failed -- `_capacity_failure` fails a
   job bigger than the configured host, shared cards included. Why the obvious
   rule (dispatch whatever fits) is wrong is [usage.md](usage.md#priority-is-not-advisory).
-- **Recovery from "a process was killed between two writes".** Which mechanism
-  applies depends on what the two records are:
-  - *Two files that must agree* -- the queue marker and `state.json`. Seven
-    paths move a job in or out of the queue (`enqueue`, `requeue_preempted`,
-    `cancel`, and four in `launch_ready`) and each writes both, so a process
-    killed between them leaves the pair disagreeing. **`queue.reconcile()`
-    makes `state.json` win**: a `queued` job with no marker gets one back, a
-    marker for a job that is not queued is removed, a marker naming no job goes,
-    and a job with two markers keeps the better-priority one. Because the repair
-    is symmetric the *order* of the two writes stops mattering, which is what
-    lets `launch_ready`'s four ways out share one helper, `queue.leave_queue`,
-    rather than each arguing its ordering. (The other three move a job *in*, or
-    need to know whether it was queued at all, and keep their own ordering
-    arguments -- `enqueue`'s marker-last comment is still load-bearing, since a
-    marker written before the spec would have the job failed `bad-spec`.)
-    - `state.json` is authoritative for *status*, not for priority: `reorder`
-      renames the marker and then writes the spec, and deliberately keeps the
-      move when the second write fails. A marker lost from that state comes
-      back at the spec's priority.
-    - **Run wherever the dispatcher would stop serving the queue**, not just at
-      startup: before an ephemeral host drains on the idle timer, and before a
-      non-ephemeral one exits (`_nothing_waiting`). Startup alone is not enough
-      because `enqueue` spawns its dispatcher *after* writing both files, so an
-      interrupted submit leaves a job no marker names and starts nothing that
-      would look for it -- and the incumbent has long since reconciled.
-  - *A file versus reality* -- `state.runner_pid` against the process table.
-    A record cannot be made atomic with a `fork`, so nothing concludes a runner
-    is gone from a missing pid; `adopt_orphans` asks /proc instead (below).
-
-  Neither covers a window whose intermediate state no reader visits, which is
-  the question to ask of any new multi-write sequence here: *if this is
-  interrupted halfway, which pass looks at what is left?* `requeue_preempted`
-  is the one three-file sequence, and answers it with its own ordering and
-  `_finish_interrupted_requeue`.
+- **A job is submitted when its queue marker exists, and not before.**
+  `enqueue` writes the spec, then the state, then the marker, so an interrupted
+  `gpuc submit` leaves a job dir this host was never asked to run. It is not
+  completed and not dispatched: the client owns everything up to the commit.
+  After an hour (`cleanup.INCOMING_STALE_S`, the same horizon `stale_incoming`
+  uses, and for the same reason -- a submit that is merely slow must not be
+  mistaken for one that died) the dispatcher records it `failed:
+  incomplete-submit`, so it neither runs nor sits `queued` for ever, and the
+  ordinary retention horizons take the dir afterwards. A job `requeue_preempted`
+  is putting back is in the same shape mid-move and is excluded: its preempt
+  marker says it is coming back, and `_finish_interrupted_requeue` completes it.
+- **`launch_ready` never dispatches on a marker alone** (`_still_queued`): the
+  marker says a job was submitted, the state says what has become of it since,
+  and only a state of `queued` starts a runner. A marker that disagrees is the
+  stale half and is dropped. This is what makes a leftover marker harmless --
+  from a `leave_queue` interrupted between its two writes, or a purge that did
+  not reach `remove_job_dir`'s marker cleanup -- instead of a second runner in
+  the workdir the first one is using.
+- **Writes that take a job out of the queue put the state first**
+  (`queue.leave_queue`, and `queue.cancel` the same way). The order is the
+  design, not a preference: interrupted this way the job is `running` with a
+  stale marker, which the rule above already handles; interrupted the other way
+  it is `queued` with no marker, which is *exactly* what an uncommitted submit
+  looks like. One shape, two opposite right answers, and nothing able to tell
+  them apart. Keeping the dispatcher's own interruptions out of that shape is
+  what lets an uncommitted submit be recognised at all.
+  - The general rule this is an instance of: **do not create an intermediate
+    state that is ambiguous with one another actor produces.** Where a record
+    cannot be made atomic with the thing it describes -- `state.runner_pid`
+    against an actual process -- ask the source instead of guessing from the
+    record (below).
 - **Adoption at startup** (`adopt_orphans`): every job whose `state.json` says
   `running` is either taken over or failed `runner-died`, and the GPUs of a
   failed one go straight back in the free pool -- so anything it left behind is

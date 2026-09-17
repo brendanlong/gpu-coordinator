@@ -562,6 +562,46 @@ def _too_young(job_id: str, age_days: float | None, older_than_days: float) -> S
     return None
 
 
+def abandoned_submits(now: float | None = None) -> list[str]:
+    """Jobs whose submit never committed: `queued`, but not in the queue.
+
+    `queue.enqueue` writes the spec and the state and *then* the queue marker,
+    so the marker is what makes a job submitted. A job dir stuck without one is
+    a `gpuc submit` whose ssh died between those writes: the host was never
+    asked to run it, so it must not be dispatched -- and left alone it is a
+    phantom `queued` job in `gpuc status` that nothing ever resolves.
+
+    The dispatcher's own writes cannot produce this shape; see
+    `queue.leave_queue`, which is ordered so that they do not.
+
+    Age-gated for exactly the reason `stale_incoming` is, and against the same
+    horizon: the gap between the two writes is two syscalls wide, and an
+    enqueue that is merely slow must not be mistaken for one that died.
+
+    A job `requeue_preempted` is putting back is in this shape mid-move and is
+    excluded outright: its preempt marker is the record that it is coming back,
+    and `_finish_interrupted_requeue` is what completes the move.
+    """
+    moment = now if now is not None else datetime.now(UTC).timestamp()
+    queued = {entry.job_id for entry in queue.list_queued()}
+    abandoned: list[str] = []
+    for job_id in jobs.list_job_ids():
+        if job_id in queued or queue.is_preempted(job_id):
+            continue
+        try:
+            if jobs.read_state(job_id).status != "queued":
+                continue
+        except RuntimeError:
+            continue
+        try:
+            staleness = moment - paths.state_file(job_id).stat().st_mtime
+        except OSError:
+            continue
+        if staleness >= INCOMING_STALE_S:
+            abandoned.append(job_id)
+    return abandoned
+
+
 def stale_incoming(now: float | None = None) -> list[Path]:
     """Staged spec files in `incoming/` that no submit can still be using.
 
