@@ -18,6 +18,7 @@ from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.remote import HostSession, RemoteError, open_session
+from gpuc.control.s3index import job_uri
 from gpuc.control.transport import TransportError
 from gpuc.host.cleanup import human_bytes
 from gpuc.host.jobs import SCHEMA_VERSION
@@ -155,7 +156,8 @@ class JobView:
     isolation: str | None = None
     """`cgroup` if this job's phases run in a systemd scope (a cancel reaps the
     whole tree), `pgid` if only a process group (a daemonised grandchild
-    escapes). Shown on running jobs because it changes what a kill guarantees."""
+    escapes). In `--json` only: what a kill reaps is asked while debugging one
+    job, not while scanning a host."""
     low_util: LowUtilView = field(default_factory=LowUtilView)
     """This job's own watchdog settings, so `--suspects` names the jobs the host
     is actually about to kill -- and stays quiet about the ones that turned the
@@ -559,7 +561,7 @@ def pod_line(pod: Pod | None) -> str | None:
     """
     if pod is None:
         return None
-    age = "age ?" if pod.age is None else f"age {pod.age.total_seconds() / 60.0:.0f}m"
+    age = "age ?" if pod.age is None else f"age {format_duration(pod.age.total_seconds())}"
     util = ",".join(f"{u}%" for u in pod.gpu_utils) if pod.gpu_utils else "--"
     return (
         f"  pod     {pod.id} {pod.status} {pod.gpu_name or '?'} "
@@ -595,8 +597,8 @@ def _fmt_gpus(view: HostView, job: JobView) -> str:
     return "gpu=" + ",".join(view.gpu_label(uuid) for uuid in job.gpus)
 
 
-def _fmt_minutes(job: JobView) -> str:
-    return "--" if job.minutes is None else f"{job.minutes:.1f}m"
+def _fmt_elapsed(job: JobView) -> str:
+    return "--" if job.minutes is None else format_duration(job.minutes * 60.0)
 
 
 def _fmt_eta(job: JobView) -> str:
@@ -1071,7 +1073,7 @@ def render(
     if suspects_only:
         for job in view.suspects:
             lines.append(
-                f"  SUSPECT {_job_label(job)} phase={job.phase} {_fmt_minutes(job)} "
+                f"  SUSPECT {_job_label(job)} phase={job.phase} {_fmt_elapsed(job)} "
                 f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             )
         if view.past_ttl:
@@ -1083,7 +1085,7 @@ def render(
     for job in view.running:
         mark = "  running" if not job.suspect else "  running!"
         lines.append(
-            f"{mark} {_job_label(job)} phase={job.phase or '-'} {_fmt_minutes(job)} "
+            f"{mark} {_job_label(job)} phase={job.phase or '-'} {_fmt_elapsed(job)} "
             f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             f"{_fmt_eta(job)}{_fmt_auto_preempt(job)}"
         )
@@ -1181,6 +1183,7 @@ def job_json(
         "name": job.name,
         "status": job.status,
         "reason": job.reason,
+        "exit_code": job.exit_code,
         "phase": job.phase,
         "priority": job.priority,
         "attempt": job.attempt,
@@ -1265,7 +1268,7 @@ def job_links(job: JobView, mirror_prefix: str | None = None) -> list[dict[str, 
         # The host's *current* prefix. A job mirrored under a prefix the host
         # has since been re-registered without gets a link to an empty
         # listing; `gpuc logs` reads the job's own index entry, this does not.
-        mirror = f"{mirror_prefix.rstrip('/')}/jobs/{job.job_id}"
+        mirror = job_uri(mirror_prefix, job.job_id)
         links.append(
             {"kind": "mirror", "path": None, "target": mirror, "url": s3_console_url(mirror)}
         )

@@ -15,6 +15,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 
 import gpuc
+from gpuc.control.version import package_root
 
 RESOURCE = "SKILL.md"
 INSTALL_PARTS = (".claude", "skills", "gpuc", RESOURCE)
@@ -31,7 +32,7 @@ def packaged() -> Traversable:
 
 def source_copy() -> Path:
     """The canonical file, from a checkout or an editable install."""
-    return Path(gpuc.__file__).resolve().parents[1] / "skills" / "gpuc" / RESOURCE
+    return package_root() / "skills" / "gpuc" / RESOURCE
 
 
 def read_skill() -> str:

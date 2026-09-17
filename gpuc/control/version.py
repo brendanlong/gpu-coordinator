@@ -52,12 +52,12 @@ def installed_commit() -> str | None:
     return str(commit) if commit else None
 
 
-def source_commit(root: Path | None = None) -> str | None:
+def source_commit() -> str | None:
     """`git rev-parse HEAD` where the package lives, for a checkout or an
     editable install. Never raises: git may not be there at all."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(root or package_root()), "rev-parse", "HEAD"],
+            ["git", "-C", str(package_root()), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=False,
@@ -78,12 +78,12 @@ def local_commit() -> str | None:
     return installed_commit() or source_commit()
 
 
-def dirty(root: Path | None = None) -> bool:
+def dirty() -> bool:
     """Whether the source checkout has uncommitted changes, so `version` can
     say that the commit it printed is not the whole truth."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(root or package_root()), "status", "--porcelain"],
+            ["git", "-C", str(package_root()), "status", "--porcelain"],
             capture_output=True,
             text=True,
             check=False,

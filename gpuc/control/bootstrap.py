@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import gpuc
 from gpuc._version import user_agent
 from gpuc.control.config import HostEntry, Settings, transport_for, utc_now
 from gpuc.control.gpuinfo import discover, summarize
@@ -26,7 +25,7 @@ from gpuc.control.remote import (
     write_remote_config,
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
-from gpuc.control.version import local_commit
+from gpuc.control.version import local_commit, package_root
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
@@ -54,10 +53,6 @@ class BootstrapResult:
     pkg_commit: str | None = None
     """The gpuc commit this bootstrap shipped, as `gpuc version` reports it."""
     warnings: list[str] = field(default_factory=list)
-
-
-def package_root() -> Path:
-    return Path(gpuc.__file__).resolve().parents[1]
 
 
 def package_files(root: Path | None = None) -> list[str]:

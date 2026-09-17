@@ -7,7 +7,6 @@ import getpass
 import json
 import math
 import os
-import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -40,16 +39,20 @@ from gpuc.control.actions import (
     gather_all,
     hosts_document,
     hosts_for,
+    job_log_path,
     make_provider,
     named_registry,
+    note,
+    placement_after,
     preempt_job,
     provider_for_status,
-    queue_placement,
     read_log,
+    read_registry_warned,
     reorder_job,
     shipped_note,
     status_document,
     version_document,
+    warn,
 )
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_package
 from gpuc.control.clean import check_flags as check_clean_flags
@@ -63,11 +66,9 @@ from gpuc.control.config import (
     hosts_file,
     load_registry,
     load_settings,
-    read_registry,
     registry_transaction,
     state_dir,
     transport_for,
-    warn_stderr,
     write_config_template,
 )
 from gpuc.control.connect import Connection, connect_host, push_config
@@ -89,6 +90,7 @@ from gpuc.control.s3index import (
     S3Index,
     S3IndexError,
     S3ObjectMissing,
+    job_uri,
 )
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import (
@@ -108,6 +110,7 @@ from gpuc.control.transport import (
     SshTransport,
     Transport,
     TransportError,
+    tail_command,
 )
 from gpuc.host import jobs
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
@@ -124,6 +127,8 @@ __all__ = [
     "build_parser",
     "main",
 ]
+
+NO_HOSTS = "no hosts registered. Add one: gpuc host add local --gpus 0"
 
 GPUS_HELP = (
     "GPU UUIDs or nvidia-smi indices this host may use, comma-separated "
@@ -194,7 +199,7 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
     if args.s3_prefix is not None:
         fields["s3_prefix"] = args.s3_prefix or None
     if args.retention_days is not None:
-        fields["retention_days"] = _retention(args.retention_days)
+        fields["retention_days"] = _days(args.retention_days, "--retention-days")
     if args.workdir_days is not None:
         fields["workdir_days"] = _days(args.workdir_days, "--workdir-days")
     if args.idle_min is not None:
@@ -384,7 +389,7 @@ def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str
         lines.append(f"wrote its first config to {connection.home}/config.json")
     home = _home_line(entry)
     if home:
-        lines.append(home.rstrip())
+        lines.append(home)
     lines.append(f"next: gpuc host bootstrap {entry.name}")
     return "\n".join(lines)
 
@@ -430,16 +435,12 @@ def _days(raw: str | None, flag: str) -> float | None:
     return days
 
 
-def _retention(raw: str | None) -> float | None:
-    return _days(raw, "--retention-days")
-
-
 def _home_line(entry: HostEntry) -> str:
     if entry.root is None:
         return ""
     return (
         f"persistent root {entry.root}, so gpuc home (queue, specs, state, logs, "
-        f"workdirs) is {entry.remote_home}\n"
+        f"workdirs) is {entry.remote_home}"
     )
 
 
@@ -504,13 +505,13 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     with registry_transaction() as registry:
         current = registry.hosts.get(entry.name)
         if current is None:
-            warn_stderr(f"host {entry.name} was removed while this ran; nothing was registered")
+            warn(f"host {entry.name} was removed while this ran; nothing was registered")
         else:
             updated = current.model_copy(update=address)
             registry.put(updated if config is None else updated.with_config(config))
     home = _home_line(entry)
     if home:
-        lines.append(home.rstrip())
+        lines.append(home)
         lines.append(f"the host moves there on: gpuc host bootstrap {entry.name}")
     print("\n".join(lines))
     return 0
@@ -520,7 +521,7 @@ def cmd_host_remove(args: argparse.Namespace) -> int:
     with registry_transaction() as registry:
         registry.require(args.name)
         del registry.hosts[args.name]
-    print(f"removed host {args.name} from {state_dir()}/hosts.json (nothing on the host changed)")
+    print(f"removed host {args.name}")
     return 0
 
 
@@ -532,9 +533,7 @@ def cmd_host_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_host_list(args: argparse.Namespace) -> int:
-    read = read_registry()
-    for error in read.errors:
-        print(f"warning: {error}", file=sys.stderr)
+    read = read_registry_warned()
     registry = read.registry
     if args.json:
         jsonout.emit(hosts_document(read))
@@ -542,7 +541,7 @@ def cmd_host_list(args: argparse.Namespace) -> int:
     if not registry.hosts:
         if read.unreadable:
             return EXIT_LOCAL_STATE
-        print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        print(NO_HOSTS)
         return EXIT_OK
     for entry in registry.hosts.values():
         summary = summarize(entry.gpus, entry.gpu_info) if entry.gpus else "no GPUs"
@@ -622,14 +621,12 @@ def bootstrap_every_host(settings: Settings, health_args: str) -> int:
     the reason the flag exists. Each failure is named again in the tally and
     the command exits 1, so nobody reads a wall of output as "all upgraded".
     """
-    read = read_registry()
-    for error in read.errors:
-        print(f"warning: {error}", file=sys.stderr)
+    read = read_registry_warned()
     if read.unreadable:
         raise LocalStateUnreadable("\n".join(read.errors))
     hosts = list(read.registry.hosts.values())
     if not hosts:
-        print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        print(NO_HOSTS)
         return EXIT_OK
     done = 0
     failed: list[HostEntry] = []
@@ -847,7 +844,7 @@ def mirror_spec_first(
 
 def check_runpod_args(args: argparse.Namespace) -> None:
     """Judge the provisioning flags once, before anything is bought or written."""
-    if getattr(args, "runpod", False) and args.host:
+    if args.runpod and args.host:
         raise UsageError(
             f"--runpod creates a pod and --host {args.host} names a host that already "
             f"exists, so they cannot be combined. Drop one."
@@ -857,7 +854,7 @@ def check_runpod_args(args: argparse.Namespace) -> None:
 
 def reporter(args: argparse.Namespace) -> Reporter:
     """Where a step's progress goes: stdout, or stderr when stdout is a document."""
-    return jsonout.note if getattr(args, "json", False) else print
+    return jsonout.note if args.json else print
 
 
 def ensure_package_current(
@@ -1022,7 +1019,7 @@ def _queued(
     "position 3 of 5, starts in ~2h" is the thing the submitter actually wants
     to know and cannot work out from a job id.
     """
-    result.placement = queue_placement(entry, result.job_id, settings, session=result.session)
+    result.placement = placement_after(entry, result.job_id, settings, session=result.session)
     if args.json:
         jsonout.emit(result.document(requeued_from=requeued_from))
         return EXIT_OK
@@ -1044,20 +1041,16 @@ def cmd_status(args: argparse.Namespace) -> int:
     guess. Automation must treat that as unknown and never as idle.
     """
     settings = load_settings()
-    read = read_registry()
+    read = read_registry_warned()
     try:
         since_s = status_mod.parse_duration(args.since) if args.since else None
     except ValueError as exc:
         raise UsageError(f"--since: {exc}") from exc
     if args.json:
-        # One JSON document on stdout, whatever happened. Notes stay on stderr.
-        document = status_document(
-            read, settings, host=args.host, recent=args.recent, since_s=since_s
+        jsonout.emit(
+            status_document(read, settings, host=args.host, recent=args.recent, since_s=since_s)
         )
-        print(json.dumps(document, indent=2))
         return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
-    for error in read.errors:
-        print(f"warning: {error}", file=sys.stderr)
     entries = hosts_for(read.registry, args.host) if not read.unreadable else []
     if not entries:
         if read.unreadable:
@@ -1067,7 +1060,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return EXIT_LOCAL_STATE
-        print("no hosts registered. Add one: gpuc host add local --gpus GPU-uuid")
+        print(NO_HOSTS)
         # ...but `--all` still has something to say: the index remembers jobs
         # whose host has since been removed.
         if args.all and not args.suspects:
@@ -1101,7 +1094,7 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
         try:
             entries.update({e.job_id: e for e in s3.list_index()})
         except S3IndexError as exc:
-            print(f"note: could not read the S3 index: {exc}")
+            note(f"could not read the S3 index: {exc}")
     elsewhere = [
         entry
         for job_id, entry in sorted(entries.items())
@@ -1113,7 +1106,7 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
     print(f"jobs known only to the index{scope} (their host is gone, or lost its state):")
     lost = _outputs_lost_ids(s3, elsewhere[:MIRROR_STATE_LOOKUPS])
     for entry in elsewhere:
-        note = (
+        flag = (
             " OUTPUTS LOST (the host went away before they uploaded)"
             if entry.job_id in lost
             else ""
@@ -1121,7 +1114,7 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
         label = f"{entry.name} ({entry.job_id})" if entry.name else entry.job_id
         print(
             f"  {label} host={entry.host} attempt={entry.attempt} "
-            f"submitted {status_mod.format_age(entry.submitted_at)}{note}"
+            f"submitted {status_mod.format_age(entry.submitted_at)}{flag}"
         )
     print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")
 
@@ -1144,7 +1137,7 @@ def _outputs_lost_ids(s3: S3Index | None, entries: Sequence[IndexEntry]) -> set[
     for entry in entries:
         if not entry.s3_prefix:
             continue
-        uri = f"{entry.s3_prefix.rstrip('/')}/jobs/{entry.job_id}/state.json"
+        uri = job_uri(entry.s3_prefix, entry.job_id, "state.json")
         try:
             document = json.loads(s3.get_uri(uri))
         except (S3IndexError, json.JSONDecodeError):
@@ -1207,27 +1200,32 @@ def cmd_ssh(args: argparse.Namespace) -> int:
     os.execvp(argv[0], argv)
 
 
-def cmd_cancel(args: argparse.Namespace) -> int:
-    document = cancel_job(args.job_id, args.host, load_settings())
+def _answer(args: argparse.Namespace, document: dict[str, Any], *text: str | None) -> int:
+    """A job command's last word: its warnings on stderr, then the document or the text."""
+    for warning in document.get("warnings", []):
+        warn(warning)
     if args.json:
         jsonout.emit(document)
     else:
-        print(f"job {args.job_id} on host {document['host']}: {document['status']}")
+        print("\n".join(line for line in text if line))
     return EXIT_OK
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    document = cancel_job(args.job_id, args.host, load_settings())
+    return _answer(
+        args, document, f"job {args.job_id} on host {document['host']}: {document['status']}"
+    )
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
     document = reorder_job(args.job_id, args.priority, args.host, load_settings())
-    for text in document["warnings"]:
-        print(f"WARNING: {text}", file=sys.stderr)
-    if args.json:
-        jsonout.emit(document)
-    else:
-        print(f"job {args.job_id} on host {document['host']} moved to priority {args.priority}")
-        note = status_mod.queue_note(document)
-        if note:
-            print(note)
-    return EXIT_OK
+    return _answer(
+        args,
+        document,
+        f"job {args.job_id} on host {document['host']} moved to priority {args.priority}",
+        status_mod.queue_note(document),
+    )
 
 
 def cmd_preempt(args: argparse.Namespace) -> int:
@@ -1242,19 +1240,11 @@ def cmd_preempt(args: argparse.Namespace) -> int:
     the job has done to re-run the same job.
     """
     document = preempt_job(args.job_id, args.priority, args.host, load_settings())
-    for text in document["warnings"]:
-        print(f"WARNING: {text}", file=sys.stderr)
-    if args.json:
-        jsonout.emit(document)
-        return EXIT_OK
     priority = document["priority"]
-    at = f" at priority {priority}" if priority is not None else ""
-    print(
-        f"job {args.job_id} on host {document['host']}: {document['status']}\n"
-        f"  its runner is stopping it and syncing what it produced; the host queues it "
-        f"again{at}, to run from the start"
+    at = f"; it will be queued again at priority {priority}" if priority is not None else ""
+    return _answer(
+        args, document, f"job {args.job_id} on host {document['host']}: {document['status']}{at}"
     )
-    return EXIT_OK
 
 
 def cmd_estimate(args: argparse.Namespace) -> int:
@@ -1266,25 +1256,22 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     """
     wanted = check_estimate(args.minutes, clear=args.clear)
     document = estimate_job(args.job_id, wanted, args.host, load_settings())
-    for text in document["warnings"]:
-        print(f"WARNING: {text}", file=sys.stderr)
     recorded = document["estimated_runtime_min"]
-    host = document["host"]
-    if args.json:
-        jsonout.emit(document)
-    elif recorded is None:
-        print(f"job {args.job_id} on host {host} no longer estimates a runtime")
-    else:
-        shown = f"{recorded:g}" if isinstance(recorded, (int, float)) else recorded
-        print(f"job {args.job_id} on host {host} now estimates {shown} min")
-    return EXIT_OK
+    job = f"job {args.job_id} on host {document['host']}"
+    return _answer(
+        args,
+        document,
+        f"{job} no longer estimates a runtime"
+        if recorded is None
+        else f"{job} now estimates {recorded:g} min",
+    )
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
-    command = f"tail -n {lines} -f {shlex.quote(remote_path)}"
+    command = tail_command(remote_path, lines, follow=True)
     if isinstance(transport, SshTransport):
         return transport.ssh_argv(command)
-    return ["bash", "-lc", command]
+    return ["bash", "-c", command]
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -1296,8 +1283,8 @@ def cmd_logs(args: argparse.Namespace) -> int:
     settings = load_settings()
     if args.follow:
         entry, _ = find_job_host(args.job_id, named_registry(), args.host)
-        session = open_session(entry, settings)
-        return _follow(session.transport, f"{session.job_dir(args.job_id)}/log.txt", args.lines)
+        session, remote = job_log_path(entry, args.job_id, settings)
+        return _follow(session.transport, remote, args.lines)
     entry, log = read_log(args.job_id, args.host, args.lines, settings)
     # Bytes for a human; lines plus where they came from for a script.
     if args.json:
@@ -1390,11 +1377,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         else:
             print(result.render())
         return EXIT_ERROR if result.errors else EXIT_OK
-    print(f"reconciling every {args.interval:.0f}s; Ctrl-C to stop")
+    print(f"reconciling every {args.interval:.0f}s; Ctrl-C to stop", file=sys.stderr)
     try:
         reconcile_mod.run_loop(settings, provider, interval_s=args.interval)
     except KeyboardInterrupt:
-        print("stopped")
+        print("stopped", file=sys.stderr)
     return EXIT_OK
 
 
@@ -1416,31 +1403,25 @@ def cmd_version(args: argparse.Namespace) -> int:
     host somebody else has bootstrapped since it was read: `gpuc status` asks
     each host what it is running.
     """
-    read = read_registry()
-    for error in read.errors:
-        print(f"warning: {error}", file=sys.stderr)
+    read = read_registry_warned()
+    document = version_document(read)
     if args.json:
-        jsonout.emit(version_document(read))
+        jsonout.emit(document)
         return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
-    commit = version_mod.local_commit()
-    source = "installed" if version_mod.installed_commit() else "source checkout"
-    dirty = " (+uncommitted changes)" if version_mod.dirty() else ""
-    print(f"gpuc {version_mod.__version__}")
-    print(f"commit {version_mod.short(commit)} [{source}]{dirty}")
-    print(f"python {sys.version.split()[0]} at {sys.executable}")
-    hosts = [
-        e for e in read.registry.hosts.values() if e.pkg_commit or e.bootstrapped_at or e.seen_at
-    ]
+    dirty = " (+uncommitted changes)" if document["dirty"] else ""
+    print(f"gpuc {document['version']}")
+    print(f"commit {version_mod.short(document['commit'])} [{document['source']}]{dirty}")
+    print(f"python {document['python']} at {document['executable']}")
+    hosts = document["hosts"]
     if not hosts:
         print("hosts: none read yet")
         return EXIT_LOCAL_STATE if read.unreadable else EXIT_OK
-    print("hosts (as last read from here; gpuc status asks the hosts themselves):")
-    for entry in hosts:
-        current = version_mod.same_commit(commit, entry.pkg_commit)
-        note = "" if current else "  DIFFERS: re-bootstrap"
-        seen = f"  {status_mod.format_age(entry.seen_at)}" if entry.seen_at else ""
-        print(f"  {entry.name:<16} pkg {version_mod.short(entry.pkg_commit)}{seen}{note}")
-    if any(not version_mod.same_commit(commit, e.pkg_commit) for e in hosts):
+    print("hosts (as last read from here):")
+    for host in hosts:
+        note = "" if host["current"] else "  DIFFERS: re-bootstrap"
+        seen = f"  {status_mod.format_age(host['seen_at'])}" if host["seen_at"] else ""
+        print(f"  {host['name']:<16} pkg {version_mod.short(host['pkg_commit'])}{seen}{note}")
+    if not all(host["current"] for host in hosts):
         print(
             "upgrade a host with: gpuc host bootstrap <host> (or --all for every host; "
             "running jobs are not disturbed)"
@@ -1693,10 +1674,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DURATION",
         help="only finished jobs that ended within this long ago, e.g. 24h, 7d, 90m",
     )
-    status.add_argument(
-        "--json",
-        action="store_true",
-        help="one JSON document on stdout: key on hosts[].running, and treat exit 3 "
+    add_json_flag(
+        status,
+        "one JSON document on stdout: key on hosts[].running, and treat exit 3 "
         "(local state unreadable) as unknown, never as nothing running",
     )
     status.set_defaults(func=cmd_status)
@@ -1926,7 +1906,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Every page and API call is behind the password `gpuc web set-password` "
         "records. The dashboard is a thin view over the same code the CLI runs: what it "
         "shows is `gpuc status --json`, `gpuc host list --json` and `gpuc config show "
-        "--json`, and what it can do is `gpuc cancel`, `gpuc reorder` and `gpuc estimate`.",
+        "--json`, and what it can do is `gpuc cancel`, `gpuc preempt`, `gpuc reorder` and "
+        "`gpuc estimate`.",
     )
     serve.add_argument(
         "--bind",

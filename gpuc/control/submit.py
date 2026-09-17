@@ -235,11 +235,15 @@ def precheck_local(
     try:
         git_tracked_files(workdir)
     except TransportError as exc:
-        raise SubmitError(
-            f"{workdir} is not a git repository, so there is nothing to sync: {exc}\n"
-            f"Run `git init && git add -A` there, submit from your project directory, or pass "
-            f"--no-git to rsync the directory as it is."
-        ) from exc
+        raise _not_a_repo(workdir, exc) from exc
+
+
+def _not_a_repo(workdir: Path, exc: Exception) -> SubmitError:
+    return SubmitError(
+        f"{workdir} is not a git repository, so there is nothing to sync: {exc}\n"
+        f"Run `git init && git add -A` there, submit from your project directory, or pass "
+        f"--no-git to rsync the directory as it is."
+    )
 
 
 def git_source(workdir: Path) -> dict[str, str]:
@@ -361,11 +365,7 @@ def push_workdir(
     try:
         summary = git_summary(workdir)
     except TransportError as exc:
-        raise SubmitError(
-            f"{workdir} is not a git repository, so there is nothing to sync: {exc}\n"
-            f"Run `git init && git add -A` there, submit from your project directory, or pass "
-            f"--no-git to rsync the directory as it is."
-        ) from exc
+        raise _not_a_repo(workdir, exc) from exc
     report(summary.render())
     if summary.files:
         session.transport.rsync(workdir, remote, summary.files)
@@ -453,7 +453,6 @@ def submit_spec(
     environ: Mapping[str, str] | None = None,
     attempt: int = 1,
     job_id: str | None = None,
-    local_index: LocalIndex | None = None,
     s3: S3Index | None = None,
     spec_uri: str | None = None,
     use_git: bool = True,
@@ -505,7 +504,7 @@ def submit_spec(
         s3_prefix=entry.s3_prefix or default_s3_prefix(settings, entry.name),
         spec_uri=spec_uri,
     )
-    (local_index or LocalIndex()).record(index_entry)
+    LocalIndex().record(index_entry)
     if s3 is not None:
         try:
             s3.put_index(index_entry)

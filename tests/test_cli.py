@@ -297,7 +297,7 @@ def test_use_shared_is_an_override_of_the_spec_and_only_when_it_is_passed(
 
     monkeypatch.setattr("gpuc.control.cli.submit_file", capture)
     monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
-    monkeypatch.setattr("gpuc.control.cli.queue_placement", lambda *a, **k: placement_unknown())
+    monkeypatch.setattr("gpuc.control.cli.placement_after", lambda *a, **k: placement_unknown())
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
