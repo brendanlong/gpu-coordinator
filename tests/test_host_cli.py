@@ -22,7 +22,7 @@ def test_enqueue_from_a_file(
 ) -> None:
     spec_path = tmp_path / "job.json"
     spec_path.write_text(json.dumps({"name": "demo", "command": "true", "gpus": 0}))
-    code, payload = run(capsys, "enqueue", str(spec_path), "--no-dispatch")
+    code, payload = run(capsys, "enqueue", str(spec_path))
     assert code == 0
     assert isinstance(payload, dict)
     job_id = payload["job_id"]
@@ -52,19 +52,10 @@ def test_enqueue_from_stdin(
     monkeypatch.setattr(
         "sys.stdin", __import__("io").StringIO(json.dumps({"command": "true", "gpus": 0}))
     )
-    code, payload = run(capsys, "enqueue", "-", "--no-dispatch")
+    code, payload = run(capsys, "enqueue", "-")
     assert code == 0
     assert isinstance(payload, dict)
     assert jobs.read_state(payload["job_id"]).status == "queued"
-
-
-def test_config_prints_what_the_host_holds(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    code, payload = run(capsys, "config")
-    assert code == 0
-    assert isinstance(payload, dict)
-    assert (payload["host"], payload["gpus"]) == ("test-host", list(FAKE_GPUS))
 
 
 def test_config_merge_replaces_the_keys_it_is_given_and_no_others(
@@ -126,11 +117,8 @@ def test_config_merge_on_a_host_with_no_config_writes_one(
     assert jobs.read_config().host == "fresh"
 
 
-def test_list_and_status(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_status(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     job_id = queue.enqueue(make_spec(name="n", priority=12))
-    _, listed = run(capsys, "list")
-    assert listed == [{"priority": 12, "job_id": job_id, "name": "n"}]
-
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
     assert status["host"] == "test-host"
@@ -152,7 +140,7 @@ def test_cancel_and_reorder(gpuc_home: Path, capsys: pytest.CaptureFixture[str])
     first = queue.enqueue(make_spec(priority=50))
     second = queue.enqueue(make_spec(priority=50))
     code, payload = run(capsys, "reorder", second, "3")
-    assert code == 0 and isinstance(payload, dict) and payload["reordered"]
+    assert code == 0 and payload == {"job_id": second, "status": "queued", "priority": 3}
     assert [e.job_id for e in queue.list_queued()] == [second, first]
 
     code, payload = run(capsys, "cancel", first)
@@ -242,10 +230,13 @@ def test_resume_clears_the_pause(
     assert not paths.paused_file().exists()
 
 
-def test_dispatch_once_is_routed_to_the_dispatcher(gpuc_home: Path) -> None:
-    job_id = queue.enqueue(make_spec(gpus=0, command="true"))
-    assert cli.main(["dispatch", "--once", "--interval", "0.1"]) == 0
-    assert jobs.read_state(job_id).status in ("running", "succeeded")
+def test_dispatch_is_routed_to_the_dispatcher(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran: list[bool] = []
+    monkeypatch.setattr(dispatcher.Dispatcher, "run", lambda self, lock: ran.append(True) or 0)
+    assert cli.main(["dispatch"]) == 0
+    assert ran
 
 
 def test_health_is_routed_to_health(

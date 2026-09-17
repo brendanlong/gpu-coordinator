@@ -1456,10 +1456,9 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
     moved = "20260101-000000-aaaaaa"
 
     class Moved:
-        def host_cli(self, args: str, *, check: bool = True) -> object:
-            return type("Result", (), {"returncode": 0})()
-
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": moved, "status": "queued", "priority": 10}
             return {
                 "host": "local",
                 "gpus": [GPU],
@@ -1579,10 +1578,9 @@ def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     from gpuc.control.s3index import S3Index
 
     class Moved:
-        def host_cli(self, args: str, *, check: bool = True) -> object:
-            return type("Result", (), {"returncode": 0})()
-
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
             raise RemoteError("local", "status", "host is busy")
 
     main(["host", "add", "local", "--gpus", GPU])
@@ -1609,10 +1607,9 @@ def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Moved:
-        def host_cli(self, args: str, *, check: bool = True) -> object:
-            return type("Result", (), {"returncode": 0})()
-
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+            if args.startswith("reorder"):
+                return {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
             raise RemoteError("local", "status", "host is busy")
 
     main(["host", "add", "local", "--gpus", GPU])

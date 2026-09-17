@@ -170,7 +170,7 @@ def test_progress_command_records_a_percentage(gpuc_home: Path) -> None:
     assert runner.run_job(job_id, deps()) == 0
     state = jobs.read_state(job_id)
     assert state.progress_pct == 25.0
-    assert state.progress_at and state.progress_error is None
+    assert state.progress_error is None
     # The eta is cleared when the job ends: it is only a live job's business,
     # and a surviving one reads as a promise the job is still going.
     assert state.eta is None

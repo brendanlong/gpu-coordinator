@@ -371,10 +371,6 @@ def test_runner_uses_the_s3_prefix_for_log_and_state(
     assert f"s3://b/gpuc/h/jobs/{job_id}/state.json" in destinations
 
 
-def test_runner_main_requires_a_job_id(gpuc_home: Path) -> None:
-    assert runner.main([]) == 2
-
-
 def test_window_needs_a_full_window_before_it_fires() -> None:
     window = runner._Window(window_s=10.0)
     window.add(0.0, 1.0)

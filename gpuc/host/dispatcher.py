@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +25,7 @@ from pathlib import Path
 from gpuc.host import baseline, cleanup, gpus, jobs, paths, queue, scope, sync, terminate
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.runner import (
+    KILL_GRACE_S,
     boot_id,
     cmdline,
     is_gpuc_process,
@@ -38,7 +39,6 @@ from gpuc.host.terminate import TerminateCall
 HEARTBEAT_INTERVAL_S = 5.0
 HEARTBEAT_STALE_S = 30.0
 LOOP_INTERVAL_S = 2.0
-KILL_GRACE_S = 15.0
 TERMINATE_RETRY_S = 600.0
 MAX_CONSECUTIVE_FAILURES = 20
 RETENTION_INTERVAL_S = 3600.0
@@ -87,44 +87,22 @@ class LockBody:
 
     @staticmethod
     def parse(text: str) -> LockBody:
-        text = text.strip()
-        if not text:
-            return LockBody()
         try:
             document = json.loads(text)
         except json.JSONDecodeError:
             return LockBody()
         if not isinstance(document, dict):
             return LockBody()
+        # Tolerant on purpose: this file is written by whichever build of gpuc
+        # last took the lock, and a pid we cannot read means "no known holder"
+        # -- which the caller already handles -- not a crash on the way to
+        # taking over.
         return LockBody(
-            pid=_maybe_int(document.get("pid")),
-            pgid=_maybe_int(document.get("pgid")),
-            starttime=_maybe_str(document.get("starttime")),
-            boot_id=_maybe_str(document.get("boot_id")),
+            pid=jobs.as_opt_int(document, "pid"),
+            pgid=jobs.as_opt_int(document, "pgid"),
+            starttime=jobs.as_opt_str(document, "starttime") or None,
+            boot_id=jobs.as_opt_str(document, "boot_id") or None,
         )
-
-
-def _maybe_int(value: object) -> int | None:
-    """A pid from whatever the lock file holds, or None.
-
-    Tolerant on purpose: this file is written by whichever build of gpuc last
-    took the lock, and a pid we cannot read means "no known holder" -- which
-    the caller already handles -- not a crash on the way to taking over.
-    """
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float | str):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _maybe_str(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
 
 
 def heartbeat_age(now: Callable[[], float] = time.time) -> float | None:
@@ -328,22 +306,24 @@ def _child_env(package_root: Path) -> dict[str, str]:
     return config.apply_env(env)
 
 
-def default_spawn_runner(job_id: str) -> subprocess.Popen[bytes]:
+def _spawn_host_process(*args: str) -> subprocess.Popen[bytes]:
+    """`python -m gpuc.host <args>` in its own session, logging to the dispatcher log."""
     package_root = Path(__file__).resolve().parents[2]
-    env = _child_env(package_root)
-    log = paths.dispatcher_log().open("ab", buffering=0)
-    try:
+    paths.ensure_layout()
+    with paths.dispatcher_log().open("ab", buffering=0) as log:
         return subprocess.Popen(
-            [sys.executable, "-m", "gpuc.host", "run", job_id],
+            [sys.executable, "-m", "gpuc.host", *args],
             cwd=str(package_root),
-            env=env,
+            env=_child_env(package_root),
             stdout=log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-    finally:
-        log.close()
+
+
+def default_spawn_runner(job_id: str) -> subprocess.Popen[bytes]:
+    return _spawn_host_process("run", job_id)
 
 
 def spawn_detached_dispatcher() -> int:
@@ -352,20 +332,7 @@ def spawn_detached_dispatcher() -> int:
     Always safe to call: a second dispatcher exits silently when the incumbent
     heartbeat is fresh, so enqueue can fire this unconditionally.
     """
-    package_root = Path(__file__).resolve().parents[2]
-    env = _child_env(package_root)
-    paths.ensure_layout()
-    with paths.dispatcher_log().open("ab", buffering=0) as log:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "gpuc.host", "dispatch"],
-            cwd=str(package_root),
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    return proc.pid
+    return _spawn_host_process("dispatch").pid
 
 
 @dataclass
@@ -914,7 +881,7 @@ class Dispatcher:
                 continue
             try:
                 spec = jobs.read_spec(job_id)
-            except RuntimeError as exc:
+            except (RuntimeError, ValueError) as exc:
                 self.log(f"job {job_id} has an unreadable spec ({exc}); dropping from queue")
                 entry.marker.unlink(missing_ok=True)
                 jobs.update_state(
@@ -1051,7 +1018,7 @@ class Dispatcher:
                 continue
             try:
                 spec = jobs.read_spec(waiting.job_id)
-            except (RuntimeError, OSError):
+            except (RuntimeError, ValueError):
                 continue  # `launch_ready` is what drops an unreadable spec
             borrowing = self.config.may_borrow(spec)
             take = pool[: spec.gpus]
@@ -1088,7 +1055,7 @@ class Dispatcher:
                 continue
             try:
                 spec = jobs.read_spec(job_id)
-            except (RuntimeError, OSError):
+            except (RuntimeError, ValueError):
                 continue
             state = self._state_or_empty(job_id)
             if not spec.auto_preempt or state.status != "running":
@@ -1306,7 +1273,7 @@ class Dispatcher:
         for job_id in jobs.list_job_ids():
             try:
                 state = jobs.read_state(job_id)
-            except (RuntimeError, OSError):
+            except RuntimeError:
                 continue
             if state.status == "running":
                 # Still being written to; the runner owns those files. Every
@@ -1499,25 +1466,8 @@ class Dispatcher:
         return True
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(prog="gpuc.host dispatch")
-    parser.add_argument("--once", action="store_true", help="run a single loop iteration")
-    parser.add_argument("--interval", type=float, default=LOOP_INTERVAL_S)
-    args = parser.parse_args(list(argv) if argv is not None else None)
-
-    paths.ensure_layout()
+def main(_: object = None) -> int:
     lock = DispatcherLock()
     if not lock.acquire():
         return 0
-    dispatcher = Dispatcher(deps=DispatcherDeps(interval_s=args.interval))
-    if args.once:
-        lock.start_heartbeat()
-        try:
-            dispatcher.adopt_orphans()
-            dispatcher.run_once()
-        finally:
-            lock.release()
-        return 0
-    return dispatcher.run(lock)
+    return Dispatcher().run(lock)

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from gpuc.host import cleanup, dispatcher, gpus, health, jobs, paths, queue, runner
-from gpuc.host.jobs import JobSpec
+from gpuc.host.jobs import JobSpec, JobState
 
 
 def _read_json_object(source: str, what: str) -> dict[str, Any]:
@@ -30,13 +30,13 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     document = _read_json_object(args.spec, "spec")
     spec = JobSpec.from_dict(document)
     queue.enqueue(spec)
-    pid = 0 if args.no_dispatch else dispatcher.spawn_detached_dispatcher()
+    pid = dispatcher.spawn_detached_dispatcher()
     print(json.dumps({"job_id": spec.job_id, "dispatcher_pid": pid}))
     return 0
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    """Print this host's config.json, or merge a patch into it first.
+    """Merge a patch into this host's config.json and print the result.
 
     The host owns its config, so the control side never writes the file
     itself: `gpuc host set` and `gpuc host bootstrap` send the keys they
@@ -45,37 +45,23 @@ def cmd_config(args: argparse.Namespace) -> int:
     The patch is a file rather than an argument because `env` may hold a token,
     and argv is readable by every other user of a shared box.
     """
-    if args.merge is not None:
-        document = jobs.merge_config(_read_json_object(args.merge, "a config patch"))
-    else:
-        document = jobs.read_config().to_dict()
+    document = jobs.merge_config(_read_json_object(args.merge, "a config patch"))
     print(json.dumps(document, indent=2, sort_keys=True))
     return 0
 
 
-def cmd_list(_: argparse.Namespace) -> int:
-    print(
-        json.dumps(
-            [
-                {"priority": e.priority, "job_id": e.job_id, "name": _name(e.job_id)}
-                for e in queue.list_queued()
-            ],
-            indent=2,
-        )
-    )
-    return 0
+def _state_or_none(job_id: str) -> JobState | None:
+    try:
+        return jobs.read_state(job_id)
+    except RuntimeError:
+        return None
 
 
 def _spec(job_id: str) -> JobSpec | None:
     try:
         return jobs.read_spec(job_id)
-    except (RuntimeError, FileNotFoundError, ValueError):
+    except (RuntimeError, ValueError):
         return None
-
-
-def _name(job_id: str) -> str:
-    spec = _spec(job_id)
-    return spec.name if spec else ""
 
 
 def _resolve(entries: list[str]) -> tuple[list[str], list[str]]:
@@ -168,7 +154,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         # Whether this job may be dispatched to a shared card, which is half of
         # why a queued job asking for more cards than the host owns is waiting
         # rather than already failed.
-        entry["use_shared"] = spec.use_shared if spec else False
+        entry["use_shared"] = spec.use_shared if spec else None
         # Where the results went, for anything that wants to link to them. The
         # W&B keys are the three that name a run; the job's env is otherwise
         # its own business and never leaves the host.
@@ -254,9 +240,20 @@ def cmd_preempt(args: argparse.Namespace) -> int:
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
-    moved = queue.reorder(args.job_id, args.priority)
-    print(json.dumps({"job_id": args.job_id, "reordered": moved}))
-    return 0 if moved else 1
+    """`{"job_id", "status", "priority"}`, or `{"job_id", "error"}` and exit 1
+    for a job that is not queued, like `preempt` and `estimate` answer."""
+    if not queue.reorder(args.job_id, args.priority):
+        state = _state_or_none(args.job_id)
+        why = (
+            f"job {args.job_id} is not queued (status {state.status}); only a queued job "
+            f"can be reordered"
+            if state
+            else f"no job {args.job_id} on this host"
+        )
+        print(json.dumps({"job_id": args.job_id, "error": why}))
+        return 1
+    print(json.dumps({"job_id": args.job_id, "status": "queued", "priority": args.priority}))
+    return 0
 
 
 def _estimate_error(job_id: str, minutes: float | None) -> str | None:
@@ -399,7 +396,7 @@ def cmd_purge(args: argparse.Namespace) -> int:
 
 def cmd_resume(_: argparse.Namespace) -> int:
     paths.paused_file().unlink(missing_ok=True)
-    dispatcher.spawn_detached_dispatcher()
+    print(json.dumps({"paused": False, "dispatcher_pid": dispatcher.spawn_detached_dispatcher()}))
     return 0
 
 
@@ -409,14 +406,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     enqueue = sub.add_parser("enqueue", help="enqueue a JSON JobSpec and start the dispatcher")
     enqueue.add_argument("spec", help="path to a JSON spec, or - for stdin")
-    enqueue.add_argument("--no-dispatch", action="store_true")
     enqueue.set_defaults(func=cmd_enqueue)
 
-    sub.add_parser("list", help="list queued jobs").set_defaults(func=cmd_list)
-
-    config = sub.add_parser("config", help="print this host's config.json")
+    config = sub.add_parser("config", help="merge a patch into this host's config.json")
     config.add_argument(
         "--merge",
+        required=True,
         metavar="PATH",
         help="a JSON object (or - for stdin) whose keys replace those in config.json "
         "before it is printed; `env` is replaced wholesale, never merged",
@@ -498,20 +493,16 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_resume
     )
 
-    # Listed for `--help` only; main() hands these their own argv before parsing.
-    sub.add_parser("dispatch", help="run the dispatcher loop", add_help=False)
-    sub.add_parser("health", help="run host health checks", add_help=False)
+    sub.add_parser("dispatch", help="run the dispatcher loop").set_defaults(func=dispatcher.main)
+
+    health_cmd = sub.add_parser("health", help="run host health checks")
+    health.add_arguments(health_cmd)
+    health_cmd.set_defaults(func=health.main)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = list(argv) if argv is not None else sys.argv[1:]
-    # These two own their own flags, so hand them the remaining argv verbatim.
-    if args and args[0] == "dispatch":
-        return dispatcher.main(args[1:])
-    if args and args[0] == "health":
-        return health.main(args[1:])
-    parsed = build_parser().parse_args(args)
+    parsed = build_parser().parse_args(list(argv) if argv is not None else sys.argv[1:])
     return int(parsed.func(parsed))
 
 

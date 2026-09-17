@@ -386,12 +386,7 @@ def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings
     check_priority(priority)
     entry, _ = find_job_host(job_id, named_registry(), host)
     session = open_session(entry, settings)
-    result = session.host_cli(f"reorder {shlex.quote(job_id)} {priority}", check=False)
-    if result.returncode != 0:
-        raise CliError(
-            f"job {job_id} is not in host {entry.name}'s queue, so its priority cannot "
-            f"change (a running or finished job cannot be reordered)."
-        )
+    host_answer(session, entry, f"reorder {shlex.quote(job_id)} {priority}", job_id, "reorder")
     # The mirror, for the same reason `estimate` updates it: `requeue` submits
     # what S3 holds, so a reorder left out of it would hand the re-run back at
     # the priority the job was first submitted with.

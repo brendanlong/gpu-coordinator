@@ -385,11 +385,9 @@ class JobState:
     runner_boot_id: str | None = None
     runner_starttime: str | None = None
     util_recent: list[float | None] = field(default_factory=list)
-    util_sampled_at: str | None = None
     progress_pct: float | None = None
     """The last percentage the spec's `progress_command` reported, 0-100. Null
     on a job that has no progress command, or has not answered yet."""
-    progress_at: str | None = None
     progress_error: str | None = None
     """Why the last progress poll produced nothing. Kept because the alternative
     is a job that silently never estimates and nobody knowing the command is
@@ -475,9 +473,7 @@ class JobState:
             runner_boot_id=as_opt_str(fields, "runner_boot_id"),
             runner_starttime=as_opt_str(fields, "runner_starttime"),
             util_recent=as_opt_float_list(fields, "util_recent"),
-            util_sampled_at=as_opt_str(fields, "util_sampled_at"),
             progress_pct=as_opt_float(fields, "progress_pct"),
-            progress_at=as_opt_str(fields, "progress_at"),
             progress_error=as_opt_str(fields, "progress_error"),
             eta=as_opt_str(fields, "eta"),
             sync_error=as_opt_str(fields, "sync_error"),

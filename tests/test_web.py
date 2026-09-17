@@ -443,7 +443,7 @@ def test_preempt_is_the_preempt_command(logged_in: Client, stub: StubSession) ->
 def test_reorder_is_the_reorder_command_and_checks_the_range(
     logged_in: Client, stub: StubSession
 ) -> None:
-    stub.answers.append({"returncode": 0})
+    stub.answers.append({"job_id": RUNNING_JOB, "status": "queued", "priority": 7})
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 7}
     )
@@ -460,12 +460,13 @@ def test_reorder_is_the_reorder_command_and_checks_the_range(
 
 
 def test_a_refused_reorder_is_the_clis_refusal(logged_in: Client, stub: StubSession) -> None:
-    stub.answers.append({"returncode": 1})
+    stub.answers.append({"job_id": RUNNING_JOB, "error": "only a queued job can be reordered"})
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 7}
     )
     assert status == 500
-    assert "cannot be reordered" in document["error"] and document["exit_code"] == 1
+    assert "only a queued job can be reordered" in document["error"]
+    assert document["exit_code"] == 1
 
 
 def test_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:

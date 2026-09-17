@@ -23,7 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from gpuc.host import baseline, jobs, paths
+from gpuc.host import baseline, jobs, paths, queue
 from gpuc.host.jobs import JobSpec, Output
 
 MIN_AGE_S = 10.0
@@ -95,18 +95,43 @@ def _fail(result: CommandResult) -> None:
     )
 
 
-def aws_binary(env: Env = None) -> str | None:
-    bundled = Path.home() / ".local/aws-cli/v2/current/bin/aws"
+BUNDLED = {"aws": ".local/aws-cli/v2/current/bin/aws", "hf": ".local/bin/hf"}
+"""Where bootstrap installs each upload tool, tried before PATH."""
+
+
+def _find(name: str, env: Env) -> str | None:
+    bundled = Path.home() / BUNDLED[name]
     if bundled.exists():
         return str(bundled)
-    return shutil.which("aws", path=None if env is None else env.get("PATH"))
+    return shutil.which(name, path=None if env is None else env.get("PATH"))
+
+
+def aws_binary(env: Env = None) -> str | None:
+    return _find("aws", env)
 
 
 def hf_binary(env: Env = None) -> str | None:
-    bundled = Path.home() / ".local/bin/hf"
-    if bundled.exists():
-        return str(bundled)
-    return shutil.which("hf", path=None if env is None else env.get("PATH"))
+    return _find("hf", env)
+
+
+def _binary(name: str, env: Env, purpose: str) -> str:
+    found = (aws_binary if name == "aws" else hf_binary)(env)
+    if found is None:
+        raise SyncError(
+            f"`{name}` CLI not found (looked in ~/{BUNDLED[name]} and PATH) on host "
+            f"{_host_label()}; cannot upload {purpose}"
+        )
+    return found
+
+
+def _upload(
+    argv: list[str], local: Path, runner: CommandRunner, timeout: float | None, env: Env
+) -> None:
+    if not local.exists():
+        raise MissingOutput(f"output path does not exist: {local}")
+    result = runner(argv, timeout, env)
+    if result.returncode != 0:
+        _fail(result)
 
 
 def recently_modified(root: Path, min_age_s: float = MIN_AGE_S) -> list[str]:
@@ -157,20 +182,11 @@ def sync_dir_to_s3(
     env: Env = None,
     exclude: Sequence[str] = (),
 ) -> None:
-    aws = aws_binary(env)
-    if aws is None:
-        raise SyncError(
-            "`aws` CLI not found (looked in ~/.local/aws-cli/v2/current/bin/aws and PATH) "
-            f"on host {_host_label()}; cannot upload {local} to {dest}"
-        )
-    if not local.exists():
-        raise MissingOutput(f"output path does not exist: {local}")
+    aws = _binary("aws", env, f"{local} to {dest}")
     argv = [aws, "s3", "sync", str(local), dest.rstrip("/"), "--only-show-errors"]
     argv += _named_excludes("--exclude", exclude)
     argv += exclude_args("--exclude", local, min_age_s)
-    result = runner(argv, timeout, env)
-    if result.returncode != 0:
-        _fail(result)
+    _upload(argv, local, runner, timeout, env)
 
 
 def copy_file_to_s3(
@@ -181,14 +197,8 @@ def copy_file_to_s3(
     timeout: float | None = 300.0,
     env: Env = None,
 ) -> None:
-    aws = aws_binary(env)
-    if aws is None:
-        raise SyncError(
-            f"`aws` CLI not found on host {_host_label()}; cannot upload {local} to {dest}"
-        )
-    result = runner([aws, "s3", "cp", str(local), dest, "--only-show-errors"], timeout, env)
-    if result.returncode != 0:
-        _fail(result)
+    aws = _binary("aws", env, f"{local} to {dest}")
+    _upload([aws, "s3", "cp", str(local), dest, "--only-show-errors"], local, runner, timeout, env)
 
 
 def upload_dir_to_hf(
@@ -202,20 +212,11 @@ def upload_dir_to_hf(
     env: Env = None,
     exclude: Sequence[str] = (),
 ) -> None:
-    hf = hf_binary(env)
-    if hf is None:
-        raise SyncError(
-            "`hf` CLI not found (looked in ~/.local/bin/hf and PATH) on host "
-            f"{_host_label()}; cannot upload {local} to {repo}:{path_in_repo}"
-        )
-    if not local.exists():
-        raise MissingOutput(f"output path does not exist: {local}")
+    hf = _binary("hf", env, f"{local} to {repo}:{path_in_repo}")
     argv = [hf, "upload", repo, str(local), path_in_repo]
     argv += _named_excludes("--exclude", exclude)
     argv += exclude_args("--exclude", local, min_age_s)
-    result = runner(argv, timeout, env)
-    if result.returncode != 0:
-        _fail(result)
+    _upload(argv, local, runner, timeout, env)
 
 
 def _named_excludes(flag: str, names: Sequence[str]) -> list[str]:
@@ -396,11 +397,7 @@ class SyncLoop:
         -- actually succeeded."""
 
     def _note(self, message: str) -> None:
-        try:
-            with paths.log_file(self._spec.job_id).open("a") as handle:
-                handle.write(f">>> sync: {message}\n")
-        except OSError:
-            pass
+        queue.note(self._spec.job_id, f"sync: {message}")
 
     def _record_error(self, message: str) -> None:
         self.last_error = message

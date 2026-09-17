@@ -6,6 +6,7 @@ about (a host whose network or driver is dead) hangs rather than errors.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -247,15 +248,14 @@ def run_checks(
     }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(prog="gpuc.host health")
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--download-url", default=DEFAULT_DOWNLOAD_URL)
     parser.add_argument("--min-mbps", type=float, default=DEFAULT_MIN_MBPS)
     parser.add_argument("--min-free-gb", type=float, default=DEFAULT_MIN_FREE_GB)
     parser.add_argument("--download-timeout", type=float, default=DEFAULT_DOWNLOAD_TIMEOUT_S)
-    args = parser.parse_args(list(argv) if argv is not None else None)
+
+
+def main(args: argparse.Namespace) -> int:
     report = run_checks(
         url=args.download_url,
         min_mbps=args.min_mbps,
