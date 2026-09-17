@@ -30,6 +30,7 @@ from gpuc.host.runner import (
     boot_id,
     cmdline,
     is_gpuc_process,
+    live_runner_pids,
     pid_alive,
     process_group_alive,
     recorded_process_alive,
@@ -554,6 +555,7 @@ class Dispatcher:
     _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
     _last_reclaim_at: float | None = None
+    _last_submit_sweep_at: float | None = None
     _kill_sent: dict[str, float] = field(default_factory=dict)
     _kill_escalated: set[str] = field(default_factory=set)
     _pause_drain_pending: bool = False
@@ -592,6 +594,22 @@ class Dispatcher:
     # -- startup ---------------------------------------------------------
     def adopt_orphans(self) -> None:
         """Reconcile jobs left `running` by a dispatcher that died."""
+        # Walked at most once, and only for a job whose state names no live
+        # runner: `launch_ready` writes `running` before it has a process to
+        # name and the pid only after the spawn, so a dispatcher killed between
+        # the two -- every first takeover by a newer build, and both SIGKILL
+        # paths -- leaves a live runner nothing points at. Failing that job
+        # would lose it *and* put its cards back in the free pool underneath a
+        # process still training on them, with no pgid recorded to kill it by:
+        # the runner does not publish the job's own group until later.
+        runners: dict[str, int] | None = None
+
+        def live_runner(job_id: str) -> int | None:
+            nonlocal runners
+            if runners is None:
+                runners = live_runner_pids()
+            return runners.get(job_id)
+
         for job_id in jobs.list_job_ids():
             try:
                 state = jobs.read_state(job_id)
@@ -605,28 +623,34 @@ class Dispatcher:
                 state.runner_pid, state.runner_boot_id, state.runner_starttime
             )
             if state.finished:
-                if queue.is_preempted(job_id) and alive:
+                if queue.is_preempted(job_id):
                     # Finished, preempted, and its runner is *still there*: it
                     # is in its final sync, writing to the workdir and to
                     # state.json. Queueing the job now would launch the next
                     # attempt into that same workdir. Adopt the runner instead
                     # and let `reap` do it when the runner is really gone.
-                    self.running[job_id] = _Running(
-                        job_id, state.runner_pid or 0, self._held_gpus(job_id, state)
-                    )
-                    self.log(f"job {job_id} was preempted and is still syncing; waiting for it")
-                    continue
+                    syncing = state.runner_pid if alive else live_runner(job_id)
+                    if syncing is not None:
+                        self.running[job_id] = _Running(
+                            job_id, syncing, self._held_gpus(job_id, state)
+                        )
+                        self.log(f"job {job_id} was preempted and is still syncing; waiting for it")
+                        continue
                 # Otherwise its runner is gone and nothing was left to put it
                 # back: that is this dispatcher's job now.
                 self.requeue_if_preempted(job_id)
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
-            if alive:
-                self.running[job_id] = _Running(
-                    job_id, state.runner_pid or 0, self._held_gpus(job_id, state)
-                )
-                self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
+            runner_pid = state.runner_pid if alive else live_runner(job_id)
+            if runner_pid is not None:
+                self.running[job_id] = _Running(job_id, runner_pid, self._held_gpus(job_id, state))
+                # Not written back to the state: the runner records its own
+                # identity a moment later (`_run_phases`), and a read-modify-
+                # write from here would race the one it makes in between --
+                # `_resolve_assigned`, whose resolved UUIDs would be the loss.
+                unrecorded = "" if alive else ", which its dispatcher died before recording"
+                self.log(f"adopted running job {job_id} (runner pid {runner_pid}{unrecorded})")
             else:
                 self._mark_runner_died(job_id)
                 # A job stopped by `gpuc preempt` whose runner then died still
@@ -979,6 +1003,34 @@ class Dispatcher:
             )
         return f"needs {spec.gpus} GPUs, {have}"
 
+    def _still_queued(self, entry: queue.QueueEntry) -> bool:
+        """Whether this marker still names a job that is waiting to run.
+
+        The marker says a job was submitted; the state says what has become of
+        it since, and only the state is allowed to start a runner. Without this
+        the queue is dispatched on the marker alone, so anything that leaves one
+        behind -- `leave_queue` interrupted between its two writes, a purge
+        interrupted before `remove_job_dir` got to the marker -- starts a second
+        runner in the workdir the first one is using, or a job with no spec.
+
+        Dropping the marker is the repair: the state has already said where the
+        job went, and a marker disagreeing with it is the stale half.
+        """
+        try:
+            status = jobs.read_state(entry.job_id).status
+        except RuntimeError:
+            self.log(f"job {entry.job_id} is queued but has no readable state; dropping it")
+            entry.marker.unlink(missing_ok=True)
+            return False
+        if status != "queued":
+            self.log(
+                f"job {entry.job_id} is {status} but was still in the queue; dropping its "
+                f"marker rather than dispatching it a second time"
+            )
+            entry.marker.unlink(missing_ok=True)
+            return False
+        return True
+
     def launch_ready(self) -> None:
         """Dispatch in queue order, and hold cards for a job that does not fit.
 
@@ -1022,26 +1074,25 @@ class Dispatcher:
         held_shared = 0
         for entry in queue.list_queued():
             job_id = entry.job_id
+            if not self._still_queued(entry):
+                continue
             if queue.is_cancelled(job_id):
-                entry.marker.unlink(missing_ok=True)
-                jobs.update_state(
-                    job_id, status="cancelled", reason="cancelled", ended_at=jobs.utc_now()
+                queue.leave_queue(
+                    entry, status="cancelled", reason="cancelled", ended_at=jobs.utc_now()
                 )
                 continue
             try:
                 spec = jobs.read_spec(job_id)
             except (RuntimeError, ValueError) as exc:
                 self.log(f"job {job_id} has an unreadable spec ({exc}); dropping from queue")
-                entry.marker.unlink(missing_ok=True)
-                jobs.update_state(
-                    job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
+                queue.leave_queue(
+                    entry, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
                 )
                 continue
             too_big = self._capacity_failure(spec)
             if too_big is not None:
-                entry.marker.unlink(missing_ok=True)
-                jobs.update_state(
-                    job_id,
+                queue.leave_queue(
+                    entry,
                     status="failed",
                     reason=too_big,
                     exit_code=1,
@@ -1067,9 +1118,8 @@ class Dispatcher:
             assigned = [*owned_part, *shared_part]
             free = free[len(owned_part) :]
             borrowable = borrowable[len(shared_part) :] if borrowable is not None else None
-            entry.marker.unlink(missing_ok=True)
-            jobs.update_state(
-                job_id,
+            queue.leave_queue(
+                entry,
                 status="running",
                 gpus=assigned,
                 phase="setup",
@@ -1501,6 +1551,35 @@ class Dispatcher:
         )
 
     # -- retention -------------------------------------------------------
+    def sweep_abandoned_submits(self) -> None:
+        """Resolve jobs whose `gpuc submit` died before it committed them.
+
+        The client owns everything up to the queue marker, and a submit that
+        never wrote one asked this host for nothing. So this does not put the
+        job in the queue -- it records that the submit did not finish, which is
+        the only thing anybody can act on, and lets the ordinary retention
+        horizons take the job dir afterwards like any other finished job.
+        """
+        now = self.deps.monotonic()
+        if (
+            self._last_submit_sweep_at is not None
+            and now - self._last_submit_sweep_at < RETENTION_INTERVAL_S
+        ):
+            return
+        self._last_submit_sweep_at = now
+        for job_id in cleanup.abandoned_submits():
+            jobs.update_state(
+                job_id,
+                status="failed",
+                reason="incomplete-submit",
+                exit_code=1,
+                ended_at=jobs.utc_now(),
+            )
+            self.log(
+                f"job {job_id} was never submitted: its spec and state were written but its "
+                f"queue marker never was, so nothing here was asked to run it"
+            )
+
     def maybe_reclaim(self) -> None:
         """Run the two retention horizons at startup, then at most once an hour.
 
@@ -1564,6 +1643,7 @@ class Dispatcher:
         self.launch_ready()
         self.preempt_for_waiting()
         self.maybe_reclaim()
+        self.sweep_abandoned_submits()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:

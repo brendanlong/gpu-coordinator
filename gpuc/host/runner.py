@@ -127,6 +127,60 @@ def is_gpuc_process(pid: int) -> bool:
     return "gpuc.host" in cmdline(pid)
 
 
+def cmdline_argv(pid: int) -> list[str]:
+    """`/proc/<pid>/cmdline` as the argv it actually is.
+
+    Not `cmdline().split()`: that joins the arguments with spaces, and splitting
+    them again tears any argument that contains one into several. The runner
+    starts a job as `bash -c <the whole script>`, so an argument full of words
+    is the ordinary case on this host, not a contrived one.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    if not raw:
+        return []
+    return [arg.decode("utf-8", "replace") for arg in raw.rstrip(b"\0").split(b"\0")]
+
+
+def runner_job_id(argv: Sequence[str]) -> str | None:
+    """The job a `python -m gpuc.host run <job_id>` argv belongs to, or None.
+
+    The other half of `dispatcher._spawn_host_process`, which builds that
+    command: one fact in two modules, so a test pins them together. A runner
+    this stopped recognising would be adopted by nobody.
+    """
+    if len(argv) >= 2 and argv[-2] == "run" and "gpuc.host" in argv:
+        return argv[-1]
+    return None
+
+
+def live_runner_pids() -> dict[str, int]:
+    """Every live `gpuc.host run <job_id>` on this host, by the job it runs.
+
+    The question a recorded pid cannot answer. `launch_ready` writes a job's
+    state `running` before there is a process to name, and the runner pid only
+    after the spawn, so a dispatcher that died between the two left a state
+    naming no runner at all -- while the runner it did start is still going.
+    /proc is the only remaining record of it.
+
+    One walk, because the caller has every job to ask about. A runner that has
+    already exited is not in it even before it is reaped: a defunct process has
+    an empty cmdline.
+    """
+    found: dict[str, int] = {}
+    try:
+        pids = sorted(int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit())
+    except OSError:
+        return found
+    for pid in pids:
+        job_id = runner_job_id(cmdline_argv(pid))
+        if job_id is not None:
+            found.setdefault(job_id, pid)
+    return found
+
+
 def recorded_process_alive(
     pid: int | None, recorded_boot_id: str | None = None, recorded_starttime: str | None = None
 ) -> bool:

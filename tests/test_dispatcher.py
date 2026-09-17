@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 from collections.abc import Callable
@@ -10,8 +11,8 @@ from typing import Any, cast
 
 import pytest
 
+from gpuc.host import cleanup, jobs, paths, queue, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
-from gpuc.host import jobs, paths, queue, sync, terminate
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig
@@ -570,6 +571,160 @@ def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
     assert jobs.read_state(job_id).reason == "runner-died"
+
+
+def test_a_marker_left_behind_does_not_launch_a_second_runner(gpuc_home: Path) -> None:
+    """`leave_queue` writes the state and then drops the marker, so a
+    dispatcher killed between the two leaves a marker for a job that is already
+    running. Dispatching on the marker alone starts a second runner in the
+    workdir the first one is using."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])  # the crash
+
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+
+    assert spawned == {}
+    assert queue.list_queued() == []
+
+
+def test_a_marker_whose_job_is_gone_is_dropped_rather_than_dispatched(gpuc_home: Path) -> None:
+    """A purge interrupted before `remove_job_dir` reached the marker."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    shutil.rmtree(paths.job_dir(job_id))
+
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+
+    assert spawned == {}
+    assert queue.list_queued() == []
+
+
+def test_a_submit_that_never_committed_is_not_run_and_does_not_stay_queued(
+    gpuc_home: Path,
+) -> None:
+    """`gpuc submit` writes the spec and state and *then* the queue marker, so
+    an ssh that dies between them leaves a job this host was never asked to
+    run. It must not be dispatched -- and it must not sit `queued` for ever
+    either, which is all anybody could see of it."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)  # the submit dies here
+    old = datetime.now(UTC).timestamp() - cleanup.INCOMING_STALE_S - 1
+    os.utime(paths.state_file(job_id), (old, old))
+
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+
+    assert spawned == {}
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "incomplete-submit")
+
+
+def test_a_submit_still_in_flight_is_not_swept(gpuc_home: Path) -> None:
+    """The gap between the two writes is two syscalls wide. A sweep that could
+    not tell it from an abandoned one would fail perfectly good submits."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+
+    assert jobs.read_state(job_id).status == "queued"
+
+
+def test_a_preempted_job_being_put_back_is_not_swept(gpuc_home: Path) -> None:
+    """`requeue_preempted` writes the queued state, then the marker, then drops
+    the preempt marker -- so mid-move it looks exactly like an abandoned
+    submit. The preempt marker is what says it is coming back."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    paths.preempt_file(job_id).touch()
+    old = datetime.now(UTC).timestamp() - cleanup.INCOMING_STALE_S - 1
+    os.utime(paths.state_file(job_id), (old, old))
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.sweep_abandoned_submits()
+
+    assert jobs.read_state(job_id).status == "queued"
+
+
+def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`launch_ready` writes `running` before it has a process to name. A
+    dispatcher killed between that write and the runner pid leaves a job that
+    reads as abandoned while its runner is training: failing it would lose the
+    job and hand the card it is on to whatever starts next."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], started_at=jobs.utc_now())
+    monkeypatch.setattr(host_dispatcher, "live_runner_pids", lambda: {job_id: os.getpid()})
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+
+    assert jobs.read_state(job_id).status == "running"
+    assert dispatcher.running[job_id].pid == os.getpid()
+    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
+
+
+def test_a_preempted_job_syncing_under_an_unrecorded_runner_is_not_queued_again(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same window on the way out: a runner signalled before it recorded
+    itself still writes its final state and then spends the whole output sync
+    alive. Queued on that evidence, attempt 2 would start in the workdir
+    attempt 1 is still uploading from."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    queue.enqueue(make_spec(gpus=2, priority=1))
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
+    queue.preempt(job_id)
+    jobs.update_state(job_id, status="failed", reason="preempted", ended_at=jobs.utc_now())
+    monkeypatch.setattr(host_dispatcher, "live_runner_pids", lambda: {job_id: os.getpid()})
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+
+    assert jobs.read_state(job_id).status == "failed"
+    assert queue.is_preempted(job_id)
+    assert job_id in dispatcher.running
+
+
+def test_a_running_job_with_no_runner_anywhere_still_fails(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    queue.remove_marker(job_id)
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
+    monkeypatch.setattr(host_dispatcher, "live_runner_pids", dict)
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+
+    assert jobs.read_state(job_id).reason == "runner-died"
+    assert dispatcher.free_gpus() == [FAKE_GPUS[0], FAKE_GPUS[1]]
+
+
+def test_the_runner_the_dispatcher_spawns_is_one_the_scan_recognises(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The command is built here and read back in `runner`: two modules, one
+    fact. A runner the spawner starts and the scan cannot name is adopted by
+    nobody, and nothing else would notice the two had drifted apart."""
+    job_id = "20250101-000000-abcdef"
+    captured: list[list[str]] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, argv: list[str], **_kwargs: object) -> None:
+            captured.append(argv)
+
+    monkeypatch.setattr(host_dispatcher.subprocess, "Popen", FakePopen)
+    host_dispatcher.default_spawn_runner(job_id)
+
+    assert procinfo.runner_job_id(captured[0]) == job_id
 
 
 def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path) -> None:

@@ -225,7 +225,8 @@ queue's lexical order, not submission order below one second.
   - The SIGTERM is polite only to a holder that has the handler
     (`_stop_on_sigterm`, which finishes the pass and releases the lock). The
     *first* takeover on any host is against a build without it, which dies
-    where it stands; `adopt_orphans` picks its jobs back up.
+    where it stands; `adopt_orphans` picks its jobs back up, including one
+    killed mid-launch (see Adoption at startup).
   - Before escalating to SIGKILL the lock is re-read and the holder's pid and
     start time must be unchanged. Two dispatchers start within seconds on every
     `gpuc submit` (the resync starts one, the enqueue another), so "somebody
@@ -246,6 +247,58 @@ queue's lexical order, not submission order below one second.
   walked past instead, and neither is failed -- `_capacity_failure` fails a
   job bigger than the configured host, shared cards included. Why the obvious
   rule (dispatch whatever fits) is wrong is [usage.md](usage.md#priority-is-not-advisory).
+- **A job is submitted when its queue marker exists, and not before.**
+  `enqueue` writes the spec, then the state, then the marker, so an interrupted
+  `gpuc submit` leaves a job dir this host was never asked to run. It is not
+  completed and not dispatched: the client owns everything up to the commit.
+  After an hour (`cleanup.INCOMING_STALE_S`, the same horizon `stale_incoming`
+  uses, and for the same reason -- a submit that is merely slow must not be
+  mistaken for one that died) the dispatcher records it `failed:
+  incomplete-submit`, so it neither runs nor sits `queued` for ever, and the
+  ordinary retention horizons take the dir afterwards. A job `requeue_preempted`
+  is putting back is in the same shape mid-move and is excluded: its preempt
+  marker says it is coming back, and `_finish_interrupted_requeue` completes it.
+- **`launch_ready` never dispatches on a marker alone** (`_still_queued`): the
+  marker says a job was submitted, the state says what has become of it since,
+  and only a state of `queued` starts a runner. A marker that disagrees is the
+  stale half and is dropped. This is what makes a leftover marker harmless --
+  from a `leave_queue` interrupted between its two writes, or a purge that did
+  not reach `remove_job_dir`'s marker cleanup -- instead of a second runner in
+  the workdir the first one is using.
+- **Writes that take a job out of the queue put the state first**
+  (`queue.leave_queue`, and `queue.cancel` the same way). The order is the
+  design, not a preference: interrupted this way the job is `running` with a
+  stale marker, which the rule above already handles; interrupted the other way
+  it is `queued` with no marker, which is *exactly* what an uncommitted submit
+  looks like. One shape, two opposite right answers, and nothing able to tell
+  them apart. Keeping the dispatcher's own interruptions out of that shape is
+  what lets an uncommitted submit be recognised at all.
+  - The general rule this is an instance of: **do not create an intermediate
+    state that is ambiguous with one another actor produces.** Where a record
+    cannot be made atomic with the thing it describes -- `state.runner_pid`
+    against an actual process -- ask the source instead of guessing from the
+    record (below).
+- **Adoption at startup** (`adopt_orphans`): every job whose `state.json` says
+  `running` is either taken over or failed `runner-died`, and the GPUs of a
+  failed one go straight back in the free pool -- so anything it left behind is
+  killed first (its `cgroup_unit`, then its `pgid`). "Still running" is the
+  recorded `runner_pid` *plus* the boot id and start time recorded with it: a
+  bare pid means nothing across a reboot and little after a rollover.
+  - A job that names no live runner is **not** judged on that alone.
+    `launch_ready` writes `running` before there is a process to name and the
+    pid only after the spawn, so a dispatcher killed in that window -- every
+    first takeover by a newer build, and both SIGKILL paths -- leaves a live
+    runner nothing points at. Failing it would lose the job *and* free the
+    cards underneath a process still training on them, with no pgid recorded to
+    kill. So /proc is walked once for every live `gpuc.host run <id>`
+    (`runner.live_runner_pids`) and those runners are adopted. The same
+    lookup answers the preempted-and-still-syncing case below, where the cost
+    of getting it wrong is attempt 2 starting in the workdir attempt 1 is
+    uploading from.
+  - What is found is deliberately *not* written back to `state.json`: the
+    runner records its own `runner_pid` moments later, and a read-modify-write
+    from the dispatcher would race the one `_resolve_assigned` makes in
+    between, whose resolved UUIDs would be the loss.
 - Cancel: `queue.cancel(jobid)` writes `jobs/<id>/cancel`. The **runner** owns
   the kill (see Runner); the dispatcher escalates only once `state.json`
   publishes a `cgroup_unit`, or a pgid that is not the runner's own -- during

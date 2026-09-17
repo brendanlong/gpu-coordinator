@@ -384,3 +384,77 @@ def test_every_way_the_stop_itself_can_end_the_attempt_comes_back(
     queue.preempt(job_id)
     stopped(job_id, reason=reason)
     assert queue.requeue_preempted(job_id) == 2
+
+
+def _status_when_marker_went(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records a job's status at the moment its queue marker is dropped.
+
+    The order of those two writes is the whole design: interrupted between
+    them, a job has to land in a shape distinguishable from a submit that never
+    committed. `running` (or `cancelled`) with a stale marker is; `queued` with
+    no marker is not, because that is exactly what an interrupted `gpuc submit`
+    leaves behind.
+    """
+    seen: list[str] = []
+    real = queue.remove_marker
+
+    def spy(job_id: str) -> bool:
+        seen.append(jobs.read_state(job_id).status)
+        return real(job_id)
+
+    monkeypatch.setattr(queue, "remove_marker", spy)
+    return seen
+
+
+def test_leave_queue_writes_the_state_before_it_drops_the_marker(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    entry = queue.list_queued()[0]
+    went = _status_when_marker_went(monkeypatch)
+
+    queue.leave_queue(entry, status="running")
+
+    assert went == ["running"]
+    assert queue.find_marker(job_id) is None
+
+
+def test_leave_queue_removes_a_marker_that_was_renamed_underneath_it(gpuc_home: Path) -> None:
+    """`launch_ready` holds the entries it listed at the top of the pass, and
+    `gpuc reorder` renames markers with no lock between them. Unlinking the
+    path that was listed removes nothing, and the marker left behind dispatches
+    a second runner into the workdir the first one is using."""
+    job_id = queue.enqueue(make_spec(priority=50))
+    entry = queue.list_queued()[0]
+    queue.reorder(job_id, 10)
+
+    queue.leave_queue(entry, status="running")
+
+    assert queue.list_queued() == []
+    assert jobs.read_state(job_id).status == "running"
+
+
+def test_cancelling_a_queued_job_writes_the_state_before_dropping_the_marker(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    went = _status_when_marker_went(monkeypatch)
+
+    assert queue.cancel(job_id) == "cancelled"
+
+    assert went == ["cancelled"]
+    assert queue.find_marker(job_id) is None
+
+
+def test_cancelling_a_job_that_is_already_being_dispatched_does_not_undo_it(
+    gpuc_home: Path,
+) -> None:
+    """The dispatcher published `running` first; writing `cancelled` over it
+    would leave a live runner behind a state that says the job is over. From
+    here the runner owns the kill, which is what `cancelling` means."""
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, status="running")
+
+    assert queue.cancel(job_id) == "cancelling"
+    assert jobs.read_state(job_id).status == "running"
+    assert queue.is_cancelled(job_id)

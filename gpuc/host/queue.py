@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import JobSpec, JobState
@@ -64,6 +65,32 @@ def find_marker(job_id: str) -> Path | None:
     return None
 
 
+def leave_queue(entry: QueueEntry, **state: Any) -> None:
+    """Take a job out of the queue and record what became of it.
+
+    The one place `launch_ready`'s four ways out are written -- dispatched,
+    cancelled, unreadable spec, too big for this host -- so a fifth cannot get
+    the two writes wrong.
+
+    **The state first, then the marker**, and the two orders are not
+    interchangeable. Interrupted between them this way, the job is `running`
+    (or `failed`) with a marker still naming it, and `launch_ready` checks a
+    job's status before it dispatches, so it drops that marker and moves on.
+    The other way round the job is `queued` with no marker -- which is exactly
+    what a `gpuc submit` killed mid-enqueue leaves behind, and that one must
+    never run. One state, two opposite right answers, and nothing able to tell
+    them apart: keeping the dispatcher's own interruptions out of that shape is
+    what makes an uncommitted submit unambiguous.
+
+    By job id, not by `entry.marker`: nothing holds a lock, `gpuc reorder`
+    renames markers, and `launch_ready` can spend a whole pass between listing
+    the queue and reaching a late entry. Unlinking the path that was listed
+    would remove nothing.
+    """
+    jobs.update_state(entry.job_id, **state)
+    remove_marker(entry.job_id)
+
+
 def remove_marker(job_id: str) -> bool:
     marker = find_marker(job_id)
     if marker is None:
@@ -102,12 +129,18 @@ def cancel(job_id: str) -> str:
     if not paths.job_dir(job_id).is_dir():
         raise FileNotFoundError(f"no such job: {job_id}")
     paths.cancel_file(job_id).touch()
-    was_queued = remove_marker(job_id)
     state = jobs.read_state(job_id)
     if state.finished:
+        remove_marker(job_id)
         return state.status
-    if was_queued or state.status == "queued":
+    if state.status == "queued":
+        # State before marker, like `leave_queue` and for the same reason -- and
+        # reading it before either write is what keeps a cancel that arrives
+        # while the job is being dispatched from writing `cancelled` over the
+        # `running` the dispatcher just published. A job already on its way out
+        # is `cancelling`: the runner owns the kill from there.
         jobs.update_state(job_id, status="cancelled", reason="cancelled", ended_at=jobs.utc_now())
+        remove_marker(job_id)
         return "cancelled"
     return "cancelling"
 
