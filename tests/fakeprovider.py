@@ -292,11 +292,5 @@ def fake_bootstrap(
         python="/root/.venv/bin/python", uv="/root/.local/bin/uv"
     ).model_copy(update={"bootstrapped_at": utc_now()})
     return updated, BootstrapResult(
-        host=entry.name,
-        uv="/root/.local/bin/uv",
-        python="/root/.venv/bin/python",
-        home="/root/.gpuc",
-        files=20,
-        health={"ok": True, "checks": []},
-        dispatcher_pid=4242,
+        host=entry.name, home="/root/.gpuc", files=20, dispatcher_pid=4242
     )

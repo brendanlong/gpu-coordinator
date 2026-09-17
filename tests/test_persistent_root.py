@@ -17,10 +17,10 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.bootstrap import BootstrapError, bootstrap_host, env_prefix, remote_path
+from gpuc.control.bootstrap import BootstrapError, bootstrap_host, remote_path
 from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_USAGE, main
 from gpuc.control.config import HostEntry, load_registry
-from gpuc.control.remote import host_command
+from gpuc.control.remote import env_prefix, host_command
 from gpuc.host import dispatcher, health, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig, JobState
 from tests.conftest import FAKE_GPUS, fake_smi, host_entry, make_spec, register_host
@@ -45,7 +45,7 @@ def test_no_persistent_root_changes_nothing() -> None:
     assert entry.remote_home == "$HOME/.gpuc"
     assert entry.env == {}
     assert remote_path(entry) == 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
-    assert env_prefix(entry) == ""
+    assert env_prefix(entry.env) == ""
 
 
 def test_a_persistent_root_moves_only_gpuc_home() -> None:
@@ -54,7 +54,7 @@ def test_a_persistent_root_moves_only_gpuc_home() -> None:
     # Not the caches, not uv, not the aws bundle: a root is for the state that
     # cannot be reinstalled, and /mnt is the slow disk.
     assert entry.env == {}
-    assert env_prefix(entry) == ""
+    assert env_prefix(entry.env) == ""
 
 
 def test_a_trailing_slash_does_not_double_up() -> None:

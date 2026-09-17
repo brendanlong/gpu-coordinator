@@ -26,6 +26,10 @@ from .base import (
     cuda_key,
 )
 
+LOG_READ_S = 10.0
+"""How long a log tail reads the SSE stream: it stays open after the backfill."""
+DEFAULT_POD_ENV = {"HF_HUB_ENABLE_HF_TRANSFER": "0"}
+"""hf_transfer is not installed in the image, and `hf` fails loudly when told to use it."""
 BASE_URL = "https://api.runpod.io/v2"
 # Cloudflare in front of api.runpod.io rejects the default urllib User-Agent with a 1010.
 USER_AGENT = user_agent()
@@ -56,7 +60,6 @@ class RunPodProvider(Provider):
         self,
         api_key: str | None = None,
         *,
-        base_url: str = BASE_URL,
         caps: Caps | None = None,
         timeout_s: float = 30.0,
     ) -> None:
@@ -64,7 +67,7 @@ class RunPodProvider(Provider):
         if not key:
             raise ProviderError("RUNPOD_API_KEY is not set")
         self._api_key = key
-        self._base_url = base_url.rstrip("/")
+        self._base_url = BASE_URL.rstrip("/")
         self.caps = caps or Caps()
         self._timeout_s = timeout_s
 
@@ -103,7 +106,7 @@ class RunPodProvider(Provider):
                 if error.code == 404:
                     raise PodNotFound(method, url, error.code, text) from error
                 raise RunPodError(method, url, error.code, text) from error
-        raise RunPodError(method, url, 429, "rate limited after 5 attempts")
+        raise AssertionError("unreachable: the last attempt raises")
 
     def _json(
         self,
@@ -212,7 +215,7 @@ class RunPodProvider(Provider):
             "disk": disk_gb,
             "ports": ["22/tcp"],
             "startSsh": True,
-            "env": env or {"HF_HUB_ENABLE_HF_TRANSFER": "0"},
+            "env": env or DEFAULT_POD_ENV,
         }
         return _pod_from_api(self._json("POST", "/pods", body=body))
 
@@ -222,16 +225,16 @@ class RunPodProvider(Provider):
         except PodNotFound:
             return None
 
-    def logs(self, pod_id: str, tail: int = 100, read_seconds: float = 10.0) -> str:
+    def logs(self, pod_id: str, tail: int = 100) -> str:
         lines: list[str] = []
-        deadline = time.monotonic() + read_seconds
+        deadline = time.monotonic() + LOG_READ_S
         try:
             stream = self._open(
                 "GET",
                 f"/pods/{pod_id}/logs",
                 params={"tail": tail},
                 accept="text/event-stream",
-                timeout_s=read_seconds,
+                timeout_s=LOG_READ_S,
             )
             with stream:
                 for raw in stream:

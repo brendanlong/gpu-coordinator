@@ -11,7 +11,6 @@ from typing import Any
 
 from gpuc.control.config import (
     DesiredUnreadable,
-    Registry,
     Settings,
     load_desired,
     load_registry,
@@ -102,14 +101,13 @@ def gather(
     provider: Provider,
     *,
     heartbeats: bool = True,
-    registry: Registry | None = None,
 ) -> PodsView:
     view = PodsView()
     pods = provider.list()
     ours = owned_pods(pods, provider.caps.prefix)
     ours_ids = {pod.id for pod in ours}
     others = [pod for pod in pods if pod.id not in ours_ids]
-    registry = registry if registry is not None else load_registry()
+    registry = load_registry()
     try:
         desired_ids = {host.pod_id for host in load_desired()}
     except DesiredUnreadable as exc:

@@ -13,8 +13,8 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -210,7 +210,6 @@ class SshTransport:
     key: str | None = None
     control_dir: Path | None = None
     known_hosts: Path | None = None
-    extra_options: list[str] = field(default_factory=list)
 
     def ssh_options(self) -> list[str]:
         options = [
@@ -245,7 +244,7 @@ class SshTransport:
         if self.key:
             options += ["-i", str(Path(self.key).expanduser()), "-o", "IdentitiesOnly=yes"]
         options += ["-p", str(self.port)]
-        return options + self.extra_options
+        return options
 
     def ssh_argv(self, command: str) -> list[str]:
         # The remote login shell may be anything; bash -c makes the command we
@@ -452,20 +451,15 @@ def make_transport(
     ssh: str | None = None,
     port: int = 22,
     key: str | None = None,
-    state_dir: Path | None = None,
     known_hosts: Path | None = None,
-    extra_options: Iterable[str] = (),
 ) -> Transport:
-    """``known_hosts`` overrides the shared file: provisioning gives each pod
-    its own, so a recycled RunPod address cannot collide with a pinned key.
-
-    ``state_dir`` is only the known_hosts location; the ControlMaster socket
-    always goes in the short runtime directory (see ``control_socket_dir``).
+    """``known_hosts`` is where host keys are pinned: the shared file for most
+    hosts, a per-pod one for provisioning, so a recycled RunPod address cannot
+    collide with a pinned key. The ControlMaster socket always goes in the
+    short runtime directory (see ``control_socket_dir``).
     """
     if ssh is None:
         return LocalTransport(host=host)
-    if known_hosts is None and state_dir is not None:
-        known_hosts = state_dir / "known_hosts"
     return SshTransport(
         host=host,
         target=ssh,
@@ -473,5 +467,4 @@ def make_transport(
         key=key,
         control_dir=control_socket_dir(),
         known_hosts=known_hosts,
-        extra_options=list(extra_options),
     )

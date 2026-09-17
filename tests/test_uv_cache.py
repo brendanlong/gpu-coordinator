@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.bootstrap import bootstrap_host, cache_dir_beside, env_prefix, resolve_cache_dir
+from gpuc.control.bootstrap import bootstrap_host, cache_dir_beside, resolve_cache_dir
 from gpuc.control.probe import parse_probe
-from gpuc.control.remote import HostSession
+from gpuc.control.remote import HostSession, env_prefix
 from gpuc.host import dispatcher, health, jobs, runner
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, make_spec
@@ -83,7 +83,7 @@ def test_the_hosts_cache_dir_reaches_every_remote_step() -> None:
     host = host_entry(name="h", cache_dir="/vol/me/.cache/uv")
     assert host.cache_dir == "/vol/me/.cache/uv"
     assert host.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
-    assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in env_prefix(host)
+    assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in env_prefix(host.env)
     session = HostSession(host, ScriptedHost(), "/vol/me/gpuc", "/usr/bin/python3")
     assert session.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
 

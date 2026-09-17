@@ -12,7 +12,7 @@ import json
 import os
 import shlex
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -20,7 +20,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from gpuc.control.config import HostEntry, Settings, utc_now
+from gpuc.control.config import HostEntry, Reporter, Settings, utc_now
 from gpuc.control.remote import HostSession, open_session
 from gpuc.control.s3index import (
     IndexEntry,
@@ -40,8 +40,6 @@ from gpuc.control.transport import (
 )
 from gpuc.host import jobs, progress
 from gpuc.host.jobs import JobSpec
-
-Reporter = Callable[[str], None]
 
 
 class SubmitError(RuntimeError):

@@ -40,7 +40,6 @@ class Connection:
     """One completed connect: the entry to register, and what it cost the host."""
 
     entry: HostEntry
-    transport: Transport
     home: str
     adopted: bool = False
     """True when the host already had a config and we took it as it was."""
@@ -149,7 +148,6 @@ def _apply(
     )
     return Connection(
         entry=entry.with_config(document),
-        transport=transport,
         home=home,
         adopted=adopted,
         changes=changes,
