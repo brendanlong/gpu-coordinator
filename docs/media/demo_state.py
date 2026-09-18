@@ -63,21 +63,19 @@ def entry(
         cache=HostCache(
             read_at=at(minutes=-3),
             driver_version="580.65.06",
-            gpu_info={
-                g: GpuInfo(name=model, memory_mib=vram_mib) for g in [*gpus, *(shared or [])]
-            },
+            gpu_info={g: GpuInfo(name=model, vram_mib=vram_mib) for g in [*gpus, *(shared or [])]},
             config=config,
         ),
     )
 
 
 def views() -> list[HostView]:
-    workstation = HostView(
+    desktop = HostView(
         entry=entry(
-            "workstation",
+            "desktop",
             "local",
             gpus=[uuid(1)],
-            s3_prefix="s3://my-bucket/gpuc/workstation",
+            s3_prefix="s3://my-bucket/gpuc/desktop",
             model="NVIDIA GeForce RTX 4090",
             vram_mib=24564,
         ),
@@ -124,7 +122,7 @@ def views() -> list[HostView]:
             shared=[uuid(4)],
             s3_prefix="s3://my-bucket/gpuc/lab",
             model="NVIDIA A40",
-            vram_mib=46068,
+            vram_mib=49140,
         ),
         reachable=True,
         pkg_commit=version_mod.local_commit(),
@@ -203,7 +201,7 @@ def views() -> list[HostView]:
         entry=entry(
             "a100-burst",
             "runpod",
-            ssh="root@213.173.108.14",
+            ssh="root@1.2.3.4",
             pod_id="k7q2m9x4v1",
             gpus=[uuid(5), uuid(6)],
             s3_prefix="s3://my-bucket/gpuc/a100-burst",
@@ -245,7 +243,7 @@ def views() -> list[HostView]:
         ],
     )
 
-    return [workstation, lab, rented]
+    return [desktop, lab, rented]
 
 
 LOG = """\
@@ -286,8 +284,8 @@ ROUTES_JSON = {
         "notes": [],
     },
     "/api/version": lambda: {
-        "version": "0.1.0",
-        "commit": "8285811",
+        "version": version_mod.__version__,
+        "commit": version_mod.local_commit(),
         "source": "installed",
         "dirty": False,
         "hosts": [],
@@ -299,7 +297,7 @@ ROUTES_JSON = {
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
     def do_GET(self) -> None:
@@ -316,7 +314,7 @@ class Handler(BaseHTTPRequestHandler):
             job_id = path.split("/")[3]
             body = {
                 "job_id": job_id,
-                "host": "workstation",
+                "host": "desktop",
                 "source": "host",
                 "location": f"/home/me/.gpuc/jobs/{job_id}/log.txt",
                 "lines": LOG.splitlines(),

@@ -6,12 +6,13 @@ One submit path (`gpuc submit`) for three kinds of GPU host:
 - **ssh** — a shared box you have no sudo on, using a subset of its GPUs,
 - **runpod** — an ephemeral pod, provisioned for the job and torn down after it.
 
-![A terminal session: gpuc submit sends job.yaml to the host workstation and it
-starts at once; a second submit queues eval-checkpoints behind it; gpuc status
-prints the card, the running job at 100% utilization with its estimated finish,
-the queued job with its priority and projected start, and the last job that
-finished; gpuc logs -f then streams the training output as it is
-written.](docs/media/cli.gif)
+![A terminal session: cat job.yaml shows a five-line spec; gpuc submit sends it
+to the host workstation, which starts it at once; a second submit queues
+eval-checkpoints behind it; gpuc status prints the card, the running job with
+its estimated finish, the queued job with its priority and projected start, and
+the job that finished before them; gpuc logs -f streams the training output as
+it is written; and a last gpuc status has the running job at 100% utilization
+and 29% done.](docs/media/cli.gif)
 
 The same recording as text, to copy from:
 [asciinema.org/a/fu8jgOVnwDi6dlYd](https://asciinema.org/a/fu8jgOVnwDi6dlYd).
@@ -52,19 +53,20 @@ is doing, the queue in dispatch order, and the actions the CLI has — logs,
 estimate, reorder, preempt, cancel. It asks the hosts, so it shows what they
 say and nothing a command could not tell you.
 
-![The gpuc dashboard listing three hosts. workstation (local) has one RTX 4090
+![The gpuc dashboard listing three hosts. desktop (local) has one RTX 4090
 running a fine-tune at 96% utilization. lab (ssh) has two A40s running a grid
 search, a third card marked shared and in use by somebody else, two jobs queued
 with their priorities and projected starts, and one that failed. a100-burst
 (runpod) is a rented pod billing $1.64 an hour for a job across both of its
-A100s. Every job row carries Logs, Estimate, Preempt and Cancel
-buttons.](docs/media/web-dashboard.png)
+A100s. A running job's row carries Logs, Estimate, Preempt and Cancel; a queued
+one carries its priority, Reorder, and no Preempt.](docs/media/web-dashboard.png)
 
-A job's log opens in a panel over the list and follows the file on the host:
+A job's log opens in a panel over the list, and with `follow` ticked the page
+re-fetches its tail as the host writes it:
 
-![The log panel open over the host list, tailing a running job: uv sync in the
-setup phase, the GPU and S3 checks that run before the job's main phase, then
-training steps and a checkpoint upload to S3.](docs/media/web-logs.png)
+![The log panel open over the host list, showing a running job's log: uv sync
+in the setup phase, the GPU and S3 checks that run before the job's main phase,
+then training steps and a checkpoint upload to S3.](docs/media/web-logs.png)
 
 ## Documentation
 

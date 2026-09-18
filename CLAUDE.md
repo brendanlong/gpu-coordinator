@@ -11,6 +11,7 @@
 | [docs/setup.md](docs/setup.md), [docs/usage.md](docs/usage.md) | user-facing behaviour: install, hosts, the job spec, every command, failure reasons, `--json` schemas |
 | [skills/gpuc/SKILL.md](skills/gpuc/SKILL.md) | the agent guide, shipped in the wheel; `gpuc skill` prints it |
 | [README.md](README.md) | the short public overview |
+| [docs/media/README.md](docs/media/README.md) | the README's recording and screenshots, and how to make them again when the CLI's output or the dashboard changes |
 | `gpuc/host/` | runs on hosts, stdlib only; `gpuc/control/` runs on the client and may use dependencies |
 | `./check.sh` | lint, typecheck, tests; what CI runs. A bare `pytest` never rents hardware |
 

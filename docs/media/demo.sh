@@ -45,8 +45,9 @@ print(jobs[0]["job_id"] if jobs else "")
 run 'gpuc submit eval.yaml --host workstation' 1.5
 run 'gpuc status' 4
 
-# Recorded as idle and compressed by asciinema's -i: it is here so the host has
-# sampled utilization by the time the last status prints.
+# Here so the host has sampled utilization by the time the last status prints.
+# `agg --idle-time-limit` shortens the gap when the cast is rendered, so it
+# costs the viewer a second rather than 25.
 sleep 25
 
 run "timeout 11 gpuc logs $JOB_ID -f -n 12" 1.5
