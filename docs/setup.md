@@ -59,10 +59,8 @@ gpuc config show      # the effective settings, file or not
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | default pod image (`--image` per submit) |
 | `disk_gb` | `50` | default container disk (`--disk` per submit) |
 
-Keys left over from older builds are ignored: `dead_dispatcher_minutes` (the
-client-side reaper) and `max_pods` / `max_total_usd_per_hour` (the account-wide
-caps). Nothing limits how many pods an account runs or what they cost;
-`gpuc pods` shows what is billing.
+Nothing limits how many pods an account runs or what they cost; `gpuc pods`
+shows what is billing.
 
 **`s3_bucket` and `--s3-prefix` are two different mirrors.** `s3_bucket` is
 written by *this machine*: job specs to `s3://<bucket>/gpuc/specs/<job-id>.json`
@@ -228,13 +226,13 @@ something already known. An assigned entry no card answers to is
 called out, as are two entries naming one card: `gpuc host bootstrap` fails its
 `gpu_uuids` check on both, so the probe is where you want to find them.
 
-`gpuc host list` shows what is registered, one block per host, with each card
-as `gpu [index] name vram uuid` and a `pkg` line naming the commit the host was
+`gpuc host list` shows what is registered, one block per host, with each card as
+`gpu [index] name vram uuid` and a `pkg` line naming the commit the host was
 running **when it was last read** (`as of 3m ago`). It never asks a host
-anything: everything but the address is a cache of the last answer, which is
-why it is labelled with its age and why `gpuc status` is what asks. `gpuc host
-probe` refreshes that cache (and nothing else). The interpreter path bootstrap
-chose is in `gpuc host list --json` and `gpuc host probe`.
+anything: everything but the address is a cache of the last answer, labelled
+with its age. `gpuc status` is what asks. `gpuc host probe` refreshes that
+cache (and nothing else). The interpreter path bootstrap chose is in
+`gpuc host list --json` and `gpuc host probe`.
 
 ### Hosts whose `$HOME` is wiped on restart
 
@@ -248,9 +246,8 @@ the other filesystem is copied into every venv rather than linked. Where that
 trade is worth it, `--persistent-root R` moves **gpuc home and only
 gpuc home** to `R/gpuc`: `config.json`, `queue/` and every `jobs/<id>/` with its
 spec, state, log and workdir — the things that cannot be reinstalled. uv, its
-Pythons and the `aws` bundle stay in `$HOME`, because bootstrap puts them back
-in seconds and these shared volumes are much slower than local disk. `R` is
-created 0700 if gpuc creates it; an existing `R` keeps its mode.
+Pythons and the `aws` bundle stay in `$HOME`. `R` is created 0700 if gpuc
+creates it; an existing `R` keeps its mode.
 
 ```sh
 gpuc host add gpubox --ssh gpubox --persistent-root /mnt/ssd-2/$USER --gpus GPU-aaa,GPU-bbb
@@ -298,11 +295,11 @@ the host was running when this machine last read it, labelled with its age.
 `gpuc status` asks each host what it is running now, and that is the answer
 that counts.
 
-Shipping the package is only half an upgrade: a dispatcher imports its code once
-and lives as long as the host has work. So the dispatcher bootstrap starts asks
-the incumbent to stand down and takes over, adopting the running jobs — nothing
-is interrupted. `gpuc status` reports the *running* dispatcher's commit alongside
-the package's and warns if they come apart.
+Shipping the package is only half an upgrade: a dispatcher imports its code
+once, so the dispatcher bootstrap starts also takes over from the incumbent,
+adopting the running jobs — nothing is interrupted. `gpuc status` reports the
+*running* dispatcher's commit alongside the package's and warns if they come
+apart.
 
 `--all` takes every registered host in turn, including ephemeral ones. A host
 that fails does not stop the others (a pod that has already gone away is the
@@ -316,19 +313,16 @@ half-installed on the way past: it has no uv to run a dispatcher with.
 
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
 to enqueue on is not on this commit — read from the host's own `config.json`,
-which is also the read that tells them what the host's cards and mirror are,
-and including a host with no commit recorded, which means it was bootstrapped
-by a build old enough not to write one. They re-sync
-the package and restart the dispatcher first, print one line saying so, and
-`--no-bootstrap` skips it. Re-bootstrapping is safe at any time: **running
-jobs are not disturbed and do not block it.** A dispatcher that is already alive
-keeps the lock and finishes on its own (older) code; every new runner uses the
-new package, and whichever dispatcher takes over adopts the running jobs from
-their `state.json`. Only the dispatcher is ever replaced, never a runner.
+which is also the read that tells them what the host's cards and mirror are, and
+including a host with no commit recorded. They re-sync the package and restart
+the dispatcher first, print one line saying so, and `--no-bootstrap` skips it.
+Re-bootstrapping is safe at any time: **running jobs are not disturbed and do
+not block it.** A dispatcher that is already alive keeps the lock and finishes
+on its own (older) code; every new runner uses the new package, and whichever
+dispatcher takes over adopts the running jobs from their `state.json`. Only the
+dispatcher is ever replaced, never a runner.
 
-Two sessions on different builds are fine as long as both are recent: every file
-the two sides share is read with unknown keys ignored and a `null` for a
-non-optional field taken as that field's default.
+Two sessions on different builds are fine: each ignores fields it does not know.
 
 ### The same host from two machines
 

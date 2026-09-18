@@ -48,18 +48,3 @@ gpuc web set-password && gpuc web serve   # the same, in a browser at http://127
 
 Run `gpuc --help`, and `--help` on any subcommand, for the authoritative flags
 and defaults.
-
-## Who we say we are
-
-Every request gpuc makes to somebody else's service carries one user agent,
-from `gpuc/_version.py`:
-
-```
-gpuc/0.1.0 (+https://github.com/brendanlong/gpu-coordinator; self@brendanlong.com)
-```
-
-The RunPod API, a pod's self-terminate, the health check's download, bootstrap's
-`curl` for the uv installer, every control-side boto3 client, and
-`HF_HUB_USER_AGENT_ORIGIN` in each job's environment (so `hf` sends it too; a
-job may override it). The one exception is the `aws` CLI on a host, whose
-User-Agent cannot be overridden.

@@ -31,7 +31,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `cleanup` | `on_success` | when the runner deletes `workdir/`: `on_success`, `always`, `never` |
 | `attempt` | `1` | set by `gpuc requeue` and by a preempt, never by you; a submitter's value is ignored |
 
-Unknown keys are refused at submit, so a typo is an error rather than silence.
+Unknown keys are refused at submit.
 
 **Every output destination must name the job.** `{job_id}` expands in `s3`, `hf`
 and `hf_path` to the id `submit` assigns, and a destination that does not contain
@@ -39,8 +39,7 @@ it after expansion is refused at submit (an `hf` output with no `hf_path` upload
 under the id itself; any other `{...}` is refused too). Nothing looks at what a
 destination already holds, so this is the only overwrite guard there is.
 `hf_create: true` lets the sync preflight create a Hugging Face repo that does
-not exist; without it a missing repo fails the job in seconds instead of creating
-`org/typo`.
+not exist; without it a missing repo fails the job in seconds.
 
 **Files already under an output path are not your results.** Before `setup` the
 runner records what each declared output path already holds; every upload skips
@@ -91,9 +90,7 @@ A job reaches a shared card only when both hold:
 
 - it asked — `use_shared: true`, or `gpuc submit --use-shared`. Off by default;
 - **nobody else is on the card**: nvidia-smi reports 0 MiB used and 0% util for
-  it right now. Memory is the half that matters, since a CUDA context holds
-  hundreds of MiB between steps while util alone dips to zero between somebody
-  else's epochs. A card that could not be read counts as in use.
+  it right now. A card that could not be read counts as in use.
 
 Owned cards come first: a job takes every free owned card it can use and borrows
 only the shortfall. A borrowed card is never handed back until the job ends, so
@@ -132,9 +129,7 @@ progress_interval_s: 60
 | `42%` | a percentage — 42% |
 | `42`, `1`, `0` | **refused**: a bare integer could be either |
 
-A bare integer is refused rather than guessed at: `42` could be a percentage or
-an impossible fraction, and `1` could be 1% or a finished job. If you are
-dividing, `step / total` prints the decimal for free; in shell,
+If you are dividing, `step / total` prints the decimal for free; in shell,
 `echo "$((step * 100 / total))%"`.
 
 Only the last line is read, so the command may be a pipeline that also logs, and
@@ -178,16 +173,14 @@ freed for a job that did not ask to borrow. Nothing is stopped while a host is
 draining. The stopped job is queued again at its own priority, behind the job it
 made room for, so it cannot be handed its own cards back.
 
-There is no limit on how often one job gives way or how long it then waits; that
-is what marking it auto-preemptable asked for. `gpuc status` shows `auto-preempt`
-on those jobs, and the dispatcher log and the job's own log name the job each
-preempt made room for.
+There is no limit on how often one job gives way or how long it then waits.
+`gpuc status` shows `auto-preempt` on those jobs, and the dispatcher log and the
+job's own log name the job each preempt made room for.
 
 ## What gets synced to the host
 
 `gpuc submit` rsyncs `git ls-files --cached --others --exclude-standard`: every
-tracked file **and** every untracked one git would keep, because a file written
-and not yet `git add`ed is part of the experiment. `.gitignore` is still obeyed,
+tracked file **and** every untracked one git would keep. `.gitignore` is obeyed,
 so venvs and caches stay home; files in the index but deleted on disk are dropped
 rather than sent. One line says what happened:
 
@@ -195,10 +188,9 @@ rather than sent. One line says what happened:
 syncing 43 files (2 modified, 1 untracked, ignoring .gitignore'd)
 ```
 
-Alongside the workdir go `uncommitted.patch` — `git diff HEAD -- .` taken against
-a *copy* of the index with `git add -N` applied, so it carries untracked files
-too and never touches your staging area — and `source.json` with the commit,
-branch, origin and submitting directory.
+Alongside the workdir go `uncommitted.patch` — `git diff HEAD -- .`, untracked
+files included, taken without touching your staging area — and `source.json`
+with the commit, branch, origin and submitting directory.
 
 `--no-git` rsyncs a directory that is not a repository, minus `.venv`,
 `__pycache__`, `.git`, `*.pyc`, `node_modules` and `.uv-cache`, with a warning:
@@ -431,10 +423,9 @@ kept, so `gpuc status` and `gpuc pods` still show the pod.
 **Auto-down.** The pod terminates itself once nothing is running and the queue
 has been empty for `--idle-min`. It drains first — retrying unconfirmed outputs
 and mirroring every job's log and state — but a failed mirror does not hold up
-the terminate, since a bucket we cannot reach is no reason to keep a paid pod
-billing. Only a failed *terminate* stops the shutdown: it logs loudly, keeps
-dispatching, and retries in 10 minutes. There is no overall pod lifetime; a job's
-own cap is `max_runtime_min`.
+the terminate. Only a failed *terminate* stops the shutdown: it logs loudly,
+keeps dispatching, and retries in 10 minutes. There is no overall pod lifetime;
+a job's own cap is `max_runtime_min`.
 
 <a name="pods"></a>
 **After that the pod owns itself, and nothing here watches it.** A pod whose
@@ -471,16 +462,14 @@ in its own process group where it does not (`isolation: cgroup` or `pgid` in
 the kill, holding a GPU the next job is about to get. It cannot leave a cgroup.
 Under `pgid` — every RunPod pod, most shared boxes — that hole is real.
 
-`gpuc preempt` and `auto_preempt` use the same machinery with one extra marker,
-so a preempted job is briefly visible as `failed: preempted` before the
-dispatcher writes it back to `queued` as the next attempt. Its workdir and
-secrets file are kept whatever `cleanup:` says, since the next attempt is the
-same job id.
+A preempted job is briefly visible as `failed: preempted` before it is queued
+again as the next attempt. Its workdir and secrets file are kept whatever
+`cleanup:` says, since the next attempt is the same job id.
 
 Utilization is sampled on the assigned cards every 30 s **during phase `main`
 only**, so downloads and compiles in `setup` never show as idle. It is shown by
-`status` and used for nothing else: a job that leaves its cards idle is the job's
-business. A sample nvidia-smi could not produce is unknown, never 0%.
+`status` and used for nothing else. A sample nvidia-smi could not produce is
+unknown, never 0%.
 
 Every `failed: <reason>`:
 
@@ -516,10 +505,9 @@ Every `failed: <reason>`:
 | 4 | the job or host named on the command line does not exist |
 
 A single unreadable host entry never reaches these: it is skipped with a warning
-on stderr, every other host still works, and the entry is written back untouched
-— it is probably another session's host. Only a `hosts.json` that cannot be
-parsed at all is exit 3, and it prints the error, the path, and that a `.bak` was
-kept.
+on stderr, every other host still works, and the entry is written back untouched.
+Only a `hosts.json` that cannot be parsed at all is exit 3, and it prints the
+error, the path, and that a `.bak` was kept.
 
 ```sh
 gpuc status --json | jq '.hosts[] | {name, reachable, running: (.running | length)}'
@@ -668,12 +656,10 @@ gpuc host bootstrap --all --json | jq -r '.hosts[] | "\(.name) \(.outcome) \(.er
 
 A job's `workdir/` is the rsynced code *and* whatever the job builds in it —
 usually a venv, and a torch venv is about 6.5 GB. It is also the only part of a
-job dir gpuc will delete, because it is the only part that can be recreated.
-`spec.json`, `state.json` and `log.txt` always stay, so `logs`, `status` and
-`requeue` keep working on a cleaned job.
+job dir gpuc will delete. `spec.json`, `state.json` and `log.txt` always stay, so
+`logs`, `status` and `requeue` keep working on a cleaned job.
 
-**Per job, by the runner**, after the final sync and state write — never before,
-because `outputs:` paths live inside the workdir:
+**Per job, by the runner**, after the final sync and state write:
 
 | `cleanup:` | succeeded | failed | cancelled |
 | --- | --- | --- | --- |
@@ -722,7 +708,7 @@ removed); an empty `--only` is exit 2.
   `outputs:`, or the workdir is already gone, or nothing was ever written under
   the declared paths. Otherwise `outputs not confirmed uploaded`: those paths
   live inside the workdir, so purging could bin the only copy of a checkpoint.
-  Anything unreadable counts as content, so the answer errs towards keeping.
+  Anything unreadable counts as content.
 
 `--force` overrides those two and nothing else, per job. `--verify` HEADs each
 candidate's mirrored `log.txt` with your own credentials and purges only what
@@ -742,11 +728,11 @@ so both happen on your next submit rather than on a timer.
 
 `--workdir-days` is the one that keeps a busy host from filling up: it takes the
 checkout and the venv and leaves everything `logs`, `status` and `requeue` need.
-Because it runs with nobody watching, it refuses two things `gpuc clean` will do
-if you name them: a job whose spec says **`cleanup: never`**, and a job whose
-**`outputs:` have not reached S3 or HF** — exactly the jobs `gpuc status` flags
-as `outputs not uploaded`. A job whose `spec.json` cannot be read is skipped too.
-`--workdir-days ''` turns the horizon off.
+It refuses two things `gpuc clean` will do if you name them: a job whose spec
+says **`cleanup: never`**, and a job whose **`outputs:` have not reached S3 or
+HF** — exactly the jobs `gpuc status` flags as `outputs not uploaded`. A job
+whose `spec.json` cannot be read is skipped too. `--workdir-days ''` turns the
+horizon off.
 
 `--retention-days` is the purge, and deletes the record of the run, so it is
 opt-in and only ever acts on jobs whose log and state the host has confirmed
