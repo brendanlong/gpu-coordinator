@@ -495,24 +495,6 @@ class _Running:
         return None if pid_alive(self.pid) else -1
 
 
-@dataclass(frozen=True)
-class Reach:
-    """Which pools a card freed by a preempt could actually reach a job from.
-
-    Both are false for a job nothing can be stopped for, and that is a real
-    answer rather than an empty one: a borrowed card is no use to a job that
-    may not be dispatched onto one, and a card of either kind is no use to a
-    job the queue ahead of it would take it from first (see
-    `preempt_for_waiting`).
-    """
-
-    owned: bool
-    shared: bool
-
-    def __bool__(self) -> bool:
-        return self.owned or self.shared
-
-
 @dataclass
 class Preemptable:
     """A running job whose spec said it may be stopped for something better."""
@@ -529,13 +511,13 @@ class Preemptable:
     job, is counted by neither, because it is never handed out to anybody and
     stopping a job for it would start nothing."""
 
-    def frees(self, reach: Reach) -> int:
-        """Cards this would hand to a waiting job with that reach."""
-        return (self.owned if reach.owned else 0) + (self.borrowed if reach.shared else 0)
+    def frees(self, *, borrowing: bool) -> int:
+        """Cards this would hand to a waiting job that may (or may not) borrow."""
+        return self.owned + self.borrowed if borrowing else self.owned
 
 
 def enough_to_start(
-    candidates: list[Preemptable], priority: int, gap: int, reach: Reach
+    candidates: list[Preemptable], priority: int, gap: int, *, borrowing: bool
 ) -> list[Preemptable]:
     """Which of these to stop so a job at `priority` gets `gap` more cards.
 
@@ -544,19 +526,19 @@ def enough_to_start(
     that has been running the shortest time, because what a preempt throws away
     is the work the attempt has already done.
 
-    `reach` is which of a candidate's cards would reach the waiting job at all;
-    the rest do not count towards the gap and cannot be the reason a job is
-    stopped.
+    `borrowing` is the waiting job's `use_shared`: a borrowed card handed back
+    by a stopped job is no use to a job that may not be dispatched onto one, so
+    it does not count towards the gap and cannot be the reason a job is stopped.
     """
     chosen: list[Preemptable] = []
     freed = 0
     for candidate in sorted(candidates, key=lambda c: (c.priority, c.started_at), reverse=True):
         if freed >= gap:
             break
-        if candidate.priority <= priority or not candidate.frees(reach):
+        if candidate.priority <= priority or not candidate.frees(borrowing=borrowing):
             continue
         chosen.append(candidate)
-        freed += candidate.frees(reach)
+        freed += candidate.frees(borrowing=borrowing)
     return chosen if freed >= gap else []
 
 
@@ -1211,9 +1193,25 @@ class Dispatcher:
 
         After `launch_ready`, so everything still queued is something the free
         cards could not take, and the only question left is whether stopping a
-        job that said it may be stopped would let one of them run. Four things
-        have to hold, and they are what keep this from being a way to lose work
-        for nothing:
+        job that said it may be stopped would let one of them run.
+
+        **Exactly one queued job is asked that question**: the first one the
+        queue is actually stuck on. Anything behind it is not a reason to stop
+        anything, and the priorities are not why -- the queue is in priority
+        order, so a candidate less important than a job back there is less
+        important than this one too. It is the cards: a card handed back is
+        dispatched in queue order like any other, so this job takes it first,
+        and it is short of more than every candidate could free, or it would
+        have been the job stopped for. Stopping something for the job behind it
+        discards an attempt and starts neither.
+
+        What the walk does pass is a job that is not stuck: one already holding
+        every card it needs, because a stop in flight is bringing them, and the
+        one job the strict order steps over, which is short of a shared card
+        somebody else is using and so holds nothing (`_holds_the_queue`).
+
+        Three things then have to hold for the job it settles on, and they are
+        what keep this from being a way to lose work for nothing:
 
         * it has to be enough. A preempt that frees one of the two cards the
           waiting job needs costs an attempt and starts nothing.
@@ -1224,24 +1222,21 @@ class Dispatcher:
         * the cards have to be ones the waiting job could be dispatched onto.
           A borrowed card handed back is no use to a job that did not ask to
           borrow, so stopping a job for it would spend an attempt on nothing.
-        * nothing ahead of it in the queue may be holding. A card handed back
-          is dispatched in queue order like any other, so a job ahead that is
-          waiting for cards takes it first -- and that job's own gap has just
-          been found to be more than every candidate could cover, so it takes
-          every card and still does not start. Stopping a job for the one
-          behind it would discard an attempt and start neither.
 
-        Which is why this walks the queue the way `launch_ready` does, holding
-        cards for a job that does not fit and stepping over the one job that
-        rule exempts (`_holds_the_queue`), against a pool that also holds what
-        a stop would hand back. A gap alone says whether cards are missing; only
-        the walk says who would get them.
+        One job a pass is the whole of the rule, and the cost is a pass: where
+        two waiting jobs each deserve a stop, the second gets its own next time
+        round, once the first one's cards count as on their way. What it gives
+        up outright is narrower -- a borrower behind a job that is stuck for
+        good never has a *shared* card freed for it, though the job in front
+        could not be dispatched onto that card anyway -- and winning that back
+        costs a second model of the dispatch order, which is the thing this is
+        deliberately not.
 
         What makes the second attempt of a preempted job wait its turn rather
-        than take its own cards straight back is `launch_ready` applying that
-        same rule for real: the queue is in priority order and a job that does
-        not fit holds the cards it is waiting for, so nothing behind it -- the
-        job just stopped very much included -- can be launched onto them.
+        than take its own cards straight back is `launch_ready`: the queue is
+        in priority order and a job that does not fit holds the cards it is
+        waiting for, so nothing behind it -- the job just stopped very much
+        included -- can be launched onto them.
 
         There is no limit on how often one job gives way: `auto_preempt` says
         it would rather start over than hold a card something better wants, and
@@ -1268,10 +1263,6 @@ class Dispatcher:
         ]
         pool = [*self.free_gpus(), *(uuid for uuid in stopping if uuid in owned)]
         shared_pool = [uuid for uuid in stopping if uuid in shared]
-        # The reservation, as counts, exactly as `launch_ready` keeps it, plus
-        # which pools a job ahead would take a freed card out of first.
-        held = held_shared = 0
-        blocked = Reach(owned=False, shared=False)
         theirs = 0
         sampled = False
         for waiting in queue.list_queued():
@@ -1291,55 +1282,24 @@ class Dispatcher:
                 free_shared, theirs = self.borrowable_gpus()
                 shared_pool = [*free_shared, *shared_pool]
                 sampled = True
-            take = pool[: min(spec.gpus, max(0, len(pool) - held))]
-            short = spec.gpus - len(take)
-            take_shared = (
-                shared_pool[: min(short, max(0, len(shared_pool) - held_shared))]
-                if borrowing
-                else []
-            )
-            gap = short - len(take_shared)
+            take = pool[: spec.gpus]
+            take_shared = shared_pool[: spec.gpus - len(take)] if borrowing else []
+            gap = spec.gpus - len(take) - len(take_shared)
             if gap <= 0:
                 # Starting the moment those cards come back, so they are not on
                 # offer to the job behind it.
                 pool, shared_pool = pool[len(take) :], shared_pool[len(take_shared) :]
                 continue
-            reach = Reach(owned=not blocked.owned, shared=borrowing and not blocked.shared)
-            chosen = enough_to_start(candidates, waiting.priority, gap, reach) if reach else []
-            starts = bool(chosen)
-            for candidate in chosen:
-                # Dropped from the candidates whatever happens: a job we could
-                # not stop this pass will not stop for the next waiting job
-                # either, and counting it again would stop a second job for a
-                # gap that is still not covered.
-                candidates.remove(candidate)
-                if not self._preempt_for(candidate, waiting):
-                    starts = False
-                    break
-            if not starts:
-                if self._holds_the_queue(spec, theirs):
-                    held += len(take)
-                    held_shared += len(take_shared)
-                    blocked = Reach(owned=True, shared=blocked.shared or borrowing)
+            if not self._holds_the_queue(spec, theirs):
                 continue
-            pool, shared_pool = pool[len(take) :], shared_pool[len(take_shared) :]
-            # Least important first is by priority alone, so a set that covers
-            # the gap may overshoot it. What is handed back beyond this job's
-            # gap goes to the queue behind it, like the cards of any job that
-            # ends: counting it out would stop a second job for cards that are
-            # already on their way.
-            handed_back = [uuid for candidate in chosen for uuid in candidate.gpus]
-            # `blocked`, not `reach`: a card this job cannot be dispatched onto
-            # is still on offer to the job behind it, and dropping it here is
-            # how a second job gets stopped for a card already on its way. Only
-            # a card a job *ahead* would take never arrives.
-            back = [] if blocked.owned else [uuid for uuid in handed_back if uuid in owned]
-            back_shared = [] if blocked.shared else [uuid for uuid in handed_back if uuid in shared]
-            # What this job eats out of them, owned first as everywhere else.
-            takes = min(gap, len(back))
-            eaten_shared = gap - takes if reach.shared else 0
-            pool = [*pool, *back[takes:]]
-            shared_pool = [*shared_pool, *back_shared[eaten_shared:]]
+            for candidate in enough_to_start(
+                candidates, waiting.priority, gap, borrowing=borrowing
+            ):
+                if not self._preempt_for(candidate, waiting):
+                    # The gap is not covered any more, so the rest of the set
+                    # would be attempts spent on a job that still cannot start.
+                    break
+            return
 
     def auto_preemptable(self) -> list[Preemptable]:
         """The running jobs whose spec said they may be stopped for better work.

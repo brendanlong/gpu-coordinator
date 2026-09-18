@@ -1726,15 +1726,23 @@ def test_the_shortest_running_of_two_equals_is_the_one_that_gives_way(gpuc_home:
     assert not queue.is_preempted(older)
 
 
-def test_two_waiting_jobs_are_given_a_card_each(gpuc_home: Path) -> None:
-    first = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
-    second = queue.enqueue(make_spec(gpus=1, priority=80, auto_preempt=True))
+def test_two_waiting_jobs_are_given_a_card_each_one_pass_apart(gpuc_home: Path) -> None:
+    """One stop a pass: the job at the front is the only one asked, because a
+    card handed back would reach it first. The pass after, its card is on its
+    way and the second job is the one the queue is stuck on."""
+    first, second = enqueue_in_order(
+        {"gpus": 1, "priority": 80, "auto_preempt": True},
+        {"gpus": 1, "priority": 70, "auto_preempt": True},
+    )
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     queue.enqueue(make_spec(gpus=1, priority=10))
     queue.enqueue(make_spec(gpus=1, priority=11))
     dispatcher.run_once()
-    assert queue.is_preempted(first)
+    assert queue.is_preempted(first)  # the least important of the two
+    assert not queue.is_preempted(second)
+
+    dispatcher.run_once()
     assert queue.is_preempted(second)
 
 
@@ -2016,29 +2024,6 @@ def test_a_job_the_queue_steps_over_does_not_hold_up_a_preempt_behind_it(
     assert jobs.read_state(stuck).status == "running"
 
 
-def test_the_surplus_of_an_overshooting_stop_is_not_a_reason_to_stop_a_second_job(
-    gpuc_home: Path,
-) -> None:
-    """Least important first is by priority alone, so a two-card job is stopped
-    for a one-card gap. Its spare card goes to the queue behind it like any
-    other card that comes free, and stopping a second job for that card would
-    throw away an attempt for one that is already on its way."""
-    dispatcher, _ = shared_host(owned=list(ALL_GPUS), shared=[])
-    _, big, small = enqueue_in_order(
-        {"gpus": 1, "priority": 50},
-        {"gpus": 2, "priority": 90, "auto_preempt": True},
-        {"gpus": 1, "priority": 80, "auto_preempt": True},
-    )
-    dispatcher.run_once()
-    assert jobs.read_state(big).status == "running"
-
-    queue.enqueue(make_spec(gpus=1, priority=10))
-    queue.enqueue(make_spec(gpus=1, priority=20))
-    dispatcher.run_once()
-    assert queue.is_preempted(big)
-    assert not queue.is_preempted(small)
-
-
 def test_a_free_shared_card_counts_towards_the_gap_a_stop_has_to_cover(
     gpuc_home: Path,
 ) -> None:
@@ -2061,76 +2046,6 @@ def test_a_free_shared_card_counts_towards_the_gap_a_stop_has_to_cover(
     dispatcher.run_once()
     assert jobs.read_state(waiting).status == "running"
     assert jobs.read_state(waiting).gpus == [FAKE_GPUS[1], SHARED_GPUS[0]]
-
-
-def test_a_shared_card_handed_back_reaches_the_borrower_behind_a_job_that_cannot_use_it(
-    gpuc_home: Path,
-) -> None:
-    """The stopped job hands back one of each. The owned card is what the job
-    it was stopped for needed; the shared one is no use to *that* job, but the
-    borrower behind it can be dispatched onto it, and nothing in between can
-    take it. Dropping it stops a second job for a card already on its way."""
-    dispatcher, spawned = shared_host()
-    stuck, wide, narrow = enqueue_in_order(
-        {"gpus": 1, "priority": 5},
-        {"gpus": 2, "priority": 60, "auto_preempt": True, "use_shared": True},
-        {"gpus": 1, "priority": 80, "auto_preempt": True, "use_shared": True},
-    )
-    dispatcher.run_once()
-    assert jobs.read_state(wide).gpus == [FAKE_GPUS[1], SHARED_GPUS[0]]
-    assert jobs.read_state(narrow).gpus == [SHARED_GPUS[1]]
-
-    owner = queue.enqueue(make_spec(gpus=1, priority=10))
-    borrower = queue.enqueue(make_spec(gpus=1, priority=20, use_shared=True))
-    dispatcher.run_once()
-    assert queue.is_preempted(wide)
-    assert not queue.is_preempted(narrow)
-
-    spawned[wide].finish(status="failed", reason="preempted")
-    dispatcher.run_once()
-    assert jobs.read_state(owner).gpus == [FAKE_GPUS[1]]
-    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
-    assert jobs.read_state(stuck).status == "running"
-
-
-def test_a_holder_that_may_not_borrow_does_not_hold_up_a_shared_card(gpuc_home: Path) -> None:
-    """It takes every owned card that comes back before the job behind it, and
-    no shared one: a card it could not be dispatched onto goes straight past."""
-    dispatcher, spawned = shared_host(shared=[SHARED_GPUS[0]])
-    *_, borrower = enqueue_in_order(
-        *filling_the_owned_cards(priority=5),
-        {"gpus": 1, "priority": 60, "auto_preempt": True, "use_shared": True},
-    )
-    dispatcher.run_once()
-    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
-
-    queue.enqueue(make_spec(gpus=2, priority=10))  # holds, and nothing can start it
-    waiting = queue.enqueue(make_spec(gpus=1, priority=20, use_shared=True))
-    dispatcher.run_once()
-    assert queue.is_preempted(borrower)
-
-    spawned[borrower].finish(status="failed", reason="preempted")
-    dispatcher.run_once()
-    assert jobs.read_state(waiting).gpus == [SHARED_GPUS[0]]
-
-
-def test_a_holder_that_may_borrow_does_hold_up_a_shared_card(gpuc_home: Path) -> None:
-    """The mirror image: this one takes the shared card the stop would hand
-    back, and still does not start, so the borrower behind it gets nothing and
-    the stop would be an attempt thrown away."""
-    dispatcher, _ = shared_host()
-    *_, borrower = enqueue_in_order(
-        *filling_the_owned_cards(priority=5),
-        {"gpus": 1, "priority": 60, "auto_preempt": True, "use_shared": True},
-    )
-    dispatcher.run_once()
-    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
-
-    wide = queue.enqueue(make_spec(gpus=3, priority=10, use_shared=True))
-    queue.enqueue(make_spec(gpus=1, priority=20, use_shared=True))
-    dispatcher.run_once()
-    assert not queue.is_preempted(borrower)
-    assert jobs.read_state(wide).status == "queued"
 
 
 def test_a_card_handed_out_earlier_in_the_pass_is_not_offered_to_the_walk(
@@ -2158,23 +2073,49 @@ def test_a_card_handed_out_earlier_in_the_pass_is_not_offered_to_the_walk(
     assert jobs.read_state(stuck).status == "running"
 
 
-def test_a_card_held_for_a_job_ahead_does_not_shrink_the_gap_behind_it(gpuc_home: Path) -> None:
-    """The free card belongs to the job in front, which is waiting for a second
-    one nothing can free. Counting it for the job behind makes that job's gap
-    look like one shared card, and stops a borrower for a card it never gets."""
-    dispatcher, spawned = shared_host(shared=[SHARED_GPUS[0]])
-    stuck, ending, borrower = enqueue_in_order(
-        {"gpus": 1, "priority": 5},
+def test_a_second_job_is_not_stopped_for_a_card_already_on_its_way(gpuc_home: Path) -> None:
+    """Least important first is by priority alone, so a two-card job is stopped
+    for a one-card gap. Its spare card goes to the queue behind it like any
+    other card that comes free, and the pass after, both waiting jobs are
+    holding cards that are coming: neither is a job the queue is stuck on, so
+    the second auto-preemptable job keeps its attempt."""
+    dispatcher, _ = shared_host(owned=list(ALL_GPUS), shared=[])
+    _, big, small = enqueue_in_order(
         {"gpus": 1, "priority": 50},
+        {"gpus": 2, "priority": 90, "auto_preempt": True},
+        {"gpus": 1, "priority": 80, "auto_preempt": True},
+    )
+    dispatcher.run_once()
+    assert jobs.read_state(big).status == "running"
+
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher.run_once()
+    assert queue.is_preempted(big)
+    assert not queue.is_preempted(small)
+
+    dispatcher.run_once()
+    assert not queue.is_preempted(small)
+
+
+def test_the_job_the_queue_is_stuck_on_is_the_last_one_asked(gpuc_home: Path) -> None:
+    """Even about a card it could not use itself. The owned cards are held by
+    jobs nothing may stop, so the job at the front is stuck for good; the
+    borrower behind it could be dispatched onto the shared card, and that card
+    would indeed go straight past a job that may not borrow. Working that out
+    means modelling the dispatch order a second time, which is what this walk
+    is instead of -- so the opportunity is given up, and nothing is stopped."""
+    dispatcher, _ = shared_host(shared=[SHARED_GPUS[0]])
+    *_, borrower = enqueue_in_order(
+        *filling_the_owned_cards(priority=5),
         {"gpus": 1, "priority": 60, "auto_preempt": True, "use_shared": True},
     )
     dispatcher.run_once()
     assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
 
-    wide = queue.enqueue(make_spec(gpus=2, priority=10))
-    queue.enqueue(make_spec(gpus=2, priority=20, use_shared=True))
-    spawned[ending].finish()
+    stuck = queue.enqueue(make_spec(gpus=2, priority=10))
+    waiting = queue.enqueue(make_spec(gpus=1, priority=20, use_shared=True))
     dispatcher.run_once()
-    assert jobs.read_state(wide).status == "queued"  # holding the card that came free
     assert not queue.is_preempted(borrower)
-    assert jobs.read_state(stuck).status == "running"
+    assert jobs.read_state(stuck).status == "queued"
+    assert jobs.read_state(waiting).status == "queued"

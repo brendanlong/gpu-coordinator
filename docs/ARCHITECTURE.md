@@ -333,24 +333,33 @@ queue's lexical order, not submission order below one second.
   **last**, so an interruption is completed as the same attempt. It does not
   go back if the attempt ended for a reason of its own (`queue.STOPPED_BY_US`),
   was cancelled while stopping, has no workdir, or the host is going away.
-- Automatic preemption (`preempt_for_waiting`, after `launch_ready`): for each
-  queued job that does not fit, stop the set of running `auto_preempt` jobs
-  that together cover the *whole* gap (`enough_to_start`), least important
+- Automatic preemption (`preempt_for_waiting`, after `launch_ready`): for the
+  one queued job the host is stuck on, stop the set of running `auto_preempt`
+  jobs that together cover the *whole* gap (`enough_to_start`), least important
   first and most recently started among equals, and only at a strictly higher
   priority number than the waiting job. Nothing runs on a host that is
   `_going_away`. The stop is `queue.preempt`, so it is the ordinary preempt
   path; cards held by a job that is already stopping count as available, and
   once one stop in a set fails the rest are left alone. Nothing counts how
   often a job has given way.
-  - **It walks the queue the way `launch_ready` does**, against a pool that
-    also holds what a stop would hand back: cards are reserved for a job that
-    does not fit, the one job that rule exempts is stepped over
-    (`_holds_the_queue`, shared with `launch_ready`), the idle shared cards a
-    borrower may have count towards its take, and the surplus of a set that
-    overshot one job's gap is on offer to the next. So a job behind one that is
-    still waiting is never stopped for -- the cards would be taken in front of
-    it -- and a second job is never stopped for a card already on its way. A
-    gap says cards are missing; only the walk says who would get them.
+  - **Exactly one queued job is asked per pass**: the first the queue is stuck
+    on. A card handed back is dispatched in queue order, so that job takes it
+    first, and its own gap has just been found to be more than every candidate
+    could cover -- so a stop made for anything behind it starts neither job.
+    Not a priority argument: the queue is in priority order, so a candidate
+    eligible for a job further back is eligible for this one too. The walk
+    passes over a job that is *not* stuck -- one whose cards are already coming
+    back from a stop in flight (`pool`/`shared_pool` are consumed for it), and
+    the one job the strict order steps over (`_holds_the_queue`, shared with
+    `launch_ready`) -- and stops at the first one that is, whatever the answer.
+    The idle shared cards a borrower may have count towards its take, not its
+    gap, so nothing is stopped for a card it has already been given.
+  - Two waiting jobs that each deserve a stop get one each a pass apart, since
+    the first one's cards count as on their way next time round. Given up with
+    it: a borrower behind a job that is stuck for good never has a shared card
+    freed for it, though the job in front could not be dispatched onto that
+    card. Winning that back means modelling dispatch order a second time, which
+    is what this pass is deliberately not.
   - The pass's one nvidia-smi reading of the shared cards (`borrowable_gpus`,
     cached in `_borrowable` and reset each pass) is what both walks use, so
     they cannot disagree about which cards somebody else is on.
