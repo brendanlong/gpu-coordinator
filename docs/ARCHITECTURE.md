@@ -1,26 +1,12 @@
 # gpu-coordinator architecture
 
 The contract the code keeps: what lives where, who owns what, and the rules
-each half holds to. It is not the CLI reference -- flags and defaults are
-`gpuc --help` and each subcommand's `--help`, what they mean together is
-[usage.md](usage.md), and installing and registering hosts is
+each half holds to. What the project is for, and what it deliberately does not
+do, is [SPEC.md](SPEC.md). It is not the CLI reference either -- flags and
+defaults are `gpuc --help` and each subcommand's `--help`, what they mean
+together is [usage.md](usage.md), and installing and registering hosts is
 [setup.md](setup.md). Where a section names a function, the *why* lives in
 that function's docstring and is not repeated here.
-
-## Goals
-
-One submit path for three kinds of host: this machine (the cards you give it),
-a box reached over SSH with no sudo there (a subset of its GPUs), and ephemeral
-RunPod pods. Not finicky, not buggy, and never leaks a paid pod in the normal
-path.
-
-Non-goals for the prototype: Vast, multi-node, spot, S3 as the
-authoritative queue (host is authoritative, S3 is the mirror; `gpuc requeue`
-resubmits from the S3 spec if a host dies), and a guaranteed rental teardown.
-Nothing on a client watches a pod after handoff: a rental whose dispatcher
-dies after it was set up, or whose provisioning client was killed uncleanly
-mid-create, bills until a person ends it, and `gpuc pods` is how a person sees
-that.
 
 ## Package layout
 
@@ -91,9 +77,12 @@ out to binaries the bootstrap installs into `$HOME` (`aws` CLI v2 bundle,
 ## User agent
 
 One string, `gpuc/_version.py:user_agent()`, on every outbound request from
-either half (the README lists the callers). `gpuc.host` is stdlib-only, so
-`gpuc._version` must stay stdlib-only and bootstrap's rsync must ship it. The
-`aws` CLI on a host cannot have its User-Agent overridden.
+either half: the RunPod API, a pod's self-terminate, the health check's
+download, bootstrap's `curl` for the uv installer, every control-side boto3
+client, and `HF_HUB_USER_AGENT_ORIGIN` in each job's environment (a job may
+override it). `gpuc.host` is stdlib-only, so `gpuc._version` must stay
+stdlib-only and bootstrap's rsync must ship it. The `aws` CLI on a host cannot
+have its User-Agent overridden.
 
 ## On-host state: `~/.gpuc/`
 
@@ -621,11 +610,8 @@ hold to, whatever the flags:
 Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`, `jobs/`
 (the local job index), `known_hosts` plus `known_hosts.d/<pod>`, and
 `state.lock`, which serialises every registry read-modify-write across
-concurrent sessions. A `desired/` directory or `watch.json` left there by a
-build that had a client-side reaper is ignored. `Settings`
-(`~/.config/gpu-coordinator/config.toml`) is all optional and every key is in
-[setup.md](setup.md#settings); `dead_dispatcher_minutes`, the reaper's key,
-is ignored like any other unknown one.
+concurrent sessions. `Settings` (`~/.config/gpu-coordinator/config.toml`) is
+all optional and every key is in [setup.md](setup.md#settings).
 
 ## Shared state is read tolerantly, always
 
@@ -1049,8 +1035,7 @@ by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
   (`torch.zeros(8)`), never more than ~100 MB VRAM because other people's jobs
   share the card, and they skip themselves on a machine whose `nvidia-smi` does
   not report `tests.conftest.LOCAL_GPU_UUID` -- which is every CI runner. A GPU
-  queue whose GPU tests are the ones nobody runs is how they rot; two of them
-  had, asserting on a `gpuc status` line that had since gained a job name.
+  queue whose GPU tests are the ones nobody runs is how they rot.
 - RunPod integration: A40 only, `--max-price 0.60`, a job whose command
   is under two minutes, `--idle-min 2`, and the test asserts teardown via
   `list()` and prints the final `GET /billing/pods`

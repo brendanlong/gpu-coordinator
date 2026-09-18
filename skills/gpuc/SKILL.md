@@ -19,10 +19,9 @@ gpuc status      # registered hosts, their queues, and what is running
 
 `gpuc status` is the one that asks the hosts themselves; a `WARNING` line under
 a host means it is running a build other than this one (in either direction),
-and `gpuc host bootstrap <host>` is the fix.
-Jobs still queue and run either way. What a host *is* -- its cards, its mirror,
-its env -- is the host's own `config.json`, so there is nothing to keep in step
-between machines and nothing to warn about.
+and `gpuc host bootstrap <host>` is the fix. Jobs still queue and run either
+way. What a host *is* -- its cards, its mirror, its env -- lives in the host's
+own `config.json`, so there is nothing else to keep in step between machines.
 
 `gpuc skill` prints this file, and `gpuc skill --install [DIR]` writes a copy
 to `DIR/.claude/skills/gpuc/SKILL.md`.
