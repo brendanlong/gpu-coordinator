@@ -27,12 +27,10 @@ from gpuc.control.cli import main
 from gpuc.control.config import (
     HostEntry,
     Settings,
-    desired_dir,
-    load_desired,
     load_registry,
     load_settings,
 )
-from gpuc.control.providers.base import Caps, Offer, Pod
+from gpuc.control.providers.base import Offer, Pod
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.s3index import LocalIndex
 
@@ -100,8 +98,8 @@ def wait_until(
 class RecordingProvider(RunPodProvider):
     """A real provider that remembers what it created, so `finally` can undo it."""
 
-    def __init__(self, caps: Caps) -> None:
-        super().__init__(caps=caps)
+    def __init__(self, prefix: str) -> None:
+        super().__init__(prefix=prefix)
         self.created_ids: list[str] = []
 
     def create(self, offer: Offer, name: str, **kwargs: Any) -> Pod:
@@ -158,9 +156,7 @@ def live_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[Settings]:
     monkeypatch.setenv("GPUC_STATE_DIR", str(root / "state"))
     monkeypatch.delenv("GPUC_HOME", raising=False)
     (root / "config").mkdir()
-    (root / "config/config.toml").write_text(
-        f's3_bucket = "{BUCKET}"\nmax_pods = 2\nmax_total_usd_per_hour = 1.5\n'
-    )
+    (root / "config/config.toml").write_text(f's3_bucket = "{BUCKET}"\n')
     yield load_settings()
     shutil.rmtree(root, ignore_errors=True)
 
@@ -188,7 +184,7 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
 ) -> None:
     if not os.environ.get("RUNPOD_API_KEY"):
         pytest.skip("RUNPOD_API_KEY is not set")
-    provider = RecordingProvider(live_settings.caps())
+    provider = RecordingProvider(live_settings.runpod_pod_prefix)
     monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
     monkeypatch.chdir(workdir)
     started = time.monotonic()
@@ -210,8 +206,6 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
                         "any",
                         "--idle-min",
                         "2",
-                        "--ttl-hours",
-                        "1",
                         "--disk",
                         "20",
                         "--name-hint",
@@ -237,8 +231,6 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
                 f"pod {pod.id} {pod.name}: {pod.gpu_name} cuda {pod.cuda_version} "
                 f"${pod.cost_usd_hr:.3f}/h, {len(entry.gpus)} GPU(s) {entry.gpus}"
             )
-            assert [d.pod_id for d in load_desired()] == [pod.id]
-
             assert main(["status"]) == 0
             assert main(["pods"]) == 0
 
@@ -277,9 +269,10 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
             log(f"pod gone {idle:.0f}s after the job finished")
             assert pod.id not in [p.id for p in provider.list_ours()]
 
-            assert main(["reconcile", "--once"]) == 0
+            # Nothing here reaps: the next `submit` would forget the entry on
+            # its reuse pass, and a person does it by hand with `host remove`.
+            assert main(["host", "remove", entry.name]) == 0
             assert load_registry().hosts == {}
-            assert list(desired_dir().glob("*.json")) == []
             log(f"billing: {json.dumps(provider.billing(pod.id))[:400]}")
             log(f"total wall time {time.monotonic() - started:.0f}s")
     finally:

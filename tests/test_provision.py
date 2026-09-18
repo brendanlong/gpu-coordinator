@@ -10,19 +10,13 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.config import (
-    ConfigError,
-    DesiredHost,
     HostEntry,
     Settings,
-    desired_dir,
     load_registry,
-    read_desired,
     registry_transaction,
-    state_lock,
     utc_now,
-    write_desired,
 )
-from gpuc.control.providers.base import Caps, Constraints, Offer, Pod, ProviderError
+from gpuc.control.providers.base import Constraints, Pod, ProviderError
 from gpuc.control.provision import (
     ProvisionDeps,
     ProvisionError,
@@ -90,7 +84,6 @@ def run(
         provider=provider,
         name_hint="e2e",
         idle_minutes=2.0,
-        ttl_hours=1.0,
         report=(reports.append if reports is not None else lambda _: None),
         deps=deps(transport),
         **kwargs,  # type: ignore[arg-type]
@@ -109,11 +102,9 @@ def test_happy_path_registers_a_bootstrapped_host(control_env: Path, ssh_key: Pa
     assert entry.port == 22000
     assert entry.gpus == ["GPU-1111", "GPU-2222"]
     assert entry.python and entry.bootstrapped_at
-    assert entry.idle_minutes == 2.0 and entry.ttl_hours == 1.0
+    assert entry.idle_minutes == 2.0
 
     assert load_registry().hosts[entry.name].pod_id == entry.pod_id
-    desired = read_desired(entry.name)
-    assert desired is not None and desired.bootstrapped_at is not None
     assert provider.terminated == []
     assert provider.registered_keys == [ssh_key.read_text()]
     assert all(line.startswith("[") and "+" in line for line in reports)
@@ -143,33 +134,6 @@ def test_cuda_min_defaults_to_12_8_when_unconstrained(control_env: Path, ssh_key
     assert provider.created[0]["cuda_min"] == "12.8"
 
 
-def test_desired_state_is_written_before_the_pod_is_ready(control_env: Path, ssh_key: Path) -> None:
-    """The record has to exist even if we die mid-wait, or the pod is a leak."""
-    provider = FakeProvider([make_offer()], scripts=[PodScript(ssh_after_polls=-1)])
-    seen: list[list[str]] = []
-
-    def watch(_: float) -> None:
-        seen.append(sorted(p.name for p in desired_dir().glob("*.json")))
-
-    with pytest.raises(ProvisionError):
-        provision(
-            CONSTRAINTS,
-            Settings(),
-            provider=provider,
-            report=lambda _: None,
-            deps=ProvisionDeps(
-                sleep=watch,
-                now=ticking(),
-                bootstrap=fake_bootstrap,
-                transport_factory=lambda entry, settings: FakeTransport(),
-                poll_interval_s=0.0,
-                log_check_interval_s=0.0,
-            ),
-        )
-    assert seen and seen[0] and seen[0][0].startswith("gpuc-")
-    assert list(desired_dir().glob("*.json")) == []
-
-
 def test_capacity_error_advances_to_the_next_offer(control_env: Path, ssh_key: Path) -> None:
     provider = FakeProvider(
         [make_offer(price=0.20, gpu_id="cheap"), make_offer(price=0.40, gpu_id="dearer")],
@@ -192,7 +156,7 @@ def test_broken_host_log_terminates_and_replaces(control_env: Path, ssh_key: Pat
     assert entry.pod_id == "pod2"
     assert [p.status for p in provider.list()] == ["TERMINATED", "RUNNING"]
     assert any("broken host" in line for line in reports)
-    assert sorted(p.name for p in desired_dir().glob("*.json")) == [f"{entry.name}.json"]
+    assert sorted(load_registry().hosts) == [entry.name]
 
 
 def test_dead_pod_status_is_a_placement_failure(control_env: Path, ssh_key: Path) -> None:
@@ -225,7 +189,6 @@ def test_ceiling_terminates_and_reports_every_failure(control_env: Path, ssh_key
     assert "no direct SSH endpoint" in str(error.value)
     assert provider.terminated == ["pod1"]
     assert load_registry().hosts == {}
-    assert list(desired_dir().glob("*.json")) == []
 
 
 def test_ssh_never_answers_terminates(control_env: Path, ssh_key: Path) -> None:
@@ -275,30 +238,28 @@ def test_health_failure_terminates_and_forgets(control_env: Path, ssh_key: Path)
     assert "host health failed" in str(error.value)
     assert provider.terminated == ["pod1"]
     assert load_registry().hosts == {}
-    assert list(desired_dir().glob("*.json")) == []
 
 
-def test_a_failed_terminate_keeps_the_desired_record(control_env: Path, ssh_key: Path) -> None:
-    """A pod that is still billing must stay visible to the reaper.
-
-    Removing `desired/<host>.json` after a terminate that failed is how a pod
-    becomes invisible to `gpuc reconcile` and bills until someone notices it in
-    the RunPod console.
-    """
+def test_a_failed_terminate_keeps_the_pod_visible(control_env: Path, ssh_key: Path) -> None:
+    """A terminate is retried, and one that still fails is not retried by
+    anything after this process moves on: the pod bills until a person ends
+    it, so it must stay in the registry for `gpuc status` to show, the report
+    must say where to look, and the final error must not claim it was ended."""
     from gpuc.control.bootstrap import BootstrapError
 
     def failing_bootstrap(entry: HostEntry, *args: object, **kwargs: object):
         raise BootstrapError("health failed")
 
     provider = FakeProvider([make_offer()])
-    original = provider.terminate
+    attempts: list[str] = []
 
     def refuse(pod_id: str) -> None:
+        attempts.append(pod_id)
         raise ProviderError("502 Bad Gateway")
 
     provider.terminate = refuse  # type: ignore[method-assign]
     reports: list[str] = []
-    with pytest.raises(ProvisionError):
+    with pytest.raises(ProvisionError) as error:
         provision(
             CONSTRAINTS,
             Settings(),
@@ -312,14 +273,34 @@ def test_a_failed_terminate_keeps_the_desired_record(control_env: Path, ssh_key:
                 log_check_interval_s=0.0,
             ),
         )
-    desired = [p.name for p in desired_dir().glob("*.json")]
-    assert desired and desired[0].startswith("gpuc-")
-    assert load_registry().hosts  # still known, so `gpuc logs` can find its jobs
-    assert any("reconcile" in line for line in reports)
+    (name,) = load_registry().hosts  # still known, so `gpuc status` shows its pod
+    assert name.startswith("gpuc-")
+    assert attempts == ["pod1"] * 3
+    assert any("still billing" in line and "gpuc pods" in line for line in reports)
+    assert "pod1 could NOT be terminated and are still billing" in str(error.value)
+    assert "All pods created here were terminated" not in str(error.value)
 
-    # ...and once the terminate does work, the record goes.
-    provider.terminate = original  # type: ignore[method-assign]
-    with pytest.raises(ProvisionError):
+
+def test_a_terminate_that_fails_once_is_retried_and_confirmed(
+    control_env: Path, ssh_key: Path
+) -> None:
+    from gpuc.control.bootstrap import BootstrapError
+
+    def failing_bootstrap(entry: HostEntry, *args: object, **kwargs: object):
+        raise BootstrapError("health failed")
+
+    provider = FakeProvider([make_offer()])
+    real_terminate = provider.terminate
+    attempts: list[str] = []
+
+    def flaky(pod_id: str) -> None:
+        attempts.append(pod_id)
+        if len(attempts) == 1:
+            raise ProviderError("502 Bad Gateway")
+        real_terminate(pod_id)
+
+    provider.terminate = flaky  # type: ignore[method-assign]
+    with pytest.raises(ProvisionError) as error:
         provision(
             CONSTRAINTS,
             Settings(),
@@ -333,8 +314,10 @@ def test_a_failed_terminate_keeps_the_desired_record(control_env: Path, ssh_key:
                 log_check_interval_s=0.0,
             ),
         )
-    assert provider.terminated == ["pod2"]
-    assert sorted(p.name for p in desired_dir().glob("*.json")) == desired
+    assert attempts == ["pod1", "pod1"]
+    assert provider.terminated == ["pod1"]
+    assert load_registry().hosts == {}
+    assert "All pods created here were terminated" in str(error.value)
 
 
 def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_path: Path) -> None:
@@ -349,28 +332,6 @@ def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_pa
     (tmp_path / "my.key.pub").unlink()
     with pytest.raises(ProvisionError, match="public half"):
         public_key_path(Settings(ssh_key=str(key)))
-
-
-def test_caps_refusal_never_creates(control_env: Path, ssh_key: Path) -> None:
-    provider = FakeProvider(
-        [make_offer()],
-        caps=Caps(max_pods=1),
-        existing=[running_pod("gpuc-other-abc", "podX")],
-    )
-    with pytest.raises(ProvisionError) as error:
-        run(provider)
-    assert "max_pods=1" in str(error.value)
-    assert provider.created == []
-
-
-def test_caps_count_ignores_foreign_pods(control_env: Path, ssh_key: Path) -> None:
-    provider = FakeProvider(
-        [make_offer()],
-        caps=Caps(max_pods=1),
-        existing=[running_pod("other-someone-else", "podY")],
-    )
-    entry = run(provider)
-    assert entry.pod_id == "pod1"
 
 
 def test_no_offers_says_what_to_relax(control_env: Path, ssh_key: Path) -> None:
@@ -420,19 +381,15 @@ def _register_reusable(pod: Pod, price: float = 0.49) -> HostEntry:
         gpus=["GPU-1111"],
         python="/root/python",
         created_at=utc_now(),
+        provider={
+            "kind": "runpod",
+            "pod_id": pod.id,
+            "offer": make_offer(price=price).model_dump(mode="json"),
+            "created_at": utc_now(),
+        },
     )
     with registry_transaction() as registry:
         registry.put(entry)
-    write_desired(
-        DesiredHost(
-            name=entry.name,
-            pod_id=pod.id,
-            offer=make_offer(price=price),
-            created_at=utc_now(),
-            ceiling_at=utc_now(),
-            bootstrapped_at=utc_now(),
-        )
-    )
     return entry
 
 
@@ -551,47 +508,6 @@ def test_s3_credentials_are_skipped_without_a_prefix(control_env: Path) -> None:
     assert transport.files == {}
 
 
-class _LockWatchingProvider(FakeProvider):
-    """Records whether the state lock was held while `create` ran."""
-
-    lock_held_during_create: bool = False
-
-    def create(self, offer: Offer, name: str, **kwargs: object) -> Pod:
-        try:
-            with state_lock(timeout_s=0.2):
-                self.lock_held_during_create = False
-        except ConfigError:
-            self.lock_held_during_create = True
-        return super().create(offer, name, **kwargs)  # type: ignore[arg-type]
-
-
-def test_create_and_desired_write_happen_under_the_state_lock(
-    control_env: Path, ssh_key: Path
-) -> None:
-    """Caps are only account-wide if a second session cannot create in the gap."""
-    provider = _LockWatchingProvider([make_offer()])
-    run(provider)
-    assert provider.lock_held_during_create
-
-
-def test_a_failed_desired_write_gives_the_pod_back(
-    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No desired/ record means nothing local would ever reap it, so terminate now."""
-
-    def explode(_: DesiredHost) -> Path:
-        raise OSError("No space left on device")
-
-    provider = FakeProvider([make_offer()])
-    monkeypatch.setattr("gpuc.control.provision.write_desired", explode)
-    reports: list[str] = []
-    with pytest.raises(OSError):
-        run(provider, reports=reports)
-    assert provider.terminated == ["pod1"]
-    assert provider.live_names() == []
-    assert any("could not record desired state" in line for line in reports)
-
-
 def test_ctrl_c_during_bootstrap_terminates_the_pod(control_env: Path, ssh_key: Path) -> None:
     """A KeyboardInterrupt is not a narrow provisioning error, and still owns a pod."""
 
@@ -615,7 +531,6 @@ def test_ctrl_c_during_bootstrap_terminates_the_pod(control_env: Path, ssh_key: 
         )
     assert provider.terminated == ["pod1"]
     assert provider.live_names() == []
-    assert list(desired_dir().glob("*.json")) == []
     assert load_registry().hosts == {}
 
 
@@ -676,20 +591,6 @@ def test_reuse_skips_a_draining_host(
     assert any("draining" in line for line in reports)
 
 
-def test_reuse_skips_a_paused_host(
-    control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
-    provider.adopt(pod)
-    _register_reusable(pod)
-    monkeypatch.setattr("gpuc.control.provision.host_status", status_of(2.0, paused=True))
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=lambda _: None)
-        is None
-    )
-
-
 def test_reuse_skips_a_host_with_too_few_gpus(
     control_env: Path, ssh_key: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -723,7 +624,6 @@ def test_reuse_forgets_a_host_whose_pod_is_gone(
     )
     assert calls == []  # no ssh to an address the pod no longer owns
     assert load_registry().hosts == {}
-    assert read_desired("gpuc-e2e-aaa") is None
     assert any("forgetting" in line for line in reports)
 
 
@@ -740,13 +640,12 @@ def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
     assert sorted(load_registry().hosts) == [entry.name]
 
 
-def test_the_pod_is_given_its_own_copy_of_the_desired_record(
+def test_the_pod_is_given_its_own_record_of_what_it_was_bought_as(
     control_env: Path, ssh_key: Path
 ) -> None:
-    """`desired/` lives on this machine only; the pod carries the same record.
-
-    It is what lets a second machine -- the one running the reconcile timer --
-    tell this pod from a leak without ever having created it (`rented`).
+    """Nothing about the pod lives only on this machine: a second machine
+    reads what it was rented as off the pod itself (`rented`), and so does the
+    next `submit` here when it decides whether to reuse it.
     """
     provider = FakeProvider([make_offer()])
     transport = FakeTransport()
@@ -757,6 +656,5 @@ def test_the_pod_is_given_its_own_copy_of_the_desired_record(
     assert provider_block["kind"] == "runpod"
     assert provider_block["pod_id"] == entry.pod_id
     assert provider_block["offer"]["name"] == "A40"
-    desired = read_desired(entry.name)
-    assert desired is not None
-    assert provider_block["created_at"] == desired.created_at
+    assert provider_block["created_at"] == entry.created_at
+    assert entry.config.provider == provider_block

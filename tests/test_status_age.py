@@ -73,8 +73,8 @@ def test_done_lines_carry_the_age() -> None:
 
 
 def test_a_failure_reason_and_age_appear_together() -> None:
-    text = render(view(finished("20260915-1", status="failed", reason="low-util", days=2)))
-    assert "failed (low-util) 2d ago" in text
+    text = render(view(finished("20260915-1", status="failed", reason="timeout", days=2)))
+    assert "failed (timeout) 2d ago" in text
 
 
 def test_recent_limits_how_many_finished_jobs_are_shown() -> None:

@@ -1,4 +1,4 @@
-"""`gpuc status`: one compact block per host, and the phase-aware suspect rule.
+"""`gpuc status`: one compact block per host.
 
 Reads the host over the transport (the host is authoritative); the S3 index
 only fills in jobs whose host is gone. Never kills anything.
@@ -25,11 +25,6 @@ from gpuc.host.jobs import SCHEMA_VERSION
 
 HEARTBEAT_STALE_S = 30.0
 DEAD_POD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
-UTIL_SAMPLE_INTERVAL_S = 30.0
-"""The runner's sampling cadence, which is what `util_recent` is measured in."""
-UTIL_SAMPLES_KEPT = 40
-"""How many samples the host keeps (20 min). A `window_min` longer than this is
-judged on what there is rather than never firing at all."""
 RECENT_FINISHED = 5
 LEFTOVER_FLOOR_BYTES = 1 << 30
 """Only mention finished jobs' workdirs once they add up to something worth a
@@ -70,40 +65,6 @@ class SharedGpu:
             utilization_pct=_as_float(raw.get("utilization_pct")),
             unused=bool(raw.get("unused")),
         )
-
-
-@dataclass
-class LowUtilView:
-    """A job's own low-util watchdog settings, as the host reports them.
-
-    The defaults are the spec's, so a host that does not report them yet is
-    judged by exactly the rule its watchdog is running.
-    """
-
-    enabled: bool = True
-    window_min: float = 25.0
-    floor_pct: float = 5.0
-    grace_min: float = 10.0
-
-    @staticmethod
-    def from_payload(raw: Any) -> LowUtilView:
-        if not isinstance(raw, dict):
-            return LowUtilView()
-        default = LowUtilView()
-
-        def number(key: str, fallback: float) -> float:
-            value = raw.get(key)
-            return float(value) if isinstance(value, (int, float)) else fallback
-
-        return LowUtilView(
-            enabled=bool(raw.get("enabled", True)),
-            window_min=number("window_min", default.window_min),
-            floor_pct=number("floor_pct", default.floor_pct),
-            grace_min=number("grace_min", default.grace_min),
-        )
-
-    def samples(self, minutes: float) -> int:
-        return max(1, round(minutes * 60.0 / UTIL_SAMPLE_INTERVAL_S))
 
 
 @dataclass
@@ -160,10 +121,6 @@ class JobView:
     whole tree), `pgid` if only a process group (a daemonised grandchild
     escapes). In `--json` only: what a kill reaps is asked while debugging one
     job, not while scanning a host."""
-    low_util: LowUtilView = field(default_factory=LowUtilView)
-    """This job's own watchdog settings, so `--suspects` names the jobs the host
-    is actually about to kill -- and stays quiet about the ones that turned the
-    watchdog off on purpose."""
     outputs: list[dict[str, Any]] = field(default_factory=list)
     """The spec's `outputs:` as the host reports them, `{job_id}` already
     expanded: where this job's results went, or were meant to go."""
@@ -194,29 +151,6 @@ class JobView:
         """
         when = parse_timestamp(self.eta)
         return None if when is None else (when - datetime.now(UTC)).total_seconds()
-
-    @property
-    def suspect(self) -> bool:
-        """Billing, in `main`, and flat on this job's own low-util floor.
-
-        Phase-aware by construction: the runner only records samples during
-        `main`, so setup, download and compile can never look suspicious. The
-        thresholds are the job's, not a constant here, so a job that raised its
-        floor or turned the watchdog off is judged by what it asked for -- and
-        the ones this flags are the ones the host is about to kill.
-        """
-        if self.status != "running" or self.phase != "main" or not self.gpus:
-            return False
-        rule = self.low_util
-        if not rule.enabled:
-            return False
-        # grace_min of main phase has to have gone by before the host's own
-        # watchdog even starts watching, and its window is what it averages.
-        need = min(rule.samples(rule.grace_min + rule.window_min), UTIL_SAMPLES_KEPT)
-        window = self.util_recent[-min(rule.samples(rule.window_min), UTIL_SAMPLES_KEPT) :]
-        if len(self.util_recent) < need or not window:
-            return False
-        return sum(window) / len(window) < rule.floor_pct
 
 
 DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
@@ -322,7 +256,6 @@ class HostView:
     heartbeat_age_s: float | None = None
     pod_gone: bool = False
     draining: bool = False
-    paused: bool = False
     owned: list[str] = field(default_factory=list)
     """The UUIDs this host owns, as the host itself resolved them: `config.gpus`
     may name cards by nvidia-smi index, and only the host knows today's
@@ -362,10 +295,6 @@ class HostView:
     def free(self) -> list[str]:
         busy = {uuid for job in self.running for uuid in job.gpus}
         return [uuid for uuid in self.owned if uuid not in busy]
-
-    @property
-    def suspects(self) -> list[JobView]:
-        return [job for job in self.running if job.suspect]
 
     def gpu_label(self, uuid: str) -> str:
         """What to call this card on a job's line: its index where we know it.
@@ -410,6 +339,21 @@ class HostView:
         """Shared cards nobody is on: neither one of ours nor anybody else's."""
         return [c for c in self.shared if c.unused and not self.gpu_holder(c.uuid)]
 
+    def cards_ours_to_wait_for(self, job: JobView) -> int:
+        """How many cards this job could have once every job of ours ends.
+
+        What decides whether the host holds for a job that does not fit,
+        repeated from the dispatcher's `launch_ready`: the owned cards as
+        configured, missing ones included, plus, if the job may borrow, the
+        shared cards nobody else is on -- idle, or held by one of ours. A
+        shared card somebody else is using is left out, because when they stop
+        is not this host's to wait for: a job short of one is stepped over.
+        """
+        count = len(self.owned) + len(self.unavailable)
+        if self.may_borrow(job):
+            count += sum(1 for c in self.shared if c.unused or self.gpu_holder(c.uuid))
+        return count
+
     @property
     def outputs_at_risk(self) -> list[JobView]:
         """Finished jobs holding the only copy of what they produced."""
@@ -425,23 +369,6 @@ class HostView:
         warning in `host_warnings` is for.
         """
         return sum(job.workdir_bytes or 0 for job in self.finished)
-
-    @property
-    def past_ttl(self) -> bool:
-        """Age from the provider's own createdAt when we have it.
-
-        The registry's created_at is when *this* machine recorded the host,
-        which is not the same clock the reaper's TTL uses; a pod adopted or
-        re-registered later would read as young here and be terminated there.
-        """
-        if not self.entry.ephemeral or self.entry.ttl_hours is None:
-            return False
-        if self.pod is not None and self.pod.age is not None:
-            return self.pod.age.total_seconds() / 3600.0 > self.entry.ttl_hours
-        created = parse_timestamp(self.entry.created_at)
-        if created is None:
-            return False
-        return (datetime.now(UTC) - created).total_seconds() / 3600.0 > self.entry.ttl_hours
 
 
 def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], list[JobView]]:
@@ -480,7 +407,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             started_at=entry.get("started_at"),
             ended_at=entry.get("ended_at"),
             # A sample is null when nvidia-smi failed; drop it rather than
-            # counting a missing reading as 0% and calling the job a suspect.
+            # showing a missing reading as 0%.
             util_recent=[
                 float(u) for u in entry.get("util_recent") or [] if isinstance(u, (int, float))
             ],
@@ -493,7 +420,6 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
             isolation=entry.get("isolation"),
-            low_util=LowUtilView.from_payload(entry.get("low_util")),
             outputs=[o for o in entry.get("outputs") or [] if isinstance(o, dict)],
             wandb=_str_dict(entry.get("wandb")),
         )
@@ -529,7 +455,7 @@ def gather(
         status = "missing" if view.pod is None else view.pod.status
         view.error = (
             f"pod {entry.pod_id} is {status}; the registry entry is stale. "
-            f"Run `gpuc reconcile --once` to forget it."
+            f"Run `gpuc host remove {entry.name}` to forget it."
         )
         return view
     try:
@@ -559,12 +485,11 @@ def gather(
     # Into the one numbering table, because it is what names a card everywhere
     # it is mentioned -- including `gpu=4` on the line of a job that borrowed it.
     view.indices.update({c.uuid: c.index for c in view.shared if c.index is not None})
-    # Validated like `reconcile.probe_liveness` does: a host on another build
-    # could answer with a string here, and formatting it would take out the
-    # whole `gpuc status`, not just this host's line.
+    # Validated rather than trusted: a host on another build could answer with
+    # a string here, and formatting it would take out the whole `gpuc status`,
+    # not just this host's line.
     view.heartbeat_age_s = _as_float(payload.get("dispatcher_heartbeat_age_s"))
     view.draining = bool(payload.get("draining"))
-    view.paused = bool(payload.get("paused"))
     view.queue, view.running, view.finished = job_views(payload)
     return view
 
@@ -650,9 +575,7 @@ def _fmt_cards(job: JobView) -> str:
     job waiting for three is the answer to "there is a card free, why is it
     still queued".
     """
-    # `<= 1` and not `== 1`: a `gpus: 0` job holds no card and never waits for
-    # one, which is why it is ignored everywhere else here too.
-    if job.gpus_requested is None or job.gpus_requested <= 1:
+    if job.gpus_requested is None or job.gpus_requested == 1:
         return ""
     return f" needs {job.gpus_requested} gpus"
 
@@ -683,14 +606,16 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
     comes free at the eta of the job holding it, and the queue is taken in
     order, because that is what the dispatcher does -- a job that does not fit
     holds the free cards it is waiting for, and nothing behind it may take
-    them. A `gpus: 0` job is the exception at both ends: it holds no card and
-    is never held up by one, so it starts now wherever it sits in the queue.
+    them.
 
     A job is in the answer or it is not: one whose turn depends on a job that
     gave no estimate is absent, never guessed at. That is why a *later* job can
-    have a start time when an earlier one does not: it is one of the jobs the
-    host would walk past, because holding cards for it would mean waiting on
-    something this host does not control.
+    have a start time when an earlier one does not: the earlier one could not
+    fit even once every job of ours ends, so it is short a shared card somebody
+    else is on, and the host steps over that rather than hold cards for it. A
+    job waiting for an owned card that has dropped off nvidia-smi is the other
+    way round: it holds, exactly as the dispatcher holds for it, so it and
+    everything behind it are absent until the card is back.
 
     Shared cards are in the model, but only the ones that are idle *now* and
     only for the jobs allowed onto them. A card somebody else is using is left
@@ -700,20 +625,14 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
     pass that it starts in six hours, which is the exact question this whole
     machinery exists to answer correctly.
     """
-    # Nothing is dispatched on a paused or draining host, so every start time
-    # here would be an answer to a question nobody asked: when it would have
-    # started if the host were taking work.
-    if view.paused or view.draining or not view.queue:
+    # Nothing is dispatched on a draining host, so every start time here would
+    # be an answer to a question nobody asked: when it would have started if
+    # the host were taking work.
+    if view.draining or not view.queue:
         return {}
     cards = _card_releases(view)
     starts: dict[str, float] = {}
-    pending: list[JobView] = []
-    for job in view.queue:
-        if job.gpus_requested == 0:
-            # It holds no card and waits for none, wherever it sits in the queue.
-            starts[job.job_id] = 0.0
-        else:
-            pending.append(job)
+    pending = list(view.queue)
     clock = 0.0
     while pending:
         # Cards a job that could not start is waiting for, which the host holds
@@ -735,10 +654,12 @@ def queue_start_estimates(view: HostView) -> dict[str, float]:
             take_owned = free_owned[: job.gpus_requested]
             take_shared = free_shared[: job.gpus_requested - len(take_owned)]
             if len(take_owned) + len(take_shared) < job.gpus_requested:
-                # It does not fit. The host holds what it could take only when
-                # it could supply the whole job itself; a job that can only run
-                # by borrowing waits on somebody else and is walked past.
-                if job.gpus_requested <= len(view.owned):
+                # It does not fit. The host holds what it could take unless the
+                # job could not fit even once every job of ours ends: that one
+                # waits on somebody else's shared card and is stepped over.
+                # Counted against the configured owned cards, missing ones
+                # included, as the dispatcher does.
+                if job.gpus_requested <= view.cards_ours_to_wait_for(job):
                     held += len(take_owned)
                     held_shared += len(take_shared)
                 continue
@@ -824,13 +745,11 @@ def no_start_reason(view: HostView, job: JobView) -> str:
     """Why this queued job has no projected start time.
 
     There are several reasons and they are not interchangeable: a submit to a
-    paused host is an ordinary mistake, and this is the moment the submitter is
-    looking. Saying "a job ahead of it gave no estimate" about the only job in
-    the queue of a host that is not dispatching at all would be a lie told at
+    draining host is an ordinary mistake, and this is the moment the submitter
+    is looking. Saying "a job ahead of it gave no estimate" about the only job
+    in the queue of a host that is not dispatching at all would be a lie told at
     exactly the wrong time.
     """
-    if view.paused:
-        return f"host {view.entry.name} is paused, so nothing is being dispatched"
     if view.draining:
         return f"host {view.entry.name} is draining, so nothing more will be dispatched"
     borrows = view.may_borrow(job)
@@ -856,13 +775,15 @@ def no_start_reason(view: HostView, job: JobView) -> str:
         )
     if any(ahead.gpus_requested is None for ahead in view.queue):
         return "this host does not report how many cards a queued job asked for"
-    if borrows and job.gpus_requested is not None and job.gpus_requested > len(view.owned):
-        # Not an omission: a shared card comes free when its real owner stops
+    ours = view.cards_ours_to_wait_for(job)
+    if borrows and job.gpus_requested is not None and job.gpus_requested > ours:
+        # The job the host steps over: not an omission, and not the queue's
+        # doing either. A shared card comes free when its real owner stops
         # using it, and nothing here can know when that is. Saying so is the
         # honest answer, and the only alternative is a number we made up.
         return (
-            f"it needs {job.gpus_requested - len(view.owned)} shared card(s), and when "
-            f"somebody else stops using one is not something this host can predict"
+            f"it needs {job.gpus_requested - ours} shared card(s) somebody else is using, "
+            f"and when they stop is not something this host can predict"
         )
     order = [queued.job_id for queued in view.queue]
     blocking = next(
@@ -878,6 +799,18 @@ def no_start_reason(view: HostView, job: JobView) -> str:
         # knowable until that one's is -- and saying "the cards it needs" of a
         # job that is waiting on the queue rather than on a card is a lie.
         return f"job {blocking.job_id} is ahead of it and has no start time yet"
+    owned = len(view.owned) + len(view.unavailable)
+    if job.gpus_requested is not None and len(view.owned) < job.gpus_requested <= owned:
+        # The host holds for this job, and the card it holds for is one the
+        # host is configured with but cannot see: that is the host's problem
+        # to fix, not a wait, and what the submitter should hear. After the
+        # queue check, so only the job at the front says it, and a job behind
+        # it is told which job it is waiting on.
+        return (
+            f"it needs {job.gpus_requested} card(s) and only {len(view.owned)} of the "
+            f"{owned} this host owns answer to nvidia-smi ({', '.join(view.unavailable)} "
+            f"missing), so it is held until they do"
+        )
     # Running or queued: either way, the cards this job is waiting for are
     # spoken for by something that never said when it would be done with them.
     return "the jobs holding the cards it needs gave no end time"
@@ -937,20 +870,16 @@ def next_free_line(view: HostView) -> str | None:
     anything has no answer to give, and saying so under a `free` label, next to
     a gpu list that already says every card is busy, is a line to scan past.
     """
-    # `gpus: 0` jobs are running but hold no card, so they can never be the
-    # reason one comes free -- and naming a five-minute CPU job as the next
-    # card would answer the one question this line exists for with a lie.
-    holding = [job for job in view.running if job.gpus]
-    if not view.owned or view.free or not holding:
+    if not view.owned or view.free or not view.running:
         return None
     known: list[tuple[float, JobView]] = []
-    for job in holding:
+    for job in view.running:
         remaining = job.eta_seconds
         if remaining is not None:
             known.append((remaining, job))
     if not known:
         return None
-    silent = len(holding) - len(known)
+    silent = len(view.running) - len(known)
     remaining, job = min(known, key=lambda pair: pair[0])
     when = "overdue" if remaining < 0 else f"in ~{format_duration(remaining)}"
     # "no end time", not "no estimate": a job whose host has an estimate it has
@@ -995,7 +924,7 @@ def _gpu_lines(view: HostView) -> list[str]:
     for missing in view.unavailable:
         lines.append(
             f"  gpu     [{missing}] UNAVAILABLE  nvidia-smi does not report this card on the "
-            f"host, so nothing is dispatched to it"
+            f"host; nothing is dispatched to it, and a job waiting for it holds the queue"
         )
     return lines + _shared_gpu_lines(view)
 
@@ -1041,7 +970,6 @@ def render(
     view: HostView,
     *,
     recent: int = RECENT_FINISHED,
-    suspects_only: bool = False,
     since_s: float | None = None,
 ) -> str:
     entry = view.entry
@@ -1061,8 +989,6 @@ def render(
     flags = []
     if view.draining:
         flags.append("DRAINING")
-    if view.paused:
-        flags.append(f"PAUSED (low-util); resume with `gpuc host resume {entry.name}`")
     dispatcher = (
         f"dispatcher {view.heartbeat_age_s:.0f}s ago"
         if view.dispatcher_alive
@@ -1085,33 +1011,19 @@ def render(
     lines = [header]
     lines += [f"  WARNING {warning}" for warning in host_warnings(view)]
     lines.append(f"  {dispatcher}")
-    if not suspects_only:
-        lines += _gpu_lines(view)
+    lines += _gpu_lines(view)
     pod = pod_line(view.pod)
     if pod:
-        lines.append(pod + ("  PAST TTL" if view.past_ttl else ""))
+        lines.append(pod)
     # Where the per-job body starts. The header, the gpu lines and the pod line
     # are about the host, not about what is on it, so "nothing here" has to be
-    # measured from here -- a host with GPUs printed neither `idle` nor `no
-    # suspects` while this was compared against the whole list.
+    # measured from here -- a host with GPUs never printed `idle` while this
+    # was compared against the whole list.
     body_start = len(lines)
 
-    if suspects_only:
-        for job in view.suspects:
-            lines.append(
-                f"  SUSPECT {_job_label(job)} phase={job.phase} {_fmt_elapsed(job)} "
-                f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
-            )
-        if view.past_ttl:
-            lines.append(f"  SUSPECT pod for host {entry.name} is older than {entry.ttl_hours}h")
-        if len(lines) == body_start:
-            lines.append("  no suspects")
-        return "\n".join(lines)
-
     for job in view.running:
-        mark = "  running" if not job.suspect else "  running!"
         lines.append(
-            f"{mark} {_job_label(job)} phase={job.phase or '-'} {_fmt_elapsed(job)} "
+            f"  running {_job_label(job)} phase={job.phase or '-'} {_fmt_elapsed(job)} "
             f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             f"{_fmt_eta(job)}{_fmt_auto_preempt(job)}"
         )
@@ -1249,7 +1161,6 @@ def job_json(
         "ended_at": job.ended_at,
         "outputs_pending": job.outputs_pending,
         "outputs_lost": job.outputs_lost,
-        "suspect": job.suspect,
         "workdir_bytes": job.workdir_bytes,
         "outputs": [dict(o) for o in job.outputs],
         "links": job_links(job, mirror_prefix),
@@ -1378,7 +1289,6 @@ def host_json(
         "reachable": view.reachable,
         "pod_gone": view.pod_gone,
         "draining": view.draining,
-        "paused": view.paused,
         # The host's own answer, so null means the host did not say, never
         # "current".
         "pkg_commit": view.pkg_commit,
@@ -1413,7 +1323,6 @@ def pod_json(view: HostView) -> dict[str, Any] | None:
         "cost_usd_hr": pod.cost_usd_hr,
         "cuda_version": pod.cuda_version,
         "age_s": None if pod.age is None else round(pod.age.total_seconds(), 1),
-        "past_ttl": view.past_ttl,
     }
 
 

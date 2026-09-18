@@ -7,22 +7,15 @@ from pathlib import Path
 import pytest
 
 from gpuc.control import pods as pods_mod
-from gpuc.control.config import (
-    DesiredHost,
-    Settings,
-    desired_dir,
-    registry_transaction,
-    utc_now,
-    write_desired,
-)
+from gpuc.control.config import Settings, registry_transaction
 from gpuc.control.status import HostView, render
 from tests.conftest import host_entry
-from tests.fakeprovider import FakeProvider, PodScript, make_offer, running_pod
+from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
 FOREIGN = "other-someone-else"
 
 
-def _register(pod_name: str, pod_id: str, *, desired: bool = True) -> None:
+def _register(pod_name: str, pod_id: str) -> None:
     with registry_transaction() as registry:
         registry.put(
             host_entry(
@@ -31,17 +24,6 @@ def _register(pod_name: str, pod_id: str, *, desired: bool = True) -> None:
                 pod_id=pod_id,
                 ssh="root@1.2.3.4",
                 python="/root/python",
-            )
-        )
-    if desired:
-        write_desired(
-            DesiredHost(
-                name=pod_name,
-                pod_id=pod_id,
-                offer=make_offer(),
-                created_at=utc_now(),
-                ceiling_at=utc_now(),
-                bootstrapped_at=utc_now(),
             )
         )
 
@@ -54,10 +36,9 @@ def provider() -> FakeProvider:
     return fake
 
 
-def test_table_marks_undesired_pods_and_counts_the_rest(
+def test_table_names_the_host_each_pod_is_here_and_counts_the_rest(
     control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    desired_dir().mkdir(parents=True, exist_ok=True)
     _register("gpuc-e2e-aaa", "pod1")
     monkeypatch.setattr("gpuc.control.pods.dispatcher_heartbeat_age", lambda *a: 4.0)
 
@@ -66,12 +47,24 @@ def test_table_marks_undesired_pods_and_counts_the_rest(
     lines = text.splitlines()
     assert lines[0].split() == list(pods_mod.COLUMNS)
     assert "gpuc-e2e-aaa" in text and "NVIDIA A40" in text and "12m" in text
-    assert "yes" in lines[1] and "4s" in lines[1]
-    assert "DESIRED=NO on gpuc-leak-bbb" in text
+    assert lines[1].split()[-2:] == ["gpuc-e2e-aaa", "4s"]
+    assert lines[2].split()[-2:] == ["-", "-"]
+    assert "not registered here: gpuc-leak-bbb (podL)" in text
     assert "2 pod(s) with our prefix, $0.98/h total" in text
     assert f"1 other pod(s) in the account, never touched: {FOREIGN} (RUNNING)" in text
     # Someone else's pod contributes no cost and no row of its own.
     assert FOREIGN not in "\n".join(lines[:3])
+
+
+def test_a_young_unregistered_pod_is_flagged_as_possibly_still_provisioning(
+    control_env: Path, provider: FakeProvider
+) -> None:
+    """The registry entry is written only after connect, minutes into a
+    `submit --runpod`; a pod inside that window is not a leak to end."""
+    text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
+    note = next(line for line in text.splitlines() if "provisioning ceiling" in line)
+    assert note.startswith("gpuc-e2e-aaa:")
+    assert "gpuc-leak-bbb" not in note
 
 
 def test_two_pods_that_compare_equal_are_still_told_apart(control_env: Path) -> None:
@@ -79,38 +72,29 @@ def test_two_pods_that_compare_equal_are_still_told_apart(control_env: Path) -> 
     pods with the same fields would otherwise hide each other from the table."""
     fake = FakeProvider(existing=[running_pod(FOREIGN, "podF"), running_pod(FOREIGN, "podG")])
     fake.adopt(running_pod("gpuc-e2e-aaa", "pod1"), PodScript(ssh_after_polls=0))
-    desired_dir().mkdir(parents=True, exist_ok=True)
     view = pods_mod.gather(Settings(), fake, heartbeats=False)
     assert [row.pod.id for row in view.rows] == ["pod1"]
     assert [pod.id for pod in view.others] == ["podF", "podG"]
 
 
-def test_a_pod_nothing_wants_says_who_will_deal_with_it(
+def test_a_pod_registered_nowhere_here_says_who_will_deal_with_it(
     control_env: Path, provider: FakeProvider
 ) -> None:
-    desired_dir().mkdir(parents=True, exist_ok=True)
     text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
-    assert "asks each of them what it is" in text
-    # The one thing it must not say is that something here will terminate it.
-    assert "nothing here terminates a pod it has no record of" in text
-
-
-def test_unreadable_desired_state_is_a_note_not_a_crash(
-    control_env: Path, provider: FakeProvider
-) -> None:
+    assert "gpuc host add <name> --pod <id>" in text
+    # The one thing it must not claim is that something here will terminate it.
+    assert "nothing here ends a pod" in text
     view = pods_mod.gather(Settings(), provider, heartbeats=False)
-    assert view.notes and "unreadable" in view.notes[0]
-    assert all(not row.desired for row in view.rows)
+    assert [row.host for row in view.rows] == [None, None]
 
 
 def test_empty_account_renders_a_hint(control_env: Path) -> None:
-    desired_dir().mkdir(parents=True, exist_ok=True)
     text = pods_mod.render(pods_mod.gather(Settings(), FakeProvider()))
     assert "(no pods with our prefix)" in text
 
 
 def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
-    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", ttl_hours=1.0)
+    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
     view = HostView(
         entry=entry,
         reachable=True,

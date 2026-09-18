@@ -11,7 +11,7 @@ from gpuc.host import jobs, paths, preflight, queue, runner, sync
 from gpuc.host.jobs import HostConfig
 from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
-from tests.conftest import make_spec
+from tests.conftest import FAKE_GPUS, fake_smi, make_spec
 
 
 class FakeRunner:
@@ -145,12 +145,12 @@ def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
     spec = make_spec(command="echo SHOULD-NOT-RUN")
     job_id = queue.enqueue(spec)
     queue.remove_marker(job_id)
-    jobs.update_state(job_id, status="running")
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     fake = FakeRunner(fail_on="s3 cp", output="An error occurred (NoSuchBucket)")
 
     code = runner.run_job(
         job_id,
-        RunnerDeps(command_runner=fake, preflight=False, poll_interval_s=0.02),
+        RunnerDeps(smi=fake_smi(), command_runner=fake, preflight=False, poll_interval_s=0.02),
     )
 
     state = jobs.read_state(job_id)
@@ -165,10 +165,13 @@ def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, tools: None) -> N
     spec = make_spec(command="echo RAN")
     job_id = queue.enqueue(spec)
     queue.remove_marker(job_id)
-    jobs.update_state(job_id, status="running")
+    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
 
     code = runner.run_job(
-        job_id, RunnerDeps(command_runner=FakeRunner(), preflight=False, poll_interval_s=0.02)
+        job_id,
+        RunnerDeps(
+            smi=fake_smi(), command_runner=FakeRunner(), preflight=False, poll_interval_s=0.02
+        ),
     )
 
     assert (code, jobs.read_state(job_id).status) == (0, "succeeded")

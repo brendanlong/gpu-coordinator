@@ -18,7 +18,7 @@ from gpuc.control.bootstrap import BootstrapResult
 from gpuc.control.config import HostEntry, Settings, utc_now
 from gpuc.control.providers.base import (
     DEFAULT_IMAGE,
-    Caps,
+    DEFAULT_PREFIX,
     Cloud,
     Constraints,
     Offer,
@@ -79,11 +79,11 @@ class FakeProvider(Provider):
         self,
         offers: list[Offer] | None = None,
         *,
-        caps: Caps | None = None,
+        prefix: str = DEFAULT_PREFIX,
         scripts: list[PodScript] | None = None,
         existing: list[Pod] | None = None,
     ) -> None:
-        self.caps = caps or Caps()
+        self.prefix = prefix
         self._offers = offers if offers is not None else [make_offer()]
         self._scripts = iter(scripts or [])
         self._ids = itertools.count(1)
@@ -123,8 +123,8 @@ class FakeProvider(Provider):
         cuda_min: str | None = None,
         gpu_count: int = 1,
     ) -> Pod:
-        if not name.startswith(self.caps.prefix):
-            raise ProviderError(f"pod name {name!r} must start with {self.caps.prefix!r}")
+        if not name.startswith(self.prefix):
+            raise ProviderError(f"pod name {name!r} must start with {self.prefix!r}")
         script = next(self._scripts, PodScript())
         self.created.append(
             {

@@ -1,9 +1,11 @@
 Shapes of the two files two builds of gpuc share.
 
-`*.current.json` are copies of what this build writes today (`hosts.json` from
-a real local registry -- including a RunPod host carrying the `"ttl_hours":
-null` that started all this, with its endpoint and pod id redacted --  and
-`config.json` as bootstrap renders one). `hosts.presplit.json` is the same
+`*.current.json` are copies of what a build wrote at the time (`hosts.json`
+from a real local registry -- including a RunPod host carrying the
+`"ttl_hours": null` that started all this, with its endpoint and pod id
+redacted -- and `config.json` as bootstrap rendered one). `ttl_hours` has since
+been removed altogether, so every fixture now also proves that a key this build
+no longer knows is ignored. `hosts.presplit.json` is the same
 registry as a build from before the address/config split wrote it, with the
 host's config flat beside the address; today's reader treats every one of
 those fields as a cache of what the host holds. `*.older.json`

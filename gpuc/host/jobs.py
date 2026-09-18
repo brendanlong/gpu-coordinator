@@ -130,7 +130,7 @@ def as_float(d: Any, key: str, default: float) -> float:
 
     A field another build made optional arrives as an explicit `null`; a
     hand-edited file arrives as a string. Neither may take the dispatcher down
-    -- it crashed 20 times on one `"ttl_hours": null` and gave up -- so an
+    -- it crashed 20 times on one `"retention_days": null` and gave up -- so an
     unusable value means the default, which is what the field meant before the
     key existed at all.
     """
@@ -231,23 +231,6 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 
 @dataclass
-class LowUtil:
-    enabled: bool = True
-    window_min: float = 25.0
-    floor_pct: float = 5.0
-    grace_min: float = 10.0
-
-    @staticmethod
-    def from_dict(d: Any) -> LowUtil:
-        return LowUtil(
-            enabled=as_bool(d, "enabled", True),
-            window_min=as_float(d, "window_min", 25.0),
-            floor_pct=as_float(d, "floor_pct", 5.0),
-            grace_min=as_float(d, "grace_min", 10.0),
-        )
-
-
-@dataclass
 class Output:
     path: str
     s3: str | None = None
@@ -304,7 +287,6 @@ class JobSpec:
     percentage written with a `%` (`42%`). It replaces the submitter's estimate
     with a measured one. A failure is recorded and ignored; see `progress.py`."""
     progress_interval_s: float = progress.DEFAULT_INTERVAL_S
-    low_util: LowUtil = field(default_factory=LowUtil)
     auto_preempt: bool = False
     """Let the dispatcher stop this job whenever that starts a more important
     one right away, as often as it takes: see `dispatcher.preempt_for_waiting`.
@@ -347,7 +329,6 @@ class JobSpec:
             estimated_runtime_min=as_opt_float(fields, "estimated_runtime_min"),
             progress_command=as_opt_str(fields, "progress_command"),
             progress_interval_s=_polling_interval(fields),
-            low_util=LowUtil.from_dict(fields.get("low_util")),
             auto_preempt=as_bool(fields, "auto_preempt"),
             requires=dict(fields.get("requires") or {})
             if isinstance(fields.get("requires"), dict)
@@ -568,12 +549,6 @@ class HostConfig:
     """
     provider: dict[str, Any] | None = None
     idle_minutes: float = 15.0
-    ttl_hours: float | None = None
-    """Hard cap on this host's life, in hours. Null (the default) never
-    terminates on age: the idle timer is what stops an ephemeral host, and a
-    wall clock that kills a running job at hour 24 is a worse failure than a
-    pod that idles for fifteen minutes. When set, the dispatcher kills the
-    running job with reason `ttl`, syncs, and terminates."""
     s3_prefix: str | None = None
     created_at: str | None = None
     retention_days: float | None = None
@@ -621,7 +596,6 @@ class HostConfig:
             shared_gpus=as_str_list(fields, "shared_gpus"),
             provider=provider if isinstance(provider, dict) else None,
             idle_minutes=as_float(fields, "idle_minutes", 15.0),
-            ttl_hours=as_opt_float(fields, "ttl_hours"),
             s3_prefix=as_opt_str(fields, "s3_prefix"),
             created_at=as_opt_str(fields, "created_at"),
             retention_days=as_opt_float(fields, "retention_days"),
@@ -702,7 +676,7 @@ def merge_config(patch: dict[str, Any]) -> dict[str, Any]:
     read what is there, replace the named keys, write the whole file back
     atomically. A key this build does not know is carried through untouched --
     it belongs to whichever build wrote it, not to us -- and the keys it does
-    know are normalised, so a hand-written `"ttl_hours": "24"` cannot leave a
+    know are normalised, so a hand-written `"idle_minutes": "30"` cannot leave a
     string where the dispatcher reads a number.
 
     `env` is replaced wholesale rather than merged: "set it to exactly this" is

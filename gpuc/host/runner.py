@@ -1,4 +1,4 @@
-"""Runs exactly one job: environment, preflight, watchdogs, sync, exit code.
+"""Runs exactly one job: environment, preflight, wall-clock limit, sync, exit code.
 
 Exit-code discipline (measured in the shell implementation this replaces):
 the job's exit code is captured before *any* cleanup, and a failed final sync
@@ -14,9 +14,8 @@ import shlex
 import signal
 import subprocess
 import time
-from collections import deque
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
@@ -276,34 +275,6 @@ class RunnerDeps:
         return lambda uuids: gpus.mean_utilization(uuids, self.smi)
 
 
-@dataclass
-class _Window:
-    """Rolling mean over the trailing `window_s`, with a separate record of how
-    long we have been sampling: the retained samples always span *less* than
-    the window, so they cannot themselves tell us the window is covered."""
-
-    window_s: float
-    samples: deque[tuple[float, float]] = field(default_factory=deque)
-    first_t: float | None = None
-
-    def add(self, t: float, value: float) -> None:
-        if self.first_t is None:
-            self.first_t = t
-        self.samples.append((t, value))
-        while len(self.samples) > 1 and t - self.samples[0][0] > self.window_s:
-            self.samples.popleft()
-
-    def full(self, t: float) -> bool:
-        return (
-            self.first_t is not None
-            and len(self.samples) >= 2
-            and (t - self.first_t) >= self.window_s
-        )
-
-    def mean(self) -> float:
-        return sum(v for _, v in self.samples) / len(self.samples)
-
-
 def build_env(
     spec: JobSpec, assigned: Sequence[str], config: jobs.HostConfig | None = None
 ) -> dict[str, str]:
@@ -407,16 +378,11 @@ class JobRunner:
             cgroup_unit=self._current_unit,
         )
         sampler = deps.util_sampler()
-        low_util = self.spec.low_util
-        record_util = phase == "main" and bool(self.assigned)
-        watch_low_util = record_util and low_util.enabled
-        window = _Window(low_util.window_min * 60.0)
+        # Utilization is sampled for `gpuc status` only, and only in `main`:
+        # setup is downloads and compiles, and a 0% there says nothing.
+        record_util = phase == "main"
         phase_start = deps.now()
-        # Sampling starts immediately so `gpuc status --suspects` has data, but
-        # the kill window only opens after grace_min: setup-like work at the top
-        # of main (model download, compile) is legitimately at 0% util.
         next_sample = phase_start + deps.sample_interval_s
-        watch_from = phase_start + low_util.grace_min * 60.0
         max_runtime_s = (
             None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
         )
@@ -465,22 +431,11 @@ class JobRunner:
                     util = sampler(self.assigned)
                 except (gpus.GpuError, ValueError) as exc:
                     # A missing sample is not evidence of an idle GPU, so it is
-                    # recorded as unknown and never feeds the watchdog window.
+                    # recorded as unknown rather than as 0%.
                     self._log(log, f"utilization sample failed: {exc}")
                     self._record_util(None)
                     continue
                 self._record_util(util)
-                if not watch_low_util or t < watch_from:
-                    continue
-                window.add(t, util)
-                if window.full(t) and window.mean() < low_util.floor_pct:
-                    self._log(
-                        log,
-                        f"low-util watchdog: mean {window.mean():.1f}% over "
-                        f"{low_util.window_min:g} min is below {low_util.floor_pct:g}%",
-                    )
-                    self._kill(proc, "low-util", log)
-                    break
         return proc.wait()
 
     def _live_spec(self, previous: JobSpec) -> JobSpec:
@@ -641,8 +596,10 @@ class JobRunner:
         assignment was resolved host-side hands the index straight through. An
         index is only meaningful against the host's numbering right now, so it
         is resolved here and everything after this -- `CUDA_VISIBLE_DEVICES`,
-        the utilization watchdog -- sees UUIDs.
+        the utilization samples -- sees UUIDs.
         """
+        if not self.assigned:
+            return "no GPUs assigned; every job runs on at least one"
         before = list(self.assigned)
         try:
             self.assigned = gpus.resolve_present(self.assigned, "assigned GPUs", smi=self.deps.smi)
@@ -696,7 +653,7 @@ class JobRunner:
             if code != 0 or self.kill_reason:
                 return self._finalize(code, *self._classify(code, "setup"), sync_loop, log)
 
-        if self.assigned and self.deps.preflight:
+        if self.deps.preflight:
             cancelled = self._cancelled_before("preflight", sync_loop, log)
             if cancelled is not None:
                 return cancelled

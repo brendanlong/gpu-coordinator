@@ -23,10 +23,6 @@ class ProviderError(RuntimeError):
     pass
 
 
-class CapsExceeded(ProviderError):
-    pass
-
-
 class Constraints(BaseModel):
     gpu_names: list[str] = Field(default_factory=list)
     min_vram_gb: int | None = None
@@ -37,9 +33,9 @@ class Constraints(BaseModel):
 
 
 class Offer(BaseModel):
-    """One catalog entry. Every field has a default so a `desired/<host>.json`
-    written by another build still parses: losing track of a billing pod is a
-    worse failure than an offer record we cannot reuse."""
+    """One catalog entry. Every field has a default so the `offer` a pod's own
+    config records, written by another build, still parses: a pod we cannot
+    reuse is a smaller failure than one we cannot read."""
 
     gpu_id: str = ""
     name: str = ""
@@ -81,38 +77,15 @@ class Pod(BaseModel):
         return datetime.now(UTC) - self.created_at
 
 
-class Caps(BaseModel):
-    prefix: str = DEFAULT_PREFIX
-    max_pods: int = 3
-    max_total_usd_per_hour: float = 3.0
-
-
 def owned_pods(pods: list[Pod], prefix: str = DEFAULT_PREFIX) -> list[Pod]:
     return [p for p in pods if p.name.startswith(prefix)]
 
 
-def check_caps(caps: Caps, pods: list[Pod], new_price_usd_hr: float) -> None:
-    ours = [p for p in owned_pods(pods, caps.prefix) if p.status != "TERMINATED"]
-    if len(ours) + 1 > caps.max_pods:
-        raise CapsExceeded(
-            f"max_pods={caps.max_pods} would be exceeded: "
-            f"{len(ours)} pods with prefix {caps.prefix!r} already exist "
-            f"({', '.join(p.name for p in ours)})"
-        )
-    total = sum(p.cost_usd_hr for p in ours) + new_price_usd_hr
-    if total > caps.max_total_usd_per_hour:
-        raise CapsExceeded(
-            f"max_total_usd_per_hour={caps.max_total_usd_per_hour} would be exceeded: "
-            f"${sum(p.cost_usd_hr for p in ours):.2f}/h running + ${new_price_usd_hr:.2f}/h new "
-            f"= ${total:.2f}/h"
-        )
-
-
 class Provider(ABC):
-    caps: Caps
+    prefix: str
 
     def list_ours(self) -> list[Pod]:
-        return owned_pods(self.list(), self.caps.prefix)
+        return owned_pods(self.list(), self.prefix)
 
     @abstractmethod
     def offers(self, constraints: Constraints) -> list[Offer]: ...

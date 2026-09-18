@@ -138,28 +138,18 @@ def test_a_wide_job_is_not_starved_by_a_stream_of_narrow_ones(gpuc_home: Path) -
     assert jobs.read_state(wide).gpus == FAKE_GPUS
 
 
-def test_a_zero_gpu_job_is_never_held_up_by_a_job_waiting_for_cards(gpuc_home: Path) -> None:
-    """It holds no card, so it can never be the reason anything is short of
-    one -- and making it wait would buy the job ahead of it nothing."""
-    dispatcher, _ = make_dispatcher()
-    holding = queue.enqueue(make_spec(gpus=1, priority=50))
+def test_a_job_asking_for_no_gpus_fails_at_dispatch(gpuc_home: Path) -> None:
+    """`gpuc submit` refuses `gpus: 0`, so a spec that has it was queued by an
+    older build or written by hand. It is failed, with the reason, rather than
+    run on no card -- and it holds nothing up on its way out."""
+    none = queue.enqueue(make_spec(gpus=0, priority=10))
+    runnable = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=10))  # waiting for both cards
-    cpu_job = queue.enqueue(make_spec(gpus=0, priority=90))
-    dispatcher.run_once()
-    assert jobs.read_state(cpu_job).status == "running"
-    assert jobs.read_state(cpu_job).gpus == []
-    assert holding in dispatcher.running
-
-
-def test_a_zero_gpu_job_never_waits(gpuc_home: Path) -> None:
-    hog = queue.enqueue(make_spec(gpus=2, priority=10))
-    cpu_job = queue.enqueue(make_spec(gpus=0, priority=90))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert jobs.read_state(hog).status == "running"
-    assert jobs.read_state(cpu_job).status == "running"
-    assert jobs.read_state(cpu_job).gpus == []
+    state = jobs.read_state(none)
+    assert (state.status, state.reason) == ("failed", "needs at least 1 GPU, asked for 0")
+    assert none not in spawned
+    assert jobs.read_state(runnable).status == "running"
 
 
 def test_a_job_larger_than_the_host_fails_instead_of_blocking(gpuc_home: Path) -> None:
@@ -245,35 +235,14 @@ def test_a_live_orphan_is_adopted_not_failed(gpuc_home: Path) -> None:
     assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
 
 
-def _finish_low_util(dispatcher: Dispatcher, spawned: dict[str, FakeRunnerProcess]) -> None:
+def test_a_paused_marker_from_an_older_build_does_not_stop_dispatching(gpuc_home: Path) -> None:
+    """Builds before the host pause was removed left `paused` under the home;
+    a stale one is a file this build does not know, not a reason to sit idle."""
+    (paths.home() / "paused").write_text("two consecutive jobs failed with reason low-util\n")
     job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
-    spawned[job_id].finish(status="failed", reason="low-util")
-    dispatcher.run_once()
-
-
-def test_two_consecutive_low_util_failures_pause_the_host(gpuc_home: Path) -> None:
-    dispatcher, spawned = make_dispatcher()
-    _finish_low_util(dispatcher, spawned)
-    assert not dispatcher.paused()
-    _finish_low_util(dispatcher, spawned)
-    assert dispatcher.paused()
-    assert "low-util" in paths.paused_file().read_text()
-
-    blocked = queue.enqueue(make_spec(gpus=1))
-    dispatcher.run_once()
-    assert jobs.read_state(blocked).status == "queued"
-
-
-def test_a_success_between_low_util_failures_does_not_pause(gpuc_home: Path) -> None:
-    dispatcher, spawned = make_dispatcher()
-    _finish_low_util(dispatcher, spawned)
-    good = queue.enqueue(make_spec(gpus=1))
-    dispatcher.run_once()
-    spawned[good].finish()
-    dispatcher.run_once()
-    _finish_low_util(dispatcher, spawned)
-    assert not dispatcher.paused()
+    assert jobs.read_state(job_id).status == "running"
 
 
 def test_a_non_provider_host_never_self_terminates(gpuc_home: Path) -> None:
@@ -290,9 +259,7 @@ def test_a_non_provider_host_never_self_terminates(gpuc_home: Path) -> None:
     assert dispatcher.idle_and_not_ephemeral()
 
 
-def configure_pod(
-    idle_minutes: float = 15.0, ttl_hours: float | None = None, age_h: float = 0.0
-) -> None:
+def configure_pod(idle_minutes: float = 15.0, age_h: float = 0.0) -> None:
     created = datetime.now(UTC) - timedelta(hours=age_h)
     jobs.write_config(
         HostConfig(
@@ -300,7 +267,6 @@ def configure_pod(
             gpus=list(FAKE_GPUS),
             provider={"kind": "runpod", "pod_id": "pod-1"},
             idle_minutes=idle_minutes,
-            ttl_hours=ttl_hours,
             s3_prefix="s3://b/gpuc/pod",
             created_at=created.isoformat(),
         )
@@ -352,17 +318,6 @@ def test_a_running_job_resets_the_idle_timer(
     dispatcher.run_once()
     assert terminated == []
     clock.advance(40)
-    dispatcher.run_once()
-    assert terminated == ["pod-1"]
-
-
-def test_ttl_terminates_an_old_but_idle_pod(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
-    terminated: list[str] = []
-    dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
     dispatcher.run_once()
     assert terminated == ["pod-1"]
 
@@ -1025,8 +980,8 @@ def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     state = jobs.read_state(job_id)
     assert state.outputs_lost is True
     assert state.sync_error and "AccessDenied" in state.sync_error
-    # The pod still goes away: it is billing, and the TTL that sent us here
-    # does not pause for a bucket we cannot reach.
+    # The pod still goes away: it is billing, and a bucket we cannot reach is
+    # no reason to keep paying for it.
     assert terminated == ["pod-1"]
 
 
@@ -1045,14 +1000,11 @@ def test_the_drain_records_the_meta_backup_for_every_job(
     assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/pod"
 
 
-# -- the TTL is opt-in, and when it is on the dispatcher enforces it ------------
-
-
-def test_without_a_ttl_an_ancient_idle_pod_waits_for_its_idle_timer(
+def test_an_ancient_idle_pod_is_only_ever_stopped_by_its_idle_timer(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=None, age_h=500.0)
+    configure_pod(idle_minutes=600.0, age_h=500.0)
     terminated: list[str] = []
     dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
 
@@ -1061,43 +1013,18 @@ def test_without_a_ttl_an_ancient_idle_pod_waits_for_its_idle_timer(
     assert terminated == []
 
 
-def test_a_ttl_kills_the_running_job_with_reason_ttl_then_terminates(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
-    terminated: list[str] = []
-    dispatcher, spawned = make_dispatcher(
-        terminate_call=lambda pod, key: terminated.append(pod) or ""
-    )
-    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
-    dispatcher.run_once()
-    assert job_id in dispatcher.running
-
-    dispatcher.run_once()
-    # The runner owns the kill: the dispatcher asks, with the reason recorded.
-    assert queue.kill_reason(job_id) == "ttl"
-    assert terminated == []
-
-    spawned[job_id].finish(status="failed", reason="ttl")
-    dispatcher.run_once()
-    assert terminated == ["pod-1"]
-    assert paths.draining_file().exists()
-
-
-def test_a_ttl_kill_is_only_asked_for_once(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+def test_an_auto_preempt_kill_is_only_asked_for_once(gpuc_home: Path) -> None:
+    """A job already stopping has its cards counted as coming free; a second
+    request would say nothing new and reset the escalation clock."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
     dispatcher, _ = make_dispatcher()
-    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
     dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
     dispatcher.run_once()
-    written = paths.kill_file(job_id).stat().st_mtime_ns
+    assert queue.kill_reason(cheap) == "preempted"
+    written = paths.kill_file(cheap).stat().st_mtime_ns
     dispatcher.run_once()
-    assert paths.kill_file(job_id).stat().st_mtime_ns == written
+    assert paths.kill_file(cheap).stat().st_mtime_ns == written
 
 
 def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_running(
@@ -1123,60 +1050,27 @@ def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_runnin
     assert "could not spawn a runner" in paths.dispatcher_log().read_text()
 
 
-def test_a_low_util_pause_stops_the_other_jobs_before_it_drains(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Draining while another job runs terminated the pod out from under its
-    runner: no kill marker, no final sync, and the outputs went with it."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
-    configure_pod(idle_minutes=600.0)
-    terminated: list[str] = []
-    dispatcher, spawned = make_dispatcher(
-        terminate_call=lambda pod, key: terminated.append(pod) or ""
-    )
-    long_job = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
-    dispatcher.run_once()
-    assert long_job in dispatcher.running
-
-    _finish_low_util(dispatcher, spawned)
-    _finish_low_util(dispatcher, spawned)
-
-    assert dispatcher.paused()
-    assert queue.kill_reason(long_job) == "low-util-pause"
-    assert terminated == []
-    assert not paths.draining_file().exists()
-
-    spawned[long_job].finish(status="failed", reason="low-util-pause")
-    dispatcher.run_once()
-    assert terminated == ["pod-1"]
-
-
-def test_a_ttl_kill_the_runner_ignores_is_escalated_then_the_pod_drains(
+def test_a_preempt_kill_the_runner_ignores_is_escalated(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The kill marker is an ask, and a wedged runner never answers it. Without
-    an escalation the TTL'd pod stayed up -- billing, heartbeat fresh -- with
-    the job it was told to stop still running."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    an escalation the job it was told to stop kept running, and the one waiting
+    for its cards never started."""
     clock = FakeClock()
-    terminated: list[str] = []
-    dispatcher, spawned = make_dispatcher(
-        clock=clock, terminate_call=lambda pod, key: terminated.append(pod) or ""
-    )
-    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
+    dispatcher, spawned = make_dispatcher(clock=clock)
+    job_id = queue.enqueue(make_spec(gpus=2, command="sleep 600"))
     dispatcher.run_once()
     jobs.update_state(job_id, pgid=123456)
+    waiting = queue.enqueue(make_spec(gpus=2, priority=10))
 
     signals: list[tuple[int | None, int]] = []
     monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
     monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
 
+    queue.preempt(job_id)
     dispatcher.run_once()
-    assert queue.kill_reason(job_id) == "ttl"
+    assert queue.kill_reason(job_id) == "preempted"
     assert signals == []
 
     clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
@@ -1192,9 +1086,10 @@ def test_a_ttl_kill_the_runner_ignores_is_escalated_then_the_pod_drains(
     assert signals[-1] == (spawned[job_id].pid, signal.SIGKILL)
     assert "escalating" in paths.dispatcher_log().read_text()
 
-    spawned[job_id].finish(status="failed", reason="ttl")
+    spawned[job_id].finish(status="failed", reason="preempted")
     dispatcher.run_once()
-    assert terminated == ["pod-1"]
+    assert jobs.read_state(job_id).status == "queued"
+    assert jobs.read_state(waiting).status == "running"
 
 
 def test_the_drain_bounds_each_upload_and_skips_sync_preflight_failures(
@@ -1286,19 +1181,27 @@ def test_an_owned_index_the_host_cannot_see_is_not_handed_out(gpuc_home: Path) -
     assert "does not report" in paths.dispatcher_log().read_text()
 
 
-def test_a_job_wider_than_what_the_host_can_see_holds_no_cards(gpuc_home: Path) -> None:
-    """It is not waiting for a card that is coming back, so holding one for it
-    would idle the host for as long as a card stays missing -- possibly for
-    ever. The job is not failed either: `config.gpus` says the host owns
-    enough, and the card may be back on the next pass."""
-    configure_indices(["0", "7"])  # only index 0 is real
+def test_a_job_waiting_for_a_missing_owned_card_holds_like_any_other(gpuc_home: Path) -> None:
+    """`config.gpus` says the host has the card, so a host that cannot see it
+    is misconfigured or broken. The job holds the card it can see and the
+    queue behind it waits, which is how that gets noticed; it is not failed,
+    since the configured host is big enough, and it runs once the card is
+    back."""
+    configure_indices(["0", "1"])
     dispatcher, _ = make_dispatcher()
-    dispatcher.deps.smi = fake_smi()
-    wider_than_visible = queue.enqueue(make_spec(gpus=2, priority=10))
+    dispatcher.deps.smi = fake_smi([FAKE_GPUS[0]])  # index 1 has dropped off
+    wide = queue.enqueue(make_spec(gpus=2, priority=10))
     behind = queue.enqueue(make_spec(gpus=1, priority=50))
     dispatcher.run_once()
-    assert jobs.read_state(wider_than_visible).status == "queued"
-    assert jobs.read_state(behind).status == "running"
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(behind).status == "queued"
+    assert "does not report" in paths.dispatcher_log().read_text()
+
+    dispatcher.deps.smi = fake_smi()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "running"
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+    assert jobs.read_state(behind).status == "queued"
 
 
 def test_a_preempted_job_goes_back_in_the_queue_when_its_runner_stops(gpuc_home: Path) -> None:
@@ -1403,20 +1306,21 @@ def test_a_preempted_job_is_not_queued_again_on_a_host_that_is_going_away(
     and the drain would stop counting its outputs as unconfirmed, because that
     list is finished jobs. Left finished, it keeps both."""
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    configure_pod(idle_minutes=600.0)
     dispatcher, spawned = make_dispatcher()
     job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
     dispatcher.run_once()
     queue.enqueue(make_spec(gpus=1, priority=1))
     queue.preempt(job_id)
     spawned[job_id].finish(status="failed", reason="preempted")
+    paths.draining_file().write_text("idle\n")
     dispatcher.run_once()
 
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("failed", "preempted")
     assert queue.find_marker(job_id) is None
     assert not queue.is_preempted(job_id)
-    assert "past its ttl" in paths.dispatcher_log().read_text()
+    assert "this host is draining" in paths.dispatcher_log().read_text()
 
 
 def test_a_preempt_the_runner_ignores_is_escalated(
@@ -1634,7 +1538,7 @@ def test_a_borrowed_card_is_busy_until_its_job_ends(gpuc_home: Path) -> None:
     spawned[first].finish()
     dispatcher.deps.smi = fake_smi(ALL_GPUS)
     dispatcher.run_once()
-    assert dispatcher.borrowable_gpus() == [SHARED_GPUS[0]]
+    assert dispatcher.borrowable_gpus() == ([SHARED_GPUS[0]], 0)
 
 
 def test_a_job_too_big_even_with_shared_cards_fails_with_what_would_help(
@@ -1846,30 +1750,13 @@ def test_a_cancelled_job_in_the_queue_is_not_worth_preempting_for(gpuc_home: Pat
     assert not queue.is_preempted(cheap)
 
 
-@pytest.mark.parametrize("marker", ["paused", "draining"])
-def test_a_host_that_is_dispatching_nothing_preempts_nothing(gpuc_home: Path, marker: str) -> None:
+def test_a_draining_host_preempts_nothing(gpuc_home: Path) -> None:
     """The cards would go to nobody: the job is stopped and nothing replaces it."""
     cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     queue.enqueue(make_spec(gpus=2, priority=10))
-    (paths.paused_file() if marker == "paused" else paths.draining_file()).touch()
-    dispatcher.run_once()
-    assert not queue.is_preempted(cheap)
-
-
-def test_a_pod_past_its_ttl_preempts_nothing(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """It is about to terminate, so the waiting job would never be dispatched
-    and the stopped one would not even be queued again."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
-    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=10))
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=2.0)
+    paths.draining_file().touch()
     dispatcher.run_once()
     assert not queue.is_preempted(cheap)
 
@@ -1972,22 +1859,6 @@ def test_cards_held_for_a_job_that_is_cancelled_are_handed_out_again(gpuc_home: 
     assert jobs.read_state(cheap).attempt == 2
 
 
-def test_nothing_is_stopped_in_the_last_minutes_of_a_pods_ttl(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A job stopped here may never come back: the final sync takes as long as
-    it takes, and by then the host refuses to queue anything at all."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.0)
-    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=10))
-    configure_pod(idle_minutes=600.0, ttl_hours=1.0, age_h=0.96)  # ~2.5 min left
-    dispatcher.run_once()
-    assert not queue.is_preempted(cheap)
-
-
 def test_a_borrowed_card_is_not_freed_for_a_job_that_may_not_borrow(gpuc_home: Path) -> None:
     """Stopping it would hand back somebody else's card, which the waiting job
     cannot be dispatched onto: an attempt spent to start nothing."""
@@ -2022,8 +1893,10 @@ def test_a_borrowed_card_is_freed_for_a_job_that_asked_to_borrow(gpuc_home: Path
 
 
 def test_a_job_that_can_only_run_by_borrowing_holds_no_owned_card(gpuc_home: Path) -> None:
-    """The card it is short of comes free when somebody else's job ends, which
-    is not this host's to wait for -- so the queue behind it runs."""
+    """The one job the strict order steps over: it could not fit even once
+    every job of ours ends, because the card it is short of is a shared one
+    somebody else is on. That comes free when *their* job ends, which is not
+    this host's to wait for -- so the queue behind it runs."""
     dispatcher, _ = shared_host(
         shared=[SHARED_GPUS[0]],
         utilization={SHARED_GPUS[0]: 90.0},
@@ -2040,6 +1913,30 @@ def test_a_job_that_can_only_run_by_borrowing_holds_no_owned_card(gpuc_home: Pat
     # The free owned card goes to the job behind it rather than idling for a
     # card somebody else is training on.
     assert jobs.read_state(narrow).status == "running"
+
+
+def test_a_wide_borrower_short_of_an_owned_card_holds_like_any_other(gpuc_home: Path) -> None:
+    """The step-over is for a shared card somebody else is on, not for width.
+    This job asks for more than the host owns, but the shared card it wants is
+    idle and the card it is short of is an owned one our own job will free:
+    it holds what it took, or a steady stream of one-card jobs behind it takes
+    that owned card every time it frees and the job never runs."""
+    dispatcher, spawned = shared_host(shared=[SHARED_GPUS[0]])
+    holding = queue.enqueue(make_spec(gpus=1, priority=50))
+    dispatcher.run_once()
+    assert jobs.read_state(holding).gpus == [FAKE_GPUS[0]]
+
+    wide = queue.enqueue(make_spec(gpus=3, priority=10, use_shared=True))
+    narrow = queue.enqueue(make_spec(gpus=1, priority=50))
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(narrow).status == "queued"
+
+    spawned[holding].finish()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "running"
+    assert jobs.read_state(wide).gpus == [*FAKE_GPUS, SHARED_GPUS[0]]
+    assert jobs.read_state(narrow).status == "queued"
 
 
 def test_the_first_reading_of_the_shared_cards_is_logged_even_when_all_are_free(

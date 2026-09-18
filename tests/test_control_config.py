@@ -7,7 +7,6 @@ import pytest
 from gpuc.control import config
 from gpuc.control.config import (
     ConfigError,
-    DesiredHost,
     HostEntry,
     Registry,
     config_changes,
@@ -15,12 +14,10 @@ from gpuc.control.config import (
     forget_host,
     load_registry,
     load_settings,
-    read_desired,
     registry_transaction,
     save_registry,
     state_lock,
     transport_for,
-    write_desired,
 )
 from gpuc.control.transport import LocalTransport, SshTransport
 from gpuc.host.jobs import HostConfig
@@ -31,21 +28,21 @@ def test_settings_default_when_no_file(control_env: Path) -> None:
     settings = load_settings()
     assert settings.s3_bucket is None
     assert settings.runpod_pod_prefix == "gpuc-"
-    assert settings.max_pods == 3
+    assert settings.disk_gb == 50
 
 
 def test_settings_read_the_xdg_overridden_config(control_env: Path) -> None:
     config.config_file().write_text(
-        's3_bucket = "my-bucket"\nmax_pods = 1\nssh_key = "~/.ssh/id_ed25519"\n'
+        's3_bucket = "my-bucket"\ndisk_gb = 20\nssh_key = "~/.ssh/id_ed25519"\n'
     )
     settings = load_settings()
     assert settings.s3_bucket == "my-bucket"
-    assert settings.max_pods == 1
+    assert settings.disk_gb == 20
     assert settings.ssh_key_path is not None and settings.ssh_key_path.startswith("/")
 
 
 def test_bad_config_says_which_file_to_fix(control_env: Path) -> None:
-    config.config_file().write_text("max_pods = 'three'\n")
+    config.config_file().write_text("disk_gb = 'twenty'\n")
     with pytest.raises(ConfigError) as exc:
         load_settings()
     assert str(config.config_file()) in str(exc.value)
@@ -84,12 +81,12 @@ def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:
         kind="runpod",
         pod_id="abc",
         gpus=["GPU-a"],
-        ttl_hours=1.0,
+        retention_days=1.0,
         s3_prefix="s3://bucket/gpuc/pod1",
         env={"HF_HOME": "/big"},
         cache_dir="/vol/uv",
     )
-    assert (entry.gpus, entry.ttl_hours, entry.s3_prefix) == (
+    assert (entry.gpus, entry.retention_days, entry.s3_prefix) == (
         ["GPU-a"],
         1.0,
         "s3://bucket/gpuc/pod1",
@@ -125,14 +122,14 @@ def test_a_pre_split_registry_entry_becomes_a_cache_of_the_hosts_config() -> Non
             "python": "/usr/bin/python3.12",
             "cache_dir": "/mnt/ssd/uv",
             "env": {"HF_HOME": "/big"},
-            "ttl_hours": 24.0,
+            "retention_days": 24.0,
             "pkg_commit": "a" * 40,
         }
     )
     assert entry.gpus == ["2", "3"]
     assert entry.python == "/usr/bin/python3.12"
     assert entry.env == {"HF_HOME": "/big", "UV_CACHE_DIR": "/mnt/ssd/uv"}
-    assert entry.ttl_hours == 24.0
+    assert entry.retention_days == 24.0
     assert entry.pkg_commit == "a" * 40
     assert entry.config.host == "gpubox"
     # It is a cache now, and one that nothing has confirmed.
@@ -184,7 +181,7 @@ def test_config_drift_ignores_the_commit_and_names_env_without_its_values() -> N
 
 def test_config_drift_reports_the_settings_that_change_what_a_host_does() -> None:
     drift = config_drift(
-        {"host": "laptop-box", "s3_prefix": None, "retention_days": 30.0, "ttl_hours": None},
+        {"host": "laptop-box", "s3_prefix": None, "retention_days": 30.0},
         config_of(s3_prefix="s3://mine/gpuc/gpubox", retention_days=7.0),
     )
     assert drift == [
@@ -236,22 +233,20 @@ def test_config_drift_is_quiet_about_a_config_just_written() -> None:
 def test_forgetting_a_pod_leaves_a_different_host_of_the_same_name_alone(
     control_env: Path,
 ) -> None:
-    """A desired record and the registry can disagree about what a name means.
+    """A pod and the registry can disagree about what a name means.
 
-    The reaper forgets a host when its *pod* is gone or terminated; dropping
+    Reuse forgets a host when its *pod* is gone or terminated; dropping
     somebody's registered box because a pod answered to the same name is not
     something that should be possible.
     """
     mine = host_entry(name="shared", kind="ssh", ssh="me@box")
     with registry_transaction() as registry:
         registry.put(mine)
-    write_desired(DesiredHost(name="shared", pod_id="podX"))
 
     with state_lock():
         forget_host("shared", "podX")
 
-    assert read_desired("shared") is None  # the record was this pod's
-    assert load_registry().hosts["shared"].ssh == "me@box"  # the host was not
+    assert load_registry().hosts["shared"].ssh == "me@box"  # not this pod's entry
 
     with state_lock():
         forget_host("shared", None)  # no pod named: forget the host too

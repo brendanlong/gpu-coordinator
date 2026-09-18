@@ -1,7 +1,10 @@
-"""`gpuc pods`: the provider's view, so a leak is visible without trusting our state.
+"""`gpuc pods`: the provider's view, so what is billing is visible without trusting our state.
 
 Pods without our prefix are counted and named and nothing else: they belong to
 someone else and this command is the place that habit is most easily broken.
+Nothing here terminates anything: a pod with a dispatcher ends itself when its
+queue goes idle (`gpuc host set <host> --idle-min 0` hurries it), and one
+without is the provider console's to end.
 """
 
 from __future__ import annotations
@@ -9,23 +12,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuc.control.config import (
-    DesiredUnreadable,
-    Settings,
-    load_desired,
-    load_registry,
-)
+from gpuc.control.config import Settings, load_registry
 from gpuc.control.providers.base import Pod, Provider, owned_pods
-from gpuc.control.provision import dispatcher_heartbeat_age
+from gpuc.control.provision import CEILING_MINUTES, dispatcher_heartbeat_age
 from gpuc.control.status import format_duration
 
-COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "DESIRED", "HEARTBEAT")
+COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "HOST", "HEARTBEAT")
 
 
 @dataclass
 class PodRow:
     pod: Pod
-    desired: bool
+    host: str | None
+    """The registry name this machine drives the pod under; None if it does not."""
     heartbeat_s: float | None = None
 
     def cells(self) -> list[str]:
@@ -43,7 +42,7 @@ class PodRow:
             self.pod.cuda_version or "?",
             "?" if self.pod.age is None else format_duration(self.pod.age.total_seconds()),
             util,
-            "yes" if self.desired else "NO",
+            self.host or "-",
             heartbeat,
         ]
 
@@ -61,7 +60,7 @@ class PodRow:
             "age_s": None if age is None else round(age.total_seconds(), 1),
             "created_at": None if pod.created_at is None else pod.created_at.isoformat(),
             "gpu_utils": list(pod.gpu_utils),
-            "desired": self.desired,
+            "host": self.host,
             "heartbeat_age_s": self.heartbeat_s,
         }
 
@@ -80,11 +79,11 @@ class PodsView:
         """`gpuc pods --json`: the provider's answer, ours and everyone else's.
 
         `others` are pods without our prefix: an id, a name and a status, and
-        nothing else, because this command never touches them. `desired: false`
-        on one of ours means nothing here wants it *yet* -- `gpuc reconcile`
-        asks it what it is before anything else, and terminates nothing on the
-        absence of a record. `heartbeat_age_s` is null under `--no-heartbeat`
-        and for a pod that could not be asked.
+        nothing else, because this command never touches them. `host` on one
+        of ours is the name this machine's registry drives it under, null for
+        a pod registered nowhere here -- `gpuc host add <name> --pod <id>`
+        adopts it. `heartbeat_age_s` is null under `--no-heartbeat` and for a
+        pod that could not be asked.
         """
         return {
             "pods": [row.document() for row in self.rows],
@@ -104,15 +103,10 @@ def gather(
 ) -> PodsView:
     view = PodsView()
     pods = provider.list()
-    ours = owned_pods(pods, provider.caps.prefix)
+    ours = owned_pods(pods, provider.prefix)
     ours_ids = {pod.id for pod in ours}
     others = [pod for pod in pods if pod.id not in ours_ids]
     registry = load_registry()
-    try:
-        desired_ids = {host.pod_id for host in load_desired()}
-    except DesiredUnreadable as exc:
-        desired_ids = set()
-        view.notes.append(f"desired state is unreadable, so every pod shows DESIRED=NO: {exc}")
     by_pod_id = {e.pod_id: e for e in registry.hosts.values() if e.kind == "runpod" and e.pod_id}
 
     for pod in sorted(ours, key=lambda p: p.name):
@@ -123,9 +117,16 @@ def gather(
             if heartbeats and entry is not None and entry.python and pod.status == "RUNNING"
             else None
         )
-        view.rows.append(PodRow(pod=pod, desired=pod.id in desired_ids, heartbeat_s=age))
+        view.rows.append(
+            PodRow(pod=pod, host=entry.name if entry is not None else None, heartbeat_s=age)
+        )
     view.others = sorted(others, key=lambda p: p.name)
     return view
+
+
+def _may_be_provisioning(pod: Pod) -> bool:
+    age = pod.age
+    return age is not None and age.total_seconds() < CEILING_MINUTES * 60.0
 
 
 def render(view: PodsView) -> str:
@@ -138,16 +139,24 @@ def render(view: PodsView) -> str:
         lines.append("(no pods with our prefix)")
     else:
         lines.append(f"{len(view.rows)} pod(s) with our prefix, ${view.hourly:.2f}/h total")
-    stray = [
-        row.pod.name for row in view.rows if not row.desired and row.pod.status != "TERMINATED"
+    unregistered = [
+        row.pod for row in view.rows if row.host is None and row.pod.status != "TERMINATED"
     ]
-    if stray:
+    if unregistered:
+        names = ", ".join(f"{pod.name} ({pod.id})" for pod in unregistered)
         lines.append(
-            f"DESIRED=NO on {', '.join(stray)}: nothing here wants these yet. "
-            f"`gpuc reconcile --once` asks each of them what it is and takes on the ones "
-            f"running gpuc; anything still DESIRED=NO after that is yours to end -- nothing "
-            f"here terminates a pod it has no record of."
+            f"not registered here: {names}. `gpuc host add <name> --pod <id>` drives one "
+            f"from this machine; nothing here ends a pod, so one whose dispatcher is gone "
+            f"bills until you end it in the provider's console."
         )
+        young = [pod for pod in unregistered if _may_be_provisioning(pod)]
+        if young:
+            names = ", ".join(pod.name for pod in young)
+            lines.append(
+                f"{names}: younger than the {CEILING_MINUTES:.0f} min provisioning ceiling, "
+                f"so a `gpuc submit --runpod` elsewhere may still be setting it up; "
+                f"ending it now would cost that submit its pod."
+            )
     if view.others:
         names = ", ".join(f"{pod.name} ({pod.status})" for pod in view.others)
         lines.append(f"{len(view.others)} other pod(s) in the account, never touched: {names}")

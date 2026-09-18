@@ -57,22 +57,13 @@ class OutputModel(BaseModel):
     """Let the sync preflight create this Hugging Face repo if it is missing."""
 
 
-class LowUtilModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    window_min: float = 25.0
-    floor_pct: float = 5.0
-    grace_min: float = 10.0
-
-
 class JobSpecModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     command: str
     name: str = ""
     setup: str | None = None
-    gpus: int = Field(default=1, ge=0)
+    gpus: int = Field(default=1, ge=1)
     use_shared: bool = False
     """Let this job be dispatched to the host's shared cards -- ones gpuc does
     not own and may only borrow while nobody else is on them. Off by default."""
@@ -90,7 +81,6 @@ class JobSpecModel(BaseModel):
     line of stdout is how far along the job is, as a fraction of one (`0.42`) or
     a percentage written with a `%` (`42%`)."""
     progress_interval_s: float = Field(default=progress.DEFAULT_INTERVAL_S, ge=5)
-    low_util: LowUtilModel = Field(default_factory=LowUtilModel)
     auto_preempt: bool = False
     """Let the host stop this job, as often as it takes, whenever that lets a
     job queued at a lower `priority` number start right away. It re-runs from
@@ -151,14 +141,75 @@ def validate(document: Mapping[str, Any], origin: str = "job spec") -> JobSpecMo
 
 
 def expand_job_id(spec: JobSpec) -> JobSpec:
+    """Fill `{job_id}` into the output destinations, and refuse any that would
+    not carry the id.
+
+    Every output location includes the job id, so runs never overwrite each
+    other. The expanded string is what is judged, not the template: a
+    destination with a literal id pasted in passes when it is this job's, and
+    a mirrored spec an older build wrote with the *previous* run's id in it is
+    refused at requeue rather than pointed at that run's outputs. A Hugging
+    Face location is the repo plus the path in it, so the id may sit in either;
+    an `hf` output with no `hf_path` uploads under the id itself.
+    """
     for output in spec.outputs:
-        if output.s3:
-            output.s3 = output.s3.format(job_id=spec.job_id)
-        if output.hf:
-            output.hf = output.hf.format(job_id=spec.job_id)
-        if output.hf_path:
-            output.hf_path = output.hf_path.format(job_id=spec.job_id)
+        output.s3 = _expand(output, "s3", output.s3, spec.job_id)
+        output.hf = _expand(output, "hf", output.hf, spec.job_id)
+        output.hf_path = _expand(output, "hf_path", output.hf_path, spec.job_id)
+        if output.s3 and spec.job_id not in output.s3:
+            raise _no_job_id(output, "s3", output.s3, spec.job_id)
+        if (
+            output.hf_path
+            and spec.job_id not in output.hf_path
+            and spec.job_id not in (output.hf or "")
+        ):
+            raise _no_job_id(output, "hf_path", output.hf_path, spec.job_id)
     return spec
+
+
+def _expand(output: jobs.Output, key: str, template: str | None, job_id: str) -> str | None:
+    if not template:
+        return template
+    try:
+        return template.format(job_id=job_id)
+    except (KeyError, IndexError, ValueError) as exc:
+        raise SubmitError(
+            f"output {output.path}: `{key}: {template}` has a placeholder this does not "
+            f"know ({exc}). The only one is {{job_id}}; a literal brace is written {{{{."
+        ) from exc
+
+
+def _no_job_id(output: jobs.Output, key: str, destination: str, job_id: str) -> SubmitError:
+    where = "it or in `hf`" if key == "hf_path" else "it"
+    return SubmitError(
+        f"output {output.path}: `{key}: {destination}` does not include the job id "
+        f"({job_id}), so a second run would write over the first.\n"
+        f"Put {{job_id}} in {where}, for example `{key}: {destination.rstrip('/')}/"
+        f"{{job_id}}`. A mirrored spec that carries an earlier run's id is "
+        f"refused for the same reason; edit it out and submit the file again."
+    )
+
+
+def from_mirror(document: dict[str, Any]) -> dict[str, Any]:
+    """A mirrored spec as `requeue` submits it: the keys this build knows.
+
+    The mirror holds what some build wrote. The id and attempt are this run's
+    to assign, and a key this build does not know, at the top or on an output,
+    is not a typo. What is *not* forgiven is a destination carrying an earlier
+    run's literal id (builds before the mirror held the template wrote those):
+    `expand_job_id` refuses it, because the alternative is a new job writing
+    over an old one's outputs.
+    """
+    known = {k: v for k, v in document.items() if k in JobSpecModel.model_fields}
+    outputs = known.get("outputs")
+    if isinstance(outputs, list):
+        known["outputs"] = [
+            {k: v for k, v in o.items() if k in OutputModel.model_fields}
+            if isinstance(o, dict)
+            else o
+            for o in outputs
+        ]
+    return known
 
 
 def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -> str:
@@ -188,8 +239,6 @@ def precheck_local(
     gpu_count: int | None = None,
     environ: Mapping[str, str] | None = None,
     use_git: bool = True,
-    ttl_hours: float | None = None,
-    report: Reporter = print,
 ) -> None:
     """Everything a submit can fail on without a host, checked before we buy one.
 
@@ -202,31 +251,9 @@ def precheck_local(
             f"the spec asks for {model.gpus} GPU(s) but this request would create a pod with "
             f"{gpu_count}.\nRaise --gpu-count, or lower `gpus:` in the spec."
         )
-    if (
-        ttl_hours is not None
-        and model.max_runtime_min is not None
-        and model.max_runtime_min > ttl_hours * 60.0
-    ):
-        raise SubmitError(
-            f"the job's max_runtime_min ({model.max_runtime_min:g} min) is longer than the "
-            f"pod's --ttl-hours ({ttl_hours:g} h = {ttl_hours * 60.0:g} min), so the TTL would "
-            f"kill the job before it could finish.\n"
-            f"Raise --ttl-hours, drop it (the default is no TTL at all), or lower "
-            f"max_runtime_min."
-        )
-    if (
-        ttl_hours is not None
-        and model.estimated_runtime_min is not None
-        and model.estimated_runtime_min > ttl_hours * 60.0
-    ):
-        # A warning and not a refusal: `max_runtime_min` above is a cap the job
-        # asked to be held to, while this is a guess, and a guess must not stop
-        # somebody submitting a job they are willing to have cut short.
-        report(
-            f"WARNING: the job estimates {model.estimated_runtime_min:g} min but the pod's "
-            f"--ttl-hours is {ttl_hours:g} h ({ttl_hours * 60.0:g} min), so the TTL will very "
-            f"likely kill it before it finishes"
-        )
+    # The id the job will get is not assigned yet; any id shows whether the
+    # destinations would carry one.
+    expand_job_id(model.to_spec(jobs.new_job_id()))
     gather_secrets(model.secrets, environ)
     if not use_git:
         return
@@ -486,9 +513,11 @@ def submit_spec(
         )
     elif spec_uri is None:
         # `submit --runpod` mirrors the spec *before* it buys a pod, and passes
-        # the uri back in; the same object twice is a wasted round trip.
+        # the uri back in; the same object twice is a wasted round trip. The
+        # mirror holds `{job_id}` unexpanded, so a requeue gets its own
+        # namespace rather than the one this run wrote into.
         try:
-            spec_uri = s3.put_spec(spec)
+            spec_uri = s3.put_spec(spec_model.to_spec(spec.job_id, attempt))
         except S3IndexError as exc:
             notes.append(f"could not mirror the spec to S3: {exc}")
 

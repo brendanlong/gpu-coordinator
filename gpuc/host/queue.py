@@ -164,9 +164,8 @@ def kill_reason(job_id: str) -> str | None:
 PREEMPTED = "preempted"
 """The kill reason of a job stopped so that something else can have its GPUs.
 
-Its own reason, like `ttl` and `low-util-pause` are: a preempted job is not a
-failure of the job, and the log of the attempt that was stopped should say
-which of the three ended it.
+Its own reason: a preempted job is not a failure of the job, and the log of
+the attempt that was stopped should say what ended it.
 """
 
 
@@ -246,12 +245,6 @@ def refuse_if_nothing_else_can_run(job_id: str, priority: int) -> None:
         raise ValueError(
             f"this host is draining, so it will not start anything else: preempting "
             f"job {job_id} would throw away what it has done for nothing"
-        )
-    if paths.paused_file().exists():
-        raise ValueError(
-            f"this host is paused, so it is dispatching nothing: preempting job {job_id} "
-            f"would throw away what it has done for nothing. Clear the pause first "
-            f"(`gpuc host resume <host>`)"
         )
     if queued_ahead_of(job_id, priority) is not None:
         return

@@ -395,11 +395,8 @@ def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_en
 
 
 def test_a_rented_pod_is_stamped_as_bootstrapped_in_its_own_config(control_env: Path) -> None:
-    """The stamp any other machine reconciles that pod by (`rented`).
-
-    Without it a second machine reads the pod as one that never came up and
-    terminates it at the provisioning ceiling.
-    """
+    """The pod's own record (`rented`) says when it was set up, and by
+    whichever machine did it, so a second machine adopting it can tell."""
     bought = {"kind": "runpod", "pod_id": "pod1", "created_at": "2026-09-15T12:00:00+00:00"}
     host = ScriptedHost(config={**CONFIG_ON_HOST, "provider": dict(bought)})
     bootstrap_host(

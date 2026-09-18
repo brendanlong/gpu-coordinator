@@ -81,7 +81,6 @@ def spec_for(command: str, **overrides: object) -> JobSpec:
         "command": command,
         "gpus": 1,
         "setup": "uv sync --frozen --quiet",
-        "low_util": {"enabled": False},
     }
     document.update(overrides)
     return JobSpec.from_dict(document)
@@ -124,42 +123,19 @@ def test_a_failing_gpu_job_propagates_its_exit_code(gpu_home: Path, torch_projec
     assert state.reason == "exit 17"
 
 
-def test_a_zero_gpu_job_runs_without_waiting_for_the_card(
+def test_cancel_on_the_real_dispatcher_kills_a_grandchild(
     gpu_home: Path, torch_project: Path
 ) -> None:
-    # The hog keeps its torch project: without one it fails GPU preflight in a
-    # second or two, and then it is not holding the card the test needs held.
-    hog = enqueue_in_project(spec_for("sleep 120", gpus=1), torch_project)
-    cpu_job = queue.enqueue(
-        spec_for('echo "CVD=[$CUDA_VISIBLE_DEVICES]"; nproc', setup=None, gpus=0, priority=90)
-    )
-    pid = start_dispatcher()
-    try:
-        wait_until(lambda: finished(cpu_job), 120, "the gpus:0 job to finish")
-        assert jobs.read_state(hog).status == "running"
-        queue.cancel(hog)
-        wait_until(lambda: finished(hog), 120, "the GPU job to be cancelled")
-    finally:
-        stop_dispatcher(pid)
-    state = jobs.read_state(cpu_job)
-    assert (state.status, state.exit_code, state.gpus) == ("succeeded", 0, [])
-    assert "CVD=[]" in paths.log_file(cpu_job).read_text()
-
-
-def test_cancel_on_the_real_dispatcher_kills_a_grandchild(gpu_home: Path) -> None:
-    job_id = queue.enqueue(
-        spec_for(
-            "bash -c 'sleep 600 & echo $! > gc.pid ; wait' & echo started; wait",
-            setup=None,
-            gpus=0,
-        )
+    job_id = enqueue_in_project(
+        spec_for("bash -c 'sleep 600 & echo $! > gc.pid ; wait' & echo started; wait"),
+        torch_project,
     )
     pid_file = paths.workdir(job_id) / "gc.pid"
     pid = start_dispatcher()
     try:
         wait_until(
             lambda: pid_file.exists() and pid_file.read_text().strip().isdigit(),
-            120,
+            900,
             "the grandchild to record its pid",
         )
         grandchild = int(pid_file.read_text().strip())

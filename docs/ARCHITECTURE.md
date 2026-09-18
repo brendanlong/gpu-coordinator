@@ -16,7 +16,11 @@ path.
 
 Non-goals for the prototype: Vast, multi-node, spot, S3 as the
 authoritative queue (host is authoritative, S3 is the mirror; `gpuc requeue`
-resubmits from the S3 spec if a host dies).
+resubmits from the S3 spec if a host dies), and a guaranteed rental teardown.
+Nothing on a client watches a pod after handoff: a rental whose dispatcher
+dies after it was set up, or whose provisioning client was killed uncleanly
+mid-create, bills until a person ends it, and `gpuc pods` is how a person sees
+that.
 
 ## Package layout
 
@@ -30,8 +34,8 @@ gpuc/
     paths.py       # the ~/.gpuc layout
     jobs.py        # job ids, HostConfig/JobSpec/JobState, tolerant readers, atomic writes
     queue.py       # enqueue, list, reorder, cancel, preempt and kill markers
-    dispatcher.py  # lock+heartbeat, pick next runnable, launch runner, idle/TTL terminate
-    runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, watchdog, sync, exit code
+    dispatcher.py  # lock+heartbeat, pick next runnable, launch runner, idle terminate
+    runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, wall-clock limit, sync, exit code
     scope.py       # systemd --user scope probe/wrap/stop; the cgroup kill path
     preflight.py   # sync preflight: prove `aws`/`hf` can write before the job runs
     baseline.py    # what was already under `outputs:` before the job started
@@ -46,9 +50,8 @@ gpuc/
     actions.py     # one function per command returning its --json document; the CLI and the web call these
     status.py      # gather a host's status, render it, project queue start times
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
-    provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse, caps
-    reconcile.py   # the reaper: desired state vs provider, TTL, dead dispatcher, unclaimed pods
-    rented.py      # a pod is its own record: read `config.json` off any prefixed pod
+    provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse
+    rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
     config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
     connect.py     # `host add` / `host set`: read or write the host's own config.json
@@ -63,7 +66,7 @@ gpuc/
     version.py     # this build's commit, and comparing it with a host's
     jsonout.py     # the `--json` rules
     skill.py       # `gpuc skill`: the agent guide, from the wheel or the checkout
-    systemd.py     # what `reconcile --install` and `web serve --install` share
+    systemd.py     # what `web serve --install` needs of systemd: unit dir, ExecStart, write
     web/           # `gpuc web`: stdlib http.server, bcrypt login, a static page over the same documents
     providers/
       base.py      # Provider interface: offers(constraints), create, get, logs, terminate, list
@@ -101,7 +104,7 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uui
                      #  "shared_gpus": ["<index>" | "GPU-uuid", ...],  # cards it may borrow while
                      #                              # nobody else is on them; see Shared GPUs
                      #  "provider": null | {"kind":"runpod","pod_id":..},
-                     #  "idle_minutes": 15, "ttl_hours": null | N, "s3_prefix": "s3://bucket/gpuc/<host>",
+                     #  "idle_minutes": 15, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
                      #  "workdir_days": null | N,     # auto workdir sweep horizon; see Retention
                      #  "created_at": str,            # when this config was first written
@@ -142,7 +145,7 @@ jobs/<jobid>/
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
-  kill               # a kill request with its reason (`ttl`, `low-util-pause`, `preempted`)
+  kill               # a kill request with its reason (`preempted`)
   preempt            # this job is coming back: `gpuc preempt` wrote it beside the kill request,
                      # and the dispatcher queues the job again once its runner has stopped it.
                      # Removed by whichever of the two decides the job is not coming back
@@ -153,8 +156,6 @@ dispatcher.lock      # fd flock held by the running dispatcher
 dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
 draining             # present while the host is shutting itself down
-paused               # present after two consecutive low-util failures; an ephemeral host
-                     # then drains once nothing is running, any other host just stops dispatching
 ```
 
 All state writes are atomic (write temp in same dir, `os.replace`).
@@ -166,7 +167,7 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "name": "lego-s4",                    # human label, not an identifier
   "command": "uv run python -m experiments.lego.train --k-max 6",
   "setup": "uv sync --frozen",          # optional; runs before command, phase=setup
-  "gpus": 1,                            # 0..N owned GPUs
+  "gpus": 1,                            # at least 1
   "use_shared": false,                  # may this job also be dispatched to `shared_gpus`?
                                         # see Shared GPUs
   "env": {"REQUIRE_CUDA": "1"},
@@ -184,7 +185,6 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "progress_command": null,             # run in workdir/ every progress_interval_s of phase main;
                                         # its last line of stdout is a percentage. See Estimates
   "progress_interval_s": 60,
-  "low_util": {"enabled": true, "window_min": 25, "floor_pct": 5, "grace_min": 10},
   "auto_preempt": false,                # let the dispatcher stop this job, as often as it
                                         # takes, whenever that starts a strictly more
                                         # important queued one right away
@@ -194,8 +194,12 @@ All state writes are atomic (write temp in same dir, `os.replace`).
 }
 ```
 
-`{job_id}` is expanded in output destinations. Output namespaces are unique
-by construction; there is no overwrite guard anywhere.
+`gpuc submit` expands `{job_id}` in output destinations and refuses an `s3` or
+`hf_path` whose expanded form does not contain the id (no `hf_path` means the
+id itself). Output namespaces are unique by construction; there is no other
+overwrite guard anywhere. The S3 mirror holds the spec with `{job_id}`
+unexpanded, so `gpuc requeue` expands it with the new id; a mirrored spec
+carrying an earlier run's literal id fails the same check.
 
 Job id: `YYYYMMDD-HHMMSS-<6 hex>`, assigned by `gpuc submit`. The
 timestamp is second-granular, so two jobs submitted inside the same second
@@ -241,12 +245,19 @@ queue's lexical order, not submission order below one second.
   from the shared cards that are idle right now (see Shared GPUs).
 - **The queue is taken in order** (`launch_ready`): a job that does not fit
   holds the cards it is waiting for, owned and borrowed alike, and nothing
-  behind it may take them. Only a job the host could supply *whole* from what
-  it owns and can currently see holds; a `gpus: 0` job and a job that needs a
-  card the host cannot see (dropped off nvidia-smi, or shared and in use) are
-  walked past instead, and neither is failed -- `_capacity_failure` fails a
-  job bigger than the configured host, shared cards included. Why the obvious
-  rule (dispatch whatever fits) is wrong is [usage.md](usage.md#priority-is-not-advisory).
+  behind it may take them. The one exemption is a job that could not fit even
+  once every job of ours ends: it asks for more than `config.gpus` owns plus
+  the shared cards nobody else is on (per the pass's one nvidia-smi reading),
+  so what it is short of is a shared card somebody else is using, and it is
+  stepped over, not failed. Width alone is not the test: a job wider than the
+  owned pool that is short an owned card of ours, with the shared card it wants
+  idle, holds like any other. So does a job waiting for an owned card that has
+  dropped off nvidia-smi, since the host is misconfigured or broken and a
+  stalled queue says so.
+  `_capacity_failure` fails a job that asks for no GPU at all, or for more
+  than the configured host has, shared cards included. Why the obvious rule
+  (dispatch whatever fits) is wrong is
+  [usage.md](usage.md#priority-is-not-advisory).
 - **A job is submitted when its queue marker exists, and not before.**
   `enqueue` writes the spec, then the state, then the marker, so an interrupted
   `gpuc submit` leaves a job dir this host was never asked to run. It is not
@@ -306,9 +317,9 @@ queue's lexical order, not submission order below one second.
   are cancelled by removing the marker and setting state.
 - Stop with a reason: `queue.request_kill(jobid, reason)` writes
   `jobs/<id>/kill`; the runner kills the job the same way and ends it
-  `failed: <reason>` after a final sync. TTL, low-util pause and preempt use
-  this; cancel stays its own marker, because a TTL stop is not a cancellation
-  anyone asked for.
+  `failed: <reason>` after a final sync. Preempt uses this; cancel stays its
+  own marker, because a stop the host decided on is not a cancellation anyone
+  asked for.
 - Preempt: `queue.preempt(jobid[, prio])` writes `jobs/<id>/preempt` and then
   a `kill` marker with reason `preempted`, for a *running* job only, and only
   when something else could run instead (`refuse_if_nothing_else_can_run`).
@@ -326,11 +337,11 @@ queue's lexical order, not submission order below one second.
   queued job that does not fit, stop the set of running `auto_preempt` jobs
   that together cover the *whole* gap (`enough_to_start`), least important
   first and most recently started among equals, and only at a strictly higher
-  priority number than the waiting job. Nothing runs on a host that is paused,
-  `_going_away`, or within `AUTO_PREEMPT_TTL_MARGIN_S` of its TTL. The stop is
-  `queue.preempt`, so it is the ordinary preempt path; cards held by a job that
-  is already stopping count as available, and once one stop in a set fails the
-  rest are left alone. Nothing counts how often a job has given way.
+  priority number than the waiting job. Nothing runs on a host that is
+  `_going_away`. The stop is `queue.preempt`, so it is the ordinary preempt
+  path; cards held by a job that is already stopping count as available, and
+  once one stop in a set fails the rest are left alone. Nothing counts how
+  often a job has given way.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.
@@ -350,15 +361,6 @@ queue's lexical order, not submission order below one second.
   `terminate.self_terminate()`. Only a failed *terminate* stops the shutdown:
   remove `draining`, log loudly, keep dispatching, retry every 10 minutes. A
   failed final sync is logged and the host terminates anyway.
-- TTL (`ttl_hours`, **null by default**): checked before the idle logic, so a
-  busy host cannot dodge it. Past the cap, a `kill` marker with reason `ttl`
-  for each running job; a runner that has not acted after `kill_grace_s` is
-  escalated exactly like a cancel. With nothing running it drains and
-  terminates as above.
-- Two consecutive `failed: low-util` jobs: write `paused`, stop dispatching,
-  and (if ephemeral) drain and terminate -- never out from under a job: with
-  anything still running, a `kill` marker with reason `low-util-pause` for
-  each, and drain on a later pass.
 - Exit when the queue is empty, nothing is running, and the host is not
   ephemeral. Ephemeral hosts keep the dispatcher alive until terminate.
 
@@ -366,9 +368,9 @@ queue's lexical order, not submission order below one second.
 
 1. Resolve the assignment against `nvidia-smi --query-gpu=index,uuid` --
    indices and UUIDs both, since either form may be recorded -- and fail the
-   job (`gpu-assert`) if an entry names no card that is here. Export
-   `CUDA_VISIBLE_DEVICES=<resolved UUIDs comma-joined>` (empty string when
-   `gpus: 0`), the spec `env`, and the secrets file.
+   job (`gpu-assert`) if it is empty or an entry names no card that is here.
+   Export `CUDA_VISIBLE_DEVICES=<resolved UUIDs comma-joined>`, the spec
+   `env`, and the secrets file.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json`
    (relative path, size, mtime) -- a checkout routinely ships committed files
    where the outputs go. Before `setup`, because a setup step writing there
@@ -380,7 +382,7 @@ queue's lexical order, not submission order below one second.
 2. `phase=setup`: run `spec.setup` in `workdir` with `bash -eo pipefail`.
 3. `phase=preflight`: GPU preflight **inside the job's environment**. A named
    phase, not a step of `setup`, so `gpuc status` can tell "still installing
-   torch" from "proving the card works". If `gpus > 0`, run
+   torch" from "proving the card works". Run
    `uv run --no-sync python -c "<real op>"` (the `shared/gpu.py` probe:
    `is_available()` then a tensor add + `.item()`), and assert
    `device_count()` equals `gpus`. Failure -> `failed: gpu-preflight`.
@@ -405,12 +407,13 @@ queue's lexical order, not submission order below one second.
 5. `phase=main`: run `spec.command`, stdout+stderr appended to `log.txt`.
    Each phase runs inside its own transient scope where one is available (see
    Process isolation), and in its own process group where it is not.
-   Start the low-util watchdog after `grace_min`: sample assigned GPUs'
-   utilization every 30 s; if the rolling mean over `window_min` is below
-   `floor_pct`, SIGTERM the process group, then SIGKILL after 15 s, status
-   `failed: low-util`. `max_runtime_min` is enforced the same way with
-   reason `timeout`. In the same loop, run `spec.progress_command` every
-   `progress_interval_s` and record what it says; see Job length estimates.
+   Sample the assigned GPUs' utilization every 30 s into `util_recent`, for
+   `gpuc status` to show; nothing acts on it, since once the GPU check has
+   passed a job that leaves its cards idle is the job's business. Enforce
+   `max_runtime_min`: SIGTERM the process group, then SIGKILL after 15 s,
+   status `failed: timeout`. In the same loop, run `spec.progress_command`
+   every `progress_interval_s` and record what it says; see Job length
+   estimates.
 6. Capture the exit code **before** any cleanup. Stop the sync loop and run
    one final sync; a failed final sync makes a succeeded job `failed: sync`,
    and an output path that was never written makes it `failed: no-outputs`.
@@ -445,8 +448,8 @@ the mechanics.
   fraction with a decimal point or a percentage with a `%`. Above 0% the
   runner replaces `eta` with `now + elapsed_main * (100 - pct) / pct`; at 0%
   the submitter's estimate stands.
-- The poll is synchronous, in the same loop that watches for a cancel, a TTL
-  and `max_runtime_min`, with a 10 s timeout and a `killpg` of the whole
+- The poll is synchronous, in the same loop that watches for a cancel and
+  `max_runtime_min`, with a 10 s timeout and a `killpg` of the whole
   session behind it: a wedged progress command delays a kill by at most 10 s
   of the 15 s the runner gets before the dispatcher escalates, which is why the
   timeout is fixed rather than a spec field. Output goes to a temp file, not a
@@ -459,10 +462,10 @@ the mechanics.
   ends; `progress_pct` is not.
 - `status.queue_start_estimates` projects a queued job's *start* by replaying
   the dispatcher's own rule: cards come free at the eta of whatever holds
-  them, and the queue is taken in order, with the same two exemptions as
+  them, and the queue is taken in order, with the same one exemption as
   `launch_ready`. A card held by a job that published no eta is not
   schedulable, so a job whose turn depends on it is reported as unknown; a
-  paused or draining host projects nothing.
+  draining host projects nothing.
 
 ## Process isolation (cgroup scope, else process group)
 
@@ -585,22 +588,23 @@ hold to, whatever the flags:
 
 - `gpuc` runs with no config file at all: every setting has a default, there is
   simply no S3 mirror, and one line on stderr points at `gpuc config init`.
-- Anything that talks to RunPod (`--runpod`, `pods`, `reconcile`) checks
+- Anything that talks to RunPod (`--runpod`, `pods`, `host add --pod`) checks
   `RUNPOD_API_KEY` first and exits 1 with a single line if it is unset, before
-  mirroring a spec or picking a host. `reconcile --install` does not, since it
-  only writes unit files.
+  mirroring a spec or picking a host.
 - A host name is looked up locally; `logs`, `cancel`, `preempt`, `reorder`,
   `estimate` and `requeue` fall back to the job index and then to asking each host, and an id nothing
   knows is exit 4, never a guess.
-- Nothing runs in the background on this side except the optional
-  `gpuc reconcile` timer and, if installed, the web dashboard's service.
+- Nothing runs in the background on this side except, if installed, the web
+  dashboard's service.
 
-Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`,
-`desired/<host>.json` for ephemeral hosts, `jobs/` (the local job index),
-`known_hosts` plus `known_hosts.d/<pod>`, `watch.json` (the reconcile clock),
-and `state.lock`, which serialises every registry read-modify-write across
-concurrent sessions. `Settings` (`~/.config/gpu-coordinator/config.toml`) is
-all optional and every key is in [setup.md](setup.md#settings).
+Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`, `jobs/`
+(the local job index), `known_hosts` plus `known_hosts.d/<pod>`, and
+`state.lock`, which serialises every registry read-modify-write across
+concurrent sessions. A `desired/` directory or `watch.json` left there by a
+build that had a client-side reaper is ignored. `Settings`
+(`~/.config/gpu-coordinator/config.toml`) is all optional and every key is in
+[setup.md](setup.md#settings); `dead_dispatcher_minutes`, the reaper's key,
+is ignored like any other unknown one.
 
 ## Shared state is read tolerantly, always
 
@@ -611,13 +615,12 @@ file the two halves share obeys the same two rules, on both sides:
 - an unknown key is ignored (a newer writer may add fields);
 - an explicit `null` for a field that is **not** declared optional is dropped,
   so the field's default applies. A `null` for a field that *is* optional is a
-  real value and round-trips unchanged: `ttl_hours: null` is "never expires",
-  `retention_days: null` is "never auto-purge", `s3_prefix: null` is "no
-  mirror".
+  real value and round-trips unchanged: `retention_days: null` is "never
+  auto-purge", `s3_prefix: null` is "no mirror".
 
 Control side that means `extra="ignore"`, a default on every field, and a
 `model_validator(mode="before")` that consults the annotation (`HostEntry`,
-`HostCache`, `Registry`, `DesiredHost`, `Settings`, `IndexEntry`, `Offer`). The
+`HostCache`, `Registry`, `Settings`, `IndexEntry`, `Offer`). The
 host config a registry entry caches is kept **verbatim** on top of that, so a
 key some newer build wrote survives a round trip through this one. Host side, with
 no pydantic, the same rules are spelled out in `jobs.from_dict` for
@@ -692,16 +695,18 @@ touch argv.
   anything that decides something reads the host.
 
 What the host **is** -- `gpus`, `s3_prefix`, `env`, `idle_minutes`,
-`ttl_hours`, `retention_days`, `provider`, `pkg_commit` -- lives in
+`retention_days`, `provider`, `pkg_commit` -- lives in
 `config.json` on the host and nowhere else. One box driven from a desktop and a
 laptop therefore has one configuration, not two, and nothing about the machine
 that bootstrapped it first matters afterwards.
 
 - `gpuc host add` is a **connect** (`connect_host`): probe, read
   `config.json`, adopt it if it is there under the name the host calls itself,
-  else write the initial one. Flags are per-field overrides written through
-  to the host; a `--gpus` that overlaps the existing set without matching it
-  is refused, because that one difference hands one card to two jobs.
+  else write the initial one -- owning every card the probe saw unless
+  `--gpus` says otherwise (see GPU ownership). Flags are per-field overrides
+  written through to the host; a `--gpus` that overlaps the existing set
+  without matching it is refused, because that one difference hands one card
+  to two jobs.
 - `gpuc host set <name> --gpus ... --env ...` **writes through** to
   `config.json` via `python -m gpuc.host config --merge` (one atomic
   read-modify-write on the host, by the code that reads the file; a host with
@@ -792,6 +797,12 @@ lookup at all: that mapping is the identity, and the host is not asked.
 Shared entries (`--shared-gpus`) go through exactly the same resolution, and
 are checked for overlap with the owned ones -- see Shared GPUs.
 
+A host given its first config with no `--gpus` owns every card the probe saw,
+as UUIDs, less any named by `--shared-gpus`: there is no typed index to
+preserve, and a provisioned pod gets its cards the same way, from the
+`gpu_info` on the address `connect_host` is handed. A host that already has a
+config is never defaulted; an omitted `--gpus` there keeps what it has.
+
 Every listing names a card `[index] name vram`; `gpuc host list` adds the
 UUID (it is where UUIDs are copied from), `gpuc status` adds free/busy and
 names each running job's cards on the job's own line, and `gpuc host probe`
@@ -879,117 +890,33 @@ for a host that came back empty is in setup.md.
   and a timeout). `terminate(id)`: `POST /pods/{id}/action {"action":"terminate"}`
   then poll `get` until `TERMINATED` or 404. `list()`:
   `GET /pods?includeClusterPods=true`.
-- Caps: count pods with our prefix and sum their `cost`; refuse if `max_pods`
-  or `max_total_usd_per_hour` would be exceeded. Checked once, in the
-  provisioning flow with the state lock held -- unlocked, two concurrent
-  sessions would both read "one pod running" and both create.
+- Nothing caps how many pods an account runs or what they cost per hour;
+  spending limits across rentals are a non-goal. `gpuc pods` is how a person
+  sees what is billing.
 
 ## Provisioning flow (`gpuc submit --runpod`)
 
 1. Write the spec to S3 (`s3://bucket/gpuc/specs/<jobid>.json`) first.
-2. Unless `--no-reuse`: pick an existing desired host whose recorded offer
-   still satisfies the constraints, which owns enough cards, whose pod the
-   provider reports RUNNING, whose dispatcher heartbeat is fresh, and which is
-   neither draining nor paused; enqueue there. A registered pod the provider no
-   longer has is forgotten rather than dialled.
-3. Else for each offer in order: check caps -- offers are price-ascending, so
-   a cap this one trips every later one trips too, and `CapsExceeded` aborts
-   the whole submit instead of walking the list; then `create`; record
-   `desired/<host>.json` with pod id, offer, created_at, ceiling; poll
-   `get` until RUNNING **and** `ssh.direct` present; poll SSH until a
-   trivial command succeeds; run bootstrap (which runs host health and
-   starts the dispatcher); deliver the RunPod key as
-   `~/.gpuc/secrets/runpod` (0600) for self-terminate. Enqueue. On any
-   broken-host signature in `logs`, or the 15-minute ceiling, or a health
-   failure: `terminate`, wait for TERMINATED, try the next offer. The
-   `desired/` record is removed only once the terminate is *confirmed*; a
-   terminate that failed leaves the record (and the registry entry) in place,
-   because it is the only thing that makes the reaper retry a pod that is
-   still billing.
+2. Unless `--no-reuse`: pick an existing registered pod whose own config
+   records an offer that still satisfies the constraints, which owns enough
+   cards, whose pod the provider reports RUNNING, whose dispatcher heartbeat
+   is fresh, and which is not draining; enqueue there. A registered pod the
+   provider no longer has is forgotten rather than dialled.
+3. Else for each offer in order: `create`; poll `get` until RUNNING **and**
+   `ssh.direct` present; poll SSH until a trivial command succeeds; write
+   the pod its config,
+   whose `provider` block carries the offer and `created_at` (`rented.py`:
+   the pod is its own record, and this machine keeps none); run bootstrap
+   (which runs host health and starts the dispatcher); deliver the RunPod
+   key as `~/.gpuc/secrets/runpod` (0600) for self-terminate. Enqueue. On
+   any broken-host signature in `logs`, or the 15-minute ceiling, or a
+   health failure -- or a Ctrl-C, or a bug: `terminate`, wait for
+   TERMINATED, try the next offer. A terminate that failed is reported
+   loudly and leaves the registry entry in place, so `gpuc status` and
+   `gpuc pods` keep showing the pod; nothing retries it.
 4. The pod-scoped key delivered as `~/.gpuc/secrets/runpod` does terminate
    its own pod; `tests/test_runpod_e2e.py` proves it on every opt-in run.
-
-## Reconcile loop
-
-Every 60 s: the state lock is taken to *read* `desired/` and then for each
-local mutation, never across the provider and ssh calls in between -- a
-terminate polls for up to five minutes and a concurrent `gpuc submit --runpod`
-gives up on the lock after two minutes, and a create that cannot write its `desired/`
-record is a leaked, billing pod. Each mutation re-reads the record it is about
-to change. For each `desired/` host, `get` its pod; if
-missing or TERMINATED, mark the desired entry gone and note any jobs that
-were running there (for `requeue`). A pod older than its TTL -- only when that
-host has one; the default is none -- is terminated and logged.
-
-**The pod is the record** (`rented.py`). `desired/<host>.json` exists only on
-the machine that ran `gpuc submit --runpod`, so a reaper that trusts it alone
-terminates another machine's healthy pod at the ceiling. A pod therefore carries
-its own copy: `config.json` -- the file the host owns -- holds `offer`,
-`created_at` and `bootstrapped_at` under the `provider` block that already named
-its `kind` and `pod_id`. Every pass asks each prefixed pod it has no record of
-(one ssh session: expand gpuc home, then read `config.json`), and a pod holding
-a gpuc config is *ours*
-whoever created it: it is judged by the rules above, and the answer is cached in
-this machine's `desired/`, which is what keeps it watched on a later pass that
-cannot reach it. So the timer is a watchdog role that any machine holding the
-API key can run, and none of them is special.
-
-**Nothing is terminated for the absence of a record**: a prefixed pod this
-machine cannot get an answer out of is reported every pass and left running
-(`reconcile.py`'s module docstring has the reasoning; the user-facing rule is
-[usage.md](usage.md#reconcile)).
-
-**Adoption is permanent and one-way**, and this is the sharpest edge in the
-design. After one successful read, this machine holds a `desired/` record for
-that pod for as long as the pod exists -- nothing evicts it but a terminate or
-the pod going away -- so it will terminate that pod after
-`dead_dispatcher_minutes` of it not answering *this* machine, with the machine
-that created it never consulted. That is the trade for having a watchdog at all:
-the alternative is a wedged pod that bills until a human notices. The half of it
-worth knowing is the ssh key (a machine whose key the pod does not hold can
-never adopt it, and reports it forever instead), which setup.md says under the
-reconcile timer.
-
-Adopting stamps `last_seen_at` on the cached record, because the pod answered in
-that same pass: a machine that has only just met a pod
-gives it the same `dead_dispatcher_minutes` allowance as one it provisioned
-itself, rather than measuring silence from a `bootstrapped_at` days old. The
-name on the record comes off the config document rather than the parsed config,
-whose default `host` is `local` — a record called `local` would be matched
-against this machine's own host on the next pass.
-
-**The dead-dispatcher rule**, which is what replaced the overall TTL: a
-bootstrapped desired host is asked for its pulse each pass (a 20 s ssh
-timeout, so one wedged pod cannot stall the pass) -- the dispatcher heartbeat's
-mtime and a count of the jobs whose `state.json` says `running`, read with
-`stat` and `grep` rather than by running the host's package, because the machine
-reconciling a pod may never have bootstrapped it and knows no interpreter there.
-A heartbeat under
-`rented.HEARTBEAT_FRESH_S = 120` s, or any job the host says is running,
-counts as alive and records `last_seen_at` in its `desired/` record. That
-constant is the reaper's own and deliberately looser than the dispatcher's 30 s
-staleness or the 30 s freshness reuse demands: this one decides whether to
-terminate a pod. The clock is capped by this machine's own
-watching: `reconcile` keeps `watch.json` in the state directory with the time of
-the last pass and the start of the current unbroken stretch, and a gap of more
-than `WATCH_GAP_MINUTES` (5) resets the stretch. Silence that nothing observed
-is not evidence -- a desktop resuming from three days asleep would otherwise
-terminate every pod on the first pass whose ssh had not come up yet, and the
-timer fires two minutes after boot. The service therefore also `Wants=` the
-network target it is `After=`, since `After=` alone does not pull it in. A host
-that has managed neither for `Settings.dead_dispatcher_minutes` (30 by default) --
-including one whose ssh never answers, since that never updates `last_seen_at`
-either -- is terminated with a loud report: it cannot idle-terminate itself, it
-is doing nothing we can see, and it is still billing. A long training run keeps
-its host alive indefinitely *under this rule* -- a TTL the host actually has is
-checked first and does terminate a pod with a job on it, which is exactly why a
-TTL is opt-in. The 15-minute pre-healthy ceiling is unchanged, and it only
-applies to a record that says the pod was never bootstrapped -- which an adopted
-one never does.
-Never touch a pod without the prefix. If `desired/` is unreadable, do nothing
-and log an error (fail closed). `--install` writes a `systemd --user` service
-and timer but does not enable them, and prints the `systemctl` lines and the
-`config_dir()/env` file the service reads `RUNPOD_API_KEY` from.
+   From bootstrap on, that is the only thing that ends the pod.
 
 ## Web dashboard (`gpuc web serve`)
 
@@ -1023,12 +950,12 @@ parallel (`actions.gather_all`, also what the text `gpuc status` uses), so one
 wedged host costs its own timeout, not the sum.
 
 `gpuc web serve --install` writes `gpuc-web.service` to `~/.config/systemd/user`
-the way `reconcile --install` writes its timer -- the two share
-`control/systemd.py` for the unit directory, an absolute `gpuc` for
+through `control/systemd.py`: the unit directory, an absolute `gpuc` for
 `ExecStart` (quoted the way systemd reads it) and writing without enabling.
-The unit pins the config and state dirs, reads the timer's env file if it
-exists, and restarts on failure under a start limit, so a service with no
-password fails after five tries rather than looping for ever.
+The unit pins the config and state dirs, reads `RUNPOD_API_KEY` from
+`config_dir()/env` if that file exists, and restarts on failure under a start
+limit, so a service with no password fails after five tries rather than
+looping for ever.
 
 Anything the dashboard gains lands in `actions` first and the dashboard calls
 it.
@@ -1038,8 +965,8 @@ it.
 What `status` prints, and every flag, is usage.md. The invariants:
 
 - An ephemeral host whose pod the provider reports missing or TERMINATED is
-  `POD GONE`: no ssh is attempted, and the line says to run `gpuc reconcile
-  --once` rather than printing a connection error.
+  `POD GONE`: no ssh is attempted, and the line says to run `gpuc host remove
+  <name>` rather than printing a connection error.
 - A finished job that produced `outputs:` which never reached S3/HF is flagged
   (`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
   those are the jobs a purge -- or a pod going away -- would take with them. One
@@ -1047,8 +974,6 @@ What `status` prints, and every flag, is usage.md. The invariants:
 - A pod's `provider_util` is the provider's reading for the whole pod; a job's
   `util` is the host's own nvidia-smi sampler over that job's cards. They are
   labelled separately and never merged.
-- `--suspects` judges each running job by *its own* `low_util` window, floor and
-  grace as the host reports them, and never kills anything.
 - Every job carries the `priority` it is (or was) ordered by. While a job is
   queued that is its marker's, which is what the dispatcher reads; once the
   marker is gone it is the spec's, which `reorder` keeps current. A host too old
@@ -1106,9 +1031,8 @@ by every bootstrap and re-ship, reported back by `python -m gpuc.host status`.
   queue whose GPU tests are the ones nobody runs is how they rot; two of them
   had, asserting on a `gpuc status` line that had since gained a job name.
 - RunPod integration: A40 only, `--max-price 0.60`, a job whose command
-  is under two minutes, `--idle-min 2`, `--ttl-hours 1` (a TTL is opt-in, and a
-  test that creates a billable pod is exactly where opting in is right), and the test
-  asserts teardown via `list()` and prints the final `GET /billing/pods`
+  is under two minutes, `--idle-min 2`, and the test asserts teardown via
+  `list()` and prints the final `GET /billing/pods`
   for the pod. A pod whose name lacks the `runpod_pod_prefix` belongs to
   someone else: read it in `list()`, never act on it. Every test that creates
   a pod has a `finally` that terminates it.

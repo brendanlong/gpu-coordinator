@@ -199,9 +199,8 @@ def mean_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> f
     """Mean `utilization.gpu` over `uuids`. No GPUs asked about means 0%.
 
     Asking about GPUs and getting nothing back is a *failed sample*, not an idle
-    one: reporting 0% there feeds the low-util watchdog a floor-breaking value
-    every tick and kills a perfectly busy job. The runner catches this and
-    records the sample as unknown.
+    one: reporting 0% there would show a perfectly busy job as idle. The runner
+    catches this and records the sample as unknown.
     """
     if not uuids:
         return 0.0

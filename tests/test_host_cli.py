@@ -94,13 +94,13 @@ def test_config_merge_keeps_the_keys_this_build_does_not_know(
 def test_config_merge_can_clear_a_nullable_field(
     gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    jobs.write_config(HostConfig(host="test-host", ttl_hours=24.0, s3_prefix="s3://b/p"))
+    jobs.write_config(HostConfig(host="test-host", retention_days=14.0, s3_prefix="s3://b/p"))
     patch = tmp_path / "patch.json"
-    patch.write_text(json.dumps({"ttl_hours": None, "s3_prefix": None}))
+    patch.write_text(json.dumps({"retention_days": None, "s3_prefix": None}))
     _, payload = run(capsys, "config", "--merge", str(patch))
     assert isinstance(payload, dict)
-    assert payload["ttl_hours"] is None and payload["s3_prefix"] is None
-    assert jobs.read_config().ttl_hours is None
+    assert payload["retention_days"] is None and payload["s3_prefix"] is None
+    assert jobs.read_config().retention_days is None
 
 
 def test_config_merge_on_a_host_with_no_config_writes_one(
@@ -123,7 +123,6 @@ def test_status(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert isinstance(status, dict)
     assert status["host"] == "test-host"
     assert status["ephemeral"] is False
-    assert status["paused"] is False
     assert status["jobs"][0]["job_id"] == job_id
     assert status["queue"] == [{"priority": 12, "job_id": job_id}]
 
@@ -221,15 +220,6 @@ def test_estimate_warns_when_the_job_will_be_killed_first(
     assert isinstance(payload, dict) and "max_runtime_min" in (payload["warning"] or "")
 
 
-def test_resume_clears_the_pause(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: 0)
-    paths.paused_file().write_text("low-util\n")
-    assert cli.main(["resume"]) == 0
-    assert not paths.paused_file().exists()
-
-
 def test_dispatch_is_routed_to_the_dispatcher(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -255,23 +245,20 @@ def test_health_is_routed_to_health(
     assert json.loads(capsys.readouterr().out)["ok"]
 
 
-def test_status_resolves_the_owned_gpus_and_reports_each_jobs_watchdog(
+def test_status_resolves_the_owned_gpus(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control side cannot do either: `gpus` may name cards by index, and it
-    never sees the spec the low-util rule lives in."""
+    """The control side cannot: `gpus` may name cards by index, and only the
+    host knows today's numbering."""
     monkeypatch.setattr(cli.gpus, "list_gpus", lambda *_: [cli.gpus.Gpu(3, FAKE_GPUS[0])])
     monkeypatch.setattr(cli.gpus, "resolve_owned", lambda owned, *_: ([FAKE_GPUS[0]], ["9"]))
     jobs.write_config(HostConfig(host="test-host", gpus=["3", "9"]))
-    job_id = queue.enqueue(make_spec(low_util={"enabled": False, "floor_pct": 20.0}))
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
     assert status["gpus"] == ["3", "9"]
     assert status["gpus_resolved"] == [{"index": 3, "uuid": FAKE_GPUS[0]}]
     assert status["gpus_unavailable"] == ["9"]
-    low_util = status["jobs"][0]["low_util"]
-    assert (job_id, low_util["enabled"], low_util["floor_pct"]) == (job_id, False, 20.0)
 
 
 def test_status_reports_a_queued_jobs_estimate_from_its_spec(

@@ -15,7 +15,7 @@ from gpuc._version import user_agent
 
 from .base import (
     DEFAULT_IMAGE,
-    Caps,
+    DEFAULT_PREFIX,
     Cloud,
     Constraints,
     Offer,
@@ -60,7 +60,7 @@ class RunPodProvider(Provider):
         self,
         api_key: str | None = None,
         *,
-        caps: Caps | None = None,
+        prefix: str = DEFAULT_PREFIX,
         timeout_s: float = 30.0,
     ) -> None:
         key = api_key or os.environ.get("RUNPOD_API_KEY")
@@ -68,7 +68,7 @@ class RunPodProvider(Provider):
             raise ProviderError("RUNPOD_API_KEY is not set")
         self._api_key = key
         self._base_url = BASE_URL.rstrip("/")
-        self.caps = caps or Caps()
+        self.prefix = prefix
         self._timeout_s = timeout_s
 
     def _open(
@@ -198,12 +198,8 @@ class RunPodProvider(Provider):
         cuda_min: str | None = None,
         gpu_count: int = 1,
     ) -> Pod:
-        if not name.startswith(self.caps.prefix):
-            raise ProviderError(f"pod name {name!r} must start with {self.caps.prefix!r}")
-        # Caps are checked by `provision._create_and_record` under the state
-        # lock, which is the only place the check means anything across
-        # concurrent sessions; a second unlocked check here is one more `GET
-        # /pods` that two racing creates would both pass anyway.
+        if not name.startswith(self.prefix):
+            raise ProviderError(f"pod name {name!r} must start with {self.prefix!r}")
         gpu: dict[str, Any] = {"id": offer.gpu_id, "count": gpu_count}
         if cuda_min is not None:
             gpu["minCudaVersion"] = cuda_min

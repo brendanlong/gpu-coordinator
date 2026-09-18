@@ -158,7 +158,7 @@ def fake_host_view(entry: HostEntry, *a: object, **k: object) -> HostView:
                     "job_id": FINISHED_JOB,
                     "name": "probe",
                     "status": "failed",
-                    "reason": "low-util",
+                    "reason": "timeout",
                     "ended_at": minutes_ago(60),
                 },
             ],
@@ -266,7 +266,7 @@ def test_login_sets_a_cookie_that_opens_the_page_and_the_api(client: Client) -> 
     assert status == 200 and b"/api/status" in body
     status, document = client.get_json("/api/config")
     assert status == 200
-    assert document["settings"]["max_pods"] == 3
+    assert document["settings"]["disk_gb"] == 50
     assert "config_file" in document
 
 
@@ -345,7 +345,7 @@ def test_status_is_the_status_json_document(logged_in: Client, one_host: None) -
     )
     assert kinds["wandb"]["url"] == "https://wandb.ai/me/lego/runs/r1"
     assert host["queued"][0]["priority"] == 50
-    assert host["finished"][0]["reason"] == "low-util"
+    assert host["finished"][0]["reason"] == "timeout"
 
 
 def test_status_narrows_to_one_host_and_refuses_a_bad_since(

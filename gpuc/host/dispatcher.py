@@ -50,15 +50,6 @@ Once at startup and then hourly: deleting day-old venvs is not urgent, and
 on a non-ephemeral host the dispatcher only lives while there is work, so the
 startup pass is the one that usually fires.
 """
-AUTO_PREEMPT_TTL_MARGIN_S = 300.0
-"""How close to an ephemeral host's TTL automatic preemption stops.
-
-A job stopped inside this window may never come back: the runner's final sync
-takes as long as it takes, and `requeue_if_preempted` refuses to queue anything
-onto a host that is by then draining or past its cap. A human typing `gpuc
-preempt` is there to see that happen; this fires unattended, so it stops early
-rather than spending an attempt for nothing.
-"""
 OUTPUT_RETRY_ATTEMPTS = 3
 OUTPUT_RETRY_INTERVAL_S = 60.0
 OUTPUT_RETRY_BUDGET_S = 300.0
@@ -558,7 +549,6 @@ class Dispatcher:
     _last_submit_sweep_at: float | None = None
     _kill_sent: dict[str, float] = field(default_factory=dict)
     _kill_escalated: set[str] = field(default_factory=set)
-    _pause_drain_pending: bool = False
     _config: jobs.HostConfig | None = None
     _owned: list[str] | None = None
     _unavailable: tuple[str, ...] = ()
@@ -579,7 +569,7 @@ class Dispatcher:
     def config(self) -> jobs.HostConfig:
         """The host config, read once per loop pass.
 
-        One pass asks for it a dozen times (free GPUs, the TTL, the idle timer,
+        One pass asks for it a dozen times (free GPUs, the idle timer,
         the drain); re-reading and re-parsing the file each time bought nothing
         but syscalls, and a mid-pass change is not something any of those
         decisions should straddle.
@@ -781,16 +771,9 @@ class Dispatcher:
         self.log(f"job {job_id} was preempted; queued again as attempt {attempt}")
 
     def _going_away(self) -> str | None:
-        """Why this host will not be running anything else, or None.
-
-        The TTL is a hard cap, so a host past it must not start a fresh attempt
-        of anything -- least of all one this dispatcher would launch itself,
-        seconds before the same pass drains and terminates.
-        """
+        """Why this host will not be running anything else, or None."""
         if paths.draining_file().exists():
             return "draining"
-        if self.config.ephemeral and self._ttl_expired(self.config):
-            return f"past its ttl of {self.config.ttl_hours:g} h"
         return None
 
     def handle_cancels(self) -> None:
@@ -832,11 +815,10 @@ class Dispatcher:
     def escalate_kills(self) -> None:
         """Make a kill *request* stick when the runner never acts on it.
 
-        A TTL (or a low-util pause) asks the runner to stop its job and sync,
-        which is right when the runner is healthy and is nothing at all when it
-        is wedged: the marker sits there, the job keeps running, and an
-        ephemeral host that should have died hours ago keeps billing with a
-        fresh heartbeat. So the ask gets the same ladder a cancel gets.
+        A preempt asks the runner to stop its job and sync, which is right
+        when the runner is healthy and is nothing at all when it is wedged: the
+        marker sits there, the job keeps running, and the job waiting for its
+        cards never starts. So the ask gets the same ladder a cancel gets.
         """
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
@@ -954,15 +936,18 @@ class Dispatcher:
         busy = self._busy_gpus()
         return [uuid for uuid in self.owned_gpus() if uuid not in busy]
 
-    def borrowable_gpus(self) -> list[str]:
-        """Shared cards nothing of ours holds *and* nobody else is using either.
+    def borrowable_gpus(self) -> tuple[list[str], int]:
+        """Shared cards nothing of ours holds *and* nobody else is using either,
+        and how many shared cards somebody else *is* on.
 
         The nvidia-smi read is the whole of the preflight, and it is the one
         thing standing between a borrowed card and somebody else's training
         run, so it is taken here rather than inferred from anything cached.
         `launch_ready` asks once per pass and only when a job actually needs to
         borrow: every job is then judged against one reading, which is also
-        what stops two of them being handed the same card.
+        what stops two of them being handed the same card. The count comes
+        from the same reading because it decides which short job is stepped
+        over, and a second sample could disagree with the first.
         """
         busy = self._busy_gpus()
         unused, in_use = gpus.unused_gpus(
@@ -977,7 +962,7 @@ class Dispatcher:
                 self.log(f"shared GPU {uuid} is in use ({why}), so it is not being borrowed")
             if unused:
                 self.log(f"shared GPU(s) free to borrow: {', '.join(unused)}")
-        return unused
+        return unused, len(in_use)
 
     def _capacity_failure(self, spec: jobs.JobSpec) -> str | None:
         """Why this host can *never* run this job, or None if it could.
@@ -989,6 +974,8 @@ class Dispatcher:
         not fail one the host is perfectly well set up to run), and
         `use_shared`, which nothing changes after submit.
         """
+        if spec.gpus < 1:
+            return f"needs at least 1 GPU, asked for {spec.gpus}"
         config = self.config
         shared = config.borrowable(spec)
         if spec.gpus <= len(config.gpus) + len(shared):
@@ -1044,30 +1031,34 @@ class Dispatcher:
         offered straight to the job that had just given it up.
 
         It costs utilization: a card waiting for the rest of a job's cards runs
-        nothing, and on a rented pod that is billed. So a job only holds cards
-        when this host can supply the *whole* of it from what it owns and can
-        currently see. That rules out two jobs, and both of them would be
-        holding a card against something nobody here controls:
+        nothing, and on a rented pod that is billed. The one job that does not
+        hold is one that could not fit even once every job of ours ends: it
+        needs more cards than the host owns plus the shared cards nobody else
+        is on, so what it is short of is a shared card somebody else is using,
+        which comes free when *their* job ends, and that is not ours to wait
+        on. It is stepped over, not failed, since the configured host is big
+        enough for it. Width alone is not the test: a job wider than the owned
+        pool whose shortfall is an owned card of ours, with the shared card it
+        wants idle, holds like any other, or a stream of narrow jobs behind it
+        takes that owned card every time it frees and the job never runs.
 
-        * a job asking for more cards than are visible, whether because one has
-          dropped off nvidia-smi or because it can only run by borrowing. A
-          borrowed card comes free when somebody else's job ends, which is not
-          ours to wait on -- and failing the job would be wrong too, since
-          `config.gpus` says the host owns enough.
-        * a `gpus: 0` job, which holds no card and so can never be the reason
-          anything is short of one. It still never waits.
+        A job waiting for an owned card that has dropped off nvidia-smi holds
+        like any other: `config.gpus` says the host has that card, so the host
+        is misconfigured or broken, and idling the queue behind the job is how
+        that gets noticed rather than quietly worked around.
 
-        A job that *is* held for holds what it could take this pass, borrowed
-        cards included: having taken one of somebody else's spare cards towards
-        its total, giving it to the job behind would leave it short again.
+        A job that holds holds what it could take this pass, borrowed cards
+        included: having taken one of somebody else's spare cards towards its
+        total, giving it to the job behind would leave it short again.
         """
-        if self.paused() or paths.draining_file().exists():
+        if paths.draining_file().exists():
             return
-        visible = len(self.owned_gpus())
         free = self.free_gpus()
         # Sampled at most once per pass, and only if a job actually needs it:
-        # see `borrowable_gpus`.
+        # see `borrowable_gpus`. `theirs` is how many shared cards that reading
+        # found somebody else on.
         borrowable: list[str] | None = None
+        theirs = 0
         # Cards spoken for by a job ahead in the queue that could not start.
         # Counts, not identities: one card of ours is as good as another.
         held = 0
@@ -1107,11 +1098,17 @@ class Dispatcher:
             short = spec.gpus - len(owned_part)
             if short and self.config.may_borrow(spec):
                 if borrowable is None:
-                    borrowable = self.borrowable_gpus()
+                    borrowable, theirs = self.borrowable_gpus()
                 shared_part = borrowable[: min(short, max(0, len(borrowable) - held_shared))]
                 short -= len(shared_part)
             if short:
-                if spec.gpus <= visible:
+                # Owned cards as configured, missing ones included, plus the
+                # shared cards nobody else is on if it may borrow: what it could
+                # have once every job of ours ends.
+                ours = len(self.config.gpus)
+                if self.config.may_borrow(spec):
+                    ours += len(self.shared_gpus()) - theirs
+                if spec.gpus <= ours:
                     held += len(owned_part)
                     held_shared += len(shared_part)
                 continue
@@ -1191,7 +1188,7 @@ class Dispatcher:
         it would rather start over than hold a card something better wants, and
         a host with a steady supply of better work may never run it at all.
         """
-        if self.paused() or self._going_away() is not None or self._ttl_is_near():
+        if self._going_away() is not None:
             return
         candidates = self.auto_preemptable()
         if not candidates:
@@ -1302,66 +1299,13 @@ class Dispatcher:
         )
         return True
 
-    # -- pause / terminate ----------------------------------------------
-    def paused(self) -> bool:
-        return paths.paused_file().exists()
-
-    def recent_low_util_failures(self, count: int = 2) -> bool:
-        finished: list[tuple[str, jobs.JobState]] = []
-        for job_id in jobs.list_job_ids():
-            try:
-                state = jobs.read_state(job_id)
-            except RuntimeError:
-                continue
-            if state.finished and state.ended_at:
-                finished.append((state.ended_at, state))
-        finished.sort(key=lambda pair: pair[0], reverse=True)
-        latest = [state for _, state in finished[:count]]
-        return len(latest) == count and all(
-            s.status == "failed" and s.reason == "low-util" for s in latest
-        )
-
-    def check_pause(self) -> None:
-        """Pause on two consecutive low-util failures, and on an ephemeral host
-        go away afterwards -- but never out from under a job that is still
-        running. Draining there terminated the pod with the other jobs' runners
-        still working: no kill marker, no final sync, outputs gone with the pod.
-        Like the TTL, we ask; the drain happens on a later pass with nothing
-        left running.
-        """
-        if not self.paused():
-            if not self.recent_low_util_failures():
-                return
-            jobs.atomic_write_text(
-                paths.paused_file(),
-                "two consecutive jobs failed with reason low-util; queue paused\n",
-            )
-            self.log("PAUSED: two consecutive low-util failures; not dispatching further jobs")
-            self._pause_drain_pending = self.config.ephemeral
-        if not self._pause_drain_pending:
-            return
-        if self.running:
-            self._request_kills("low-util-pause", "the queue paused on low utilization")
-            return
-        self._pause_drain_pending = False
-        self.drain_and_terminate("two consecutive low-util failures")
-
+    # -- terminate ------------------------------------------------------
     def maybe_terminate(self) -> None:
         config = self.config
         if not config.ephemeral:
             return
         now = self.deps.monotonic()
         if self._terminate_retry_at is not None and now < self._terminate_retry_at:
-            return
-        # The TTL is a hard cap, so it is checked before anything that returns
-        # early on a busy host: the reaper used to be the only thing that
-        # enforced it, and it terminates a pod out from under a running job
-        # without a final sync.
-        if self._ttl_expired(config):
-            if self.running:
-                self._request_kills("ttl", f"the ttl of {config.ttl_hours:g} h elapsed")
-                return
-            self.drain_and_terminate(f"ttl of {config.ttl_hours:g} h elapsed")
             return
         if self.running:
             self._queue_empty_since = None
@@ -1374,54 +1318,6 @@ class Dispatcher:
         idle_s = now - self._queue_empty_since
         if idle_s >= config.idle_minutes * 60.0:
             self.drain_and_terminate(f"idle for {idle_s / 60.0:.1f} min")
-
-    def _request_kills(self, reason: str, why: str) -> None:
-        """Stop the running jobs so their runners can sync before we terminate.
-
-        The runner owns the kill and the final sync, so this asks rather than
-        signals: each job ends `failed: <reason>` with its outputs uploaded, and
-        the next pass -- with nothing running -- drains and terminates. When the
-        ask goes unanswered `escalate_kills` stops being polite.
-        """
-        now = self.deps.monotonic()
-        for job_id in sorted(self.running):
-            if queue.kill_reason(job_id):
-                # A marker from before this dispatcher took over still needs a
-                # clock, or nothing would ever escalate it.
-                self._kill_sent.setdefault(job_id, now)
-                continue
-            queue.request_kill(job_id, reason)
-            self._kill_sent[job_id] = now
-            self.log(
-                f"{why} with job {job_id} running: asked its runner to stop it "
-                f"(reason {reason}) and sync before this host terminates"
-            )
-
-    def _ttl_expired(self, config: jobs.HostConfig) -> bool:
-        left = self._ttl_seconds_left(config)
-        return left is not None and left <= 0.0
-
-    def _ttl_seconds_left(self, config: jobs.HostConfig) -> float | None:
-        """Seconds until this host's hard cap, or None if it has none.
-
-        Null `ttl_hours` -- the default -- never expires. An overall TTL is
-        opt-in precisely because the failure it causes (a training run killed
-        at hour 24) is worse than the one it prevents.
-        """
-        if config.ttl_hours is None or not config.created_at:
-            return None
-        try:
-            created = datetime.fromisoformat(config.created_at)
-        except ValueError:
-            return None
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=UTC)
-        age_s = (self.deps.utcnow() - created).total_seconds()
-        return config.ttl_hours * 3600.0 - age_s
-
-    def _ttl_is_near(self) -> bool:
-        left = self._ttl_seconds_left(self.config)
-        return self.config.ephemeral and left is not None and left <= AUTO_PREEMPT_TTL_MARGIN_S
 
     def drain_and_terminate(self, why: str) -> bool:
         config = self.config
@@ -1493,9 +1389,9 @@ class Dispatcher:
         """One last attempt to upload what a terminating host is still holding.
 
         Bounded on purpose: three tries a minute apart, five minutes in total.
-        A pod that cannot reach S3 now is billing while it tries, and the TTL
-        that sent us here does not pause -- so a job whose outputs still will
-        not go up is marked `outputs_lost` and the host terminates anyway.
+        A pod that cannot reach S3 now is billing while it tries -- so a job
+        whose outputs still will not go up is marked `outputs_lost` and the
+        host terminates anyway.
         """
         pending = self.unconfirmed_output_jobs()
         if not pending:
@@ -1639,7 +1535,6 @@ class Dispatcher:
         self.reap()
         self.handle_cancels()
         self.escalate_kills()
-        self.check_pause()
         self.launch_ready()
         self.preempt_for_waiting()
         self.maybe_reclaim()

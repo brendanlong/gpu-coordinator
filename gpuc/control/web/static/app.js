@@ -348,7 +348,7 @@ function section(label, headers, rows) {
 
 function runningTable(host) {
   if (!host.running.length) return null;
-  const rows = host.running.map((job) => el("tr", { class: job.suspect ? "suspect" : null },
+  const rows = host.running.map((job) => el("tr", {},
     el("td", {}, jobLabel(job)),
     el("td", {}, job.phase || "-"),
     el("td", { class: "num" }, fmtElapsed(job)),
@@ -427,12 +427,10 @@ function hostHeader(host, entry) {
     entry && entry.s3_prefix ? el("span", { class: "mono" }, `mirror ${entry.s3_prefix}`) : null,
     entry && entry.retention_days !== null && entry.retention_days !== undefined ? el("span", {}, `retention ${entry.retention_days}d`) : null,
     entry && entry.workdir_days !== null && entry.workdir_days !== undefined ? el("span", {}, `workdirs ${entry.workdir_days}d`) : null,
-    host.kind === "runpod" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`, entry.ttl_hours !== null && entry.ttl_hours !== undefined ? `, ttl ${entry.ttl_hours}h` : "") : null,
+    host.kind === "runpod" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`) : null,
   );
   const flags = el("div", { class: "flags" },
     host.draining ? badge("DRAINING", "warn") : null,
-    host.paused ? badge(`PAUSED (low-util); resume with gpuc host resume ${host.name}`, "warn") : null,
-    host.pod && host.pod.past_ttl ? badge("PAST TTL", "warn") : null,
   );
   return [
     el("header", {},
@@ -489,7 +487,7 @@ function renderHosts(status, hosts) {
   // redrawn on every refresh rather than toasted again each time.
   replace(document.getElementById("errors"), status.errors.map((error) => el("div", { class: "notice bad" }, error)));
   if (!status.hosts.length) {
-    replace(list, el("p", { class: "empty" }, "no hosts registered. Add one: gpuc host add local --gpus 0"));
+    replace(list, el("p", { class: "empty" }, "no hosts registered. Add one: gpuc host add local"));
     return;
   }
   replace(list, status.hosts.map((host) => hostCard(host, entries.get(host.name))));

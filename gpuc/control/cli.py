@@ -10,12 +10,12 @@ import os
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from gpuc.control import jsonout, rented
 from gpuc.control import pods as pods_mod
-from gpuc.control import reconcile as reconcile_mod
 from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
 from gpuc.control import version as version_mod
@@ -32,6 +32,7 @@ from gpuc.control.actions import (
     cancel_job,
     check_estimate,
     config_document,
+    connection_document,
     estimate_job,
     exit_code_for,
     failure_message,
@@ -39,6 +40,7 @@ from gpuc.control.actions import (
     gather_all,
     hosts_document,
     hosts_for,
+    init_config,
     job_log_path,
     make_provider,
     named_registry,
@@ -48,19 +50,26 @@ from gpuc.control.actions import (
     provider_for_status,
     read_log,
     read_registry_warned,
+    remove_host,
     reorder_job,
     shipped_note,
     status_document,
     version_document,
     warn,
 )
-from gpuc.control.bootstrap import BootstrapError, bootstrap_host, resync_package
+from gpuc.control.bootstrap import (
+    BootstrapError,
+    BootstrapResult,
+    bootstrap_host,
+    resync_package,
+)
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
+    Reporter,
     Settings,
     config_file,
     hosts_file,
@@ -69,12 +78,11 @@ from gpuc.control.config import (
     registry_transaction,
     state_dir,
     transport_for,
-    write_config_template,
 )
 from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.gpuinfo import summarize
-from gpuc.control.probe import probe_host
+from gpuc.control.probe import ProbeReport, probe_host
 from gpuc.control.providers.base import Cloud, Constraints
 from gpuc.control.provision import runpod_host
 from gpuc.control.remote import (
@@ -95,9 +103,8 @@ from gpuc.control.s3index import (
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import (
     JobSpecModel,
-    Reporter,
     SubmitResult,
-    expand_job_id,
+    from_mirror,
     load_document,
     precheck_local,
     submit_file,
@@ -128,7 +135,7 @@ __all__ = [
     "main",
 ]
 
-NO_HOSTS = "no hosts registered. Add one: gpuc host add local --gpus 0"
+NO_HOSTS = "no hosts registered. Add one: gpuc host add local"
 
 GPUS_HELP = (
     "GPU UUIDs or nvidia-smi indices this host may use, comma-separated "
@@ -204,10 +211,6 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
         fields["workdir_days"] = _days(args.workdir_days, "--workdir-days")
     if args.idle_min is not None:
         fields["idle_minutes"] = args.idle_min
-    if args.ttl_hours is not None:
-        # argparse cannot express "given but empty" for a float flag, and a TTL
-        # that can be set but never unset is a trap.
-        fields["ttl_hours"] = _ttl_hours(args.ttl_hours)
     return fields
 
 
@@ -285,7 +288,6 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         fields=fields,
         env_updates=env_updates,
         force=args.force,
-        gpu_hint="\n" + "\n".join(report.render(all_gpus=True).splitlines()[1:]),
         before_write=lambda adopted: _refuse_a_taken_name(
             load_registry().hosts.get(adopted.name), adopted, args.name
         ),
@@ -302,42 +304,38 @@ def cmd_host_add(args: argparse.Namespace) -> int:
                 update={"bootstrapped_at": current.bootstrapped_at}
             )
         registry.put(entry)
+    warnings: list[str] = []
+    if not connection.adopted and not entry.gpus:
+        warnings.append(_owns_nothing_warning(entry, args, report))
+    if args.pod and not connection.adopted:
+        # A pod nobody has set up has no dispatcher, so nothing will ever idle
+        # it out: it bills until bootstrap gives it one or a person ends it.
+        warnings.append(
+            f"nothing has bootstrapped this pod, so nothing on it will ever terminate it: "
+            f"`gpuc host bootstrap {entry.name}` gives it a dispatcher that does"
+        )
+    if args.json:
+        jsonout.emit(connection_document(entry, connection, warnings=warnings))
+        return EXIT_OK
     lines = [_added_line(entry, connection, args.name)]
-    if args.pod:
-        lines.append(_watch_pod(entry, settings, bootstrapped=connection.adopted))
+    lines += [f"  {warning}" for warning in warnings]
     print("\n".join(lines))
-    return 0
+    return EXIT_OK
 
 
-def _watch_pod(entry: HostEntry, settings: Settings, bootstrapped: bool) -> str:
-    """Cache what an adopted pod said in `desired/`, so this machine watches it too.
-
-    `gpuc reconcile` here would ask the pod and reach the same record on its
-    next pass; writing it now is what makes `gpuc pods` say straight away that
-    this pod is wanted, and what keeps it watched if it stops answering before
-    that pass.
-
-    Watching a pod means being willing to terminate it, so a pod nobody has
-    installed gpuc on is told the deadline it has just been given: it has no
-    dispatcher to beat, so the silence rule starts now.
-    """
-    record = rented.desired_from_entry(entry)
-    try:
-        if not rented.remember(record):
-            return f"desired/{record.name}.json is already here; left as it is"
-    except (ConfigError, OSError) as exc:
-        return f"WARNING: could not record {record.name} in desired/: {exc}"
-    line = (
-        f"recorded it in desired/{record.name}.json, so `gpuc reconcile` here watches it too "
-        f"(TTL {'none' if record.ttl_hours is None else f'{record.ttl_hours:g} h'})"
-    )
-    if bootstrapped:
-        return line
+def _owns_nothing_warning(entry: HostEntry, args: argparse.Namespace, report: ProbeReport) -> str:
+    """A first config that owns no card is legal and useless; say which it was."""
+    if args.gpus is not None:
+        why = "--gpus '' asked for none"
+    elif not report.has_nvidia_smi:
+        why = "it has no nvidia-smi"
+    elif entry.config.shared_gpus:
+        why = "every card it has is shared"
+    else:
+        why = "nvidia-smi found no cards on it"
     return (
-        f"{line}\n"
-        f"  nothing has bootstrapped this pod, so it has no dispatcher to beat: "
-        f"`gpuc reconcile` here terminates it in {settings.dead_dispatcher_minutes:.0f} min "
-        f"unless `gpuc host bootstrap {entry.name}` gets there first"
+        f"it owns no GPUs ({why}), so nothing can be submitted to it: "
+        f"`gpuc host set {entry.name} --gpus <list>` assigns some"
     )
 
 
@@ -394,30 +392,13 @@ def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str
     return "\n".join(lines)
 
 
-def _ttl_hours(raw: float | None) -> float | None:
-    """`--ttl-hours`: hours, or a negative sentinel meaning "no TTL at all".
-
-    A stored -1 would be a host that is *already* past its TTL, so the next
-    reaper pass terminates it -- the opposite of what anyone types it for, and
-    the same rule `gpuc host set` has always used for clearing one.
-    """
-    if raw is None or raw < 0:
-        return None
-    if raw == 0:
-        raise UsageError(
-            "--ttl-hours 0 would expire the host the moment it exists; "
-            "pass -1 (or omit it) for no TTL"
-        )
-    return raw
-
-
 def _days(raw: str | None, flag: str) -> float | None:
     """A horizon flag: a number of days, or '' to go back to keeping everything.
 
     A string, not `type=float`, because argparse cannot express "given but
     empty" for a float -- and a horizon that can be set but never unset is a
-    trap. Zero is a real answer here, unlike `--ttl-hours`: "reclaim it as soon
-    as it finishes" is what `cleanup: always` says per job.
+    trap. Zero is a real answer: "reclaim it as soon as it finishes" is what
+    `cleanup: always` says per job.
     """
     if raw is None or raw == "":
         return None
@@ -458,7 +439,6 @@ _SET_FIELDS = (
     "retention_days",
     "workdir_days",
     "idle_min",
-    "ttl_hours",
 )
 
 
@@ -497,40 +477,46 @@ def cmd_host_set(args: argparse.Namespace) -> int:
         lines += [f"  host <- {change}" for change in connection.changes] or [
             "  host already holds that config; nothing changed"
         ]
+    else:
+        # The address alone changed, so the host was not asked: the document
+        # still says which config it holds, from the cache, dated as such.
+        connection = Connection(entry=entry, home=entry.remote_home, adopted=True)
     entry = entry.model_copy(update=address)
     lines += [f"  here <- {key}={value!r}" for key, value in sorted(address.items())]
+    warnings: list[str] = []
     # Re-read under the lock: the entry above was read before an ssh round
     # trip, and writing it back whole would undo whatever a concurrent `gpuc
     # host probe` or submit learned about the same host in between.
     with registry_transaction() as registry:
         current = registry.hosts.get(entry.name)
         if current is None:
-            warn(f"host {entry.name} was removed while this ran; nothing was registered")
+            warnings.append(f"host {entry.name} was removed while this ran; nothing was registered")
         else:
             updated = current.model_copy(update=address)
             registry.put(updated if config is None else updated.with_config(config))
+    for warning in warnings:
+        warn(warning)
     home = _home_line(entry)
     if home:
         lines.append(home)
         lines.append(f"the host moves there on: gpuc host bootstrap {entry.name}")
+    if args.json:
+        document = connection_document(entry, connection, warnings=warnings)
+        jsonout.emit({**document, "address": address})
+        return EXIT_OK
     print("\n".join(lines))
-    return 0
+    return EXIT_OK
 
 
 def cmd_host_remove(args: argparse.Namespace) -> int:
-    with registry_transaction() as registry:
-        registry.require(args.name)
-        del registry.hosts[args.name]
+    document = remove_host(args.name)
+    if args.json:
+        jsonout.emit(document)
+        return EXIT_OK
     print(f"removed host {args.name}")
-    return 0
-
-
-def cmd_host_resume(args: argparse.Namespace) -> int:
-    entry = named_registry().require(args.name)
-    payload = open_session(entry, load_settings()).host_json("resume")
-    pid = payload.get("dispatcher_pid") if isinstance(payload, dict) else None
-    print(f"host {args.name}: low-util pause cleared, dispatcher pid {pid or '?'}")
-    return 0
+    for text in document["notes"]:
+        print(f"  {text}")
+    return EXIT_OK
 
 
 def cmd_host_list(args: argparse.Namespace) -> int:
@@ -580,41 +566,99 @@ def cmd_host_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def bootstrap_and_record(entry: HostEntry, settings: Settings, health_args: str) -> None:
+def bootstrap_and_record(
+    entry: HostEntry, settings: Settings, health_args: str, report: Reporter = print
+) -> BootstrapResult:
     """Bootstrap one host, persist what it told us about itself, and say so."""
-    updated, result = bootstrap_host(entry, settings, health_args=health_args)
+    updated, result = bootstrap_host(entry, settings, health_args=health_args, report=report)
     with registry_transaction() as registry:
         registry.put(updated)
-    print(
-        f"host {result.host} ready: {result.files} package files at {result.home}/pkg "
-        f"({version_mod.short(result.pkg_commit)}), dispatcher pid {result.dispatcher_pid}"
-    )
-    if result.warnings:
-        print(f"{len(result.warnings)} warning(s) above")
+    report(result.render())
+    return result
 
 
-def bootstrap_tally(total: int, done: int, failed: Sequence[HostEntry], skipped: int) -> str:
+@dataclass
+class BootstrapTally:
     """The last word of a `--all` run: what worked, what did not, what was never read.
 
     Counted rather than claimed, because the run this ends can be long enough
     that nobody reads the middle of it: a host this build could not parse out
     of the registry was never bootstrapped either, and saying "all of them"
-    over the top of that warning is how one gets missed for a month.
+    over the top of that warning is how one gets missed for a month. One
+    entry per registered host, in the order they were taken, so the `--json`
+    form is the tally as data rather than as a sentence.
     """
-    lines = [f"{done}/{total} host(s) bootstrapped"]
-    if failed:
-        lines.append(f"failed: {', '.join(entry.name for entry in failed)}")
-        if any(entry.ephemeral for entry in failed):
+
+    hosts: list[HostEntry]
+    unreadable: list[str]
+    """Registry entries this build could not read, by name: never attempted."""
+    errors: list[str]
+    outcomes: list[dict[str, Any]] = field(default_factory=list)
+    interrupted: bool = False
+
+    def record(
+        self,
+        entry: HostEntry,
+        outcome: str,
+        result: BootstrapResult | None = None,
+        *,
+        error: str | None = None,
+    ) -> None:
+        detail = result.document() if result else BootstrapResult.no_document()
+        detail.pop("host", None)
+        self.outcomes.append(
+            {
+                "name": entry.name,
+                "outcome": outcome,
+                "error": error,
+                "ephemeral": entry.ephemeral,
+                **detail,
+            }
+        )
+
+    @property
+    def done(self) -> list[str]:
+        return [o["name"] for o in self.outcomes if o["outcome"] == "bootstrapped"]
+
+    @property
+    def failed(self) -> list[dict[str, Any]]:
+        return [o for o in self.outcomes if o["outcome"] == "failed"]
+
+    def render(self) -> str:
+        lines = [f"{len(self.done)}/{len(self.hosts)} host(s) bootstrapped"]
+        if self.failed:
+            lines.append(f"failed: {', '.join(o['name'] for o in self.failed)}")
+            if any(o["ephemeral"] for o in self.failed):
+                lines.append(
+                    "an ephemeral host whose pod is already gone is forgotten by "
+                    "`gpuc host remove <name>`"
+                )
+        if self.unreadable:
             lines.append(
-                "an ephemeral host whose pod is already gone is forgotten by "
-                "`gpuc reconcile --once`"
+                f"{len(self.unreadable)} host(s) in the registry could not be read (warnings above)"
             )
-    if skipped:
-        lines.append(f"{skipped} host(s) in the registry could not be read (warnings above)")
-    return "\n".join(lines)
+        return "\n".join(lines)
+
+    def document(self) -> dict[str, Any]:
+        """`gpuc host bootstrap --all --json`: every registered host and what became of it."""
+        attempted = {o["name"] for o in self.outcomes}
+        for entry in self.hosts:
+            if entry.name not in attempted:
+                self.record(entry, "not_attempted")
+        return {
+            "hosts": self.outcomes,
+            "total": len(self.hosts),
+            "bootstrapped": self.done,
+            "failed": [o["name"] for o in self.failed],
+            "unreadable": list(self.unreadable),
+            "interrupted": self.interrupted,
+            "errors": list(self.errors),
+        }
 
 
-def bootstrap_every_host(settings: Settings, health_args: str) -> int:
+def bootstrap_every_host(
+    settings: Settings, health_args: str, *, as_json: bool, report: Reporter
+) -> int:
     """`gpuc host bootstrap --all`: the upgrade loop, one command.
 
     A host that fails does not stop the others: an ephemeral host whose pod is
@@ -626,35 +670,46 @@ def bootstrap_every_host(settings: Settings, health_args: str) -> int:
     if read.unreadable:
         raise LocalStateUnreadable("\n".join(read.errors))
     hosts = list(read.registry.hosts.values())
+    tally = BootstrapTally(hosts, sorted(read.skipped), list(read.errors))
     if not hosts:
-        print(NO_HOSTS)
+        if as_json:
+            jsonout.emit(tally.document())
+        else:
+            print(NO_HOSTS)
         return EXIT_OK
-    done = 0
-    failed: list[HostEntry] = []
+    code = EXIT_OK
     for index, entry in enumerate(hosts, start=1):
         if index > 1:
-            print()
-        print(f"== {entry.name} ({index}/{len(hosts)}) ==")
+            report("")
+        report(f"== {entry.name} ({index}/{len(hosts)}) ==")
         try:
-            bootstrap_and_record(entry, settings, health_args)
-            done += 1
+            tally.record(
+                entry, "bootstrapped", bootstrap_and_record(entry, settings, health_args, report)
+            )
         except KeyboardInterrupt:
             # Health alone allows five minutes a host, so this is a command
             # somebody does give up on; what it got through is still true.
-            print(f"\ninterrupted during {entry.name}")
-            print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
-            return EXIT_ERROR
+            report(f"\ninterrupted during {entry.name}")
+            tally.record(entry, "interrupted")
+            tally.interrupted = True
+            code = EXIT_ERROR
+            break
         except LocalStateUnreadable:
             # The registry stopped being readable mid-run, so the next host's
-            # write would be a guess: say how far this got, and exit 3.
-            print(f"\n{bootstrap_tally(len(hosts), done, failed, len(read.skipped))}")
+            # write would be a guess: say how far this got, and exit 3. Under
+            # --json the error document is the one stdout gets.
+            report(f"\n{tally.render()}")
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
             print(f"error: host {entry.name}: {exc}", file=sys.stderr)
-            failed.append(entry)
+            tally.record(entry, "failed", error=str(exc))
+            code = EXIT_ERROR
+    if as_json:
+        jsonout.emit(tally.document())
+        return code
     print()
-    print(bootstrap_tally(len(hosts), done, failed, len(read.skipped)))
-    return EXIT_ERROR if failed else EXIT_OK
+    print(tally.render())
+    return code
 
 
 def cmd_host_bootstrap(args: argparse.Namespace) -> int:
@@ -664,10 +719,15 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> int:
             raise UsageError(
                 f"host bootstrap takes a host name or --all, not both (got {args.name!r})"
             )
-        return bootstrap_every_host(settings, args.health_args)
+        return bootstrap_every_host(
+            settings, args.health_args, as_json=args.json, report=reporter(args)
+        )
     if not args.name:
         raise UsageError("host bootstrap wants a host name, or --all for every registered host")
-    bootstrap_and_record(named_registry().require(args.name), settings, args.health_args)
+    entry = named_registry().require(args.name)
+    result = bootstrap_and_record(entry, settings, args.health_args, reporter(args))
+    if args.json:
+        jsonout.emit(result.document())
     return EXIT_OK
 
 
@@ -711,8 +771,12 @@ def cmd_host_clean(args: argparse.Namespace) -> int:
     if not args.uv_cache:
         raise UsageError("host clean needs --uv-cache (job workdirs are `gpuc clean --host H`)")
     entry = named_registry().require(args.name)
-    print(prune_uv_cache(entry, load_settings()))
-    return 0
+    report = prune_uv_cache(entry, load_settings())
+    if args.json:
+        jsonout.emit(report.document())
+    else:
+        print(report.render())
+    return EXIT_OK
 
 
 def cmd_host_probe(args: argparse.Namespace) -> int:
@@ -794,7 +858,6 @@ def runpod_target(args: argparse.Namespace, settings: Settings) -> HostEntry:
         reuse=not args.no_reuse,
         name_hint=args.name_hint,
         idle_minutes=args.idle_min,
-        ttl_hours=args.ttl_hours,
         disk_gb=args.disk if args.disk is not None else settings.disk_gb,
         image=args.image or settings.image,
         health_args=args.health_args,
@@ -802,9 +865,15 @@ def runpod_target(args: argparse.Namespace, settings: Settings) -> HostEntry:
 
 
 def cmd_config_init(args: argparse.Namespace) -> int:
-    path = write_config_template(force=args.force)
-    print(f"wrote {path}\nEvery key is commented with its default; edit what you need.")
-    return 0
+    document = init_config(force=args.force)
+    if args.json:
+        jsonout.emit(document)
+        return EXIT_OK
+    print(
+        f"wrote {document['config_file']}\n"
+        f"Every key is commented with its default; edit what you need."
+    )
+    return EXIT_OK
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
@@ -829,7 +898,8 @@ def mirror_spec_first(
     """Put the spec in S3 before spending any money, so a lost pod is still requeueable.
 
     Returns the uri it landed at, so the submit that follows does not PUT the
-    same object a second time.
+    same object a second time. `{job_id}` goes up unexpanded: the mirror is
+    what `requeue` submits, and that run must land in its own namespace.
     """
     s3 = S3Index.from_settings(settings)
     if s3 is None:
@@ -838,7 +908,7 @@ def mirror_spec_first(
             "`gpuc requeue` will need the job file again"
         ]
     try:
-        return s3.put_spec(expand_job_id(model.to_spec(job_id))), []
+        return s3.put_spec(model.to_spec(job_id)), []
     except S3IndexError as exc:
         return None, [f"could not mirror the spec to S3 before provisioning: {exc}"]
 
@@ -850,7 +920,6 @@ def check_runpod_args(args: argparse.Namespace) -> None:
             f"--runpod creates a pod and --host {args.host} names a host that already "
             f"exists, so they cannot be combined. Drop one."
         )
-    args.ttl_hours = _ttl_hours(args.ttl_hours)
 
 
 def reporter(args: argparse.Namespace) -> Reporter:
@@ -968,8 +1037,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
             Path.cwd(),
             gpu_count=args.gpu_count,
             use_git=use_git,
-            ttl_hours=args.ttl_hours,
-            report=report,
         )
         job_id = jobs.new_job_id()
         spec_uri, notes = mirror_spec_first(model, job_id, settings)
@@ -1064,19 +1131,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(NO_HOSTS)
         # ...but `--all` still has something to say: the index remembers jobs
         # whose host has since been removed.
-        if args.all and not args.suspects:
+        if args.all:
             _print_unhosted(settings, set(), args.host)
         return EXIT_OK
     provider = provider_for_status(entries, settings)
     seen: set[str] = set()
     for view in gather_all(entries, settings, provider):
         seen.update(job.job_id for job in view.queue + view.running + view.finished)
-        print(
-            status_mod.render(
-                view, recent=args.recent, suspects_only=args.suspects, since_s=since_s
-            )
-        )
-    if args.all and not args.suspects:
+        print(status_mod.render(view, recent=args.recent, since_s=since_s))
+    if args.all:
         _print_unhosted(settings, seen, args.host)
     return EXIT_OK
 
@@ -1329,8 +1392,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             f"Check the id with `gpuc status --all`; only jobs submitted with s3_bucket "
             f"set can be requeued."
         ) from exc
-    for key in ("job_id", "attempt"):
-        document.pop(key, None)
+    document = from_mirror(document)
     attempt = (index.attempt if index else 1) + 1
     model = validate(document, f"spec for {args.job_id}")
     use_git = not args.no_git
@@ -1341,8 +1403,6 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             Path.cwd(),
             gpu_count=args.gpu_count,
             use_git=use_git,
-            ttl_hours=args.ttl_hours,
-            report=report,
         )
     entry = runpod_target(args, settings) if target is None else registry.require(target)
     entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap, report=report)
@@ -1356,34 +1416,6 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         report=report,
     )
     return _queued(result, args, entry, settings, requeued_from=args.job_id)
-
-
-def cmd_reconcile(args: argparse.Namespace) -> int:
-    if args.json and (args.install or not args.once):
-        raise UsageError(
-            "reconcile --json needs --once and nothing else: the loop and --install have "
-            "no document to print, only a running commentary."
-        )
-    if args.install:
-        reconcile_mod.install(args.interval)
-        return EXIT_OK
-    settings = load_settings()
-    provider = make_provider(settings)
-    if args.once:
-        # Every pod it judges is a line of commentary, and under --json stdout
-        # belongs to the document.
-        result = reconcile_mod.reconcile_once(settings, provider, report=reporter(args))
-        if args.json:
-            jsonout.emit(result.document())
-        else:
-            print(result.render())
-        return EXIT_ERROR if result.errors else EXIT_OK
-    print(f"reconciling every {args.interval:.0f}s; Ctrl-C to stop", file=sys.stderr)
-    try:
-        reconcile_mod.run_loop(settings, provider, interval_s=args.interval)
-    except KeyboardInterrupt:
-        print("stopped", file=sys.stderr)
-    return EXIT_OK
 
 
 def cmd_pods(args: argparse.Namespace) -> int:
@@ -1495,8 +1527,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add.add_argument(
         "--gpus",
-        help=f"required for a host with no config of its own; on a host that has one this "
-        f"reassigns its cards, and a list that overlaps the host's is refused. {GPUS_HELP}",
+        help=f"a host with no config of its own owns every card nvidia-smi reports unless "
+        f"this narrows it ('' for none); on a host that has one this reassigns its cards, "
+        f"and a list that overlaps the host's is refused. {GPUS_HELP}",
     )
     add.add_argument("--shared-gpus", help=SHARED_GPUS_HELP)
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
@@ -1538,18 +1571,12 @@ def build_parser() -> argparse.ArgumentParser:
         "itself (default 15); ignored for hosts that are not ephemeral",
     )
     add.add_argument(
-        "--ttl-hours",
-        type=float,
-        default=None,
-        help="hard cap on the host's life; omit or pass -1 for none (the default). When "
-        "set, the dispatcher kills the running job with reason ttl, syncs, and terminates",
-    )
-    add.add_argument(
         "--force",
         action="store_true",
         help="allow a --gpus that claims some but not all of the cards the host is already "
         "configured with",
     )
+    add_json_flag(add, "the host as `host list --json` reports it, plus what this wrote to it")
     add.set_defaults(func=cmd_host_add)
 
     edit = host.add_parser(
@@ -1590,9 +1617,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MINUTES",
         help="idle minutes before an ephemeral host terminates itself",
     )
-    edit.add_argument(
-        "--ttl-hours", type=float, help="hard cap in hours; -1 clears it (no TTL, the default)"
-    )
+    add_json_flag(edit, "the host as `host list --json` reports it, plus what this changed")
     edit.set_defaults(func=cmd_host_set)
 
     bootstrap = host.add_parser("bootstrap", help="install uv, the package and the dispatcher")
@@ -1605,6 +1630,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bootstrap.add_argument(
         "--health-args", default="", help="extra flags for `gpuc.host health`, e.g. --min-mbps 0.1"
+    )
+    add_json_flag(
+        bootstrap,
+        "what the bootstrap left on the host; with --all, one entry per registered host "
+        "saying whether it was bootstrapped, failed (and why) or was never reached. "
+        "Progress goes to stderr, and the exit code is the same as without it",
     )
     bootstrap.set_defaults(func=cmd_host_bootstrap)
 
@@ -1624,18 +1655,15 @@ def build_parser() -> argparse.ArgumentParser:
     host_clean.add_argument(
         "--uv-cache", action="store_true", help="run `uv cache prune` on the host"
     )
+    add_json_flag(host_clean, "the cache directory and its size before and after the prune")
     host_clean.set_defaults(func=cmd_host_clean)
 
     host_list = host.add_parser("list", help="list registered hosts")
     add_json_flag(host_list)
     host_list.set_defaults(func=cmd_host_list)
-    resume = host.add_parser(
-        "resume", help="clear a low-util pause on a host and restart its dispatcher"
-    )
-    resume.add_argument("name")
-    resume.set_defaults(func=cmd_host_resume)
     remove = host.add_parser("remove", help="forget a host")
     remove.add_argument("name")
+    add_json_flag(remove, "what was forgotten: the entry's name, kind and pod id")
     remove.set_defaults(func=cmd_host_remove)
 
     submit = sub.add_parser("submit", help="submit a job file to a host")
@@ -1662,7 +1690,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--host", metavar="NAME", help="only this host; omit for every registered host"
     )
     status.add_argument("--all", action="store_true", help="also list jobs only the index knows")
-    status.add_argument("--suspects", action="store_true", help="billing but idle; never kills")
     status.add_argument(
         "--recent",
         type=int,
@@ -1863,25 +1890,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
-    reconcile = sub.add_parser(
-        "reconcile", help="terminate leaked or expired pods; --install for a systemd timer"
+    pods = sub.add_parser(
+        "pods", help="every pod with our prefix: cost, util, age, which host it is here"
     )
-    reconcile.add_argument("--once", action="store_true", help="one pass, then exit")
-    reconcile.add_argument(
-        "--interval",
-        type=float,
-        default=reconcile_mod.DEFAULT_INTERVAL_S,
-        metavar="SECONDS",
-        help=f"seconds between passes of the loop, and of the installed timer "
-        f"(default {reconcile_mod.DEFAULT_INTERVAL_S:.0f})",
-    )
-    reconcile.add_argument(
-        "--install", action="store_true", help="write (but do not enable) systemd --user units"
-    )
-    add_json_flag(reconcile, f"{JSON_HELP}; needs --once")
-    reconcile.set_defaults(func=cmd_reconcile)
-
-    pods = sub.add_parser("pods", help="every pod with our prefix, cost, util, age, desired?")
     pods.add_argument(
         "--no-heartbeat", action="store_true", help="skip the per-pod dispatcher ssh check"
     )
@@ -1893,6 +1904,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_init = config.add_parser("init", help="write a commented config.toml")
     config_init.add_argument("--force", action="store_true", help="overwrite an existing file")
+    add_json_flag(config_init, "the path written, and whether a file was already there")
     config_init.set_defaults(func=cmd_config_init)
     config_show = config.add_parser("show", help="print the effective settings")
     add_json_flag(config_show)
@@ -2001,13 +2013,6 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
         metavar="MINUTES",
         help="terminate the pod once its queue has been empty this long (default 15)",
     )
-    parser.add_argument(
-        "--ttl-hours",
-        type=float,
-        default=None,
-        help="hard cap on the pod's life; omit or pass -1 for none (the default), leaving "
-        "--idle-min and `gpuc reconcile` to stop it",
-    )
     parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
     parser.add_argument("--image", help="pod image; default from config")
     parser.add_argument("--no-reuse", action="store_true", help="always create a new pod")
@@ -2016,11 +2021,9 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def wants_runpod(args: argparse.Namespace) -> bool:
-    if getattr(args, "install", False):
-        return False  # `reconcile --install` only writes unit files
     if getattr(args, "pod", None):
         return True  # `gpuc host add --pod` asks the provider where that pod is
-    return bool(getattr(args, "runpod", False)) or args.command in ("pods", "reconcile")
+    return bool(getattr(args, "runpod", False)) or args.command == "pods"
 
 
 def first_run_note() -> None:
@@ -2062,7 +2065,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return failed(
             args,
             "RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc host add --pod`, `gpuc pods` or `gpuc reconcile`",
+            "`gpuc host add --pod` or `gpuc pods`",
             EXIT_ERROR,
         )
     if args.command not in ("config", "skill"):

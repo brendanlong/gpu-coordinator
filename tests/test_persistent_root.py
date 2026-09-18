@@ -23,7 +23,15 @@ from gpuc.control.config import HostEntry, load_registry
 from gpuc.control.remote import env_prefix, host_command
 from gpuc.host import dispatcher, health, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig, JobState
-from tests.conftest import FAKE_GPUS, fake_smi, host_entry, make_spec, register_host
+from tests.conftest import (
+    FAKE_GPUS,
+    fake_smi,
+    host_entry,
+    install_fake_nvidia_smi,
+    install_fake_torch,
+    make_spec,
+    register_host,
+)
 from tests.fakehost import FakeHost
 from tests.test_bootstrap import ScriptedHost
 from tests.test_runner import deps, log_of, prepare
@@ -150,20 +158,29 @@ def test_the_job_command_really_sees_the_host_env(gpuc_home: Path) -> None:
     assert f"cache={HOST_ENV['UV_CACHE_DIR']}" in log_of(job_id)
 
 
-def test_a_dispatched_job_sees_it_too(gpuc_home: Path) -> None:
+def test_a_dispatched_job_sees_it_too(
+    gpuc_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The dispatcher spawns the runner as a real child, so this covers the
-    whole chain (config -> dispatcher env -> runner -> bash) in one go."""
-    with_host_env()
-    queue.enqueue(make_spec(command='echo "cache=$UV_CACHE_DIR"', gpus=0))
+    whole chain (config -> dispatcher env -> runner -> bash) in one go. The
+    runner asks the real `nvidia-smi` and runs the real preflight, so both are
+    faked on the machine rather than in the process."""
+    cache = tmp_path / "uv-cache"
+    jobs.write_config(
+        HostConfig(host="gpubox", gpus=list(FAKE_GPUS), env={"UV_CACHE_DIR": str(cache)})
+    )
+    install_fake_nvidia_smi(tmp_path / "bin")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    job_id = queue.enqueue(make_spec(command='echo "cache=$UV_CACHE_DIR"'))
+    install_fake_torch(paths.workdir(job_id))
     loop = dispatcher.Dispatcher(dispatcher.DispatcherDeps(smi=fake_smi()))
     loop.run_once()
-    job_id = jobs.list_job_ids()[0]
     deadline = time.monotonic() + 60
     while not jobs.read_state(job_id).finished and time.monotonic() < deadline:
         time.sleep(0.05)
         loop.run_once()
-    assert jobs.read_state(job_id).status == "succeeded"
-    assert f"cache={HOST_ENV['UV_CACHE_DIR']}" in log_of(job_id)
+    assert jobs.read_state(job_id).status == "succeeded", log_of(job_id)
+    assert f"cache={cache}" in log_of(job_id)
 
 
 def test_health_measures_the_gpuc_home_filesystem(
@@ -379,11 +396,10 @@ def test_host_set_replaces_the_whole_env(control_env: Path, fake_host: FakeHost)
     assert fake_host.config is not None and fake_host.config["env"] == {}
 
 
-def test_host_set_changes_the_timers(control_env: Path, fake_host: FakeHost) -> None:
+def test_host_set_changes_the_idle_timer(control_env: Path, fake_host: FakeHost) -> None:
     add()
-    main(["host", "set", "gpubox", "--idle-min", "3", "--ttl-hours", "0.5"])
-    entry = load_registry().require("gpubox")
-    assert (entry.idle_minutes, entry.ttl_hours) == (3.0, 0.5)
+    main(["host", "set", "gpubox", "--idle-min", "3"])
+    assert load_registry().require("gpubox").idle_minutes == 3.0
 
 
 def test_host_set_with_no_flags_says_so(

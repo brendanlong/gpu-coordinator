@@ -31,6 +31,7 @@ from gpuc.control.config import (
     config_file,
     hosts_file,
     load_registry,
+    pod_known_hosts_file,
     read_registry,
 )
 from gpuc.control.status import HostView
@@ -44,7 +45,6 @@ GOOD_ENTRY = {
     "kind": "local",
     "gpus": [GPU],
     "idle_minutes": 15.0,
-    "ttl_hours": None,
 }
 BAD_ENTRY = {"name": "bad", "kind": "a kind that does not exist", "port": "twenty-two"}
 
@@ -253,7 +253,7 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
     (paths.workdir(FINISHED_JOB) / "results").mkdir(parents=True, exist_ok=True)
     (paths.workdir(FINISHED_JOB) / "results" / "loss.json").write_text("{}")
     jobs.write_state(
-        FINISHED_JOB, JobState(status="failed", reason="low-util", ended_at=ended, exit_code=1)
+        FINISHED_JOB, JobState(status="failed", reason="timeout", ended_at=ended, exit_code=1)
     )
     monkeypatch.delenv("GPUC_HOME")
 
@@ -305,7 +305,6 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "ended_at",
         "outputs_pending",
         "outputs_lost",
-        "suspect",
         "priority",
         "attempt",
         "started_at",
@@ -321,7 +320,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
     assert (job["outputs"], job["links"]) == ([], [])
 
     done = next(j for j in host["finished"] if j["job_id"] == FINISHED_JOB)
-    assert done["reason"] == "low-util"
+    assert done["reason"] == "timeout"
     assert done["outputs_pending"] is True
     # Where the results were meant to go, and a console link to open it: the
     # dashboard's anchors come from here, and the text view has no room for them.
@@ -338,7 +337,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
     assert (link["kind"], link["path"], link["target"]) == ("s3", "results", "s3://bucket/{job_id}")
     assert link["url"].startswith("https://s3.console.aws.amazon.com/s3/buckets/bucket?prefix=")
     assert host["pod"] is None
-    assert (host["draining"], host["paused"], host["pod_gone"]) == (False, False, False)
+    assert (host["draining"], host["pod_gone"]) == (False, False)
 
     # One row for the owned card. Which shape it takes says whether nvidia-smi
     # on *this* machine could resolve it, which is not what this test is about.
@@ -354,14 +353,14 @@ def test_status_json_is_one_document_with_the_promised_shape(
 def test_config_show_json_is_the_effective_settings(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    config_file().write_text('s3_bucket = "bucket"\nmax_pods = 5\n')
+    config_file().write_text('s3_bucket = "bucket"\ndisk_gb = 5\n')
     assert main(["config", "show", "--json"]) == EXIT_OK
     document = status_json(capsys)
     assert document["schema_version"] == 1
     assert document["config_file"] == str(config_file())
     assert document["config_file_exists"] is True
     assert document["settings"]["s3_bucket"] == "bucket"
-    assert document["settings"]["max_pods"] == 5
+    assert document["settings"]["disk_gb"] == 5
     assert document["notes"] == []
 
 
@@ -661,9 +660,14 @@ JSON_COMMANDS = [
     ["pods"],
     ["version"],
     ["clean"],
-    ["reconcile"],
     ["host", "list"],
     ["host", "probe"],
+    ["host", "add"],
+    ["host", "set"],
+    ["host", "bootstrap"],
+    ["host", "clean"],
+    ["host", "remove"],
+    ["config", "init"],
 ]
 
 
@@ -733,6 +737,276 @@ def test_host_list_json_carries_the_entries_and_the_skipped_ones(
     assert host["remote_home"] == "$HOME/.gpuc"
     assert host["ephemeral"] is False
     assert "skipping host 'bad'" in document["errors"][0]
+
+
+def test_host_add_json_is_the_host_as_list_reports_it_plus_what_add_did(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The registry entry `host add` just wrote, in `host list --json`'s shape."""
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert (document["name"], document["kind"], document["ssh"]) == ("gpubox", "ssh", "me@box")
+    assert document["gpus"] == ["GPU-a", "GPU-b"]
+    assert document["adopted"] is False
+    assert document["config_path"] == "/home/u/.gpuc/config.json"
+    assert document["warnings"] == []
+    assert isinstance(document["changes"], list)
+    assert fake_host.config is not None
+
+
+def test_host_add_json_carries_the_owns_nothing_warning_in_the_document(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "none", "--ssh", "me@none", "--gpus", "", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document["gpus"] == []
+    assert any("owns no GPUs (--gpus '' asked for none)" in w for w in document["warnings"])
+
+
+def test_host_add_json_failure_is_a_document_with_the_text_forms_exit_code(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "GPU-a", "--shared-gpus", "GPU-a"]
+    code = main(argv)
+    captured = capsys.readouterr()
+    assert code == 1 and captured.out == ""
+    assert main([*argv, "--json"]) == code
+    assert document_of(capsys)["exit_code"] == code
+
+
+def test_host_set_json_is_the_host_after_the_change(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == EXIT_OK
+    capsys.readouterr()
+    assert main(["host", "set", "gpubox", "--shared-gpus", "1", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document["name"] == "gpubox"
+    assert document["shared_gpus"] == ["1"]
+    assert document["adopted"] is True
+    assert document["changes"] and any("shared_gpus" in change for change in document["changes"])
+    assert document["address"] == {}
+    assert document["warnings"] == []
+    assert load_registry().require("gpubox").config.shared_gpus == ["1"]
+
+
+def test_host_set_json_reports_an_address_change_made_here(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == EXIT_OK
+    capsys.readouterr()
+    assert main(["host", "set", "gpubox", "--persistent-root", "/vol/me", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document["address"] == {"persistent_root": "/vol/me"}
+    assert document["changes"] == []
+    assert document["persistent_root"] == "/vol/me"
+    assert document["remote_home"] == "/vol/me/gpuc"
+
+
+def test_host_set_json_with_nothing_to_set_is_usage_in_both_forms(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    register_host(name="local", gpus=GPU)
+    assert main(["host", "set", "local"]) == EXIT_USAGE
+    capsys.readouterr()
+    assert main(["host", "set", "local", "--json"]) == EXIT_USAGE
+    assert document_of(capsys)["exit_code"] == EXIT_USAGE
+
+
+def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    register_host(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1")
+    register_host(name="local", gpus=GPU)
+    pinned = pod_known_hosts_file("pod")
+    pinned.parent.mkdir(parents=True, exist_ok=True)
+    pinned.write_text("[1.2.3.4]:22 ssh-ed25519 AAAA\n")
+    capsys.readouterr()
+    assert main(["host", "remove", "pod", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert (document["host"], document["kind"], document["pod_id"]) == ("pod", "runpod", "p1")
+    assert any("p1" in text and "not terminated" in text for text in document["notes"])
+    # RunPod recycles host:port, so the next pod under this name must not be
+    # checked against this one's key.
+    assert not pinned.exists()
+    assert main(["host", "remove", "local", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert (document["host"], document["kind"], document["pod_id"]) == ("local", "local", None)
+    assert document["notes"] == []
+    assert load_registry().hosts == {}
+    assert main(["host", "remove", "local"]) == EXIT_NOT_FOUND
+    capsys.readouterr()
+    assert main(["host", "remove", "local", "--json"]) == EXIT_NOT_FOUND
+    assert document_of(capsys)["exit_code"] == EXIT_NOT_FOUND
+
+
+def test_host_bootstrap_json_is_what_the_bootstrap_left_on_the_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_cli import bootstrapping
+
+    register_host(name="local", gpus=GPU)
+    bootstrapping(monkeypatch)
+    capsys.readouterr()
+    assert main(["host", "bootstrap", "local", "--json"]) == EXIT_OK
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document == {
+        "schema_version": 1,
+        "host": "local",
+        "home": "/root/.gpuc",
+        "files": 20,
+        "pkg_commit": None,
+        "dispatcher_pid": 4242,
+        "warnings": [],
+    }
+    # The step-by-step progress bootstrap prints is on stderr, off the document.
+    assert "fake bootstrap of local" in captured.err
+    assert load_registry().require("local").bootstrapped_at
+
+
+def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.bootstrap import BootstrapError
+    from tests.test_cli import bootstrapping
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1")
+    document = json.loads(hosts_file().read_text())
+    document["hosts"]["bad"] = BAD_ENTRY
+    hosts_file().write_text(json.dumps(document))
+    bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
+    capsys.readouterr()
+
+    # Exit 1 because a host failed, exactly as without --json.
+    assert main(["host", "bootstrap", "--all", "--json"]) == 1
+    captured = capsys.readouterr()
+    tally = json.loads(captured.out)
+    assert tally["schema_version"] == 1
+    assert (tally["total"], tally["bootstrapped"], tally["failed"]) == (2, ["gpubox"], ["pod"])
+    assert tally["unreadable"] == ["bad"]
+    assert tally["interrupted"] is False
+    assert "skipping host 'bad'" in tally["errors"][0]
+    by_name = {host["name"]: host for host in tally["hosts"]}
+    assert set(by_name) == {"gpubox", "pod"}
+    assert by_name["gpubox"]["outcome"] == "bootstrapped"
+    assert by_name["gpubox"]["error"] is None
+    assert by_name["gpubox"]["dispatcher_pid"] == 4242
+    assert by_name["pod"]["outcome"] == "failed"
+    assert by_name["pod"]["error"] == "ssh to pod failed"
+    assert by_name["pod"]["ephemeral"] is True
+    assert by_name["pod"]["dispatcher_pid"] is None
+    assert "== gpubox (1/2) ==" in captured.err
+    assert "error: host pod: ssh to pod failed" in captured.err
+
+
+def test_host_bootstrap_all_json_interrupted_names_the_hosts_never_reached(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_cli import bootstrapping
+
+    register_host(name="abox", kind="ssh", ssh="me@a")
+    register_host(name="bbox", kind="ssh", ssh="me@b")
+    register_host(name="cbox", kind="ssh", ssh="me@c")
+    bootstrapping(monkeypatch, fail={"bbox": KeyboardInterrupt()})
+    capsys.readouterr()
+    assert main(["host", "bootstrap", "--all", "--json"]) == 1
+    tally = document_of(capsys)
+    assert tally["interrupted"] is True
+    assert [(h["name"], h["outcome"]) for h in tally["hosts"]] == [
+        ("abox", "bootstrapped"),
+        ("bbox", "interrupted"),
+        ("cbox", "not_attempted"),
+    ]
+
+
+def test_host_bootstrap_all_json_with_no_hosts_is_an_empty_tally(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "bootstrap", "--all", "--json"]) == EXIT_OK
+    tally = document_of(capsys)
+    assert (tally["hosts"], tally["total"]) == ([], 0)
+
+
+def test_host_bootstrap_all_json_on_a_registry_that_breaks_mid_run_is_the_error_document(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.config import LocalStateUnreadable
+    from tests.test_cli import bootstrapping
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="local", gpus=GPU)
+    bootstrapping(monkeypatch, fail={"local": LocalStateUnreadable("hosts.json is not json")})
+    capsys.readouterr()
+    assert main(["host", "bootstrap", "--all", "--json"]) == EXIT_LOCAL_STATE
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document["exit_code"] == EXIT_LOCAL_STATE
+    assert "hosts.json is not json" in document["error"]
+    assert "1/2 host(s) bootstrapped" in captured.err
+
+
+class PruningTransport:
+    """A host whose `uv cache prune` reports the cache size either side."""
+
+    def __init__(self, output: str) -> None:
+        self.output = output
+
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> Any:
+        from gpuc.control.transport import CommandResult
+
+        return CommandResult("fake", ["sh", "-c", command], 0, self.output, "")
+
+
+def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register_host(name="local", gpus=GPU)
+    host = PruningTransport("before_kib=18874368\nafter_kib=11534336\ndir=/home/u/.cache/uv\n")
+    monkeypatch.setattr("gpuc.control.clean.transport_for", lambda entry, settings=None: host)
+    assert main(["host", "clean", "local", "--uv-cache"]) == EXIT_OK
+    assert "pruned 18.0 GiB -> 11.0 GiB" in capsys.readouterr().out
+    assert main(["host", "clean", "local", "--uv-cache", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document == {
+        "schema_version": 1,
+        "host": "local",
+        "cache_dir": "/home/u/.cache/uv",
+        "before": "18.0 GiB",
+        "after": "11.0 GiB",
+        "before_bytes": 18874368 * 1024,
+        "after_bytes": 11534336 * 1024,
+        "freed_bytes": (18874368 - 11534336) * 1024,
+    }
+
+
+def test_host_clean_json_without_the_flag_is_usage_in_both_forms(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    register_host(name="local", gpus=GPU)
+    assert main(["host", "clean", "local"]) == EXIT_USAGE
+    capsys.readouterr()
+    assert main(["host", "clean", "local", "--json"]) == EXIT_USAGE
+    assert document_of(capsys)["exit_code"] == EXIT_USAGE
+
+
+def test_config_init_json_is_the_path_and_whether_it_was_there(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["config", "init", "--json"]) == EXIT_OK
+    document = document_of(capsys)
+    assert document == {"schema_version": 1, "config_file": str(config_file()), "existed": False}
+    assert config_file().exists()
+    # Refusing to clobber is exit 1 in both forms, with the reason as `error`.
+    assert main(["config", "init"]) == 1
+    capsys.readouterr()
+    assert main(["config", "init", "--json"]) == 1
+    document = document_of(capsys)
+    assert document["exit_code"] == 1
+    assert "already exists" in document["error"]
+    assert main(["config", "init", "--force", "--json"]) == EXIT_OK
+    assert document_of(capsys)["existed"] is True
 
 
 def test_host_list_json_on_an_unreadable_registry_is_exit_three_and_still_json(

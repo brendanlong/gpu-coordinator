@@ -1,5 +1,5 @@
-"""What `reconcile --install` and `web serve --install` share: where user units
-go, how to name this `gpuc` absolutely, and writing without enabling."""
+"""What `web serve --install` needs of systemd: where user units go, how to
+name this `gpuc` absolutely, and writing without enabling."""
 
 from __future__ import annotations
 

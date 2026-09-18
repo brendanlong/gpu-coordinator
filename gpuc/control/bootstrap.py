@@ -26,7 +26,7 @@ from gpuc.control.remote import (
     write_remote_config,
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
-from gpuc.control.version import local_commit, package_root
+from gpuc.control.version import local_commit, package_root, short
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
@@ -49,6 +49,38 @@ class BootstrapResult:
     pkg_commit: str | None = None
     """The gpuc commit this bootstrap shipped, as `gpuc version` reports it."""
     warnings: list[str] = field(default_factory=list)
+
+    def render(self) -> str:
+        line = (
+            f"host {self.host} ready: {self.files} package files at {self.home}/pkg "
+            f"({short(self.pkg_commit)}), dispatcher pid {self.dispatcher_pid}"
+        )
+        if self.warnings:
+            line += f"\n{len(self.warnings)} warning(s) above"
+        return line
+
+    def document(self) -> dict[str, Any]:
+        """`gpuc host bootstrap --json`, and one entry of `--all`'s `hosts[]`."""
+        return {
+            "host": self.host,
+            "home": self.home,
+            "files": self.files,
+            "pkg_commit": self.pkg_commit,
+            "dispatcher_pid": self.dispatcher_pid,
+            "warnings": list(self.warnings),
+        }
+
+    @classmethod
+    def no_document(cls) -> dict[str, Any]:
+        """The same keys as `document()`, for a host that was never bootstrapped."""
+        return {
+            "host": None,
+            "home": None,
+            "files": None,
+            "pkg_commit": None,
+            "dispatcher_pid": None,
+            "warnings": [],
+        }
 
 
 def package_files(root: Path | None = None) -> list[str]:
@@ -393,11 +425,10 @@ def start_dispatcher(session: HostSession) -> int:
 def bootstrapped_provider(entry: HostEntry) -> dict[str, Any]:
     """`{"provider": ...}` with this moment stamped on it, for a rented host.
 
-    A pod carries its own desired record (`rented`), and this is the stamp that
-    says it got past the provisioning ceiling. Written by whichever machine
-    bootstraps it, so a second one reconciling that pod does not have to have
-    been there. Empty for a host nobody is renting: inventing a provider block
-    for one would make `gpuc pods` claim it.
+    A pod carries its own record of what it was bought as (`rented`), and this
+    is the stamp that says it was set up, written by whichever machine did so.
+    Empty for a host nobody is renting: inventing a provider block for one
+    would make it read as a pod.
 
     The question is whether this host is *rented*, not whether its config
     already says so: a pod set up before the block existed has none, and it is

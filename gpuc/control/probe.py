@@ -289,7 +289,7 @@ class ProbeReport:
         """What this host will do to a job unless somebody acts, in words."""
         notes: list[str] = []
         if not self.has_nvidia_smi:
-            notes.append("no nvidia-smi, so this host can only run gpus: 0 jobs")
+            notes.append("no nvidia-smi, so this host cannot run jobs")
         notes += self._gpu_notes()
         if self.sections.get("killuserprocesses", "").endswith("=yes"):
             notes.append(
@@ -314,7 +314,7 @@ class ProbeReport:
         notes: list[str] = []
         if rows and not self.owned:
             notes.append(
-                f"no GPUs are assigned to {self.host}, so it can only run gpus: 0 jobs;\n"
+                f"no GPUs are assigned to {self.host}, so nothing can be submitted to it;\n"
                 f"        assign some with `gpuc host set {self.host} --gpus <list>`, "
                 f"from the indices or UUIDs above"
             )
