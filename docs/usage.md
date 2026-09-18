@@ -248,15 +248,32 @@ behind, exactly as `gpuc preempt` does, so it belongs to work that is cheap to
 repeat — a sweep point, an eval, a job that checkpoints and resumes — and not
 to a run whose `setup:` would trip over its own leftovers.
 
-The host only does it when it is worth it, and the rules are the command's:
+The host only does it when it is worth it. The rules are the command's, plus
+one the command leaves to the person typing it:
 
 - **It has to be enough.** Freeing one of the two cards the waiting job needs
   would cost an attempt and start nothing, so a job is stopped only when what
-  is stopped covers the whole gap. Several are stopped together where one is
-  not enough, least important first, and among equals the one that has been
-  running the shortest time. Least important first is by `priority` alone, so
-  a job may free more cards than the waiting one needs; the surplus goes back
-  to the queue like any other card.
+  is stopped covers the whole gap — the cards the waiting job is *short* of,
+  counting an idle shared card it may borrow as one it already has. Several
+  are stopped together where one is not enough, least important first, and
+  among equals the one that has been running the shortest time. Least
+  important first is by `priority` alone, so a job may free more cards than
+  the waiting one needs; the surplus goes back to the queue like any other
+  card, and nothing is stopped a second time for a card already on its way.
+- **It is made for the job the queue is stuck on, and no other.** One stop a
+  pass, for the first job that is genuinely waiting for cards — never for a job
+  behind it. A card handed back is dispatched in queue order like any other, so
+  the job in front takes it first, and that job needs more than everything
+  stoppable would free, or it would have been the job stopped for. The rule is
+  about cards, not priorities: the queue is in priority order, so a job that
+  could preempt something is never behind a job that could not. Two waiting
+  jobs that each deserve a stop get one each, a pass apart. The front of the
+  queue is passed over only when it is not stuck — a job already holding every
+  card it needs, because a stop in flight is bringing them, or the one job the
+  queue steps over, which is short of a shared card somebody else is using and
+  so holds nothing. This is the rule `gpuc preempt` does not have: the command
+  refuses a preempt that would start nothing *at all*, but whether the job you
+  have in mind is the one that gets the cards is yours to read off the queue.
 - **The waiting job has to be strictly more important.** At the *same*
   priority nothing happens: dispatch order is `<priority>-<job id>` and the
   stopped job's id is the older one, so it would win the tie and take its own

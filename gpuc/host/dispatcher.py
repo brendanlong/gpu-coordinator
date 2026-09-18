@@ -504,12 +504,16 @@ class Preemptable:
     gpus: list[str]
     started_at: str
     owned: int
-    """How many of `gpus` this host owns. The rest are borrowed, and only a
-    waiting job that asked to borrow can be started on those."""
+    borrowed: int
+    """How many of `gpus` this host owns, and how many it is borrowing. Only a
+    waiting job that asked to borrow can be started on a borrowed one -- and a
+    card in neither list, one that has dropped off nvidia-smi under a running
+    job, is counted by neither, because it is never handed out to anybody and
+    stopping a job for it would start nothing."""
 
     def frees(self, *, borrowing: bool) -> int:
         """Cards this would hand to a waiting job that may (or may not) borrow."""
-        return len(self.gpus) if borrowing else self.owned
+        return self.owned + self.borrowed if borrowing else self.owned
 
 
 def enough_to_start(
@@ -554,6 +558,9 @@ class Dispatcher:
     _unavailable: tuple[str, ...] = ()
     _shared: list[str] | None = None
     _shared_unavailable: tuple[str, ...] = ()
+    _borrowable: tuple[list[str], int] | None = None
+    """This pass's one reading of the shared cards: the ones nobody else was
+    on, and how many they were on. Reset every pass; see `borrowable_gpus`."""
     _shared_in_use: tuple[str, ...] | None = None
     """The shared cards somebody else was on, last time this was asked.
 
@@ -942,27 +949,35 @@ class Dispatcher:
 
         The nvidia-smi read is the whole of the preflight, and it is the one
         thing standing between a borrowed card and somebody else's training
-        run, so it is taken here rather than inferred from anything cached.
-        `launch_ready` asks once per pass and only when a job actually needs to
-        borrow: every job is then judged against one reading, which is also
-        what stops two of them being handed the same card. The count comes
-        from the same reading because it decides which short job is stepped
-        over, and a second sample could disagree with the first.
+        run, so it is taken fresh each pass rather than inferred from anything
+        longer-lived. It is taken *once* a pass, and only when a job actually
+        needs to borrow: every job that pass is then judged against one
+        reading, which is also what stops two of them being handed the same
+        card, and what stops `preempt_for_waiting` disagreeing with the
+        `launch_ready` it is reasoning about. The count comes from the same
+        reading because it decides which short job is stepped over.
+
+        The cards the reading found free are re-filtered on the way out: a job
+        launched later in the same pass has taken its own, and those are not on
+        offer twice.
         """
         busy = self._busy_gpus()
-        unused, in_use = gpus.unused_gpus(
-            [uuid for uuid in self.shared_gpus() if uuid not in busy], self.deps.smi
-        )
-        # Logged when the *set* changes, not when the numbers do: this is
-        # sampled every pass a job is waiting, and somebody else's job moves a
-        # utilization figure twice a second.
-        if tuple(sorted(in_use)) != self._shared_in_use:
-            self._shared_in_use = tuple(sorted(in_use))
-            for uuid, why in sorted(in_use.items()):
-                self.log(f"shared GPU {uuid} is in use ({why}), so it is not being borrowed")
-            if unused:
-                self.log(f"shared GPU(s) free to borrow: {', '.join(unused)}")
-        return unused, len(in_use)
+        if self._borrowable is None:
+            unused, in_use = gpus.unused_gpus(
+                [uuid for uuid in self.shared_gpus() if uuid not in busy], self.deps.smi
+            )
+            self._borrowable = (unused, len(in_use))
+            # Logged when the *set* changes, not when the numbers do: this is
+            # sampled every pass a job is waiting, and somebody else's job moves
+            # a utilization figure twice a second.
+            if tuple(sorted(in_use)) != self._shared_in_use:
+                self._shared_in_use = tuple(sorted(in_use))
+                for uuid, why in sorted(in_use.items()):
+                    self.log(f"shared GPU {uuid} is in use ({why}), so it is not being borrowed")
+                if unused:
+                    self.log(f"shared GPU(s) free to borrow: {', '.join(unused)}")
+        unused, theirs = self._borrowable
+        return [uuid for uuid in unused if uuid not in busy], theirs
 
     def _capacity_failure(self, spec: jobs.JobSpec) -> str | None:
         """Why this host can *never* run this job, or None if it could.
@@ -1017,6 +1032,26 @@ class Dispatcher:
             entry.marker.unlink(missing_ok=True)
             return False
         return True
+
+    def _holds_the_queue(self, spec: jobs.JobSpec, theirs: int) -> bool:
+        """Whether a job that cannot start yet keeps the cards it is waiting for.
+
+        The strict order and its one exemption, in one place: a job that could
+        not fit even once every job of ours ends is stepped over, because what
+        it is short of is a shared card somebody else is using and that is not
+        ours to wait on. What it could have is the owned cards as configured,
+        missing ones included, plus the shared cards nobody else is on if it
+        may borrow -- `theirs` being how many of those the pass's one
+        nvidia-smi reading found somebody else on.
+
+        `preempt_for_waiting` asks the same question about the same queue: a
+        job that is stepped over there is one the cards a preempt hands back
+        would pass by, and one that holds is a job they would not get past.
+        """
+        ours = len(self.config.gpus)
+        if self.config.may_borrow(spec):
+            ours += len(self.shared_gpus()) - theirs
+        return spec.gpus <= ours
 
     def launch_ready(self) -> None:
         """Dispatch in queue order, and hold cards for a job that does not fit.
@@ -1102,13 +1137,7 @@ class Dispatcher:
                 shared_part = borrowable[: min(short, max(0, len(borrowable) - held_shared))]
                 short -= len(shared_part)
             if short:
-                # Owned cards as configured, missing ones included, plus the
-                # shared cards nobody else is on if it may borrow: what it could
-                # have once every job of ours ends.
-                ours = len(self.config.gpus)
-                if self.config.may_borrow(spec):
-                    ours += len(self.shared_gpus()) - theirs
-                if spec.gpus <= ours:
+                if self._holds_the_queue(spec, theirs):
                     held += len(owned_part)
                     held_shared += len(shared_part)
                 continue
@@ -1164,9 +1193,25 @@ class Dispatcher:
 
         After `launch_ready`, so everything still queued is something the free
         cards could not take, and the only question left is whether stopping a
-        job that said it may be stopped would let one of them run. Three things
-        have to hold, and they are what keep this from being a way to lose work
-        for nothing:
+        job that said it may be stopped would let one of them run.
+
+        **Exactly one queued job is asked that question**: the first one the
+        queue is actually stuck on. Anything behind it is not a reason to stop
+        anything, and the priorities are not why -- the queue is in priority
+        order, so a candidate less important than a job back there is less
+        important than this one too. It is the cards: a card handed back is
+        dispatched in queue order like any other, so this job takes it first,
+        and it is short of more than every candidate could free, or it would
+        have been the job stopped for. Stopping something for the job behind it
+        discards an attempt and starts neither.
+
+        What the walk does pass is a job that is not stuck: one already holding
+        every card it needs, because a stop in flight is bringing them, and the
+        one job the strict order steps over, which is short of a shared card
+        somebody else is using and so holds nothing (`_holds_the_queue`).
+
+        Three things then have to hold for the job it settles on, and they are
+        what keep this from being a way to lose work for nothing:
 
         * it has to be enough. A preempt that frees one of the two cards the
           waiting job needs costs an attempt and starts nothing.
@@ -1177,6 +1222,15 @@ class Dispatcher:
         * the cards have to be ones the waiting job could be dispatched onto.
           A borrowed card handed back is no use to a job that did not ask to
           borrow, so stopping a job for it would spend an attempt on nothing.
+
+        One job a pass is the whole of the rule, and the cost is a pass: where
+        two waiting jobs each deserve a stop, the second gets its own next time
+        round, once the first one's cards count as on their way. What it gives
+        up outright is narrower -- a borrower behind a job that is stuck for
+        good never has a *shared* card freed for it, though the job in front
+        could not be dispatched onto that card anyway -- and winning that back
+        costs a second model of the dispatch order, which is the thing this is
+        deliberately not.
 
         What makes the second attempt of a preempted job wait its turn rather
         than take its own cards straight back is `launch_ready`: the queue is
@@ -1209,6 +1263,8 @@ class Dispatcher:
         ]
         pool = [*self.free_gpus(), *(uuid for uuid in stopping if uuid in owned)]
         shared_pool = [uuid for uuid in stopping if uuid in shared]
+        theirs = 0
+        sampled = False
         for waiting in queue.list_queued():
             if queue.is_cancelled(waiting.job_id):
                 continue
@@ -1217,26 +1273,33 @@ class Dispatcher:
             except (RuntimeError, ValueError):
                 continue  # `launch_ready` is what drops an unreadable spec
             borrowing = self.config.may_borrow(spec)
+            if borrowing and not sampled:
+                # The shared cards nobody else is on. `launch_ready` offered
+                # these to this very job a moment ago, so a gap counted without
+                # them is one somebody would be stopped to cover twice. This
+                # costs no reading: a queued borrower is a job `launch_ready`
+                # asked the same question of, against the same reading.
+                free_shared, theirs = self.borrowable_gpus()
+                shared_pool = [*free_shared, *shared_pool]
+                sampled = True
             take = pool[: spec.gpus]
             take_shared = shared_pool[: spec.gpus - len(take)] if borrowing else []
             gap = spec.gpus - len(take) - len(take_shared)
-            # Spoken for either way: whether this job is waiting for the rest
-            # of its cards or starting as soon as these come back, the job
-            # behind it is not being offered them.
-            pool, shared_pool = pool[len(take) :], shared_pool[len(take_shared) :]
             if gap <= 0:
+                # Starting the moment those cards come back, so they are not on
+                # offer to the job behind it.
+                pool, shared_pool = pool[len(take) :], shared_pool[len(take_shared) :]
                 continue
-            chosen = enough_to_start(candidates, waiting.priority, gap, borrowing=borrowing)
-            if not chosen:
+            if not self._holds_the_queue(spec, theirs):
                 continue
-            for candidate in chosen:
-                # Dropped from the pool whatever happens: a job we could not
-                # stop this pass will not stop for the next waiting job either,
-                # and counting it again would stop a second job for a gap that
-                # is still not covered.
-                candidates.remove(candidate)
+            for candidate in enough_to_start(
+                candidates, waiting.priority, gap, borrowing=borrowing
+            ):
                 if not self._preempt_for(candidate, waiting):
+                    # The gap is not covered any more, so the rest of the set
+                    # would be attempts spent on a job that still cannot start.
                     break
+            return
 
     def auto_preemptable(self) -> list[Preemptable]:
         """The running jobs whose spec said they may be stopped for better work.
@@ -1246,6 +1309,7 @@ class Dispatcher:
         """
         found: list[Preemptable] = []
         owned = set(self.owned_gpus())
+        shared = set(self.shared_gpus())
         for job_id, entry in self.running.items():
             if self._stopping(job_id):
                 continue
@@ -1263,6 +1327,7 @@ class Dispatcher:
                     list(entry.gpus),
                     state.started_at or "",
                     owned=sum(1 for uuid in entry.gpus if uuid in owned),
+                    borrowed=sum(1 for uuid in entry.gpus if uuid in shared),
                 )
             )
         return found
@@ -1532,6 +1597,7 @@ class Dispatcher:
         self._config = jobs.read_config()
         self._owned = None
         self._shared = None
+        self._borrowable = None
         self.reap()
         self.handle_cancels()
         self.escalate_kills()
