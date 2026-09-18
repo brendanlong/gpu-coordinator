@@ -190,32 +190,26 @@ def _no_job_id(output: jobs.Output, key: str, destination: str, job_id: str) -> 
     )
 
 
-def from_mirror(document: dict[str, Any], previous_id: str) -> dict[str, Any]:
-    """A mirrored spec as `requeue` submits it: what this build knows, with the
-    earlier run's namespace made the new run's.
+def from_mirror(document: dict[str, Any]) -> dict[str, Any]:
+    """A mirrored spec as `requeue` submits it: the keys this build knows.
 
     The mirror holds what some build wrote. The id and attempt are this run's
     to assign, and a key this build does not know, at the top or on an output,
-    is not a typo. Builds before the mirror held the template stored the spec
-    with `{job_id}` expanded, so the previous id is put back as the placeholder
-    wherever it appears in a destination: the new job gets its own namespace
-    rather than a refusal over a file nobody can edit any more.
+    is not a typo. What is *not* forgiven is a destination carrying an earlier
+    run's literal id (builds before the mirror held the template wrote those):
+    `expand_job_id` refuses it, because the alternative is a new job writing
+    over an old one's outputs.
     """
     known = {k: v for k, v in document.items() if k in JobSpecModel.model_fields}
     outputs = known.get("outputs")
     if isinstance(outputs, list):
-        known["outputs"] = [_output_from_mirror(o, previous_id) for o in outputs]
+        known["outputs"] = [
+            {k: v for k, v in o.items() if k in OutputModel.model_fields}
+            if isinstance(o, dict)
+            else o
+            for o in outputs
+        ]
     return known
-
-
-def _output_from_mirror(output: Any, previous_id: str) -> Any:
-    if not isinstance(output, dict):
-        return output
-    pruned = {k: v for k, v in output.items() if k in OutputModel.model_fields}
-    for key in ("s3", "hf", "hf_path"):
-        if isinstance(pruned.get(key), str):
-            pruned[key] = pruned[key].replace(previous_id, "{job_id}")
-    return pruned
 
 
 def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -> str:

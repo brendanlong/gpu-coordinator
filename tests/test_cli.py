@@ -1405,13 +1405,14 @@ def test_requeue_refuses_a_mirrored_spec_that_asks_for_no_gpu(
     assert "gpus: Input should be greater than or equal to 1" in capsys.readouterr().err
 
 
-def test_requeue_gives_a_mirror_an_older_build_expanded_its_own_namespace(
+def test_requeue_refuses_a_mirror_an_older_build_expanded(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Older builds mirrored the spec with `{job_id}` already expanded, so what
-    they left behind names the first run's outputs. A build never fails on a
-    file another build wrote: the first run's id is put back as the placeholder
-    and the new job gets its own namespace, never the old one's."""
+    they left behind names the first run's outputs. A requeue is a new job and
+    a new job never writes over an old one's outputs: refused, nothing shipped.
+    The deliberate break with the compatibility rule, pre-release, in favour
+    of never clobbering."""
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     s3 = FakeS3Client()
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
@@ -1426,20 +1427,17 @@ def test_requeue_gives_a_mirror_an_older_build_expanded_its_own_namespace(
         }
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
-    submitted: list[JobSpecModel] = []
-
-    def fake_submit(entry: Any, model: JobSpecModel, *a: Any, **k: Any) -> SubmitResult:
-        submitted.append(model)
-        return SubmitResult(job_id="new", host=entry.name, attempt=2)
-
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
+    monkeypatch.setattr(
+        "gpuc.control.submit.open_session",
+        lambda *a, **k: pytest.fail("a spec pointed at an earlier run's outputs must not ship"),
+    )
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
-    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
-    outputs = submitted[0].outputs
-    assert outputs[0].s3 == "s3://b/exp/{job_id}/results"
-    assert outputs[1].hf == "org/run-{job_id}"
+    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
+    err = capsys.readouterr().err
+    assert "s3://b/exp/20260101-000000-aaaaaa/results` does not include the job id" in err
 
 
 def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning(

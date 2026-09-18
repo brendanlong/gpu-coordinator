@@ -447,13 +447,14 @@ It therefore **needs `s3_bucket`** (without it, submit the job file again) and
 cannot rebuild a `--no-git` workdir. `--host H` sends it somewhere else;
 `--runpod` provisions for it; with neither, it goes back to the host the local
 index says it ran on. The mirror holds the spec with `{job_id}` unexpanded, so
-the new run gets its own output namespace; a mirror an older build wrote with
-the first run's id already expanded into a destination is read the same way,
-with that id put back as the placeholder. The mirrored spec is otherwise
-checked as a job file is, except that keys this build does not know, at the
-top or on an output, are dropped rather than refused (a newer or older build
-may have mirrored them); so one an older build wrote with `gpus: 0` is refused
-here rather than queued to fail. It is the other half of the pair with `gpuc
+the new run gets its own output namespace. The mirrored spec is checked as a
+job file is, except that keys this build does not know, at the top or on an
+output, are dropped rather than refused (a newer or older build may have
+mirrored them); so one an older build wrote with `gpus: 0` is refused here
+rather than queued to fail, and so is one that carries an earlier run's
+literal id in a destination (builds before this one mirrored the expanded
+spec): the new job must not write over the old one's outputs, so submit the
+job file again. It is the other half of the pair with `gpuc
 preempt`: a new job id from the mirror, on whichever host you name, for a job
 that has already finished.
 

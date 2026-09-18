@@ -1392,7 +1392,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
             f"Check the id with `gpuc status --all`; only jobs submitted with s3_bucket "
             f"set can be requeued."
         ) from exc
-    document = from_mirror(document, args.job_id)
+    document = from_mirror(document)
     attempt = (index.attempt if index else 1) + 1
     model = validate(document, f"spec for {args.job_id}")
     use_git = not args.no_git
