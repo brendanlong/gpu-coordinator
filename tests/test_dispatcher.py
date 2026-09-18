@@ -1953,3 +1953,111 @@ def test_the_first_reading_of_the_shared_cards_is_logged_even_when_all_are_free(
     assert f"shared GPU(s) free to borrow: {', '.join(SHARED_GPUS)}" in (
         paths.dispatcher_log().read_text()
     )
+
+
+def test_nothing_is_stopped_for_a_job_the_queue_ahead_would_take_the_cards_from(
+    gpuc_home: Path,
+) -> None:
+    """The card would never reach the job it was freed for. The job at the
+    front of the queue needs both cards and only one can be stopped for, so it
+    holds what comes back and still does not start -- and the one-card job
+    behind it, the only job the stop could have been for, gets nothing. Work
+    discarded and nothing started."""
+    stuck, cheap = enqueue_in_order(
+        {"gpus": 1, "priority": 5},
+        {"gpus": 1, "priority": 50, "auto_preempt": True},
+    )
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(cheap).status == "running"
+
+    wide = queue.enqueue(make_spec(gpus=2, priority=10))
+    narrow = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher.run_once()
+    assert not queue.is_preempted(cheap)
+    assert queue.kill_reason(cheap) is None
+
+    # And once the job that was holding is gone, the stop is worth making.
+    queue.cancel(wide)
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(narrow).status == "running"
+    assert jobs.read_state(stuck).status == "running"
+
+
+def test_a_job_the_queue_steps_over_does_not_hold_up_a_preempt_behind_it(
+    gpuc_home: Path,
+) -> None:
+    """The one job that holds nothing: it is short of a shared card somebody
+    else is on, so the queue walks past it and the card a stop hands back
+    reaches the job behind it."""
+    dispatcher, spawned = shared_host(
+        shared=[SHARED_GPUS[0]],
+        utilization={SHARED_GPUS[0]: 90.0},
+        memory_used={SHARED_GPUS[0]: 8000.0},
+    )
+    stuck, cheap = enqueue_in_order(
+        {"gpus": 1, "priority": 5},
+        {"gpus": 1, "priority": 50, "auto_preempt": True},
+    )
+    dispatcher.run_once()
+    assert jobs.read_state(cheap).status == "running"
+
+    queue.enqueue(make_spec(gpus=3, priority=10, use_shared=True))  # needs the busy card
+    narrow = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
+
+    spawned[cheap].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(narrow).status == "running"
+    assert jobs.read_state(stuck).status == "running"
+
+
+def test_the_surplus_of_an_overshooting_stop_is_not_a_reason_to_stop_a_second_job(
+    gpuc_home: Path,
+) -> None:
+    """Least important first is by priority alone, so a two-card job is stopped
+    for a one-card gap. Its spare card goes to the queue behind it like any
+    other card that comes free, and stopping a second job for that card would
+    throw away an attempt for one that is already on its way."""
+    dispatcher, _ = shared_host(owned=list(ALL_GPUS), shared=[])
+    _, big, small = enqueue_in_order(
+        {"gpus": 1, "priority": 50},
+        {"gpus": 2, "priority": 90, "auto_preempt": True},
+        {"gpus": 1, "priority": 80, "auto_preempt": True},
+    )
+    dispatcher.run_once()
+    assert jobs.read_state(big).status == "running"
+
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher.run_once()
+    assert queue.is_preempted(big)
+    assert not queue.is_preempted(small)
+
+
+def test_a_free_shared_card_counts_towards_the_gap_a_stop_has_to_cover(
+    gpuc_home: Path,
+) -> None:
+    """`launch_ready` holds the idle shared card for the waiting job, so the
+    only card left to stop for is the owned one it is still short of. Counting
+    the gap without it stops a second job for a card the waiting one has
+    already been given."""
+    dispatcher, spawned = shared_host(shared=[SHARED_GPUS[0]])
+    first, second = enqueue_in_order(
+        {"gpus": 1, "priority": 80, "auto_preempt": True},
+        {"gpus": 1, "priority": 70, "auto_preempt": True},
+    )
+    dispatcher.run_once()
+    waiting = queue.enqueue(make_spec(gpus=2, priority=10, use_shared=True))
+    dispatcher.run_once()
+    assert queue.is_preempted(first)  # the least important of the two, and only it
+    assert not queue.is_preempted(second)
+
+    spawned[first].finish(status="failed", reason="preempted")
+    dispatcher.run_once()
+    assert jobs.read_state(waiting).status == "running"
+    assert jobs.read_state(waiting).gpus == [FAKE_GPUS[1], SHARED_GPUS[0]]

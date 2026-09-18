@@ -342,6 +342,18 @@ queue's lexical order, not submission order below one second.
   path; cards held by a job that is already stopping count as available, and
   once one stop in a set fails the rest are left alone. Nothing counts how
   often a job has given way.
+  - **It walks the queue the way `launch_ready` does**, against a pool that
+    also holds what a stop would hand back: cards are reserved for a job that
+    does not fit, the one job that rule exempts is stepped over
+    (`_holds_the_queue`, shared with `launch_ready`), the idle shared cards a
+    borrower may have count towards its take, and the surplus of a set that
+    overshot one job's gap is on offer to the next. So a job behind one that is
+    still waiting is never stopped for -- the cards would be taken in front of
+    it -- and a second job is never stopped for a card already on its way. A
+    gap says cards are missing; only the walk says who would get them.
+  - The pass's one nvidia-smi reading of the shared cards (`borrowable_gpus`,
+    cached in `_borrowable` and reset each pass) is what both walks use, so
+    they cannot disagree about which cards somebody else is on.
 - Isolation: at startup the dispatcher probes `systemd-run --user --scope
   --collect --quiet -- true` once and hands the answer to every runner it spawns
   as `GPUC_ISOLATION`. See Process isolation.

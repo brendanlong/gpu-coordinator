@@ -252,11 +252,22 @@ The host only does it when it is worth it, and the rules are the command's:
 
 - **It has to be enough.** Freeing one of the two cards the waiting job needs
   would cost an attempt and start nothing, so a job is stopped only when what
-  is stopped covers the whole gap. Several are stopped together where one is
-  not enough, least important first, and among equals the one that has been
-  running the shortest time. Least important first is by `priority` alone, so
-  a job may free more cards than the waiting one needs; the surplus goes back
-  to the queue like any other card.
+  is stopped covers the whole gap — the cards the waiting job is *short* of,
+  counting an idle shared card it may borrow as one it already has. Several
+  are stopped together where one is not enough, least important first, and
+  among equals the one that has been running the shortest time. Least
+  important first is by `priority` alone, so a job may free more cards than
+  the waiting one needs; the surplus goes back to the queue like any other
+  card, and nothing is stopped a second time for a card already on its way.
+- **Nothing ahead of it may still be waiting.** A card handed back is
+  dispatched in queue order like any other, so a job in front of the waiting
+  one takes it first — and that job is in front precisely because stopping
+  everything eligible would not have been enough for it, so it takes the card
+  and still does not start. The host works out what the queue would do with
+  the cards before it stops anything, and stops nothing unless the job it
+  would be stopping for is the one that ends up with them. The exception is
+  the one job the queue steps over: a job short of a shared card somebody else
+  is using holds nothing, so a card handed back goes straight past it.
 - **The waiting job has to be strictly more important.** At the *same*
   priority nothing happens: dispatch order is `<priority>-<job id>` and the
   stopped job's id is the older one, so it would win the tie and take its own
