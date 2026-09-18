@@ -153,18 +153,16 @@ gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idem
 **`host add` is a connect.** It opens the host, probes it, and reads
 `~/.gpuc/config.json`:
 
-- the host **has** a config — it was set up from another machine, or from this
-  one before — and that config is adopted as it stands. Only the address
-  (`--ssh`, `--port`, `--gpuc-home` / `--persistent-root`) is recorded here.
-  Flags you pass are explicit overrides, written through to the host and
-  reported field by field (`host <- retention_days 30.0 -> 7.0`). A `--gpus`
-  that claims *some* of the cards the host already has is refused rather than
-  warned about, because that is the one difference that can hand one card to
-  two jobs — in whichever spelling, since `--gpus 0` and `--gpus GPU-…` can be
-  the same card; a disjoint list is a reassignment and goes through, and
-  `--force` overrides the refusal. The host is registered under the name it
-  calls itself, unless a *different* host is already registered here under that
-  name, which is refused rather than replaced.
+- the host **has** a config — set up from another machine, or from this one
+  before — and it is adopted as it stands; only the address (`--ssh`, `--port`,
+  `--gpuc-home` / `--persistent-root`) is recorded here. Flags you pass are
+  overrides, written through to the host and reported field by field
+  (`host <- retention_days 30.0 -> 7.0`). A `--gpus` that claims *some* of the
+  cards the host already has is refused (that is the one difference that can
+  hand a card to two jobs, and `--gpus 0` and `--gpus GPU-…` may be the same
+  card); a disjoint list is a reassignment and goes through, and `--force`
+  overrides. The host is registered under the name it calls itself, unless a
+  *different* host already has that name here.
 - the host has **no** config — nothing has been set up there yet — so this is
   where one is written, and by default it **owns every card** nvidia-smi
   reports there, by UUID. `--gpus` narrows that to the cards named (`--gpus ''`
@@ -179,11 +177,9 @@ gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idem
   than given "owns nothing" as its first config; `--gpus ''` says so on
   purpose.
 
-So a host is registered by asking it what it is, and a second machine
-connecting to a box the first one set up is the ordinary path. Such a host is
-usable from that machine at once — `gpuc status`, `gpuc host set`, `gpuc logs`
-— because the probe records an interpreter to run the on-host package with;
-`gpuc host bootstrap` is still what ships *this* build's package to it.
+A second machine connecting to a box the first one set up is the ordinary path,
+and such a host is usable from it at once — `gpuc status`, `gpuc host set`,
+`gpuc logs`. `gpuc host bootstrap` is what ships *this* build's package to it.
 
 A `config.json` that is there but does not parse stops all of this: it is a
 file the host is running on, so nothing replaces it, and the error says to fix
@@ -199,11 +195,10 @@ gpuc pods                                  # the account's pods, with their ids
 gpuc host add rented --pod <pod-id>        # its address from the provider, its config from the pod
 ```
 
-That is what makes a pod the laptop queued usable from the desktop: the pod owns
-its `config.json` — cards, mirror, idle timer, and the record of what it was rented as —
-so nothing about the machine that created it matters afterwards. A pod nobody
-has bootstrapped has no dispatcher and so will never end itself; `host add`
-says so, and `gpuc host bootstrap <name>` gives it one.
+The pod owns its `config.json` — cards, mirror, idle timer, and what it was
+rented as — so nothing about the machine that created it matters afterwards. A
+pod nobody has bootstrapped has no dispatcher and so will never end itself;
+`host add` says so, and `gpuc host bootstrap <name>` gives it one.
 
 The address is the top two rows, kept here (`here <- …`) and applied to the
 host by the next `gpuc host bootstrap`. Every other flag is the host's own
@@ -303,29 +298,21 @@ the host was running when this machine last read it, labelled with its age.
 `gpuc status` asks each host what it is running now, and that is the answer
 that counts.
 
-Shipping the package is only half an upgrade: the **dispatcher** imports its
-code once and then lives for as long as the host has work, so the one already
-running would otherwise go on serving the queue from the build it started with.
-The dispatcher bootstrap starts sees that it is the newer build, asks the
-incumbent to stand down (it finishes its pass and releases the lock) and takes
-over, adopting the running jobs. Nothing is interrupted. `gpuc status` reports
-the *running* dispatcher's commit alongside the package's and warns if they ever
-come apart.
+Shipping the package is only half an upgrade: a dispatcher imports its code once
+and lives as long as the host has work. So the dispatcher bootstrap starts asks
+the incumbent to stand down and takes over, adopting the running jobs — nothing
+is interrupted. `gpuc status` reports the *running* dispatcher's commit alongside
+the package's and warns if they come apart.
 
 `--all` takes every registered host in turn, including ephemeral ones. A host
-that fails does not stop the others — a pod that has already gone away is the
-ordinary case, and `gpuc host remove <name>` is what forgets it — so the run ends
-with a tally naming each failure and exits 1, while the hosts that did upgrade
-stay upgraded. The tally also counts any host entry this build could not read
-(skipped with a warning), because that host was not upgraded either. `--json`
-prints that tally as one entry per host with its outcome and, for a failure,
-the reason ([usage.md](usage.md#--json-everywhere-else)).
+that fails does not stop the others (a pod that has already gone away is the
+ordinary case; `gpuc host remove <name>` forgets it): the run ends with a tally
+naming each failure, including host entries this build could not read, and exits
+1, while the hosts that did upgrade stay upgraded. `--json` prints that tally as
+one entry per host ([usage.md](usage.md#--json-everywhere-else)).
 
-A host nothing has ever installed gpuc on -- registered with `gpuc host add`
-and not bootstrapped, by this machine or any other -- is refused by `gpuc
-submit` rather than half-installed on the way past: shipping the package to it
-would start a dispatcher with no uv under it, and the job would fail there
-instead of here.
+A host nothing has ever bootstrapped is refused by `gpuc submit` rather than
+half-installed on the way past: it has no uv to run a dispatcher with.
 
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
 to enqueue on is not on this commit — read from the host's own `config.json`,
