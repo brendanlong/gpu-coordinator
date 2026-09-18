@@ -522,13 +522,16 @@ class Preemptable:
     gpus: list[str]
     started_at: str
     owned: int
-    """How many of `gpus` this host owns. The rest are borrowed, and only a
-    waiting job that asked to borrow can be started on those."""
+    borrowed: int
+    """How many of `gpus` this host owns, and how many it is borrowing. Only a
+    waiting job that asked to borrow can be started on a borrowed one -- and a
+    card in neither list, one that has dropped off nvidia-smi under a running
+    job, is counted by neither, because it is never handed out to anybody and
+    stopping a job for it would start nothing."""
 
     def frees(self, reach: Reach) -> int:
         """Cards this would hand to a waiting job with that reach."""
-        borrowed = len(self.gpus) - self.owned
-        return (self.owned if reach.owned else 0) + (borrowed if reach.shared else 0)
+        return (self.owned if reach.owned else 0) + (self.borrowed if reach.shared else 0)
 
 
 def enough_to_start(
@@ -1326,12 +1329,17 @@ class Dispatcher:
             # ends: counting it out would stop a second job for cards that are
             # already on their way.
             handed_back = [uuid for candidate in chosen for uuid in candidate.gpus]
-            back = [uuid for uuid in handed_back if uuid in owned] if reach.owned else []
-            back_shared = [uuid for uuid in handed_back if uuid in shared] if reach.shared else []
-            # Owned first, as everywhere else.
+            # `blocked`, not `reach`: a card this job cannot be dispatched onto
+            # is still on offer to the job behind it, and dropping it here is
+            # how a second job gets stopped for a card already on its way. Only
+            # a card a job *ahead* would take never arrives.
+            back = [] if blocked.owned else [uuid for uuid in handed_back if uuid in owned]
+            back_shared = [] if blocked.shared else [uuid for uuid in handed_back if uuid in shared]
+            # What this job eats out of them, owned first as everywhere else.
             takes = min(gap, len(back))
+            eaten_shared = gap - takes if reach.shared else 0
             pool = [*pool, *back[takes:]]
-            shared_pool = [*shared_pool, *back_shared[gap - takes :]]
+            shared_pool = [*shared_pool, *back_shared[eaten_shared:]]
 
     def auto_preemptable(self) -> list[Preemptable]:
         """The running jobs whose spec said they may be stopped for better work.
@@ -1341,6 +1349,7 @@ class Dispatcher:
         """
         found: list[Preemptable] = []
         owned = set(self.owned_gpus())
+        shared = set(self.shared_gpus())
         for job_id, entry in self.running.items():
             if self._stopping(job_id):
                 continue
@@ -1358,6 +1367,7 @@ class Dispatcher:
                     list(entry.gpus),
                     state.started_at or "",
                     owned=sum(1 for uuid in entry.gpus if uuid in owned),
+                    borrowed=sum(1 for uuid in entry.gpus if uuid in shared),
                 )
             )
         return found

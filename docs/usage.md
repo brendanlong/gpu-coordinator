@@ -248,7 +248,8 @@ behind, exactly as `gpuc preempt` does, so it belongs to work that is cheap to
 repeat — a sweep point, an eval, a job that checkpoints and resumes — and not
 to a run whose `setup:` would trip over its own leftovers.
 
-The host only does it when it is worth it, and the rules are the command's:
+The host only does it when it is worth it. The rules are the command's, plus
+one the command leaves to the person typing it:
 
 - **It has to be enough.** Freeing one of the two cards the waiting job needs
   would cost an attempt and start nothing, so a job is stopped only when what
@@ -267,7 +268,10 @@ The host only does it when it is worth it, and the rules are the command's:
   the cards before it stops anything, and stops nothing unless the job it
   would be stopping for is the one that ends up with them. The exception is
   the one job the queue steps over: a job short of a shared card somebody else
-  is using holds nothing, so a card handed back goes straight past it.
+  is using holds nothing, so a card handed back goes straight past it. This is
+  the rule `gpuc preempt` does not have: it refuses a preempt that would start
+  nothing *at all*, but whether the job you have in mind is the one that gets
+  the cards is yours to work out from the queue.
 - **The waiting job has to be strictly more important.** At the *same*
   priority nothing happens: dispatch order is `<priority>-<job id>` and the
   stopped job's id is the older one, so it would win the tie and take its own
