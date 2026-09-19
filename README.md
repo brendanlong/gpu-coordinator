@@ -6,6 +6,17 @@ One submit path (`gpuc submit`) for three kinds of GPU host:
 - **ssh** — a shared box you have no sudo on, using a subset of its GPUs,
 - **runpod** — an ephemeral pod, provisioned for the job and torn down after it.
 
+![A terminal session: cat job.yaml shows a five-line spec; gpuc submit sends it
+to the host workstation, which starts it at once; a second submit queues
+eval-checkpoints behind it; gpuc status prints the card, the running job with
+its estimated finish, the queued job with its priority and projected start, and
+the job that finished before them; gpuc logs -f streams the training output as
+it is written; and a last gpuc status has the running job at 100% utilization
+and 29% done.](docs/media/cli.gif)
+
+The same recording as text, to copy from:
+[asciinema.org/a/fu8jgOVnwDi6dlYd](https://asciinema.org/a/fu8jgOVnwDi6dlYd).
+
 ## The model
 
 Each host runs a small stdlib-only dispatcher out of `~/.gpuc` (or
@@ -34,6 +45,28 @@ gpuc status                                  # queues, running jobs, recent resu
 gpuc logs <job-id> -f
 gpuc web set-password && gpuc web serve   # the same, in a browser at http://127.0.0.1:8646/
 ```
+
+## The dashboard
+
+`gpuc web serve` puts every host behind one password: the cards and what each
+is doing, the queue in dispatch order, and the actions the CLI has — logs,
+estimate, reorder, preempt, cancel. It asks the hosts, so it shows what they
+say and nothing a command could not tell you.
+
+![The gpuc dashboard listing three hosts. desktop (local) has one RTX 4090
+running a fine-tune at 96% utilization. lab (ssh) has two A40s running a grid
+search, a third card marked shared and in use by somebody else, two jobs queued
+with their priorities and projected starts, and one that failed. a100-burst
+(runpod) is a rented pod billing $1.64 an hour for a job across both of its
+A100s. A running job's row carries Logs, Estimate, Preempt and Cancel; a queued
+one carries its priority, Reorder, and no Preempt.](docs/media/web-dashboard.png)
+
+A job's log opens in a panel over the list, and with `follow` ticked the page
+re-fetches its tail as the host writes it:
+
+![The log panel open over the host list, showing a running job's log: uv sync
+in the setup phase, the GPU and S3 checks that run before the job's main phase,
+then training steps and a checkpoint upload to S3.](docs/media/web-logs.png)
 
 ## Documentation
 

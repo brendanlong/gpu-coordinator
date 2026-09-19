@@ -40,7 +40,7 @@ for step in "${steps[@]}"; do
       run uv run --frozen ruff format --check .
       ;;
     typecheck)
-      run uv run --frozen pyright gpuc tests
+      run uv run --frozen pyright gpuc tests docs/media
       ;;
     test)
       # Which markers run by default is `addopts` in pyproject.toml.
