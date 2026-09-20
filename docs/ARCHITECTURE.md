@@ -669,9 +669,12 @@ them did not, exactly as `gpuc ssh <host> -- cmd` exits with the remote
 command's code. A wait that could not find out -- a host that stayed unreachable
 past `wait.TROUBLE_GRACE_S` and whose mirror had nothing -- is 1 as well, with
 the reason on the job's line and in `errors[]`. 3 and 4 keep their usual
-meanings, and **130** is added for these two alone: a Ctrl-C must not be exit 0
-where 0 means the job succeeded. `--follow-forever` keeps exit 0 on Ctrl-C,
-because it never claimed its code said anything about the run.
+meanings, and **130** is added: a Ctrl-C must not be exit 0 where 0 means the
+job succeeded. It is raised in one place -- `main` turns any `KeyboardInterrupt`
+into the same exit and the same `--json` error document, and a command with
+something specific to say about what was in flight raises `Interrupted` to add
+it. Both blocking commands got that wrong while they each handled it
+themselves.
 
 ## Waiting for a job to end (`control/wait.py`)
 

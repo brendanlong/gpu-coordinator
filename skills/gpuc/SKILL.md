@@ -227,7 +227,7 @@ the run, because the host owns the job.
 | 2 | usage: a bad or missing flag |
 | 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
 | 4 | the job or host named does not exist |
-| 130 | a Ctrl-C out of `gpuc wait` or `gpuc logs -f`, the only two commands that block. Not 0 — for them 0 means the job succeeded |
+| 130 | a Ctrl-C. Not 0, because for `gpuc wait` and `gpuc logs -f` 0 means the job succeeded |
 
 ```bash
 gpuc status --json | jq -r '.hosts[] | "\(.name) reachable=\(.reachable) running=\(.running | length)"'

@@ -30,6 +30,7 @@ from gpuc.control.actions import (
     EXIT_OK,
     EXIT_USAGE,
     CliError,
+    Interrupted,
     NotFound,
     UsageError,
     cancel_job,
@@ -1386,16 +1387,8 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def _follow_forever(transport: Transport, remote: str, lines: int) -> int:
-    """`--follow-forever`: the stream with no end, and no claim about the job.
-
-    Ctrl-C is the only way out and is exit 0 here, unlike `-f`: this form never
-    promised its exit code meant anything about the run.
-    """
-    argv = _follow_argv(transport, remote, lines)
-    try:
-        return subprocess.call(argv)
-    except KeyboardInterrupt:
-        return EXIT_OK
+    """`--follow-forever`: the stream with no end, and no claim about the job."""
+    return subprocess.call(_follow_argv(transport, remote, lines))
 
 
 def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
@@ -1465,12 +1458,8 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
         # landing in the flush above, arrives here with the job already ended,
         # and then its outcome is still the answer.
         if not ended:
-            # Never the job's exit code, because we never learned it: `logs -f`
-            # promises 0 means *succeeded*, and a script must not read "the
-            # user got bored" as one.
             where = f"is still {watched.status} on {watched.host}" if watched else "was not reached"
-            note(f"interrupted; job {args.job_id} {where}")
-            return EXIT_INTERRUPTED
+            raise Interrupted(f"interrupted; job {args.job_id} {where}") from None
     if watched is None:
         raise CliError(f"job {args.job_id} was never looked up")
     print(watched.line())
@@ -1516,13 +1505,10 @@ def cmd_wait(args: argparse.Namespace) -> int:
         )
     except KeyboardInterrupt:
         # This command exists to be abandoned, so a Ctrl-C is an ordinary way
-        # for it to end -- but never a silent one, and never exit 0: under
-        # --json an empty stdout is the one thing the flag promises never to
-        # give, and the jobs are all still on their hosts.
+        # for it to end -- and naming what is still out there is the whole
+        # value of saying anything at all.
         pending = [job.job_id for job in watch.pending] if watch else list(args.job_ids)
-        return failed(
-            args, f"interrupted; still on their hosts: {', '.join(pending)}", EXIT_INTERRUPTED
-        )
+        raise Interrupted(f"interrupted; still on their hosts: {', '.join(pending)}") from None
     if args.json:
         jsonout.emit(wait_mod.document(waited))
     return wait_mod.exit_code(waited)
@@ -2281,6 +2267,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         first_run_note()
     try:
         return int(args.func(args))
+    except KeyboardInterrupt:
+        # Every Ctrl-C out of a blocking command lands here, so none of them can
+        # return 0 by accident or leave `--json` with an empty stdout -- the two
+        # ways `gpuc wait` and `gpuc logs -f` each got this wrong when they
+        # handled it themselves. A command with something specific to say about
+        # what was in flight raises `Interrupted` instead, which is the line
+        # below.
+        return failed(args, "interrupted", EXIT_INTERRUPTED)
     except Exception as exc:
         code = exit_code_for(exc)
         if code is None:

@@ -697,6 +697,28 @@ def test_a_failure_under_json_is_a_document_and_the_same_exit_code(
     assert "no registered host knows job" in captured.err
 
 
+def test_a_ctrl_c_is_exit_130_and_a_document_whoever_was_running(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary in `main`, not the blocking commands' own handling.
+
+    `status` has no idea about interrupts, which is the point: a command that
+    blocks cannot forget to be 130, and cannot leave `--json` with the empty
+    stdout the flag promises never to give.
+    """
+    from gpuc.control import cli
+
+    def interrupted(*_args: Any, **_kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "read_registry_warned", interrupted)
+    assert main(["status"]) == 130
+    assert "interrupted" in capsys.readouterr().err
+    assert main(["status", "--json"]) == 130
+    document = document_of(capsys)
+    assert (document["exit_code"], document["error"]) == (130, "interrupted")
+
+
 def test_a_usage_error_under_json_is_a_document_too(
     control_env: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

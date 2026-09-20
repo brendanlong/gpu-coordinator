@@ -283,8 +283,8 @@ itself always has them. If the stream itself dies (an ssh that gave up) the wait
 says so and carries on: it polls over its own connection.
 
 `--follow-forever` is the old behaviour — stream and never stop, Ctrl-C to
-leave, and its exit code means nothing about the job — and `--interval SECONDS`
-pins the poll, whose default backs off from 2s to 30s. Neither follow can be
+leave — and `--interval SECONDS` pins the poll, whose default backs off from
+2s to 30s. Neither follow can be
 combined with `--json`, and the two cannot be combined with each other.
 
 **`gpuc wait <job-id> [<job-id> ...] [--host H]`** — the same wait with no log,
@@ -553,7 +553,7 @@ Every `failed: <reason>`:
 | 2 | usage: a bad flag, a missing required one, a bad `--since` |
 | 3 | local state is unreadable (`hosts.json` or `config.toml`), so the answer is **unknown** |
 | 4 | the job or host named on the command line does not exist |
-| 130 | a Ctrl-C out of `gpuc wait` or `gpuc logs -f`. Only those two: it has to be distinct from 0, which for them means the job *succeeded* |
+| 130 | a Ctrl-C. It has to be distinct from 0 because for `gpuc wait` and `gpuc logs -f` 0 means the job *succeeded* |
 
 A single unreadable host entry never reaches these: it is skipped with a warning
 on stderr, every other host still works, and the entry is written back untouched.
