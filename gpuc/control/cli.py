@@ -1407,47 +1407,53 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
     while this thread asks the host, and the job's own outcome becomes the exit
     code, which is what makes `gpuc logs -f "$id"` a foreground wait on its own.
     """
-    watch = wait_mod.start([args.job_id], args.host, settings)
-    watched = watch.jobs[args.job_id]
-    watch.poll()
-    watch.check_known()
-    if watched.settled:
-        # Nothing more is coming, and `tail -f` on it would simply hang. The
-        # ordinary read, so a purged job still falls back to the S3 mirror.
-        _, log = read_log(args.job_id, watched.host, args.lines, settings)
-        sys.stdout.write(log.text)
-        print(watched.line())
-        return wait_mod.exit_code([watched])
-    if watched.status == "queued":
-        # Said before tail is started, because tail then says `cannot open ...
-        # No such file or directory` about a log the host has not opened yet,
-        # and on its own that reads like a failure rather than a queue.
-        note(f"job {args.job_id} is queued; following the log from when it starts")
-    # The watch's own session, rather than a second one: opening another costs
-    # a round trip to resolve the same home on the same host.
-    session = watch.session(watched.host)
-    tail = subprocess.Popen(
-        _follow_argv(session.transport, f"{session.job_dir(args.job_id)}/log.txt", args.lines)
-    )
-    reported_stream_end = False
-
-    def check_tail() -> None:
-        """Say so once if the stream died, rather than freeze the log in silence.
-
-        An ssh whose keepalives ran out takes the tail with it. The wait itself
-        is fine -- it polls over its own connection -- so this is a note and
-        not an ending.
-        """
-        nonlocal reported_stream_end
-        if reported_stream_end or tail.poll() is None:
-            return
-        reported_stream_end = True
-        note("the log stream ended before the job did; still waiting for the job")
-
+    watched: wait_mod.Watched | None = None
     ended = False
+    # Everything is inside, not just the polling: finding the job's host can
+    # ask every registered host in turn, 60s each, which is exactly where
+    # somebody who mistyped an id reaches for Ctrl-C.
     try:
+        watch = wait_mod.start([args.job_id], args.host, settings)
+        watched = watch.jobs[args.job_id]
+        watch.poll()
+        watch.check_known()
+        if watched.settled:
+            # Nothing more is coming, and `tail -f` on it would simply hang.
+            # The ordinary read, so a purged job falls back to the S3 mirror.
+            _, log = read_log(args.job_id, watched.host, args.lines, settings)
+            sys.stdout.write(log.text)
+            print(watched.line())
+            return wait_mod.exit_code([watched])
+        if watched.status == "queued":
+            # Said before tail is started, because tail then says `cannot open
+            # ... No such file or directory` about a log the host has not
+            # opened yet, and alone that reads like a failure not a queue.
+            note(f"job {args.job_id} is queued; following the log from when it starts")
+        # The watch's own session, rather than a second one: opening another
+        # costs a round trip to resolve the same home on the same host.
+        session = watch.session(watched.host)
+        argv = _follow_argv(
+            session.transport, f"{session.job_dir(args.job_id)}/log.txt", args.lines
+        )
+        reported_stream_end = False
+
+        def check_tail(tail: subprocess.Popen[bytes]) -> None:
+            """Say so once if the stream died, rather than freeze the log in silence.
+
+            An ssh whose keepalives ran out takes the tail with it. The wait
+            itself is fine -- it polls over its own connection -- so this is a
+            note and not an ending.
+            """
+            nonlocal reported_stream_end
+            if reported_stream_end or tail.poll() is None:
+                return
+            reported_stream_end = True
+            note("the log stream ended before the job did; still waiting for the job")
+
+        # Nothing between the spawn and the `try` that owns its cleanup.
+        tail = subprocess.Popen(argv)
         try:
-            wait_mod.block(watch, interval=args.interval, each_round=check_tail)
+            wait_mod.block(watch, interval=args.interval, each_round=lambda: check_tail(tail))
             ended = True
         finally:
             # Only a job that ended has last lines worth waiting for; an
@@ -1462,8 +1468,11 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
             # Never the job's exit code, because we never learned it: `logs -f`
             # promises 0 means *succeeded*, and a script must not read "the
             # user got bored" as one.
-            note(f"interrupted; job {args.job_id} is still {watched.status} on {watched.host}")
+            where = f"is still {watched.status} on {watched.host}" if watched else "was not reached"
+            note(f"interrupted; job {args.job_id} {where}")
             return EXIT_INTERRUPTED
+    if watched is None:
+        raise CliError(f"job {args.job_id} was never looked up")
     print(watched.line())
     return wait_mod.exit_code([watched])
 
@@ -1493,11 +1502,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
     output interleaved would be unreadable and only the verdicts matter.
     """
     check_interval(args, polls=True)
-    watch = wait_mod.start(args.job_ids, args.host, load_settings())
+    watch: wait_mod.Watch | None = None
     # Under --json stdout belongs to the document, so the outcomes go to stderr
     # as they happen and are in the document at the end.
     announce = jsonout.note if args.json else print
     try:
+        # `start` is inside too: with no --host and nothing in the index it asks
+        # every registered host in turn, 60s each, and that is the wait a user
+        # interrupts most.
+        watch = wait_mod.start(args.job_ids, args.host, load_settings())
         waited = wait_mod.block(
             watch, interval=args.interval, on_settled=lambda watched: announce(watched.line())
         )
@@ -1505,12 +1518,10 @@ def cmd_wait(args: argparse.Namespace) -> int:
         # This command exists to be abandoned, so a Ctrl-C is an ordinary way
         # for it to end -- but never a silent one, and never exit 0: under
         # --json an empty stdout is the one thing the flag promises never to
-        # give, and the jobs are all still running.
-        waiting = ", ".join(job.job_id for job in watch.pending)
+        # give, and the jobs are all still on their hosts.
+        pending = [job.job_id for job in watch.pending] if watch else list(args.job_ids)
         return failed(
-            args,
-            f"interrupted; still running or queued on their hosts: {waiting}",
-            EXIT_INTERRUPTED,
+            args, f"interrupted; still on their hosts: {', '.join(pending)}", EXIT_INTERRUPTED
         )
     if args.json:
         jsonout.emit(wait_mod.document(waited))

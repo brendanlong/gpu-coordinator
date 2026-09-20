@@ -123,7 +123,7 @@ class Watched:
         # Said, because it changes what the answer is worth: the mirror holds
         # what the host uploaded last, and a host that died mid-upload uploaded
         # nothing after that.
-        whence = " (from the S3 mirror; the host is gone)" if self.source == "mirror" else ""
+        whence = " (from the S3 mirror)" if self.source == "mirror" else ""
         return (
             f"{status_mod.job_label(job)} on {self.host}: {job.status}"
             f"{f' ({detail})' if detail else ''}{took}{flag}{whence}"
@@ -240,8 +240,11 @@ class Watch:
             self._trouble_with(name, pending, f"answered `status` with {kind}, not JSON")
             return
         self._clear_trouble(name)
-        self._check_dispatcher(name, payload)
         views = {view.job_id: view for group in status_mod.job_views(payload) for view in group}
+        waiting_to_start = [
+            w for w in pending if (view := views.get(w.job_id)) and view.status == "queued"
+        ]
+        self._check_dispatcher(name, payload, bool(waiting_to_start))
         for watched in pending:
             view = views.get(watched.job_id)
             if view is None:
@@ -250,13 +253,19 @@ class Watch:
             watched.view = view
             watched.seen = True
 
-    def _check_dispatcher(self, name: str, payload: dict[str, Any]) -> None:
+    def _check_dispatcher(self, name: str, payload: dict[str, Any], queued: bool) -> None:
         """Say so, once, when a reachable host has nobody serving its queue.
 
         Otherwise a queued job waits for a dispatcher that is never coming back
         and the wait looks identical to one behind a long job. Not an error: the
         job really is still queued, and one `gpuc host bootstrap` starts it.
+
+        Only where something we are waiting on is actually queued: a *running*
+        job is written to its end by its own runner, so the wait finishes
+        whatever the dispatcher is doing and the warning would be false.
         """
+        if not queued:
+            return
         # Another build's JSON: a string here must cost a missing warning, not
         # the whole wait.
         age = payload.get("dispatcher_heartbeat_age_s")
@@ -288,19 +297,21 @@ class Watch:
         if now - since < TROUBLE_GRACE_S:
             return
         waited = status_mod.format_duration(now - since)
+        # One index, not one per job: it holds a boto3 client, and twenty jobs
+        # on a host that died is twenty of them.
+        s3 = S3Index.from_settings(self.settings)
         for watched in pending:
             # The mirror before giving up, and only now: the spec's rule is
             # that monitoring asks the host and reads the mirror when the host
             # is gone. A rental that idled itself down after finishing the job
             # is exactly that, and reporting its success as "could not ask"
             # would be wrong about the one run the user was waiting for.
-            if self._from_mirror(watched):
+            if self._from_mirror(watched, s3):
                 continue
             watched.error = f"host {name} could not be asked for {waited}: {why}"
 
-    def _from_mirror(self, watched: Watched) -> bool:
+    def _from_mirror(self, watched: Watched, s3: S3Index | None) -> bool:
         """This job's outcome from S3, if the mirror has a terminal one."""
-        s3 = S3Index.from_settings(self.settings)
         if s3 is None or not watched.mirror_prefix:
             return False
         uri = job_uri(watched.mirror_prefix, watched.job_id, "state.json")
@@ -310,13 +321,29 @@ class Watch:
             return False
         if not isinstance(document, dict):
             return False
+        indexed = LocalIndex().get(watched.job_id)
         # Through `job_views`, so another build's state.json is read as
-        # tolerantly here as a host's own answer is.
-        _, _, finished = status_mod.job_views({"jobs": [{**document, "job_id": watched.job_id}]})
+        # tolerantly here as a host's own answer is. The two fields the file
+        # cannot carry are supplied: `name` lives in the spec, and
+        # `outputs_pending` is the host's own check against the spec, which is
+        # why a mirrored `outputs_lost` has to stand on its own here -- this is
+        # the dead-rental case, and it is the same case that loses outputs.
+        _, _, finished = status_mod.job_views(
+            {
+                "jobs": [
+                    {
+                        **document,
+                        "job_id": watched.job_id,
+                        "name": (indexed.name if indexed else "") or "",
+                        "outputs_pending": bool(document.get("outputs_lost")),
+                    }
+                ]
+            }
+        )
         view = next((v for v in finished if v.status in FINISHED_STATUSES), None)
         if view is None:
             return False
-        self.report(f"host {watched.host} is gone; read {watched.job_id} from {uri}")
+        self.report(f"read {watched.job_id} from the mirror at {uri}")
         watched.view = view
         watched.source = "mirror"
         return True

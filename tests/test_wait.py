@@ -36,6 +36,7 @@ from gpuc.control.cli import (
     main,
 )
 from gpuc.control.config import config_file, registry_transaction
+from gpuc.control.s3index import IndexEntry, LocalIndex
 from gpuc.control.transport import tail_command
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
@@ -82,19 +83,28 @@ def put_job(home: Path, job_id: str = JOB, *, name: str = "lego-s4", **state: An
         jobs.write_state(job_id, JobState(**{"status": "running", "phase": "main", **state}))
 
 
-def ends_after(
-    monkeypatch: pytest.MonkeyPatch, home: Path, rounds: int, **state: Any
+def after_polls(
+    monkeypatch: pytest.MonkeyPatch, rounds: int, then: Callable[[], None]
 ) -> Callable[[], int]:
-    """End the job after `rounds` polls, by standing in for the sleep between them."""
-    polls = [0]
+    """Do `then` once the wait has polled `rounds` times, and count the polls.
 
-    def sleep(_seconds: float) -> None:
-        polls[0] += 1
-        if polls[0] == rounds:
-            put_job(home, **state)
+    Hooked onto the poll rather than onto `time.sleep`: that attribute is the
+    whole process's, and `Popen.wait(timeout=...)` busy-waits on it, so a
+    stand-in there fires from inside subprocess reaping too.
+    """
+    real = wait_mod.Watch.poll
+    seen = [0]
 
-    monkeypatch.setattr(wait_mod.time, "sleep", sleep)
-    return lambda: polls[0]
+    def poll(self: wait_mod.Watch) -> list[wait_mod.Watched]:
+        settled = real(self)
+        seen[0] += 1
+        if seen[0] == rounds:
+            then()
+        return settled
+
+    monkeypatch.setattr(wait_mod.Watch, "poll", poll)
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+    return lambda: seen[0]
 
 
 # -- `gpuc wait` ---------------------------------------------------------------
@@ -138,11 +148,13 @@ def test_wait_blocks_until_the_job_ends(
     host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     put_job(host_home)
-    polls = ends_after(
-        monkeypatch, host_home, 3, status="succeeded", phase=None, ended_at=jobs.utc_now()
+    polls = after_polls(
+        monkeypatch,
+        3,
+        lambda: put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now()),
     )
     assert main(["wait", JOB]) == EXIT_OK
-    assert polls() == 3
+    assert polls() == 4, "three polls saw it running, the fourth saw it end"
     assert "succeeded" in capsys.readouterr().out
 
 
@@ -279,6 +291,23 @@ def test_an_interrupted_wait_under_json_still_prints_a_document(
     assert JOB in document["error"]
 
 
+def test_an_interrupt_before_the_first_poll_is_reported_too(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding a job's host can ask every host in turn, 60s each: it is where a
+    mistyped id gets Ctrl-C'd, and it is outside the polling loop."""
+    put_job(host_home)
+
+    def interrupted(*_args: Any, **_kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(wait_mod, "start", interrupted)
+    assert main(["wait", JOB, "--json"]) == EXIT_INTERRUPTED
+    document = json.loads(capsys.readouterr().out)
+    assert document["exit_code"] == EXIT_INTERRUPTED
+    assert JOB in document["error"]
+
+
 def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
     host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -299,6 +328,9 @@ def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
         property(lambda self: FakeS3Client(objects={key: state.encode()})),
     )
     config_file().write_text('s3_bucket = "bucket"\n')
+    # The index `gpuc submit` writes here: the mirrored state.json has no name
+    # (that lives in the spec), so this is where the line's label comes from.
+    LocalIndex().record(IndexEntry(job_id=JOB, host="local", name="lego-s4", s3_prefix=prefix))
     with registry_transaction() as registry:
         registry.put(
             host_entry(
@@ -317,6 +349,46 @@ def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
     out = capsys.readouterr().out
     assert "succeeded" in out
     assert "from the S3 mirror" in out
+    assert f"lego-s4 ({JOB})" in out
+
+
+def test_the_mirror_still_shouts_when_a_dead_host_lost_the_outputs(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fallback exists for the dead-rental case, which is the same case
+    that loses outputs -- so it must not be the one that stays quiet about it.
+
+    `outputs_pending` is the host's own check against the spec and is not in
+    the mirrored state, so a mirrored `outputs_lost` has to stand on its own.
+    """
+    from tests.fakes3 import FakeS3Client
+
+    put_job(host_home)
+    key = f"bucket/gpuc/local/jobs/{JOB}/state.json"
+    state = json.dumps(
+        {"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0, "outputs_lost": True}
+    )
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client",
+        property(lambda self: FakeS3Client(objects={key: state.encode()})),
+    )
+    config_file().write_text('s3_bucket = "bucket"\n')
+    with registry_transaction() as registry:
+        registry.put(
+            host_entry(
+                name="local",
+                kind="local",
+                gpus=[GPU],
+                gpuc_home=str(host_home),
+                python="/no/such",
+                s3_prefix="s3://bucket/gpuc/local",
+            )
+        )
+    monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+
+    assert main(["wait", JOB, "--host", "local"]) == EXIT_OK
+    assert "OUTPUTS LOST" in capsys.readouterr().out
 
 
 def test_wait_says_once_when_a_reachable_host_has_no_dispatcher(
@@ -324,18 +396,30 @@ def test_wait_says_once_when_a_reachable_host_has_no_dispatcher(
 ) -> None:
     """A queued job there will never start, and silence looks like a busy queue."""
     put_job(host_home, status="queued", phase=None)
-    paths_heartbeat = host_home / "dispatcher.heartbeat"
-    paths_heartbeat.unlink(missing_ok=True)
-    polls = [0]
-
-    def sleep(_seconds: float) -> None:
-        polls[0] += 1
-        if polls[0] == 3:
-            put_job(host_home, status="cancelled", phase=None, ended_at=jobs.utc_now())
-
-    monkeypatch.setattr(wait_mod.time, "sleep", sleep)
+    (host_home / "dispatcher.heartbeat").unlink(missing_ok=True)
+    after_polls(
+        monkeypatch,
+        3,
+        lambda: put_job(host_home, status="cancelled", phase=None, ended_at=jobs.utc_now()),
+    )
     assert main(["wait", JOB]) == EXIT_ERROR
     assert capsys.readouterr().err.count("dispatcher DOWN") == 1
+
+
+def test_a_dead_dispatcher_is_not_mentioned_while_the_job_is_already_running(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A running job is written to its end by its own runner, so the warning
+    would be false: nothing here is waiting for the dispatcher to start it."""
+    put_job(host_home)
+    (host_home / "dispatcher.heartbeat").unlink(missing_ok=True)
+    after_polls(
+        monkeypatch,
+        2,
+        lambda: put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now()),
+    )
+    assert main(["wait", JOB]) == EXIT_OK
+    assert "dispatcher DOWN" not in capsys.readouterr().err
 
 
 def test_wait_json_carries_the_error_and_where_the_answer_came_from(
