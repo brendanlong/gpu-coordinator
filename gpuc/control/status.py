@@ -524,7 +524,7 @@ def _fmt_util(job: JobView, *, source: bool = False) -> str:
     return f"util --{tag}" if job.last_util is None else f"util {job.last_util:.0f}%{tag}"
 
 
-def _job_label(job: JobView) -> str:
+def job_label(job: JobView) -> str:
     """`name (job-id)`: the name is what a reader is looking for, the id is
     what every other command takes as an argument."""
     return f"{job.name} ({job.job_id})" if job.name else job.job_id
@@ -1023,14 +1023,14 @@ def render(
 
     for job in view.running:
         lines.append(
-            f"  running {_job_label(job)} phase={job.phase or '-'} {_fmt_elapsed(job)} "
+            f"  running {job_label(job)} phase={job.phase or '-'} {_fmt_elapsed(job)} "
             f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
             f"{_fmt_eta(job)}{_fmt_auto_preempt(job)}"
         )
     starts = queue_start_estimates(view)
     for job in view.queue:
         lines.append(
-            f"  queued  {_job_label(job)} prio={job.priority}{_fmt_cards(job)}"
+            f"  queued  {job_label(job)} prio={job.priority}{_fmt_cards(job)}"
             f"{_fmt_estimate(job)}{_fmt_starts(job, starts)}{_fmt_auto_preempt(job)}"
         )
     free = next_free_line(view)
@@ -1051,7 +1051,7 @@ def render(
         elif job.outputs_pending:
             flag = "  outputs not uploaded"
         lines.append(
-            f"  done    {_job_label(job)} {job.status}"
+            f"  done    {job_label(job)} {job.status}"
             f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
         )
     if since_s is not None and not finished and view.finished:

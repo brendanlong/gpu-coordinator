@@ -1,0 +1,316 @@
+"""`gpuc wait` and `gpuc logs -f`: finding out that a job ended without looking.
+
+Every test here drives a real `gpuc.host status` round trip (see `host_home`),
+because the thing being tested is precisely the reading of another process's
+state file -- a stubbed poll would test the stub.
+
+Where a test needs the job to end mid-wait it stands in for the sleep between
+polls, which is both the hook and what keeps these from being the slowest tests
+in the suite. The one that streams a real `tail` uses a real clock instead:
+there is a race in it worth losing sometimes.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import pytest
+
+from gpuc.control import wait as wait_mod
+from gpuc.control.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, main
+from gpuc.control.config import registry_transaction
+from gpuc.control.transport import tail_command
+from gpuc.host import jobs, paths
+from gpuc.host.jobs import HostConfig, JobSpec, JobState
+from tests.conftest import host_entry
+
+GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+JOB = "20260915-120000-abc123"
+
+
+@pytest.fixture
+def host_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env: Path) -> Path:
+    """A registered `local` host whose GPUC_HOME really answers `gpuc.host status`.
+
+    The `pkg` symlink is what makes the poll a round trip rather than a fake:
+    the control side runs `python -m gpuc.host status` with PYTHONPATH pointing
+    at it, and reads back whatever that printed.
+    """
+    home = tmp_path / "host-home"
+    monkeypatch.setenv("GPUC_HOME", str(home))
+    paths.ensure_layout()
+    jobs.write_config(HostConfig(host="local", gpus=[GPU]))
+    paths.heartbeat_file().touch()
+    monkeypatch.delenv("GPUC_HOME")
+    (home / "pkg").symlink_to(Path(__file__).resolve().parents[1])
+    with registry_transaction() as registry:
+        registry.put(
+            host_entry(
+                name="local",
+                kind="local",
+                gpus=[GPU],
+                gpuc_home=str(home),
+                python=sys.executable,
+            )
+        )
+    return home
+
+
+def put_job(home: Path, job_id: str = JOB, *, name: str = "lego-s4", **state: Any) -> None:
+    """A job on the host, in whatever state the test needs it to be in."""
+    with mock.patch.dict(os.environ, {"GPUC_HOME": str(home)}):
+        jobs.write_spec(
+            JobSpec.from_dict({"job_id": job_id, "name": name, "command": "train", "gpus": 1})
+        )
+        jobs.write_state(job_id, JobState(**{"status": "running", "phase": "main", **state}))
+
+
+def ends_after(
+    monkeypatch: pytest.MonkeyPatch, home: Path, rounds: int, **state: Any
+) -> Callable[[], int]:
+    """End the job after `rounds` polls, by standing in for the sleep between them."""
+    polls = [0]
+
+    def sleep(_seconds: float) -> None:
+        polls[0] += 1
+        if polls[0] == rounds:
+            put_job(home, **state)
+
+    monkeypatch.setattr(wait_mod.time, "sleep", sleep)
+    return lambda: polls[0]
+
+
+# -- `gpuc wait` ---------------------------------------------------------------
+
+
+def test_wait_on_a_finished_job_returns_its_outcome_at_once(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    assert main(["wait", JOB]) == EXIT_OK
+    assert f"lego-s4 ({JOB}) on local: succeeded" in capsys.readouterr().out
+
+
+def test_wait_exits_non_zero_for_a_job_that_failed(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The point of the command: a script learns the outcome from `$?`."""
+    put_job(
+        host_home,
+        status="failed",
+        phase=None,
+        reason="sync-preflight",
+        exit_code=1,
+        ended_at=jobs.utc_now(),
+    )
+    assert main(["wait", JOB]) == EXIT_ERROR
+    assert "failed (sync-preflight)" in capsys.readouterr().out
+
+
+def test_wait_exits_non_zero_for_a_cancelled_job(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Cancelled is terminal but it is not the work getting done."""
+    put_job(host_home, status="cancelled", phase=None, ended_at=jobs.utc_now())
+    assert main(["wait", JOB]) == EXIT_ERROR
+    # `cancelled (cancelled)` would say nothing twice.
+    assert "on local: cancelled" in capsys.readouterr().out
+
+
+def test_wait_blocks_until_the_job_ends(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    put_job(host_home)
+    polls = ends_after(
+        monkeypatch, host_home, 3, status="succeeded", phase=None, ended_at=jobs.utc_now()
+    )
+    assert main(["wait", JOB]) == EXIT_OK
+    assert polls() == 3
+    assert "succeeded" in capsys.readouterr().out
+
+
+def test_wait_takes_several_ids_and_fails_if_any_of_them_did(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    other = "20260915-130000-def456"
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    put_job(
+        host_home,
+        other,
+        name="sweep-2",
+        status="failed",
+        phase=None,
+        reason="timeout",
+        ended_at=jobs.utc_now(),
+    )
+    assert main(["wait", JOB, other]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "succeeded" in out
+    assert "failed (timeout)" in out
+
+
+def test_wait_says_each_job_once_however_often_it_is_named(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    assert main(["wait", JOB, JOB]) == EXIT_OK
+    assert capsys.readouterr().out.count(JOB) == 1
+
+
+def test_wait_json_is_one_document_of_final_states(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    put_job(
+        host_home,
+        status="failed",
+        phase=None,
+        reason="timeout",
+        exit_code=1,
+        ended_at=jobs.utc_now(),
+    )
+    assert main(["wait", JOB, "--json"]) == EXIT_ERROR
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document["schema_version"] == 1
+    assert document["errors"] == []
+    job = document["jobs"][0]
+    assert (job["job_id"], job["host"], job["status"]) == (JOB, "local", "failed")
+    assert job["reason"] == "timeout"
+    # The outcome line still exists under --json; stdout is the document alone.
+    assert "failed (timeout)" in captured.err
+
+
+def test_wait_on_an_id_no_host_has_is_exit_four(host_home: Path) -> None:
+    """`--host` skips the search, so the host itself has to be asked."""
+    assert main(["wait", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_NOT_FOUND
+
+
+def test_wait_keeps_trying_a_host_it_cannot_reach_and_then_gives_up(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An ssh blip must not end a six-hour wait; a host that has gone must not hang one.
+
+    The interpreter the host is run through is not there, so every poll fails
+    the way a dead pod's would -- and the wait keeps asking until the grace
+    runs out, which here is a fifth of a second rather than five minutes.
+    """
+    put_job(host_home)
+    with registry_transaction() as registry:
+        registry.put(
+            host_entry(
+                name="local", kind="local", gpus=[GPU], gpuc_home=str(host_home), python="/no/such"
+            )
+        )
+    monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.2)
+    polls = [0]
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: polls.__setitem__(0, polls[0] + 1))
+
+    assert main(["wait", JOB, "--host", "local"]) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "could not be asked" in captured.out
+    assert polls[0] > 1, "one failed poll is a blip, not a verdict"
+    # Said once, not once per poll.
+    assert captured.err.count("still waiting") == 1
+
+
+def test_wait_rejects_an_interval_that_is_not_a_delay(host_home: Path) -> None:
+    put_job(host_home)
+    assert main(["wait", JOB, "--interval", "0"]) == EXIT_USAGE
+
+
+# -- `gpuc logs -f` ------------------------------------------------------------
+
+
+def write_log(home: Path, job_id: str, text: str) -> Path:
+    log = home / "jobs" / job_id / "log.txt"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(text)
+    return log
+
+
+def test_follow_a_finished_job_prints_the_tail_and_exits(
+    host_home: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """`tail -f` on a job that has ended would hang for ever with nothing to say."""
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    write_log(host_home, JOB, "epoch 1\nepoch 2\n")
+    assert main(["logs", JOB, "-f"]) == EXIT_OK
+    out = capfd.readouterr().out
+    assert "epoch 2" in out
+    assert out.strip().endswith("on local: succeeded")
+
+
+def test_follow_a_failed_job_exits_with_it(
+    host_home: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    put_job(host_home, status="failed", phase=None, reason="gpu-preflight", ended_at=jobs.utc_now())
+    write_log(host_home, JOB, "no CUDA device\n")
+    assert main(["logs", JOB, "-f"]) == EXIT_ERROR
+    assert "failed (gpu-preflight)" in capfd.readouterr().out
+
+
+def test_follow_streams_a_running_job_and_stops_when_it_ends(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The whole issue in one test: the stream ends, and with the job's verdict.
+
+    Real `tail`, real clock, real interval: the thing worth proving is that a
+    line written just before the job ended still reaches the screen, and only
+    the actual child process can prove that.
+    """
+    put_job(host_home)
+    log = write_log(host_home, JOB, "starting\n")
+    monkeypatch.setattr(wait_mod, "FLUSH_GRACE_S", 0.5)
+
+    def end_the_job() -> None:
+        time.sleep(0.3)
+        with log.open("a") as handle:
+            handle.write("epoch 1\n")
+        put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+
+    ending = threading.Thread(target=end_the_job)
+    ending.start()
+    try:
+        assert main(["logs", JOB, "-f", "--interval", "0.05"]) == EXIT_OK
+    finally:
+        ending.join()
+    out = capfd.readouterr().out
+    assert "epoch 1" in out
+    assert out.strip().endswith("on local: succeeded")
+
+
+def test_follow_forever_is_still_there_for_anyone_who_wants_it(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """It never consults the job's state: a finished job would end `-f` at once."""
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    write_log(host_home, JOB, "done\n")
+    argv: list[list[str]] = []
+    monkeypatch.setattr(
+        "gpuc.control.cli.subprocess.call", lambda command: argv.append(command) or 0
+    )
+    assert main(["logs", JOB, "--follow-forever"]) == EXIT_OK
+    assert "tail -F" in " ".join(argv[0])
+
+
+def test_follow_under_json_is_still_refused(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    put_job(host_home)
+    assert main(["logs", JOB, "--json", "-f"]) == EXIT_USAGE
+    assert main(["logs", JOB, "--json", "--follow-forever"]) == EXIT_USAGE
+
+
+def test_a_follow_retries_a_log_that_is_not_written_yet_and_a_read_does_not() -> None:
+    """A plain read must fail on a missing log: that is what sends it to S3."""
+    assert tail_command("/j/log.txt", 10, follow=True, retry=True).startswith("tail -F ")
+    assert tail_command("/j/log.txt", 10, follow=True).startswith("tail -f ")
+    assert tail_command("/j/log.txt", 10).startswith("tail -n ")

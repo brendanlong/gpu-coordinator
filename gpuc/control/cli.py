@@ -9,6 +9,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,7 @@ from gpuc.control import pods as pods_mod
 from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
 from gpuc.control import version as version_mod
+from gpuc.control import wait as wait_mod
 from gpuc.control import web as web_mod
 from gpuc.control.actions import (
     EXIT_ERROR,
@@ -1332,23 +1334,33 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
-    command = tail_command(remote_path, lines, follow=True)
+    # `--retry`: `gpuc submit && gpuc logs -f` is the obvious pair to type, and
+    # a job that has not been dispatched yet has no log.txt for tail to open.
+    command = tail_command(remote_path, lines, follow=True, retry=True)
     if isinstance(transport, SshTransport):
         return transport.ssh_argv(command)
     return ["bash", "-c", command]
 
 
+def check_interval(interval: float | None) -> None:
+    if interval is not None and not interval > 0.0:
+        raise UsageError(f"--interval must be a positive number of seconds, got {interval:g}")
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
-    if args.json and args.follow:
+    if args.json and (args.follow or args.follow_forever):
         raise UsageError(
             "logs --json cannot follow: -f streams a log that has no end, and a JSON "
             "document has to be complete. Drop one of them."
         )
+    check_interval(args.interval)
     settings = load_settings()
-    if args.follow:
+    if args.follow_forever:
         entry, _ = find_job_host(args.job_id, named_registry(), args.host)
         session, remote = job_log_path(entry, args.job_id, settings)
-        return _follow(session.transport, remote, args.lines)
+        return _follow_forever(session.transport, remote, args.lines)
+    if args.follow:
+        return _follow_until_done(args, settings)
     entry, log = read_log(args.job_id, args.host, args.lines, settings)
     # Bytes for a human; lines plus where they came from for a script.
     if args.json:
@@ -1358,12 +1370,87 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _follow(transport: Transport, remote: str, lines: int) -> int:
+def _follow_forever(transport: Transport, remote: str, lines: int) -> int:
     argv = _follow_argv(transport, remote, lines)
     try:
         return subprocess.call(argv)
     except KeyboardInterrupt:
-        return 0
+        return EXIT_OK
+
+
+def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
+    """`logs -f`: the log while the job runs, its outcome, and exit with it.
+
+    The stream and the polling are two things at once because there is nothing
+    in a log that says a job has ended -- the host's state file is the only
+    thing that does. So `tail` runs as a child writing straight to our stdout
+    while this thread asks the host, and the job's own outcome becomes the exit
+    code, which is what makes `gpuc logs -f "$id"` a foreground wait on its own.
+    """
+    watch = wait_mod.start([args.job_id], args.host, settings)
+    watched = watch.jobs[args.job_id]
+    watch.poll()
+    watch.check_known()
+    if watched.settled:
+        # Nothing more is coming, and `tail -f` on it would simply hang. The
+        # ordinary read, so a purged job still falls back to the S3 mirror.
+        _, log = read_log(args.job_id, watched.host, args.lines, settings)
+        sys.stdout.write(log.text)
+        print(watched.line())
+        return wait_mod.exit_code([watched])
+    session, remote = job_log_path(watch.entries[watched.host], args.job_id, settings)
+    tail = subprocess.Popen(_follow_argv(session.transport, remote, args.lines))
+    ended = False
+    try:
+        wait_mod.block(watch, interval=args.interval)
+        ended = True
+    except KeyboardInterrupt:
+        # Ctrl-C reached the tail too: it shares this process group. The job
+        # does not care either way -- its host owns it, not us.
+        note(f"interrupted; job {args.job_id} is still {watched.status} on {watched.host}")
+    finally:
+        # Only a job that ended has last lines worth waiting for; an interrupt
+        # wants the stream gone now.
+        _end_tail(tail, flush=ended)
+    if not ended:
+        return EXIT_OK
+    print(watched.line())
+    return wait_mod.exit_code([watched])
+
+
+def _end_tail(tail: subprocess.Popen[bytes], *, flush: bool) -> None:
+    if tail.poll() is None:
+        if flush:
+            time.sleep(wait_mod.FLUSH_GRACE_S)
+        tail.terminate()
+    try:
+        tail.wait(timeout=10.0)
+    except subprocess.TimeoutExpired:
+        tail.kill()
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    """Block until every named job has ended, then exit with their outcome.
+
+    No log: this is the half of `logs -f` a sweep wants, where twenty jobs'
+    output interleaved would be unreadable and only the verdicts matter.
+    """
+    check_interval(args.interval)
+    watch = wait_mod.start(args.job_ids, args.host, load_settings())
+    # Under --json stdout belongs to the document, so the outcomes go to stderr
+    # as they happen and are in the document at the end.
+    announce = jsonout.note if args.json else print
+    waited = wait_mod.block(
+        watch, interval=args.interval, on_settled=lambda watched: announce(watched.line())
+    )
+    if args.json:
+        jsonout.emit(
+            {
+                "jobs": [watched.document() for watched in waited],
+                "errors": [job.error for job in waited if job.error is not None],
+            }
+        )
+    return wait_mod.exit_code(waited)
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
@@ -1771,12 +1858,31 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(clean)
     clean.set_defaults(func=cmd_clean)
 
-    logs = sub.add_parser("logs", help="tail a job log from its host")
+    logs = sub.add_parser(
+        "logs",
+        help="tail a job log from its host, or follow it until the job ends",
+        description="With -f this is also a wait: the log streams until the host says the "
+        "job has ended, the outcome is the last line, and gpuc exits 0 only if the job "
+        "succeeded.",
+    )
     logs.add_argument("job_id")
-    logs.add_argument("-f", "--follow", action="store_true", help="stream the log as it is written")
+    logs.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="stream the log until the job ends, then print its outcome and exit with it "
+        "(0 succeeded, 1 anything else)",
+    )
+    logs.add_argument(
+        "--follow-forever",
+        action="store_true",
+        help="stream the log and never stop, as -f used to: for watching a host's own "
+        "writing past the end of a run. Ctrl-C is the only way out",
+    )
     logs.add_argument(
         "-n", "--lines", type=int, default=200, metavar="N", help="lines of history (default 200)"
     )
+    add_interval_flag(logs)
     logs.add_argument(
         "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
     )
@@ -1786,6 +1892,22 @@ def build_parser() -> argparse.ArgumentParser:
         "not with -f, which has no end",
     )
     logs.set_defaults(func=cmd_logs)
+
+    wait = sub.add_parser(
+        "wait",
+        help="block until jobs end; exit non-zero if any of them did not succeed",
+        description="Polls each job's host and prints one line per job as it ends. No log "
+        "output: `gpuc logs -f <job-id>` is the one-job version that streams. Exit 0 only "
+        "if every job succeeded, so `gpuc submit --json | jq -r .job_id | xargs gpuc wait` "
+        "is a script.",
+    )
+    wait.add_argument("job_ids", nargs="+", metavar="job_id")
+    add_interval_flag(wait)
+    wait.add_argument(
+        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
+    )
+    add_json_flag(wait, "each job's final state, as `status --json` reports one")
+    wait.set_defaults(func=cmd_wait)
 
     ssh = sub.add_parser(
         "ssh",
@@ -1963,6 +2085,18 @@ JSON_HELP = (
 
 def add_json_flag(parser: argparse.ArgumentParser, help_text: str = JSON_HELP) -> None:
     parser.add_argument("--json", action="store_true", help=help_text)
+
+
+def add_interval_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=f"how often to ask the host whether the job has ended; the default backs off "
+        f"from {wait_mod.FIRST_INTERVAL_S:g}s to {wait_mod.MAX_INTERVAL_S:g}s as the wait "
+        f"gets longer",
+    )
 
 
 def add_bootstrap_flag(parser: argparse.ArgumentParser) -> None:

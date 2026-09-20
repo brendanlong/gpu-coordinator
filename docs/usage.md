@@ -259,8 +259,43 @@ UUIDs are in `gpuc host list`, and everything a host can say about itself is in
 **`gpuc logs <job-id> [-f] [-n N] [--host H]`** — tails `log.txt` on the host
 (`-n` defaults to 200). If the host cannot produce it, gpuc says why — including
 "was purged" when the whole job dir is gone — and falls back to the S3 mirror,
-which needs `s3_bucket` set here **and** an `s3_prefix` for that job. `-f`
-follows the host's file, never falls back, and cannot be combined with `--json`.
+which needs `s3_bucket` set here **and** an `s3_prefix` for that job.
+
+**`-f` is also a wait.** It streams the host's file while asking the host, every
+few seconds, whether the job has ended; when it has, the job's outcome is the
+last line and gpuc exits **0 only if the job succeeded**, 1 for anything else.
+So `gpuc logs -f "$id"` is a foreground wait you can put in a script, and a job
+that is *already* finished prints its tail and exits instead of hanging. A job
+still in the queue is followed too: the log that does not exist yet is waited
+for rather than refused.
+
+```
+epoch 11 loss 0.214
+lego-s4 (20260915-233000-112233) on spar: failed (sync-preflight) after 41s
+```
+
+Nothing about the job changes if the follow is killed: the host owns it either
+way. The outcome is read from the host's state file, which the runner writes
+just *before* its own last log lines, so a line or two of the runner's cleanup
+can land after the follow has gone; the log itself always has them.
+`--follow-forever` is the old behaviour — stream and never stop, Ctrl-C to
+leave — and `--interval SECONDS` pins the poll, whose default backs off from
+2s to 30s. Neither form can be combined with `--json`.
+
+**`gpuc wait <job-id> [<job-id> ...] [--host H]`** — the same wait with no log,
+for when several jobs are in flight and their output interleaved would be
+unreadable. It blocks until every job named has ended, prints one line per job
+as that happens, and exits 0 only if **all** of them succeeded:
+
+```sh
+gpuc submit job.yaml --host spar --json | jq -r .job_id | xargs gpuc wait || echo "it did not work"
+```
+
+An id no host has is exit 4, as everywhere else. A host that stops answering is
+not: the wait rides out a blip and only gives up on it — exit 1, with the reason
+as that job's line — after five minutes of failures, because the alternative is
+an ssh hiccup ending a six-hour wait. `--interval` is as above, and `--json` is
+[below](#exit-codes-and---json).
 
 **`gpuc ssh <host|job-id> [--print] [-- CMD ...]`** — an ssh with gpuc's own key,
 port, `known_hosts` and ControlMaster socket, none of which are in your
@@ -310,9 +345,10 @@ carrying an earlier run's literal id in a destination — is refused rather than
 queued to fail, and submitting the job file again is the way round it. Keys this
 build does not know are dropped rather than refused.
 
-`--host` is optional on `logs`, `cancel`, `preempt`, `reorder`, `estimate` and
-`requeue`: the local job index is tried first, then every registered host is
-asked whether it knows the id. An unknown job or host is exit 4.
+`--host` is optional on `logs`, `wait`, `cancel`, `preempt`, `reorder`,
+`estimate` and `requeue`: the local job index is tried first, then every
+registered host is asked whether it knows the id. An unknown job or host is
+exit 4.
 
 **`gpuc skill`** — prints the agent guide
 ([`skills/gpuc/SKILL.md`](../skills/gpuc/SKILL.md)) to stdout. `--install [DIR]`
@@ -499,7 +535,7 @@ Every `failed: <reason>`:
 | code | meaning |
 | --- | --- |
 | 0 | ok. **Includes** a host that is unreachable, has a dead dispatcher, or whose pod is gone: that is data about a host, reported per host, not a failure of the command |
-| 1 | the command failed (transport, provider, a refused submit, a `clean` the host reported errors for, a `host bootstrap --all` any host failed — the others still upgraded, and the tally says which) |
+| 1 | the command failed (transport, provider, a refused submit, a `clean` the host reported errors for, a `host bootstrap --all` any host failed — the others still upgraded, and the tally says which). Also a job that did not succeed, under `gpuc wait` and `gpuc logs -f`, whose exit code is the job's rather than their own |
 | 2 | usage: a bad flag, a missing required one, a bad `--since` |
 | 3 | local state is unreadable (`hosts.json` or `config.toml`), so the answer is **unknown** |
 | 4 | the job or host named on the command line does not exist |
@@ -600,7 +636,7 @@ Rules for anything automated:
 
 ### `--json` everywhere else
 
-`status`, `submit`, `requeue`, `logs`, `cancel`, `preempt`, `reorder`,
+`status`, `submit`, `requeue`, `logs`, `wait`, `cancel`, `preempt`, `reorder`,
 `estimate`, `pods`, `version`, `clean`, `config show`, `config init`,
 `host list`, `host probe`, `host add`, `host set`, `host bootstrap`,
 `host clean` and `host remove` take `--json`: **stdout is exactly one JSON
@@ -628,6 +664,7 @@ per-job trouble a command survived, which never implies a non-zero exit by itsel
 | --- | --- |
 | `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is null on `submit`; `notes` are the text output's `note:` lines. The queue fields are the host's answer just after the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, and `starts_unknown` says why there is no start time (null when there is one). All of them are null when the host could not be asked again — never a reason to think the job was not queued |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
+| `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is that job's final state in exactly the shape `status --json` gives a job, plus `host`; a job the wait gave up on has `"status": null` and its reason in `errors`. The per-job outcome lines go to stderr under `--json`, as everything but the document does. Exit 1 unless every job succeeded |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |
@@ -647,6 +684,7 @@ per-job trouble a command survived, which never implies a non-zero exit by itsel
 ```sh
 gpuc submit job.yaml --host gpubox --json | jq -r .job_id
 gpuc logs "$id" --json | jq -r '.lines[-20:][]'
+gpuc wait "$id" --json | jq -r '.jobs[] | "\(.job_id) \(.status) \(.reason // "")"'
 gpuc pods --json | jq '[.pods[] | select(.host == null) | .name]'
 gpuc clean --host gpubox --all-finished --dry-run --json | jq .freed_bytes
 gpuc host bootstrap --all --json | jq -r '.hosts[] | "\(.name) \(.outcome) \(.error // "")"'

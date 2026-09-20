@@ -42,7 +42,8 @@ gpuc host add local                          # every card nvidia-smi reports; --
 gpuc host bootstrap local                    # installs uv, the package, the dispatcher
 gpuc submit job.example.yaml --host local    # or --runpod --gpu A40 --max-price 0.60
 gpuc status                                  # queues, running jobs, recent results
-gpuc logs <job-id> -f
+gpuc logs <job-id> -f                        # streams until the job ends, then exits with it
+gpuc wait <job-id> [<job-id> ...]            # the same wait with no log, for a sweep
 gpuc web set-password && gpuc web serve   # the same, in a browser at http://127.0.0.1:8646/
 ```
 
