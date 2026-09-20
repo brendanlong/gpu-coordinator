@@ -659,16 +659,19 @@ thing on each: stdout is one object carrying `schema_version`, everything else
 the command has to say goes to stderr, and a failure prints
 `{schema_version, error, exit_code}` rather than nothing. The flag never changes
 an exit code. `gpuc logs --json` is the tail as `lines[]` plus where it was read
-from; with `-f` it is exit 2, because a stream has no end. Each command's schema
-is the table in usage.md.
+from; with either follow it is exit 2, because the document is printed once and
+a follow is a stream. Each command's schema is the table in usage.md.
 
 `gpuc wait` and `gpuc logs -f` are the two exceptions to "1 means the command
-failed", and deliberately: their exit code is the *job's*, so 0 means every job
-named succeeded and 1 means one of them did not, exactly as `gpuc ssh <host> --
-cmd` exits with the remote command's code. A wait that could not find out --
-a host that stayed unreachable past `wait.TROUBLE_GRACE_S` -- is 1 as well,
-with the reason on the job's line and in `errors[]`. 3 and 4 keep their usual
-meanings.
+failed", and deliberately -- the spec's *Monitoring* section says so: their exit
+code is the *job's*, so 0 means every job named succeeded and 1 means one of
+them did not, exactly as `gpuc ssh <host> -- cmd` exits with the remote
+command's code. A wait that could not find out -- a host that stayed unreachable
+past `wait.TROUBLE_GRACE_S` and whose mirror had nothing -- is 1 as well, with
+the reason on the job's line and in `errors[]`. 3 and 4 keep their usual
+meanings, and **130** is added for these two alone: a Ctrl-C must not be exit 0
+where 0 means the job succeeded. `--follow-forever` keeps exit 0 on Ctrl-C,
+because it never claimed its code said anything about the run.
 
 ## Waiting for a job to end (`control/wait.py`)
 
@@ -684,9 +687,16 @@ job list.
   dies in its preflight dies in the first minute, and a job still running after
   ten has hours left.
 - A host that cannot be asked is *trouble*, not an answer. It is reported once
-  on stderr, retried for `TROUBLE_GRACE_S` (5 min), and only then does each job
-  on it get an `error` and stop being waited for. An ssh blip must not end a
-  six-hour wait; a pod that has gone must not hang one for ever.
+  on stderr and retried for `TROUBLE_GRACE_S` (5 min); only then is the **S3
+  mirror** read -- the spec's "the mirror is read only when the host is gone",
+  and the answer for a rental that finished the job and idled itself down --
+  and only if that has no terminal `state.json` does each job get an `error`.
+  An ssh blip must not end a six-hour wait; a pod that has gone must not hang
+  one for ever; and a job that succeeded must not be reported as a failure
+  because the machine that ran it has since been billed off.
+- A reachable host whose dispatcher heartbeat is stale is said once and waited
+  through. Its queued jobs will not start, but the queue is intact and one
+  `gpuc host bootstrap` serves it again, so this is a note and not an ending.
 - An id whose host answers and does not list it is exit 4, checked after the
   first poll -- `find_job_host` believes the local index and an explicit
   `--host` without asking anybody. A job that *was* listed and then vanishes is
@@ -694,8 +704,14 @@ job list.
 - `logs -f` runs `tail -F` as a child writing straight to stdout while this
   loop polls, then gives the stream `FLUSH_GRACE_S` to catch up before stopping
   it: the runner writes its terminal state before it logs the outcome, so the
-  poll is always slightly ahead of the log. `-F` rather than `-f` so a job that
-  has not been dispatched yet is followed rather than refused.
+  poll is always slightly ahead of the log. The stop is in a `finally` inside
+  `_end_tail`, so a second Ctrl-C landing in that grace cannot leave a `tail`
+  writing into a terminal gpuc has left. `-F` rather than `-f` so a job that
+  has not been dispatched yet is followed rather than refused -- and only from
+  the follow path: `Transport.tail()` keeps `-f`, because a missing log's
+  non-zero exit is what routes `gpuc logs` to the mirror. A tail that dies
+  before the job does (an ssh that gave up) is a note, not an ending; the poll
+  has its own connection.
 
 ## Transport
 

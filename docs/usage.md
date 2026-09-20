@@ -275,12 +275,17 @@ lego-s4 (20260915-233000-112233) on spar: failed (sync-preflight) after 41s
 ```
 
 Nothing about the job changes if the follow is killed: the host owns it either
-way. The outcome is read from the host's state file, which the runner writes
-just *before* its own last log lines, so a line or two of the runner's cleanup
-can land after the follow has gone; the log itself always has them.
+way. A Ctrl-C is **exit 130**, never 0 — 0 means the job succeeded, and the
+whole point is that a script can believe it. The outcome is read from the host's
+state file, which the runner writes just *before* its own last log lines, so a
+line or two of the runner's cleanup can land after the follow has gone; the log
+itself always has them. If the stream itself dies (an ssh that gave up) the wait
+says so and carries on: it polls over its own connection.
+
 `--follow-forever` is the old behaviour — stream and never stop, Ctrl-C to
-leave — and `--interval SECONDS` pins the poll, whose default backs off from
-2s to 30s. Neither form can be combined with `--json`.
+leave, and its exit code means nothing about the job — and `--interval SECONDS`
+pins the poll, whose default backs off from 2s to 30s. Neither follow can be
+combined with `--json`, and the two cannot be combined with each other.
 
 **`gpuc wait <job-id> [<job-id> ...] [--host H]`** — the same wait with no log,
 for when several jobs are in flight and their output interleaved would be
@@ -291,11 +296,20 @@ as that happens, and exits 0 only if **all** of them succeeded:
 gpuc submit job.yaml --host spar --json | jq -r .job_id | xargs gpuc wait || echo "it did not work"
 ```
 
-An id no host has is exit 4, as everywhere else. A host that stops answering is
-not: the wait rides out a blip and only gives up on it — exit 1, with the reason
-as that job's line — after five minutes of failures, because the alternative is
-an ssh hiccup ending a six-hour wait. `--interval` is as above, and `--json` is
-[below](#exit-codes-and---json).
+An id no host has is exit 4, as everywhere else, and a Ctrl-C is exit 130 with
+the jobs still named on stderr. A host that stops answering is neither: the wait
+rides out a blip and keeps asking, because an ssh hiccup must not end a six-hour
+wait. After five minutes of failures it looks in the **S3 mirror** — which is
+where a rental that finished the job and then idled itself down will have left
+the answer — and reports what it finds there, saying that it came from the
+mirror. Only if that has nothing does the job get exit 1 with `could not be
+asked` as its line.
+
+A reachable host whose **dispatcher is down** is a third case: a queued job
+there will never start, so the wait says so once and keeps waiting, since
+`gpuc host bootstrap <host>` is all it takes to start the queue moving again.
+
+`--interval` is as above, and `--json` is [below](#exit-codes-and---json).
 
 **`gpuc ssh <host|job-id> [--print] [-- CMD ...]`** — an ssh with gpuc's own key,
 port, `known_hosts` and ControlMaster socket, none of which are in your
@@ -539,6 +553,7 @@ Every `failed: <reason>`:
 | 2 | usage: a bad flag, a missing required one, a bad `--since` |
 | 3 | local state is unreadable (`hosts.json` or `config.toml`), so the answer is **unknown** |
 | 4 | the job or host named on the command line does not exist |
+| 130 | a Ctrl-C out of `gpuc wait` or `gpuc logs -f`. Only those two: it has to be distinct from 0, which for them means the job *succeeded* |
 
 A single unreadable host entry never reaches these: it is skipped with a warning
 on stderr, every other host still works, and the entry is written back untouched.
@@ -664,7 +679,7 @@ per-job trouble a command survived, which never implies a non-zero exit by itsel
 | --- | --- |
 | `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is null on `submit`; `notes` are the text output's `note:` lines. The queue fields are the host's answer just after the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, and `starts_unknown` says why there is no start time (null when there is one). All of them are null when the host could not be asked again — never a reason to think the job was not queued |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with `-f`** — a stream has no end, so `--json -f` is exit 2 |
-| `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is that job's final state in exactly the shape `status --json` gives a job, plus `host`; a job the wait gave up on has `"status": null` and its reason in `errors`. The per-job outcome lines go to stderr under `--json`, as everything but the document does. Exit 1 unless every job succeeded |
+| `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is that job's final state in exactly the shape `status --json` gives a job, plus `host`, `source` (`"host"`, or `"mirror"` for an outcome read from S3 after the host went away) and `error`. **`error` is the key to check**: it is null for a job that ended, and when it is not, `status` is only the last thing its host managed to say — `"running"` for a job whose host vanished mid-run, and null for one nothing was ever heard about. Every `error` is in `errors[]` too. The per-job outcome lines go to stderr under `--json`, as everything but the document does. Exit 1 unless every job succeeded |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |

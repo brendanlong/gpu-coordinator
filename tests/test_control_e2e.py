@@ -270,12 +270,15 @@ def test_following_a_real_job_stops_when_the_job_does(
     assert main(["logs", job_id, "-f", "--interval", "0.5"]) == 0
     out = capfd.readouterr().out
     assert "line-two" in out, out
-    # The outcome is the last line, and the workdir cleanup the runner logs
-    # *after* writing that outcome is on the ones before it: the follow gives
-    # the stream a moment to catch up rather than cutting it off mid-sentence.
+    # The outcome is the last line, because it is printed after the stream has
+    # been stopped. `removed workdir` is somewhere above it: the runner logs
+    # that *after* writing the terminal state this wait read, so its presence
+    # is the flush grace doing its job. Not asserted at a fixed position -- a
+    # loaded machine can take longer over that cleanup than the grace allows,
+    # and losing a line from the stream is not a failure of anything.
     lines = out.strip().splitlines()
     assert lines[-1].startswith(f"chatty ({job_id}) on local: succeeded after "), lines[-3:]
-    assert "removed workdir" in lines[-2]
+    assert "removed workdir" in out
 
 
 def test_submit_says_where_in_the_queue_the_job_landed(

@@ -154,9 +154,19 @@ destinations. Adding another of either changes nothing else in this document.
   cards and dispatcher; every queued job in dispatch order with its projected
   start; every running job with its phase, cards, utilization and estimate;
   recent results; and each job's log.
+- **A job ending is something the user is told, not something they discover.**
+  There is a command that blocks until named jobs have ended and reports what
+  happened to them, so that waiting for a run is one foreground command rather
+  than a polling loop the user writes. It runs on a client, and nothing about
+  it reaches the host: the host owns the job whether or not anybody is
+  watching, and a wait that is killed changes nothing.
 - **Every command that reports something supports JSON output**, and exit
   codes distinguish "failed", "usage", "local state unreadable, so unknown"
-  and "no such job or host". An unreachable host is data, not a failure.
+  and "no such job or host". An unreachable host is data, not a failure --
+  except to a command whose whole purpose was to wait for a job on it, which
+  after a grace period reports that it could not find out, as a failure.
+  **A command that waits for a job exits with that job's outcome**, not with
+  its own: for it, "failed" means the job did not succeed.
 - **The web app shows the same information and offers the same actions as
   the CLI, and nothing else.** A capability exists in the CLI first, and the
   web app calls the same code.

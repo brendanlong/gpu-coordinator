@@ -24,6 +24,7 @@ from gpuc.control import wait as wait_mod
 from gpuc.control import web as web_mod
 from gpuc.control.actions import (
     EXIT_ERROR,
+    EXIT_INTERRUPTED,
     EXIT_LOCAL_STATE,
     EXIT_NOT_FOUND,
     EXIT_OK,
@@ -126,6 +127,7 @@ from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
 __all__ = [
     "EXIT_ERROR",
+    "EXIT_INTERRUPTED",
     "EXIT_LOCAL_STATE",
     "EXIT_NOT_FOUND",
     "EXIT_OK",
@@ -1334,26 +1336,39 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
-    # `--retry`: `gpuc submit && gpuc logs -f` is the obvious pair to type, and
-    # a job that has not been dispatched yet has no log.txt for tail to open.
+    # `-F`, not `-f`: `gpuc submit && gpuc logs -f` is the obvious pair to type,
+    # and a job that has not been dispatched yet has no log.txt to open.
     command = tail_command(remote_path, lines, follow=True, retry=True)
     if isinstance(transport, SshTransport):
         return transport.ssh_argv(command)
     return ["bash", "-c", command]
 
 
-def check_interval(interval: float | None) -> None:
-    if interval is not None and not interval > 0.0:
-        raise UsageError(f"--interval must be a positive number of seconds, got {interval:g}")
+def check_interval(args: argparse.Namespace, *, polls: bool) -> None:
+    """`--interval` paces a poll, so it is a usage error where nothing polls."""
+    if args.interval is None:
+        return
+    if not polls:
+        raise UsageError(
+            "--interval paces the check for whether the job has ended, which only "
+            "`gpuc logs -f` and `gpuc wait` do. Drop it, or use -f."
+        )
+    if not args.interval > 0.0:
+        raise UsageError(f"--interval must be a positive number of seconds, got {args.interval:g}")
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
+    if args.follow and args.follow_forever:
+        raise UsageError(
+            "-f and --follow-forever are the two different things you can mean by "
+            "following: -f stops when the job does, --follow-forever never stops."
+        )
     if args.json and (args.follow or args.follow_forever):
         raise UsageError(
-            "logs --json cannot follow: -f streams a log that has no end, and a JSON "
-            "document has to be complete. Drop one of them."
+            "logs --json cannot follow: the document is printed once, and a follow is a "
+            "stream. `gpuc wait <job-id> --json` is the JSON form of waiting for a job."
         )
-    check_interval(args.interval)
+    check_interval(args, polls=args.follow)
     settings = load_settings()
     if args.follow_forever:
         entry, _ = find_job_host(args.job_id, named_registry(), args.host)
@@ -1371,6 +1386,11 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def _follow_forever(transport: Transport, remote: str, lines: int) -> int:
+    """`--follow-forever`: the stream with no end, and no claim about the job.
+
+    Ctrl-C is the only way out and is exit 0 here, unlike `-f`: this form never
+    promised its exit code meant anything about the run.
+    """
     argv = _follow_argv(transport, remote, lines)
     try:
         return subprocess.call(argv)
@@ -1398,35 +1418,72 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
         sys.stdout.write(log.text)
         print(watched.line())
         return wait_mod.exit_code([watched])
-    session, remote = job_log_path(watch.entries[watched.host], args.job_id, settings)
-    tail = subprocess.Popen(_follow_argv(session.transport, remote, args.lines))
+    if watched.status == "queued":
+        # Said before tail is started, because tail then says `cannot open ...
+        # No such file or directory` about a log the host has not opened yet,
+        # and on its own that reads like a failure rather than a queue.
+        note(f"job {args.job_id} is queued; following the log from when it starts")
+    # The watch's own session, rather than a second one: opening another costs
+    # a round trip to resolve the same home on the same host.
+    session = watch.session(watched.host)
+    tail = subprocess.Popen(
+        _follow_argv(session.transport, f"{session.job_dir(args.job_id)}/log.txt", args.lines)
+    )
+    reported_stream_end = False
+
+    def check_tail() -> None:
+        """Say so once if the stream died, rather than freeze the log in silence.
+
+        An ssh whose keepalives ran out takes the tail with it. The wait itself
+        is fine -- it polls over its own connection -- so this is a note and
+        not an ending.
+        """
+        nonlocal reported_stream_end
+        if reported_stream_end or tail.poll() is None:
+            return
+        reported_stream_end = True
+        note("the log stream ended before the job did; still waiting for the job")
+
     ended = False
     try:
-        wait_mod.block(watch, interval=args.interval)
-        ended = True
+        try:
+            wait_mod.block(watch, interval=args.interval, each_round=check_tail)
+            ended = True
+        finally:
+            # Only a job that ended has last lines worth waiting for; an
+            # interrupt wants the stream gone now.
+            _end_tail(tail, flush=ended)
     except KeyboardInterrupt:
         # Ctrl-C reached the tail too: it shares this process group. The job
-        # does not care either way -- its host owns it, not us.
-        note(f"interrupted; job {args.job_id} is still {watched.status} on {watched.host}")
-    finally:
-        # Only a job that ended has last lines worth waiting for; an interrupt
-        # wants the stream gone now.
-        _end_tail(tail, flush=ended)
-    if not ended:
-        return EXIT_OK
+        # does not care either way -- its host owns it, not us. A second one,
+        # landing in the flush above, arrives here with the job already ended,
+        # and then its outcome is still the answer.
+        if not ended:
+            # Never the job's exit code, because we never learned it: `logs -f`
+            # promises 0 means *succeeded*, and a script must not read "the
+            # user got bored" as one.
+            note(f"interrupted; job {args.job_id} is still {watched.status} on {watched.host}")
+            return EXIT_INTERRUPTED
     print(watched.line())
     return wait_mod.exit_code([watched])
 
 
 def _end_tail(tail: subprocess.Popen[bytes], *, flush: bool) -> None:
-    if tail.poll() is None:
-        if flush:
-            time.sleep(wait_mod.FLUSH_GRACE_S)
-        tail.terminate()
+    """Stop the stream and reap it, whatever happens in the grace.
+
+    The `finally` matters: a second Ctrl-C lands in the sleep below, and a tail
+    left behind keeps writing into a terminal gpuc has already left.
+    """
     try:
-        tail.wait(timeout=10.0)
-    except subprocess.TimeoutExpired:
-        tail.kill()
+        if flush and tail.poll() is None:
+            time.sleep(wait_mod.FLUSH_GRACE_S)
+    finally:
+        tail.terminate()
+        try:
+            tail.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            tail.kill()
+            tail.wait()
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
@@ -1435,21 +1492,28 @@ def cmd_wait(args: argparse.Namespace) -> int:
     No log: this is the half of `logs -f` a sweep wants, where twenty jobs'
     output interleaved would be unreadable and only the verdicts matter.
     """
-    check_interval(args.interval)
+    check_interval(args, polls=True)
     watch = wait_mod.start(args.job_ids, args.host, load_settings())
     # Under --json stdout belongs to the document, so the outcomes go to stderr
     # as they happen and are in the document at the end.
     announce = jsonout.note if args.json else print
-    waited = wait_mod.block(
-        watch, interval=args.interval, on_settled=lambda watched: announce(watched.line())
-    )
-    if args.json:
-        jsonout.emit(
-            {
-                "jobs": [watched.document() for watched in waited],
-                "errors": [job.error for job in waited if job.error is not None],
-            }
+    try:
+        waited = wait_mod.block(
+            watch, interval=args.interval, on_settled=lambda watched: announce(watched.line())
         )
+    except KeyboardInterrupt:
+        # This command exists to be abandoned, so a Ctrl-C is an ordinary way
+        # for it to end -- but never a silent one, and never exit 0: under
+        # --json an empty stdout is the one thing the flag promises never to
+        # give, and the jobs are all still running.
+        waiting = ", ".join(job.job_id for job in watch.pending)
+        return failed(
+            args,
+            f"interrupted; still running or queued on their hosts: {waiting}",
+            EXIT_INTERRUPTED,
+        )
+    if args.json:
+        jsonout.emit(wait_mod.document(waited))
     return wait_mod.exit_code(waited)
 
 

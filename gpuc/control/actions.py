@@ -68,6 +68,12 @@ EXIT_LOCAL_STATE = 3
 answer is unknown. Automation must not read this as `nothing is running`."""
 EXIT_NOT_FOUND = 4
 """The named job or host does not exist."""
+EXIT_INTERRUPTED = 130
+"""A Ctrl-C out of a command that blocks: `gpuc wait` and `gpuc logs -f`.
+
+The shell's own convention for SIGINT, and it has to be distinct from 0 for
+exactly these two: their exit code is the *job's* outcome, and a script must
+never read "the user got bored" as "the job succeeded"."""
 
 
 class CliError(RuntimeError):

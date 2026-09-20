@@ -6,8 +6,10 @@ state file -- a stubbed poll would test the stub.
 
 Where a test needs the job to end mid-wait it stands in for the sleep between
 polls, which is both the hook and what keeps these from being the slowest tests
-in the suite. The one that streams a real `tail` uses a real clock instead:
-there is a race in it worth losing sometimes.
+in the suite. The one that streams a real `tail` uses a real clock instead --
+only the actual child process can prove a line reaches the screen -- and asserts
+on what is in the output rather than on which line it landed at, so a slow
+runner cannot fail it.
 """
 
 from __future__ import annotations
@@ -25,8 +27,15 @@ from unittest import mock
 import pytest
 
 from gpuc.control import wait as wait_mod
-from gpuc.control.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, main
-from gpuc.control.config import registry_transaction
+from gpuc.control.cli import (
+    EXIT_ERROR,
+    EXIT_INTERRUPTED,
+    EXIT_NOT_FOUND,
+    EXIT_OK,
+    EXIT_USAGE,
+    main,
+)
+from gpuc.control.config import config_file, registry_transaction
 from gpuc.control.transport import tail_command
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
@@ -226,6 +235,132 @@ def test_wait_rejects_an_interval_that_is_not_a_delay(host_home: Path) -> None:
     assert main(["wait", JOB, "--interval", "0"]) == EXIT_USAGE
 
 
+def interrupt_after(monkeypatch: pytest.MonkeyPatch, polls: int = 1) -> None:
+    """A Ctrl-C landing where one really does: in the middle of the wait.
+
+    Hooked onto the poll rather than onto `time.sleep`, which is the whole
+    process's and which `Popen.wait(timeout=...)` busy-waits on -- standing in
+    for that would put the interrupt inside the tail's own reaping too.
+    """
+    real = wait_mod.Watch.poll
+    seen = [0]
+
+    def poll(self: wait_mod.Watch) -> list[wait_mod.Watched]:
+        seen[0] += 1
+        if seen[0] > polls:
+            raise KeyboardInterrupt
+        return real(self)
+
+    monkeypatch.setattr(wait_mod.Watch, "poll", poll)
+
+
+def test_an_interrupted_wait_says_so_and_is_not_exit_zero(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """This command exists to be abandoned; abandoning it must not read as success."""
+    put_job(host_home)
+    interrupt_after(monkeypatch)
+    assert main(["wait", JOB, "--interval", "0.01"]) == EXIT_INTERRUPTED
+    captured = capsys.readouterr()
+    assert JOB in captured.err
+    assert "interrupted" in captured.err
+    assert captured.out == ""
+
+
+def test_an_interrupted_wait_under_json_still_prints_a_document(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty stdout is the one answer --json promises never to give."""
+    put_job(host_home)
+    interrupt_after(monkeypatch)
+    assert main(["wait", JOB, "--json", "--interval", "0.01"]) == EXIT_INTERRUPTED
+    document = json.loads(capsys.readouterr().out)
+    assert document["exit_code"] == EXIT_INTERRUPTED
+    assert JOB in document["error"]
+
+
+def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rental case: the pod finished the job, then idled itself down.
+
+    Reporting "could not be asked" for a run that succeeded would be wrong
+    about the one thing the user was waiting for, and the mirror is where the
+    spec says to look once a host is gone.
+    """
+    from tests.fakes3 import FakeS3Client
+
+    put_job(host_home)
+    prefix = "s3://bucket/gpuc/local"
+    key = f"bucket/gpuc/local/jobs/{JOB}/state.json"
+    state = json.dumps({"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0})
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client",
+        property(lambda self: FakeS3Client(objects={key: state.encode()})),
+    )
+    config_file().write_text('s3_bucket = "bucket"\n')
+    with registry_transaction() as registry:
+        registry.put(
+            host_entry(
+                name="local",
+                kind="local",
+                gpus=[GPU],
+                gpuc_home=str(host_home),
+                python="/no/such",
+                s3_prefix=prefix,
+            )
+        )
+    monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+
+    assert main(["wait", JOB, "--host", "local"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "succeeded" in out
+    assert "from the S3 mirror" in out
+
+
+def test_wait_says_once_when_a_reachable_host_has_no_dispatcher(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A queued job there will never start, and silence looks like a busy queue."""
+    put_job(host_home, status="queued", phase=None)
+    paths_heartbeat = host_home / "dispatcher.heartbeat"
+    paths_heartbeat.unlink(missing_ok=True)
+    polls = [0]
+
+    def sleep(_seconds: float) -> None:
+        polls[0] += 1
+        if polls[0] == 3:
+            put_job(host_home, status="cancelled", phase=None, ended_at=jobs.utc_now())
+
+    monkeypatch.setattr(wait_mod.time, "sleep", sleep)
+    assert main(["wait", JOB]) == EXIT_ERROR
+    assert capsys.readouterr().err.count("dispatcher DOWN") == 1
+
+
+def test_wait_json_carries_the_error_and_where_the_answer_came_from(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`status` alone cannot say "we never found out"; `error` is the key to check."""
+    put_job(host_home)
+    with registry_transaction() as registry:
+        registry.put(
+            host_entry(
+                name="local", kind="local", gpus=[GPU], gpuc_home=str(host_home), python="/no/such"
+            )
+        )
+    monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+
+    assert main(["wait", JOB, "--host", "local", "--json"]) == EXIT_ERROR
+    document = json.loads(capsys.readouterr().out)
+    job = document["jobs"][0]
+    assert job["source"] == "host"
+    assert job["status"] is None, "never seen, so there is nothing to report as its state"
+    assert "could not be asked" in job["error"]
+    assert document["errors"] == [job["error"]]
+
+
 # -- `gpuc logs -f` ------------------------------------------------------------
 
 
@@ -284,7 +419,8 @@ def test_follow_streams_a_running_job_and_stops_when_it_ends(
         ending.join()
     out = capfd.readouterr().out
     assert "epoch 1" in out
-    assert out.strip().endswith("on local: succeeded")
+    # Last, because it is printed after the stream has been stopped.
+    assert out.strip().splitlines()[-1] == f"lego-s4 ({JOB}) on local: succeeded"
 
 
 def test_follow_forever_is_still_there_for_anyone_who_wants_it(
@@ -307,6 +443,30 @@ def test_follow_under_json_is_still_refused(
     put_job(host_home)
     assert main(["logs", JOB, "--json", "-f"]) == EXIT_USAGE
     assert main(["logs", JOB, "--json", "--follow-forever"]) == EXIT_USAGE
+
+
+def test_the_two_follows_are_different_things_and_cannot_both_be_meant(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    put_job(host_home)
+    assert main(["logs", JOB, "-f", "--follow-forever"]) == EXIT_USAGE
+
+
+def test_an_interval_is_refused_where_nothing_polls(host_home: Path) -> None:
+    """It paces the check for the job's end, which a plain read never makes."""
+    put_job(host_home)
+    assert main(["logs", JOB, "--interval", "5"]) == EXIT_USAGE
+
+
+def test_an_interrupted_follow_is_never_exit_zero(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """0 means the job succeeded, so a Ctrl-C must not be able to say it."""
+    put_job(host_home)
+    write_log(host_home, JOB, "starting\n")
+    interrupt_after(monkeypatch)
+    assert main(["logs", JOB, "-f", "--interval", "0.01"]) == EXIT_INTERRUPTED
+    assert "interrupted" in capfd.readouterr().err
 
 
 def test_a_follow_retries_a_log_that_is_not_written_yet_and_a_read_does_not() -> None:

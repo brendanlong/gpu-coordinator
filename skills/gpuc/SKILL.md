@@ -202,12 +202,21 @@ id=$(gpuc submit job.yaml --host gpubox --json | jq -r .job_id)
 gpuc wait "$id" || gpuc logs "$id" -n 50     # exit 1 means it did not succeed
 ```
 
-It backs its polling off from 2s to 30s, rides out an ssh blip for five minutes
-before giving up on a host, and takes several ids so a sweep is one command.
-`gpuc logs <jobid> -f` is the same wait for a single job with the log on screen.
-Both exit with the **job's** outcome, not their own: 0 only if every job
-succeeded. Neither is a background job — a wait that is killed changes nothing
-about the run, because the host owns the job.
+It backs its polling off from 2s to 30s and takes several ids so a sweep is one
+command. `gpuc logs <jobid> -f` is the same wait for a single job with the log on
+screen. Both exit with the **job's** outcome, not their own: 0 only if every job
+succeeded, 1 if any did not, and **130** if you Ctrl-C out — never 0, so the
+difference between "it worked" and "I stopped looking" survives into `$?`.
+
+A host that stops answering does not end the wait: it rides out a blip for five
+minutes, then reads the job's state from the S3 mirror (which is where a pod
+that finished the job and idled itself down leaves it) and says the answer came
+from there. Only if the mirror has nothing is it exit 1. A reachable host whose
+dispatcher is down is called out once and waited through — `gpuc host bootstrap
+<host>` restarts the queue.
+
+Neither command is a background job. A wait that is killed changes nothing about
+the run, because the host owns the job.
 
 ## Exit codes and `--json` (read this before scripting anything)
 
@@ -215,6 +224,7 @@ about the run, because the host owns the job.
 | --- | --- |
 | 0 | ok — **including** a host that is unreachable or whose dispatcher is down; that is reported per host, not as a failure |
 | 1 | the command failed (transport, provider, refused submit). For `gpuc wait` and `gpuc logs -f` it means the **job** did not succeed: their exit code is the job's, like `gpuc ssh -- cmd` |
+| 130 | a Ctrl-C out of `gpuc wait` or `gpuc logs -f`, the only two commands that block. Not 0 — for them 0 means the job succeeded |
 | 2 | usage: a bad or missing flag |
 | 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
 | 4 | the job or host named does not exist |
@@ -252,7 +262,7 @@ scraping any of the text output.
 | --- | --- |
 | `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a draining host, a job ahead that estimated nothing, a job wider than the host, an owned card it needs that nvidia-smi no longer reports — and is null when there is one |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
-| `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the same shape `status --json` uses, plus `host`; a job the wait gave up on has `"status": null` and its reason in `errors`. Exit 1 unless every job succeeded |
+| `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the same shape `status --json` uses, plus `host`, `source` (`host` or `mirror`) and `error`. **Check `error`, not `status`**: it is null for a job that ended, and when it is not, `status` is only the last thing its host managed to say (`running` for a host that vanished mid-run, null for one never heard from). Exit 1 unless every job succeeded |
 | `cancel` | `{job_id, host, status}` |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`; `status` is `preempting` and `priority` is what it will be queued again at |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same queue fields as `submit`, so you can see the move take effect. A `warnings` entry means the mirrored spec kept the old priority, so a `requeue` would not carry the move |
