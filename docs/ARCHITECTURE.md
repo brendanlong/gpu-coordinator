@@ -35,6 +35,7 @@ gpuc/
     cli.py         # argparse and the text output of every `gpuc` command
     actions.py     # one function per command returning its --json document; the CLI and the web call these
     status.py      # gather a host's status, render it, project queue start times
+    wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
     provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse
     rented.py      # a pod is its own record: the `provider` block in its config.json
@@ -601,9 +602,9 @@ hold to, whatever the flags:
 - Anything that talks to RunPod (`--runpod`, `pods`, `host add --pod`) checks
   `RUNPOD_API_KEY` first and exits 1 with a single line if it is unset, before
   mirroring a spec or picking a host.
-- A host name is looked up locally; `logs`, `cancel`, `preempt`, `reorder`,
-  `estimate` and `requeue` fall back to the job index and then to asking each host, and an id nothing
-  knows is exit 4, never a guess.
+- A host name is looked up locally; `logs`, `wait`, `cancel`, `preempt`,
+  `reorder`, `estimate` and `requeue` fall back to the job index and then to
+  asking each host, and an id nothing knows is exit 4, never a guess.
 - Nothing runs in the background on this side except, if installed, the web
   dashboard's service.
 
@@ -658,8 +659,62 @@ thing on each: stdout is one object carrying `schema_version`, everything else
 the command has to say goes to stderr, and a failure prints
 `{schema_version, error, exit_code}` rather than nothing. The flag never changes
 an exit code. `gpuc logs --json` is the tail as `lines[]` plus where it was read
-from; with `-f` it is exit 2, because a stream has no end. Each command's schema
-is the table in usage.md.
+from; with either follow it is exit 2, because the document is printed once and
+a follow is a stream. Each command's schema is the table in usage.md.
+
+`gpuc wait` and `gpuc logs -f` are the two exceptions to "1 means the command
+failed", and deliberately -- the spec's *Monitoring* section says so: their exit
+code is the *job's*, so 0 means every job named succeeded and 1 means one of
+them did not, exactly as `gpuc ssh <host> -- cmd` exits with the remote
+command's code. A wait that could not find out -- a host that stayed unreachable
+past `wait.TROUBLE_GRACE_S` and whose mirror had nothing -- is 1 as well, with
+the reason on the job's line and in `errors[]`. 3 and 4 keep their usual
+meanings, and **130** is added: a Ctrl-C must not be exit 0 where 0 means the
+job succeeded. It is raised in one place -- `main` turns any `KeyboardInterrupt`
+into the same exit and the same `--json` error document, and a command with
+something specific to say about what was in flight raises `Interrupted` to add
+it. Both blocking commands got that wrong while they each handled it
+themselves.
+
+## Waiting for a job to end (`control/wait.py`)
+
+Purely client-side: nothing on a host knows a client is waiting, so the loop is
+free to be killed, and a host does not change what it does because somebody is
+watching. `Watch` holds the jobs being waited on plus one `HostSession` per
+host, and each round sends **one `status` per host** rather than one per job --
+a sweep is usually twenty ids on one box. `status <job-id>` is used when only
+one job on that host is left, so the common case does not walk the host's whole
+job list.
+
+- The pace backs off from 2s to 30s unless `--interval` pins it: a job that
+  dies in its preflight dies in the first minute, and a job still running after
+  ten has hours left.
+- A host that cannot be asked is *trouble*, not an answer. It is reported once
+  on stderr and retried for `TROUBLE_GRACE_S` (5 min); only then is the **S3
+  mirror** read -- the spec's "the mirror is read only when the host is gone",
+  and the answer for a rental that finished the job and idled itself down --
+  and only if that has no terminal `state.json` does each job get an `error`.
+  An ssh blip must not end a six-hour wait; a pod that has gone must not hang
+  one for ever; and a job that succeeded must not be reported as a failure
+  because the machine that ran it has since been billed off.
+- A reachable host whose dispatcher heartbeat is stale is said once and waited
+  through. Its queued jobs will not start, but the queue is intact and one
+  `gpuc host bootstrap` serves it again, so this is a note and not an ending.
+- An id whose host answers and does not list it is exit 4, checked after the
+  first poll -- `find_job_host` believes the local index and an explicit
+  `--host` without asking anybody. A job that *was* listed and then vanishes is
+  trouble, not a missing id.
+- `logs -f` runs `tail -F` as a child writing straight to stdout while this
+  loop polls, then gives the stream `FLUSH_GRACE_S` to catch up before stopping
+  it: the runner writes its terminal state before it logs the outcome, so the
+  poll is always slightly ahead of the log. The stop is in a `finally` inside
+  `_end_tail`, so a second Ctrl-C landing in that grace cannot leave a `tail`
+  writing into a terminal gpuc has left. `-F` rather than `-f` so a job that
+  has not been dispatched yet is followed rather than refused -- and only from
+  the follow path: `Transport.tail()` keeps `-f`, because a missing log's
+  non-zero exit is what routes `gpuc logs` to the mirror. A tail that dies
+  before the job does (an ssh that gave up) is a note, not an ending; the poll
+  has its own connection.
 
 ## Transport
 

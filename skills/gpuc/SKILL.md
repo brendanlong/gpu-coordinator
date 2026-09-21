@@ -142,8 +142,14 @@ gpuc status --json               # the same, machine-readable; --json is on ever
                                  # that has an answer (see "Exit codes" below). A human
                                  # wants `gpuc web serve`: the same in a browser
 gpuc status --all                # adds jobs only the index knows (a host that lost its state)
-gpuc logs <jobid> [-f]           # tails the host; falls back to the S3 mirror only if that job
+gpuc logs <jobid>                # tails the host; falls back to the S3 mirror only if that job
                                  # has an s3_prefix (its own or the host's) and s3_bucket is set
+gpuc logs <jobid> -f             # the same, but it STOPS when the job does: the outcome is the
+                                 # last line and gpuc exits 0 only if the job succeeded. Use it
+                                 # as a foreground wait on one job. --follow-forever is the old
+                                 # never-ending stream
+gpuc wait <jobid> [<jobid> ...]  # block with no log output until every job named has ended;
+                                 # one line each, exit 0 only if ALL of them succeeded
 gpuc ssh <host|jobid>            # a shell there (a job id lands in its workdir)
 gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc exits with that
                                  # command's own exit code
@@ -187,15 +193,41 @@ and that its first log lines look right, then check back on a timer. Do not kill
 a job on a wall-clock guess; `gpuc status` shows the phase, utilization and
 estimate to judge from.
 
+**Do not write a polling loop around `gpuc status`** — `gpuc wait` is that loop,
+and it is the one to use whenever the next thing you do depends on how a job
+turned out:
+
+```bash
+id=$(gpuc submit job.yaml --host gpubox --json | jq -r .job_id)
+gpuc wait "$id" || gpuc logs "$id" -n 50     # exit 1 means it did not succeed
+```
+
+It backs its polling off from 2s to 30s and takes several ids so a sweep is one
+command. `gpuc logs <jobid> -f` is the same wait for a single job with the log on
+screen. Both exit with the **job's** outcome, not their own: 0 only if every job
+succeeded, 1 if any did not, and **130** if you Ctrl-C out — never 0, so the
+difference between "it worked" and "I stopped looking" survives into `$?`.
+
+A host that stops answering does not end the wait: it rides out a blip for five
+minutes, then reads the job's state from the S3 mirror (which is where a pod
+that finished the job and idled itself down leaves it) and says the answer came
+from there. Only if the mirror has nothing is it exit 1. A reachable host whose
+dispatcher is down is called out once and waited through — `gpuc host bootstrap
+<host>` restarts the queue.
+
+Neither command is a background job. A wait that is killed changes nothing about
+the run, because the host owns the job.
+
 ## Exit codes and `--json` (read this before scripting anything)
 
 | code | meaning |
 | --- | --- |
 | 0 | ok — **including** a host that is unreachable or whose dispatcher is down; that is reported per host, not as a failure |
-| 1 | the command failed (transport, provider, refused submit) |
+| 1 | the command failed (transport, provider, refused submit). For `gpuc wait` and `gpuc logs -f` it means the **job** did not succeed: their exit code is the job's, like `gpuc ssh -- cmd` |
 | 2 | usage: a bad or missing flag |
 | 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
 | 4 | the job or host named does not exist |
+| 130 | a Ctrl-C. Not 0, because for `gpuc wait` and `gpuc logs -f` 0 means the job succeeded |
 
 ```bash
 gpuc status --json | jq -r '.hosts[] | "\(.name) reachable=\(.reachable) running=\(.running | length)"'
@@ -230,6 +262,7 @@ scraping any of the text output.
 | --- | --- |
 | `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a draining host, a job ahead that estimated nothing, a job wider than the host, an owned card it needs that nvidia-smi no longer reports — and is null when there is one |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
+| `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` uses, plus `host`, `source` (`host` or `mirror`) and `error` — except a job nothing was ever heard about, which is only `job_id`, `host`, `source`, `error` and a null `status`. **Check `error`, not `status`**: it is null for a job that ended, and when it is not, `status` is only the last thing its host managed to say (`running` for a host that vanished mid-run, null for one never heard from). Exit 1 unless every job succeeded |
 | `cancel` | `{job_id, host, status}` |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`; `status` is `preempting` and `priority` is what it will be queued again at |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same queue fields as `submit`, so you can see the move take effect. A `warnings` entry means the mirrored spec kept the old priority, so a `requeue` would not carry the move |

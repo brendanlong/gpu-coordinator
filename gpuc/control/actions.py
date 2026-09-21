@@ -68,6 +68,12 @@ EXIT_LOCAL_STATE = 3
 answer is unknown. Automation must not read this as `nothing is running`."""
 EXIT_NOT_FOUND = 4
 """The named job or host does not exist."""
+EXIT_INTERRUPTED = 130
+"""A Ctrl-C out of a command that blocks. The shell's own convention for SIGINT.
+
+Distinct from 0 because `gpuc wait` and `gpuc logs -f` exit with the *job's*
+outcome, where 0 means it succeeded: a script must never read "the user got
+bored" as "the job worked"."""
 
 
 class CliError(RuntimeError):
@@ -84,6 +90,17 @@ class NotFound(CliError):
     """The job or host named on the command line does not exist."""
 
     exit_code = EXIT_NOT_FOUND
+
+
+class Interrupted(CliError):
+    """A Ctrl-C, with something command-specific to say about what was in flight.
+
+    Raised rather than returned so that a blocking command cannot get the exit
+    code or the `--json` document wrong: `main` turns an unhandled Ctrl-C into
+    the same thing with a bare message, and this only adds detail.
+    """
+
+    exit_code = EXIT_INTERRUPTED
 
 
 FAILURES = (

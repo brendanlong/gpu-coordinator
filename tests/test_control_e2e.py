@@ -236,6 +236,51 @@ def test_submit_runs_a_job_and_logs_and_status_find_it(
     assert "succeeded" in status
 
 
+def test_wait_blocks_on_a_real_job_and_exits_with_its_outcome(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`gpuc wait` is the `wait_until` loop above, made a command.
+
+    Against the real dispatcher, because what it has to read correctly is the
+    state file another process writes as the job ends.
+    """
+    job_id = submit(workdir, "name: doomed\ncommand: sh -c 'echo working; exit 3'\n")
+    capsys.readouterr()
+
+    assert main(["wait", job_id, "--interval", "0.5"]) == 1
+    out = capsys.readouterr().out
+    assert job_id in out
+    assert "failed" in out
+    assert finished(bootstrapped_home, job_id)
+
+
+def test_following_a_real_job_stops_when_the_job_does(
+    bootstrapped_home: Path, workdir: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The issue itself: `logs -f` used to stream happily past the end of the run.
+
+    `capfd`, not `capsys`: the tail is a child process writing to the real
+    descriptor, and it is the whole point of the test.
+    """
+    job_id = submit(
+        workdir, "name: chatty\ncommand: sh -c 'echo line-one; sleep 1; echo line-two'\n"
+    )
+    capfd.readouterr()
+
+    assert main(["logs", job_id, "-f", "--interval", "0.5"]) == 0
+    out = capfd.readouterr().out
+    assert "line-two" in out, out
+    # The outcome is the last line, because it is printed after the stream has
+    # been stopped. `removed workdir` is somewhere above it: the runner logs
+    # that *after* writing the terminal state this wait read, so its presence
+    # is the flush grace doing its job. Not asserted at a fixed position -- a
+    # loaded machine can take longer over that cleanup than the grace allows,
+    # and losing a line from the stream is not a failure of anything.
+    lines = out.strip().splitlines()
+    assert lines[-1].startswith(f"chatty ({job_id}) on local: succeeded after "), lines[-3:]
+    assert "removed workdir" in out
+
+
 def test_submit_says_where_in_the_queue_the_job_landed(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

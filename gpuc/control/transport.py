@@ -314,9 +314,18 @@ class SshTransport:
         )
 
 
-def tail_command(remote_path: str, lines: int = 200, follow: bool = False) -> str:
-    """The one `tail` line both transports (and `gpuc logs -f`) send."""
-    return f"tail {'-f ' if follow else ''}-n {lines} {shlex.quote(remote_path)}"
+def tail_command(
+    remote_path: str, lines: int = 200, follow: bool = False, retry: bool = False
+) -> str:
+    """The one `tail` line both transports (and `gpuc logs -f`) send.
+
+    `retry` waits for a log that is not there yet instead of failing, which is
+    what a follow of a job still in the queue needs and what a plain read must
+    not do: a missing log is exactly the non-zero exit that sends `gpuc logs`
+    to the S3 mirror.
+    """
+    flags = "-F " if follow and retry else "-f " if follow else ""
+    return f"tail {flags}-n {lines} {shlex.quote(remote_path)}"
 
 
 def rsync_argv(
