@@ -67,8 +67,8 @@ destinations. Adding another of either changes nothing else in this document.
   draining its uploads. Nothing on a client watches a rental after handoff.
 - **A rental that has ended is a state, not a failure.** A client that finds
   the pod gone forgets its record of that host and says so.
-- **Any client whose SSH key reaches a host can drive it**, and sees the same
-  queue, jobs and configuration. Nothing about the client that set the host up
+- **Any client whose SSH key reaches a host can drive it, without conflict**,
+  and sees the same queue, jobs and configuration. Nothing about the client that set the host up
   matters afterwards, including for a rental another machine rented.
 - The client's record of a host is an address plus a cache. Anything that
   decides something asks the host; output from the cache is labelled with its
@@ -99,8 +99,8 @@ destinations. Adding another of either changes nothing else in this document.
   order can run, by command or automatically for jobs that opt in -- and
   automatically only for a strictly higher-priority job. Preemption restarts
   the job from the beginning in its existing working tree; checkpointing is the
-  job's business. A preempt that would free nothing for a waiting job is
-  refused.
+  job's business. A preempt is refused when nothing waiting would be
+  dispatched ahead of the preempted job.
 - **Shared GPUs** are used only by jobs that opt in, only after every free
   owned card, and only while nvidia-smi reports the card idle. Owned cards are
   trusted to have no other users. A borrowed card is held until the job ends;
@@ -153,7 +153,8 @@ destinations. Adding another of either changes nothing else in this document.
   happened to each and exits with their outcome.
 - **A command does as much as it can, says what it could not do, and exits
   non-zero if anything failed.** One host that cannot be reached never stops
-  the others being reported.
+  the others being reported, and the reason it could not be reached is never
+  hidden.
 - **Every command that reports something supports JSON output**, and exit
   codes distinguish "failed", "usage", "local state unreadable, so unknown"
   and "no such job or host".

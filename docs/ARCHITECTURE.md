@@ -201,9 +201,11 @@ the ssh that started it. The rules it holds to:
 - **A dispatcher started from the package on disk replaces one that is not**,
   fresh heartbeat or not: the lock body records the `pkg_commit` its holder
   started from, and a holder whose commit *differs* is SIGTERMed, then SIGKILLed
-  at 30 s if the lock still names the same process. Otherwise a dispatcher
-  outlives every re-bootstrap of its host. `gpuc status` reports the holder's
-  commit as `dispatcher.pkg_commit`.
+  at 30 s if the lock still names the same process. *Different*, not newer --
+  a holder that recorded no commit counts as different and is evicted, and a
+  dispatcher whose own commit is unrecorded replaces nobody. `gpuc status`
+  reports the holder's commit as `dispatcher.pkg_commit` and warns when it
+  differs from the package on disk.
 - **The queue is taken in order** (`launch_ready`), every 2 s: a job that does
   not fit holds the cards it is waiting for, owned and borrowed alike, and
   nothing behind it may take them. The one exemption is a job short only of a
@@ -213,17 +215,16 @@ the ssh that started it. The rules it holds to:
 - **A job is submitted when its queue marker exists, and not before.** `enqueue`
   writes spec, then state, then marker, so an interrupted submit leaves a job
   dir the host was never asked to run; after an hour it is `failed:
-  incomplete-submit`.
+  incomplete-submit`. A job `requeue_preempted` is putting back is in the same
+  shape mid-move and is excluded.
 - **`launch_ready` never dispatches on a marker alone** (`_still_queued`): only
   a state of `queued` starts a runner, and a marker that disagrees is dropped.
   A leftover marker is therefore harmless rather than a second runner in a
   workdir.
 - **Writes that take a job out of the queue put the state first**
-  (`queue.leave_queue`, `queue.cancel`). Interrupted that way a job is `running`
-  with a stale marker, which the rule above handles; the other order is
-  indistinguishable from an uncommitted submit. The general rule: **do not
-  create an intermediate state that is ambiguous with one another actor
-  produces.**
+  (`queue.leave_queue`, `queue.cancel`): interrupted that way a job is `running`
+  with a stale marker, which the rule above handles, where the other order is
+  indistinguishable from an uncommitted submit.
 - **Adoption at startup** (`adopt_orphans`): every job whose state says
   `running` is adopted or failed `runner-died`, and a failed one's leftovers are
   killed (`cgroup_unit`, then `pgid`) before its cards go back in the pool.
@@ -249,10 +250,13 @@ the ssh that started it. The rules it holds to:
   was cancelled while stopping, has no workdir, or the host is going away.
 - **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
-  `auto_preempt` jobs that together cover the whole gap, least important first,
-  and only at a strictly higher priority number. Exactly one queued job is asked
-  per pass. Nothing is stopped on a host that is going away, and one pass's
-  nvidia-smi reading of the shared cards serves both walks.
+  `auto_preempt` jobs that together cover the whole gap -- least important
+  first, most recently started among equals, and only at a strictly higher
+  priority number. Cards held by a job that is already stopping count as
+  available and that job is not a candidate again; once one stop in a set
+  fails, the rest are left alone. Exactly one queued job is asked per pass.
+  Nothing is stopped on a host that is going away, and one pass's nvidia-smi
+  reading of the shared cards serves both walks.
 - **Reorder** renames the marker *and* updates the spec, which is the only copy
   that can say what priority a running job was dispatched at. **Estimate**
   rewrites the spec as raw JSON, so keys another build wrote survive. The
@@ -292,7 +296,8 @@ The order is the contract; each step is in `runner.py`.
    outputs: `hf` must resolve, `hf auth whoami` must succeed with the job's
    token, and a `.preflight` file must upload to each repo, creating it when
    that output sets `hf_create: true`. Failure -> `failed: sync-preflight`, with
-   the command and its error in `log.txt`, and no final output sync.
+   the command and its error in `log.txt`, and no final output sync. A job with
+   no outputs on a host with no mirror checks nothing.
 4. Start the sync loop (background thread): `outputs` every `sync_interval_s`,
    skipping files modified in the last 10 s, plus `log.txt` and `state.json` to
    `s3_prefix/jobs/<id>/`. Uploads run with the **job's** environment, secrets
@@ -358,9 +363,7 @@ systemd-run --user --scope --collect --quiet -p TimeoutStopSec=15 \
 ```
 
 The script is base64-encoded because the words after `--` become a systemd
-`ExecStart`, where systemd's own substitution (`$$` -> `$`, `$VAR` ->
-environment) would corrupt inline shell. The base64 alphabet has no `$`, and
-`$1` is digit-led.
+`ExecStart`, whose own substitution would corrupt inline shell.
 
 The kill path is then `systemctl --user stop <unit>`, with the process-group
 kill kept as a fallback, and the dispatcher's backstop uses the unit when
@@ -380,14 +383,17 @@ policy, the two horizons and every refusal are
 - No policy touches a job that is not finished, and the runner applies its
   policy after the final sync and state write. A preempted job keeps its
   workdir whatever `cleanup:` says: the next attempt re-runs in it.
-- `python -m gpuc.host clean` and `purge` print JSON and **fail closed**: a
+- `python -m gpuc.host clean (--all-finished | --older-than DAYS | --only IDS)
+  [--sweep-only IDS] [--dry-run]` and `purge [--older-than DAYS] [--only IDS]
+  [--sweep-only IDS] [--dry-run] [--force]` print JSON and **fail closed**: a
   running or queued job, an unreadable `state.json`, and (under an age gate) a
   job with no parseable `ended_at` are skipped. `--only` replaces the age gate,
   and a named id no job dir matches removes nothing and exits 1 -- so the
   control side reads these two with `host_json(check=False)`, since the
-  document is the report of the failure. `--only` and `--sweep-only` stay
-  separate because `--verify` purges what the mirror confirmed and sweeps what
-  was named.
+  document is the report of the failure. `--purge` also runs the workdir sweep,
+  and `gpuc clean --only` sends the ids as both `--only` and `--sweep-only`; the
+  two stay separate because `--verify` purges what the mirror confirmed and
+  sweeps what was named.
 - The host cannot consult the mirror, so `meta_synced_at` in the job's own
   `state.json` is the purge's authority. `--verify` on the control side is the
   exception: it HEADs the mirrored `log.txt` under `meta_synced_to` first.
@@ -427,10 +433,9 @@ Two rules follow:
   the host's config already names is never overridden, and an unreadable
   comparison changes nothing.
 
-The case that matters is a pod with `--persistent-root`: gpuc home on the
-network volume, `~/.cache` on the container's overlay, and uv copying every
-wheel into every venv at full size onto the slowest disk the host has. The
-check compares filesystems rather than sizes because `du` cannot see a reflink.
+The check compares filesystems rather than sizes because `du` cannot see a
+reflink. The case it exists for is a pod with `--persistent-root`: gpuc home on
+the network volume, `~/.cache` on the container's overlay.
 
 `gpuc host probe` and the health check both report the cache's size and whether
 it shares a filesystem with gpuc home; the health check is warn-only. `gpuc host
@@ -504,9 +509,8 @@ A rental the provider reports missing or TERMINATED is not a failure: `status`
 and `host bootstrap --all` forget that registry entry where they find it
 (`forget_gone_rentals`, `rental_gone`). A pod the provider still has and nothing
 can run on (EXITED, ERROR) is a failure like any other host that could not be
-read, and is kept for `gpuc host remove`. Only a command somebody typed forgets
--- the dashboard's poll is a view, so a stray 404 cannot cost a live host its
-entry with nobody watching.
+read, and is kept for `gpuc host remove`. Only a command somebody typed
+forgets: the dashboard's poll never writes to the registry.
 
 `--json` is on every command that has an answer to give, and means the same
 thing on each: stdout is one object carrying `schema_version`, everything else
@@ -775,8 +779,11 @@ dependency. One password, hashed into `config_dir()/web-password` (0600) and
 read once at startup; a server with no password refuses to start. Sessions are
 random tokens held in memory, `HttpOnly; SameSite=Strict`, seven days, and a
 POST carrying an `Origin` must match `Host`. Wrong passwords are checked one at
-a time under their own lock with a growing pause, so a guesser at the door
-cannot stall requests from inside. No TLS: localhost, a VPN, or behind a proxy.
+a time under their own lock with a growing pause that a quiet minute resets, so
+a guesser at the door cannot stall requests from inside. Idle keep-alive
+connections time out after 30 s, a body over 1 MiB is refused before it is read,
+and a bug in a handler is a 500 with a traceback in the server log, never a
+dropped connection. No TLS: localhost, a VPN, or behind a proxy.
 
 The page is static HTML/JS polling `/api/status`, `/api/hosts`, `/api/config`
 and `/api/version` every 15 s, and `/api/jobs/<id>/logs` while a log panel is
