@@ -255,6 +255,9 @@ class HostView:
     error: str | None = None
     heartbeat_age_s: float | None = None
     pod_gone: bool = False
+    pod_terminated: bool = False
+    """The provider says this pod no longer exists, so the registry entry can
+    only mislead: whoever gathered this view forgets it."""
     draining: bool = False
     owned: list[str] = field(default_factory=list)
     """The UUIDs this host owns, as the host itself resolved them: `config.gpus`
@@ -286,6 +289,17 @@ class HostView:
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
+
+    @property
+    def failure(self) -> str | None:
+        """Why this host could not be read, if that is what happened.
+
+        A rental that has ended is not that: it is the state every rental
+        reaches, and the entry is forgotten rather than reported. A pod the
+        provider still has and cannot run anything on is a failure like any
+        other host nothing can be read from.
+        """
+        return None if self.pod_terminated else self.error
 
     @property
     def dispatcher_alive(self) -> bool:
@@ -449,13 +463,16 @@ def gather(
         except ProviderError as exc:
             view.error = f"could not read pod {entry.pod_id}: {exc}"
     if view.pod_gone:
-        # The pod is gone but the registry still lists it. SSH would hang and
-        # then print a stack about a refused connection, which tells nobody
-        # anything: say what happened and what removes the entry.
+        # An ssh here would hang and then print a stack about a refused
+        # connection, which tells nobody anything. A pod that is gone for good
+        # is forgotten by the caller; one that is merely stopped is left alone,
+        # since the provider still has it.
         status = "missing" if view.pod is None else view.pod.status
+        view.pod_terminated = view.pod is None or view.pod.status == "TERMINATED"
         view.error = (
-            f"pod {entry.pod_id} is {status}; the registry entry is stale. "
-            f"Run `gpuc host remove {entry.name}` to forget it."
+            f"pod {entry.pod_id} is {status}; this rental has ended"
+            if view.pod_terminated
+            else f"pod {entry.pod_id} is {status}; `gpuc host remove {entry.name}` forgets it"
         )
         return view
     try:
@@ -1009,6 +1026,10 @@ def render(
     if flags:
         header += "  " + " ".join(flags)
     lines = [header]
+    if view.error:
+        # A host that answered can still carry one -- the provider could not be
+        # asked about its pod -- and it is this command's exit code.
+        lines.append(f"  ERROR {view.error}")
     lines += [f"  WARNING {warning}" for warning in host_warnings(view)]
     lines.append(f"  {dispatcher}")
     lines += _gpu_lines(view)
@@ -1288,6 +1309,7 @@ def host_json(
         "target": entry.ssh,
         "reachable": view.reachable,
         "pod_gone": view.pod_gone,
+        "pod_terminated": view.pod_terminated,
         "draining": view.draining,
         # The host's own answer, so null means the host did not say, never
         # "current".

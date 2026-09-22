@@ -66,6 +66,8 @@ destinations. Adding another of either changes nothing else in this document.
   and, for a rental, its own shutdown. A rental terminates itself once its
   queue has been empty for a configured idle period, after draining its
   uploads. Nothing on a client watches or terminates a rental after handoff.
+- **A rental that has ended is a state, not a failure.** A client that finds
+  the pod gone forgets its record of that host and says so.
 - **Any client whose SSH key reaches a host can connect to it without
   conflict** and sees the same queue, jobs and configuration. Nothing else
   about the client that set a host up matters afterwards. That includes a
@@ -155,18 +157,15 @@ destinations. Adding another of either changes nothing else in this document.
   start; every running job with its phase, cards, utilization and estimate;
   recent results; and each job's log.
 - **A job ending is something the user is told, not something they discover.**
-  There is a command that blocks until named jobs have ended and reports what
-  happened to them, so that waiting for a run is one foreground command rather
-  than a polling loop the user writes. It runs on a client, and nothing about
-  it reaches the host: the host owns the job whether or not anybody is
-  watching, and a wait that is killed changes nothing.
+  A command blocks until the jobs named have ended, reports what happened to
+  each, and exits with their outcome. It runs on a client and changes nothing
+  about a job: a wait that is killed leaves the run alone.
+- **A command does as much as it can, says what it could not do, and exits
+  non-zero if anything failed.** One host that cannot be reached never stops
+  the others being reported, and never hides the reason it could not be reached.
 - **Every command that reports something supports JSON output**, and exit
   codes distinguish "failed", "usage", "local state unreadable, so unknown"
-  and "no such job or host". An unreachable host is data, not a failure --
-  except to a command whose whole purpose was to wait for a job on it, which
-  after a grace period reports that it could not find out, as a failure.
-  **A command that waits for a job exits with that job's outcome**, not with
-  its own: for it, "failed" means the job did not succeed.
+  and "no such job or host".
 - **The web app shows the same information and offers the same actions as
   the CLI, and nothing else.** A capability exists in the CLI first, and the
   web app calls the same code.

@@ -19,6 +19,7 @@ import pytest
 
 from gpuc.control import status as status_mod
 from gpuc.control.cli import (
+    EXIT_ERROR,
     EXIT_LOCAL_STATE,
     EXIT_NOT_FOUND,
     EXIT_OK,
@@ -34,6 +35,7 @@ from gpuc.control.config import (
     pod_known_hosts_file,
     read_registry,
 )
+from gpuc.control.s3index import S3IndexError
 from gpuc.control.status import HostView
 from tests.conftest import host_entry, register_host
 from tests.fakehost import FakeHost
@@ -69,7 +71,8 @@ def test_one_bad_host_entry_is_skipped_and_the_rest_still_work(
     assert "skipping host 'bad'" in read.errors[0]
     assert read.skipped["bad"] == BAD_ENTRY
 
-    assert main(["host", "list"]) == EXIT_OK
+    # Exit 1: one host is missing from the answer. The rest of it is still here.
+    assert main(["host", "list"]) == EXIT_ERROR
     captured = capsys.readouterr()
     assert "good" in captured.out
     assert "skipping host 'bad'" in captured.err
@@ -142,30 +145,75 @@ def test_a_missing_registry_is_simply_no_hosts(control_env: Path) -> None:
 # -- exit codes ---------------------------------------------------------------
 
 
-def test_status_is_zero_even_when_every_host_is_unreachable(
+def test_status_reports_an_unreachable_host_and_exits_one(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The host it could not read is the failure; the ones it could are the answer."""
     register_host(name="gpubox", kind="ssh", ssh="me@nowhere.invalid", gpus=GPU)
+    register_host(name="local", gpus=GPU)
 
-    def unreachable(entry: HostEntry, *args: object, **kwargs: object) -> HostView:
+    def only_local(entry: HostEntry, *args: object, **kwargs: object) -> HostView:
+        if entry.name == "local":
+            return HostView(entry=entry, reachable=True)
         return HostView(entry=entry, reachable=False, error="ssh: could not resolve hostname")
 
-    monkeypatch.setattr(status_mod, "gather", unreachable)
-    assert main(["status"]) == EXIT_OK
-    assert "UNREACHABLE" in capsys.readouterr().out
+    monkeypatch.setattr(status_mod, "gather", only_local)
+    assert main(["status"]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "UNREACHABLE" in out
+    assert "host local" in out
 
 
-def test_status_reports_a_bad_entry_per_host_without_failing(
+def test_status_reports_a_bad_entry_per_host_and_exits_one(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
     monkeypatch.setattr(
         status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
     )
-    assert main(["status"]) == EXIT_OK
+    assert main(["status"]) == EXIT_ERROR
     captured = capsys.readouterr()
     assert "host good" in captured.out
     assert "skipping host 'bad'" in captured.err
+
+
+def test_a_bad_entry_does_not_fail_a_status_asked_about_another_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--host good` was never asked about the entry that would not parse."""
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    monkeypatch.setattr(
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+    )
+    assert main(["status", "--host", "good"]) == EXIT_OK
+    assert main(["status", "--host", "good", "--json"]) == EXIT_OK
+
+
+def test_status_all_is_one_when_the_index_it_needs_cannot_be_read(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--all` exists to list what a lost host had, and a short list is not that."""
+    register_host(name="local", gpus=GPU)
+    monkeypatch.setattr(
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+    )
+
+    class _Unreadable:
+        def list_index(self) -> list[object]:
+            raise S3IndexError("no credentials")
+
+    monkeypatch.setattr("gpuc.control.cli.S3Index.from_settings", lambda settings: _Unreadable())
+    assert main(["status", "--all"]) == EXIT_ERROR
+    assert "could not read the S3 index" in capsys.readouterr().err
+
+
+def test_version_exits_one_for_an_entry_it_could_not_read(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    assert main(["version"]) == EXIT_ERROR
+    assert main(["version", "--json"]) == EXIT_ERROR
+    assert "skipping host 'bad'" in capsys.readouterr().err
 
 
 def test_a_named_host_that_does_not_exist_is_four(
@@ -374,7 +422,7 @@ def test_status_json_says_unreachable_rather_than_empty(
         "gather",
         lambda entry, *a, **k: HostView(entry=entry, reachable=False, error="ssh timed out"),
     )
-    assert main(["status", "--json"]) == EXIT_OK
+    assert main(["status", "--json"]) == EXIT_ERROR
     host = status_json(capsys)["hosts"][0]
     assert host["reachable"] is False
     assert host["running"] == []
@@ -400,7 +448,7 @@ def test_status_json_carries_the_skipped_entry_as_a_top_level_error(
     monkeypatch.setattr(
         status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
     )
-    assert main(["status", "--json"]) == EXIT_OK
+    assert main(["status", "--json"]) == EXIT_ERROR
     document = status_json(capsys)
     assert [host["name"] for host in document["hosts"]] == ["good"]
     assert "skipping host 'bad'" in document["errors"][0]
@@ -751,7 +799,7 @@ def test_host_list_json_carries_the_entries_and_the_skipped_ones(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
-    assert main(["host", "list", "--json"]) == EXIT_OK
+    assert main(["host", "list", "--json"]) == EXIT_ERROR
     document = document_of(capsys)
     (host,) = document["hosts"]
     assert host["name"] == "good"

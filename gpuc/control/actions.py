@@ -30,6 +30,7 @@ from gpuc.control.config import (
     RegistryRead,
     Settings,
     config_file,
+    forget_host_locked,
     hosts_file,
     pod_known_hosts_file,
     read_registry,
@@ -57,10 +58,11 @@ from gpuc.control.transport import TransportError
 from gpuc.host import jobs
 
 EXIT_OK = 0
-"""Everything the command was asked to do happened, including reporting that a
-host is unreachable: that is data about a host, not a failure of the command."""
+"""Everything the command was asked to do happened."""
 EXIT_ERROR = 1
-"""The command failed: a transport error, a provider error, a refused submit."""
+"""Some part of the command failed: a transport error, a provider error, a
+refused submit, a host that could not be read. Whatever did work is reported
+anyway -- one unreachable host never costs the others their status."""
 EXIT_USAGE = 2
 """The command line itself was wrong (argparse uses this too)."""
 EXIT_LOCAL_STATE = 3
@@ -233,15 +235,103 @@ def status_document(
     caller decides whether that is exit 3 or HTTP 503, but the document is the
     same either way.
     """
+    views = status_views(read, settings, host=host, report=report)
+    return status_mod.document(views, errors=status_errors(read), recent=recent, since_s=since_s)
+
+
+def status_views(
+    read: RegistryRead,
+    settings: Settings,
+    *,
+    host: str | None = None,
+    report: Callable[[str], None] = note,
+) -> list[status_mod.HostView]:
+    """Every host `gpuc status` reports on, asked at once and in registry order.
+
+    The text output gathers the same views itself, so that it can print each
+    host as soon as it has answered rather than waiting for the slowest.
+    """
     entries = hosts_for(read.registry, host) if not read.unreadable else []
     provider = provider_for_status(entries, settings, report) if entries else None
-    views = list(gather_all(entries, settings, provider))
+    return list(gather_all(entries, settings, provider))
+
+
+def status_errors(read: RegistryRead) -> list[str]:
+    """The `gpuc status` errors that belong to no host: the registry's own."""
     errors = list(read.errors)
     if read.unreadable:
         errors.append(
             f"{hosts_file()} could not be read, so `hosts` is empty because nothing is known"
         )
-    return status_mod.document(views, errors=errors, recent=recent, since_s=since_s)
+    return errors
+
+
+def forget_gone_rentals(
+    views: Sequence[status_mod.HostView], report: Callable[[str], None] = note
+) -> None:
+    """Drop the registry entry of every rental the provider says no longer exists.
+
+    A rental ends itself when its queue goes idle, so this is the ordinary end
+    of one rather than something gone wrong; leaving the entry would have the
+    next command ssh to an address somebody else now owns. Only a command
+    somebody typed does this: deleting a registry entry off the back of a
+    dashboard's poll would mean a stray 404 costing a live host its record with
+    nobody watching.
+    """
+    for view in views:
+        if view.pod_terminated:
+            report(f"forgetting host {view.entry.name}: its pod is gone")
+            forget_host_locked(view.entry.name, view.entry.pod_id, report)
+
+
+def rental_gone(
+    entry: HostEntry, provider: Provider | None, report: Callable[[str], None] = note
+) -> str | None:
+    """Why this host's pod no longer exists, or None if it does.
+
+    Asked only once a host has failed to answer: a rental that ended itself
+    when its queue went idle is how one is meant to die, not a failure. A
+    provider that cannot be asked leaves the failure as it was.
+    """
+    if provider is None or entry.kind != "runpod" or not entry.pod_id:
+        return None
+    try:
+        pod = provider.get(entry.pod_id)
+    except ProviderError as exc:
+        report(f"could not ask the provider about pod {entry.pod_id}: {exc}")
+        return None
+    if pod is None:
+        return f"pod {entry.pod_id} no longer exists"
+    if pod.status == "TERMINATED":
+        return f"pod {entry.pod_id} is TERMINATED"
+    return None
+
+
+def registry_exit(read: RegistryRead) -> int:
+    """Exit code for reporting on the registry: 0 only if all of it parsed.
+
+    A registry that could not be read at all is exit 3 -- unknown -- while an
+    entry this build could not parse is one host missing from an answer that is
+    otherwise complete, so it is exit 1 with the rest of the answer printed.
+    """
+    if read.unreadable:
+        return EXIT_LOCAL_STATE
+    return EXIT_ERROR if read.errors else EXIT_OK
+
+
+def status_exit(
+    read: RegistryRead, views: Sequence[status_mod.HostView], *, every_host: bool = True
+) -> int:
+    """Exit code for `gpuc status`: 0 only if the whole answer is here.
+
+    A skipped registry entry counts only under `every_host` -- with `--host X`
+    the answer was never meant to cover an entry that is not X.
+    """
+    if read.unreadable:
+        return EXIT_LOCAL_STATE
+    if any(view.failure for view in views):
+        return EXIT_ERROR
+    return EXIT_ERROR if every_host and read.errors else EXIT_OK
 
 
 def shipped_note(entry: HostEntry) -> str | None:

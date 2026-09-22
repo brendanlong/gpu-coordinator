@@ -269,8 +269,9 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
             log(f"pod gone {idle:.0f}s after the job finished")
             assert pod.id not in [p.id for p in provider.list_ours()]
 
-            # Nothing here reaps: the next `submit` would forget the entry on
-            # its reuse pass, and a person does it by hand with `host remove`.
+            # Nothing here reaps the pod itself; the registry entry is dropped
+            # by whatever looks next -- `status`, `bootstrap --all`, the next
+            # `submit` reuse pass -- and by hand with `host remove`.
             assert main(["host", "remove", entry.name]) == 0
             assert load_registry().hosts == {}
             log(f"billing: {json.dumps(provider.billing(pod.id))[:400]}")

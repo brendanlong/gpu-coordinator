@@ -252,7 +252,8 @@ memory and utilization.
 `--host H` narrows it; `--recent N` (default 5) and `--since 24h|7d|90m` (a bare
 number means hours) choose how much of the finished list to show; `--all` adds
 jobs only the local index and the S3 index know, which is how you find what was
-on a host that lost its state; `--json` is [below](#exit-codes-and---json). Card
+on a host that lost its state, and is exit 1 if the S3 index could not be read,
+since that list would be short; `--json` is [below](#exit-codes-and---json). Card
 UUIDs are in `gpuc host list`, and everything a host can say about itself is in
 `gpuc host probe`.
 
@@ -261,53 +262,37 @@ UUIDs are in `gpuc host list`, and everything a host can say about itself is in
 "was purged" when the whole job dir is gone — and falls back to the S3 mirror,
 which needs `s3_bucket` set here **and** an `s3_prefix` for that job.
 
-**`-f` is also a wait.** It streams the host's file while asking the host, every
-few seconds, whether the job has ended; when it has, the job's outcome is the
-last line and gpuc exits **0 only if the job succeeded**, 1 for anything else.
-So `gpuc logs -f "$id"` is a foreground wait you can put in a script, and a job
-that is *already* finished prints its tail and exits instead of hanging. A job
-still in the queue is followed too: the log that does not exist yet is waited
-for rather than refused.
+**`-f` follows the log until the job ends**, prints the job's outcome as its
+last line, and exits 0 only if the job succeeded — a foreground wait on one job.
+A job that has already finished prints its tail and exits; a job still queued is
+followed until its log appears.
 
 ```
 epoch 11 loss 0.214
 lego-s4 (20260915-233000-112233) on spar: failed (sync-preflight) after 41s
 ```
 
-Nothing about the job changes if the follow is killed: the host owns it either
-way. A Ctrl-C is **exit 130**, never 0 — 0 means the job succeeded, and the
-whole point is that a script can believe it. The outcome is read from the host's
-state file, which the runner writes just *before* its own last log lines, so a
-line or two of the runner's cleanup can land after the follow has gone; the log
-itself always has them. If the stream itself dies (an ssh that gave up) the wait
-says so and carries on: it polls over its own connection.
+A line or two of the runner's own cleanup can land after the follow has stopped;
+the log itself always has them. `--follow-forever` streams until you stop it, and
+`--interval SECONDS` pins the poll, whose default backs off from 2s to 30s.
+Neither follow can be combined with `--json`, or with the other.
 
-`--follow-forever` is the old behaviour — stream and never stop, Ctrl-C to
-leave — and `--interval SECONDS` pins the poll, whose default backs off from
-2s to 30s. Neither follow can be
-combined with `--json`, and the two cannot be combined with each other.
-
-**`gpuc wait <job-id> [<job-id> ...] [--host H]`** — the same wait with no log,
-for when several jobs are in flight and their output interleaved would be
-unreadable. It blocks until every job named has ended, prints one line per job
-as that happens, and exits 0 only if **all** of them succeeded:
+**`gpuc wait <job-id> [<job-id> ...] [--host H]`** — the same wait without the
+log, for several jobs at once. It blocks until every job named has ended, prints
+one line per job as that happens, and exits 0 only if **all** of them succeeded:
 
 ```sh
 gpuc submit job.yaml --host spar --json | jq -r .job_id | xargs gpuc wait || echo "it did not work"
 ```
 
-An id no host has is exit 4, as everywhere else, and a Ctrl-C is exit 130 with
-the jobs still named on stderr. A host that stops answering is neither: the wait
-rides out a blip and keeps asking, because an ssh hiccup must not end a six-hour
-wait. After five minutes of failures it looks in the **S3 mirror** — which is
-where a rental that finished the job and then idled itself down will have left
-the answer — and reports what it finds there, saying that it came from the
-mirror. Only if that has nothing does the job get exit 1 with `could not be
-asked` as its line.
+Killing a wait leaves the run alone: the host owns the job either way.
 
-A reachable host whose **dispatcher is down** is a third case: a queued job
-there will never start, so the wait says so once and keeps waiting, since
-`gpuc host bootstrap <host>` is all it takes to start the queue moving again.
+A host that stops answering does not end the wait — gpuc keeps asking for five
+minutes, then reads the job's final state from the **S3 mirror** and says the
+answer came from there. Only if the mirror has nothing is that job exit 1, with
+`could not be asked` as its line. A reachable host whose dispatcher is down is
+reported once and waited through; `gpuc host bootstrap <host>` starts its queue
+again. An id no host has is exit 4.
 
 `--interval` is as above, and `--json` is [below](#exit-codes-and---json).
 
@@ -491,9 +476,12 @@ skips the per-pod ssh check, which is what makes the command slow when a pod is
 wedged. A pod registered nowhere here is named at the bottom with how to take it
 on, and `gpuc pods` never terminates anything.
 
-A registry entry whose pod is gone shows as `POD GONE` in `gpuc status`;
-`gpuc host remove <name>` forgets it, and the next `submit --runpod` does so on
-its own when it looks for a pod to reuse.
+A rental that ended itself is **forgotten where it is found**: `gpuc status`,
+`gpuc host bootstrap --all` and the next `submit --runpod` reuse pass each drop
+the registry entry and say so, rather than reporting a host nobody can reach.
+That is a pod the provider reports missing or `TERMINATED`. A pod it still has
+but has stopped (`EXITED`, `ERROR`) is a host nothing can be run on: `POD GONE`
+in `gpuc status`, exit 1, and it stays until `gpuc host remove <name>`.
 
 ## How a job is killed
 
@@ -548,17 +536,23 @@ Every `failed: <reason>`:
 
 | code | meaning |
 | --- | --- |
-| 0 | ok. **Includes** a host that is unreachable, has a dead dispatcher, or whose pod is gone: that is data about a host, reported per host, not a failure of the command |
-| 1 | the command failed (transport, provider, a refused submit, a `clean` the host reported errors for, a `host bootstrap --all` any host failed — the others still upgraded, and the tally says which). Also a job that did not succeed, under `gpuc wait` and `gpuc logs -f`, whose exit code is the job's rather than their own |
+| 0 | everything the command was asked to do worked. For `gpuc wait` and `gpuc logs -f`, the job succeeded |
+| 1 | something failed: a transport, a provider, a refused submit, a host that could not be read, a `clean` the host reported errors for, a host `host bootstrap --all` failed on. For `gpuc wait` and `gpuc logs -f` it is the **job** that did not succeed |
 | 2 | usage: a bad flag, a missing required one, a bad `--since` |
 | 3 | local state is unreadable (`hosts.json` or `config.toml`), so the answer is **unknown** |
 | 4 | the job or host named on the command line does not exist |
-| 130 | a Ctrl-C. It has to be distinct from 0 because for `gpuc wait` and `gpuc logs -f` 0 means the job *succeeded* |
+| 130 | a Ctrl-C |
 
-A single unreadable host entry never reaches these: it is skipped with a warning
-on stderr, every other host still works, and the entry is written back untouched.
-Only a `hosts.json` that cannot be parsed at all is exit 3, and it prints the
-error, the path, and that a `.bak` was kept.
+**A failure never costs you the rest of the answer.** A host that cannot be
+reached is reported in its own block, every other host is still reported in
+full, and the command exits 1. A registry entry this build cannot parse is the
+same thing: a warning on stderr, the entry written back untouched, and exit 1
+from the commands that were reporting on every host (`status`, `host list`,
+`version`) — a command given one host, or one job, is not failed by an entry it
+was never asked about. A rental whose pod the provider says has ended is not a
+failure at all: gpuc forgets that host and says so. Only a `hosts.json` that
+cannot be parsed at all is exit 3, and it prints the error, the path, and that a
+`.bak` was kept.
 
 ```sh
 gpuc status --json | jq '.hosts[] | {name, reachable, running: (.running | length)}'
@@ -630,8 +624,9 @@ Beyond what the example shows:
   `provider_util` is the provider's per-GPU reading for the whole pod, null
   elsewhere. Two measurements that will differ.
 
-Per host: `target`, `draining`, `pod_gone`, `pod` (the provider's view of an
-ephemeral host's pod) and `pkg_commit`, the host's own answer for the build it
+Per host: `target`, `draining`, `pod_gone`, `pod_terminated` (that pod is gone
+for good, so the next `gpuc status` forgets the host), `pod` (the provider's
+view of an ephemeral host's pod) and `pkg_commit`, the host's own answer for the build it
 runs — `null` means it did not say, never "up to date". A card the host cannot
 see appears in `gpus` as `{"owned_as": "3", "available": false}`; `shared_gpus`
 has the same shape plus `unused` (no memory held, no work running) and
@@ -672,27 +667,26 @@ never handed nothing at all:
 `error` (singular) is the whole answer: the command did not do what it was asked.
 A command line argparse itself rejects gets the same document, with the reason on
 stderr where argparse wrote it. `errors` (plural) is different — per-host or
-per-job trouble a command survived, which never implies a non-zero exit by itself
-(`clean` is the one that exits 1 on its own `errors`).
+per-job trouble the command reported rather than stopped for.
 
 | command | the document |
 | --- | --- |
 | `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is null on `submit`; `notes` are the text output's `note:` lines. The queue fields are the host's answer just after the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, and `starts_unknown` says why there is no start time (null when there is one). All of them are null when the host could not be asked again — never a reason to think the job was not queued |
-| `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with either follow** — the document is printed once and a follow is a stream, so `--json -f` is exit 2; `gpuc wait --json` is the JSON form of waiting |
-| `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` gives a job, plus `host`, `source` (`"host"`, or `"mirror"` for an outcome read from S3 after the host went away) and `error`. **`error` is the key to check**: it is null for a job that ended, and when it is not, `status` is only the last thing its host managed to say — `"running"` for a job whose host vanished mid-run, and null for one nothing was ever heard about. Every `error` is in `errors[]` too. A job nothing was ever heard about carries `job_id`, `host`, `source`, `error` and a null `status` **and nothing else** — there was no answer to shape. On `"source": "mirror"` the `outputs_*` fields come from the mirrored state rather than the host's own check against the spec, which needs a host to run on. The per-job outcome lines go to stderr under `--json`, as everything but the document does. Exit 1 unless every job succeeded |
+| `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with either follow** (exit 2): the document is printed once and a follow is a stream, so `gpuc wait --json` is the JSON form of waiting |
+| `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` gives a job, plus `host`, `source` (`"host"`, or `"mirror"` for a state read from S3 after the host went away) and `error`. **Check `error`, not `status`**: it is null for a job that ended, and when it is not, `status` is only the last thing its host managed to say — `"running"` for a job whose host vanished mid-run, and null for a job nothing was ever heard about, which carries only `job_id`, `host`, `source`, `error` and a null `status`. Every `error` is in `errors[]` too. Under `"source": "mirror"` the `outputs_*` fields come from the mirrored state rather than the host's own check against the spec. The per-job outcome lines go to stderr. Exit 1 unless every job succeeded |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], host, heartbeat_age_s}`; `host` is the registry name this machine drives it under, null if none; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
-| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` here is the commit the host was running when this machine last read it, not what it runs now — that is `status --json`'s `pkg_commit`. Exit 3 if the registry is unreadable |
+| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` here is the commit the host was running when this machine last read it, not what it runs now — that is `status --json`'s `pkg_commit`. Exit 1 for an entry that could not be parsed, 3 if the whole registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}` — the effective settings, file or not |
-| `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at`, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]`. Nothing here asks the host. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`). A skipped entry is an `errors` string, not a host. Exit 3 if the registry is unreadable |
+| `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at`, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]`. Nothing here asks the host. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`). A skipped entry is an `errors` string, not a host, and exit 1. Exit 3 if the whole registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. Job objects are `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
 | `host add`, `host set` | the host as `host list --json` reports one entry (the address, the host's own config flattened beside it, `cache`, `remote_home`, `ephemeral`), as the registry holds it once the command is done, plus `adopted` (the host already had a config, which `add` took as it stood), `config_path` (that config on the host), `changes[]` (one line per config field this command wrote through to the host, empty when it held that already) and `warnings[]` (`host list`'s re-bootstrap note, and for `add` a host that owns no card or a pod nothing has bootstrapped). `host set` adds `address{}`: the fields it changed here rather than on the host (`persistent_root`, `gpuc_home`), by name and new value |
 | `host remove` | `{host, kind, pod_id, notes[]}` — what was forgotten here. Nothing on the host changes, and a rental is **not** terminated: it bills until it idles out, and `notes` says so |
-| `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}` — the gpuc home the package went to, how many files, the commit it now runs, the dispatcher started, and every warning the run printed. With `--all`: `{hosts[], total, bootstrapped[], failed[], unreadable[], interrupted, errors[]}`, the tally as data — one `hosts[]` entry per registered host, `{name, outcome, error, ephemeral}` plus the single-host fields (null unless it was bootstrapped), where `outcome` is `bootstrapped`, `failed` (with `error` saying why), `interrupted` (the host a Ctrl-C landed in) or `not_attempted` (the ones after it); `unreadable` names the registry entries this build could not read and so never tried, and `errors` is what it said about them. Exit 1 if any host failed or the run was interrupted, exactly as without the flag; a registry that stops being readable mid-run is the error document and exit 3 |
+| `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}` — the gpuc home the package went to, how many files, the commit it now runs, the dispatcher started, and every warning the run printed. With `--all`: `{hosts[], total, bootstrapped[], failed[], gone[], unreadable[], interrupted, errors[]}`, the tally as data — one `hosts[]` entry per registered host, `{name, outcome, error, ephemeral}` plus the single-host fields (null unless it was bootstrapped), where `outcome` is `bootstrapped`, `failed` (with `error` saying why), `gone` (a rental the provider no longer has, forgotten rather than failed), `interrupted` (the host a Ctrl-C landed in) or `not_attempted` (the ones after it); `unreadable` names the registry entries this build could not read and so never tried, and `errors` is what it said about them. Exit 1 if any host failed or the run was interrupted, exactly as without the flag; a registry that stops being readable mid-run is the error document and exit 3 |
 | `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` — the cache pruned and its size either side, in bytes and as a human-readable string derived from them. All four size fields are null when `du` on the host failed |
 | `config init` | `{config_file, existed}` — the path written, and whether a file was already there (only ever true with `--force`; without it an existing file is refused, exit 1) |
 
@@ -845,6 +839,6 @@ expires.
 | a warning names one skipped host entry | that entry did not validate; every other host still works and is written back untouched | fix it by hand, or `gpuc host add <name> --ssh ...` to connect to that host again |
 | `status` warns `host X is running gpuc <sha> and this machine has <sha>` | the host was last bootstrapped from a different build than this one, in either direction | `gpuc host bootstrap X`, or `gpuc host bootstrap --all` for every host at once — safe while jobs run; the new dispatcher adopts them |
 | `status` warns `host X has gpuc <sha> on disk but its running dispatcher was started on <sha>` | the dispatcher outlived the package under it, so nothing shipped since is in effect. A newer dispatcher normally takes over by itself | `gpuc host bootstrap X` — safe while jobs run; the new dispatcher adopts them |
-| `status` says `POD GONE` | the pod is terminated or missing but the registry still lists it | `gpuc host remove <name>` |
+| `status` says `POD GONE` | the provider reports the pod stopped, so nothing can be run on it. A pod that is terminated or missing is the end of the rental, and `status` forgets that entry as it prints it | nothing for a rental that ended; `gpuc host remove <name>` for a stopped pod the provider still has |
 | `gpuc pods` shows a pod with no heartbeat and nothing running | its dispatcher died, or the machine that was provisioning it was killed before it could clean up; nothing here will end it | terminate it in the RunPod console. A pod that still answers ssh can be re-bootstrapped instead (`gpuc host add <name> --pod <id>`, then `gpuc host bootstrap <name>`) |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | the runbook in [setup.md](setup.md#hosts-whose-home-is-wiped-on-restart) |
