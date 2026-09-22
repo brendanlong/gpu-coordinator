@@ -229,9 +229,7 @@ re-running it would be a retry nobody requested (`gpuc requeue` is that)."""
 
 
 def stopped_for_preempt(state: JobState) -> bool:
-    # `_blame` composes a compound reason -- `preempted+sync` when the final
-    # upload failed too -- and the first part is what ended the job.
-    return (state.reason or "").split("+")[0] in STOPPED_BY_US
+    return state.reason in STOPPED_BY_US
 
 
 def requeue_preempted(job_id: str) -> int | None:

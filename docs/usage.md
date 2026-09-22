@@ -731,7 +731,6 @@ gpuc clean --host gpubox --only 20260101-120000-ab12,20260101-130000-cd34
 | `spec.json`, `state.json`, `log.txt` | **kept** | removed |
 | the job's `secrets/<id>.env`, if any is left | kept | **removed** |
 | job dirs under `incoming/` a submit never finished | removed | removed |
-| a stray queue marker for the job | — | removed |
 | running or queued jobs, or ones with unreadable state | never touched | never touched |
 
 `--only ID[,ID...]` replaces `--all-finished` and `--older-than`: exactly those
