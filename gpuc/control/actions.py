@@ -54,6 +54,7 @@ from gpuc.control.s3index import (
 )
 from gpuc.control.skill import SkillError
 from gpuc.control.submit import SubmitError
+from gpuc.control.teardown import TerminateError
 from gpuc.control.transport import TransportError
 from gpuc.host import jobs
 
@@ -110,6 +111,7 @@ FAILURES = (
     CliError,
     ConfigError,
     SubmitError,
+    TerminateError,
     BootstrapError,
     ProvisionError,
     ProviderError,
@@ -414,7 +416,8 @@ def remove_host(name: str) -> dict[str, Any]:
 
     A rental in particular is not terminated: after handoff it ends itself
     when idle, and nothing on a client watches it. The document says so for an
-    ephemeral host, so a caller does not take "removed" for "stopped billing".
+    ephemeral host, so a caller does not take "removed" for "stopped billing"
+    -- and names `gpuc host terminate`, which is the command that does.
     """
     with registry_transaction() as registry:
         entry = registry.require(name)
@@ -427,6 +430,9 @@ def remove_host(name: str) -> dict[str, Any]:
             f"its {pod} is not terminated by this: it ends itself once its queue has been "
             f"idle, and `gpuc pods` shows it until then"
         )
+        if entry.pod_id:
+            # By pod id, not by name: this machine has just forgotten the name.
+            notes.append(f"`gpuc host terminate {entry.pod_id}` ends it now instead")
     return {"host": entry.name, "kind": entry.kind, "pod_id": entry.pod_id, "notes": notes}
 
 

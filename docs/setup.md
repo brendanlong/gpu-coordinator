@@ -126,10 +126,10 @@ own `--s3-prefix` mirror — needs. A provisioned pod is additionally given
 an `s3_prefix`, with the region from `AWS_REGION`, `AWS_DEFAULT_REGION`, else
 `us-east-1`.
 
-**RunPod.** Export `RUNPOD_API_KEY`. `gpuc submit --runpod`, `gpuc pods` and
-`gpuc host add --pod` check it first and exit 1 with one line if it is
-missing. The key is delivered to each pod as `~/.gpuc/secrets/runpod` so it
-can terminate itself.
+**RunPod.** Export `RUNPOD_API_KEY`. `gpuc submit --runpod`, `gpuc pods`,
+`gpuc host add --pod` and `gpuc host terminate` check it first and exit 1 with
+one line if it is missing. The key is delivered to each pod as
+`~/.gpuc/secrets/runpod` so it can terminate itself.
 
 **Hugging Face.** Put `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) in the job's
 `secrets:`. The sync preflight runs `hf auth whoami` with it and fails the job
@@ -340,31 +340,40 @@ the first machine.
 ```sh
 gpuc host remove <name>        # forgets it locally; nothing on the host changes
 gpuc host clean <name> --uv-cache   # `uv cache prune` there, if you want the disk back first
+gpuc host terminate <name>     # a rental only: ends it at the provider, then forgets it
 ```
 
 `host remove` does not stop anything: to clear a host's own state, delete its
 gpuc home (`gpuc ssh <host> -- rm -rf ~/.gpuc`, or the persistent root's `gpuc`
 directory) while nothing is running.
 
-**Terminating a pod deliberately.** There is no terminate command, and deleting
-local state is not one: nothing here terminates a pod for having no record. Tell
-the pod instead — it is the thing that can stop itself:
+**Terminating a pod deliberately.**
 
 ```sh
-gpuc pods                                       # confirm the name and that it is idle
-gpuc host set <name> --idle-min 0               # stop as soon as the queue is empty
-gpuc cancel <job-id>                            # and end a job you are not waiting for
+gpuc host terminate <name>             # end the rental now, and forget it here
+gpuc host terminate <pod-id> --force   # one that cannot answer: do not ask it anything
 ```
 
-`--idle-min 0` reaches the host's own `config.json`, so the dispatcher drains
-(retrying unconfirmed outputs, mirroring every job's log and state) and
-terminates on its next pass with nothing running. Nothing stops a pod out from
-under a running job: cancel the job first if you do not want to wait for it.
+Without `--force` the host has to say it is idle; the refusals, and what each
+one prints, are in [usage.md](usage.md#terminate). Either way the terminate is
+retried and confirmed with the provider before this machine forgets the host, and
+a pod that may still be billing keeps its registry entry.
+
+**To let the pod finish first**, tell it to stop itself instead — it drains,
+retrying unconfirmed outputs and mirroring every job's log and state, and
+terminates on its next pass with nothing running:
+
+```sh
+gpuc pods                           # confirm the name and what it is doing
+gpuc host set <name> --idle-min 0   # stop as soon as the queue is empty
+gpuc cancel <job-id>                # and end a job you are not waiting for
+```
+
 **Nothing on this machine watches a pod after it is set up.** One whose
-dispatcher has died, or that has stopped answering ssh altogether, bills until
-you end it: `gpuc pods` shows it, with its hourly cost and how long ago its
-dispatcher last beat, and the RunPod console terminates it. Check `gpuc pods`
-before you walk away.
+dispatcher has died, or that has stopped answering ssh altogether, will never
+idle out: `gpuc pods` shows it with its hourly cost and its heartbeat, and
+`gpuc host terminate <pod-id> --force` ends it. Check `gpuc pods` before you
+walk away.
 
 **Disabling the dashboard service.**
 

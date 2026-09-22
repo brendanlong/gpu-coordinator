@@ -65,6 +65,7 @@ destinations. Adding another of either changes nothing else in this document.
   configuration and, for a rental, its own shutdown. A rental terminates
   itself once its queue has been empty for a configured idle period, after
   draining its uploads. Nothing on a client watches a rental after handoff.
+- **A user can end a rental**, in one command, whether or not it's still busy.
 - **A rental that has ended is a state, not a failure.** A client that finds
   the pod gone forgets its record of that host and says so.
 - **Any client whose SSH key reaches a host can drive it, without conflict**,

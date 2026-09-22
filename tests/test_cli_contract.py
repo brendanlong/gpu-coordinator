@@ -716,6 +716,7 @@ JSON_COMMANDS = [
     ["host", "bootstrap"],
     ["host", "clean"],
     ["host", "remove"],
+    ["host", "terminate"],
     ["config", "init"],
 ]
 
@@ -908,6 +909,34 @@ def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
     assert main(["host", "remove", "local"]) == EXIT_NOT_FOUND
     capsys.readouterr()
     assert main(["host", "remove", "local", "--json"]) == EXIT_NOT_FOUND
+    assert document_of(capsys)["exit_code"] == EXIT_NOT_FOUND
+
+
+def test_host_terminate_json_is_what_was_ended_and_what_it_was_doing(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.fakeprovider import FakeProvider, PodScript, running_pod
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    provider = FakeProvider()
+    provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"), PodScript(ssh_after_polls=0))
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    register_host(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", pod_id="pod1")
+    capsys.readouterr()
+
+    assert main(["host", "terminate", "gpuc-e2e-aaa", "--force", "--json"]) == EXIT_OK
+
+    document = document_of(capsys)
+    assert (document["host"], document["pod_id"]) == ("gpuc-e2e-aaa", "pod1")
+    assert (document["terminated"], document["forgotten"], document["checked"]) == (
+        True,
+        True,
+        False,
+    )
+    assert document["cost_usd_hr"] == 0.49
+    assert provider.terminated == ["pod1"]
+    assert load_registry().hosts == {}
+    assert main(["host", "terminate", "nothing-like-this", "--json"]) == EXIT_NOT_FOUND
     assert document_of(capsys)["exit_code"] == EXIT_NOT_FOUND
 
 

@@ -766,8 +766,13 @@ def registry_transaction() -> Iterator[Registry]:
         save_registry(read.registry, read.skipped)
 
 
-def forget_host(name: str, pod_id: str | None = None) -> None:
-    """Drop every local trace of one host. The caller must hold the state lock.
+def forget_host(name: str, pod_id: str | None = None) -> bool:
+    """Drop every local trace of one host, and say whether the entry went.
+
+    The caller must hold the state lock. False is every reason the registry
+    still lists the host -- it was never there, it is another pod's, the file
+    could not be read -- because a caller that reports "forgotten" has to be
+    reporting what happened rather than what it asked for.
 
     `pod_id` names the pod the caller is forgetting, and the registry entry is
     only removed if it is that pod's. A pod and a registry entry can disagree
@@ -783,30 +788,34 @@ def forget_host(name: str, pod_id: str | None = None) -> None:
     pod_known_hosts_file(name).unlink(missing_ok=True)
     read = read_registry()
     if read.unreadable:
-        return
+        return False
     entry = read.registry.hosts.get(name)
     if entry is None:
-        return
+        return False
     if pod_id is not None and entry.pod_id != pod_id:
         # Not this pod's entry -- a box of this machine's that answers to the
         # same name, or another pod under it.
-        return
+        return False
     del read.registry.hosts[name]
     save_registry(read.registry, read.skipped)
+    return True
 
 
-def forget_host_locked(name: str, pod_id: str | None, report: Reporter) -> None:
+def forget_host_locked(name: str, pod_id: str | None, report: Reporter) -> bool:
     """`forget_host` under the state lock, taken for just that mutation.
 
     Never held across the provider and ssh calls that decide *whether* to
     forget: a terminate polls for up to five minutes, and every other command
-    that touches the registry gives up on the lock after thirty seconds.
+    that touches the registry gives up on the lock after thirty seconds. A lock
+    another session is holding is a warning and a False, not a failure: the pod
+    is already gone by the time anything calls this.
     """
     try:
         with state_lock():
-            forget_host(name, pod_id)
+            return forget_host(name, pod_id)
     except ConfigError as exc:
         report(f"WARNING: could not remove host {name} from the registry: {exc}")
+        return False
 
 
 def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transport:

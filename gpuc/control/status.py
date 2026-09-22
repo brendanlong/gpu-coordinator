@@ -472,7 +472,10 @@ def gather(
         view.error = (
             f"pod {entry.pod_id} is {status}; this rental has ended"
             if view.pod_terminated
-            else f"pod {entry.pod_id} is {status}; `gpuc host remove {entry.name}` forgets it"
+            # The provider still has this one, so it may still be billing:
+            # ending it is a different act from forgetting it.
+            else f"pod {entry.pod_id} is {status}; `gpuc host terminate {entry.name}` ends "
+            f"it, `gpuc host remove {entry.name}` forgets it"
         )
         return view
     try:

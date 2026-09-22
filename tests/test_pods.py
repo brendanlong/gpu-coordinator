@@ -84,8 +84,8 @@ def test_a_pod_registered_nowhere_here_says_who_will_deal_with_it(
 ) -> None:
     text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
     assert "gpuc host add <name> --pod <id>" in text
-    # The one thing it must not claim is that something here will terminate it.
-    assert "nothing here ends a pod" in text
+    # It bills until somebody ends it, and this is where the command to do that is.
+    assert "gpuc host terminate <id> --force" in text
     view = pods_mod.gather(Settings(), provider, heartbeats=False)
     assert [row.host for row in view.rows] == [None, None]
 

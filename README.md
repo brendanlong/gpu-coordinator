@@ -31,7 +31,8 @@ go up from here and each host mirrors its own logs and state, which is what
 makes `gpuc requeue`, `gpuc logs` after a pod is gone, and `gpuc clean --purge`
 possible. Nothing runs in the background on the control side except the
 optional web dashboard; a rented pod ends itself once its queue has been idle,
-and `gpuc pods` shows what is still billing.
+`gpuc pods` shows what is still billing, and `gpuc host terminate` ends one
+outright.
 
 ## Quick start
 

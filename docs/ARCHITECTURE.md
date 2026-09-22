@@ -38,6 +38,7 @@ gpuc/
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
     provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse
+    teardown.py    # `host terminate`: end a rental on purpose, and forget it here
     rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
     config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
@@ -761,9 +762,32 @@ The runbook for a host that came back empty is in setup.md.
    15-minute ceiling, a health failure, a Ctrl-C or a bug: `terminate`, wait for
    TERMINATED, try the next offer. A terminate that failed is reported loudly
    and leaves the registry entry in place; nothing retries it.
-4. From bootstrap on, the pod-scoped key at `~/.gpuc/secrets/runpod` is the only
-   thing that ends the pod. `tests/test_runpod_e2e.py` proves it on every opt-in
-   run.
+4. From bootstrap on, the only things that end the pod are the pod itself,
+   through the pod-scoped key at `~/.gpuc/secrets/runpod`, and a client running
+   `gpuc host terminate`. `tests/test_runpod_e2e.py` proves the first on every
+   opt-in run.
+
+## Ending a rental on purpose (`gpuc host terminate`, `teardown.py`)
+
+Client-side: the provider call works whether or not the pod still answers, and
+once it returns there is no host left to own any state.
+
+- The target is a registry name, else a pod id, else a pod name; the pod search
+  is over `list_ours()`, so a name that is not a registered host only ever
+  resolves to a pod with our prefix. A `local` or `ssh` host is refused; an
+  unknown name is exit 4.
+- Unless `--force`, the host must *say* it is idle: one `status.gather`, then
+  exit 1 on work in flight (running, queued, or finished with outputs not
+  confirmed uploaded, each named), on a host that did not answer, or on a
+  target with no registry entry to ask. `--force` does not ask at all.
+- A pod the provider reports in `DEAD_STATUSES` is never refused over.
+- The terminate is retried (`TERMINATE_ATTEMPTS`) and the provider must confirm
+  TERMINATED before anything local changes. Only then is the entry dropped,
+  through `forget_host`, which drops it only if it is that pod's and reports
+  whether it went -- what `forgotten` in the document means. A terminate that
+  could not be confirmed raises, keeping the entry.
+- A pod the provider already reports TERMINATED is not an error: nothing is
+  called, and the stale entry is dropped.
 
 ## Web dashboard (`gpuc web serve`)
 
