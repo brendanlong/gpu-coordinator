@@ -558,8 +558,9 @@ def mark_mirrored(home: Path, job_id: str, prefix: str = "s3://bucket/gpuc/local
     """Stand in for a successful final meta sync on a host with a prefix."""
     path = home / "jobs" / job_id / "state.json"
     document = json.loads(path.read_text())
-    document["meta_synced_at"] = document.get("ended_at")
-    document["meta_synced_to"] = prefix
+    document["uploads"] = [
+        {"to": f"{prefix}/jobs/{job_id}", "output": None, "ok_at": document.get("ended_at")}
+    ]
     path.write_text(json.dumps(document, indent=2) + "\n")
 
 
