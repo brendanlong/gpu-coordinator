@@ -238,7 +238,7 @@ class JobProcesses:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, signal.SIGKILL)
 
-    def escalate(self, elapsed_s: float, grace_s: float, log: Log = lambda _: None) -> None:
+    def escalate(self, elapsed_s: float, grace_s: float, log: Log | None = None) -> None:
         """The backstop for a runner that has not honoured a stop request.
 
         One rung per grace period: the job's processes, then a SIGTERM to the
@@ -249,6 +249,7 @@ class JobProcesses:
         """
         if elapsed_s <= grace_s:
             return
+        log = log or (lambda _: None)
         self.kill(log)
         runner = self.runner_pid
         if not runner or runner <= 1:

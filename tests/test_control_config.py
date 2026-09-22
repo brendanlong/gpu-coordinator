@@ -139,11 +139,15 @@ def test_kind_is_what_the_address_says(address: dict[str, str], kind: str) -> No
     assert entry.model_copy(update={"kind": "ssh"}).kind == kind
 
 
-def test_kind_is_not_written_to_the_registry() -> None:
-    """Derived, so there is nothing to store that could disagree with it."""
+def test_kind_is_written_for_older_builds_and_ignored_on_the_way_back() -> None:
+    """Derived, so nothing stored can disagree with it -- but still written,
+    because the build before this one reads it and defaults a missing one to
+    `local`, which sends every command for an ssh host to this machine."""
     entry = HostEntry(name="box", ssh="me@box")
-    assert "kind" not in json.loads(entry.model_dump_json())
-    assert HostEntry.model_validate_json(entry.model_dump_json()).kind == "ssh"
+    assert json.loads(entry.model_dump_json())["kind"] == "ssh"
+    stored = json.loads(entry.model_dump_json())
+    stored["kind"] = "runpod"
+    assert HostEntry.model_validate(stored).kind == "ssh"
 
 
 def test_a_pre_split_registry_entry_parses_as_an_address_with_an_empty_cache() -> None:

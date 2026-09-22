@@ -384,15 +384,23 @@ def test_a_verified_set_overrules_a_mirror_the_host_recorded(gpuc_home: Path) ->
     )
 
 
-def test_a_verified_set_vouches_for_a_mirror_the_host_never_recorded(gpuc_home: Path) -> None:
+def test_a_verified_set_cannot_vouch_for_a_mirror_the_host_never_recorded(
+    gpuc_home: Path,
+) -> None:
+    """Every periodic tick mirrors the log, so a listing that finds one says
+    nothing about the *final* upload; only the host's record does."""
     job_id = finished_job("succeeded")
     vouched = cleanup.Evidence(verified=frozenset({job_id}))
-    assert may_delete(job_id, cleanup.JOBDIR, cleanup.ASKED) is not None
+    assert may_delete(job_id, cleanup.JOBDIR, vouched) == (
+        "not backed up: no s3_prefix on this host"
+    )
+    mirrored(job_id)
     assert may_delete(job_id, cleanup.JOBDIR, vouched) is None
 
 
 def test_a_verified_set_does_not_vouch_for_unconfirmed_outputs(gpuc_home: Path) -> None:
     job_id = job_with_outputs_still_only_here()
+    mirrored(job_id)
     vouched = cleanup.Evidence(verified=frozenset({job_id}))
     assert may_delete(job_id, cleanup.JOBDIR, vouched) == "outputs not confirmed uploaded"
 

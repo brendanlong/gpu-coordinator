@@ -773,14 +773,15 @@ def test_the_runner_the_dispatcher_spawns_is_one_the_scan_recognises(
     assert procinfo.runner_job_id(scoped) == job_id
 
 
-def test_a_runner_in_its_final_sync_is_never_escalated(
+def test_a_runner_in_its_final_sync_is_given_a_long_patience_before_the_ladder(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The final upload has no wall-clock cap, and a runner in it is honouring
-    the stop: a ladder that reached it there would kill the upload that
-    matters most."""
+    the stop: a ladder that reached it after the ordinary grace would kill the
+    upload that matters most. One hung there for half an hour holds cards
+    somebody wants, so the ladder does start, from the first rung."""
     clock = FakeClock()
-    dispatcher, _ = make_dispatcher(clock=clock)
+    dispatcher, spawned = make_dispatcher(clock=clock)
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher.run_once()
     jobs.update_state(job_id, pgid=123456, phase="sync")
@@ -792,6 +793,14 @@ def test_a_runner_in_its_final_sync_is_never_escalated(
         clock.advance(10.0)  # kill_grace_s is 1.0 in these tests
     assert signals == []
     assert "escalating" not in paths.dispatcher_log().read_text()
+
+    # The rungs count from the end of the patience, one grace period apart.
+    clock.advance(host_dispatcher.SYNC_STOP_PATIENCE_S - 100.0 + 0.5)
+    dispatcher.escalate_stops()
+    assert signals == [(123456, signal.SIGKILL)]
+    clock.advance(1.5)
+    dispatcher.escalate_stops()
+    assert (spawned[job_id].pid, signal.SIGTERM) in signals
 
 
 def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path) -> None:

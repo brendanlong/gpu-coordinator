@@ -215,8 +215,10 @@ Started by every `enqueue`, and by bootstrap, in its own session so it outlives
 the ssh that started it -- and, where the host has user systemd, in a transient
 scope of its own, so it outlives the *cgroup* that started it too: a
 dispatcher started from inside somebody's session scope would otherwise be
-stopped with that session, and so would every runner it spawned. The rules it
-holds to:
+stopped with that session, and so would every runner it spawned. The scope
+lives under the user's systemd instance, so a host whose user manager stops at
+logout needs `loginctl enable-linger`, as the dashboard's unit already does.
+The rules it holds to:
 
 - **One dispatcher per host**, by `flock` on `dispatcher.lock` plus a heartbeat.
   A holder whose heartbeat is stale (30 s) is killed by the pgid in the lock
@@ -265,8 +267,9 @@ holds to:
   `cancelled` or `failed: preempted` after a final sync -- and the dispatcher
   escalates only once the grace period has passed (`escalate_stops`), one
   rung per grace period: the job's scope and group, then the runner itself,
-  then the runner's group. Never while the runner is in its final sync: the
-  upload has no cap by design, and it is the runner honouring the request. A
+  then the runner's group. A runner in its final sync gets
+  `SYNC_STOP_PATIENCE_S` first: the upload has no cap by design and is the
+  runner honouring the request, but one hung there holds its cards for ever. A
   queued job is cancelled on the spot, with no intent. A cancel overrides a
   preempt.
 - **Preempt** (`queue.preempt`) is for a running job, and only when something
@@ -443,7 +446,10 @@ policy, the two horizons and every refusal are
 - The host cannot consult the mirror, so the mirror's upload record in the
   job's own `state.json` is the purge's authority. `--verify` on the control
   side lists the mirrored logs under the host's prefix first and passes the
-  ids as `--verified`, which replaces that record: one round trip either way.
+  ids as `--verified`; a job must then be in the list *and* have the record
+  (every periodic tick mirrors the log, so the list alone would vouch for a
+  job whose final upload failed). One round trip either way; a list too long
+  for an argument goes over as a file.
 - The dispatcher sweeps with `Evidence(automatic=True)` at startup and then at
   most once an hour, purge first.
   `workdir_days` defaults to `cleanup.DEFAULT_WORKDIR_DAYS` only for a host
@@ -513,8 +519,9 @@ hold to, whatever the flags:
   (`find_job_host`): the job index, then asking each host, and an id nothing
   knows is exit 4, never a guess. The job index is one facade
   (`s3index.JobIndex`) over the local index and the mirror's, in that order,
-  so a second machine finds a job it never submitted without asking every
-  host, and the precedence is written once. Every per-job verb runs through
+  and the precedence is written once. A host name from the mirror's index is
+  the *submitting* client's name for it, so it is asked first rather than
+  believed; the local index's name is this machine's and is trusted. Every per-job verb runs through
   `actions.job_verb`: find the host, ask it, insist on a verdict, re-mirror a
   spec field it changed. The CLI and the dashboard call the same functions.
 - What a command does lives in `actions` (with `hosts` and `submitting` for

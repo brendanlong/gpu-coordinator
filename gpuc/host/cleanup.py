@@ -481,8 +481,11 @@ class Evidence:
     force: bool = False
     """A person waives the backup preconditions, and is told so per job."""
     verified: frozenset[str] | None = None
-    """Job ids whose mirror the caller checked itself. When given, it replaces
-    the host's own record of the mirror: only these count as backed up."""
+    """Job ids whose mirror the caller listed itself. When given, a job must be
+    in it *and* have the host's own record of a successful final upload: the
+    listing proves the log is there, the record proves it is the final one --
+    every periodic tick mirrors the log too, so a listing alone would vouch
+    for a job whose last upload failed."""
 
 
 ASKED = Evidence()
@@ -521,9 +524,10 @@ def may_delete(job_id: str, state: JobState, what: str, evidence: Evidence) -> s
         _, why = outputs_confirmed(job_id, state)
         return why
     reasons: list[str] = []
-    mirrored = state.mirrored if evidence.verified is None else job_id in evidence.verified
-    if not mirrored:
-        reasons.append(_not_backed_up(host_s3_prefix(), verified=evidence.verified is not None))
+    if not state.mirrored:
+        reasons.append(_not_backed_up(host_s3_prefix()))
+    elif evidence.verified is not None and job_id not in evidence.verified:
+        reasons.append("not backed up: the mirror has no log for it")
     _, why = outputs_confirmed(job_id, state)
     if why:
         reasons.append(why)
@@ -746,9 +750,7 @@ def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | No
     return False, f"outputs not confirmed uploaded{detail}"
 
 
-def _not_backed_up(prefix: str | None, *, verified: bool = False) -> str:
-    if verified:
-        return "not backed up: the mirror has no log for it"
+def _not_backed_up(prefix: str | None) -> str:
     if prefix is None:
         return "not backed up: no s3_prefix on this host"
     return "not backed up: final upload failed"

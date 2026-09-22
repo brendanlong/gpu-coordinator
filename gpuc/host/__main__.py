@@ -461,6 +461,10 @@ def cmd_purge(args: argparse.Namespace) -> int:
     if refused:
         return _emit(refused)
     verified = _selection(args.verified)
+    if args.verified_file:
+        listed = Path(args.verified_file)
+        verified = _selection(listed.read_text().strip())
+        listed.unlink(missing_ok=True)
     return _emit(
         cleanup.purge(
             older_than_days=args.older_than,
@@ -556,9 +560,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     purge.add_argument(
         "--verified",
-        help="comma-separated job ids whose mirror the caller checked itself; given, "
-        "only these count as backed up, whatever this host's own records say. Empty "
+        help="comma-separated job ids whose mirrored log the caller listed itself; given, "
+        "a job must be in it as well as recorded here to count as backed up. Empty "
         "means none of them are.",
+    )
+    purge.add_argument(
+        "--verified-file",
+        metavar="PATH",
+        help="the same list read from PATH (and PATH removed), for a list too long for argv",
     )
     purge.set_defaults(func=cmd_purge)
 

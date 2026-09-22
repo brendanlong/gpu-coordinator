@@ -670,6 +670,33 @@ def purged_entry(job_id: str, prefix: str | None = "s3://bucket/gpuc/gpubox") ->
     }
 
 
+def test_a_verified_list_too_long_for_an_argument_travels_as_a_file(
+    control_env: Path,
+) -> None:
+    from gpuc.control import clean as clean_mod
+
+    ids = [f"20260101-000000-{i:06x}" for i in range(3000)]
+    client = FakeS3Client(
+        objects={f"bucket/gpuc/gpubox/jobs/{job_id}/log.txt": b"x" for job_id in ids}
+    )
+    puts: dict[str, str] = {}
+
+    class FileSession(StubSession):
+        home = "/home/u/.gpuc"
+        transport = SimpleNamespace(
+            put_file=lambda content, path, mode=0o600: puts.__setitem__(path, content)
+        )
+
+    session = FileSession([{"purged": [], "purge_skipped": [], "removed": []}])
+    clean_mod.purge_host(
+        mirrored_host(), Settings(), session=as_session(session), verify=True, s3_client=client
+    )
+    (call,) = session.calls
+    assert "--verified-file " in call and "--verified " not in call
+    ((path, content),) = puts.items()
+    assert path in call and content.strip().split(",") == ids
+
+
 def mirrored_host() -> HostEntry:
     return host_entry(
         name="gpubox",
@@ -830,11 +857,12 @@ def _probes(monkeypatch: pytest.MonkeyPatch, answers: dict[str, object]) -> list
     return asked
 
 
-def test_a_second_client_finds_a_job_through_the_mirror_without_asking_any_host(
+def test_a_second_client_asks_the_host_the_mirror_names_first(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """This machine never submitted the job, so its local index is empty; the
-    S3 index entry the submitting machine wrote names the host."""
+    S3 index entry the submitting machine wrote names the host -- by *that*
+    machine's name for it, so it is asked first rather than believed."""
     from gpuc.control.actions import find_job_host
     from gpuc.control.s3index import IndexEntry, S3Index
 
@@ -845,12 +873,31 @@ def test_a_second_client_finds_a_job_through_the_mirror_without_asking_any_host(
         IndexEntry(job_id="j1", host="gpubox", s3_prefix="s3://bkt/gpuc/gpubox")
     )
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
-    asked = _probes(monkeypatch, {})
+    asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
 
     entry, index = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
     assert entry.name == "gpubox"
     assert index is not None and index.s3_prefix == "s3://bkt/gpuc/gpubox"
-    assert asked == []
+    assert asked == ["gpubox"]
+
+
+def test_a_mirror_index_naming_a_host_that_does_not_know_the_job_is_not_believed(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another client's `gpu1` may be this client's `lab`."""
+    from gpuc.control.actions import find_job_host
+    from gpuc.control.s3index import IndexEntry, S3Index
+
+    register_host(name="gpu1", ssh="me@mine")
+    register_host(name="lab", ssh="me@theirs")
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(IndexEntry(job_id="j1", host="gpu1"))
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    asked = _probes(monkeypatch, {"lab": {"jobs": [{"job_id": "j1"}]}})
+
+    entry, _ = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert entry.name == "lab"
+    assert asked == ["gpu1", "lab"]
 
 
 def test_a_job_the_mirror_has_no_entry_for_is_found_by_asking_the_hosts(

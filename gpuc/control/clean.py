@@ -3,12 +3,13 @@
 Both are thin: the host package decides what is safe to delete (it is the only
 thing that can read a job's `state.json` without a race), and this module asks
 it and formats the answer. `--purge` adds the one thing the control side can
-do and the host cannot: `--verify` HEADs the mirrored log in S3 with our own
-credentials before the job dir that holds the original goes away.
+do and the host cannot: `--verify` lists the mirrored logs in S3 with our own
+credentials before a job dir that holds the original goes away.
 """
 
 from __future__ import annotations
 
+import os
 import shlex
 from dataclasses import dataclass, field
 from typing import Any
@@ -275,12 +276,7 @@ def _report(host: str, payload: Any, **extra: Any) -> CleanReport:
 
 
 def _purge_args(
-    older_than_days: float,
-    *,
-    dry_run: bool,
-    force: bool,
-    only: list[str] | None,
-    verified: list[str] | None = None,
+    older_than_days: float, *, dry_run: bool, force: bool, only: list[str] | None
 ) -> str:
     args = ["purge", "--older-than", str(older_than_days)]
     if dry_run:
@@ -289,9 +285,22 @@ def _purge_args(
         args.append("--force")
     if only is not None:
         args += ["--only", shlex.quote(",".join(only))]
-    if verified is not None:
-        args += ["--verified", shlex.quote(",".join(verified))]
     return " ".join(args)
+
+
+VERIFIED_INLINE_MAX = 32 * 1024
+"""Longer than this and the id list travels as a file: every id ever mirrored
+under a busy host's prefix, in one argument, would pass the kernel's
+per-argument limit long before the host stopped being worth purging."""
+
+
+def _verified_arg(session: HostSession, verified: list[str]) -> str:
+    joined = ",".join(verified)
+    if len(joined) <= VERIFIED_INLINE_MAX:
+        return f"--verified {shlex.quote(joined)}"
+    path = f"{session.home}/incoming/.verified-{os.getpid()}"
+    session.transport.put_file(joined + "\n", path, 0o600)
+    return f"--verified-file {shlex.quote(path)}"
 
 
 def purge_host(
@@ -327,11 +336,10 @@ def purge_host(
         else (DEFAULT_RETENTION_DAYS if older_than_days is None else older_than_days)
     )
     verified = verified_mirrors(entry, settings, client=s3_client) if verify else None
-    payload = session.host_json(
-        _purge_args(days, dry_run=dry_run, force=force, only=only, verified=verified),
-        timeout=900.0,
-        check=False,
-    )
+    args = _purge_args(days, dry_run=dry_run, force=force, only=only)
+    if verified is not None:
+        args += f" {_verified_arg(session, verified)}"
+    payload = session.host_json(args, timeout=900.0, check=False)
     report = _report(entry.name, payload, purge=True)
     if verified is not None:
         report.verified = [job["job_id"] for job in report.purged if job["job_id"] in verified]
@@ -339,8 +347,7 @@ def purge_host(
 
 
 def _s3_client(settings: Settings) -> Any:
-    """A client for the HEADs. The bucket comes from each job's own recorded
-    prefix, so this works even for a host mirroring outside `s3_bucket`."""
+    """A client for the listing, from `s3_bucket` when there is one."""
     index = S3Index.from_settings(settings)
     if index is not None:
         return index.client

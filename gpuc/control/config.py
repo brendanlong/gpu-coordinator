@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, computed_field
 
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX
@@ -255,10 +255,14 @@ class HostEntry(TolerantModel):
         root = self.root
         return f"{root}/gpuc" if root else "$HOME/.gpuc"
 
+    @computed_field  # still written: a build that reads `kind` routes by it
     @property
     def kind(self) -> HostKind:
         """What the address says: a pod id makes a rental, an ssh target a
-        remote box, neither this machine. Derived, so it cannot disagree."""
+        remote box, neither this machine. Derived, so it cannot disagree, and
+        written to the registry all the same because the build before this
+        one reads it -- and defaults a missing one to `local`, which would
+        send every command for an ssh or rented host to this machine."""
         if self.pod_id is not None:
             return "runpod"
         return "ssh" if self.ssh else "local"

@@ -399,15 +399,37 @@ def test_host_cli_purge_verified_empty_purges_nothing_and_says_the_mirror_has_no
     assert paths.state_file(job_id).exists()
 
 
-def test_host_cli_purge_verified_names_the_jobs_that_count_as_backed_up(
+def test_host_cli_purge_verified_narrows_what_the_records_already_allow(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    verified = make_job(mirrored=False)
-    unverified = make_job(mirrored=True)
-    assert host_cli.main(["purge", "--older-than", "0", "--verified", verified]) == 0
+    """A job needs both: the caller's listing and the host's own record of a
+    successful final upload. The listing cannot vouch for a job the host
+    never recorded, since every periodic tick mirrors the log too."""
+    both = make_job(mirrored=True)
+    recorded_only = make_job(mirrored=True)
+    listed_only = make_job(mirrored=False)
+    argv = ["purge", "--older-than", "0", "--verified", f"{both},{listed_only}"]
+    assert host_cli.main(argv) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert [c["job_id"] for c in payload["purged"]] == [verified]
-    assert [s["job_id"] for s in payload["purge_skipped"]] == [unverified]
+    assert [c["job_id"] for c in payload["purged"]] == [both]
+    assert {s["job_id"]: s["why"] for s in payload["purge_skipped"]} == {
+        recorded_only: "not backed up: the mirror has no log for it",
+        listed_only: "not backed up: no s3_prefix on this host",
+    }
+
+
+def test_host_cli_purge_reads_a_long_verified_list_from_a_file(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = make_job(mirrored=True)
+    listed = gpuc_home / "incoming" / ".verified-1"
+    listed.parent.mkdir(parents=True, exist_ok=True)
+    listed.write_text(f"{job_id}\n")
+    argv = ["purge", "--older-than", "0", "--verified-file", str(listed)]
+    assert host_cli.main(argv) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [c["job_id"] for c in payload["purged"]] == [job_id]
+    assert not listed.exists()
 
 
 def test_host_cli_purge_refuses_a_selection_holding_a_job_id_it_does_not_know(

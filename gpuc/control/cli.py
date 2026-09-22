@@ -1322,7 +1322,8 @@ def build_parser() -> argparse.ArgumentParser:
     clean.add_argument(
         "--verify",
         action="store_true",
-        help="with --purge: HEAD each job's mirrored log.txt in S3 before deleting it",
+        help="with --purge: list the mirrored logs in S3 yourself and purge only jobs "
+        "that have one, on top of the host's own record",
     )
     clean.add_argument(
         "--yes",

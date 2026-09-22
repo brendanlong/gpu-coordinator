@@ -498,10 +498,15 @@ def find_job_host(
         # The local index only: the caller already knows the host, and the
         # entry is a convenience for whoever wants the mirror prefix.
         return registry.require(explicit), LocalIndex().get(job_id)
-    index = JobIndex(settings or load_settings()).get(job_id)
-    if index is not None and index.host in registry.hosts:
-        return registry.hosts[index.host], index
-    for entry in registry.hosts.values():
+    local = LocalIndex().get(job_id)
+    if local is not None and local.host in registry.hosts:
+        return registry.hosts[local.host], local
+    index = local or JobIndex(settings or load_settings()).get(job_id)
+    # A name in the mirror's index is the *submitting* client's name for the
+    # host, which need not be this machine's: it is asked first, not believed.
+    first = [registry.hosts[index.host]] if index and index.host in registry.hosts else []
+    rest = [entry for entry in registry.hosts.values() if entry not in first]
+    for entry in [*first, *rest]:
         try:
             payload = open_session(entry).host_json(f"status {shlex.quote(job_id)}", timeout=60.0)
         except (RemoteError, TransportError):

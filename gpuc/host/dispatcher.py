@@ -41,6 +41,11 @@ from gpuc.host.terminate import TerminateCall
 HEARTBEAT_INTERVAL_S = 5.0
 HEARTBEAT_STALE_S = 30.0
 LOOP_INTERVAL_S = 2.0
+SYNC_STOP_PATIENCE_S = 1800.0
+"""How long a stop request waits on a runner in its final sync before the
+escalation ladder starts. A checkpoint upload can legitimately take this long;
+an upload that is still going half an hour after somebody asked for the job
+to stop is hung, and the cards it holds are wanted."""
 TERMINATE_RETRY_S = 600.0
 MAX_CONSECUTIVE_FAILURES = 20
 RETENTION_INTERVAL_S = 3600.0
@@ -839,22 +844,30 @@ class Dispatcher:
         grace = self.deps.kill_grace_s
         for job_id, entry in list(self.running.items()):
             state = self._state_or_empty(job_id)
-            if state.intent is None or state.phase == "sync":
+            if state.intent is None:
                 continue
             # A request another process wrote -- `gpuc cancel`, or a
             # dispatcher we took over from -- needs a clock of its own, or a
             # runner that never acts on it is never escalated either.
             elapsed = now - self._stop_sent.setdefault(job_id, now)
-            if elapsed <= grace:
+            # A runner in its final sync is honouring the request, and the
+            # upload has no cap by design; but one that is *hung* there holds
+            # the cards for ever, so the ladder starts after a long patience
+            # rather than never.
+            patience = SYNC_STOP_PATIENCE_S if state.phase == "sync" else grace
+            if elapsed <= patience:
                 continue
-            if job_id not in self._stop_escalated:
+            first = job_id not in self._stop_escalated
+            if first:
                 self._stop_escalated.add(job_id)
                 self.log(
                     f"job {job_id}: its runner has not stopped it {elapsed:.0f}s after the "
                     f"{state.intent} request; escalating"
                 )
             JobProcesses.of(state, entry.pid).escalate(
-                elapsed, grace, lambda m, job_id=job_id: self.log(f"job {job_id}: {m}")
+                elapsed - patience + grace,
+                grace,
+                (lambda m, job_id=job_id: self.log(f"job {job_id}: {m}")) if first else None,
             )
 
     @staticmethod
@@ -1433,6 +1446,10 @@ class Dispatcher:
         self.escalate_stops()
         self.launch_ready()
         self.preempt_for_waiting()
+        # The listing is shared by the two walks above and by nothing after
+        # them: a reclaim can take seconds, and a job accepted during it must
+        # be seen by the idle clock.
+        self._queued = None
         self.maybe_reclaim()
         self.sweep_stale_incoming()
         self.maybe_terminate()
