@@ -755,9 +755,10 @@ selection (exit 1, nothing removed); an empty `--only` is exit 2.
   paths. Otherwise `outputs not confirmed uploaded`. Anything unreadable counts
   as content.
 
-`--force` overrides those two and nothing else, per job. `--verify` HEADs each
-candidate's mirrored `log.txt` with your own credentials and purges only what
-answered; without it the host's own record is trusted. `--purge
+`--force` overrides those two and nothing else, per job. `--verify` lists the
+mirrored logs under the host's prefix with your own credentials and lets the
+host purge only the jobs that have one; without it the host's own record is
+trusted. `--purge
 --all-finished` is an age horizon of zero, so it needs `--yes` (or `--dry-run`).
 
 **Automatic, by the host: two horizons.** The dispatcher reclaims disk at

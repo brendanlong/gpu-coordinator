@@ -34,8 +34,8 @@ from gpuc.host import (
 )
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.jobs import JobSpec
+from gpuc.host.procs import KILL_GRACE_S, JobProcesses, boot_id, starttime
 
-KILL_GRACE_S = 15.0
 SAMPLE_INTERVAL_S = 30.0
 ESTIMATE_REFRESH_S = 30.0
 """How often the monitor re-reads the job's estimate while it runs.
@@ -65,134 +65,6 @@ print(f"gpu preflight ok: torch {torch.__version__} cuda {torch.version.cuda} "
 """
 
 
-# -- process facts ------------------------------------------------------------
-# A recorded pid alone proves nothing: pids are reused within a boot and reused
-# from 1 again after a reboot, so "is the process that wrote this file still
-# running?" needs the boot id and the process start time as well.
-
-BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
-
-
-def boot_id() -> str | None:
-    try:
-        return BOOT_ID_PATH.read_text().strip() or None
-    except OSError:
-        return None
-
-
-def parse_starttime(stat: str) -> str | None:
-    """Field 22 of ``/proc/<pid>/stat``, as text.
-
-    Split after the last ``)``: the comm field is parenthesised and may itself
-    contain spaces and parentheses, which breaks a naive ``split()``.
-    """
-    _, sep, rest = stat.rpartition(")")
-    if not sep:
-        return None
-    fields = rest.split()
-    if len(fields) < 20:
-        return None
-    return fields[19]
-
-
-def starttime(pid: int) -> str | None:
-    try:
-        return parse_starttime(Path(f"/proc/{pid}/stat").read_text())
-    except OSError:
-        return None
-
-
-def cmdline(pid: int) -> str:
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return ""
-    return raw.decode("utf-8", "replace").replace("\0", " ").strip()
-
-
-def pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def is_gpuc_process(pid: int) -> bool:
-    return "gpuc.host" in cmdline(pid)
-
-
-def cmdline_argv(pid: int) -> list[str]:
-    """`/proc/<pid>/cmdline` as the argv it actually is.
-
-    Not `cmdline().split()`: that joins the arguments with spaces, and splitting
-    them again tears any argument that contains one into several. The runner
-    starts a job as `bash -c <the whole script>`, so an argument full of words
-    is the ordinary case on this host, not a contrived one.
-    """
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return []
-    if not raw:
-        return []
-    return [arg.decode("utf-8", "replace") for arg in raw.rstrip(b"\0").split(b"\0")]
-
-
-def runner_job_id(argv: Sequence[str]) -> str | None:
-    """The job a `python -m gpuc.host run <job_id>` argv belongs to, or None.
-
-    The other half of `dispatcher._spawn_host_process`, which builds that
-    command: one fact in two modules, so a test pins them together. A runner
-    this stopped recognising would be adopted by nobody.
-    """
-    if len(argv) >= 2 and argv[-2] == "run" and "gpuc.host" in argv:
-        return argv[-1]
-    return None
-
-
-def live_runner_pids() -> dict[str, int]:
-    """Every live `gpuc.host run <job_id>` on this host, by the job it runs.
-
-    The question a recorded pid cannot answer. `launch_ready` writes a job's
-    state `running` before there is a process to name, and the runner pid only
-    after the spawn, so a dispatcher that died between the two left a state
-    naming no runner at all -- while the runner it did start is still going.
-    /proc is the only remaining record of it.
-
-    One walk, because the caller has every job to ask about. A runner that has
-    already exited is not in it even before it is reaped: a defunct process has
-    an empty cmdline.
-    """
-    found: dict[str, int] = {}
-    try:
-        pids = sorted(int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit())
-    except OSError:
-        return found
-    for pid in pids:
-        job_id = runner_job_id(cmdline_argv(pid))
-        if job_id is not None:
-            found.setdefault(job_id, pid)
-    return found
-
-
-def recorded_process_alive(
-    pid: int | None, recorded_boot_id: str | None = None, recorded_starttime: str | None = None
-) -> bool:
-    """Is the *same* process we recorded still running?"""
-    if not pid or not pid_alive(pid):
-        return False
-    current_boot = boot_id()
-    if recorded_boot_id and current_boot and recorded_boot_id != current_boot:
-        return False
-    current_start = starttime(pid)
-    return not (recorded_starttime and current_start and recorded_starttime != current_start)
-
-
 class _Terminated(BaseException):
     """The runner itself was signalled. A BaseException so that no `except
     Exception` in a phase can swallow the shutdown."""
@@ -200,51 +72,6 @@ class _Terminated(BaseException):
     def __init__(self, signum: int) -> None:
         super().__init__(signum)
         self.signum = signum
-
-
-def process_group_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def kill_process_group(
-    pgid: int,
-    *,
-    grace_s: float = KILL_GRACE_S,
-    sleep: Callable[[float], None] = time.sleep,
-    now: Callable[[], float] = time.monotonic,
-    reap: Callable[[], object] | None = None,
-) -> None:
-    """SIGTERM the whole group, then SIGKILL it after `grace_s`.
-
-    The group, not the pid: jobs routinely spawn helper processes (dataloader
-    workers, a `sleep` in a shell wrapper) that would otherwise survive and
-    hold the GPU.
-
-    `reap` must wait() our own direct child if we have one: an unreaped zombie
-    is still a member of its process group, so without it every kill would burn
-    the whole grace period before the group looked empty.
-    """
-    if pgid <= 1:
-        return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = now() + grace_s
-    while now() < deadline:
-        if reap is not None:
-            reap()
-        if not process_group_alive(pgid):
-            return
-        sleep(0.25)
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pgid, signal.SIGKILL)
 
 
 def preflight_command(spec: JobSpec) -> str:
@@ -514,21 +341,13 @@ class JobRunner:
 
     def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
         self.kill_reason = reason
-        unit = self._current_unit
-        if unit is not None:
-            self._log(log, f"stopping scope {unit}: {reason}")
-            if not scope.stop_unit(unit):
-                self._log(log, f"systemctl --user stop {unit} failed; falling back to the group")
-        else:
-            self._log(log, f"killing process group {proc.pid}: {reason}")
-        # Always, scope or not: the group kill is the fallback, and against a
-        # cgroup that is already empty it costs one ProcessLookupError.
-        kill_process_group(
-            proc.pid,
+        JobProcesses(self._current_unit, proc.pid).stop(
+            reason,
             grace_s=self.deps.kill_grace_s,
             sleep=self.deps.sleep,
             now=self.deps.now,
             reap=proc.poll,
+            log=lambda message: self._log(log, message),
         )
 
     def _run_phase(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -95,12 +96,12 @@ def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:
     assert entry.config.ephemeral
     assert entry.seen_at == SEEN_AT
     # Nothing is known about a host nobody has read yet, and it says so.
-    blank = HostEntry(name="gpubox", kind="ssh", ssh="me@box")
+    blank = HostEntry(name="gpubox", ssh="me@box")
     assert (blank.gpus, blank.s3_prefix, blank.seen_at) == ([], None, None)
 
 
 def test_the_provider_block_comes_from_the_address_for_a_config_we_initialise() -> None:
-    address = HostEntry(name="pod1", kind="runpod", pod_id="abc")
+    address = HostEntry(name="pod1", pod_id="abc")
     assert address.provider() == {"kind": "runpod", "pod_id": "abc"}
     assert HostEntry(name="local").provider() is None
     initial = address.initial_config()
@@ -109,14 +110,40 @@ def test_the_provider_block_comes_from_the_address_for_a_config_we_initialise() 
 
 
 def test_a_rental_is_an_address_with_a_pod_behind_it() -> None:
-    """`kind` is stored but decides nothing: only a pod id makes an entry a
-    rental, and only a rental implies a provider block."""
-    assert HostEntry(name="pod1", kind="runpod", pod_id="abc").ephemeral
-    assert HostEntry(name="box", kind="ssh", ssh="me@box", pod_id="abc").ephemeral
-    podless = HostEntry(name="pod1", kind="runpod")
+    """Only a pod id makes an entry a rental, and only a rental implies a
+    provider block."""
+    assert HostEntry(name="pod1", pod_id="abc").ephemeral
+    assert HostEntry(name="box", ssh="me@box", pod_id="abc").ephemeral
+    podless = HostEntry(name="pod1", ssh="root@1.2.3.4")
     assert not podless.ephemeral
     assert podless.provider() is None
     assert not HostEntry(name="local").ephemeral
+
+
+@pytest.mark.parametrize(
+    ("address", "kind"),
+    [
+        ({}, "local"),
+        ({"ssh": "me@box"}, "ssh"),
+        ({"ssh": "root@1.2.3.4", "pod_id": "abc"}, "runpod"),
+        ({"pod_id": "abc"}, "runpod"),
+        # A stored `kind` is a key this build no longer reads: the address decides.
+        ({"kind": "ssh"}, "local"),
+        ({"kind": "runpod", "ssh": "me@box"}, "ssh"),
+        ({"kind": "local", "pod_id": "abc"}, "runpod"),
+    ],
+)
+def test_kind_is_what_the_address_says(address: dict[str, str], kind: str) -> None:
+    entry = HostEntry.model_validate({"name": "h", **address})
+    assert entry.kind == kind
+    assert entry.model_copy(update={"kind": "ssh"}).kind == kind
+
+
+def test_kind_is_not_written_to_the_registry() -> None:
+    """Derived, so there is nothing to store that could disagree with it."""
+    entry = HostEntry(name="box", ssh="me@box")
+    assert "kind" not in json.loads(entry.model_dump_json())
+    assert HostEntry.model_validate_json(entry.model_dump_json()).kind == "ssh"
 
 
 def test_a_pre_split_registry_entry_parses_as_an_address_with_an_empty_cache() -> None:
@@ -145,7 +172,7 @@ def test_a_pre_split_registry_entry_parses_as_an_address_with_an_empty_cache() -
 
 
 def test_with_config_and_with_cache_stamp_when_the_host_was_read() -> None:
-    entry = HostEntry(name="gpubox", kind="ssh", ssh="me@box")
+    entry = HostEntry(name="gpubox", ssh="me@box")
     read = entry.with_config({"host": "gpubox", "gpus": ["0"]}, read_at="2026-01-01T00:00:00+00:00")
     assert read.gpus == ["0"]
     assert read.seen_at == "2026-01-01T00:00:00+00:00"
@@ -232,7 +259,7 @@ def test_config_drift_is_quiet_about_a_config_just_written() -> None:
     entry = host_entry(name="gpuc-1", kind="runpod", pod_id="pod-1", gpus=["GPU-a"])
     assert config_drift(entry.config.to_dict(), entry.config) == []
     # A difference in the provider block reads as a sentence, not as punctuation.
-    fresh = HostEntry(name="gpuc-1", kind="runpod", pod_id="pod-2").initial_config()
+    fresh = HostEntry(name="gpuc-1", pod_id="pod-2").initial_config()
     assert config_drift({"provider": {"kind": "runpod", "pod_id": "pod-1"}}, fresh) == [
         "provider kind=runpod pod_id=pod-1 -> kind=runpod pod_id=pod-2"
     ]

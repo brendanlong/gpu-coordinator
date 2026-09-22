@@ -256,7 +256,7 @@ def test_the_automatic_sweep_leaves_a_job_that_asked_to_keep_its_workdir(
 ) -> None:
     never = job_wanting_its_workdir_kept("never")
     on_success = job_wanting_its_workdir_kept("on_success")
-    result = cleanup.clean(all_finished=True, automatic=True)
+    result = cleanup.clean(all_finished=True, evidence=cleanup.Evidence(automatic=True))
     assert [c.job_id for c in result.removed] == [on_success]
     assert (paths.workdir(never) / "blob.bin").exists()
     assert any(s.job_id == never and s.why == "cleanup: never" for s in result.skipped)
@@ -265,7 +265,7 @@ def test_the_automatic_sweep_leaves_a_job_that_asked_to_keep_its_workdir(
 def test_the_automatic_sweep_leaves_outputs_that_are_still_only_here(gpuc_home: Path) -> None:
     """The sweep must not bin what `purge` refuses to, and `status` warns about."""
     job_id = job_with_outputs_still_only_here()
-    result = cleanup.clean(all_finished=True, automatic=True)
+    result = cleanup.clean(all_finished=True, evidence=cleanup.Evidence(automatic=True))
     assert not result.removed
     assert (paths.workdir(job_id) / "results" / "checkpoint.pt").exists()
     assert any(s.job_id == job_id and "outputs" in s.why for s in result.skipped)
@@ -274,7 +274,10 @@ def test_the_automatic_sweep_leaves_outputs_that_are_still_only_here(gpuc_home: 
     for output in jobs.read_spec(job_id).outputs:
         for destination in destinations.of(output, job_id):
             jobs.record_upload(job_id, destination.uri, output.path, ok_at=jobs.utc_now())
-    assert [c.job_id for c in cleanup.clean(all_finished=True, automatic=True).removed] == [job_id]
+    assert [
+        c.job_id
+        for c in cleanup.clean(all_finished=True, evidence=cleanup.Evidence(automatic=True)).removed
+    ] == [job_id]
 
 
 def test_a_person_naming_the_job_still_takes_it(gpuc_home: Path) -> None:
@@ -288,7 +291,7 @@ def test_a_person_naming_the_job_still_takes_it(gpuc_home: Path) -> None:
 def test_the_automatic_sweep_leaves_a_job_whose_spec_is_unreadable(gpuc_home: Path) -> None:
     job_id = finished_job("succeeded")
     paths.job_dir(job_id).joinpath("spec.json").write_text("{not json")
-    result = cleanup.clean(all_finished=True, automatic=True)
+    result = cleanup.clean(all_finished=True, evidence=cleanup.Evidence(automatic=True))
     assert not result.removed
     assert (paths.workdir(job_id) / "blob.bin").exists()
 
@@ -296,10 +299,102 @@ def test_the_automatic_sweep_leaves_a_job_whose_spec_is_unreadable(gpuc_home: Pa
 def test_the_purge_implied_sweep_is_guarded_too_when_it_is_automatic(gpuc_home: Path) -> None:
     """`retention_days` must not be a way around what `workdir_days` respects."""
     job_id = job_with_outputs_still_only_here()
-    result = cleanup.purge(older_than_days=0.0, automatic=True)
+    result = cleanup.purge(older_than_days=0.0, evidence=cleanup.Evidence(automatic=True))
     assert not result.purged
     assert not result.removed
     assert (paths.workdir(job_id) / "results" / "checkpoint.pt").exists()
+
+
+# -- may_delete: the one retention predicate ---------------------------------
+
+AUTOMATIC = cleanup.Evidence(automatic=True)
+FORCE = cleanup.Evidence(force=True)
+
+
+def mirrored(job_id: str) -> None:
+    jobs.record_upload(job_id, f"s3://bucket/gpuc/jobs/{job_id}", None, ok_at=jobs.utc_now())
+
+
+def may_delete(job_id: str, what: str, evidence: cleanup.Evidence) -> str | None:
+    return cleanup.may_delete(job_id, jobs.read_state(job_id), what, evidence)
+
+
+@pytest.mark.parametrize("what", [cleanup.WORKDIR, cleanup.JOBDIR])
+@pytest.mark.parametrize(
+    "evidence", [cleanup.ASKED, AUTOMATIC, FORCE, cleanup.Evidence(verified=frozenset())]
+)
+def test_may_delete_never_allows_anything_of_an_unfinished_job(
+    gpuc_home: Path, what: str, evidence: cleanup.Evidence
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, status="running")
+    assert may_delete(job_id, what, evidence) == "status running"
+
+
+def test_may_delete_gives_a_person_the_workdir_of_a_finished_job(gpuc_home: Path) -> None:
+    never = job_wanting_its_workdir_kept("never")
+    unconfirmed = job_with_outputs_still_only_here()
+    assert may_delete(never, cleanup.WORKDIR, cleanup.ASKED) is None
+    assert may_delete(unconfirmed, cleanup.WORKDIR, cleanup.ASKED) is None
+
+
+def test_may_delete_refuses_the_automatic_sweep_a_workdir_marked_cleanup_never(
+    gpuc_home: Path,
+) -> None:
+    job_id = job_wanting_its_workdir_kept("never")
+    assert may_delete(job_id, cleanup.WORKDIR, AUTOMATIC) == "cleanup: never"
+    assert (
+        may_delete(job_wanting_its_workdir_kept("on_success"), cleanup.WORKDIR, AUTOMATIC) is None
+    )
+
+
+def test_may_delete_refuses_the_automatic_sweep_outputs_not_confirmed_elsewhere(
+    gpuc_home: Path,
+) -> None:
+    job_id = job_with_outputs_still_only_here()
+    assert may_delete(job_id, cleanup.WORKDIR, AUTOMATIC) == "outputs not confirmed uploaded"
+
+
+def test_may_delete_refuses_a_jobdir_with_no_mirror_unless_forced(gpuc_home: Path) -> None:
+    job_id = finished_job("succeeded")
+    assert may_delete(job_id, cleanup.JOBDIR, cleanup.ASKED) == (
+        "not backed up: no s3_prefix on this host"
+    )
+    assert may_delete(job_id, cleanup.JOBDIR, AUTOMATIC) is not None
+    assert may_delete(job_id, cleanup.JOBDIR, FORCE) is None
+    mirrored(job_id)
+    assert may_delete(job_id, cleanup.JOBDIR, cleanup.ASKED) is None
+
+
+def test_may_delete_refuses_a_mirrored_jobdir_whose_outputs_are_unconfirmed(
+    gpuc_home: Path,
+) -> None:
+    job_id = job_with_outputs_still_only_here()
+    mirrored(job_id)
+    assert may_delete(job_id, cleanup.JOBDIR, cleanup.ASKED) == "outputs not confirmed uploaded"
+    assert may_delete(job_id, cleanup.JOBDIR, FORCE) is None
+
+
+def test_a_verified_set_overrules_a_mirror_the_host_recorded(gpuc_home: Path) -> None:
+    job_id = finished_job("succeeded")
+    mirrored(job_id)
+    unvouched = cleanup.Evidence(verified=frozenset({"some-other-job"}))
+    assert may_delete(job_id, cleanup.JOBDIR, unvouched) == (
+        "not backed up: the mirror has no log for it"
+    )
+
+
+def test_a_verified_set_vouches_for_a_mirror_the_host_never_recorded(gpuc_home: Path) -> None:
+    job_id = finished_job("succeeded")
+    vouched = cleanup.Evidence(verified=frozenset({job_id}))
+    assert may_delete(job_id, cleanup.JOBDIR, cleanup.ASKED) is not None
+    assert may_delete(job_id, cleanup.JOBDIR, vouched) is None
+
+
+def test_a_verified_set_does_not_vouch_for_unconfirmed_outputs(gpuc_home: Path) -> None:
+    job_id = job_with_outputs_still_only_here()
+    vouched = cleanup.Evidence(verified=frozenset({job_id}))
+    assert may_delete(job_id, cleanup.JOBDIR, vouched) == "outputs not confirmed uploaded"
 
 
 def test_clean_keeps_spec_state_and_log(gpuc_home: Path) -> None:

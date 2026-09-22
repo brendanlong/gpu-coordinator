@@ -666,17 +666,44 @@ def purged_entry(job_id: str, prefix: str | None = "s3://bucket/gpuc/gpubox") ->
     }
 
 
+def mirrored_host() -> HostEntry:
+    return host_entry(
+        name="gpubox",
+        ssh="me@gpubox",
+        python="/usr/bin/python3",
+        s3_prefix="s3://bucket/gpuc/gpubox",
+    )
+
+
 def as_session(session: StubSession) -> HostSession:
     return cast("HostSession", session)
 
 
-def test_verify_purges_only_the_jobs_whose_mirror_answers(control_env: Path) -> None:
-    client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+NO_MIRRORED_LOG = "not backed up: the mirror has no log for it"
+
+
+def test_verify_is_one_host_call_carrying_the_ids_the_mirror_has_a_log_for(
+    control_env: Path,
+) -> None:
+    """The listing happens first, here; the host is asked once, with the answer."""
+    client = FakeS3Client(
+        objects={
+            "bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n",
+            "bucket/gpuc/gpubox/jobs/kept/state.json": b"{}",
+            # Another host's prefix, and a job with a state but no log: neither counts.
+            "bucket/gpuc/other/jobs/elsewhere/log.txt": b"hello\n",
+            "bucket/gpuc/gpubox/jobs/nolog/state.json": b"{}",
+        }
+    )
+    entry = mirrored_host()
     session = StubSession(
         [
-            {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
-            {"dry_run": False, "purged": [purged_entry("kept")], "freed_bytes": 1024},
+            {
+                "dry_run": False,
+                "purged": [purged_entry("kept")],
+                "purge_skipped": [{"job_id": "gone", "why": NO_MIRRORED_LOG}],
+                "freed_bytes": 1024,
+            }
         ]
     )
     report = purge_host(
@@ -687,10 +714,169 @@ def test_verify_purges_only_the_jobs_whose_mirror_answers(control_env: Path) -> 
         verify=True,
         s3_client=client,
     )
+    assert session.calls == ["purge --older-than 7.0 --verified kept"]
+    assert session.checked == [False]
     assert report.verified == ["kept"]
     assert [job["job_id"] for job in report.purged] == ["kept"]
-    assert any("no mirrored log" in str(job["why"]) for job in report.purge_skipped)
-    assert "--only kept" in session.calls[1]
+    assert any(job["why"] == NO_MIRRORED_LOG for job in report.purge_skipped)
+    assert "SKIPPED gone  " + NO_MIRRORED_LOG in report.render()
+
+
+def test_verify_with_nothing_mirrored_still_passes_an_empty_verified_list(
+    control_env: Path,
+) -> None:
+    """`--verified ''` is "none of them are backed up", which must not collapse
+    into leaving the flag off and letting the host trust its own records."""
+    entry = mirrored_host()
+    session = StubSession([{"dry_run": True, "purged": []}])
+    report = purge_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        only=["gone"],
+        verify=True,
+        dry_run=True,
+        s3_client=FakeS3Client(),
+    )
+    assert session.calls == ["purge --older-than 0.0 --dry-run --only gone --verified ''"]
+    assert report.purged == []
+    assert report.verified == []
+
+
+def test_verify_asks_the_host_nothing_when_the_mirror_cannot_be_listed(
+    control_env: Path,
+) -> None:
+    """ "Could not check" must not read as "nothing is backed up", and it must
+    not reach the host as a purge either."""
+    from gpuc.control.clean import CleanError
+
+    class Refusing(FakeS3Client):
+        def list_objects_v2(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("AccessDenied")
+
+    entry = mirrored_host()
+    session = StubSession([])
+    with pytest.raises(CleanError, match="AccessDenied"):
+        purge_host(
+            entry,
+            Settings(),
+            session=as_session(session),
+            older_than_days=7.0,
+            verify=True,
+            s3_client=Refusing(),
+        )
+    assert session.calls == []
+
+
+def test_verified_mirrors_are_the_ids_with_a_log_under_the_hosts_prefix(
+    control_env: Path,
+) -> None:
+    from gpuc.control.clean import verified_mirrors
+
+    client = FakeS3Client(
+        objects={
+            "bucket/gpuc/gpubox/jobs/b/log.txt": b"",
+            "bucket/gpuc/gpubox/jobs/a/log.txt": b"",
+            "bucket/gpuc/gpubox/jobs/a/state.json": b"{}",
+            "bucket/gpuc/gpubox/jobs/nolog/state.json": b"{}",
+            "bucket/gpuc/gpubox/jobs/deep/outputs/log.txt": b"",
+            "bucket/gpuc/gpubox-2/jobs/sibling/log.txt": b"",
+            "bucket/gpuc/other/jobs/elsewhere/log.txt": b"",
+        },
+        page_size=2,
+    )
+    assert verified_mirrors(mirrored_host(), Settings(), client=client) == ["a", "b"]
+    assert {call["Prefix"] for call in client.list_calls} == {"gpuc/gpubox/jobs/"}
+    assert len(client.list_calls) > 1  # followed the continuation tokens
+
+
+def test_verified_mirrors_of_a_host_with_no_prefix_is_nothing(control_env: Path) -> None:
+    from gpuc.control.clean import verified_mirrors
+
+    client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/a/log.txt": b""})
+    entry = host_entry(name="gpubox", ssh="me@gpubox")
+    assert verified_mirrors(entry, Settings(), client=client) == []
+    assert client.list_calls == []
+
+
+def test_verified_mirrors_raises_when_the_listing_fails(control_env: Path) -> None:
+    from gpuc.control.clean import CleanError, verified_mirrors
+
+    class Refusing(FakeS3Client):
+        def list_objects_v2(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("AccessDenied")
+
+    with pytest.raises(CleanError, match=r"s3://bucket/gpuc/gpubox/jobs/.*AccessDenied"):
+        verified_mirrors(mirrored_host(), Settings(), client=Refusing())
+
+
+# -- find_job_host --------------------------------------------------------------
+
+
+def _probes(monkeypatch: pytest.MonkeyPatch, answers: dict[str, object]) -> list[str]:
+    """Stand in for `open_session` in `find_job_host`: each host answers its
+    `status <id>` with `answers[name]`. Returns the hosts that were asked."""
+    asked: list[str] = []
+
+    def session(entry: HostEntry, *_: object, **__: object) -> object:
+        asked.append(entry.name)
+        return SimpleNamespace(host_json=lambda *a, **k: answers.get(entry.name, {"jobs": []}))
+
+    monkeypatch.setattr("gpuc.control.actions.open_session", session)
+    return asked
+
+
+def test_a_second_client_finds_a_job_through_the_mirror_without_asking_any_host(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This machine never submitted the job, so its local index is empty; the
+    S3 index entry the submitting machine wrote names the host."""
+    from gpuc.control.actions import find_job_host
+    from gpuc.control.s3index import IndexEntry, S3Index
+
+    register_host(name="first", ssh="me@first")
+    register_host(name="gpubox", ssh="me@gpubox")
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(
+        IndexEntry(job_id="j1", host="gpubox", s3_prefix="s3://bkt/gpuc/gpubox")
+    )
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    asked = _probes(monkeypatch, {})
+
+    entry, index = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert entry.name == "gpubox"
+    assert index is not None and index.s3_prefix == "s3://bkt/gpuc/gpubox"
+    assert asked == []
+
+
+def test_a_job_the_mirror_has_no_entry_for_is_found_by_asking_the_hosts(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing index object is "not indexed", not an error: the probe goes on."""
+    from gpuc.control.actions import find_job_host
+
+    register_host(name="first", ssh="me@first")
+    register_host(name="gpubox", ssh="me@gpubox")
+    client = FakeS3Client()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
+
+    entry, index = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert entry.name == "gpubox"
+    assert index is None
+    assert "gpubox" in asked
+
+
+def test_a_job_no_index_and_no_host_knows_is_not_found(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.actions import NotFound, find_job_host
+
+    register_host(name="gpubox", ssh="me@gpubox")
+    asked = _probes(monkeypatch, {})
+    with pytest.raises(NotFound, match="no registered host knows job j1"):
+        find_job_host("j1", load_registry(), None, Settings())
+    assert asked == ["gpubox"]
 
 
 def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path) -> None:
@@ -711,15 +897,11 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
     assert "purging every finished job (horizon 0)" in report.render()
 
 
-def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> None:
+def test_verify_with_force_passes_both_and_reports_the_forced_purge(control_env: Path) -> None:
     client = FakeS3Client()
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
-    session = StubSession(
-        [
-            {"dry_run": True, "purged": [purged_entry("gone")]},
-            {"dry_run": False, "purged": [purged_entry("gone")], "freed_bytes": 1024},
-        ]
-    )
+    entry = mirrored_host()
+    forced = {**purged_entry("gone"), "forced": True}
+    session = StubSession([{"dry_run": False, "purged": [forced], "freed_bytes": 1024}])
     report = purge_host(
         entry,
         Settings(),
@@ -729,8 +911,10 @@ def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> N
         verify=True,
         s3_client=client,
     )
+    assert session.calls == ["purge --older-than 7.0 --force --verified ''"]
     assert [job["job_id"] for job in report.purged] == ["gone"]
-    assert any("purged anyway because --force" in note for note in report.notes)
+    assert report.verified == []
+    assert "FORCED" in report.render()
 
 
 def test_verify_without_purge_is_refused(
@@ -767,7 +951,7 @@ def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
         purge=True,
         only=["a", "b"],
     )
-    assert session.calls == ["purge --older-than 0.0 --only a,b --sweep-only a,b"]
+    assert session.calls == ["purge --older-than 0.0 --only a,b"]
     assert "--only a,b" in report.render()
     # A host that exits 1 has still said what it deleted; the report is the
     # point of the call, so `clean` must not let the exit code discard it.
@@ -783,15 +967,21 @@ def test_only_without_purge_cleans_just_those_workdirs(control_env: Path) -> Non
     assert session.calls == ["clean --only a"]
 
 
-def test_only_with_verify_purges_what_answered_and_sweeps_what_was_asked(
+def test_only_with_verify_names_the_jobs_and_what_the_mirror_vouches_for(
     control_env: Path,
 ) -> None:
+    """The host scopes purge and sweep to `--only`, and judges the backup by
+    `--verified`: one call, both lists."""
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = mirrored_host()
     session = StubSession(
         [
-            {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
-            {"dry_run": False, "purged": [purged_entry("kept")], "freed_bytes": 1024},
+            {
+                "dry_run": False,
+                "purged": [purged_entry("kept")],
+                "purge_skipped": [{"job_id": "gone", "why": NO_MIRRORED_LOG}],
+                "freed_bytes": 1024,
+            }
         ]
     )
     report = purge_host(
@@ -802,31 +992,8 @@ def test_only_with_verify_purges_what_answered_and_sweeps_what_was_asked(
         verify=True,
         s3_client=client,
     )
+    assert session.calls == ["purge --older-than 0.0 --only kept,gone --verified kept"]
     assert report.verified == ["kept"]
-    assert "--only kept,gone --sweep-only kept,gone" in session.calls[0]
-    # The job whose mirror never answered keeps its dir and still loses its venv.
-    assert session.calls[1].endswith("--only kept --sweep-only kept,gone")
-
-
-def test_a_dry_run_says_the_workdirs_verification_dropped_will_still_go(
-    control_env: Path,
-) -> None:
-    """The host sized its sweep over the dirs it expected to purge, so the
-    workdirs of the jobs we then drop are in neither total."""
-    client = FakeS3Client()
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
-    session = StubSession([{"dry_run": True, "purged": [purged_entry("gone")]}])
-    report = purge_host(
-        entry,
-        Settings(),
-        session=as_session(session),
-        only=["gone"],
-        verify=True,
-        dry_run=True,
-        s3_client=client,
-    )
-    assert report.purged == []
-    assert any("still reclaims their workdirs" in note for note in report.notes)
 
 
 def test_purge_only_needs_no_yes(control_env: Path) -> None:
@@ -927,7 +1094,7 @@ def test_a_bad_workdir_days_value_is_rejected(
 
 def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:
     from gpuc.control.cli import _outputs_lost_ids
-    from gpuc.control.s3index import IndexEntry, S3Index
+    from gpuc.control.s3index import IndexEntry, JobIndex, S3Index
 
     client = FakeS3Client(
         objects={
@@ -939,7 +1106,11 @@ def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path)
         IndexEntry(job_id=job_id, host="pod", s3_prefix="s3://bucket/gpuc/pod")
         for job_id in ("lost", "fine", "missing")
     ]
-    assert _outputs_lost_ids(S3Index("bucket", client), entries) == {"lost"}
+    index = JobIndex(Settings(s3_bucket="bucket"))
+    index.s3 = S3Index("bucket", client)
+    assert _outputs_lost_ids(index, entries) == {"lost"}
+    # No bucket configured: no mirror to read, so nothing is flagged.
+    assert _outputs_lost_ids(JobIndex(Settings()), entries) == set()
 
 
 def test_submit_and_requeue_both_take_no_git() -> None:

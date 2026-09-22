@@ -32,6 +32,7 @@ from gpuc.control.config import (
     config_file,
     forget_host_locked,
     hosts_file,
+    load_settings,
     pod_known_hosts_file,
     read_registry,
     registry_transaction,
@@ -46,6 +47,7 @@ from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.remote import config_file as remote_config_file
 from gpuc.control.s3index import (
     IndexEntry,
+    JobIndex,
     LocalIndex,
     S3Index,
     S3IndexError,
@@ -343,6 +345,9 @@ def host_document(entry: HostEntry) -> dict[str, Any]:
     because that is the shape every consumer of this document already reads.
     """
     document: dict[str, Any] = json.loads(entry.model_dump_json())
+    # Derived from the address, so not in the dump, and the one word a reader
+    # scans the list by.
+    document["kind"] = entry.kind
     config = entry.config.to_dict()
     # The host file's own version says nothing about this document's shape, and
     # beside the address it reads as if it did.
@@ -484,11 +489,16 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
 
 
 def find_job_host(
-    job_id: str, registry: Registry, explicit: str | None
+    job_id: str, registry: Registry, explicit: str | None, settings: Settings | None = None
 ) -> tuple[HostEntry, IndexEntry | None]:
-    index = LocalIndex().get(job_id)
+    """The host a job is on, and its index entry: `--host` if given, else the
+    index (local, then the mirror), else whichever registered host admits to
+    it. An id nothing knows is exit 4, never a guess."""
     if explicit:
-        return registry.require(explicit), index
+        # The local index only: the caller already knows the host, and the
+        # entry is a convenience for whoever wants the mirror prefix.
+        return registry.require(explicit), LocalIndex().get(job_id)
+    index = JobIndex(settings or load_settings()).get(job_id)
     if index is not None and index.host in registry.hosts:
         return registry.hosts[index.host], index
     for entry in registry.hosts.values():
@@ -779,7 +789,7 @@ def logs_from_s3(
     report: Callable[[str], None] = note,
 ) -> LogText:
     s3 = S3Index.from_settings(settings)
-    prefix = (index.s3_prefix if index else None) or entry.s3_prefix
+    prefix = JobIndex(settings).mirror_prefix(job_id, entry)
     if s3 is None or not prefix:
         gone = (
             f"Its job dir was purged from host {entry.name}, so this log no longer exists "

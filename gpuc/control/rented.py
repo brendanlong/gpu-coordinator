@@ -40,7 +40,6 @@ def address_for(name: str, pod: Pod) -> HostEntry | None:
         return None
     return HostEntry(
         name=name,
-        kind="runpod",
         ssh=f"{pod.ssh_direct.username}@{pod.ssh_direct.host}",
         port=pod.ssh_direct.port,
         pod_id=pod.id,

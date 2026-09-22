@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import math
 import os
 import subprocess
@@ -103,11 +102,10 @@ from gpuc.control.remote import (
 )
 from gpuc.control.s3index import (
     IndexEntry,
-    LocalIndex,
+    JobIndex,
     S3Index,
     S3IndexError,
     S3ObjectMissing,
-    job_uri,
 )
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import (
@@ -234,7 +232,6 @@ def _env_updates(args: argparse.Namespace) -> dict[str, str | None]:
 def _address(args: argparse.Namespace) -> HostEntry:
     return HostEntry(
         name=args.name,
-        kind="ssh" if args.ssh else "local",
         ssh=args.ssh,
         port=args.port,
         gpuc_home=args.gpuc_home,
@@ -262,9 +259,7 @@ def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEnt
             f"pod {pod_id} ({pod.name}) is {pod.status} and has no direct SSH endpoint yet, so "
             f"it cannot be asked what it is. Try again once `gpuc pods` shows it RUNNING."
         )
-    return address.model_copy(
-        update={"kind": "runpod", "ssh": reached.ssh, "port": reached.port, "pod_id": pod.id}
-    )
+    return address.model_copy(update={"ssh": reached.ssh, "port": reached.port, "pod_id": pod.id})
 
 
 def cmd_host_add(args: argparse.Namespace) -> int:
@@ -1221,15 +1216,10 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
     <id> --host <name>` is how each one comes back, so `--host H --all` narrows
     it to the host being recovered.
     """
-    complete = True
-    entries = {entry.job_id: entry for entry in LocalIndex().list()}
-    s3 = S3Index.from_settings(settings)
-    if s3 is not None:
-        try:
-            entries.update({e.job_id: e for e in s3.list_index()})
-        except S3IndexError as exc:
-            note(f"could not read the S3 index: {exc}")
-            complete = False
+    index = JobIndex(settings)
+    entries, complete = index.all()
+    if not complete:
+        note("could not read the S3 index; this list may be short")
     elsewhere = [
         entry
         for job_id, entry in sorted(entries.items())
@@ -1239,7 +1229,7 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
         return complete
     scope = f" for host {host}" if host else ""
     print(f"jobs known only to the index{scope} (their host is gone, or lost its state):")
-    lost = _outputs_lost_ids(s3, elsewhere[:MIRROR_STATE_LOOKUPS])
+    lost = _outputs_lost_ids(index, elsewhere[:MIRROR_STATE_LOOKUPS])
     for entry in elsewhere:
         flag = (
             " OUTPUTS LOST (the host went away before they uploaded)"
@@ -1261,26 +1251,18 @@ the answer (did this job's outputs make it off the host?) matters most for the
 handful at the top of a recovery list."""
 
 
-def _outputs_lost_ids(s3: S3Index | None, entries: Sequence[IndexEntry]) -> set[str]:
+def _outputs_lost_ids(index: JobIndex, entries: Sequence[IndexEntry]) -> set[str]:
     """Which of these jobs the mirror records as having lost their outputs.
 
     Best effort: a job whose state.json is missing or unreadable simply does not
     get the flag, because this is a note on a listing, not a decision.
     """
-    if s3 is None:
-        return set()
-    lost: set[str] = set()
-    for entry in entries:
-        if not entry.s3_prefix:
-            continue
-        uri = job_uri(entry.s3_prefix, entry.job_id, "state.json")
-        try:
-            document = json.loads(s3.get_uri(uri))
-        except (S3IndexError, json.JSONDecodeError):
-            continue
-        if isinstance(document, dict) and document.get("outputs_lost"):
-            lost.add(entry.job_id)
-    return lost
+    return {
+        entry.job_id
+        for entry in entries
+        if (document := index.mirrored_state(entry.job_id, entry.s3_prefix))
+        and document.get("outputs_lost")
+    }
 
 
 def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
@@ -1576,7 +1558,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     settings = load_settings()
     check_runpod_args(args)
     registry = named_registry()
-    index = LocalIndex().get(args.job_id)
+    index = JobIndex(settings).get(args.job_id)
     s3 = S3Index.from_settings(settings)
     if s3 is None:
         raise CliError(

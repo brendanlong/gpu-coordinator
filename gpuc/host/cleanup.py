@@ -467,35 +467,83 @@ class CleanResult:
         }
 
 
+@dataclass(frozen=True)
+class Evidence:
+    """What the caller can vouch for, beyond what the job's own records say.
+
+    Every delete goes through `may_delete` with one of these; the flags a
+    person types and the fact that nobody typed anything are both evidence,
+    not separate policies.
+    """
+
+    automatic: bool = False
+    """Nobody typed this: the dispatcher sweeping on its own horizon."""
+    force: bool = False
+    """A person waives the backup preconditions, and is told so per job."""
+    verified: frozenset[str] | None = None
+    """Job ids whose mirror the caller checked itself. When given, it replaces
+    the host's own record of the mirror: only these count as backed up."""
+
+
+ASKED = Evidence()
+"""A person typed the command and waived nothing."""
+
+WORKDIR = "workdir"
+JOBDIR = "jobdir"
+
+
+def may_delete(job_id: str, state: JobState, what: str, evidence: Evidence) -> str | None:
+    """Why this job's `what` may not be deleted, or None if it may.
+
+    Fails closed at every step. `workdir/` is recreatable and only ever
+    deleted because the job's own state says it is over; a sweep nobody typed
+    adds two refusals -- a spec that said `cleanup: never`, and outputs not
+    confirmed elsewhere, since those paths live *inside* the workdir. The
+    whole `jobs/<id>/` is the record of a run, so it needs that record
+    mirrored (or vouched for) and the outputs confirmed, unless a person
+    forces it. A person naming a job with `gpuc clean --only <id>` gets its
+    workdir with no further questions: that is a delete typed with the id in
+    front of them.
+    """
+    if not state.finished:
+        return f"status {state.status}"
+    if what == WORKDIR:
+        if not evidence.automatic:
+            return None
+        try:
+            policy = jobs.read_spec(job_id).cleanup
+        except (RuntimeError, ValueError):
+            # An unreadable spec cannot say it wanted this kept, but it cannot
+            # say it did not either.
+            return "no readable spec.json"
+        if policy == jobs.NEVER:
+            return "cleanup: never"
+        _, why = outputs_confirmed(job_id, state)
+        return why
+    reasons: list[str] = []
+    mirrored = state.mirrored if evidence.verified is None else job_id in evidence.verified
+    if not mirrored:
+        reasons.append(_not_backed_up(host_s3_prefix(), verified=evidence.verified is not None))
+    _, why = outputs_confirmed(job_id, state)
+    if why:
+        reasons.append(why)
+    if reasons and not evidence.force:
+        return "; ".join(reasons)
+    return None
+
+
 def candidates(
     *,
     all_finished: bool = False,
     older_than_days: float | None = None,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
-    automatic: bool = False,
+    evidence: Evidence = ASKED,
 ) -> tuple[list[Candidate], list[Skipped]]:
     """Which finished jobs' workdirs may be removed, and why the rest may not.
 
-    Fails closed at every step: a job with no readable state, a job that is not
-    finished, and (under `--older-than`) a job whose end time cannot be read are
-    all skipped. A workdir is only ever removed because its own `state.json`
-    says the job is over.
-
-    `automatic` is the dispatcher sweeping on its own horizon rather than a
-    person typing a delete, and it adds the two guards that only make sense
-    when nobody is watching:
-
-    - a job whose spec says `cleanup: never`, which is the one way to ask for
-      a workdir to be kept and would otherwise mean "kept for a day";
-    - a job whose `outputs:` are not confirmed to be anywhere else. Those paths
-      live *inside* the workdir, so this is the difference between reclaiming a
-      venv and binning the only copy of a checkpoint -- the same precondition
-      `purge` fails closed on, and the one the `outputs not uploaded` warning in
-      `gpuc status` is pointing at.
-
-    A person can still take both with `gpuc clean --only <id>`, which is a
-    delete somebody typed with the id in front of them.
+    Selection first -- the ids named, else the age horizon, else every
+    finished job -- then `may_delete` on each.
     """
     moment = now or datetime.now(UTC)
     wanted = None if only is None else set(only)
@@ -524,21 +572,10 @@ def candidates(
         elif not all_finished:
             skipped.append(Skipped(job_id, "no selection given"))
             continue
-        if automatic:
-            try:
-                policy = jobs.read_spec(job_id).cleanup
-            except (RuntimeError, ValueError):
-                # An unreadable spec cannot say it wanted this kept, but it
-                # cannot say it did not either.
-                skipped.append(Skipped(job_id, "no readable spec.json"))
-                continue
-            if policy == jobs.NEVER:
-                skipped.append(Skipped(job_id, "cleanup: never"))
-                continue
-            confirmed, why = outputs_confirmed(job_id, state)
-            if not confirmed and why:
-                skipped.append(Skipped(job_id, why))
-                continue
+        why = may_delete(job_id, state, WORKDIR, evidence)
+        if why:
+            skipped.append(Skipped(job_id, why))
+            continue
         picked.append(
             Candidate.of(state, job_id=job_id, bytes=reclaimable_bytes(workdir), age_days=age_days)
         )
@@ -613,14 +650,14 @@ def clean(
     dry_run: bool = False,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
-    automatic: bool = False,
+    evidence: Evidence = ASKED,
 ) -> CleanResult:
     picked, skipped = candidates(
         all_finished=all_finished,
         older_than_days=older_than_days,
         now=now,
         only=only,
-        automatic=automatic,
+        evidence=evidence,
     )
     result = CleanResult(dry_run=dry_run, skipped=skipped, s3_prefix=host_s3_prefix())
     for candidate in picked:
@@ -709,7 +746,9 @@ def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | No
     return False, f"outputs not confirmed uploaded{detail}"
 
 
-def _not_backed_up(prefix: str | None) -> str:
+def _not_backed_up(prefix: str | None, *, verified: bool = False) -> str:
+    if verified:
+        return "not backed up: the mirror has no log for it"
     if prefix is None:
         return "not backed up: no s3_prefix on this host"
     return "not backed up: final upload failed"
@@ -719,20 +758,18 @@ def purge_candidates(
     *,
     older_than_days: float = DEFAULT_RETENTION_DAYS,
     now: datetime | None = None,
-    force: bool = False,
     only: Iterable[str] | None = None,
+    evidence: Evidence = ASKED,
 ) -> tuple[list[Candidate], list[Skipped]]:
     """Which finished jobs' whole directories may go, and why the rest may not.
 
-    Fails closed exactly as `clean` does -- unreadable state, not finished, no
-    usable `ended_at`, too young -- and then adds the two preconditions that
-    make deleting the record itself safe: the mirror record (log and state are
-    mirrored) and confirmed outputs. `force` overrides only those last two, and
-    the candidate is marked `forced` so the report can say so.
+    The same selection as `candidates` -- named ids replace the age gate,
+    including for a job whose `ended_at` never got written, which is exactly
+    the stuck kind somebody names -- then `may_delete` on the job dir. A
+    forced candidate is marked so the report can say so.
     """
     moment = now or datetime.now(UTC)
     wanted = None if only is None else set(only)
-    prefix = host_s3_prefix()
     picked: list[Candidate] = []
     skipped: list[Skipped] = []
     for job_id in jobs.list_job_ids():
@@ -743,31 +780,27 @@ def purge_candidates(
             skipped.append(finished)
             continue
         state, age_days = finished
-        # The age gate is how an unnamed job is chosen, so naming ids replaces
-        # it rather than adding to it -- including for a job whose `ended_at`
-        # never got written, which is exactly the stuck kind somebody names.
-        # The preconditions below are not waived by naming anything.
         if wanted is None:
             too_young = _too_young(job_id, age_days, older_than_days)
             if too_young:
                 skipped.append(too_young)
                 continue
-        reasons: list[str] = []
-        if not state.mirrored:
-            reasons.append(_not_backed_up(prefix))
-        confirmed, why = outputs_confirmed(job_id, state)
-        if not confirmed and why:
-            reasons.append(why)
-        if reasons and not force:
-            skipped.append(Skipped(job_id, "; ".join(reasons)))
+        why = may_delete(job_id, state, JOBDIR, evidence)
+        if why:
+            skipped.append(Skipped(job_id, why))
             continue
+        # Forced means: without the waiver it would have been refused -- judged
+        # against the same mirror evidence, so `--verify --force` still marks a
+        # job the mirror has no log for.
+        unforced = Evidence(verified=evidence.verified)
+        forced = evidence.force and may_delete(job_id, state, JOBDIR, unforced) is not None
         picked.append(
             Candidate.of(
                 state,
                 job_id=job_id,
                 bytes=reclaimable_bytes(paths.job_dir(job_id)),
                 age_days=age_days,
-                forced=bool(reasons),
+                forced=forced,
             )
         )
     return picked, skipped
@@ -788,28 +821,19 @@ def purge(
     *,
     older_than_days: float = DEFAULT_RETENTION_DAYS,
     dry_run: bool = False,
-    force: bool = False,
     now: datetime | None = None,
     only: Iterable[str] | None = None,
-    sweep_only: Iterable[str] | None = None,
-    automatic: bool = False,
+    evidence: Evidence = ASKED,
 ) -> CleanResult:
     """Remove whole job dirs, then run the ordinary workdir sweep over the rest.
 
     `--purge` implying `clean` is what makes one command enough: the jobs a
     purge refuses (no mirror, unconfirmed outputs) are exactly the ones whose
-    workdirs are still worth reclaiming. `only` therefore narrows what may be
-    *purged* and nothing else -- it exists for the control side's `--verify`,
-    which cannot let an unverified job dir go but has no reason to keep its
-    venv either.
-
-    `sweep_only` narrows that implied sweep, and is what a user naming job ids
-    wants: purging two jobs should not also reclaim every other finished job's
-    venv. The two are separate because `--verify` needs both at once -- purge
-    the ids whose mirror answered, sweep the ids the user asked about.
+    workdirs are still worth reclaiming. `only` scopes both: purging two jobs
+    should not also reclaim every other finished job's venv.
     """
     picked, skipped = purge_candidates(
-        older_than_days=older_than_days, now=now, force=force, only=only
+        older_than_days=older_than_days, now=now, only=only, evidence=evidence
     )
     result = CleanResult(dry_run=dry_run, purge_skipped=skipped, s3_prefix=host_s3_prefix())
     for candidate in picked:
@@ -826,14 +850,14 @@ def purge(
     # Named ids replace the age gate here too, or `--purge --only X` would
     # reclaim less than a bare `clean --only X` does for a job whose state
     # never recorded when it ended.
-    named = sweep_only is not None
+    named = only is not None
     sweep = clean(
         all_finished=named,
         older_than_days=None if named else older_than_days,
         dry_run=dry_run,
         now=now,
-        only=sweep_only,
-        automatic=automatic,
+        only=only,
+        evidence=evidence,
     )
     # In a dry run the purged dirs are still there, so the sweep sees their
     # workdirs too; counting both would report the same bytes twice.

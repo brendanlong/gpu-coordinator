@@ -219,7 +219,6 @@ class HostEntry(TolerantModel):
     """
 
     name: str = ""
-    kind: HostKind = "local"
     ssh: str | None = None
     port: int = 22
     gpuc_home: str | None = None
@@ -257,9 +256,16 @@ class HostEntry(TolerantModel):
         return f"{root}/gpuc" if root else "$HOME/.gpuc"
 
     @property
+    def kind(self) -> HostKind:
+        """What the address says: a pod id makes a rental, an ssh target a
+        remote box, neither this machine. Derived, so it cannot disagree."""
+        if self.pod_id is not None:
+            return "runpod"
+        return "ssh" if self.ssh else "local"
+
+    @property
     def ephemeral(self) -> bool:
-        """A rental: there is a pod behind this address. The one fact `kind`
-        adds is which provider, and only a rental has one."""
+        """A rental: there is a pod behind this address."""
         return self.pod_id is not None
 
     def provider(self) -> dict[str, Any] | None:

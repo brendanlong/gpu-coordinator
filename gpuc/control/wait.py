@@ -12,7 +12,6 @@ impatient or as forgiving as it likes about a host it cannot reach.
 
 from __future__ import annotations
 
-import json
 import shlex
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -32,7 +31,7 @@ from gpuc.control.actions import (
 from gpuc.control.config import ConfigError, HostEntry, Reporter, Settings, load_settings
 from gpuc.control.providers.base import Provider
 from gpuc.control.remote import HostSession, RemoteError, open_session
-from gpuc.control.s3index import LocalIndex, S3Index, S3IndexError, S3ObjectMissing, job_uri
+from gpuc.control.s3index import JobIndex, job_uri
 from gpuc.control.status import JobView
 from gpuc.control.transport import TransportError
 from gpuc.host.jobs import FINISHED_STATUSES
@@ -166,9 +165,12 @@ class Watch:
         self.settings = settings if settings is not None else load_settings()
         self.report = report
         self.provider = provider
+        self.index = JobIndex(self.settings)
         self.entries = {entry.name: entry for _, entry in targets}
         self.jobs = {
-            job_id: Watched(job_id, entry.name, mirror_prefix=mirror_prefix(job_id, entry))
+            job_id: Watched(
+                job_id, entry.name, mirror_prefix=self.index.mirror_prefix(job_id, entry)
+            )
             for job_id, entry in targets
         }
         self.by_host: dict[str, list[str]] = {}
@@ -305,31 +307,23 @@ class Watch:
         if gone is None and now - since < TROUBLE_GRACE_S:
             return
         waited = status_mod.format_duration(now - since)
-        # One index, not one per job: it holds a boto3 client, and twenty jobs
-        # on a host that died is twenty of them.
-        s3 = S3Index.from_settings(self.settings)
         for watched in pending:
             # The mirror before giving up, and only now: the spec's rule is
             # that monitoring asks the host and reads the mirror when the host
             # is gone. A rental that idled itself down after finishing the job
             # is exactly that, and reporting its success as "could not ask"
             # would be wrong about the one run the user was waiting for.
-            if self._from_mirror(watched, s3):
+            if self._from_mirror(watched):
                 continue
             watched.error = f"host {name} could not be asked for {waited}: {why}"
 
-    def _from_mirror(self, watched: Watched, s3: S3Index | None) -> bool:
+    def _from_mirror(self, watched: Watched) -> bool:
         """This job's outcome from S3, if the mirror has a terminal one."""
-        if s3 is None or not watched.mirror_prefix:
+        document = self.index.mirrored_state(watched.job_id, watched.mirror_prefix)
+        if document is None or not watched.mirror_prefix:
             return False
         uri = job_uri(watched.mirror_prefix, watched.job_id, "state.json")
-        try:
-            document = json.loads(s3.get_uri(uri))
-        except (S3IndexError, S3ObjectMissing, json.JSONDecodeError, OSError):
-            return False
-        if not isinstance(document, dict):
-            return False
-        indexed = LocalIndex().get(watched.job_id)
+        indexed = self.index.get(watched.job_id)
         # Through `job_views`, so another build's state.json is read as
         # tolerantly here as a host's own answer is. The two fields the file
         # cannot carry are supplied: `name` lives in the spec, and
@@ -359,16 +353,6 @@ class Watch:
     def _clear_trouble(self, name: str) -> None:
         if self._trouble.pop(name, None) is not None:
             self.report(f"host {name} is answering again")
-
-
-def mirror_prefix(job_id: str, entry: HostEntry) -> str | None:
-    """Where this job's own mirror is: the index's answer, else the host's.
-
-    The job's is the one that counts -- a host whose `s3_prefix` changed after
-    the job ran still has the old jobs under the old prefix.
-    """
-    indexed = LocalIndex().get(job_id)
-    return (indexed.s3_prefix if indexed else None) or entry.s3_prefix
 
 
 def start(

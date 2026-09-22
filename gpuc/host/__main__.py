@@ -446,17 +446,18 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 def cmd_purge(args: argparse.Namespace) -> int:
     only = _selection(args.only)
-    sweep_only = _selection(args.sweep_only)
-    refused = _refusal(args.dry_run, only, sweep_only)
+    refused = _refusal(args.dry_run, only)
     if refused:
         return _emit(refused)
+    verified = _selection(args.verified)
     return _emit(
         cleanup.purge(
             older_than_days=args.older_than,
             dry_run=args.dry_run,
-            force=args.force,
             only=only,
-            sweep_only=sweep_only,
+            evidence=cleanup.Evidence(
+                force=args.force, verified=None if verified is None else frozenset(verified)
+            ),
         )
     )
 
@@ -539,14 +540,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     purge.add_argument(
         "--only",
-        help="comma-separated job ids that may be purged, and no others, whatever their "
-        "age; the implied workdir sweep is unaffected. Empty means purge nothing.",
+        help="comma-separated job ids that may be purged (and swept), and no others, "
+        "whatever their age. Empty means purge nothing.",
     )
     purge.add_argument(
-        "--sweep-only",
-        help="comma-separated job ids the implied workdir sweep may touch, and no "
-        "others, whatever their age; by default it covers every finished job past "
-        "the horizon",
+        "--verified",
+        help="comma-separated job ids whose mirror the caller checked itself; given, "
+        "only these count as backed up, whatever this host's own records say. Empty "
+        "means none of them are.",
     )
     purge.set_defaults(func=cmd_purge)
 

@@ -90,7 +90,7 @@ def test_every_finished_status_is_purgeable_once_old_and_mirrored(
 @pytest.mark.parametrize("force", [False, True])
 def test_a_live_job_is_never_purged(gpuc_home: Path, status: str, force: bool) -> None:
     job_id = make_job(status=status, mirrored=True)
-    result = cleanup.purge(older_than_days=0.0, force=force)
+    result = cleanup.purge(older_than_days=0.0, evidence=cleanup.Evidence(force=force))
     assert result.purged == []
     assert why(result, job_id) == f"status {status}"
     assert paths.spec_file(job_id).exists()
@@ -120,7 +120,7 @@ def test_a_job_with_a_prefix_but_no_record_says_the_upload_failed(gpuc_home: Pat
 
 def test_force_purges_an_unmirrored_job_and_says_so(gpuc_home: Path) -> None:
     job_id = make_job(mirrored=False)
-    result = cleanup.purge(older_than_days=7.0, force=True)
+    result = cleanup.purge(older_than_days=7.0, evidence=cleanup.Evidence(force=True))
     assert [(c.job_id, c.forced) for c in result.purged] == [(job_id, True)]
     assert not paths.job_dir(job_id).exists()
 
@@ -135,7 +135,7 @@ def test_a_job_with_no_usable_ended_at_is_kept(gpuc_home: Path) -> None:
 def test_unreadable_state_fails_closed(gpuc_home: Path) -> None:
     job_id = make_job()
     paths.state_file(job_id).write_text("{ this is not json")
-    result = cleanup.purge(older_than_days=0.0, force=True)
+    result = cleanup.purge(older_than_days=0.0, evidence=cleanup.Evidence(force=True))
     assert why(result, job_id) == "no readable state.json"
     assert paths.job_dir(job_id).is_dir()
 
@@ -308,14 +308,15 @@ def test_the_secrets_file_goes_with_the_purged_job(gpuc_home: Path) -> None:
     assert not paths.job_env_file(job_id).exists()
 
 
-def test_only_restricts_what_may_be_purged_but_not_the_sweep(gpuc_home: Path) -> None:
+def test_only_scopes_both_the_purge_and_the_implied_sweep(gpuc_home: Path) -> None:
+    """What `gpuc clean --purge --only` sends: purge one job, sweep no others."""
     keep = make_job()
     go = make_job()
     result = cleanup.purge(older_than_days=7.0, only=[go])
     assert [c.job_id for c in result.purged] == [go]
-    # The other job dir survives, but the sweep still reclaimed its workdir.
+    assert result.removed == []
     assert paths.state_file(keep).exists()
-    assert not paths.workdir(keep).exists()
+    assert paths.workdir(keep).is_dir()
 
 
 def test_only_nothing_purges_nothing(gpuc_home: Path) -> None:
@@ -325,23 +326,16 @@ def test_only_nothing_purges_nothing(gpuc_home: Path) -> None:
     assert paths.state_file(job_id).exists()
 
 
-def test_sweep_only_keeps_the_implied_sweep_off_every_other_job(gpuc_home: Path) -> None:
-    """What `gpuc clean --purge --only` sends: purge one job, sweep no others."""
-    keep = make_job()
-    go = make_job()
-    result = cleanup.purge(older_than_days=7.0, only=[go], sweep_only=[go])
-    assert [c.job_id for c in result.purged] == [go]
-    assert result.removed == []
-    assert paths.workdir(keep).is_dir()
-
-
-def test_sweep_only_still_reclaims_a_named_job_that_could_not_be_purged(
+def test_a_named_job_the_caller_could_not_verify_is_swept_but_not_purged(
     gpuc_home: Path,
 ) -> None:
     """The `--verify` shape: purge what the mirror confirmed, sweep what was asked."""
     unverified = make_job()
-    result = cleanup.purge(older_than_days=7.0, only=[], sweep_only=[unverified])
+    result = cleanup.purge(
+        older_than_days=7.0, only=[unverified], evidence=cleanup.Evidence(verified=frozenset())
+    )
     assert result.purged == []
+    assert why(result, unverified) == "not backed up: the mirror has no log for it"
     assert [c.job_id for c in result.removed] == [unverified]
     assert paths.state_file(unverified).exists()
     assert not paths.workdir(unverified).exists()
@@ -378,16 +372,42 @@ def test_host_cli_purge_only_empty_means_none(
     assert json.loads(capsys.readouterr().out)["purged"] == []
 
 
-def test_host_cli_purge_sweep_only_scopes_the_sweep(
+def test_host_cli_purge_only_scopes_the_sweep(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     keep = make_job()
     go = make_job()
-    assert host_cli.main(["purge", "--older-than", "0", "--only", go, "--sweep-only", go]) == 0
+    assert host_cli.main(["purge", "--older-than", "0", "--only", go]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [c["job_id"] for c in payload["purged"]] == [go]
     assert payload["removed"] == []
     assert paths.workdir(keep).is_dir()
+
+
+def test_host_cli_purge_verified_empty_purges_nothing_and_says_the_mirror_has_no_log(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host's own mirror record says yes; the caller checked and found
+    nothing, and the caller's answer is the one that counts."""
+    job_id = make_job(mirrored=True)
+    assert host_cli.main(["purge", "--older-than", "0", "--verified", ""]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["purged"] == []
+    assert [(s["job_id"], s["why"]) for s in payload["purge_skipped"]] == [
+        (job_id, "not backed up: the mirror has no log for it")
+    ]
+    assert paths.state_file(job_id).exists()
+
+
+def test_host_cli_purge_verified_names_the_jobs_that_count_as_backed_up(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    verified = make_job(mirrored=False)
+    unverified = make_job(mirrored=True)
+    assert host_cli.main(["purge", "--older-than", "0", "--verified", verified]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [c["job_id"] for c in payload["purged"]] == [verified]
+    assert [s["job_id"] for s in payload["purge_skipped"]] == [unverified]
 
 
 def test_host_cli_purge_refuses_a_selection_holding_a_job_id_it_does_not_know(
@@ -397,14 +417,8 @@ def test_host_cli_purge_refuses_a_selection_holding_a_job_id_it_does_not_know(
     pair, and the half this would delete does not come back."""
     job_id = make_job()
     selection = f"{job_id},20260101-000000-typo11"
-    assert (
-        host_cli.main(
-            ["purge", "--older-than", "0", "--only", selection, "--sweep-only", selection]
-        )
-        == 1
-    )
+    assert host_cli.main(["purge", "--older-than", "0", "--only", selection]) == 1
     payload = json.loads(capsys.readouterr().out)
-    # Named once, though both flags carried it.
     assert payload["errors"] == [
         "20260101-000000-typo11: no job with that id on this host",
         "refused the whole selection: nothing was removed",
@@ -416,7 +430,9 @@ def test_host_cli_purge_refuses_a_selection_holding_a_job_id_it_does_not_know(
 
 def test_naming_a_running_job_neither_purges_it_nor_takes_its_workdir(gpuc_home: Path) -> None:
     job_id = make_job(status="running")
-    result = cleanup.purge(older_than_days=0.0, force=True, only=[job_id], sweep_only=[job_id])
+    result = cleanup.purge(
+        older_than_days=0.0, only=[job_id], evidence=cleanup.Evidence(force=True)
+    )
     assert result.purged == [] and result.removed == []
     assert [s.why for s in result.purge_skipped] == ["status running"]
     assert paths.workdir(job_id).is_dir()
@@ -427,6 +443,6 @@ def test_purging_a_named_job_does_not_need_a_usable_ended_at(gpuc_home: Path) ->
     short; a bare `clean --only` would still reclaim its workdir."""
     job_id = make_job()
     jobs.update_state(job_id, ended_at=None)
-    result = cleanup.purge(older_than_days=7.0, only=[job_id], sweep_only=[job_id])
+    result = cleanup.purge(older_than_days=7.0, only=[job_id])
     assert [c.job_id for c in result.purged] == [job_id]
     assert not paths.job_dir(job_id).exists()

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import destinations, jobs, paths, queue, runner, sync
+from gpuc.host import destinations, jobs, paths, procs, queue, runner, sync
 from gpuc.host.jobs import HostConfig, JobState
 from gpuc.host.runner import RunnerDeps
 from tests.conftest import (
@@ -317,27 +317,6 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
-def test_kill_process_group_escalates_to_sigkill(tmp_path: Path) -> None:
-    ready = tmp_path / "ready"
-    proc = subprocess.Popen(
-        ["bash", "-c", f"trap '' TERM; touch {ready}; sleep 60"], start_new_session=True
-    )
-    try:
-        _wait_until(ready.exists, timeout=10)
-        start = time.monotonic()
-        runner.kill_process_group(proc.pid, grace_s=1.0, reap=proc.poll)
-        assert proc.wait(timeout=10) == -9
-        assert 1.0 <= time.monotonic() - start < 10
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-
-
-def test_kill_process_group_ignores_a_dead_group() -> None:
-    runner.kill_process_group(0)
-    runner.kill_process_group(2**30)
-
-
 def test_state_records_the_phase_and_pgid_while_running(gpuc_home: Path) -> None:
     job_id = prepare(command="sleep 5")
     observed: list[tuple[str | None, int | None]] = []
@@ -421,7 +400,7 @@ def test_sigterm_kills_the_job_group_and_writes_failed_terminated(gpuc_home: Pat
         pgid = wait_for_job_pgid(job_id)
         proc.send_signal(signal.SIGTERM)
         assert proc.wait(timeout=60) == runner.TERMINATED_EXIT_CODE
-        _wait_until(lambda: not runner.process_group_alive(pgid))
+        _wait_until(lambda: not procs.process_group_alive(pgid))
     finally:
         if proc.poll() is None:
             proc.kill()

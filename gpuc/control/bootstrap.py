@@ -20,6 +20,7 @@ from gpuc.control.gpuinfo import discover, summarize
 from gpuc.control.remote import (
     HostSession,
     env_prefix,
+    host_python,
     parse_last_json,
     read_remote_config,
     resolve_home,
@@ -384,9 +385,8 @@ def derive_env(
 def ensure_layout(transport: Transport, entry: HostEntry, home: str, python: str) -> None:
     """Create gpuc home and its subdirectories 0700, using the host's own code."""
     transport.run(
-        f'{env_prefix(entry.env)}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" '
-        f'"{python}" '
-        f'-c "from gpuc.host import paths; paths.ensure_layout()"',
+        f'{host_python(python, home, entry.env)} -c "from gpuc.host import paths; '
+        f'paths.ensure_layout()"',
         check=True,
     )
 
@@ -420,14 +420,27 @@ def driver_version(health: dict[str, Any]) -> str | None:
     return None
 
 
+STALE_UNITS = ("gpuc-reconcile.timer", "gpuc-reconcile.service")
+"""Units an earlier build installed and no build serves any more; left in
+place they fail every minute for ever. Removed best-effort on every bootstrap."""
+
+
+def remove_stale_units(transport: Transport) -> None:
+    units = " ".join(STALE_UNITS)
+    files = " ".join(f"$HOME/.config/systemd/user/{unit}" for unit in STALE_UNITS)
+    transport.run(
+        f"systemctl --user disable --now {units} >/dev/null 2>&1; rm -f {files}; true",
+        check=False,
+    )
+
+
 def start_dispatcher(session: HostSession) -> int:
     # The dispatcher re-derives PATH and the host env from config.json itself;
     # setting them here means the very first process in the chain already has
     # them, before it has read anything.
     command = (
-        f"{remote_path(session.entry)} {env_prefix(session.entry.env)}"
-        f'GPUC_HOME="{session.home}" PYTHONPATH="{session.home}/pkg" '
-        f'"{session.python}" '
+        f"{remote_path(session.entry)} "
+        f"{host_python(session.python, session.home, session.entry.env)} "
         f'-c "from gpuc.host import dispatcher; print(dispatcher.spawn_detached_dispatcher())"'
     )
     result = session.transport.run(command, check=False)
@@ -608,6 +621,7 @@ def bootstrap_host(
         warnings.append(warning)
         report(f"WARNING: {warning}")
 
+    remove_stale_units(transport)
     pid = start_dispatcher(session)
     report(f"dispatcher running (pid {pid})")
 
