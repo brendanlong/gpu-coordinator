@@ -155,13 +155,20 @@ def projected_starts(
             cards.append(plan.Card(row["uuid"], True, release(row["uuid"])))
         else:
             theirs += 1
+    # The queue from the same snapshot as everything else in this document:
+    # listed separately, a job the dispatcher claimed in between would be
+    # reported queued with no start time and no reason.
+    queued = sorted(
+        queue.QueueEntry(state.priority, job_id)
+        for job_id, state in states.items()
+        if state.status == "queued"
+    )
     requests: list[plan.Request] = []
-    for entry in queue.list_queued():
+    for entry in queued:
         spec = _spec(entry.job_id)
-        state = states.get(entry.job_id)
-        if spec is None or state is None:
-            # Accepted since `states` was read, or a spec the dispatcher is
-            # about to fail: the next call will say.
+        state = states[entry.job_id]
+        if spec is None:
+            # A spec the dispatcher is about to fail: the next call will say.
             continue
         estimate = state.estimated_runtime_min
         requests.append(
@@ -259,7 +266,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "draining": paths.draining_file().exists(),
                 "dispatcher_heartbeat_age_s": None if heartbeat is None else round(heartbeat, 1),
                 "queue": [
-                    {"priority": e.priority, "job_id": e.job_id} for e in queue.list_queued()
+                    {"priority": state.priority, "job_id": job_id}
+                    for job_id, state in sorted(
+                        states.items(), key=lambda item: (item[1].priority, item[0])
+                    )
+                    if state.status == "queued"
                 ],
                 "jobs": entries,
             },

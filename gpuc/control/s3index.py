@@ -276,17 +276,17 @@ class JobIndex:
             entry = self.s3.get_index(job_id)
         return entry
 
-    def all(self) -> tuple[dict[str, IndexEntry], bool]:
-        """Every job either index knows, by id, and whether that is the whole
-        list: a mirror that could not be read leaves it short."""
+    def all(self) -> tuple[dict[str, IndexEntry], str | None]:
+        """Every job either index knows, by id, and why that may not be the
+        whole list: the error a mirror that could not be read gave, or None."""
         entries = {entry.job_id: entry for entry in self.local.list()}
         if self.s3 is None:
-            return entries, True
+            return entries, None
         try:
             entries.update({e.job_id: e for e in self.s3.list_index()})
-        except S3IndexError:
-            return entries, False
-        return entries, True
+        except S3IndexError as exc:
+            return entries, f"could not read the S3 index: {exc}"
+        return entries, None
 
     def mirror_prefix(self, job_id: str, entry: HostEntry) -> str | None:
         """Where this job's own mirror is: the index's answer, else the host's.

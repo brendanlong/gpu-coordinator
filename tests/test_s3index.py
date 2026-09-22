@@ -178,9 +178,9 @@ def test_job_index_all_merges_both_indexes(tmp_path: Path) -> None:
     S3Index("bkt", client).put_index(IndexEntry(job_id="remote", host="pod"))
     index = job_index(tmp_path, client)
     index.local.record(IndexEntry(job_id="local", host="gpubox"))
-    entries, complete = index.all()
+    entries, short = index.all()
     assert sorted(entries) == ["local", "remote"]
-    assert complete
+    assert short is None
 
 
 def test_job_index_all_is_incomplete_when_the_mirror_cannot_be_listed(tmp_path: Path) -> None:
@@ -192,9 +192,9 @@ def test_job_index_all_is_incomplete_when_the_mirror_cannot_be_listed(tmp_path: 
 
     index = job_index(tmp_path, Broken())
     index.local.record(IndexEntry(job_id="local", host="gpubox"))
-    entries, complete = index.all()
+    entries, short = index.all()
     assert list(entries) == ["local"]
-    assert not complete
+    assert short is not None and "AccessDenied" in short
 
 
 def test_job_index_mirror_prefix_is_the_jobs_own_before_the_hosts(tmp_path: Path) -> None:

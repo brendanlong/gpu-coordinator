@@ -811,7 +811,7 @@ def logs_from_s3(
 
 def unhosted_jobs(
     settings: Settings, seen: set[str], host: str | None = None
-) -> tuple[list[IndexEntry], set[str], bool]:
+) -> tuple[list[IndexEntry], set[str], str | None]:
     """The index's view of jobs no host admitted to having, and whether that is
     all of it: an S3 index that could not be read leaves this list short.
 
@@ -821,18 +821,18 @@ def unhosted_jobs(
     it to the host being recovered.
 
     Returns the entries, the ids among them whose outputs the mirror records as
-    lost, and whether the index was read in full.
+    lost, and why the list may be short (None when the index was read in full).
     """
     index = JobIndex(settings)
-    entries, complete = index.all()
+    entries, short = index.all()
     elsewhere = [
         entry
         for job_id, entry in sorted(entries.items())
         if job_id not in seen and (host is None or entry.host == host)
     ]
     if not elsewhere:
-        return [], set(), complete
-    return elsewhere, _outputs_lost_ids(index, elsewhere[:MIRROR_STATE_LOOKUPS]), complete
+        return [], set(), short
+    return elsewhere, _outputs_lost_ids(index, elsewhere[:MIRROR_STATE_LOOKUPS]), short
 
 
 MIRROR_STATE_LOOKUPS = 25

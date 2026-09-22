@@ -637,11 +637,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def _show_unhosted(settings: Settings, seen: set[str], host: str | None = None) -> bool:
     """`unhosted_jobs` as text, and whether the index was read in full."""
-    elsewhere, lost, complete = unhosted_jobs(settings, seen, host)
-    if not complete:
-        note("could not read the S3 index; this list may be short")
+    elsewhere, lost, short = unhosted_jobs(settings, seen, host)
+    if short:
+        note(f"{short}; this list may be short")
     if not elsewhere:
-        return complete
+        return short is None
     scope = f" for host {host}" if host else ""
     print(f"jobs known only to the index{scope} (their host is gone, or lost its state):")
     for entry in elsewhere:
@@ -656,7 +656,7 @@ def _show_unhosted(settings: Settings, seen: set[str], host: str | None = None) 
             f"submitted {status_mod.format_age(entry.submitted_at)}{flag}"
         )
     print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")
-    return complete
+    return short is None
 
 
 def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
