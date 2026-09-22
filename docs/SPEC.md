@@ -62,16 +62,14 @@ destinations. Adding another of either changes nothing else in this document.
   owned and shared GPU resolves to a present card and none is in both lists,
   free disk, and a basic network throughput test.
 - **After that the host owns itself**: its queue, its job state, its logs, its
-  configuration (which cards it owns and shares, its mirror, its environment)
-  and, for a rental, its own shutdown. A rental terminates itself once its
-  queue has been empty for a configured idle period, after draining its
-  uploads. Nothing on a client watches or terminates a rental after handoff.
+  configuration and, for a rental, its own shutdown. A rental terminates
+  itself once its queue has been empty for a configured idle period, after
+  draining its uploads. Nothing on a client watches a rental after handoff.
 - **A rental that has ended is a state, not a failure.** A client that finds
   the pod gone forgets its record of that host and says so.
-- **Any client whose SSH key reaches a host can connect to it without
-  conflict** and sees the same queue, jobs and configuration. Nothing else
-  about the client that set a host up matters afterwards. That includes a
-  rental another machine rented.
+- **Any client whose SSH key reaches a host can drive it**, and sees the same
+  queue, jobs and configuration. Nothing about the client that set the host up
+  matters afterwards, including for a rental another machine rented.
 - The client's record of a host is an address plus a cache. Anything that
   decides something asks the host; output from the cache is labelled with its
   age.
@@ -93,23 +91,20 @@ destinations. Adding another of either changes nothing else in this document.
   dispatch if the configuration shrinks afterwards.
 - **Priority is numeric, lower first, and strict.** The queue is taken in
   order: a job that does not yet fit holds the free cards it is waiting for,
-  and nothing behind it may take them, even at the cost of idle cards. The
-  one exception is a job waiting for a shared card someone else is using: it
-  is stepped over, because the host cannot know when that card frees.
+  and nothing behind it may take them, even at the cost of idle cards. A job
+  waiting for a shared card someone else is using is stepped over instead.
 - Priorities of queued jobs can be changed, and the queue reorders
   accordingly.
 - **A running job can be preempted** so that a job ahead of it in dispatch
-  order can run, by command or automatically for jobs that opt in. Automatic
-  preemption fires only for a strictly higher-priority job. Preemption
-  restarts the job from the beginning in its existing working tree;
-  checkpointing is the job's business. A preempt is refused when nothing
-  waiting would be dispatched ahead of the preempted job, because it would
-  discard work for nothing.
+  order can run, by command or automatically for jobs that opt in -- and
+  automatically only for a strictly higher-priority job. Preemption restarts
+  the job from the beginning in its existing working tree; checkpointing is the
+  job's business. A preempt that would free nothing for a waiting job is
+  refused.
 - **Shared GPUs** are used only by jobs that opt in, only after every free
-  owned card, and only while nvidia-smi reports zero memory and zero
-  utilization on the card. Owned cards are trusted to have no other users;
-  nothing checks. A borrowed card is treated as owned until the job ends;
-  nothing detects a later collision with other users.
+  owned card, and only while nvidia-smi reports the card idle. Owned cards are
+  trusted to have no other users. A borrowed card is held until the job ends;
+  nothing detects a later collision.
 
 ## Running a job
 
@@ -128,12 +123,10 @@ destinations. Adding another of either changes nothing else in this document.
   as results. Every output location includes the job id, so runs never
   overwrite each other.
 - On success, uploads finish and the working tree is deleted. On failure or
-  cancellation it is kept for a configurable period for debugging. On a
-  rental, the rental's shutdown overrides that period, and a rental that has
-  retried its uploads and still cannot deliver them terminates anyway: an
-  expensive machine is not kept alive for a bucket we cannot reach. A job
-  whose outputs are not confirmed backed up is never deleted automatically on
-  a host that persists.
+  cancellation it is kept for a configurable period. A rental's shutdown
+  overrides that period, and one that has retried its uploads and still cannot
+  deliver them terminates anyway. A job whose outputs are not confirmed backed
+  up is never deleted automatically on a host that persists.
 - A job may set a wall-clock limit and will be terminated if it exceeds that
   time.
 - Cancel, preempt and every other kill reap the job's whole process tree,
@@ -156,13 +149,11 @@ destinations. Adding another of either changes nothing else in this document.
   cards and dispatcher; every queued job in dispatch order with its projected
   start; every running job with its phase, cards, utilization and estimate;
   recent results; and each job's log.
-- **A job ending is something the user is told, not something they discover.**
-  A command blocks until the jobs named have ended, reports what happened to
-  each, and exits with their outcome. It runs on a client and changes nothing
-  about a job: a wait that is killed leaves the run alone.
+- **A user can wait for jobs to end**, in one command that reports what
+  happened to each and exits with their outcome.
 - **A command does as much as it can, says what it could not do, and exits
   non-zero if anything failed.** One host that cannot be reached never stops
-  the others being reported, and never hides the reason it could not be reached.
+  the others being reported.
 - **Every command that reports something supports JSON output**, and exit
   codes distinguish "failed", "usage", "local state unreadable, so unknown"
   and "no such job or host".
