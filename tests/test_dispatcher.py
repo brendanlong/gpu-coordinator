@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import itertools
 import os
-import shutil
 import signal
 import subprocess
 from collections.abc import Callable
@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import pytest
 
-from gpuc.host import cleanup, jobs, paths, queue, sync, terminate
+from gpuc.host import cleanup, destinations, jobs, paths, queue, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
@@ -165,16 +165,45 @@ def test_a_job_larger_than_the_host_fails_instead_of_blocking(gpuc_home: Path) -
 
 def test_a_job_cancelled_while_queued_is_never_launched(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
-    paths.cancel_file(job_id).touch()
+    assert queue.cancel(job_id) == "cancelled"
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
     assert spawned == {}
     assert jobs.read_state(job_id).status == "cancelled"
 
 
-def test_cancel_signals_the_job_process_group_then_the_runner(
+def test_a_job_cancelled_between_listing_and_claiming_is_not_launched(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Listing the queue and claiming a job out of it are not one operation, so
+    a cancel landing in between has to win: `queue.claim` is the compare-and-set
+    that decides it, and the card the job would have taken stays free."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    read_spec = jobs.read_spec
+    listed: list[str] = []
+
+    def cancel_it_first(wanted: str) -> jobs.JobSpec:
+        listed.append(wanted)
+        queue.cancel(wanted)
+        return read_spec(wanted)
+
+    monkeypatch.setattr(host_dispatcher.jobs, "read_spec", cancel_it_first)
+    dispatcher.launch_ready()
+
+    assert listed == [job_id], "the job was queued when the pass listed it"
+    assert spawned == {}
+    assert jobs.read_state(job_id).status == "cancelled"
+    assert dispatcher.free_gpus() == FAKE_GPUS
+
+
+def test_a_stop_the_runner_never_acts_on_is_escalated_after_the_grace_period(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner owns the kill: it polls its own state and stops the job. That
+    is nothing at all when the runner is wedged, so an intent it has not
+    honoured within the grace period gets the ladder -- the job's group, then
+    the runner, then the runner's own group -- and nothing before it."""
     clock = FakeClock()
     dispatcher, spawned = make_dispatcher(clock=clock)
     job_id = queue.enqueue(make_spec(gpus=1))
@@ -185,20 +214,20 @@ def test_cancel_signals_the_job_process_group_then_the_runner(
     monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
     monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
-    queue.cancel(job_id)
-    dispatcher.handle_cancels()
-    assert signals == [(123456, 15)]
+    assert queue.cancel(job_id) == "cancelling"
+    dispatcher.escalate_stops()
+    assert signals == [], "inside the grace period the runner is left to do it"
 
-    clock.advance(1.5)
-    dispatcher.handle_cancels()
-    assert signals[-1] == (123456, 9)
+    clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
+    dispatcher.escalate_stops()
+    assert signals[-1] == (123456, signal.SIGKILL)
 
     clock.advance(1.0)
-    dispatcher.handle_cancels()
+    dispatcher.escalate_stops()
     assert signals[-1] == (spawned[job_id].pid, signal.SIGTERM)
 
     clock.advance(1.0)
-    dispatcher.handle_cancels()
+    dispatcher.escalate_stops()
     assert signals[-1] == (spawned[job_id].pid, signal.SIGKILL)
 
 
@@ -213,9 +242,41 @@ def test_a_runner_that_dies_without_final_state_fails_the_job(gpuc_home: Path) -
     assert dispatcher.running == {}
 
 
+def test_a_runner_that_dies_leaves_no_output_confirmed(gpuc_home: Path) -> None:
+    """A periodic tick's success says nothing about what the job wrote after
+    it, and the final upload never ran: the sweep must not take the workdir."""
+    spec = make_spec(gpus=1, outputs=[{"path": "out", "s3": "s3://b/{job_id}"}])
+    job_id = queue.enqueue(spec)
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    jobs.record_upload(job_id, f"s3://b/{job_id}", "out", ok_at=jobs.utc_now())
+    (paths.workdir(job_id) / "out").mkdir()
+    (paths.workdir(job_id) / "out" / "late.pt").write_text("x")
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert state.reason == "runner-died"
+    assert not state.outputs_uploaded(jobs.read_spec(job_id))
+    assert cleanup.outputs_confirmed(job_id, state) == (False, "outputs not confirmed uploaded")
+
+
+def test_a_stop_asked_for_as_the_runner_dies_is_not_written_over(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=1))
+    queue.preempt(job_id)
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    # The intent was seen: runner-died is a stop of ours, so the job comes back
+    # as its next attempt (and may already be running again on the freed card).
+    state = jobs.read_state(job_id)
+    assert (state.attempt, state.intent) == (2, None)
+    assert state.status in ("queued", "running")
+
+
 def test_orphans_from_a_dead_dispatcher_are_reconciled(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=2**30)
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
@@ -226,7 +287,6 @@ def test_a_live_orphan_is_adopted_not_failed(gpuc_home: Path) -> None:
     import os
 
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=os.getpid())
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
@@ -276,7 +336,7 @@ def configure_pod(idle_minutes: float = 15.0, age_h: float = 0.0) -> None:
 def test_idle_terminate_drains_syncs_and_calls_the_provider(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     monkeypatch.setenv("RUNPOD_POD_ID", "pod-1")
     configure_pod(idle_minutes=15.0)
@@ -388,7 +448,7 @@ def test_a_failed_final_drain_sync_still_terminates(
     stayed broken.
     """
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: None)
     configure_pod(idle_minutes=0.0)
     terminated: list[str] = []
     dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
@@ -499,7 +559,6 @@ def test_an_occasional_failure_does_not_stop_the_loop(gpuc_home: Path) -> None:
 
 def test_an_orphan_from_a_previous_boot_is_not_adopted(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(
         job_id,
         status="running",
@@ -514,7 +573,6 @@ def test_an_orphan_from_a_previous_boot_is_not_adopted(gpuc_home: Path) -> None:
 
 def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(
         job_id,
         status="running",
@@ -528,79 +586,71 @@ def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).reason == "runner-died"
 
 
-def test_a_marker_left_behind_does_not_launch_a_second_runner(gpuc_home: Path) -> None:
-    """`leave_queue` writes the state and then drops the marker, so a
-    dispatcher killed between the two leaves a marker for a job that is already
-    running. Dispatching on the marker alone starts a second runner in the
-    workdir the first one is using."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])  # the crash
+def staged_submit(job_id: str, *, age_s: float = 0.0) -> Path:
+    """A job dir a `gpuc submit` was building under `incoming/`, `age_s` old.
 
-    dispatcher, spawned = make_dispatcher()
-    dispatcher.run_once()
-
-    assert spawned == {}
-    assert queue.list_queued() == []
-
-
-def test_a_marker_whose_job_is_gone_is_dropped_rather_than_dispatched(gpuc_home: Path) -> None:
-    """A purge interrupted before `remove_job_dir` reached the marker."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    shutil.rmtree(paths.job_dir(job_id))
-
-    dispatcher, spawned = make_dispatcher()
-    dispatcher.run_once()
-
-    assert spawned == {}
-    assert queue.list_queued() == []
+    Aged by mtime on every path in it, which is what `stale_incoming` measures:
+    an rsync still adding files keeps refreshing it.
+    """
+    staging = paths.incoming_job_dir(job_id)
+    (staging / "workdir").mkdir(parents=True)
+    (staging / "workdir" / "train.py").write_text("print('hi')\n")
+    stamp = datetime.now(UTC).timestamp() - age_s
+    for path in (staging, staging / "workdir", staging / "workdir" / "train.py"):
+        os.utime(path, (stamp, stamp))
+    return staging
 
 
-def test_a_submit_that_never_committed_is_not_run_and_does_not_stay_queued(
-    gpuc_home: Path,
-) -> None:
-    """`gpuc submit` writes the spec and state and *then* the queue marker, so
-    an ssh that dies between them leaves a job this host was never asked to
-    run. It must not be dispatched -- and it must not sit `queued` for ever
-    either, which is all anybody could see of it."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)  # the submit dies here
-    old = datetime.now(UTC).timestamp() - cleanup.INCOMING_STALE_S - 1
-    os.utime(paths.state_file(job_id), (old, old))
-
-    dispatcher, spawned = make_dispatcher()
-    dispatcher.run_once()
-
-    assert spawned == {}
-    state = jobs.read_state(job_id)
-    assert (state.status, state.reason) == ("failed", "incomplete-submit")
-
-
-def test_a_submit_still_in_flight_is_not_swept(gpuc_home: Path) -> None:
-    """The gap between the two writes is two syscalls wide. A sweep that could
-    not tell it from an abandoned one would fail perfectly good submits."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
+def test_a_dead_submits_secrets_go_with_its_staged_dir(gpuc_home: Path) -> None:
+    """The secrets file was delivered before the enqueue that never came, and
+    nothing else would ever unlink it."""
+    abandoned = staged_submit("20260101-000000-secret", age_s=cleanup.INCOMING_STALE_S + 60)
+    secrets = paths.job_env_file("20260101-000000-secret")
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text("AWS_SECRET_ACCESS_KEY=hunter2\n")
 
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
 
-    assert jobs.read_state(job_id).status == "queued"
+    assert not abandoned.exists()
+    assert not secrets.exists()
 
 
-def test_a_preempted_job_being_put_back_is_not_swept(gpuc_home: Path) -> None:
-    """`requeue_preempted` writes the queued state, then the marker, then drops
-    the preempt marker -- so mid-move it looks exactly like an abandoned
-    submit. The preempt marker is what says it is coming back."""
+def test_a_dir_left_under_incoming_is_removed_after_an_hour(gpuc_home: Path) -> None:
+    """A job is accepted by renaming its dir out of `incoming/` into `jobs/`, so
+    one still sitting there an hour later is a submit that died before the host
+    was ever asked to run it -- and nothing else will ever clear it away."""
+    abandoned = staged_submit("20260101-000000-abandon", age_s=cleanup.INCOMING_STALE_S + 60)
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+
+    assert not abandoned.exists()
+    assert "a submit that never finished enqueueing it" in paths.dispatcher_log().read_text()
+
+
+def test_a_submit_still_rsyncing_into_incoming_is_left_alone(gpuc_home: Path) -> None:
+    """The working tree lands there first and a big one takes a while. A sweep
+    that could not tell it from a dead submit would delete a live one."""
+    staging = staged_submit("20260101-000000-inflight")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+
+    assert (staging / "workdir" / "train.py").exists()
+
+
+def test_an_accepted_job_is_never_swept_however_long_it_waits(gpuc_home: Path) -> None:
+    """The sweep is about `incoming/`, and `jobs/` is where a job the host has
+    accepted lives: an old queued job is waiting its turn, not abandoned."""
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
-    paths.preempt_file(job_id).touch()
-    old = datetime.now(UTC).timestamp() - cleanup.INCOMING_STALE_S - 1
+    old = datetime.now(UTC).timestamp() - cleanup.INCOMING_STALE_S - 60
     os.utime(paths.state_file(job_id), (old, old))
 
     dispatcher, _ = make_dispatcher()
-    dispatcher.sweep_abandoned_submits()
+    dispatcher.sweep_stale_incoming()
 
-    assert jobs.read_state(job_id).status == "queued"
+    assert paths.job_dir(job_id).is_dir()
 
 
 def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(
@@ -611,7 +661,6 @@ def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(
     reads as abandoned while its runner is training: failing it would lose the
     job and hand the card it is on to whatever starts next."""
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], started_at=jobs.utc_now())
     monkeypatch.setattr(host_dispatcher, "live_runner_pids", lambda: {job_id: os.getpid()})
 
@@ -631,7 +680,6 @@ def test_a_preempted_job_syncing_under_an_unrecorded_runner_is_not_queued_again(
     alive. Queued on that evidence, attempt 2 would start in the workdir
     attempt 1 is still uploading from."""
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     queue.enqueue(make_spec(gpus=2, priority=1))
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     queue.preempt(job_id)
@@ -650,7 +698,6 @@ def test_a_running_job_with_no_runner_anywhere_still_fails(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     monkeypatch.setattr(host_dispatcher, "live_runner_pids", dict)
 
@@ -692,26 +739,30 @@ def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path)
     assert state.runner_boot_id == procinfo.boot_id()
 
 
-def test_cancel_in_the_launch_window_never_signals_the_runners_own_group(
+def test_a_stop_in_the_launch_window_never_signals_the_runners_own_group(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Until the state names the job's group, the runner is the only member of
+    its own -- and killing it there kills the one process that can stop the job
+    cleanly and write down what happened to it."""
     clock = FakeClock()
     dispatcher, _ = make_dispatcher(clock=clock)
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher.run_once()
+    assert jobs.read_state(job_id).pgid is None
 
     signals: list[tuple[int | None, int]] = []
     monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
     monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
     queue.cancel(job_id)
-    dispatcher.handle_cancels()
+    dispatcher.escalate_stops()
+    clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
+    dispatcher.escalate_stops()
     assert signals == []
-    assert "has not published a job process group yet" in paths.dispatcher_log().read_text()
 
     # The runner publishes the job's group, and only then is it signalled.
     jobs.update_state(job_id, pgid=123456)
-    clock.advance(2.0)
-    dispatcher.handle_cancels()
+    dispatcher.escalate_stops()
     assert signals == [(123456, signal.SIGKILL)]
 
 
@@ -734,15 +785,10 @@ def test_spawned_children_get_the_home_tool_dirs_on_path(
 
 def finished_job(days_old: float = 30.0, *, mirrored: bool = True) -> str:
     job_id = queue.enqueue(make_spec())
-    queue.remove_marker(job_id)
     ended = (datetime.now(UTC) - timedelta(days=days_old)).isoformat()
-    jobs.update_state(
-        job_id,
-        status="succeeded",
-        ended_at=ended,
-        meta_synced_at=ended if mirrored else None,
-        meta_synced_to="s3://b/gpuc/h" if mirrored else None,
-    )
+    jobs.update_state(job_id, status="succeeded", ended_at=ended)
+    if mirrored:
+        jobs.record_upload(job_id, f"s3://b/gpuc/h/jobs/{job_id}", None, ok_at=ended)
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
     return job_id
@@ -831,7 +877,6 @@ def test_the_workdir_horizon_leaves_outputs_that_never_reached_the_mirror(
     configure_retention(None, 1.0)
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     ended = (datetime.now(UTC) - timedelta(days=2)).isoformat()
     jobs.update_state(job_id, status="failed", ended_at=ended)
     results = paths.workdir(job_id) / "results"
@@ -848,7 +893,6 @@ def test_the_workdir_horizon_leaves_a_job_that_asked_to_keep_its_workdir(
 ) -> None:
     configure_retention(None, 1.0)
     job_id = queue.enqueue(make_spec(cleanup="never"))
-    queue.remove_marker(job_id)
     ended = (datetime.now(UTC) - timedelta(days=2)).isoformat()
     jobs.update_state(job_id, status="failed", ended_at=ended)
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
@@ -929,30 +973,32 @@ def test_retention_never_touches_a_running_job(gpuc_home: Path) -> None:
 def job_with_pending_outputs() -> str:
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now())
     (paths.workdir(job_id) / "results").mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "results" / "a.txt").write_text("hi\n")
     return job_id
 
 
+def outputs_uploaded(job_id: str) -> bool:
+    return jobs.read_state(job_id).outputs_uploaded(jobs.read_spec(job_id))
+
+
 def test_the_drain_retries_unconfirmed_outputs_and_records_success(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     dispatcher, _ = make_dispatcher()
     dispatcher.drain_and_terminate("test")
-    state = jobs.read_state(job_id)
-    assert state.outputs_synced_at is not None
-    assert state.outputs_lost is False
+    assert outputs_uploaded(job_id)
+    assert jobs.read_state(job_id).outputs_lost is False
 
 
 def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     attempts: list[list[str]] = []
@@ -979,25 +1025,59 @@ def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     assert slept == [60.0, 60.0]
     state = jobs.read_state(job_id)
     assert state.outputs_lost is True
-    assert state.sync_error and "AccessDenied" in state.sync_error
+    assert any("AccessDenied" in error for error in state.upload_errors())
     # The pod still goes away: it is billing, and a bucket we cannot reach is
     # no reason to keep paying for it.
     assert terminated == ["pod-1"]
 
 
+def test_giving_up_on_outputs_marks_them_lost_and_changes_nothing_else(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`outputs_lost` is the drain's whole verdict. The job's outcome is the
+    runner's, and the failure itself is already in the destination's upload
+    record, where `status` reads it from."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=0.0)
+    job_id = job_with_pending_outputs()
+    before = jobs.read_state(job_id).to_dict()
+
+    def outputs_fail(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        broken = "s3://bucket/" in " ".join(argv)
+        return sync.CommandResult(argv, 1 if broken else 0, "AccessDenied" if broken else "")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.command_runner = outputs_fail
+    dispatcher.deps.sleep = lambda seconds: None
+    dispatcher.drain_and_terminate("test")
+
+    after = jobs.read_state(job_id)
+    assert after.outputs_lost is True
+    changed = {k for k, v in after.to_dict().items() if before.get(k) != v}
+    assert changed == {"outputs_lost", "uploads"}
+    assert (after.status, after.reason, after.problems) == ("succeeded", "sync", [])
+    output_records = after.output_uploads()
+    assert [(u.output, u.to, u.ok_at) for u in output_records] == [
+        ("results", f"s3://bucket/{job_id}", None)
+    ]
+    assert output_records[0].error and "AccessDenied" in output_records[0].error
+    assert after.mirrored  # the mirror record is the final meta sync's, not the drain's
+
+
 def test_the_drain_records_the_meta_backup_for_every_job(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     job_id = queue.enqueue(make_spec())
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="succeeded", ended_at=jobs.utc_now())
     dispatcher, _ = make_dispatcher()
     dispatcher.drain_and_terminate("test")
     state = jobs.read_state(job_id)
-    assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/pod"
+    assert state.mirrored
+    assert state.mirror is not None and state.mirror.to == f"s3://b/gpuc/pod/jobs/{job_id}"
 
 
 def test_an_ancient_idle_pod_is_only_ever_stopped_by_its_idle_timer(
@@ -1013,18 +1093,30 @@ def test_an_ancient_idle_pod_is_only_ever_stopped_by_its_idle_timer(
     assert terminated == []
 
 
-def test_an_auto_preempt_kill_is_only_asked_for_once(gpuc_home: Path) -> None:
+def test_an_auto_preempt_stop_is_only_asked_for_once(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A job already stopping has its cards counted as coming free; a second
     request would say nothing new and reset the escalation clock."""
     cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
+
+    asked: list[str] = []
+    real = queue.preempt
+
+    def counting(job_id: str, priority: int | None = None) -> str:
+        asked.append(job_id)
+        return real(job_id, priority)
+
+    monkeypatch.setattr(host_dispatcher.queue, "preempt", counting)
     queue.enqueue(make_spec(gpus=2, priority=10))
     dispatcher.run_once()
-    assert queue.kill_reason(cheap) == "preempted"
-    written = paths.kill_file(cheap).stat().st_mtime_ns
+    assert asked == [cheap]
+    assert queue.stop_requested(cheap) == "preempted"
+
     dispatcher.run_once()
-    assert paths.kill_file(cheap).stat().st_mtime_ns == written
+    assert asked == [cheap]
 
 
 def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_running(
@@ -1050,12 +1142,12 @@ def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_runnin
     assert "could not spawn a runner" in paths.dispatcher_log().read_text()
 
 
-def test_a_preempt_kill_the_runner_ignores_is_escalated(
+def test_a_preempt_the_runner_ignores_is_escalated_and_the_job_still_comes_back(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The kill marker is an ask, and a wedged runner never answers it. Without
-    an escalation the job it was told to stop kept running, and the one waiting
-    for its cards never started."""
+    """A stop intent is an ask, and a wedged runner never answers it. Without an
+    escalation the job it was told to stop kept running, and the one waiting for
+    its cards never started."""
     clock = FakeClock()
     dispatcher, spawned = make_dispatcher(clock=clock)
     job_id = queue.enqueue(make_spec(gpus=2, command="sleep 600"))
@@ -1070,7 +1162,7 @@ def test_a_preempt_kill_the_runner_ignores_is_escalated(
 
     queue.preempt(job_id)
     dispatcher.run_once()
-    assert queue.kill_reason(job_id) == "preempted"
+    assert queue.stop_requested(job_id) == "preempted"
     assert signals == []
 
     clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
@@ -1098,7 +1190,7 @@ def test_the_drain_bounds_each_upload_and_skips_sync_preflight_failures(
     """An unbounded upload can hang a billing pod for hours, and a job that
     failed its sync preflight proved before it ran that these uploads cannot
     work -- retrying it three times only burns the budget."""
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     pending = job_with_pending_outputs()
@@ -1122,7 +1214,7 @@ def test_the_drain_bounds_each_upload_and_skips_sync_preflight_failures(
         for _argv, timeout in uploads
     )
     assert not any(hopeless in " ".join(argv) for argv, _timeout in uploads)
-    assert jobs.read_state(pending).outputs_synced_at is not None
+    assert outputs_uploaded(pending)
     assert jobs.read_state(hopeless).outputs_lost is False
 
 
@@ -1158,7 +1250,6 @@ def test_an_orphan_holding_an_index_is_adopted_as_the_uuid_that_index_names(
     dispatcher, _ = make_dispatcher()
     dispatcher.deps.smi = fake_smi()
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=["1"], runner_pid=os.getpid())
     dispatcher.adopt_orphans()
 
@@ -1249,10 +1340,9 @@ def test_a_preempted_job_whose_runner_died_still_comes_back(gpuc_home: Path) -> 
 def test_a_job_preempted_while_no_dispatcher_was_alive_is_picked_up_at_startup(
     gpuc_home: Path,
 ) -> None:
-    """Nothing else would ever look at the marker: the dispatcher that would
+    """Nothing else would ever look at the intent: the dispatcher that would
     have reaped this job is the one that died."""
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running")
     waiting = queue.enqueue(make_spec(gpus=1, priority=1))
     queue.preempt(job_id)
@@ -1273,7 +1363,6 @@ def test_a_preempted_job_still_finalizing_is_not_queued_under_its_own_runner(
     now would launch the next attempt straight into it -- two processes, one
     directory -- so the runner is adopted and `reap` does it afterwards."""
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     # Two cards, so it cannot start while the finalizing runner holds one.
     queue.enqueue(make_spec(gpus=2, priority=1))
     jobs.update_state(
@@ -1318,16 +1407,17 @@ def test_a_preempted_job_is_not_queued_again_on_a_host_that_is_going_away(
 
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("failed", "preempted")
-    assert queue.find_marker(job_id) is None
+    assert not queue.is_queued(job_id)
     assert not queue.is_preempted(job_id)
     assert "this host is draining" in paths.dispatcher_log().read_text()
 
 
-def test_a_preempt_the_runner_ignores_is_escalated(
+def test_a_stop_another_process_asked_for_gets_an_escalation_clock_of_its_own(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dispatcher did not write this kill marker, and before it adopted one
-    it had no clock for it: a wedged runner kept the job (and its GPUs) for ever."""
+    """`gpuc preempt` writes the intent over ssh, so this dispatcher never sent
+    it and has nothing to time it from until it first sees it. Without a clock
+    of its own, a wedged runner kept the job (and its GPUs) for ever."""
     clock = FakeClock()
     dispatcher, spawned = make_dispatcher(clock=clock)
     job_id = queue.enqueue(make_spec(gpus=1))
@@ -1359,7 +1449,7 @@ def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     """The stopped attempt's results are still in that workdir, and the drain
     is the last thing that will ever look at them. Filtering the retry list on
     `finished` alone hid them the moment the job went back in the queue."""
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     queue.enqueue(make_spec(priority=1))  # what the preempt is making room for
@@ -1371,7 +1461,7 @@ def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     dispatcher, _ = make_dispatcher()
     assert dispatcher.unconfirmed_output_jobs() == [job_id]
     dispatcher.drain_and_terminate("test")
-    assert jobs.read_state(job_id).outputs_synced_at is not None
+    assert outputs_uploaded(job_id)
 
 
 def test_a_running_jobs_outputs_are_left_to_its_own_runner(gpuc_home: Path) -> None:
@@ -1385,11 +1475,10 @@ def test_a_preempted_job_whose_runner_died_before_the_dispatcher_did_comes_back(
     gpuc_home: Path,
 ) -> None:
     """Startup finds it still marked `running` with nobody running it. Without
-    the re-queue here nothing would look at the marker again until some later
+    the re-queue here nothing would look at the intent again until some later
     dispatcher started -- and then it would resurrect a job reported failed
     hours before."""
     job_id = queue.enqueue(make_spec(gpus=1))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=2**30)
     queue.enqueue(make_spec(gpus=1, priority=1))
     queue.preempt(job_id)
@@ -1430,17 +1519,22 @@ def shared_host(
     return dispatcher, spawned
 
 
+_ORDERED_IDS = itertools.count()
+"""Ids for `enqueue_in_order`, never reused: `enqueue` refuses a job id that
+already has a dir under `jobs/`, so two calls in one test need two ranges."""
+
+
 def enqueue_in_order(*specs: dict[str, Any]) -> list[str]:
     """Queue these jobs in exactly this order, whatever their priorities say.
 
-    Dispatch order is the marker name `<priority>-<job id>`, and a real job id
-    carries a random suffix -- so two jobs queued in the same second at the
-    same priority sort unpredictably, and a test about which card a *particular*
-    job gets would pass or fail on that coin flip.
+    Dispatch order is `(priority, job id)`, and a real job id carries a random
+    suffix -- so two jobs queued in the same second at the same priority sort
+    unpredictably, and a test about which card a *particular* job gets would
+    pass or fail on that coin flip.
     """
     return [
-        queue.enqueue(make_spec(job_id=f"20260101-000000-{index:06d}", **spec))
-        for index, spec in enumerate(specs)
+        queue.enqueue(make_spec(job_id=f"20260101-000000-{next(_ORDERED_IDS):06d}", **spec))
+        for spec in specs
     ]
 
 
@@ -1646,7 +1740,7 @@ def test_an_auto_preempt_job_gives_its_cards_to_a_more_important_one(gpuc_home: 
     urgent = queue.enqueue(make_spec(gpus=2, priority=10))
     dispatcher.run_once()
     assert queue.is_preempted(cheap)
-    assert queue.kill_reason(cheap) == "preempted"
+    assert queue.stop_requested(cheap) == "preempted"
     assert f"auto_preempt: stopping so job {urgent}" in paths.log_file(cheap).read_text()
 
     spawned[cheap].finish(status="failed", reason="preempted")
@@ -1654,6 +1748,20 @@ def test_an_auto_preempt_job_gives_its_cards_to_a_more_important_one(gpuc_home: 
     assert jobs.read_state(urgent).status == "running"
     state = jobs.read_state(cheap)
     assert (state.status, state.attempt) == ("queued", 2)
+
+
+def test_auto_preempt_judges_a_job_by_the_priority_it_runs_at(gpuc_home: Path) -> None:
+    """Submitted at 10, moved to 60 while queued: it is a 60 job now, and a 30
+    job waiting is strictly more important than it."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=10, auto_preempt=True))
+    assert queue.reorder(cheap, 60)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(cheap).status == "running"
+
+    queue.enqueue(make_spec(gpus=2, priority=30))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
 
 
 @pytest.mark.parametrize("priority", [80, 50])
@@ -1669,7 +1777,7 @@ def test_an_auto_preempt_job_keeps_its_cards_when_nothing_better_is_waiting(
     queue.enqueue(make_spec(gpus=2, priority=priority))
     dispatcher.run_once()
     assert not queue.is_preempted(cheap)
-    assert queue.kill_reason(cheap) is None
+    assert queue.stop_requested(cheap) is None
 
 
 def test_a_job_that_never_asked_for_it_is_not_preempted(gpuc_home: Path) -> None:
@@ -1746,14 +1854,14 @@ def test_two_waiting_jobs_are_given_a_card_each_one_pass_apart(gpuc_home: Path) 
     assert queue.is_preempted(second)
 
 
-def test_a_cancelled_job_in_the_queue_is_not_worth_preempting_for(gpuc_home: Path) -> None:
-    """The marker alone, as `gpuc cancel` writes it before it takes the queue
-    marker off: for that instant the job is both queued and not coming back."""
+def test_nothing_is_stopped_for_a_job_that_has_been_cancelled(gpuc_home: Path) -> None:
+    """A cancelled job leaves the queue there and then, so nothing is waiting
+    for the cards any more and an attempt spent freeing them buys nothing."""
     cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     doomed = queue.enqueue(make_spec(gpus=2, priority=10))
-    paths.cancel_file(doomed).touch()
+    assert queue.cancel(doomed) == "cancelled"
     dispatcher.preempt_for_waiting()
     assert not queue.is_preempted(cheap)
 
@@ -1983,7 +2091,7 @@ def test_nothing_is_stopped_for_a_job_the_queue_ahead_would_take_the_cards_from(
     narrow = queue.enqueue(make_spec(gpus=1, priority=20))
     dispatcher.run_once()
     assert not queue.is_preempted(cheap)
-    assert queue.kill_reason(cheap) is None
+    assert queue.stop_requested(cheap) is None
 
     # And once the job that was holding is gone, the stop is worth making.
     queue.cancel(wide)

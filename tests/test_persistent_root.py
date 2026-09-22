@@ -3,9 +3,11 @@ per-host `env` plumbing it shares wiring with, and `gpuc host set`.
 
 The env chain under test is registry entry -> on-host config.json `env` ->
 dispatcher child env -> runner job env -> what the job's own command sees.
-Nothing populates that env automatically: uv, its caches and the aws bundle
-live in `$HOME` on every host, because bootstrap reinstalls them in seconds and
-these shared volumes are slower than the local disk.
+uv, its managed Pythons and the aws bundle live in `$HOME` on every host,
+because bootstrap reinstalls them in seconds and these shared volumes are
+slower than the local disk. The caches are the exception: bootstrap puts the
+Hugging Face cache beside gpuc home, and uv's there too when `$HOME` is another
+filesystem.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -40,8 +43,10 @@ ROOT = "/mnt/ssd-2/brendan"
 HOST_ENV = {"UV_CACHE_DIR": "/mnt/ssd-2/brendan/uv-cache", "HF_HOME": "/scratch/hf"}
 
 
-def rooted(**overrides: object) -> HostEntry:
-    return HostEntry.model_validate({"name": "gpubox", "persistent_root": ROOT, **overrides})
+def rooted(**overrides: Any) -> HostEntry:
+    """A host under the persistent root; `overrides` are address fields or keys
+    of the config the host holds, as `host_entry` takes them."""
+    return host_entry(**{"name": "gpubox", "persistent_root": ROOT, **overrides})
 
 
 # -- the registry entry ---------------------------------------------------
@@ -59,8 +64,8 @@ def test_no_persistent_root_changes_nothing() -> None:
 def test_a_persistent_root_moves_only_gpuc_home() -> None:
     entry = rooted()
     assert entry.remote_home == f"{ROOT}/gpuc"
-    # Not the caches, not uv, not the aws bundle: a root is for the state that
-    # cannot be reinstalled, and /mnt is the slow disk.
+    # Not uv, not the aws bundle: a root is for the state that cannot be
+    # reinstalled, and /mnt is the slow disk. (The caches are bootstrap's call.)
     assert entry.env == {}
     assert env_prefix(entry.env) == ""
 
@@ -245,7 +250,11 @@ def test_the_package_and_config_land_under_the_root(control_env: Path) -> None:
     host, _ = bootstrapped()
     assert host.rsyncs[0][1] == f"{ROOT}/gpuc/pkg"
     assert host.config is not None
-    assert (host.config["gpus"], host.config["env"]) == (["GPU-a"], {})
+    # Nothing hand-set, only the cache bootstrap puts beside gpuc home.
+    assert (host.config["gpus"], host.config["env"]) == (
+        ["GPU-a"],
+        {"HF_HOME": f"{ROOT}/.cache/huggingface"},
+    )
     assert all(f"{ROOT}/gpuc/config.json" not in put for put in host.puts)
 
 
@@ -394,6 +403,25 @@ def test_host_set_replaces_the_whole_env(control_env: Path, fake_host: FakeHost)
     main(["host", "set", "gpubox", "--env", ""])
     assert load_registry().require("gpubox").env == {}
     assert fake_host.config is not None and fake_host.config["env"] == {}
+
+
+def test_host_set_keeps_the_hf_home_a_new_env_did_not_mention(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    """`HF_HOME` is managed like `UV_CACHE_DIR`: bootstrap puts it beside gpuc
+    home, so an `--env` that replaces the hand-set keys must not drop it and
+    send every model download back to a `$HOME` that a pod wipes."""
+    fake_host.put_file(
+        json.dumps({"host": "gpubox", "gpus": ["0"], "env": {"HF_HOME": f"{ROOT}/.cache/hf"}}),
+        "/home/u/.gpuc/config.json",
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert main(["host", "set", "gpubox", "--env", "A=1"]) == 0
+    assert fake_host.config is not None
+    assert fake_host.config["env"] == {"A": "1", "HF_HOME": f"{ROOT}/.cache/hf"}
+    # Only naming it moves it.
+    assert main(["host", "set", "gpubox", "--env", "HF_HOME=/scratch/hf"]) == 0
+    assert fake_host.config["env"] == {"HF_HOME": "/scratch/hf"}
 
 
 def test_host_set_changes_the_idle_timer(control_env: Path, fake_host: FakeHost) -> None:

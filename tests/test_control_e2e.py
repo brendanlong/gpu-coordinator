@@ -355,9 +355,7 @@ def test_estimate_reaches_a_running_job_and_status_and_json_agree(
 
     assert main(["estimate", job_id, "--minutes", "150"]) == 0
     assert "150 min" in capsys.readouterr().out
-    assert json.loads((home / "jobs" / job_id / "spec.json").read_text())[
-        "estimated_runtime_min"
-    ] == pytest.approx(150.0)
+    assert state_of(home, job_id)["estimated_runtime_min"] == pytest.approx(150.0)
 
     assert main(["status", "--host", "local"]) == 0
     text = capsys.readouterr().out
@@ -535,19 +533,21 @@ def test_status_mentions_leftover_workdirs_and_clean_clears_it(
     assert "gpuc clean" not in capsys.readouterr().out
 
 
-def test_clean_removes_a_leftover_staged_spec(
+def test_clean_removes_a_leftover_incoming_dir(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     home = bootstrapped_home
     job_id = submit(workdir, 'name: ok\ncommand: "true"\n')
     wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
-    staged = home / "incoming" / f"{job_id}.json"
-    staged.parent.mkdir(parents=True, exist_ok=True)
-    staged.write_text("{}\n")
+    staged = home / "incoming" / "20200101-000000-dead00"
+    (staged / "workdir").mkdir(parents=True)
+    old = time.time() - 2 * 3600
+    for path in [staged, staged / "workdir"]:
+        os.utime(path, (old, old))
     capsys.readouterr()
 
     assert main(["clean", "--host", "local", "--all-finished"]) == 0
-    assert "leftover staged spec" in capsys.readouterr().out
+    assert "leftover staged" in capsys.readouterr().out
     assert not staged.exists()
 
 
@@ -558,8 +558,9 @@ def mark_mirrored(home: Path, job_id: str, prefix: str = "s3://bucket/gpuc/local
     """Stand in for a successful final meta sync on a host with a prefix."""
     path = home / "jobs" / job_id / "state.json"
     document = json.loads(path.read_text())
-    document["meta_synced_at"] = document.get("ended_at")
-    document["meta_synced_to"] = prefix
+    document["uploads"] = [
+        {"to": f"{prefix}/jobs/{job_id}", "output": None, "ok_at": document.get("ended_at")}
+    ]
     path.write_text(json.dumps(document, indent=2) + "\n")
 
 

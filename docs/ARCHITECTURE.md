@@ -18,17 +18,19 @@ gpuc/
   host/          # runs ON hosts. STDLIB ONLY: `python -m gpuc.host <cmd>` with a bare interpreter
     __main__.py    # the on-host CLI the control side drives over ssh
     paths.py       # the ~/.gpuc layout
-    jobs.py        # job ids, HostConfig/JobSpec/JobState, tolerant readers, atomic writes
-    queue.py       # enqueue, list, reorder, cancel, preempt and kill markers
-    dispatcher.py  # lock+heartbeat, pick next runnable, launch runner, idle terminate
+    jobs.py        # job ids, HostConfig/JobSpec/JobState, the per-job lock, tolerant readers, atomic writes
+    queue.py       # accept a job, list the queue, cancel, preempt, requeue: every change of a job's status
+    plan.py        # the dispatch rule, pure: what a pass does with each queued job, and when each will start
+    dispatcher.py  # lock+heartbeat, act on the plan, launch runners, escalate stops, idle terminate
     runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, wall-clock limit, sync, exit code
     scope.py       # systemd --user scope probe/wrap/stop; the cgroup kill path
-    preflight.py   # sync preflight: prove `aws`/`hf` can write before the job runs
+    destinations.py # where files go: one Destination per store (S3, Hugging Face); upload, put_file, preflight
+    preflight.py   # sync preflight: prove every destination can be written before the job runs
     baseline.py    # what was already under `outputs:` before the job started
     cleanup.py     # `cleanup:` policy, workdir sizing, the `clean`/`purge` sweeps
     gpus.py        # nvidia-smi parsing, index<->UUID resolution, utilization sampling
     progress.py    # the optional `progress_command`: run it, read a percentage off it
-    sync.py        # periodic upload loop (shells out to `aws` or `hf`)
+    sync.py        # periodic upload loop, recording each destination's result in the job's state
     health.py      # host preflight: driver, owned GPUs, disk, network download timing
     terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
   control/       # runs on the local machine; may use third-party deps
@@ -42,6 +44,7 @@ gpuc/
     rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
     config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
+    tolerant.py    # the pydantic base every shared-state model reads through
     connect.py     # `host add` / `host set`: read or write the host's own config.json
     bootstrap.py   # install uv + this package on a host, run host health, start the dispatcher
     probe.py       # `host probe`: what a host has, before bootstrap
@@ -99,30 +102,35 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uui
                      #  "workdir_days": null | N,     # auto workdir sweep horizon; see Retention
                      #  "created_at": str,            # when this config was first written
                      #  "pkg_commit": null | "<sha>", # the commit bootstrap shipped to this host
-                     #  "env": {"HF_HOME": ...}}      # host-wide, hand-set; see Persistent root
+                     #  "env": {"HF_HOME": ...}}      # host-wide; see Persistent root
 secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
-incoming/<jobid>.json # a spec staged 0644 by `submit`, fed to `enqueue -` and deleted
-queue/<prio>-<jobid> # empty marker files; lexical order is dispatch order. prio is 2 digits, default 50.
+incoming/<jobid>/    # a job `gpuc submit` is still building: the rsynced workdir, then the spec.
+                     # `enqueue` renames the whole dir into jobs/, which is the acceptance
 jobs/<jobid>/
-  spec.json          # the submitted JobSpec. Only `gpuc estimate` and `gpuc reorder` rewrite it,
-                     # and both keep keys another build wrote (see Reorder, Estimate below)
-  state.json         # {"status": queued|running|succeeded|failed|cancelled, "attempt": n,
-                     #  "reason": str|null, "exit_code": int|null, "gpus": [...], "started_at", "ended_at",
+  .lock              # the flock every read-modify-write of state.json takes
+  spec.json          # the submitted JobSpec, written once by `enqueue` and never again
+  state.json         # {"status": queued|running|succeeded|failed|cancelled,
+                     #  "intent": null | "cancel" | "preempt",   # what somebody asked of a running job
+                     #  "attempt": n, "priority": p,           # the live priority; the queue is
+                     #                                        # every `queued` state in (priority, id) order
+                     #  "estimated_runtime_min": null | m,     # the live estimate, as `gpuc estimate` left it
+                     #  "reason": str|null, "problems": [str, ...],  # what ended it, and what else went wrong
+                     #  "exit_code": int|null, "gpus": [...], "started_at", "ended_at",
                      #  "phase": setup|preflight|main|sync, "pid": int|null, "pgid": int|null,
                      #  "isolation": "cgroup"|"pgid", "cgroup_unit": str|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
-                     #  "runner_starttime": str|null, "sync_error": str|null,
+                     #  "runner_starttime": str|null,
                      #  "util_recent": [float|null, ...],
                      #  "progress_pct": float|null, "progress_error": str|null, "eta": str|null,
+                     #  "uploads": [{"to": uri, "output": path|null, "ok_at": str|null, "error": str|null}],
+                     #                              # one record per destination, `output` null for
+                     #                              # the host's mirror of log.txt and state.json;
+                     #                              # the whole account of what is safely elsewhere
                      #  "workdir_removed": bool,
                      #  "workdir_bytes": int|null,  # what removing workdir/ would free;
                      #                              # measured once, as the job ended (or by
                      #                              # the first status to find it missing)
-                     #  "meta_synced_at": str|null, "meta_synced_to": str|null,
-                     #  "outputs_synced_at": str|null, "outputs_lost": bool}
-                     # meta_synced_* are written only after a successful final meta sync, and
-                     # are the precondition `purge` checks. outputs_synced_at only when the
-                     # final `outputs:` upload succeeded; outputs_lost by a drain that gave up.
+                     #  "outputs_lost": bool}       # a drain retried the outputs and gave up
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and must not be read as 0%. eta is null unless the job is running.
                      # progress_pct survives the job. pgid is the *job's* group, published by
@@ -130,10 +138,6 @@ jobs/<jobid>/
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
-  kill               # a kill request with its reason (`preempted`)
-  preempt            # this job is coming back: `gpuc preempt` wrote it beside the kill request,
-                     # and the dispatcher queues the job again once its runner has stopped it.
-                     # Removed by whichever of the two decides the job is not coming back
   workdir/           # rsynced code (git-tracked + untracked, .gitignore obeyed); removed per `cleanup:`
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir
@@ -142,6 +146,15 @@ dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
 draining             # present while the host is shutting itself down
 ```
+
+There is no queue file and no marker file: a job's `state.json` is the one
+record of what it is doing and what has been asked of it, every change to it
+is one atomic replace under the job's lock, and the queue is derived from it.
+So there is no order of writes to survive a crash between, and nothing that
+reconciles two files that disagree. A change of ownership -- the dispatcher
+claiming a queued job, a cancel ending one, a requeue putting one back -- is a
+compare-and-set on `status` (`jobs.transition`), so two of them racing on one
+job cannot both win.
 
 All state writes are atomic (write temp in same dir, `os.replace`).
 
@@ -152,6 +165,7 @@ All state writes are atomic (write temp in same dir, `os.replace`).
   "name": "lego-s4",                    # human label, not an identifier
   "command": "uv run python -m experiments.lego.train --k-max 6",
   "setup": "uv sync --frozen",          # optional; runs before command, phase=setup
+  "python": "uv run --no-sync python",  # how the GPU check runs Python in the job's own env
   "gpus": 1,                            # at least 1
   "use_shared": false,                  # may this job also be dispatched to `shared_gpus`?
                                         # see Shared GPUs
@@ -163,10 +177,12 @@ All state writes are atomic (write temp in same dir, `os.replace`).
               {"path": "checkpoints", "hf": "org/repo", "hf_path": "{job_id}",
                "hf_create": false}],   # create the repo if the sync preflight finds it missing
   "sync_interval_s": 180,
-  "priority": 50,
+  "priority": 50,                       # copied into the state at enqueue; the state's copy is
+                                        # the live one (`gpuc reorder`, `gpuc preempt --priority`)
   "max_runtime_min": null,
   "estimated_runtime_min": null,        # the submitter's own guess, measured from the runner's
-                                        # start exactly as max_runtime_min is. Informational only
+                                        # start exactly as max_runtime_min is. Informational only;
+                                        # copied into the state at enqueue, where `gpuc estimate` edits it
   "progress_command": null,             # run in workdir/ every progress_interval_s of phase main;
                                         # its last line of stdout is a percentage. See Estimates
   "progress_interval_s": 60,
@@ -207,25 +223,28 @@ the ssh that started it. The rules it holds to:
   dispatcher whose own commit is unrecorded replaces nobody. `gpuc status`
   reports the holder's commit as `dispatcher.pkg_commit` and warns when it
   differs from the package on disk.
-- **The queue is taken in order** (`launch_ready`), every 2 s: a job that does
-  not fit holds the cards it is waiting for, owned and borrowed alike, and
+- **One dispatch rule** (`plan.plan`), pure, over one pass's inputs: the
+  queue in `(priority, job_id)` order, the owned cards free now, the configured
+  counts, and one nvidia-smi reading of the shared cards taken only if a job
+  needs to borrow. It decides one of four things per job -- assigned, holds,
+  stepped over, fails -- and `launch_ready` acts on it every 2 s: a job that
+  does not fit holds the cards it could take, owned and borrowed alike, and
   nothing behind it may take them. The one exemption is a job short only of a
   shared card somebody else is on, which is stepped over rather than failed. A
-  job that asks for no GPU, or for more than the host has including shared
-  cards, is failed (`_capacity_failure`).
-- **A job is submitted when its queue marker exists, and not before.** `enqueue`
-  writes spec, then state, then marker, so an interrupted submit leaves a job
-  dir the host was never asked to run; after an hour it is `failed:
-  incomplete-submit`. A job `requeue_preempted` is putting back is in the same
-  shape mid-move and is excluded.
-- **`launch_ready` never dispatches on a marker alone** (`_still_queued`): only
-  a state of `queued` starts a runner, and a marker that disagrees is dropped.
-  A leftover marker is therefore harmless rather than a second runner in a
-  workdir.
-- **Writes that take a job out of the queue put the state first**
-  (`queue.leave_queue`, `queue.cancel`): interrupted that way a job is `running`
-  with a stale marker, which the rule above handles, where the other order is
-  indistinguishable from an uncommitted submit.
+  job that asks for no GPU, or for more than the host is configured with
+  including the shared cards it may borrow, is failed. The same function,
+  run over the cards a stop in flight will hand back, is how automatic
+  preemption finds the one job the queue is stuck on, and run forward over the
+  running jobs' etas (`plan.project`) it is how the host's `status` says when
+  each queued job will start. Three questions, one rule.
+- **Acceptance is a rename.** `gpuc submit` builds the job dir under
+  `incoming/`; the host's `enqueue` writes the spec and initial state there
+  and renames the dir into `jobs/`. A job dir under `jobs/` was accepted by
+  construction; a dir left under `incoming/` an hour after its last change is
+  a submit that died, and is removed.
+- **A queued job is claimed by compare-and-set** (`queue.claim`): only a state
+  still `queued` becomes `running`, so a cancel that landed between listing
+  the queue and launching costs nothing but a skipped launch.
 - **Adoption at startup** (`adopt_orphans`): every job whose state says
   `running` is adopted or failed `runner-died`, and a failed one's leftovers are
   killed (`cgroup_unit`, then `pgid`) before its cards go back in the pool.
@@ -235,20 +254,20 @@ the ssh that started it. The rules it holds to:
   live `gpuc.host run <id>` processes (`runner.live_runner_pids`) and those are
   adopted. What is found is not written back: the runner records its own pid
   moments later.
-- **Cancel** is a `cancel` marker; the **runner** owns the kill and the
-  dispatcher escalates only once the state publishes a `cgroup_unit` or a pgid
-  that is not the runner's own. A queued job is cancelled by removing its
-  marker.
-- **Stop with a reason** is a `kill` marker (`queue.request_kill`): the runner
-  ends the job `failed: <reason>` after a final sync. Preempt uses it; cancel
-  keeps its own marker.
+- **A stop is an intent** in the job's state: `cancel` or `preempt`. The
+  **runner** owns the kill -- it polls its state and ends the attempt as
+  `cancelled` or `failed: preempted` after a final sync -- and the dispatcher
+  escalates only once the grace period has passed (`escalate_stops`): the
+  job's scope and group, then the runner itself, then the runner's group. A
+  queued job is cancelled on the spot, with no intent. A cancel overrides a
+  preempt.
 - **Preempt** (`queue.preempt`) is for a running job, and only when something
   else could run instead. The runner keeps `workdir/` and the secrets file and
-  does not re-take the outputs baseline. `queue.requeue_preempted` clears
-  `kill`, writes a fresh `queued` state at `attempt+1`, writes the marker, and
-  removes `preempt` **last**, so an interruption is completed as the same
-  attempt. It does not go back if the attempt ended for a reason of its own,
-  was cancelled while stopping, has no workdir, or the host is going away.
+  does not re-take the outputs baseline. `queue.requeue_preempted` is one write
+  under the job's lock: a fresh `queued` state at `attempt+1`, keeping the
+  live priority and estimate. It does not go back if the attempt ended for a
+  reason of its own, was cancelled while stopping, has no workdir, or the host
+  is going away.
 - **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
   `auto_preempt` jobs that together cover the whole gap -- least important
@@ -258,11 +277,9 @@ the ssh that started it. The rules it holds to:
   fails, the rest are left alone. Exactly one queued job is asked per pass.
   Nothing is stopped on a host that is going away, and one pass's nvidia-smi
   reading of the shared cards serves both walks.
-- **Reorder** renames the marker *and* updates the spec, which is the only copy
-  that can say what priority a running job was dispatched at. **Estimate**
-  rewrites the spec as raw JSON, so keys another build wrote survive. The
-  control side re-mirrors the spec after both; a mirror it cannot write is a
-  warning.
+- **Reorder** and **estimate** write the job's state and nothing else; the
+  spec is never rewritten after enqueue. The control side re-mirrors the spec
+  after both; a mirror it cannot write is a warning.
 - **Idle terminate** (only with `config.provider` set): no running jobs and an
   empty queue for `idle_minutes` -> `draining`, retry unconfirmed outputs,
   mirror every job's state and log, then `terminate.self_terminate()`. Only a
@@ -277,8 +294,11 @@ The order is the contract; each step is in `runner.py`.
 
 1. Resolve the assignment against `nvidia-smi --query-gpu=index,uuid`, indices
    and UUIDs both, and fail `gpu-assert` if it is empty or names a card that is
-   not here. Export `CUDA_VISIBLE_DEVICES=<resolved UUIDs>`, the spec `env` and
-   the secrets file.
+   not here. Export `CUDA_VISIBLE_DEVICES` as the cards' nvidia-smi **indices**
+   with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the numbers mean the same cards to
+   CUDA (vLLM `int()`s each entry; a UUID there fails inside a subprocess with
+   an error that points at the model); as UUIDs only if the index table could
+   not be read. Then the spec `env` and the secrets file.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json` (path,
    size, mtime), **before `setup`** -- a setup step writing there is this job's
    doing, a committed file that was already there is not. Every upload excludes
@@ -286,41 +306,48 @@ The order is the contract; each step is in `runner.py`.
    no-outputs`. Above `baseline.MAX_TRACKED` files the exclusion is dropped with
    a loud warning.
 2. `phase=setup`: `spec.setup` in `workdir` under `bash -eo pipefail`.
-3. `phase=preflight`: the GPU check **inside the job's environment** -- `uv run
-   --no-sync` over the `shared/gpu.py` probe (`is_available()`, then a tensor
-   add and `.item()`), asserting `device_count()` equals `gpus`. Failure ->
+3. `phase=preflight`: the GPU check **inside the job's environment** -- the
+   spec's `python` (default `uv run --no-sync python`) over a probe
+   (`is_available()`, then a tensor add and `.item()`), asserting
+   `device_count()` equals `gpus`. Failure ->
    `failed: gpu-preflight`. Its own phase, so `gpuc status` can tell "installing
    torch" from "proving the card works".
-3b. **Sync preflight**, still before `main`. With S3 outputs or a host
-   `s3_prefix`: `aws` must resolve and a `.preflight` object must upload to
-   every destination and to the host's `jobs/<id>/` mirror prefix. With HF
-   outputs: `hf` must resolve, `hf auth whoami` must succeed with the job's
-   token, and a `.preflight` file must upload to each repo, creating it when
-   that output sets `hf_create: true`. Failure -> `failed: sync-preflight`, with
-   the command and its error in `log.txt`, and no final output sync. A job with
-   no outputs on a host with no mirror checks nothing.
+3b. **Sync preflight**, still before `main`: every `Destination` the job will
+   upload to -- each output's, and the host's `jobs/<id>/` mirror -- proves a
+   `.preflight` write works with the job's own environment (S3: `aws` resolves
+   and the copy succeeds; Hugging Face: `hf` resolves, `hf auth whoami`
+   succeeds with the job's token, the repo exists or `hf_create` makes it, and
+   the upload succeeds). Failure -> `failed: sync-preflight`, with the command
+   and its error in `log.txt`, and no final output sync. A job with no outputs
+   on a host with no mirror checks nothing.
 4. Start the sync loop (background thread): `outputs` every `sync_interval_s`,
    skipping files modified in the last 10 s, plus `log.txt` and `state.json` to
-   `s3_prefix/jobs/<id>/`. Uploads run with the **job's** environment, secrets
-   included, so `secrets: [AWS_ACCESS_KEY_ID, ...]` is enough and no host-level
-   credential is needed. The secrets file is unlinked after the final sync,
-   never before.
+   `s3_prefix/jobs/<id>/`. **Every upload is recorded** in the state's
+   `uploads`, one record per destination: the last success and the last
+   failure, an output path that does not exist included -- which is how a
+   running job whose output is not being uploaded shows up in `status` rather
+   than in a log line nobody reads. Uploads run with the **job's** environment,
+   secrets included, so `secrets: [AWS_ACCESS_KEY_ID, ...]` is enough and no
+   host-level credential is needed. The secrets file is unlinked after the
+   final sync, never before.
 5. `phase=main`: `spec.command`, stdout and stderr appended to `log.txt`, in its
    own scope or process group (see Process isolation). Sample the assigned GPUs
    every 30 s into `util_recent`; nothing acts on it. Enforce
    `max_runtime_min` (SIGTERM the group, SIGKILL at 15 s, `failed: timeout`),
    and run `spec.progress_command` every `progress_interval_s`.
-6. Capture the exit code **before** any cleanup, stop the sync loop and run one
-   final sync: a failed one makes a succeeded job `failed: sync`, and an output
-   path that was never written makes it `failed: no-outputs`. Write final state.
+6. Capture the exit code **before** any cleanup, stop the sync loop, clear
+   every output's success record and run one final sync, so only the upload
+   that includes the last minute's files counts. A failed one makes a succeeded
+   job `failed: sync`, and an output path that was never written makes it
+   `failed: no-outputs`; a job already over for a reason of its own keeps that
+   `reason` and lists the upload failure under `problems`. Write final state.
    The runner exits with the job's code.
 7. Apply `spec.cleanup` to `workdir/` **after** the final sync and state write,
    never before -- `outputs:` paths resolve inside the workdir. Record
    `workdir_removed` and `workdir_bytes`; a removal that fails is logged and
-   nothing more. Then upload state and log once more, recording
-   `meta_synced_at`/`meta_synced_to`, so the mirror includes the record of
-   itself. `outputs_synced_at` is written in step 6 when the final output upload
-   succeeded.
+   nothing more. Then upload state and log once more and record the mirror's
+   own upload (the record with `output: null`), so the mirror includes the
+   record of itself.
 
 ## Job length estimates
 
@@ -329,10 +356,9 @@ informational and may never change a job's outcome; what they mean to a
 submitter is [usage.md](usage.md#job-length-estimates).
 
 - `estimated_runtime_min` is published as `eta` at the top of *every* phase,
-  not just `main`. The monitor loop re-reads the spec every `SPEC_REFRESH_S`,
-  which is how `gpuc estimate` reaches a running job, and picks up a
-  `progress_command` or `progress_interval_s` added mid-run. Those three fields
-  are the whole of what a running job re-reads.
+  not just `main`. The monitor loop re-reads it from the job's state every
+  `ESTIMATE_REFRESH_S`, which is how `gpuc estimate` reaches a running job.
+  It is the one thing a running job re-reads; the spec is never rewritten.
 - `progress_command` runs in `workdir/` with the job's environment, during
   `main` only; `progress.parse` accepts a fraction with a decimal point or a
   percentage with a `%`, and nothing else. Above 0% the runner replaces `eta`
@@ -345,11 +371,13 @@ submitter is [usage.md](usage.md#job-length-estimates).
 - A failed, timed-out or unparseable poll writes `progress_error`, logged the
   first time each distinct message appears. `eta` is cleared when the job ends;
   `progress_pct` is not.
-- `status.queue_start_estimates` projects a queued job's *start* by replaying
-  the dispatcher's rule: cards come free at the eta of whatever holds them, the
-  queue is taken in order, with the same one exemption as `launch_ready`. A card
-  held by a job that published no eta is not schedulable, so a job whose turn
-  depends on it is unknown; a draining host projects nothing.
+- The **host** projects each queued job's start (`plan.project`, published by
+  `python -m gpuc.host status` as `starts_in_s`, with `starts_unknown` saying
+  why not) by running the dispatch rule forward: cards come free at the eta of
+  whatever holds them and the queue is taken in order, by the same function a
+  pass dispatches with. A card held by a job that published no eta is not
+  schedulable, so a job whose turn depends on it is unknown; a draining host
+  projects nothing. The control side renders the answer and computes nothing.
 
 ## Process isolation (cgroup scope, else process group)
 
@@ -395,9 +423,11 @@ policy, the two horizons and every refusal are
   and `gpuc clean --only` sends the ids as both `--only` and `--sweep-only`; the
   two stay separate because `--verify` purges what the mirror confirmed and
   sweeps what was named.
-- The host cannot consult the mirror, so `meta_synced_at` in the job's own
-  `state.json` is the purge's authority. `--verify` on the control side is the
-  exception: it HEADs the mirrored `log.txt` under `meta_synced_to` first.
+- The host cannot consult the mirror, so the mirror's upload record in the
+  job's own `state.json` is the purge's authority, and confirmed outputs are
+  every output destination's record saying the last upload succeeded.
+  `--verify` on the control side is the exception: it HEADs the mirrored
+  `log.txt` under the recorded mirror uri first.
 - The dispatcher runs `cleanup.clean(automatic=True)` at startup and then at
   most once an hour, purge first. The automatic form adds two refusals a delete
   nobody typed needs: `cleanup: never`, and outputs not confirmed elsewhere.
@@ -434,6 +464,15 @@ Two rules follow:
   the host's config already names is never overridden, and an unreadable
   comparison changes nothing.
 
+`HostConfig.env` is otherwise opaque, and the keys the tool has an opinion
+about are one table, `jobs.MANAGED_ENV`: `UV_CACHE_DIR` and `HF_HOME` are
+*sticky* (an `--env` that does not name them keeps them) and *derived* by
+bootstrap beside gpuc home when the host names nothing -- the uv cache wherever
+gpuc home and `$HOME` are on different filesystems, `HF_HOME` only under a
+persistent root, so the root keeps both caches and an ordinary host keeps the
+user's own; `UV_INSTALL_DIR` and `UV_TOOL_BIN_DIR` name directories
+that go on every child's PATH. Nothing else in `env` means anything to gpuc.
+
 The check compares filesystems rather than sizes because `du` cannot see a
 reflink. The case it exists for is a pod with `--persistent-root`: gpuc home on
 the network volume, `~/.cache` on the container's overlay.
@@ -455,8 +494,11 @@ hold to, whatever the flags:
   `RUNPOD_API_KEY` first and exits 1 with a single line if it is unset, before
   mirroring a spec or picking a host.
 - A host name is looked up locally; `logs`, `wait`, `cancel`, `preempt`,
-  `reorder`, `estimate` and `requeue` fall back to the job index and then to
-  asking each host, and an id nothing knows is exit 4, never a guess.
+  `reorder`, `estimate`, `requeue` and `ssh` resolve a job id the same way
+  (`find_job_host`): the job index, then asking each host, and an id nothing
+  knows is exit 4, never a guess. Every per-job verb runs through
+  `actions.job_verb`: find the host, ask it, insist on a verdict, re-mirror a
+  spec field it changed. The CLI and the dashboard call the same functions.
 - Nothing runs in the background on this side except, if installed, the web
   dashboard's service.
 
@@ -478,18 +520,19 @@ file the two halves share obeys the same two rules, on both sides:
   real value and round-trips unchanged: `retention_days: null` is "never
   auto-purge", `s3_prefix: null` is "no mirror".
 
-Control side that means `extra="ignore"`, a default on every field, and a
-`model_validator(mode="before")` that consults the annotation (`HostEntry`,
-`HostCache`, `Registry`, `Settings`, `IndexEntry`, `Offer`). The
-host config a registry entry caches is kept **verbatim** on top of that, so a
-key some newer build wrote survives a round trip through this one. Host side, with
+Control side that means one base, `tolerant.TolerantModel` (`extra="ignore"`,
+a default on every field, and a `model_validator(mode="before")` that consults
+the annotation), which `HostEntry`, `HostCache`, `Registry`, `Settings`,
+`IndexEntry` and `Offer` all derive from. The host config a registry entry
+caches is kept **verbatim** on top of that, so a key some newer build wrote
+survives a round trip through this one. Host side, with
 no pydantic, the same rules are spelled out in `jobs.from_dict` for
 `HostConfig`, `JobSpec`, `JobState` and the dispatcher's lock body: never
 `float(None)`, never a `KeyError`, an unusable value means the default.
 
 `hosts.json` and `config.json` both carry `schema_version` (1); readers accept
 it missing. `tests/fixtures/schema/` holds today's shape of each file plus
-older, newer and pre-split variants, and every one of them must parse.
+older and newer variants, and every one of them must parse.
 
 A host entry that still does not validate is **skipped, not fatal**: `gpuc`
 warns, works with the rest, and writes that entry back untouched on the next
@@ -535,8 +578,9 @@ that reach outside the module:
 
 - A host that cannot be asked is *trouble*, not an answer: retried for
   `TROUBLE_GRACE_S`, then read from the **S3 mirror** (the spec's "the mirror is
-  read only when the host is gone"). Only if that has no terminal state does the
-  job get an `error`.
+  read only when the host is gone"). A rental whose pod the provider already
+  reports gone skips the grace and is read from the mirror at once. Only if
+  that has no terminal state does the job get an `error`.
 - An id whose host answers and does not list it is exit 4, checked after the
   first poll. A job that *was* listed and then vanishes is trouble, not a
   missing id.
@@ -549,7 +593,10 @@ that reach outside the module:
 
 ## Transport
 
-`LocalTransport` runs subprocesses directly. `SshTransport` uses the system
+`LocalTransport` runs subprocesses directly. Both expose the same protocol,
+including `argv(command)` and `interactive_argv(command)`, so nothing above
+them asks which kind it holds: `gpuc ssh`, `gpuc logs -f` and `--print` build
+the same command for either. `SshTransport` uses the system
 `ssh`/`rsync` with `-o BatchMode=yes -o ConnectTimeout=15`, per-command
 timeouts, and host keys pinned on first contact into
 `~/.local/share/gpu-coordinator/known_hosts` -- except for ephemeral hosts,
@@ -581,7 +628,8 @@ touch argv.
 - the **address** -- `name`, `kind`, `ssh`, `port`, `gpuc_home` /
   `persistent_root`, `pod_id` -- which is hand-entered, local to this machine,
   and is everything needed to open a session and find `config.json`. Nothing in
-  it is a fact about how the host behaves.
+  it is a fact about how the host behaves. A host is a rental exactly when it
+  has a `pod_id`; `kind` only says which provider.
 - a **cache** of what the host last said: `python`, `uv`, `gpu_info`,
   `driver_version` and a copy of its `config.json`, stamped with `read_at`.
   Offline commands (`host list`, `version`) print it labelled "as of <age>";
@@ -619,12 +667,6 @@ that bootstrapped it first matters afterwards.
 - Provision is create pod -> wait for ssh -> the same connect, with the initial
   config a pod nobody has configured yet needs.
 
-A registry from before this split still parses: `HostEntry` folds the config
-fields it carries into the cache (`cache_dir` becomes `env.UV_CACHE_DIR`, which
-is the only place the host ever had it), and the next connect, `host set` or
-bootstrap works from the host's own copy. A `config.json` from before it needs
-no change at all: it is already the shape the host reads.
-
 ## Bootstrap (any host, idempotent)
 
 1. Install `uv` if `~/.local/bin/uv` is missing; `uv python install 3.12` if no
@@ -635,10 +677,11 @@ no change at all: it is already the shape the host reads.
    `s3_prefix` whose `aws` could not be installed fails bootstrap outright,
    since every job on it would end `failed: sync-preflight`.
 3. **Never rewrite `~/.gpuc/config.json`.** The host owns it, so bootstrap reads
-   it and merges back exactly two keys through the host's own `config --merge`:
-   the commit just shipped, and `env.UV_CACHE_DIR` when the host names none. The
-   one exception is a host with **no** config at all, where the last config this
-   machine read off it is restored.
+   it and merges back only what it derived, through the host's own `config
+   --merge`: the commit just shipped, and the managed env keys the host names
+   none of (`UV_CACHE_DIR` by filesystem comparison, `HF_HOME` beside gpuc
+   home under a persistent root). The one exception is a host with **no** config at all, where the last
+   config this machine read off it is restored.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `$HOME/.local/bin` and `$HOME/.cargo/bin` on PATH,
    and record the commit this build came from in the host's `config.json` --
@@ -659,11 +702,14 @@ numbering into a file nobody looks at again.
 
 Everything downstream is UUIDs. The dispatcher re-runs `nvidia-smi
 --query-gpu=index,uuid` each pass, maps the owned entries to whatever the driver
-calls those cards now, and assigns, accounts for and pins by UUID --
-`CUDA_VISIBLE_DEVICES` is never an index. The runner resolves its assignment
-again on the way in and writes the UUIDs back to the job state, and the
-dispatcher resolves what it adopts at startup: an index mistaken for a busy
-card's name is a card handed out twice.
+calls those cards now, and assigns and accounts by UUID. The runner resolves
+its assignment again on the way in and writes the UUIDs back to the job
+state, and the dispatcher resolves what it adopts at startup: an index
+mistaken for a busy card's name is a card handed out twice. The one place an
+index appears again is the job's own `CUDA_VISIBLE_DEVICES`, translated from
+the UUIDs by the runner at that instant and pinned with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, because that is the form every CUDA stack
+accepts.
 
 An owned entry that resolves to nothing is logged, treated as unavailable (jobs
 wait, they do not fail), and reported by `gpuc status` and the health check's
@@ -723,7 +769,17 @@ overlay `$HOME` is not a misconfiguration to warn about. The health check's disk
 floor is measured on `paths.home()`, so it is `R`'s volume when a root is set.
 The runbook for a host that came back empty is in setup.md.
 
-## RunPod provider (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
+## Providers
+
+Everything the control side knows about a provider's vocabulary lives on the
+`Provider` instance: which pod statuses mean nothing can run (`dead_statuses`),
+which mean the rental has ended (`gone_statuses`), the log signature of a
+broken host, and how a terminate is retried. Provisioning, `status`, `wait`
+and `host terminate` read those and name no status themselves;
+`actions.PROVIDERS` maps a `provider.kind` to its class. Adding a provider is
+one class and one table entry.
+
+### RunPod (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
 
 - `offers(constraints)`: `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=<tier>&minCudaVersion=<x>`
   once per requested tier; filter by name list / min VRAM / max price /
@@ -757,13 +813,13 @@ The runbook for a host that came back empty is in setup.md.
    `ssh.direct` present; poll SSH until a trivial command succeeds; write the
    pod its config, whose `provider` block carries the offer and `created_at`
    (`rented.py`: the pod is its own record, and this machine keeps none); run
-   bootstrap; deliver the RunPod key as `~/.gpuc/secrets/runpod` (0600) for
-   self-terminate; enqueue. On any broken-host signature in `logs`, the
+   bootstrap; enqueue. The pod terminates itself with the pod-scoped key
+   RunPod leaves in its own `/etc/rp_environment`. On any broken-host signature in `logs`, the
    15-minute ceiling, a health failure, a Ctrl-C or a bug: `terminate`, wait for
    TERMINATED, try the next offer. A terminate that failed is reported loudly
    and leaves the registry entry in place; nothing retries it.
 4. From bootstrap on, the only things that end the pod are the pod itself,
-   through the pod-scoped key at `~/.gpuc/secrets/runpod`, and a client running
+   through that pod-scoped key, and a client running
    `gpuc host terminate`. `tests/test_runpod_e2e.py` proves the first on every
    opt-in run.
 
@@ -824,25 +880,28 @@ after five tries rather than looping for ever.
 
 What `status` prints, and every flag, is usage.md. The invariants:
 
-- An ephemeral host whose pod the provider reports missing or dead is
-  `POD GONE`: no ssh is attempted, and the line says what the provider said
-  rather than printing a connection error. Missing or TERMINATED is the end of
-  that rental (`pod_terminated`), so the entry is forgotten as it is printed; a
-  pod the provider still has is a failure left for `gpuc host remove`.
+- A host is in one of four states (`status.HostState`), decided once in
+  `gather` and read everywhere else: it answered; it could not be reached; its
+  pod is dead (the provider still has it and nothing can run on it: a failure,
+  kept for `gpuc host terminate` or `gpuc host remove`); its pod is gone (the
+  rental has ended: not a failure, and the entry is forgotten as it is
+  printed). For either pod state no ssh is attempted, and the line says what
+  the provider said rather than printing a connection error.
 - A host that answered and still carries an `error` -- the provider could not be
   asked about its pod -- prints it as an `ERROR` line under the header. Nothing
   that decides an exit code may be visible only under `--json`.
 - A finished job that produced `outputs:` which never reached S3/HF is flagged
   (`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
   those are the jobs a purge -- or a pod going away -- would take with them. One
-  that declared outputs and never wrote them is not: there is nothing there.
+  that declared outputs and never wrote them is not: there is nothing there. A
+  *running* job with a failure standing at one of its destinations says
+  `UPLOAD FAILING` on its line, from the same upload records.
 - A pod's `provider_util` is the provider's reading for the whole pod; a job's
   `util` is the host's own nvidia-smi sampler over that job's cards. They are
   labelled separately and never merged.
-- Every job carries the `priority` it is (or was) ordered by. While a job is
-  queued that is its marker's, which is what the dispatcher reads; once the
-  marker is gone it is the spec's, which `reorder` keeps current. A host too old
-  to report either says `null`, never a default.
+- Every job carries the `priority` it is (or was) ordered by, from its state,
+  which is the one copy there is. A host too old to report it says `null`,
+  never a default.
 - The host's `status` reports each job's `outputs` (the spec's, `{job_id}`
   expanded) and `wandb` (`entity`, `project`, `run_id` from the job's `WANDB_*`
   env, and nothing else of its env). The control side turns those into

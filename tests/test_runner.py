@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import jobs, paths, queue, runner, sync
+from gpuc.host import destinations, jobs, paths, queue, runner, sync
 from gpuc.host.jobs import HostConfig, JobState
 from gpuc.host.runner import RunnerDeps
 from tests.conftest import (
@@ -27,7 +27,6 @@ from tests.conftest import (
 def prepare(gpus: Sequence[str] = (FAKE_GPUS[0],), **overrides: object) -> str:
     spec = make_spec(**overrides)
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=list(gpus))
     return job_id
 
@@ -79,10 +78,32 @@ def test_setup_uses_pipefail(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).reason == "setup"
 
 
-def test_cuda_visible_devices_is_the_assigned_uuids(gpuc_home: Path) -> None:
-    job_id = prepare(gpus=FAKE_GPUS, command='echo "CVD=$CUDA_VISIBLE_DEVICES"')
+def test_cuda_visible_devices_is_the_nvidia_smi_indices_of_the_assigned_cards(
+    gpuc_home: Path,
+) -> None:
+    job_id = prepare(
+        gpus=FAKE_GPUS, command='echo "CVD=$CUDA_VISIBLE_DEVICES ORDER=$CUDA_DEVICE_ORDER"'
+    )
     assert runner.run_job(job_id, deps()) == 0
-    assert f"CVD={FAKE_GPUS[0]},{FAKE_GPUS[1]}" in log_of(job_id)
+    assert "CVD=0,1 ORDER=PCI_BUS_ID" in log_of(job_id)
+
+
+def test_build_env_names_cards_by_index_when_every_one_has_an_index(gpuc_home: Path) -> None:
+    spec = make_spec(job_id="j1")
+    env = runner.build_env(spec, [FAKE_GPUS[1]], indices={FAKE_GPUS[0]: 0, FAKE_GPUS[1]: 1})
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+
+@pytest.mark.parametrize("indices", [None, {FAKE_GPUS[0]: 0}], ids=["no-table", "partial-table"])
+def test_build_env_falls_back_to_uuids_without_a_full_index_map(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, indices: dict[str, int] | None
+) -> None:
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    spec = make_spec(job_id="j1")
+    env = runner.build_env(spec, FAKE_GPUS, indices=indices)
+    assert env["CUDA_VISIBLE_DEVICES"] == f"{FAKE_GPUS[0]},{FAKE_GPUS[1]}"
+    assert "CUDA_DEVICE_ORDER" not in env
 
 
 def test_spec_env_cannot_override_the_gpu_assignment(gpuc_home: Path) -> None:
@@ -92,7 +113,7 @@ def test_spec_env_cannot_override_the_gpu_assignment(gpuc_home: Path) -> None:
         command='echo "CVD=$CUDA_VISIBLE_DEVICES MY_VAR=$MY_VAR"',
     )
     assert runner.run_job(job_id, deps()) == 0
-    assert f"CVD={FAKE_GPUS[0]} MY_VAR=set" in log_of(job_id)
+    assert "CVD=0 MY_VAR=set" in log_of(job_id)
 
 
 def test_secrets_file_is_sourced_into_the_job(gpuc_home: Path) -> None:
@@ -102,14 +123,14 @@ def test_secrets_file_is_sourced_into_the_job(gpuc_home: Path) -> None:
     assert "TOKEN=hf_abc" in log_of(job_id)
 
 
-def test_a_job_assigned_gpus_by_index_runs_on_the_uuids_those_indices_name(
+def test_a_job_assigned_gpus_by_index_runs_on_the_card_that_index_names(
     gpuc_home: Path,
 ) -> None:
     """A position-pinned host assigns `1`, and the preflight must resolve that
     rather than compare it against UUIDs and fail every job."""
     job_id = prepare(gpus=["1"], command='echo "CVD=$CUDA_VISIBLE_DEVICES"')
     assert runner.run_job(job_id, deps()) == 0
-    assert f"CVD={FAKE_GPUS[1]}" in log_of(job_id)
+    assert "CVD=1" in log_of(job_id)
     # Written back so a dispatcher that restarts adopts the card as busy.
     assert jobs.read_state(job_id).gpus == [FAKE_GPUS[1]]
 
@@ -144,7 +165,7 @@ def test_a_job_with_no_gpu_assigned_never_runs(gpuc_home: Path) -> None:
 def test_failed_final_sync_turns_a_succeeded_job_into_failed_sync(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: None)
     job_id = prepare(
         command="mkdir -p out && echo x > out/x",
         outputs=[{"path": "out", "s3": "s3://bucket/{job_id}"}],
@@ -154,22 +175,51 @@ def test_failed_final_sync_turns_a_succeeded_job_into_failed_sync(
     assert runner.run_job(job_id, deps(sync_preflight=False)) == 1
     state = jobs.read_state(job_id)
     assert (state.status, state.reason, state.exit_code) == ("failed", "sync", 1)
+    # The upload failing *is* the reason, so it is not listed again beside it.
+    assert state.problems == []
     assert "final sync FAILED" in log_of(job_id)
 
 
 def test_failed_final_sync_does_not_mask_a_failed_job(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: None)
     job_id = prepare(
         command="mkdir -p out && exit 7",
         outputs=[{"path": "out", "s3": "s3://bucket/{job_id}"}],
     )
     assert runner.run_job(job_id, deps(sync_preflight=False)) == 7
     state = jobs.read_state(job_id)
-    assert state.status == "failed"
-    assert state.reason == "exit 7+sync"
-    assert state.exit_code == 7
+    assert (state.status, state.reason, state.exit_code) == ("failed", "exit 7", 7)
+    assert state.problems == ["sync"]
+
+
+def test_a_preempted_job_whose_final_upload_fails_still_comes_back(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upload failure is noted beside the reason, not folded into it: a
+    `preempted+sync` reason was one the requeue did not recognise."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+    command_runner, _ = uploading(fail_dest="s3://bucket/")
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt && sleep 30",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+    )
+    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
+    written = paths.workdir(job_id) / "results/a.txt"
+
+    def preempt_once_written() -> None:
+        _wait_until(written.exists)
+        queue.preempt(job_id)
+
+    thread = threading.Thread(target=preempt_once_written, daemon=True)
+    thread.start()
+    assert runner.run_job(job_id, deps(command_runner=command_runner, sync_preflight=False)) != 0
+    thread.join(timeout=30)
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.problems) == ("failed", "preempted", ["sync"])
+    assert queue.requeue_preempted(job_id) == 2
+    assert jobs.read_state(job_id).status == "queued"
 
 
 def test_max_runtime_kills_with_reason_timeout(gpuc_home: Path) -> None:
@@ -313,7 +363,7 @@ def test_runner_uses_the_s3_prefix_for_log_and_state(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     jobs.write_config(HostConfig(host="h", gpus=list(FAKE_GPUS), s3_prefix="s3://b/gpuc/h"))
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     calls: list[list[str]] = []
 
     def command_runner(
@@ -324,9 +374,9 @@ def test_runner_uses_the_s3_prefix_for_log_and_state(
 
     job_id = prepare(command="true")
     assert runner.run_job(job_id, deps(command_runner=command_runner)) == 0
-    destinations = [argv[-2] for argv in calls]
-    assert f"s3://b/gpuc/h/jobs/{job_id}/log.txt" in destinations
-    assert f"s3://b/gpuc/h/jobs/{job_id}/state.json" in destinations
+    targets = [argv[-2] for argv in calls]
+    assert f"s3://b/gpuc/h/jobs/{job_id}/log.txt" in targets
+    assert f"s3://b/gpuc/h/jobs/{job_id}/state.json" in targets
 
 
 def test_build_env_exposes_job_paths(gpuc_home: Path) -> None:
@@ -381,7 +431,7 @@ def test_sigterm_kills_the_job_group_and_writes_failed_terminated(gpuc_home: Pat
     assert "received SIGTERM" in log_of(job_id)
 
 
-def test_sigterm_after_a_cancel_marker_ends_the_job_as_cancelled(gpuc_home: Path) -> None:
+def test_sigterm_after_a_cancel_request_ends_the_job_as_cancelled(gpuc_home: Path) -> None:
     job_id = prepare(command="sleep 300")
     proc = run_detached(job_id, gpuc_home)
     try:
@@ -405,7 +455,22 @@ def test_a_job_cancelled_during_the_launch_window_never_runs_its_command(
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("cancelled", "cancelled")
     assert not (paths.workdir(job_id) / "RAN").exists()
-    assert "cancel marker present before phase=setup" in log_of(job_id)
+    assert "cancelled before phase=setup; not starting it" in log_of(job_id)
+
+
+def test_a_job_preempted_during_the_launch_window_never_runs_its_command(
+    gpuc_home: Path,
+) -> None:
+    """The intent lands between phases as readily as mid-phase, and a job that
+    is going back in the queue must not spend a single phase's work first."""
+    job_id = prepare(command="touch RAN")
+    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
+    queue.preempt(job_id)
+    assert runner.run_job(job_id, deps()) == runner.TERMINATED_EXIT_CODE
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "preempted")
+    assert not (paths.workdir(job_id) / "RAN").exists()
+    assert "preempted before phase=setup; not starting it" in log_of(job_id)
 
 
 def test_the_secrets_file_is_removed_once_the_job_has_finished(gpuc_home: Path) -> None:
@@ -440,7 +505,7 @@ def test_the_generated_preflight_asks_torch_whether_the_card_is_there() -> None:
     and the repo's own venv has no torch, and it has to actually *count*
     devices: importing torch proves nothing about a host whose driver is gone.
     """
-    command = runner.preflight_command()
+    command = runner.preflight_command(make_spec())
     assert command.startswith("uv run --no-sync python -c ")
     assert "import os, sys, torch" in command
     assert "torch.cuda.device_count()" in command
@@ -448,12 +513,24 @@ def test_the_generated_preflight_asks_torch_whether_the_card_is_there() -> None:
     assert "device_count()=={count}, expected {expected}" in command
 
 
+def test_the_jobs_python_is_the_interpreter_the_preflight_runs_under() -> None:
+    command = runner.preflight_command(make_spec(python=".venv/bin/python"))
+    assert command.startswith(".venv/bin/python -c ")
+    assert "torch.cuda.device_count()" in command
+
+
+def test_a_job_that_names_its_python_runs_its_preflight_through_it(gpuc_home: Path) -> None:
+    job_id = prepare(gpus=[FAKE_GPUS[0]], command="true", python="echo VIA-THE-JOBS-PYTHON")
+    assert runner.run_job(job_id, deps(preflight=True)) == 0
+    assert "phase=preflight: echo VIA-THE-JOBS-PYTHON -c " in log_of(job_id)
+
+
 def test_preflight_is_a_real_phase(gpuc_home: Path) -> None:
     job_id = prepare(gpus=[FAKE_GPUS[0]], command="true")
     assert (
         runner.run_job(
             job_id,
-            deps(preflight=True, preflight_command=lambda: "echo gpu preflight ok"),
+            deps(preflight=True, preflight_command=lambda spec: "echo gpu preflight ok"),
         )
         == 0
     )
@@ -465,7 +542,7 @@ def test_preflight_is_a_real_phase(gpuc_home: Path) -> None:
 def test_a_missing_output_dir_fails_the_job_as_no_outputs_not_as_sync(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setattr(
         sync, "run_command", lambda argv, timeout=None, env=None: sync.CommandResult(argv, 0, "")
     )
@@ -513,7 +590,7 @@ def test_a_jobs_secrets_reach_the_sync_loop(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`secrets: [AWS_ACCESS_KEY_ID]` must be enough: no ~/.aws on the host."""
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     seen: list[sync.Env] = []
 
@@ -539,7 +616,7 @@ def test_the_secrets_file_outlives_the_job_until_the_final_sync_is_done(
 ) -> None:
     """Unlinking it before the final sync would break exactly the upload that
     matters most: the one carrying the finished run's outputs."""
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     present_during_sync: list[bool] = []
 
@@ -593,25 +670,27 @@ def uploading(
 def test_a_successful_final_sync_records_the_backup(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading()
     job_id = prepare(command="true")
     assert runner.run_job(job_id, deps(command_runner=command_runner)) == 0
     state = jobs.read_state(job_id)
-    assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/h"
+    assert state.mirrored
+    assert state.mirror is not None and state.mirror.to == f"s3://b/gpuc/h/jobs/{job_id}"
 
 
 def test_a_failed_final_meta_sync_records_no_backup(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading(ok=False)
     job_id = prepare(command="true")
     runner.run_job(job_id, deps(command_runner=command_runner))
     state = jobs.read_state(job_id)
-    assert (state.meta_synced_at, state.meta_synced_to) == (None, None)
+    assert not state.mirrored
+    assert state.mirror is not None and state.mirror.ok_at is None and state.mirror.error
     assert "final state upload failed" in log_of(job_id)
 
 
@@ -620,11 +699,12 @@ def test_a_host_with_no_prefix_records_no_backup(gpuc_home: Path) -> None:
     job_id = prepare(command="true")
     assert runner.run_job(job_id, deps()) == 0
     state = jobs.read_state(job_id)
-    assert (state.meta_synced_at, state.outputs_synced_at) == (None, None)
+    assert state.uploads == []
+    assert not state.mirrored
 
 
 def test_confirmed_outputs_are_recorded(gpuc_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading()
     job_id = prepare(
@@ -632,13 +712,13 @@ def test_confirmed_outputs_are_recorded(gpuc_home: Path, monkeypatch: pytest.Mon
         outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
     )
     assert runner.run_job(job_id, deps(command_runner=command_runner)) == 0
-    assert jobs.read_state(job_id).outputs_synced_at is not None
+    assert jobs.read_state(job_id).outputs_uploaded(jobs.read_spec(job_id))
 
 
 def test_an_output_upload_that_fails_leaves_outputs_unconfirmed(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading(fail_dest="s3://bucket/")
     job_id = prepare(
@@ -647,16 +727,17 @@ def test_an_output_upload_that_fails_leaves_outputs_unconfirmed(
     )
     runner.run_job(job_id, deps(command_runner=command_runner, sync_preflight=False))
     state = jobs.read_state(job_id)
-    assert state.outputs_synced_at is None
+    assert not state.outputs_uploaded(jobs.read_spec(job_id))
+    assert state.upload_errors() and "AccessDenied" in state.upload_errors()[0]
     assert (state.status, state.reason) == ("failed", "sync")
     # The log and state still made it, so the record itself is backed up.
-    assert state.meta_synced_at is not None
+    assert state.mirrored
 
 
 def test_an_ephemeral_host_keeps_the_secrets_file_for_the_drain(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(
         HostConfig(
             host="pod",
@@ -684,7 +765,7 @@ def test_a_job_that_produced_nothing_does_not_keep_its_secrets_file(
 ) -> None:
     """The drain only retries jobs that are holding something. Keeping a job's
     credentials on disk for a retry that will never come is pure exposure."""
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(
         HostConfig(
             host="pod",
@@ -707,7 +788,7 @@ def test_a_job_that_produced_nothing_does_not_keep_its_secrets_file(
 def test_a_shared_host_still_removes_the_secrets_file(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading(fail_dest="s3://bucket/")
     job_id = prepare(

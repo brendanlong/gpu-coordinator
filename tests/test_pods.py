@@ -10,7 +10,7 @@ import pytest
 from gpuc.control import pods as pods_mod
 from gpuc.control.cli import EXIT_OK, main
 from gpuc.control.config import Settings, load_registry, registry_transaction
-from gpuc.control.status import HostView, render
+from gpuc.control.status import HostState, HostView, render
 from tests.conftest import host_entry
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
@@ -99,7 +99,7 @@ def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
     entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
     view = HostView(
         entry=entry,
-        reachable=True,
+        state=HostState.ANSWERED,
         heartbeat_age_s=3.0,
         owned=["GPU-1"],
         pod=running_pod("gpuc-e2e-aaa", "pod1", age_minutes=20),
@@ -110,7 +110,9 @@ def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
 
 def test_status_shows_the_pod_even_when_the_host_is_unreachable() -> None:
     entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
-    view = HostView(entry=entry, reachable=False, error="ssh timed out", pod=running_pod("n", "p"))
+    view = HostView(
+        entry=entry, state=HostState.UNREACHABLE, error="ssh timed out", pod=running_pod("n", "p")
+    )
     text = render(view)
     assert "UNREACHABLE" in text and "pod     p RUNNING" in text
 

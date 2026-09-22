@@ -57,7 +57,6 @@ from gpuc.control.actions import (
     read_registry_warned,
     registry_exit,
     remove_host,
-    rental_gone,
     reorder_job,
     shipped_note,
     status_errors,
@@ -114,9 +113,10 @@ from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import (
     JobSpecModel,
     SubmitResult,
+    check_gpu_count,
     from_mirror,
     load_document,
-    precheck_local,
+    prepare,
     submit_file,
     submit_spec,
     validate,
@@ -124,7 +124,6 @@ from gpuc.control.submit import (
 )
 from gpuc.control.transport import (
     NO_GIT_EXCLUDES,
-    SshTransport,
     Transport,
     TransportError,
     tail_command,
@@ -250,10 +249,11 @@ def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEnt
     one: the pod owns its config and carries its own record of what it was
     bought as (`rented`), so all this has to find is the door.
     """
-    pod = make_provider(settings).get(pod_id)
-    if pod is None or pod.status == "TERMINATED":
+    provider = make_provider(settings)
+    pod = provider.get(pod_id)
+    if pod is None or provider.is_gone(pod):
         raise CliError(
-            f"pod {pod_id} is {'gone' if pod is None else 'TERMINATED'} on this account, so "
+            f"pod {pod_id} is {'gone' if pod is None else pod.status} on this account, so "
             f"there is nothing to add. `gpuc pods` lists the pods it can see."
         )
     reached = rented.address_for(address.name, pod)
@@ -759,7 +759,7 @@ def bootstrap_every_host(
             report(f"\n{tally.render()}")
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
-            gone = rental_gone(entry, provider, report)
+            gone = status_mod.rental_gone(entry, provider, report)
             if gone is not None:
                 report(f"{gone}; forgetting this host")
                 tally.record(entry, "gone")
@@ -1096,13 +1096,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if args.runpod:
         document = with_overrides(load_document(args.job_file), **overrides)
         model = validate(document, str(args.job_file))
-        precheck_local(
-            model,
-            Path.cwd(),
-            gpu_count=args.gpu_count,
-            use_git=use_git,
-        )
+        check_gpu_count(model, args.gpu_count)
         job_id = jobs.new_job_id()
+        prepared = prepare(model, Path.cwd(), job_id=job_id, use_git=use_git)
         spec_uri, notes = mirror_spec_first(model, job_id, settings)
         entry = runpod_target(args, settings)
         entry = ensure_package_current(
@@ -1117,6 +1113,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             spec_uri=spec_uri,
             use_git=use_git,
             report=report,
+            prepared=prepared,
         )
         result.notes.extend(notes)
         return _queued(result, args, entry, settings)
@@ -1313,7 +1310,6 @@ def cmd_ssh(args: argparse.Namespace) -> int:
         command = command[1:]
     entry, directory, fallback = ssh_target(args)
     transport = transport_for(entry, load_settings())
-    local = entry.kind == "local"
     if command:
         # Joined with spaces and handed to a shell, which is what `ssh host CMD`
         # has always done and what anyone typing `-- 'ls | wc -l'` expects.
@@ -1330,11 +1326,6 @@ def cmd_ssh(args: argparse.Namespace) -> int:
         print(ssh_mod.print_line(ssh_mod.interactive_argv(transport, directory, fallback)))
         return EXIT_OK
     print(f"# {entry.name}:{directory}", file=sys.stderr)
-    if local:
-        # No ssh to this machine: chdir and hand over the terminal directly.
-        os.chdir(ssh_mod.local_directory(directory, fallback))
-        shell = os.environ.get("SHELL", ssh_mod.DEFAULT_SHELL)
-        os.execvp(shell, [shell, "-l"])
     argv = ssh_mod.interactive_argv(transport, directory, fallback)
     os.execvp(argv[0], argv)
 
@@ -1409,10 +1400,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
     # `-F`, not `-f`: `gpuc submit && gpuc logs -f` is the obvious pair to type,
     # and a job that has not been dispatched yet has no log.txt to open.
-    command = tail_command(remote_path, lines, follow=True, retry=True)
-    if isinstance(transport, SshTransport):
-        return transport.ssh_argv(command)
-    return ["bash", "-c", command]
+    return transport.argv(tail_command(remote_path, lines, follow=True, retry=True))
 
 
 def check_interval(args: argparse.Namespace, *, polls: bool) -> None:
@@ -1589,11 +1577,6 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     check_runpod_args(args)
     registry = named_registry()
     index = LocalIndex().get(args.job_id)
-    target = args.host or (None if args.runpod else (index.host if index else None))
-    if not target and not args.runpod:
-        raise UsageError(
-            f"requeue needs --host <name>: nothing local knows where {args.job_id} ran"
-        )
     s3 = S3Index.from_settings(settings)
     if s3 is None:
         raise CliError(
@@ -1615,14 +1598,15 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     model = validate(document, f"spec for {args.job_id}")
     use_git = not args.no_git
     report = reporter(args)
-    if target is None:
-        precheck_local(
-            model,
-            Path.cwd(),
-            gpu_count=args.gpu_count,
-            use_git=use_git,
-        )
-    entry = runpod_target(args, settings) if target is None else registry.require(target)
+    prepared = prepare(model, Path.cwd(), attempt=attempt, use_git=use_git)
+    if args.runpod:
+        check_gpu_count(model, args.gpu_count)
+        entry = runpod_target(args, settings)
+    else:
+        # Where the job ran, by the same lookup every other job command uses:
+        # the local index, then every registered host. A second client with
+        # no index of its own still finds it, and an id nobody knows is exit 4.
+        entry, _ = find_job_host(args.job_id, registry, args.host)
     entry = ensure_package_current(entry, settings, bootstrap=not args.no_bootstrap, report=report)
     result = submit_spec(
         entry,
@@ -1632,6 +1616,7 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         attempt=attempt,
         use_git=use_git,
         report=report,
+        prepared=prepared,
     )
     return _queued(result, args, entry, settings, requeued_from=args.job_id)
 

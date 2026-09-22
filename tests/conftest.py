@@ -82,6 +82,8 @@ def host_entry(
         config["env"] = {**(config.get("env") or {}), "UV_CACHE_DIR": cache_dir}
     document: dict[str, Any] = {"host": name, **config}
     if kind == "runpod":
+        # A rental is an address with a pod behind it; `kind` alone is not one.
+        pod_id = pod_id or f"pod-{name}"
         document.setdefault("provider", {"kind": "runpod", "pod_id": pod_id})
     return HostEntry(
         name=name,

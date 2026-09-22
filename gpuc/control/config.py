@@ -14,8 +14,6 @@ import shutil
 import sys
 import time
 import tomllib
-import types
-import typing
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -23,10 +21,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError
 
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX
+from gpuc.control.tolerant import TolerantModel
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
@@ -54,48 +53,6 @@ class LocalStateUnreadable(ConfigError):
 
 class HostNotFound(ConfigError):
     """A named host is not in the registry (CLI exit 4, not a generic failure)."""
-
-
-def _allows_none(annotation: Any) -> bool:
-    if annotation is None or annotation is type(None) or annotation is Any:
-        return True
-    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
-        return any(_allows_none(arg) for arg in typing.get_args(annotation))
-    return False
-
-
-class TolerantModel(BaseModel):
-    """Read shared state the way Postel would: every field optional, nulls inert.
-
-    Every model here parses a file that another version of gpuc -- an older
-    build still installed in a second session, a newer one from `uv tool
-    upgrade` -- may have written. Two rules make that safe in both directions:
-    an unknown key is ignored (a newer writer may add fields), and an explicit
-    `null` for a field that is not nullable is dropped so the field's default
-    applies (a newer writer may make a field optional). Without the second
-    rule, one `"retention_days": null` in the shared registry made every subcommand
-    of the other session -- including `status` and `logs` -- fail validation.
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    @model_validator(mode="before")
-    @classmethod
-    def _null_means_default(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        document: dict[Any, Any] = data
-        drop = [
-            key
-            for key, value in document.items()
-            if value is None
-            and isinstance(key, str)
-            and key in cls.model_fields
-            and not _allows_none(cls.model_fields[key].annotation)
-        ]
-        if not drop:
-            return document
-        return {key: value for key, value in document.items() if key not in drop}
 
 
 def config_dir() -> Path:
@@ -244,22 +201,6 @@ class HostCache(TolerantModel):
     """
 
 
-# The address/config split landed on 2026-09-16 (518bc9b). A registry written
-# before it carries each host's config flat beside its address; `save_registry`
-# rewrites the folded shape, so this can go once every control machine has run
-# a writing command on a build past that commit.
-LEGACY_CACHE_KEYS = ("python", "uv", "gpu_info", "driver_version")
-LEGACY_CONFIG_KEYS = (
-    "gpus",
-    "s3_prefix",
-    "env",
-    "idle_minutes",
-    "retention_days",
-    "created_at",
-    "pkg_commit",
-)
-
-
 class HostEntry(TolerantModel):
     """How to reach one host, plus what this machine last saw on it.
 
@@ -289,42 +230,6 @@ class HostEntry(TolerantModel):
     bootstrap is invisible here, which is why nothing decides on it."""
     cache: HostCache = Field(default_factory=HostCache)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _fold_pre_split_entry(cls, data: Any) -> Any:
-        """Read a registry written before the address and the config were split.
-
-        Such an entry holds a copy of the host's config flat beside the
-        address, because the machine that wrote it believed it owned that
-        config. It does not, so those fields become the cache, and the next
-        connect, `gpuc host set` or bootstrap works from the host's own copy.
-        """
-        if not isinstance(data, dict):
-            return data
-        document: dict[Any, Any] = data
-        if not any(
-            key in document for key in (*LEGACY_CACHE_KEYS, *LEGACY_CONFIG_KEYS, "cache_dir")
-        ):
-            return document
-        cache = dict(document.get("cache") or {})
-        config = dict(cache.get("config") or {})
-        for key in LEGACY_CACHE_KEYS:
-            if key in document and key not in cache:
-                cache[key] = document[key]
-        for key in LEGACY_CONFIG_KEYS:
-            if key in document and key not in config:
-                config[key] = document[key]
-        # `cache_dir` was the one config key the registry kept outside `env`.
-        # On the host it has only ever been `env["UV_CACHE_DIR"]`.
-        if document.get("cache_dir"):
-            env = dict(config.get("env") or {})
-            env.setdefault("UV_CACHE_DIR", str(document["cache_dir"]))
-            config["env"] = env
-        if document.get("name") and not config.get("host"):
-            config["host"] = document["name"]
-        cache["config"] = config
-        return {**document, "cache": cache}
-
     # -- the address ---------------------------------------------------------
 
     @property
@@ -353,13 +258,15 @@ class HostEntry(TolerantModel):
 
     @property
     def ephemeral(self) -> bool:
-        return self.kind == "runpod"
+        """A rental: there is a pod behind this address. The one fact `kind`
+        adds is which provider, and only a rental has one."""
+        return self.pod_id is not None
 
     def provider(self) -> dict[str, Any] | None:
         """The `provider` block this address implies, for a config we initialise."""
-        if self.kind != "runpod":
+        if self.pod_id is None:
             return None
-        return {"kind": "runpod", "pod_id": self.pod_id}
+        return {"kind": self.kind, "pod_id": self.pod_id}
 
     # -- what the host last said about itself --------------------------------
 
@@ -405,17 +312,6 @@ class HostEntry(TolerantModel):
         return self.config.env
 
     @property
-    def cache_dir(self) -> str | None:
-        """uv's cache for this host, which reaches jobs as `UV_CACHE_DIR`.
-
-        uv materialises a venv by reflinking or hardlinking out of its cache,
-        which only works within one filesystem, so a host whose gpuc home is on
-        a different volume from `$HOME` gets a cache next to gpuc home instead
-        of copying every wheel. Bootstrap fills it in; `--cache-dir` pins it.
-        """
-        return self.env.get("UV_CACHE_DIR")
-
-    @property
     def s3_prefix(self) -> str | None:
         return self.config.s3_prefix
 
@@ -446,11 +342,8 @@ class HostEntry(TolerantModel):
     def initial_config(self) -> HostConfig:
         """The config to give a host that has none of its own.
 
-        Two cases reach it: a host being bootstrapped from a registry written
-        before the split (whose cached config is this machine's old record of
-        it), and one whose gpuc home was wiped and has to be rebuilt. Both want
-        the same thing -- what we last saw, with the facts only this address
-        knows filled in.
+        A host whose gpuc home was wiped and has to be rebuilt: what we last
+        saw, with the facts only this address knows filled in.
         """
         config = self.config
         return replace(
@@ -833,9 +726,7 @@ def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transpo
         ssh=entry.ssh,
         port=entry.port,
         key=settings.ssh_key_path,
-        known_hosts=(
-            pod_known_hosts_file(entry.name) if entry.kind == "runpod" else known_hosts_file()
-        ),
+        known_hosts=(pod_known_hosts_file(entry.name) if entry.ephemeral else known_hosts_file()),
     )
 
 

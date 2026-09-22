@@ -108,7 +108,7 @@ def gather(
     ours_ids = {pod.id for pod in ours}
     others = [pod for pod in pods if pod.id not in ours_ids]
     registry = load_registry()
-    by_pod_id = {e.pod_id: e for e in registry.hosts.values() if e.kind == "runpod" and e.pod_id}
+    by_pod_id = {e.pod_id: e for e in registry.hosts.values() if e.pod_id}
 
     for pod in sorted(ours, key=lambda p: p.name):
         entry = by_pod_id.get(pod.id)

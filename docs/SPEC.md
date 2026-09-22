@@ -85,7 +85,8 @@ destinations. Adding another of either changes nothing else in this document.
 - **A job has exactly one owner at a time.** The client owns it until the
   host has accepted it into its queue; from then on the host owns it. Before
   acceptance the host never runs the job. A submit that dies before
-  acceptance leaves a job the host eventually marks failed and cleans up.
+  acceptance leaves nothing the host will run, and what it staged is
+  removed.
 - A job states its requirements as a number of GPUs, at least one. A job
   asking for more cards than the host is configured with, counting shared
   cards only if the job opted into them, is refused at submit and fails at

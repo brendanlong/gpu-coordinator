@@ -6,9 +6,11 @@ only fills in jobs whose host is gone. Never kills anything.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any
 from urllib.parse import quote
 
@@ -24,11 +26,14 @@ from gpuc.host.cleanup import human_bytes
 from gpuc.host.jobs import SCHEMA_VERSION
 
 HEARTBEAT_STALE_S = 30.0
-DEAD_POD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
 RECENT_FINISHED = 5
 LEFTOVER_FLOOR_BYTES = 1 << 30
 """Only mention finished jobs' workdirs once they add up to something worth a
 command. A job dir under a gigabyte is noise next to a 6.5 GB torch venv."""
+
+
+def _note(message: str) -> None:
+    print(message, file=sys.stderr)
 
 
 @dataclass
@@ -85,6 +90,12 @@ class JobView:
     that did not say -- a build older than shared cards, or a spec it could
     not read."""
     reason: str | None = None
+    problems: list[str] = field(default_factory=list)
+    """What else went wrong on the way out, beside `reason`: `sync`, `no-outputs`."""
+    upload_errors: list[str] = field(default_factory=list)
+    """The last failure standing at each of the job's upload destinations. A
+    running job with one here has an output path that is not being uploaded,
+    which is the thing to notice before it runs for four hours."""
     exit_code: int | None = None
     attempt: int = 1
     started_at: str | None = None
@@ -97,6 +108,11 @@ class JobView:
     where there is one, from the spec's `estimated_runtime_min` otherwise."""
     estimated_runtime_min: float | None = None
     """The submitter's own estimate, which is all a *queued* job has."""
+    starts_in_s: float | None = None
+    """When the host expects this queued job's turn to come, by replaying its
+    own dispatch rule over the running jobs' etas. Null when it cannot say."""
+    starts_unknown: str | None = None
+    """Why the host could not say, for a queued job with no `starts_in_s`."""
     auto_preempt: bool | None = None
     """This job asked to be stopped and queued again whenever that lets a more
     important one start, so a `running` line for it is not a promise that it
@@ -223,11 +239,6 @@ def _as_int(value: Any) -> int | None:
     return None if number is None else int(number)
 
 
-def _first_int(marker: int | None, reported: Any) -> int | None:
-    """`0` is a real priority -- the highest one -- so this cannot be an `or`."""
-    return marker if marker is not None else _as_int(reported)
-
-
 def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -248,16 +259,60 @@ def _str_dict(value: Any) -> dict[str, str]:
     return {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, str)}
 
 
+class HostState(Enum):
+    """Whether a host could be asked, and if not, which of the ways it
+    could not. One value, decided once in `gather`; everything that prints,
+    exits or forgets reads it rather than re-deriving it."""
+
+    ANSWERED = "answered"
+    UNREACHABLE = "unreachable"
+    """No answer over ssh (or not a JSON one)."""
+    POD_DEAD = "pod_dead"
+    """The provider still has the pod and nothing can run on it: a failure,
+    and an entry kept for `gpuc host terminate` or `gpuc host remove`."""
+    POD_GONE = "pod_gone"
+    """The provider says the rental has ended. The state every rental
+    reaches, not a failure; whoever gathered this view forgets the entry."""
+
+
+def pod_state(entry: HostEntry, provider: Provider | None) -> tuple[Pod | None, HostState | None]:
+    """The provider's word on a rental's pod. `(pod, None)` means it is up,
+    or this is not a rental; a provider that cannot be asked raises."""
+    if provider is None or not entry.pod_id:
+        return None, None
+    pod = provider.get(entry.pod_id)
+    if pod is None or provider.is_gone(pod):
+        return pod, HostState.POD_GONE
+    if provider.is_dead(pod):
+        return pod, HostState.POD_DEAD
+    return pod, None
+
+
+def rental_gone(
+    entry: HostEntry, provider: Provider | None, report: Callable[[str], None] = _note
+) -> str | None:
+    """Why this host's pod no longer exists, or None if it does.
+
+    Asked once a host has failed to answer: a rental that ended itself when
+    its queue went idle is how one is meant to die, not a failure. A provider
+    that cannot be asked leaves the failure as it was.
+    """
+    try:
+        pod, state = pod_state(entry, provider)
+    except ProviderError as exc:
+        report(f"could not ask the provider about pod {entry.pod_id}: {exc}")
+        return None
+    if state is not HostState.POD_GONE:
+        return None
+    return f"pod {entry.pod_id} {'no longer exists' if pod is None else f'is {pod.status}'}"
+
+
 @dataclass
 class HostView:
     entry: HostEntry
-    reachable: bool = False
+    state: HostState = HostState.UNREACHABLE
     error: str | None = None
     heartbeat_age_s: float | None = None
-    pod_gone: bool = False
-    pod_terminated: bool = False
-    """The provider says this pod no longer exists, so the registry entry can
-    only mislead: whoever gathered this view forgets it."""
     draining: bool = False
     owned: list[str] = field(default_factory=list)
     """The UUIDs this host owns, as the host itself resolved them: `config.gpus`
@@ -291,15 +346,23 @@ class HostView:
     finished: list[JobView] = field(default_factory=list)
 
     @property
-    def failure(self) -> str | None:
-        """Why this host could not be read, if that is what happened.
+    def reachable(self) -> bool:
+        return self.state is HostState.ANSWERED
 
-        A rental that has ended is not that: it is the state every rental
-        reaches, and the entry is forgotten rather than reported. A pod the
-        provider still has and cannot run anything on is a failure like any
-        other host nothing can be read from.
-        """
-        return None if self.pod_terminated else self.error
+    @property
+    def pod_gone(self) -> bool:
+        """No ssh was attempted: the provider said the pod cannot answer."""
+        return self.state in (HostState.POD_DEAD, HostState.POD_GONE)
+
+    @property
+    def pod_terminated(self) -> bool:
+        return self.state is HostState.POD_GONE
+
+    @property
+    def failure(self) -> str | None:
+        """Why this host could not be read, if that is what happened. A rental
+        that has ended is not that."""
+        return None if self.state is HostState.POD_GONE else self.error
 
     @property
     def dispatcher_alive(self) -> bool:
@@ -330,43 +393,10 @@ class HostView:
                 return job.job_id
         return None
 
-    def may_borrow(self, job: JobView) -> bool:
-        """Could this job be dispatched to a shared card at all?
-
-        The host's rule (`HostConfig.may_borrow`) repeated over what the host
-        reported, so the two cannot disagree about why a job is waiting.
-
-        `shared_unavailable` counts: the host judges a job against the cards it
-        is *configured* with, and makes it wait for one that is missing this
-        minute rather than failing it.
-
-        A `use_shared` of None reads as no, which is the conservative half of
-        it: an unknown is never credited with a shared card, so it cannot buy
-        a start time it may not get. The other half is not this function's to
-        give -- `no_start_reason` refuses to say `never` about an unknown
-        rather than reading it as no.
-        """
-        return bool(job.use_shared) and bool(self.shared or self.shared_unavailable)
-
     @property
     def borrowable(self) -> list[SharedGpu]:
         """Shared cards nobody is on: neither one of ours nor anybody else's."""
         return [c for c in self.shared if c.unused and not self.gpu_holder(c.uuid)]
-
-    def cards_ours_to_wait_for(self, job: JobView) -> int:
-        """How many cards this job could have once every job of ours ends.
-
-        What decides whether the host holds for a job that does not fit,
-        repeated from the dispatcher's `launch_ready`: the owned cards as
-        configured, missing ones included, plus, if the job may borrow, the
-        shared cards nobody else is on -- idle, or held by one of ours. A
-        shared card somebody else is using is left out, because when they stop
-        is not this host's to wait for: a job short of one is stepped over.
-        """
-        count = len(self.owned) + len(self.unavailable)
-        if self.may_borrow(job):
-            count += sum(1 for c in self.shared if c.unused or self.gpu_holder(c.uuid))
-        return count
 
     @property
     def outputs_at_risk(self) -> list[JobView]:
@@ -391,15 +421,6 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
     A host on a different commit -- or a half-written state file -- must cost
     one missing row, never a traceback out of `gpuc status` for every host.
     """
-    # The queue marker is the priority the dispatcher is actually ordering by,
-    # so it wins while a job is queued; the job's own `priority` (from its
-    # spec) is what is left once the marker is gone, and is all a running job
-    # ever has.
-    priorities = {
-        e["job_id"]: _as_int(e.get("priority"))
-        for e in payload.get("queue") or []
-        if isinstance(e, dict) and isinstance(e.get("job_id"), str)
-    }
     queued: list[JobView] = []
     running: list[JobView] = []
     finished: list[JobView] = []
@@ -411,11 +432,17 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             name=entry.get("name", ""),
             status=entry.get("status", "queued"),
             phase=entry.get("phase"),
-            priority=_first_int(priorities.get(entry["job_id"]), entry.get("priority")),
+            priority=_as_int(entry.get("priority")),
             gpus=list(entry.get("gpus") or []),
             gpus_requested=_as_int(entry.get("gpus_requested")),
             use_shared=_as_bool(entry.get("use_shared")),
             reason=entry.get("reason"),
+            problems=[p for p in entry.get("problems") or [] if isinstance(p, str)],
+            upload_errors=[
+                u["error"]
+                for u in entry.get("uploads") or []
+                if isinstance(u, dict) and isinstance(u.get("error"), str)
+            ],
             exit_code=entry.get("exit_code"),
             attempt=entry.get("attempt", 1),
             started_at=entry.get("started_at"),
@@ -428,6 +455,8 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
+            starts_in_s=_as_float(entry.get("starts_in_s")),
+            starts_unknown=_as_str(entry.get("starts_unknown")),
             auto_preempt=_as_bool(entry.get("auto_preempt")),
             progress_error=_as_str(entry.get("progress_error")),
             workdir_bytes=_as_int(entry.get("workdir_bytes")),
@@ -456,22 +485,19 @@ def gather(
     provider: Provider | None = None,
 ) -> HostView:
     view = HostView(entry=entry, owned=list(entry.gpus))
-    if provider is not None and entry.kind == "runpod" and entry.pod_id:
-        try:
-            view.pod = provider.get(entry.pod_id)
-            view.pod_gone = view.pod is None or view.pod.status in DEAD_POD_STATUSES
-        except ProviderError as exc:
-            view.error = f"could not read pod {entry.pod_id}: {exc}"
-    if view.pod_gone:
+    dead: HostState | None = None
+    try:
+        view.pod, dead = pod_state(entry, provider)
+    except ProviderError as exc:
+        view.error = f"could not read pod {entry.pod_id}: {exc}"
+    if dead is not None:
         # An ssh here would hang and then print a stack about a refused
-        # connection, which tells nobody anything. A pod that is gone for good
-        # is forgotten by the caller; one that is merely stopped is left alone,
-        # since the provider still has it.
+        # connection, which tells nobody anything.
+        view.state = dead
         status = "missing" if view.pod is None else view.pod.status
-        view.pod_terminated = view.pod is None or view.pod.status == "TERMINATED"
         view.error = (
             f"pod {entry.pod_id} is {status}; this rental has ended"
-            if view.pod_terminated
+            if dead is HostState.POD_GONE
             # The provider still has this one, so it may still be billing:
             # ending it is a different act from forgetting it.
             else f"pod {entry.pod_id} is {status}; `gpuc host terminate {entry.name}` ends "
@@ -487,7 +513,7 @@ def gather(
     if not isinstance(payload, dict):
         view.error = f"host {entry.name} answered `status` with {type(payload).__name__}, not JSON"
         return view
-    view.reachable = True
+    view.state = HostState.ANSWERED
     view.pkg_commit = _as_str(payload.get("pkg_commit"))
     view.dispatcher_pkg_commit = _as_str(payload.get("dispatcher_pkg_commit"))
     view.owned, view.indices = owned_gpus(payload, entry)
@@ -600,10 +626,18 @@ def _fmt_cards(job: JobView) -> str:
     return f" needs {job.gpus_requested} gpus"
 
 
-def _fmt_starts(job: JobView, starts: dict[str, float]) -> str:
-    """` starts in ~2h10m`: when this job's turn comes, where that is known."""
-    seconds = starts.get(job.job_id)
+def _fmt_starts(job: JobView) -> str:
+    """` starts in ~2h10m`: when this job's turn comes, where the host said."""
+    seconds = job.starts_in_s
     return "" if seconds is None else f" starts {_fmt_wait(seconds)}"
+
+
+def _fmt_upload_error(job: JobView) -> str:
+    """` UPLOAD FAILING: <why>`: an output that is not reaching its destination."""
+    if not job.upload_errors:
+        return ""
+    first = job.upload_errors[0].splitlines()[0]
+    return f" UPLOAD FAILING: {first[:80]}"
 
 
 def _fmt_auto_preempt(job: JobView) -> str:
@@ -619,122 +653,6 @@ def _fmt_estimate(job: JobView, *, total: bool = False) -> str:
     return f" est {format_duration(job.estimated_runtime_min * 60.0)}{' total' if total else ''}"
 
 
-def queue_start_estimates(view: HostView) -> dict[str, float]:
-    """Seconds until each queued job is expected to start, by job id.
-
-    The host's own dispatch rule run forward over the estimates it has: a card
-    comes free at the eta of the job holding it, and the queue is taken in
-    order, because that is what the dispatcher does -- a job that does not fit
-    holds the free cards it is waiting for, and nothing behind it may take
-    them.
-
-    A job is in the answer or it is not: one whose turn depends on a job that
-    gave no estimate is absent, never guessed at. That is why a *later* job can
-    have a start time when an earlier one does not: the earlier one could not
-    fit even once every job of ours ends, so it is short a shared card somebody
-    else is on, and the host steps over that rather than hold cards for it. A
-    job waiting for an owned card that has dropped off nvidia-smi is the other
-    way round: it holds, exactly as the dispatcher holds for it, so it and
-    everything behind it are absent until the card is back.
-
-    Shared cards are in the model, but only the ones that are idle *now* and
-    only for the jobs allowed onto them. A card somebody else is using is left
-    out entirely rather than given a release time: when they will stop is the
-    one thing this host cannot know. Leaving the idle ones out instead was the
-    other option and is worse -- it told a job that would borrow on the next
-    pass that it starts in six hours, which is the exact question this whole
-    machinery exists to answer correctly.
-    """
-    # Nothing is dispatched on a draining host, so every start time here would
-    # be an answer to a question nobody asked: when it would have started if
-    # the host were taking work.
-    if view.draining or not view.queue:
-        return {}
-    cards = _card_releases(view)
-    starts: dict[str, float] = {}
-    pending = list(view.queue)
-    clock = 0.0
-    while pending:
-        # Cards a job that could not start is waiting for, which the host holds
-        # rather than handing to the job behind it. Reset at each release: this
-        # is the same walk the dispatcher makes on a pass, not a running total.
-        held = held_shared = 0
-        for job in list(pending):
-            if job.gpus_requested is None:
-                # A host too old to say what a queued job asked for. It will
-                # take cards we cannot count, and it holds them, so nothing
-                # behind it can be estimated either.
-                return starts
-            borrows = view.may_borrow(job)
-            # Owned first, exactly as the dispatcher assigns them, so a job
-            # borrows only the shortfall and holds a shared card no longer
-            # than it has to.
-            free_owned = _free_now(cards, clock, shared=False)[held:]
-            free_shared = _free_now(cards, clock, shared=True)[held_shared:] if borrows else []
-            take_owned = free_owned[: job.gpus_requested]
-            take_shared = free_shared[: job.gpus_requested - len(take_owned)]
-            if len(take_owned) + len(take_shared) < job.gpus_requested:
-                # It does not fit. The host holds what it could take unless the
-                # job could not fit even once every job of ours ends: that one
-                # waits on somebody else's shared card and is stepped over.
-                # Counted against the configured owned cards, missing ones
-                # included, as the dispatcher does.
-                if job.gpus_requested <= view.cards_ours_to_wait_for(job):
-                    held += len(take_owned)
-                    held_shared += len(take_shared)
-                continue
-            done = (
-                None
-                if job.estimated_runtime_min is None
-                else clock + job.estimated_runtime_min * 60.0
-            )
-            for index in [*take_owned, *take_shared]:
-                cards[index] = (done, cards[index][1])
-            starts[job.job_id] = clock
-            pending.remove(job)
-        later = [release for release, _ in cards if release is not None and release > clock]
-        if not later:
-            break
-        clock = min(later)
-    return starts
-
-
-def _free_now(cards: list[tuple[float | None, bool]], clock: float, *, shared: bool) -> list[int]:
-    """Indices of the owned (or shared) cards that are free at `clock`."""
-    return [
-        i
-        for i, (release, is_shared) in enumerate(cards)
-        if is_shared is shared and release is not None and release <= clock
-    ]
-
-
-def _card_releases(view: HostView) -> list[tuple[float | None, bool]]:
-    """`(seconds until this card is free, is it a shared one)` per card.
-
-    Now if nothing holds it, the holder's eta if one of our jobs does, and None
-    when the card is not one anything can be scheduled onto -- either its
-    holder offered no end time, or it is a shared card somebody else is on and
-    nothing here can say when they will stop.
-
-    Owned cards come first so that the walk above prefers them.
-    """
-    running = {job.job_id: job for job in view.running}
-
-    def release(uuid: str) -> float | None:
-        holder = running.get(view.gpu_holder(uuid) or "")
-        if holder is None:
-            return 0.0
-        remaining = holder.eta_seconds
-        return None if remaining is None else max(0.0, remaining)
-
-    cards: list[tuple[float | None, bool]] = [(release(uuid), False) for uuid in view.owned]
-    for card in view.shared:
-        held = view.gpu_holder(card.uuid)
-        if held or card.unused:
-            cards.append((release(card.uuid), True))
-    return cards
-
-
 def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
     """Where one job sits in its host's queue, for `submit` and `reorder` to
     print: the answer to "so when does it run".
@@ -746,7 +664,7 @@ def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
         return placement_unknown()
     queued = {job.job_id: job for job in view.queue}
     job = queued.get(job_id)
-    seconds = queue_start_estimates(view).get(job_id) if job is not None else None
+    seconds = job.starts_in_s if job is not None else None
     return {
         "queue_position": list(queued).index(job_id) + 1 if job is not None else None,
         "queue_length": len(queued),
@@ -755,85 +673,8 @@ def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
         "dispatched": any(running.job_id == job_id for running in view.running),
         "starts_in_s": None if seconds is None else round(seconds, 1),
         "starts_at": _at(seconds),
-        "starts_unknown": None
-        if job is None or seconds is not None
-        else no_start_reason(view, job),
+        "starts_unknown": None if job is None or seconds is not None else job.starts_unknown,
     }
-
-
-def no_start_reason(view: HostView, job: JobView) -> str:
-    """Why this queued job has no projected start time.
-
-    There are several reasons and they are not interchangeable: a submit to a
-    draining host is an ordinary mistake, and this is the moment the submitter
-    is looking. Saying "a job ahead of it gave no estimate" about the only job
-    in the queue of a host that is not dispatching at all would be a lie told at
-    exactly the wrong time.
-    """
-    if view.draining:
-        return f"host {view.entry.name} is draining, so nothing more will be dispatched"
-    borrows = view.may_borrow(job)
-    # Cards the host cannot see this minute are counted in: the host makes a
-    # job wait for one of those, it does not fail it (see the dispatcher's
-    # `_capacity_failure`), and "it will never be dispatched" is an absolute
-    # this may not say about a job the host is perfectly well set up to run.
-    capacity = len(view.owned) + len(view.unavailable)
-    if borrows:
-        capacity += len(view.shared) + len(view.shared_unavailable)
-    if job.gpus_requested is not None and job.gpus_requested > capacity:
-        if job.use_shared is None and (view.shared or view.shared_unavailable):
-            # Whether it may borrow is the one thing that decides this, and the
-            # host did not say. `never` is an absolute; not knowing is not one.
-            return (
-                f"it asks for {job.gpus_requested} card(s) and this host does not report "
-                f"whether a queued job may borrow the shared ones it would need"
-            )
-        shared = " (shared included)" if borrows else ""
-        return (
-            f"it asks for {job.gpus_requested} card(s) and the host has "
-            f"{capacity}{shared}, so it will never be dispatched"
-        )
-    if any(ahead.gpus_requested is None for ahead in view.queue):
-        return "this host does not report how many cards a queued job asked for"
-    ours = view.cards_ours_to_wait_for(job)
-    if borrows and job.gpus_requested is not None and job.gpus_requested > ours:
-        # The job the host steps over: not an omission, and not the queue's
-        # doing either. A shared card comes free when its real owner stops
-        # using it, and nothing here can know when that is. Saying so is the
-        # honest answer, and the only alternative is a number we made up.
-        return (
-            f"it needs {job.gpus_requested - ours} shared card(s) somebody else is using, "
-            f"and when they stop is not something this host can predict"
-        )
-    order = [queued.job_id for queued in view.queue]
-    blocking = next(
-        (
-            ahead
-            for ahead in view.queue[: order.index(job.job_id)]
-            if ahead.job_id not in queue_start_estimates(view)
-        ),
-        None,
-    )
-    if blocking is not None:
-        # Nothing starts before the job ahead of it does, so its turn is not
-        # knowable until that one's is -- and saying "the cards it needs" of a
-        # job that is waiting on the queue rather than on a card is a lie.
-        return f"job {blocking.job_id} is ahead of it and has no start time yet"
-    owned = len(view.owned) + len(view.unavailable)
-    if job.gpus_requested is not None and len(view.owned) < job.gpus_requested <= owned:
-        # The host holds for this job, and the card it holds for is one the
-        # host is configured with but cannot see: that is the host's problem
-        # to fix, not a wait, and what the submitter should hear. After the
-        # queue check, so only the job at the front says it, and a job behind
-        # it is told which job it is waiting on.
-        return (
-            f"it needs {job.gpus_requested} card(s) and only {len(view.owned)} of the "
-            f"{owned} this host owns answer to nvidia-smi ({', '.join(view.unavailable)} "
-            f"missing), so it is held until they do"
-        )
-    # Running or queued: either way, the cards this job is waiting for are
-    # spoken for by something that never said when it would be done with them.
-    return "the jobs holding the cards it needs gave no end time"
 
 
 def placement_unknown() -> dict[str, Any]:
@@ -858,11 +699,12 @@ def queue_note(placement: dict[str, Any]) -> str | None:
     if position is None:
         return None
     when = placement.get("starts_in_s")
-    starts = (
-        f"start time unknown ({placement.get('starts_unknown')})"
-        if when is None
-        else f"starts {_fmt_wait(when)}"
-    )
+    if when is not None:
+        starts = f"starts {_fmt_wait(when)}"
+    elif placement.get("starts_unknown"):
+        starts = f"start time unknown ({placement['starts_unknown']})"
+    else:
+        starts = "start time unknown"
     return f"  queue: position {position} of {placement['queue_length']}; {starts}"
 
 
@@ -1049,13 +891,12 @@ def render(
         lines.append(
             f"  running {job_label(job)} phase={job.phase or '-'} {_fmt_elapsed(job)} "
             f"{_fmt_util(job, source=view.pod is not None)} {_fmt_gpus(view, job)}"
-            f"{_fmt_eta(job)}{_fmt_auto_preempt(job)}"
+            f"{_fmt_eta(job)}{_fmt_auto_preempt(job)}{_fmt_upload_error(job)}"
         )
-    starts = queue_start_estimates(view)
     for job in view.queue:
         lines.append(
             f"  queued  {job_label(job)} prio={job.priority}{_fmt_cards(job)}"
-            f"{_fmt_estimate(job)}{_fmt_starts(job, starts)}{_fmt_auto_preempt(job)}"
+            f"{_fmt_estimate(job)}{_fmt_starts(job)}{_fmt_auto_preempt(job)}"
         )
     free = next_free_line(view)
     if free:
@@ -1066,6 +907,8 @@ def render(
         # to the status is worth the parenthesis.
         reason = job.reason if job.reason != job.status else None
         detail = reason or (f"exit {job.exit_code}" if job.exit_code else "")
+        if job.problems:
+            detail = ", ".join(filter(None, [detail, *job.problems]))
         flag = ""
         if job.outputs_lost and job.outputs_pending:
             # `outputs_lost` is written once and never cleared, so it outlives
@@ -1134,9 +977,7 @@ def host_warnings(view: HostView) -> list[str]:
     return [running] if running else []
 
 
-def job_json(
-    job: JobView, mirror_prefix: str | None = None, *, starts_in_s: float | None = None
-) -> dict[str, Any]:
+def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
     """The text view's fields, named the same, with nothing rendered.
 
     `running` is the list automation should key on. It is the host's own
@@ -1163,6 +1004,8 @@ def job_json(
         "name": job.name,
         "status": job.status,
         "reason": job.reason,
+        "problems": list(job.problems),
+        "upload_errors": list(job.upload_errors),
         "exit_code": job.exit_code,
         "phase": job.phase,
         "priority": job.priority,
@@ -1179,8 +1022,9 @@ def job_json(
         "gpus": list(job.gpus),
         "gpus_requested": job.gpus_requested,
         "use_shared": job.use_shared,
-        "starts_in_s": None if starts_in_s is None else round(starts_in_s, 1),
-        "starts_at": _at(starts_in_s),
+        "starts_in_s": None if job.starts_in_s is None else round(job.starts_in_s, 1),
+        "starts_at": _at(job.starts_in_s),
+        "starts_unknown": job.starts_unknown,
         "iso": job.isolation,
         "ended_at": job.ended_at,
         "outputs_pending": job.outputs_pending,
@@ -1305,7 +1149,6 @@ def host_json(
     errors = [view.error] if view.error else []
     errors += host_warnings(view)
     finished = [job for job in view.finished if within(job, since_s)][:recent]
-    starts = queue_start_estimates(view)
     return {
         "name": entry.name,
         "kind": entry.kind,
@@ -1326,9 +1169,7 @@ def host_json(
         "pod": pod_json(view),
         "gpus": gpu_json(view),
         "shared_gpus": shared_gpu_json(view),
-        "queued": [
-            job_json(job, entry.s3_prefix, starts_in_s=starts.get(job.job_id)) for job in view.queue
-        ],
+        "queued": [job_json(job, entry.s3_prefix) for job in view.queue],
         "running": [job_json(job, entry.s3_prefix) for job in view.running],
         "finished": [job_json(job, entry.s3_prefix) for job in finished],
         "errors": errors,

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.cli import main
+from gpuc.host import gpus
 from tests.conftest import LOCAL_GPU_UUID, requires_gpu
 from tests.test_control_e2e import (
     HEALTH_ARGS,
@@ -118,13 +119,15 @@ def test_a_submitted_gpu_job_runs_on_the_owned_uuid(
     state = state_of(home, job_id)
     assert state["status"] == "succeeded", log[-3000:]
     assert state["gpus"] == [LOCAL_GPU_UUID]
-    assert f"CVD={LOCAL_GPU_UUID}" in log
+    # The card by its nvidia-smi index, which is what every CUDA stack accepts.
+    index = next(gpu.index for gpu in gpus.list_gpus() if gpu.uuid == LOCAL_GPU_UUID)
+    assert f"CVD={index}" in log
     assert "COUNT=1" in log
     assert "SUM=8" in log
     assert "gpu preflight ok" in log
 
     assert main(["logs", job_id, "-n", "500"]) == 0
-    assert f"CVD={LOCAL_GPU_UUID}" in capsys.readouterr().out
+    assert f"CVD={index}" in capsys.readouterr().out
 
     assert main(["status", "--host", "local"]) == 0
     status = capsys.readouterr().out

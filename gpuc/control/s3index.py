@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from gpuc._version import user_agent
-from gpuc.control.config import Settings, TolerantModel, index_dir
+from gpuc.control.config import Settings, index_dir
+from gpuc.control.tolerant import TolerantModel
 from gpuc.host.jobs import JobSpec
 
 if TYPE_CHECKING:

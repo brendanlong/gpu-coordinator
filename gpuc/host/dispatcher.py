@@ -17,13 +17,13 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from gpuc._version import is_other_build
-from gpuc.host import baseline, cleanup, gpus, jobs, paths, queue, scope, sync, terminate
+from gpuc.host import baseline, cleanup, gpus, jobs, paths, plan, queue, scope, sync, terminate
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.runner import (
     KILL_GRACE_S,
@@ -547,12 +547,14 @@ class Dispatcher:
     deps: DispatcherDeps = field(default_factory=DispatcherDeps)
     running: dict[str, _Running] = field(default_factory=dict)
     _queue_empty_since: float | None = None
-    _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
     _last_reclaim_at: float | None = None
-    _last_submit_sweep_at: float | None = None
-    _kill_sent: dict[str, float] = field(default_factory=dict)
-    _kill_escalated: set[str] = field(default_factory=set)
+    _last_incoming_sweep_at: float | None = None
+    _stop_sent: dict[str, float] = field(default_factory=dict)
+    """When this dispatcher first saw each running job's stop intent, so the
+    ladder in `escalate_stops` has a clock even for a request another process
+    wrote."""
+    _stop_escalated: set[str] = field(default_factory=set)
     _config: jobs.HostConfig | None = None
     _owned: list[str] | None = None
     _unavailable: tuple[str, ...] = ()
@@ -620,7 +622,7 @@ class Dispatcher:
                 state.runner_pid, state.runner_boot_id, state.runner_starttime
             )
             if state.finished:
-                if queue.is_preempted(job_id):
+                if state.intent == jobs.PREEMPT:
                     # Finished, preempted, and its runner is *still there*: it
                     # is in its final sync, writing to the workdir and to
                     # state.json. Queueing the job now would launch the next
@@ -687,17 +689,29 @@ class Dispatcher:
             self.log(f"job {job_id} has an unreadable state.json ({exc}); treating as runner-died")
             state = None
         self._kill_orphaned_group(job_id, state.pgid if state else None, state)
-        final = state or jobs.JobState()
-        final.status = "failed"
-        final.reason = "runner-died"
-        final.exit_code = final.exit_code or 1
-        final.ended_at = jobs.utc_now()
-        final.phase = None
-        # The runner clears this itself on every path it survives; here it did
-        # not survive, and a finished job carrying an eta reads to anything
-        # keying on it as a job that is still going.
-        final.eta = None
-        jobs.write_state(job_id, final)
+        with jobs.locked(job_id):
+            # Re-read under the lock: a cancel or preempt that landed since
+            # the read above must not be written over.
+            try:
+                final = jobs.read_state(job_id)
+            except RuntimeError:
+                final = jobs.JobState()
+            final.status = "failed"
+            final.reason = "runner-died"
+            final.exit_code = final.exit_code or 1
+            final.ended_at = jobs.utc_now()
+            final.phase = None
+            # The runner clears this itself on every path it survives; here it
+            # did not survive, and a finished job carrying an eta reads to
+            # anything keying on it as a job that is still going.
+            final.eta = None
+            # A periodic tick's success says nothing about what the job wrote
+            # after it, and the final upload that would have never ran: these
+            # outputs are not confirmed anywhere, and the sweep must not take
+            # them.
+            for record in final.output_uploads():
+                record.ok_at = None
+            jobs.write_state(job_id, final)
         self.log(f"job {job_id} failed: runner died without writing final state")
 
     def _kill_orphaned_group(
@@ -721,9 +735,8 @@ class Dispatcher:
             if entry.poll() is None:
                 continue
             del self.running[job_id]
-            self._cancel_sent.pop(job_id, None)
-            self._kill_sent.pop(job_id, None)
-            self._kill_escalated.discard(job_id)
+            self._stop_sent.pop(job_id, None)
+            self._stop_escalated.discard(job_id)
             try:
                 state: jobs.JobState | None = jobs.read_state(job_id)
             except RuntimeError:
@@ -753,7 +766,8 @@ class Dispatcher:
             # count its outputs as unconfirmed (that list is finished jobs).
             # Left finished, it keeps its record, its `preempted` reason and
             # its place in the drain's last upload attempt.
-            paths.preempt_file(job_id).unlink(missing_ok=True)
+            with contextlib.suppress(RuntimeError, OSError):
+                jobs.update_state(job_id, intent=None)
             self.log(
                 f"job {job_id} was preempted, but this host is {going}, so it is not going "
                 f"back in the queue: it stays {self._state_or_empty(job_id).status} and "
@@ -783,90 +797,49 @@ class Dispatcher:
             return "draining"
         return None
 
-    def handle_cancels(self) -> None:
-        """Escalate a cancel, without ever killing the runner's own group during
-        the launch window.
+    def escalate_stops(self) -> None:
+        """Make a stop request stick when the runner never acts on it.
 
-        Between spawn and the first phase the runner *is* the only member of its
-        group, so signalling it there would kill the one process that can finish
-        the job cleanly. Until the job's own pgid appears in state.json the
-        cancel marker is the whole mechanism; the runner checks it before every
-        phase and ends as `cancelled`.
+        The runner owns the kill: it polls its state, stops the job's scope or
+        group, syncs and writes the final state. That is right when the runner
+        is healthy and nothing at all when it is wedged, so a request it has
+        not honoured within the grace period gets the ladder: the job's scope
+        and group first, then the runner itself (which handles SIGTERM with a
+        final sync), then the runner's group. Never inside the grace period,
+        and the job's group is only ever the one the state names -- during the
+        launch window the runner is the only member of its own group, and
+        killing that would kill the one process that can finish the job
+        cleanly. By three grace periods the runner is wedged and its group
+        goes regardless.
         """
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
         for job_id, entry in list(self.running.items()):
-            if not queue.is_cancelled(job_id):
+            state = self._state_or_empty(job_id)
+            if state.intent is None:
                 continue
-            sent = self._cancel_sent.get(job_id)
-            if sent is None:
-                self._cancel_sent[job_id] = now
-                state = self._state_or_empty(job_id)
-                job_pgid = self._job_pgid(state, entry)
-                if state.cgroup_unit:
-                    # A cgroup stop reaps the whole tree, daemonised
-                    # grandchildren included; the group kill below cannot.
-                    self.log(f"cancelling job {job_id} (scope {state.cgroup_unit})")
-                    scope.stop_unit(state.cgroup_unit)
-                elif job_pgid:
-                    self.log(f"cancelling job {job_id} (pgid {job_pgid})")
-                    self._signal_group(job_pgid, signal.SIGTERM)
-                else:
-                    self.log(
-                        f"cancelling job {job_id}: the runner has not published a job process "
-                        f"group yet, so the cancel marker alone stops it"
-                    )
-                continue
-            self._escalate(job_id, entry, now - sent, grace)
-
-    def escalate_kills(self) -> None:
-        """Make a kill *request* stick when the runner never acts on it.
-
-        A preempt asks the runner to stop its job and sync, which is right
-        when the runner is healthy and is nothing at all when it is wedged: the
-        marker sits there, the job keeps running, and the job waiting for its
-        cards never starts. So the ask gets the same ladder a cancel gets.
-        """
-        now = self.deps.monotonic()
-        grace = self.deps.kill_grace_s
-        for job_id, entry in list(self.running.items()):
-            if queue.kill_reason(job_id):
-                # A marker somebody else wrote -- `gpuc preempt`, or a
-                # dispatcher we took over from -- needs a clock of its own, or
-                # a runner that never acts on it is never escalated either.
-                self._kill_sent.setdefault(job_id, now)
-            sent = self._kill_sent.get(job_id)
-            # A cancelled job already has an escalation, and one owner is enough.
-            if sent is None or queue.is_cancelled(job_id):
-                continue
-            elapsed = now - sent
+            # A request another process wrote -- `gpuc cancel`, or a
+            # dispatcher we took over from -- needs a clock of its own, or a
+            # runner that never acts on it is never escalated either.
+            elapsed = now - self._stop_sent.setdefault(job_id, now)
             if elapsed <= grace:
                 continue
-            if job_id not in self._kill_escalated:
-                self._kill_escalated.add(job_id)
+            if job_id not in self._stop_escalated:
+                self._stop_escalated.add(job_id)
                 self.log(
                     f"job {job_id}: its runner has not stopped it {elapsed:.0f}s after the "
-                    f"{queue.kill_reason(job_id) or 'kill'} request; escalating"
+                    f"{state.intent} request; escalating"
                 )
-            self._escalate(job_id, entry, elapsed, grace)
-
-    def _escalate(self, job_id: str, entry: _Running, elapsed: float, grace: float) -> None:
-        """The kill ladder: the job's scope and group first, the runner last.
-
-        The runner handles SIGTERM itself (final sync, final state), so it gets
-        a signal of its own -- and the time to use it -- before its group goes.
-        """
-        state = self._state_or_empty(job_id)
-        job_pgid = self._job_pgid(state, entry)
-        if state.cgroup_unit and elapsed > grace:
-            scope.stop_unit(state.cgroup_unit)
-        if job_pgid and elapsed > grace:
-            self._signal_group(job_pgid, signal.SIGKILL)
-        if elapsed > 2 * grace:
-            self._signal_pid(entry.pid, signal.SIGTERM)
-        if elapsed > 3 * grace and process_group_alive(entry.pid):
-            self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
-            self._signal_group(entry.pid, signal.SIGKILL)
+            job_pgid = self._job_pgid(state, entry)
+            if state.cgroup_unit:
+                scope.stop_unit(state.cgroup_unit)
+            if job_pgid:
+                self._signal_group(job_pgid, signal.SIGKILL)
+            if elapsed > 2 * grace:
+                self._signal_pid(entry.pid, signal.SIGTERM)
+            if elapsed > 3 * grace and process_group_alive(entry.pid):
+                self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
+                self._signal_group(entry.pid, signal.SIGKILL)
 
     @staticmethod
     def _state_or_empty(job_id: str) -> jobs.JobState:
@@ -979,213 +952,103 @@ class Dispatcher:
         unused, theirs = self._borrowable
         return [uuid for uuid in unused if uuid not in busy], theirs
 
-    def _capacity_failure(self, spec: jobs.JobSpec) -> str | None:
-        """Why this host can *never* run this job, or None if it could.
-
-        This is a deletion: the caller unlinks the queue marker and writes the
-        job `failed`. So everything it reads has to be fixed for the life of a
-        queued job -- the *configured* card counts, which a card that is
-        missing this minute does not change (that makes a job wait, it must
-        not fail one the host is perfectly well set up to run), and
-        `use_shared`, which nothing changes after submit.
-        """
-        if spec.gpus < 1:
-            return f"needs at least 1 GPU, asked for {spec.gpus}"
-        config = self.config
-        shared = config.borrowable(spec)
-        if spec.gpus <= len(config.gpus) + len(shared):
-            return None
-        have = f"host owns {len(config.gpus)}"
-        if shared:
-            have += f" and may borrow {len(shared)} shared"
-        elif config.shared_gpus:
-            have += (
-                f" and shares {len(config.shared_gpus)} this job did not ask for "
-                f"(`use_shared: true` would let it)"
+    def _requests(self) -> list[tuple[queue.QueueEntry, plan.Request]]:
+        """The queue as `plan` sees it. A job whose spec cannot be read is
+        failed here: it is the one thing about a queued job that only the
+        dispatcher can decide."""
+        requests: list[tuple[queue.QueueEntry, plan.Request]] = []
+        for entry in queue.list_queued():
+            try:
+                spec = jobs.read_spec(entry.job_id)
+            except (RuntimeError, ValueError) as exc:
+                self.log(f"job {entry.job_id} has an unreadable spec ({exc}); dropping from queue")
+                queue.claim(
+                    entry.job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
+                )
+                continue
+            requests.append(
+                (entry, plan.Request(entry.job_id, spec.gpus, self.config.may_borrow(spec)))
             )
-        return f"needs {spec.gpus} GPUs, {have}"
+        return requests
 
-    def _still_queued(self, entry: queue.QueueEntry) -> bool:
-        """Whether this marker still names a job that is waiting to run.
-
-        The marker says a job was submitted; the state says what has become of
-        it since, and only the state is allowed to start a runner. Without this
-        the queue is dispatched on the marker alone, so anything that leaves one
-        behind -- `leave_queue` interrupted between its two writes, a purge
-        interrupted before `remove_job_dir` got to the marker -- starts a second
-        runner in the workdir the first one is using, or a job with no spec.
-
-        Dropping the marker is the repair: the state has already said where the
-        job went, and a marker disagreeing with it is the stale half.
-        """
-        try:
-            status = jobs.read_state(entry.job_id).status
-        except RuntimeError:
-            self.log(f"job {entry.job_id} is queued but has no readable state; dropping it")
-            entry.marker.unlink(missing_ok=True)
-            return False
-        if status != "queued":
-            self.log(
-                f"job {entry.job_id} is {status} but was still in the queue; dropping its "
-                f"marker rather than dispatching it a second time"
-            )
-            entry.marker.unlink(missing_ok=True)
-            return False
-        return True
-
-    def _holds_the_queue(self, spec: jobs.JobSpec, theirs: int) -> bool:
-        """Whether a job that cannot start yet keeps the cards it is waiting for.
-
-        The strict order and its one exemption, in one place: a job that could
-        not fit even once every job of ours ends is stepped over, because what
-        it is short of is a shared card somebody else is using and that is not
-        ours to wait on. What it could have is the owned cards as configured,
-        missing ones included, plus the shared cards nobody else is on if it
-        may borrow -- `theirs` being how many of those the pass's one
-        nvidia-smi reading found somebody else on.
-
-        `preempt_for_waiting` asks the same question about the same queue: a
-        job that is stepped over there is one the cards a preempt hands back
-        would pass by, and one that holds is a job they would not get past.
-        """
-        ours = len(self.config.gpus)
-        if self.config.may_borrow(spec):
-            ours += len(self.shared_gpus()) - theirs
-        return spec.gpus <= ours
+    def _pool(
+        self, *, extra_owned: Sequence[str] = (), extra_shared: Sequence[str] = ()
+    ) -> plan.Pool:
+        """This pass's cards. `extra_*` are the ones a stop in flight will hand
+        back, which `preempt_for_waiting` counts as free."""
+        return plan.Pool(
+            owned_free=[*self.free_gpus(), *extra_owned],
+            owned_configured=len(self.config.gpus),
+            shared_configured=len(self.config.shared_entries()),
+            shared_visible=len(self.shared_gpus()),
+            sample=self.borrowable_gpus,
+            shared_extra=list(extra_shared),
+        )
 
     def launch_ready(self) -> None:
-        """Dispatch in queue order, and hold cards for a job that does not fit.
-
-        The queue is in priority order, so a job that cannot start yet keeps
-        the free cards it is waiting for: nothing behind it may take them. Any
-        other rule makes priority advisory the moment the job at the front is
-        wider than the free pool -- a two-card job at priority 10 starved
-        indefinitely behind a stream of one-card jobs at 50, each of which fit
-        the one card it was waiting for -- and it is what made automatic
-        preemption livelock, since the card a preempted job handed back was
-        offered straight to the job that had just given it up.
-
-        It costs utilization: a card waiting for the rest of a job's cards runs
-        nothing, and on a rented pod that is billed. The one job that does not
-        hold is one that could not fit even once every job of ours ends: it
-        needs more cards than the host owns plus the shared cards nobody else
-        is on, so what it is short of is a shared card somebody else is using,
-        which comes free when *their* job ends, and that is not ours to wait
-        on. It is stepped over, not failed, since the configured host is big
-        enough for it. Width alone is not the test: a job wider than the owned
-        pool whose shortfall is an owned card of ours, with the shared card it
-        wants idle, holds like any other, or a stream of narrow jobs behind it
-        takes that owned card every time it frees and the job never runs.
+        """Act on `plan`: start what fits, fail what never will, hold the rest.
 
         A job waiting for an owned card that has dropped off nvidia-smi holds
         like any other: `config.gpus` says the host has that card, so the host
         is misconfigured or broken, and idling the queue behind the job is how
         that gets noticed rather than quietly worked around.
-
-        A job that holds holds what it could take this pass, borrowed cards
-        included: having taken one of somebody else's spare cards towards its
-        total, giving it to the job behind would leave it short again.
         """
         if paths.draining_file().exists():
             return
-        free = self.free_gpus()
-        # Sampled at most once per pass, and only if a job actually needs it:
-        # see `borrowable_gpus`. `theirs` is how many shared cards that reading
-        # found somebody else on.
-        borrowable: list[str] | None = None
-        theirs = 0
-        # Cards spoken for by a job ahead in the queue that could not start.
-        # Counts, not identities: one card of ours is as good as another.
-        held = 0
-        held_shared = 0
-        for entry in queue.list_queued():
-            job_id = entry.job_id
-            if not self._still_queued(entry):
-                continue
-            if queue.is_cancelled(job_id):
-                queue.leave_queue(
-                    entry, status="cancelled", reason="cancelled", ended_at=jobs.utc_now()
-                )
-                continue
-            try:
-                spec = jobs.read_spec(job_id)
-            except (RuntimeError, ValueError) as exc:
-                self.log(f"job {job_id} has an unreadable spec ({exc}); dropping from queue")
-                queue.leave_queue(
-                    entry, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
-                )
-                continue
-            too_big = self._capacity_failure(spec)
-            if too_big is not None:
-                queue.leave_queue(
-                    entry,
-                    status="failed",
-                    reason=too_big,
-                    exit_code=1,
-                    ended_at=jobs.utc_now(),
-                )
-                continue
-            # Owned cards first, always: a job borrows only the shortfall, so a
-            # shared card is held for the shortest time that runs the job. The
-            # cards a job ahead is waiting for are not on offer to this one.
-            owned_part = free[: min(spec.gpus, max(0, len(free) - held))]
-            shared_part: list[str] = []
-            short = spec.gpus - len(owned_part)
-            if short and self.config.may_borrow(spec):
-                if borrowable is None:
-                    borrowable, theirs = self.borrowable_gpus()
-                shared_part = borrowable[: min(short, max(0, len(borrowable) - held_shared))]
-                short -= len(shared_part)
-            if short:
-                if self._holds_the_queue(spec, theirs):
-                    held += len(owned_part)
-                    held_shared += len(shared_part)
-                continue
-            assigned = [*owned_part, *shared_part]
-            free = free[len(owned_part) :]
-            borrowable = borrowable[len(shared_part) :] if borrowable is not None else None
-            queue.leave_queue(
-                entry,
-                status="running",
-                gpus=assigned,
-                phase="setup",
-                started_at=jobs.utc_now(),
-            )
-            try:
-                proc = self.deps.spawn_runner(job_id)
-            except OSError as exc:
-                # The state said `running` a line ago; leaving it there would
-                # leave a job nothing is running, with no runner pid to notice
-                # the absence of, holding its GPUs against every later pass.
-                self.log(f"job {job_id}: could not spawn a runner ({exc})")
-                jobs.update_state(
+        requests = self._requests()
+        decisions = plan.plan([request for _, request in requests], self._pool())
+        for decision in decisions:
+            job_id = decision.job_id
+            if isinstance(decision, plan.Fails):
+                queue.claim(
                     job_id,
                     status="failed",
-                    reason="spawn-failed",
+                    reason=decision.reason,
                     exit_code=1,
                     ended_at=jobs.utc_now(),
-                    phase=None,
                 )
-                free = [*owned_part, *free]
-                if borrowable is not None:
-                    borrowable = [*shared_part, *borrowable]
                 continue
-            # pgid stays unset until the runner publishes the *job's* group: it
-            # is what `cancel` signals, and the runner's own group is not it.
+            if not isinstance(decision, plan.Assigned):
+                continue
+            self._launch(job_id, decision.gpus)
+
+    def _launch(self, job_id: str, assigned: list[str]) -> None:
+        if not queue.claim(
+            job_id, status="running", gpus=assigned, phase="setup", started_at=jobs.utc_now()
+        ):
+            # Cancelled between listing the queue and here; its cards stay free.
+            return
+        try:
+            proc = self.deps.spawn_runner(job_id)
+        except OSError as exc:
+            # The state said `running` a line ago; leaving it there would leave
+            # a job nothing is running, with no runner pid to notice the
+            # absence of, holding its GPUs against every later pass.
+            self.log(f"job {job_id}: could not spawn a runner ({exc})")
             jobs.update_state(
                 job_id,
-                pid=proc.pid,
-                pgid=None,
-                runner_pid=proc.pid,
-                runner_boot_id=boot_id(),
-                runner_starttime=starttime(proc.pid),
+                status="failed",
+                reason="spawn-failed",
+                exit_code=1,
+                ended_at=jobs.utc_now(),
+                phase=None,
             )
-            self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
-            borrowed = f", borrowing {','.join(shared_part)}" if shared_part else ""
-            self.log(
-                f"launched {job_id} (pid {proc.pid}) on "
-                f"{','.join(assigned) if assigned else 'cpu'}{borrowed}"
-            )
+            return
+        # pgid stays unset until the runner publishes the *job's* group: it
+        # is what a stop signals, and the runner's own group is not it.
+        jobs.update_state(
+            job_id,
+            pid=proc.pid,
+            pgid=None,
+            runner_pid=proc.pid,
+            runner_boot_id=boot_id(),
+            runner_starttime=starttime(proc.pid),
+        )
+        self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
+        shared = set(self.shared_gpus())
+        borrowed = [uuid for uuid in assigned if uuid in shared]
+        note = f", borrowing {','.join(borrowed)}" if borrowed else ""
+        self.log(f"launched {job_id} (pid {proc.pid}) on {','.join(assigned) or 'cpu'}{note}")
 
     # -- automatic preemption --------------------------------------------
     def preempt_for_waiting(self) -> None:
@@ -1208,7 +1071,7 @@ class Dispatcher:
         What the walk does pass is a job that is not stuck: one already holding
         every card it needs, because a stop in flight is bringing them, and the
         one job the strict order steps over, which is short of a shared card
-        somebody else is using and so holds nothing (`_holds_the_queue`).
+        somebody else is using and so holds nothing (`plan.SteppedOver`).
 
         Three things then have to hold for the job it settles on, and they are
         what keep this from being a way to lose work for nothing:
@@ -1247,12 +1110,10 @@ class Dispatcher:
         candidates = self.auto_preemptable()
         if not candidates:
             return
-        # Cards held by a job that is already stopping, plus the free ones: a
-        # gap the cards of a preempt already in flight will cover needs no
-        # second job stopped for it. Kept in two lists because a borrowed card
-        # is only on offer to a job that asked to borrow -- and a card that has
-        # dropped off nvidia-smi is in neither, since it is never handed out at
-        # all and counting it would stop a job for nothing.
+        # Cards held by a job that is already stopping count as free: a gap the
+        # cards of a preempt already in flight will cover needs no second job
+        # stopped for it. A card that has dropped off nvidia-smi is in neither
+        # list, since it is never handed out at all.
         owned = set(self.owned_gpus())
         shared = set(self.shared_gpus())
         stopping = [
@@ -1261,39 +1122,18 @@ class Dispatcher:
             if self._stopping(job_id)
             for uuid in entry.gpus
         ]
-        pool = [*self.free_gpus(), *(uuid for uuid in stopping if uuid in owned)]
-        shared_pool = [uuid for uuid in stopping if uuid in shared]
-        theirs = 0
-        sampled = False
-        for waiting in queue.list_queued():
-            if queue.is_cancelled(waiting.job_id):
+        requests = self._requests()
+        by_id = {request.job_id: (entry, request) for entry, request in requests}
+        pool = self._pool(
+            extra_owned=[u for u in stopping if u in owned],
+            extra_shared=[u for u in stopping if u in shared],
+        )
+        for decision in plan.plan([request for _, request in requests], pool):
+            if not isinstance(decision, plan.Holds):
                 continue
-            try:
-                spec = jobs.read_spec(waiting.job_id)
-            except (RuntimeError, ValueError):
-                continue  # `launch_ready` is what drops an unreadable spec
-            borrowing = self.config.may_borrow(spec)
-            if borrowing and not sampled:
-                # The shared cards nobody else is on. `launch_ready` offered
-                # these to this very job a moment ago, so a gap counted without
-                # them is one somebody would be stopped to cover twice. This
-                # costs no reading: a queued borrower is a job `launch_ready`
-                # asked the same question of, against the same reading.
-                free_shared, theirs = self.borrowable_gpus()
-                shared_pool = [*free_shared, *shared_pool]
-                sampled = True
-            take = pool[: spec.gpus]
-            take_shared = shared_pool[: spec.gpus - len(take)] if borrowing else []
-            gap = spec.gpus - len(take) - len(take_shared)
-            if gap <= 0:
-                # Starting the moment those cards come back, so they are not on
-                # offer to the job behind it.
-                pool, shared_pool = pool[len(take) :], shared_pool[len(take_shared) :]
-                continue
-            if not self._holds_the_queue(spec, theirs):
-                continue
+            waiting, request = by_id[decision.job_id]
             for candidate in enough_to_start(
-                candidates, waiting.priority, gap, borrowing=borrowing
+                candidates, waiting.priority, decision.gap, borrowing=request.borrows
             ):
                 if not self._preempt_for(candidate, waiting):
                     # The gap is not covered any more, so the rest of the set
@@ -1323,7 +1163,7 @@ class Dispatcher:
             found.append(
                 Preemptable(
                     job_id,
-                    spec.priority,
+                    state.priority,
                     list(entry.gpus),
                     state.started_at or "",
                     owned=sum(1 for uuid in entry.gpus if uuid in owned),
@@ -1332,10 +1172,9 @@ class Dispatcher:
             )
         return found
 
-    @staticmethod
-    def _stopping(job_id: str) -> bool:
+    def _stopping(self, job_id: str) -> bool:
         """Already asked to stop, so its cards are on their way back anyway."""
-        return queue.kill_reason(job_id) is not None or queue.is_cancelled(job_id)
+        return self._state_or_empty(job_id).intent is not None
 
     def _preempt_for(self, candidate: Preemptable, waiting: queue.QueueEntry) -> bool:
         """Stop one auto-preemptable job, saying in both logs who took its place.
@@ -1444,7 +1283,7 @@ class Dispatcher:
             # A job that failed its sync preflight proved these uploads cannot
             # work *before* it ran, and produced nothing. Retrying it three
             # times here only burns the budget the jobs with real outputs need.
-            if (state.reason or "").startswith("sync-preflight"):
+            if state.reason == "sync-preflight":
                 continue
             if not cleanup.outputs_confirmed(job_id, state)[0]:
                 pending.append(job_id)
@@ -1476,7 +1315,7 @@ class Dispatcher:
                     continue
                 pending.remove(job_id)
                 with contextlib.suppress(RuntimeError, OSError, KeyError):
-                    jobs.update_state(job_id, outputs_synced_at=jobs.utc_now(), outputs_lost=False)
+                    jobs.update_state(job_id, outputs_lost=False)
                 self.log(f"drain: job {job_id} outputs uploaded on attempt {attempt}")
             if not pending or attempt == OUTPUT_RETRY_ATTEMPTS:
                 break
@@ -1488,7 +1327,7 @@ class Dispatcher:
             error = last_error.get(job_id, "outputs were never confirmed uploaded")
             self.log(f"drain: job {job_id} OUTPUTS LOST: {error}")
             with contextlib.suppress(RuntimeError, OSError, KeyError):
-                jobs.update_state(job_id, outputs_lost=True, sync_error=error)
+                jobs.update_state(job_id, outputs_lost=True)
 
     def _upload_outputs(self, job_id: str, config: jobs.HostConfig, timeout: float) -> None:
         spec = jobs.read_spec(job_id)
@@ -1512,34 +1351,22 @@ class Dispatcher:
         )
 
     # -- retention -------------------------------------------------------
-    def sweep_abandoned_submits(self) -> None:
-        """Resolve jobs whose `gpuc submit` died before it committed them.
+    def sweep_stale_incoming(self) -> None:
+        """Remove job dirs a `gpuc submit` started building and never accepted.
 
-        The client owns everything up to the queue marker, and a submit that
-        never wrote one asked this host for nothing. So this does not put the
-        job in the queue -- it records that the submit did not finish, which is
-        the only thing anybody can act on, and lets the ordinary retention
-        horizons take the job dir afterwards like any other finished job.
+        The client owns a job until `enqueue` renames its dir into `jobs/`, so
+        a dir still under `incoming/` an hour later is a submit that died, and
+        the host was never asked to run it. Hourly, like the other reclaims.
         """
         now = self.deps.monotonic()
         if (
-            self._last_submit_sweep_at is not None
-            and now - self._last_submit_sweep_at < RETENTION_INTERVAL_S
+            self._last_incoming_sweep_at is not None
+            and now - self._last_incoming_sweep_at < RETENTION_INTERVAL_S
         ):
             return
-        self._last_submit_sweep_at = now
-        for job_id in cleanup.abandoned_submits():
-            jobs.update_state(
-                job_id,
-                status="failed",
-                reason="incomplete-submit",
-                exit_code=1,
-                ended_at=jobs.utc_now(),
-            )
-            self.log(
-                f"job {job_id} was never submitted: its spec and state were written but its "
-                f"queue marker never was, so nothing here was asked to run it"
-            )
+        self._last_incoming_sweep_at = now
+        for name in cleanup.remove_stale_incoming():
+            self.log(f"removed incoming/{name}: a submit that never finished enqueueing it")
 
     def maybe_reclaim(self) -> None:
         """Run the two retention horizons at startup, then at most once an hour.
@@ -1599,12 +1426,11 @@ class Dispatcher:
         self._shared = None
         self._borrowable = None
         self.reap()
-        self.handle_cancels()
-        self.escalate_kills()
+        self.escalate_stops()
         self.launch_ready()
         self.preempt_for_waiting()
         self.maybe_reclaim()
-        self.sweep_abandoned_submits()
+        self.sweep_stale_incoming()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:

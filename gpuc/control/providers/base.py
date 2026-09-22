@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from pydantic import BaseModel, Field
+
+from gpuc.control.tolerant import TolerantModel
 
 Cloud = Literal["SECURE", "COMMUNITY"]
 Availability = Literal["NONE", "LOW", "MEDIUM", "HIGH"]
@@ -32,10 +35,11 @@ class Constraints(BaseModel):
     gpu_count: int = 1
 
 
-class Offer(BaseModel):
-    """One catalog entry. Every field has a default so the `offer` a pod's own
-    config records, written by another build, still parses: a pod we cannot
-    reuse is a smaller failure than one we cannot read."""
+class Offer(TolerantModel):
+    """One catalog entry. Read tolerantly because the `offer` a pod's own
+    config records was written by whichever build rented it: a pod we cannot
+    reuse is a smaller failure than one we cannot read, and one we cannot read
+    is one `submit --runpod` buys a second of."""
 
     gpu_id: str = ""
     name: str = ""
@@ -82,7 +86,25 @@ def owned_pods(pods: list[Pod], prefix: str = DEFAULT_PREFIX) -> list[Pod]:
 
 
 class Provider(ABC):
+    """One rental provider. Everything the control side needs to know about a
+    provider's vocabulary lives on the instance, so the provisioning and
+    teardown flows are written once and read it from here."""
+
     prefix: str
+    dead_statuses: tuple[str, ...] = ()
+    """Pod statuses nothing can run on. A pod in one is a failed host."""
+    gone_statuses: tuple[str, ...] = ()
+    """Statuses that mean the rental has ended: forget the pod, never terminate it."""
+    broken_host: re.Pattern[str] | None = None
+    """Log signatures of a host whose GPU device nodes are broken: re-place, never retry."""
+    terminate_attempts: int = 3
+    terminate_retry_s: float = 5.0
+
+    def is_dead(self, pod: Pod | None) -> bool:
+        return pod is None or pod.status in self.dead_statuses
+
+    def is_gone(self, pod: Pod | None) -> bool:
+        return pod is None or pod.status in self.gone_statuses
 
     def list_ours(self) -> list[Pod]:
         return owned_pods(self.list(), self.prefix)

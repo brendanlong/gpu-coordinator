@@ -7,13 +7,14 @@ about what it must *not* delete.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from gpuc.host import __main__ as host_cli
-from gpuc.host import cleanup, jobs, paths, queue, runner
+from gpuc.host import cleanup, destinations, jobs, paths, queue, runner
 from gpuc.host.jobs import JobSpec
 from tests.conftest import make_spec
 from tests.test_runner import deps, log_of, prepare
@@ -164,7 +165,6 @@ def test_outputs_are_synced_before_the_workdir_goes(gpuc_home: Path) -> None:
 
 def finished_job(job_id_status: str, *, ended: datetime | None = None, size: int = 8192) -> str:
     job_id = queue.enqueue(make_spec())
-    queue.remove_marker(job_id)
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "blob.bin").write_bytes(b"y" * size)
     jobs.update_state(
@@ -235,7 +235,6 @@ def test_clean_leaves_a_job_whose_state_is_corrupt(gpuc_home: Path) -> None:
 
 def job_wanting_its_workdir_kept(policy: str) -> str:
     job_id = queue.enqueue(make_spec(cleanup=policy))
-    queue.remove_marker(job_id)
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "blob.bin").write_bytes(b"y" * 8192)
     jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now())
@@ -245,7 +244,6 @@ def job_wanting_its_workdir_kept(policy: str) -> str:
 def job_with_outputs_still_only_here() -> str:
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     results = paths.workdir(job_id) / "results"
     results.mkdir(parents=True, exist_ok=True)
     (results / "checkpoint.pt").write_bytes(b"w" * 8192)
@@ -273,7 +271,9 @@ def test_the_automatic_sweep_leaves_outputs_that_are_still_only_here(gpuc_home: 
     assert any(s.job_id == job_id and "outputs" in s.why for s in result.skipped)
 
     # ...and once they are somewhere else, it is free to go.
-    jobs.update_state(job_id, outputs_synced_at=jobs.utc_now())
+    for output in jobs.read_spec(job_id).outputs:
+        for destination in destinations.of(output, job_id):
+            jobs.record_upload(job_id, destination.uri, output.path, ok_at=jobs.utc_now())
     assert [c.job_id for c in cleanup.clean(all_finished=True, automatic=True).removed] == [job_id]
 
 
@@ -341,48 +341,49 @@ def test_a_workdir_already_gone_is_not_an_error(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).status == "succeeded"
 
 
-# -- leftover staged specs ----------------------------------------------------
+# -- leftover incoming job dirs -----------------------------------------------
 
 
 def staged(job_id: str, age_s: float = 0.0) -> Path:
-    directory = paths.home() / "incoming"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{job_id}.json"
-    path.write_text("{}\n")
+    """A job dir as `gpuc submit` builds it, left behind under `incoming/`."""
+    path = paths.incoming_job_dir(job_id)
+    (path / "workdir").mkdir(parents=True, exist_ok=True)
+    (path / "workdir" / "train.py").write_text("print('hi')\n")
+    (path / "spec.json").write_text("{}\n")
     if age_s:
-        stamp = path.stat().st_mtime - age_s
-        import os
-
-        os.utime(path, (stamp, stamp))
+        age(path, age_s)
     return path
 
 
-def test_clean_removes_a_staged_spec_whose_job_finished(gpuc_home: Path) -> None:
-    job_id = finished_job("succeeded")
-    path = staged(job_id)
-    result = cleanup.clean(all_finished=True)
-    assert result.incoming_removed == [path.name]
-    assert not path.exists()
+def age(path: Path, age_s: float) -> None:
+    """Backdate a staged dir and everything under it: `stale_incoming` takes
+    the newest mtime in the tree, so backdating only the top is not enough."""
+    for entry in [path, *path.rglob("*")]:
+        stamp = entry.stat().st_mtime - age_s
+        os.utime(entry, (stamp, stamp))
 
 
-def test_clean_removes_an_orphaned_staged_spec_once_it_is_old(gpuc_home: Path) -> None:
+def test_clean_removes_an_orphaned_incoming_dir_once_it_is_old(gpuc_home: Path) -> None:
     fresh = staged("20260101-000000-aaaaaa")
     old = staged("20260101-000000-bbbbbb", age_s=cleanup.INCOMING_STALE_S + 60)
     result = cleanup.clean(all_finished=True)
     assert result.incoming_removed == [old.name]
-    assert fresh.exists(), "a spec a concurrent submit may still be enqueueing"
+    assert not old.exists()
+    assert fresh.exists(), "a dir a concurrent submit may still be rsyncing into"
 
 
-def test_clean_leaves_a_staged_spec_for_a_running_job(gpuc_home: Path) -> None:
-    job_id = finished_job("running")
-    path = staged(job_id)
-    cleanup.clean(all_finished=True)
+def test_an_incoming_dir_an_rsync_is_still_filling_is_not_stale(gpuc_home: Path) -> None:
+    """A slow submit's dir was created hours ago and is still growing. Going by
+    the dir's own mtime alone would delete the workdir out from under rsync."""
+    path = staged("20260101-000000-cccccc", age_s=cleanup.INCOMING_STALE_S + 60)
+    (path / "workdir" / "just-arrived.bin").write_bytes(b"x")
+    assert cleanup.stale_incoming() == []
+    assert cleanup.clean(all_finished=True).incoming_removed == []
     assert path.exists()
 
 
-def test_dry_run_does_not_remove_staged_specs(gpuc_home: Path) -> None:
-    job_id = finished_job("succeeded")
-    path = staged(job_id)
+def test_dry_run_does_not_remove_stale_incoming_dirs(gpuc_home: Path) -> None:
+    path = staged("20260101-000000-dddddd", age_s=cleanup.INCOMING_STALE_S + 60)
     result = cleanup.clean(all_finished=True, dry_run=True)
     assert result.incoming_removed == [path.name]
     assert path.exists()
@@ -871,32 +872,3 @@ def test_a_preempted_job_keeps_its_workdir_whatever_its_policy_says(gpuc_home: P
     assert (paths.workdir(job_id) / "train.py").exists()
     assert state.workdir_removed is False
     assert "preempted; keeping workdir (cleanup=always)" in log_of(job_id)
-
-
-def test_the_workdir_survives_the_dispatcher_taking_the_marker_mid_finalize(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The marker is a request, not a latch. A dispatcher starting up sees a
-    finished job with a preempt marker and is entitled to consume it the
-    instant the final state lands -- and the runner is still running, two
-    decisions away from deleting the workdir the next attempt was about to be
-    dispatched with."""
-    job_id = prepare(command="sleep 30", cleanup="always")
-    (paths.workdir(job_id) / "train.py").write_text("print('hi')\n")
-    paths.job_env_file(job_id).write_text('HF_TOKEN="hf_abc"\n')
-    queue.enqueue(make_spec(priority=1))
-    queue.preempt(job_id)
-
-    real_update = jobs.update_state
-
-    def take_the_marker_when_the_state_lands(job_id: str, **fields: object) -> jobs.JobState:
-        state = real_update(job_id, **fields)
-        if fields.get("status") == "failed":
-            paths.preempt_file(job_id).unlink(missing_ok=True)
-        return state
-
-    monkeypatch.setattr(runner.jobs, "update_state", take_the_marker_when_the_state_lands)
-    assert runner.run_job(job_id, deps()) != 0
-
-    assert (paths.workdir(job_id) / "train.py").exists()
-    assert paths.job_env_file(job_id).exists()

@@ -13,6 +13,8 @@ as an output.
 
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -103,13 +105,37 @@ def unchanged(root: Path, entries: Entries) -> list[str]:
 
 
 def has_new_content(root: Path, entries: Entries) -> bool:
-    """Did this output path gain or change anything at all?"""
-    if not root.exists():
+    """Did this output path gain or change anything at all?
+
+    Every way of not knowing counts as content: a path that cannot be read, a
+    symlink (which `aws s3 sync` follows and `rglob` does not), a walk that
+    errors part way down. The answer decides both whether there is anything to
+    upload and whether a job dir may be deleted, and a wrong "nothing here"
+    is the only copy of a result going in the bin.
+    """
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
         return False
-    if root.is_file():
+    except OSError:
+        return True
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    if not stat.S_ISDIR(info.st_mode):
         return not unchanged(root.parent, {root.name: entries.get(root.name, [])})
-    files = [p for p in root.rglob("*") if p.is_file()]
-    return len(files) > len(unchanged(root, entries))
+    unreadable = False
+
+    def note(_: OSError) -> None:
+        nonlocal unreadable
+        unreadable = True
+
+    files = 0
+    for parent, dirs, names in os.walk(root, onerror=note):
+        for name in (*dirs, *names):
+            if Path(parent, name).is_symlink():
+                return True
+        files += len(names)
+    return unreadable or files > len(unchanged(root, entries))
 
 
 def too_many(entries: Entries) -> bool:

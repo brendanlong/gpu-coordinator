@@ -9,10 +9,9 @@ a line you can copy.
 
 from __future__ import annotations
 
-import os
 import shlex
 
-from gpuc.control.transport import CommandResult, SshTransport, Transport
+from gpuc.control.transport import CommandResult, Transport
 
 DEFAULT_SHELL = "/bin/bash"
 
@@ -37,46 +36,11 @@ def login_command(directory: str, fallback: str | None = None) -> str:
     return f'{quoted_cd(directory, fallback)}; exec "${{SHELL:-{DEFAULT_SHELL}}}" -l'
 
 
-def interactive_options(transport: SshTransport) -> list[str]:
-    """The transport's ssh options, minus `BatchMode`.
-
-    BatchMode is right for every automated call -- a prompt there would hang a
-    polling loop forever -- and wrong here, where the user may well need to
-    type a key passphrase.
-    """
-    options = transport.ssh_options()
-    kept: list[str] = []
-    index = 0
-    while index < len(options):
-        if (
-            options[index] == "-o"
-            and index + 1 < len(options)
-            and options[index + 1].startswith("BatchMode")
-        ):
-            index += 2
-            continue
-        kept.append(options[index])
-        index += 1
-    return kept
-
-
 def interactive_argv(
     transport: Transport, directory: str, fallback: str | None = None
 ) -> list[str]:
-    """The argv to `exec` for an interactive session.
-
-    `-t` forces a tty: without it the remote shell has no job control, no
-    prompt and no `clear`, which is not a shell anyone wants.
-    """
-    if isinstance(transport, SshTransport):
-        return [
-            "ssh",
-            *interactive_options(transport),
-            "-t",
-            transport.target,
-            login_command(directory, fallback),
-        ]
-    return ["bash", "-lc", login_command(directory, fallback)]
+    """The argv to `exec` for an interactive session in `directory`."""
+    return transport.interactive_argv(login_command(directory, fallback))
 
 
 def shell_command(directory: str, command: str, fallback: str | None = None) -> str:
@@ -96,10 +60,7 @@ def command_argv(
     transport: Transport, directory: str, command: str, fallback: str | None = None
 ) -> list[str]:
     """The argv for one non-interactive command, for `--print` to show."""
-    remote = shell_command(directory, command, fallback)
-    if isinstance(transport, SshTransport):
-        return transport.ssh_argv(remote)
-    return ["bash", "-c", remote]
+    return transport.argv(shell_command(directory, command, fallback))
 
 
 def run_command(
@@ -112,17 +73,6 @@ def run_command(
 ) -> CommandResult:
     """Run one command in `directory` on the host, whatever it exits."""
     return transport.run(shell_command(directory, command, fallback), timeout=timeout, check=False)
-
-
-def local_directory(directory: str, fallback: str | None = None) -> str:
-    """The first of these paths that exists here, `$HOME` expanded."""
-    for candidate in (directory, fallback):
-        if candidate is None:
-            continue
-        path = os.path.expanduser(os.path.expandvars(candidate))
-        if os.path.isdir(path):
-            return path
-    return os.path.expanduser("~")
 
 
 def print_line(argv: list[str]) -> str:

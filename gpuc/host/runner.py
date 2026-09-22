@@ -14,7 +14,7 @@ import shlex
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -37,12 +37,12 @@ from gpuc.host.jobs import JobSpec
 
 KILL_GRACE_S = 15.0
 SAMPLE_INTERVAL_S = 30.0
-SPEC_REFRESH_S = 30.0
-"""How often the monitor re-reads `spec.json` while a job runs.
+ESTIMATE_REFRESH_S = 30.0
+"""How often the monitor re-reads the job's estimate while it runs.
 
-`gpuc estimate` edits the spec of a job that is already running, and the copy
-loaded at job start would never see it -- which is the job that most needs an
-end time, since nobody can add one before it started."""
+`gpuc estimate` changes the state of a job that is already running, and the
+value loaded at job start would never see it -- which is the job that most
+needs an end time, since nobody can add one before it started."""
 UTIL_SAMPLES_KEPT = 40  # 20 minutes at the default sample interval
 POLL_INTERVAL_S = 0.5
 TERMINATED_EXIT_CODE = 143  # 128 + SIGTERM, the shell convention
@@ -247,8 +247,9 @@ def kill_process_group(
         os.killpg(pgid, signal.SIGKILL)
 
 
-def preflight_command() -> str:
-    return f"uv run --no-sync python -c {shlex.quote(PREFLIGHT_SOURCE)}"
+def preflight_command(spec: JobSpec) -> str:
+    """The GPU check, run through the interpreter the spec says is the job's."""
+    return f"{spec.python} -c {shlex.quote(PREFLIGHT_SOURCE)}"
 
 
 @dataclass
@@ -261,10 +262,10 @@ class RunnerDeps:
     now: Callable[[], float] = time.monotonic
     poll_interval_s: float = POLL_INTERVAL_S
     sample_interval_s: float = SAMPLE_INTERVAL_S
-    spec_refresh_s: float = SPEC_REFRESH_S
+    estimate_refresh_s: float = ESTIMATE_REFRESH_S
     kill_grace_s: float = KILL_GRACE_S
     preflight: bool = True
-    preflight_command: Callable[[], str] = preflight_command
+    preflight_command: Callable[[JobSpec], str] = preflight_command
     sync_preflight: bool = True
     isolation: str | None = None
     """`cgroup`, `pgid`, or None to ask `scope.isolation()` at job start."""
@@ -276,8 +277,21 @@ class RunnerDeps:
 
 
 def build_env(
-    spec: JobSpec, assigned: Sequence[str], config: jobs.HostConfig | None = None
+    spec: JobSpec,
+    assigned: Sequence[str],
+    config: jobs.HostConfig | None = None,
+    indices: Mapping[str, int] | None = None,
 ) -> dict[str, str]:
+    """The job's environment: the host's, the secrets file, the spec's, then
+    the cards -- last, so a spec `env` typo cannot hand the job the wrong ones.
+
+    `CUDA_VISIBLE_DEVICES` names the cards by nvidia-smi index when the runner
+    has just resolved every one (vLLM and others `int()` each entry, and a
+    UUID there fails inside a subprocess with an error that points at the
+    model), pinned to nvidia-smi's numbering by `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+    so the index means the same card to CUDA. Without a full index map the
+    UUIDs go through as they are, which every torch accepts.
+    """
     env = dict(os.environ)
     # The host's own env and PATH go first, so a job may still pin either
     # explicitly. The dispatcher normally passes these down already; doing it
@@ -286,8 +300,11 @@ def build_env(
     (config or jobs.read_config()).apply_env(env)
     env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
     env.update(spec.env)
-    # Last, so a spec `env` typo cannot hand the job the wrong cards.
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned)
+    if indices is not None and assigned and all(uuid in indices for uuid in assigned):
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(indices[uuid]) for uuid in assigned)
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned)
     env["GPUC_JOB_ID"] = spec.job_id
     env["GPUC_JOB_DIR"] = str(paths.job_dir(spec.job_id))
     env["GPUC_OUTPUTS"] = str(paths.outputs_dir(spec.job_id))
@@ -318,10 +335,10 @@ class JobRunner:
         """Whether a `progress_command` has produced an eta yet. Once one has,
         the spec's estimate is no longer published: it is a guess, and this is
         a measurement."""
-        self._live = self.spec
-        """The spec as the last re-read found it on disk, which outlives the
-        phase that read it: an estimate added during `setup` must not be
-        undone by `main` starting from the copy loaded at job start."""
+        self._estimate = self.state.estimated_runtime_min
+        """The estimate as the last re-read found it, which outlives the phase
+        that read it: an estimate added during `setup` must not be undone by
+        `main` starting from the value loaded at job start."""
         self._published_estimate: float | None = None
         """The `estimated_runtime_min` behind the eta now in the state file,
         null when that eta is not ours. Kept so the spec re-read only writes
@@ -386,44 +403,36 @@ class JobRunner:
         max_runtime_s = (
             None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
         )
-        # `spec.json` is re-read on a timer, so an estimate (or a progress
-        # command) added after the job started still takes effect. Only what it
-        # *reports* -- `estimated_runtime_min`, `progress_command` and its
-        # interval -- is taken from the re-read: a command, an env or an output
-        # path changing mid-flight would leave the spec describing a run that
-        # never happened.
-        live = self._live
-        next_spec = phase_start + deps.spec_refresh_s
+        # The estimate is re-read on a timer, so one added after the job
+        # started still takes effect. It is the one thing a running job
+        # re-reads: the spec is never rewritten after enqueue.
+        next_estimate = phase_start + deps.estimate_refresh_s
         # The submitter's estimate, published from the first phase on: a job
         # still installing torch is exactly the one somebody wants an end time
         # for. A `progress_command` replaces it with a measured one below.
-        self._publish_estimated_eta(live.estimated_runtime_min, phase_start - job_start)
+        self._publish_estimated_eta(self._estimate, phase_start - job_start)
         # Progress is a fraction of the job's own work, so only `main` can
         # report it: during setup the command would be reading a file the job
         # has not started writing.
-        progress_command = live.progress_command if phase == "main" else None
-        next_progress = phase_start + live.progress_interval_s
+        progress_command = self.spec.progress_command if phase == "main" else None
+        next_progress = phase_start + self.spec.progress_interval_s
 
         while proc.poll() is None:
             deps.sleep(deps.poll_interval_s)
             t = deps.now()
-            if queue.is_cancelled(self.job_id):
-                self._kill(proc, "cancelled", log)
-                break
-            requested = queue.kill_reason(self.job_id)
+            requested = queue.stop_requested(self.job_id)
             if requested:
                 self._kill(proc, requested, log)
                 break
             if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
                 self._kill(proc, "timeout", log)
                 break
-            if t >= next_spec:
-                next_spec = t + deps.spec_refresh_s
-                live = self._live = self._live_spec(live)
-                self._publish_estimated_eta(live.estimated_runtime_min, t - job_start)
-                progress_command = live.progress_command if phase == "main" else None
+            if t >= next_estimate:
+                next_estimate = t + deps.estimate_refresh_s
+                self._estimate = self._live_estimate()
+                self._publish_estimated_eta(self._estimate, t - job_start)
             if progress_command and t >= next_progress:
-                next_progress = t + live.progress_interval_s
+                next_progress = t + self.spec.progress_interval_s
                 self._record_progress(progress_command, t - phase_start, log)
             if record_util and t >= next_sample:
                 next_sample = t + deps.sample_interval_s
@@ -438,13 +447,14 @@ class JobRunner:
                 self._record_util(util)
         return proc.wait()
 
-    def _live_spec(self, previous: JobSpec) -> JobSpec:
-        """The spec as `spec.json` holds it now, or `previous` if it cannot be
-        read -- a spec being rewritten under us may not end a running job."""
+    def _live_estimate(self) -> float | None:
+        """The estimate as the state holds it now, or the last one read if the
+        state cannot be read -- a file being replaced under us may not end a
+        running job."""
         try:
-            return jobs.read_spec(self.job_id)
+            return jobs.read_state(self.job_id).estimated_runtime_min
         except (RuntimeError, OSError, ValueError):
-            return previous
+            return self._estimate
 
     def _publish_estimated_eta(self, estimate: float | None, elapsed_s: float) -> None:
         """The end time the submitter's estimate implies, while that is the
@@ -570,7 +580,7 @@ class JobRunner:
         paths.ensure_job_layout(self.job_id)
         job_start = self.deps.now()
         gpu_error = self._resolve_assigned()
-        env = build_env(self.spec, self.assigned, self.config)
+        env = build_env(self.spec, self.assigned, self.config, self._indices())
         # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
         # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
         # credential file anywhere on the host.
@@ -612,6 +622,14 @@ class JobRunner:
             jobs.update_state(self.job_id, gpus=self.assigned)
         return None
 
+    def _indices(self) -> dict[str, int] | None:
+        """uuid -> nvidia-smi index, read now, just after the assignment was
+        resolved against the same driver; None if it cannot be read."""
+        try:
+            return {gpu.uuid: gpu.index for gpu in gpus.list_gpus(self.deps.smi)}
+        except gpus.GpuError:
+            return None
+
     def _run_phases(
         self,
         env: dict[str, str],
@@ -632,8 +650,8 @@ class JobRunner:
         )
         if gpu_error:
             self._log(log, f"GPU assertion failed: {gpu_error}")
-            # The job never ran, so its `outputs:` cannot exist and a second
-            # failure would only add a confusing `+no-outputs`.
+            # The job never ran, so its `outputs:` cannot exist and there is
+            # nothing to upload.
             return self._finalize(1, "failed", "gpu-assert", sync_loop, log, skip_output_sync=True)
 
         self._log(
@@ -657,7 +675,9 @@ class JobRunner:
             cancelled = self._cancelled_before("preflight", sync_loop, log)
             if cancelled is not None:
                 return cancelled
-            code = self._run_phase("preflight", self.deps.preflight_command(), env, log, job_start)
+            code = self._run_phase(
+                "preflight", self.deps.preflight_command(self.spec), env, log, job_start
+            )
             if code != 0 or self.kill_reason:
                 return self._finalize(code, *self._classify(code, "gpu-preflight"), sync_loop, log)
 
@@ -728,11 +748,13 @@ class JobRunner:
         return None
 
     def _cancelled_before(self, phase: str, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int | None:
-        """A job cancelled during the launch window never starts a phase."""
-        if not queue.is_cancelled(self.job_id):
+        """A job asked to stop between phases never starts the next one."""
+        requested = queue.stop_requested(self.job_id)
+        if requested is None:
             return None
-        self._log(log, f"cancel marker present before phase={phase}; not starting it")
-        return self._finalize(TERMINATED_EXIT_CODE, "cancelled", "cancelled", sync_loop, log)
+        self.kill_reason = requested
+        self._log(log, f"{requested} before phase={phase}; not starting it")
+        return self._finalize(TERMINATED_EXIT_CODE, *self._classify(1, None), sync_loop, log)
 
     def _finalize_terminated(
         self, exc: _Terminated, sync_loop: sync.SyncLoop, log: IO[bytes]
@@ -752,7 +774,7 @@ class JobRunner:
             self._kill(proc, "terminated", log)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
-        cancelled = queue.is_cancelled(self.job_id)
+        cancelled = queue.stop_requested(self.job_id) == "cancelled"
         status, reason = ("cancelled", "cancelled") if cancelled else ("failed", "terminated")
         return self._finalize(TERMINATED_EXIT_CODE, status, reason, sync_loop, log)
 
@@ -775,28 +797,27 @@ class JobRunner:
         skip_output_sync: bool = False,
     ) -> int:
         self._finalizing = True
-        # Read once, and before the final state write below: from that write
-        # on, a dispatcher starting up sees a finished job with a preempt
-        # marker and is entitled to consume the marker. Asked again afterwards
-        # -- as the workdir and secrets decisions used to -- the answer flips
-        # to "no preempt" and this runner deletes the very workdir and secrets
-        # file the next attempt was about to be dispatched with.
+        # The intent survives every write this runner makes, and the
+        # dispatcher only consumes it once this process has exited, so the
+        # workdir and secrets decisions below can trust this reading.
         self._preempting = queue.is_preempted(self.job_id)
         jobs.update_state(self.job_id, phase="sync")
+        problems: list[str] = []
         if skip_output_sync:
             # The job never ran (a failed preflight, a card that is not here),
-            # so a second failure would only add a confusing `+no-outputs` to a
-            # reason that is already exact.
+            # so its outputs cannot exist and there is nothing to upload.
             self._log(log, "skipping the final output sync: the job never ran")
         else:
             try:
                 sync_loop.final()
             except sync.MissingOutput as exc:
                 self._log(log, f"final sync found no outputs: {exc}")
-                status, reason, exit_code = self._blame(status, reason, exit_code, "no-outputs")
+                status, reason, exit_code = self._blame(
+                    status, reason, exit_code, "no-outputs", problems
+                )
             except sync.SyncError as exc:
                 self._log(log, f"final sync FAILED: {exc}")
-                status, reason, exit_code = self._blame(status, reason, exit_code, "sync")
+                status, reason, exit_code = self._blame(status, reason, exit_code, "sync", problems)
             if sync_loop.last_error and status == "succeeded":
                 self._log(log, f"periodic sync had errors: {sync_loop.last_error}")
 
@@ -804,6 +825,7 @@ class JobRunner:
             self.job_id,
             status=status,
             reason=reason,
+            problems=problems,
             exit_code=exit_code,
             ended_at=jobs.utc_now(),
             phase=None,
@@ -815,7 +837,6 @@ class JobRunner:
             # the useful part. A surviving `eta` would read as a promise the
             # job is still going.
             eta=None,
-            outputs_synced_at=sync_loop.outputs_synced_at,
         )
         self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")
         # After the final state write, and only then: the outputs the sync just
@@ -841,15 +862,15 @@ class JobRunner:
             if warning:
                 self._log(log, f"WARNING: {warning}")
         except sync.SyncError as exc:
-            # meta_synced_at stays null, so `purge` will refuse to delete this
-            # job dir: the only copy of the log lives here.
+            # No mirror record, so `purge` will refuse to delete this job dir:
+            # the only copy of the log lives here.
             self._log(log, f"final state upload failed: {exc}")
         # Only now: the final sync and the state upload authenticate with the
         # secrets this file holds, so removing it earlier would break exactly
         # the upload that matters most. On an ephemeral host with outputs still
         # unconfirmed it stays: the drain gets one more go at uploading them,
         # and the file dies with the pod in minutes either way.
-        if self._keep_secrets_for_drain(sync_loop):
+        if self._keep_secrets_for_drain():
             self._log(
                 log,
                 "outputs are not confirmed uploaded; keeping this job's secrets file so the "
@@ -864,8 +885,10 @@ class JobRunner:
             paths.job_env_file(self.job_id).unlink(missing_ok=True)
         return exit_code
 
-    def _keep_secrets_for_drain(self, sync_loop: sync.SyncLoop) -> bool:
-        if not (self.config.ephemeral and self.spec.outputs and not sync_loop.outputs_synced_at):
+    def _keep_secrets_for_drain(self) -> bool:
+        if not (self.config.ephemeral and self.spec.outputs):
+            return False
+        if jobs.read_state(self.job_id).outputs_uploaded(self.spec):
             return False
         # The same question the drain asks before it retries anything: a job
         # that wrote no outputs is skipped there, so keeping its credentials on
@@ -901,11 +924,17 @@ class JobRunner:
 
     @staticmethod
     def _blame(
-        status: str, reason: str | None, exit_code: int, sync_reason: str
+        status: str, reason: str | None, exit_code: int, sync_reason: str, problems: list[str]
     ) -> tuple[str, str | None, int]:
+        """A job that succeeded and then lost its outputs failed, for that
+        reason. One that was already over for a reason of its own keeps it,
+        and the upload failure is a problem noted beside it."""
         if status == "succeeded":
             return "failed", sync_reason, 1
-        return status, f"{reason}+{sync_reason}" if reason else sync_reason, exit_code
+        if reason is None:
+            return status, sync_reason, exit_code
+        problems.append(sync_reason)
+        return status, reason, exit_code
 
 
 def run_job(job_id: str, deps: RunnerDeps | None = None) -> int:

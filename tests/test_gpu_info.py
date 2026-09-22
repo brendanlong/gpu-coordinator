@@ -7,7 +7,7 @@ from pathlib import Path
 from gpuc.control.cli import main
 from gpuc.control.config import HostEntry, load_registry, registry_transaction
 from gpuc.control.gpuinfo import GpuInfo, parse_smi, rows, summarize, vram_text
-from gpuc.control.status import HostView, JobView, render
+from gpuc.control.status import HostState, HostView, JobView, render
 from tests.conftest import host_entry
 
 SMI_OUTPUT = """\
@@ -73,7 +73,7 @@ def test_host_list_names_the_cards_and_the_driver(control_env: Path, capsys) -> 
 def test_status_names_the_cards_and_who_holds_them() -> None:
     view = HostView(
         entry=entry_with_cards(),
-        reachable=True,
+        state=HostState.ANSWERED,
         heartbeat_age_s=2.0,
         owned=[A40, A40_TWO],
         running=[JobView(job_id="20260915-1", status="running", gpus=[A40])],

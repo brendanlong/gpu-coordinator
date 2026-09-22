@@ -67,8 +67,18 @@ def job_env_file(job_id: str) -> Path:
     return secrets_dir() / f"{job_id}.env"
 
 
-def queue_dir() -> Path:
-    return home() / "queue"
+def incoming_dir() -> Path:
+    """Job dirs a `gpuc submit` is still building.
+
+    A job is accepted by renaming its dir from here into `jobs/`, so a job dir
+    under `jobs/` is one the host was asked to run, by construction, and a dir
+    left here is a submit that died. See `queue.enqueue`.
+    """
+    return home() / "incoming"
+
+
+def incoming_job_dir(job_id: str) -> Path:
+    return incoming_dir() / job_id
 
 
 def jobs_dir() -> Path:
@@ -77,6 +87,15 @@ def jobs_dir() -> Path:
 
 def job_dir(job_id: str) -> Path:
     return jobs_dir() / job_id
+
+
+def job_lock_file(job_id: str) -> Path:
+    """The flock every read-modify-write of `state.json` takes.
+
+    The dispatcher, the job's runner and a `python -m gpuc.host cancel` from
+    over ssh all update the one file, each with an atomic replace; without the
+    lock the last writer silently discards the others' fields."""
+    return job_dir(job_id) / ".lock"
 
 
 def spec_file(job_id: str) -> Path:
@@ -104,29 +123,6 @@ def outputs_baseline_file(job_id: str) -> Path:
     return job_dir(job_id) / "outputs_baseline.json"
 
 
-def cancel_file(job_id: str) -> Path:
-    return job_dir(job_id) / "cancel"
-
-
-def kill_file(job_id: str) -> Path:
-    """A kill request with a reason in it, written by the dispatcher.
-
-    Separate from `cancel`: a preempt must end as `failed: <reason>`, not as a
-    cancellation nobody asked for, and the runner is still the process that
-    does the killing and the final sync."""
-    return job_dir(job_id) / "kill"
-
-
-def preempt_file(job_id: str) -> Path:
-    """A request to put this job back in the queue once its runner has stopped.
-
-    Written beside the `kill` marker by `queue.preempt`, and acted on by the
-    dispatcher when the job ends: the runner still owns the kill and the final
-    sync, and the queue is the dispatcher's.
-    """
-    return job_dir(job_id) / "preempt"
-
-
 def lock_file() -> Path:
     return home() / "dispatcher.lock"
 
@@ -145,7 +141,7 @@ def draining_file() -> Path:
 
 def ensure_layout() -> None:
     home().mkdir(parents=True, exist_ok=True)
-    queue_dir().mkdir(parents=True, exist_ok=True)
+    incoming_dir().mkdir(parents=True, exist_ok=True)
     jobs_dir().mkdir(parents=True, exist_ok=True)
     secrets_dir().mkdir(parents=True, exist_ok=True)
     # The whole tree, not just secrets/: job dirs hold a workdir and logs that

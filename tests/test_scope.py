@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.status import HostView, host_json, job_views
+from gpuc.control.status import HostState, HostView, host_json, job_views
 from gpuc.host import jobs, paths, queue, runner, scope
 from gpuc.host.runner import RunnerDeps
 from tests.conftest import FAKE_GPUS, fake_smi, host_entry, make_spec
@@ -112,7 +112,6 @@ def test_a_cgroup_host_records_its_unit_while_a_phase_runs(monkeypatch: pytest.M
 def prepare(command: str) -> str:
     spec = make_spec(command=command)
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     return job_id
 
@@ -216,6 +215,11 @@ def test_status_json_says_which_isolation_a_running_job_has() -> None:
     )
     assert (queued, finished) == ([], [])
     document = host_json(
-        HostView(entry=host_entry(name="h"), reachable=True, heartbeat_age_s=1.0, running=running)
+        HostView(
+            entry=host_entry(name="h"),
+            state=HostState.ANSWERED,
+            heartbeat_age_s=1.0,
+            running=running,
+        )
     )
     assert document["running"][0]["iso"] == "cgroup"

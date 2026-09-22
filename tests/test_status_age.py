@@ -6,7 +6,15 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from gpuc.control.status import HostView, JobView, format_age, parse_duration, render, within
+from gpuc.control.status import (
+    HostState,
+    HostView,
+    JobView,
+    format_age,
+    parse_duration,
+    render,
+    within,
+)
 from tests.conftest import host_entry
 
 
@@ -28,7 +36,7 @@ def finished(job_id: str, status: str = "succeeded", reason: str | None = None, 
 def view(*jobs: JobView) -> HostView:
     return HostView(
         entry=host_entry(name="h", gpus=["GPU-a"]),
-        reachable=True,
+        state=HostState.ANSWERED,
         heartbeat_age_s=1.0,
         owned=["GPU-a"],
         finished=list(jobs),

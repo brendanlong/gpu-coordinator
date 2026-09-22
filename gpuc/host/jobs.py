@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +25,21 @@ deliberately tolerant enough that it has not had to."""
 
 FINISHED_STATUSES = ("succeeded", "failed", "cancelled")
 
+CANCEL = "cancel"
+PREEMPT = "preempt"
+INTENTS = (CANCEL, PREEMPT)
+"""What somebody has asked of a job, as distinct from what it is doing.
+
+`status` is the job's own progress; `intent` is the request standing against
+it. A queued job is cancelled outright, so the only intents are ones a running
+job's runner acts on: `cancel` ends it as `cancelled`, `preempt` ends the
+attempt as `failed: preempted` and the dispatcher queues it again. Both live
+in the same file as `status`, written in the same atomic replace, so there is
+no order of writes to get right and nothing to reconcile after a crash.
+"""
+
+DEFAULT_PYTHON = "uv run --no-sync python"
+
 ON_SUCCESS = "on_success"
 ALWAYS = "always"
 NEVER = "never"
@@ -34,7 +51,7 @@ def _polling_interval(fields: Any) -> float:
     """`progress_interval_s`, with anything unusable meaning the default.
 
     A zero, a negative or a NaN reaches here from a hand-edited `spec.json`, a
-    staged `incoming/<id>.json`, or another build -- the control side's
+    staged `incoming/<id>/spec.json`, or another build -- the control side's
     validation is not in that path. Zero and negative would poll on every pass
     of the runner's loop, forking a shell twice a second for the life of the
     job; NaN would silently never poll at all.
@@ -190,6 +207,11 @@ def as_bool(d: Any, key: str, default: bool = False) -> bool:
     return default if value is None else bool(value)
 
 
+def as_list(d: Any, key: str) -> list[Any]:
+    value = fields_of(d).get(key)
+    return list(value) if isinstance(value, list) else []
+
+
 def as_str_list(d: Any, key: str) -> list[str]:
     value = fields_of(d).get(key)
     return [str(item) for item in value] if isinstance(value, list) else []
@@ -259,6 +281,10 @@ class JobSpec:
     command: str
     name: str = ""
     setup: str | None = None
+    python: str = DEFAULT_PYTHON
+    """How to run Python inside the job's own environment, for the GPU check
+    before `main`. The default assumes a uv project; a repo that keeps its
+    stack elsewhere names its own interpreter (`.venv/bin/python`, `python`)."""
     gpus: int = 1
     use_shared: bool = False
     """May this job be dispatched to the host's `shared_gpus` -- cards gpuc
@@ -318,6 +344,7 @@ class JobSpec:
             command=command,
             name=as_str(fields, "name"),
             setup=as_opt_str(fields, "setup"),
+            python=as_str(fields, "python", DEFAULT_PYTHON) or DEFAULT_PYTHON,
             gpus=as_int(fields, "gpus", 1),
             use_shared=as_bool(fields, "use_shared"),
             env=as_str_dict(fields, "env"),
@@ -342,11 +369,55 @@ class JobSpec:
 
 
 @dataclass
+class Upload:
+    """The last thing that happened to one destination of one job.
+
+    One record per destination, kept in the job's state: `ok_at` is the last
+    successful upload, `error` the last failure, and the newer of the two is
+    what stands. `output` is the spec path the files came from, or null for
+    the host's mirror of the job's own log and state.
+    """
+
+    to: str
+    output: str | None = None
+    ok_at: str | None = None
+    error: str | None = None
+
+    @staticmethod
+    def from_dict(d: Any) -> Upload | None:
+        to = as_opt_str(d, "to")
+        if not to:
+            return None
+        return Upload(
+            to=to,
+            output=as_opt_str(d, "output"),
+            ok_at=as_opt_str(d, "ok_at"),
+            error=as_opt_str(d, "error"),
+        )
+
+
+@dataclass
 class JobState:
     status: str = "queued"
     """queued | running | succeeded | failed | cancelled."""
+    intent: str | None = None
+    """`cancel` | `preempt` | null: see `INTENTS`."""
     attempt: int = 1
+    priority: int = 50
+    """The priority the job is (or was) ordered by. Starts as the spec's and
+    is what `gpuc reorder` and `gpuc preempt --priority` change; the queue is
+    every `queued` state sorted by `(priority, job_id)`, so this is the one
+    copy of it."""
+    estimated_runtime_min: float | None = None
+    """The submitter's estimate, as `gpuc estimate` last left it. The spec is
+    never rewritten after enqueue, so the live value is here and the runner
+    re-reads it from here."""
     reason: str | None = None
+    """What ended the job, one word: see usage.md's table."""
+    problems: list[str] = field(default_factory=list)
+    """What else went wrong on the way out -- `sync`, `no-outputs` -- for a
+    job that already had a reason. A succeeded job with a failed upload is
+    `failed: sync` outright, since its result never arrived."""
     exit_code: int | None = None
     gpus: list[str] = field(default_factory=list)
     started_at: str | None = None
@@ -377,7 +448,10 @@ class JobState:
     """When this job is expected to finish, from `progress_pct` if there is one
     and from the spec's `estimated_runtime_min` otherwise. Null while the job is
     queued, once it is finished, and whenever it has nothing to estimate from."""
-    sync_error: str | None = None
+    uploads: list[Upload] = field(default_factory=list)
+    """One record per destination this job uploads to; see `Upload`. The
+    whole account of whether its outputs, its log and its state are
+    somewhere other than this host."""
     workdir_removed: bool = False
     """Whether `workdir/` has been deleted, by the job's `cleanup:` policy or by
     `gpuc clean`. Recorded so `status` and `logs` can say "gone on purpose"
@@ -401,29 +475,11 @@ class JobState:
     Not the number `du` gives: see `cleanup.reclaimable_bytes`. `gpuc clean`
     measures afresh rather than trusting this, because it is about to delete
     what it is quoting."""
-    meta_synced_at: str | None = None
-    """When this job's `log.txt` and `state.json` were last confirmed mirrored.
-
-    Written only after a *successful* final `sync_job_meta`, and the whole
-    precondition for `purge`: the local state is the authority on whether a job
-    dir may be deleted, because the mirror cannot be consulted from the host
-    without credentials the host may not have. Null means "no confirmed backup"
-    -- either the upload failed or this host has no `s3_prefix` at all."""
-    meta_synced_to: str | None = None
-    """The `s3_prefix` the confirmed mirror went to, so a purge can name it."""
-    outputs_synced_at: str | None = None
-    """When the *final* upload of this job's `outputs:` finished without error.
-
-    `outputs:` paths live inside `workdir/`, so a job that ended `failed: sync`
-    -- or was killed between periodic ticks -- may hold the only copy of what it
-    produced. Null with a declared `outputs:` and a workdir still on disk means
-    `purge` must not delete it. A spec that declares no outputs leaves this null
-    too; there is simply nothing to confirm."""
     outputs_lost: bool = False
     """The drain retried this job's output upload to the end and it still
-    failed, so an ephemeral host is about to take the only copy with it.
-    `sync_error` holds the last failure. Surfaced by `status` because nothing
-    fixes it afterwards except re-running the job."""
+    failed, so an ephemeral host is about to take the only copy with it. The
+    record's `error` holds the last failure. Surfaced by `status` because
+    nothing fixes it afterwards except re-running the job."""
 
     @staticmethod
     def from_dict(d: Any) -> JobState:
@@ -437,10 +493,15 @@ class JobState:
         that can be written by another build, or by hand.
         """
         fields = fields_of(d)
+        intent = as_opt_str(fields, "intent")
         return JobState(
             status=as_str(fields, "status", "queued") or "queued",
+            intent=intent if intent in INTENTS else None,
             attempt=as_int(fields, "attempt", 1),
+            priority=as_int(fields, "priority", 50),
+            estimated_runtime_min=as_opt_float(fields, "estimated_runtime_min"),
             reason=as_opt_str(fields, "reason"),
+            problems=as_str_list(fields, "problems"),
             exit_code=as_opt_int(fields, "exit_code"),
             gpus=as_str_list(fields, "gpus"),
             started_at=as_opt_str(fields, "started_at"),
@@ -457,12 +518,13 @@ class JobState:
             progress_pct=as_opt_float(fields, "progress_pct"),
             progress_error=as_opt_str(fields, "progress_error"),
             eta=as_opt_str(fields, "eta"),
-            sync_error=as_opt_str(fields, "sync_error"),
+            uploads=[
+                upload
+                for upload in (Upload.from_dict(u) for u in as_list(fields, "uploads"))
+                if upload is not None
+            ],
             workdir_removed=as_bool(fields, "workdir_removed"),
             workdir_bytes=as_opt_int(fields, "workdir_bytes"),
-            meta_synced_at=as_opt_str(fields, "meta_synced_at"),
-            meta_synced_to=as_opt_str(fields, "meta_synced_to"),
-            outputs_synced_at=as_opt_str(fields, "outputs_synced_at"),
             outputs_lost=as_bool(fields, "outputs_lost"),
         )
 
@@ -473,29 +535,88 @@ class JobState:
     def finished(self) -> bool:
         return self.status in FINISHED_STATUSES
 
+    @property
+    def mirror(self) -> Upload | None:
+        """The record of this job's log and state being mirrored, if any."""
+        return next((u for u in self.uploads if u.output is None), None)
+
+    @property
+    def mirrored(self) -> bool:
+        """Is the record of this job somewhere other than this host? The
+        precondition for deleting its job dir."""
+        mirror = self.mirror
+        return mirror is not None and mirror.ok_at is not None and mirror.error is None
+
+    def output_uploads(self) -> list[Upload]:
+        return [u for u in self.uploads if u.output is not None]
+
+    def upload_errors(self) -> list[str]:
+        """The last failure at each destination that has one standing."""
+        return [u.error for u in self.uploads if u.error]
+
+    def outputs_uploaded(self, spec: JobSpec) -> bool:
+        """Did the last upload of every declared output reach every one of its
+        destinations? False for a job with outputs and no record at all."""
+        wanted = {(o.path, d) for o in spec.outputs for d in _destination_uris(o, spec.job_id)}
+        done = {(u.output, u.to) for u in self.uploads if u.ok_at and not u.error}
+        return wanted <= done
+
+    @staticmethod
+    def initial(spec: JobSpec) -> JobState:
+        """The state a job is enqueued with: everything the spec said that can
+        change afterwards, copied out of it once."""
+        return JobState(
+            status="queued",
+            attempt=spec.attempt,
+            priority=spec.priority,
+            estimated_runtime_min=spec.estimated_runtime_min,
+        )
+
+
+def _destination_uris(output: Output, job_id: str) -> list[str]:
+    from gpuc.host import destinations  # it imports this module
+
+    return [d.uri for d in destinations.of(output, job_id)]
+
+
+def record_upload(
+    job_id: str, to: str, output: str | None, *, ok_at: str | None = None, error: str | None = None
+) -> None:
+    """Note what just happened at one destination. The newer of success and
+    failure stands: a success clears the error, a failure keeps the last
+    success time so a reader can see when it last worked."""
+    with locked(job_id):
+        state = read_state(job_id)
+        record = next((u for u in state.uploads if u.to == to and u.output == output), None)
+        if record is None:
+            record = Upload(to=to, output=output)
+            state.uploads.append(record)
+        if ok_at is not None:
+            record.ok_at, record.error = ok_at, None
+        else:
+            record.error = error
+        write_state(job_id, state)
+
+
+def clear_output_uploads(job_id: str) -> None:
+    """Forget every output's success: the final upload is the only one that
+    proves the files written since the last tick are safe."""
+    with locked(job_id):
+        state = read_state(job_id)
+        for record in state.output_uploads():
+            record.ok_at = None
+        write_state(job_id, state)
+
 
 def write_spec(spec: JobSpec) -> None:
+    """Written once, by `enqueue`. Nothing rewrites a spec after that: the
+    fields a person can change later (`priority`, `estimated_runtime_min`)
+    live in the state, so the spec is always what was submitted."""
     atomic_write_json(paths.spec_file(spec.job_id), spec.to_dict())
 
 
 def read_spec(job_id: str) -> JobSpec:
     return JobSpec.from_dict(read_json(paths.spec_file(job_id)))
-
-
-def update_spec(job_id: str, **fields: Any) -> JobSpec:
-    """Change fields of a job's spec, in place on disk.
-
-    Raw JSON in and raw JSON out rather than a `JobSpec` round trip: a spec
-    written by another build holds keys `from_dict` drops, and setting an
-    estimate is not a reason to lose them.
-    """
-    document = dict(fields_of(read_json(paths.spec_file(job_id))))
-    for key, value in fields.items():
-        if key not in JobSpec.__dataclass_fields__:
-            raise KeyError(f"unknown JobSpec field: {key}")
-        document[key] = value
-    atomic_write_json(paths.spec_file(job_id), document)
-    return JobSpec.from_dict(document)
 
 
 def write_state(job_id: str, state: JobState) -> None:
@@ -506,14 +627,58 @@ def read_state(job_id: str) -> JobState:
     return JobState.from_dict(read_json(paths.state_file(job_id)))
 
 
-def update_state(job_id: str, **fields: Any) -> JobState:
-    state = read_state(job_id)
+@contextlib.contextmanager
+def locked(job_id: str) -> Iterator[None]:
+    """Hold the job's lock for a read-modify-write of its state.
+
+    Three processes update one job's `state.json`: the dispatcher, the job's
+    runner (from two threads), and whatever `python -m gpuc.host` command an
+    ssh session runs. Each write is an atomic replace, so readers never see a
+    torn file, but two read-modify-writes that overlap lose one of them --
+    which, when the lost one was `intent: cancel`, is a job that keeps running.
+    """
+    path = paths.job_lock_file(job_id)
+    if not path.parent.is_dir():
+        raise FileNotFoundError(f"no such job: {job_id}")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _apply(state: JobState, fields: Mapping[str, Any]) -> JobState:
     for key, value in fields.items():
         if key not in JobState.__dataclass_fields__:
             raise KeyError(f"unknown JobState field: {key}")
         setattr(state, key, value)
-    write_state(job_id, state)
     return state
+
+
+def update_state(job_id: str, **fields: Any) -> JobState:
+    with locked(job_id):
+        state = _apply(read_state(job_id), fields)
+        write_state(job_id, state)
+        return state
+
+
+def transition(job_id: str, *, expect: str | tuple[str, ...], **fields: Any) -> JobState | None:
+    """Update the state only if its `status` is still one of `expect`.
+
+    The compare-and-set every change of ownership goes through: the
+    dispatcher claims a queued job, a cancel ends a queued job, a requeue puts
+    a finished one back. Two of those racing on one job -- a cancel landing as
+    the dispatcher launches it -- cannot both win, and the loser learns it
+    from the None rather than from a job that is both running and cancelled.
+    """
+    wanted = (expect,) if isinstance(expect, str) else expect
+    with locked(job_id):
+        state = read_state(job_id)
+        if state.status not in wanted:
+            return None
+        write_state(job_id, _apply(state, fields))
+        return state
 
 
 def list_job_ids() -> list[str]:
@@ -523,14 +688,47 @@ def list_job_ids() -> list[str]:
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
-HOST_ENV_BIN_KEYS = ("UV_INSTALL_DIR", "UV_TOOL_BIN_DIR")
-"""Keys in ``HostConfig.env`` whose values are directories holding binaries.
+@dataclass(frozen=True)
+class ManagedKey:
+    """A key of `HostConfig.env` the tool itself has an opinion about.
 
-A host told to keep uv (or its tools) somewhere other than ``$HOME`` needs
-that directory on ``PATH`` too, or the runner's own ``uv run --no-sync``
-preflight cannot find it. Deriving the extra PATH entries from the env dict
-keeps one source of truth: the config.
-"""
+    `env` is otherwise opaque, hand-set, and replaced wholesale by `--env`.
+    The keys here are the exceptions, and this table is the whole list of
+    them: `sticky` ones survive an `--env` that does not name them, because
+    bootstrap derived them from the host's own filesystem and a user
+    restating their `HF_TOKEN` did not mean to lose the uv cache; `on_path`
+    ones name directories holding binaries, which go on every child's PATH;
+    `beside_home` ones are derived by bootstrap as `<parent of gpuc
+    home>/.cache/<name>` when the host names nothing -- beside gpuc home so a
+    persistent root keeps them and an `rm -rf` of gpuc home does not.
+    """
+
+    sticky: bool = False
+    on_path: bool = False
+    beside_home: str | None = None
+
+
+MANAGED_ENV: dict[str, ManagedKey] = {
+    "UV_CACHE_DIR": ManagedKey(sticky=True, beside_home="uv"),
+    "HF_HOME": ManagedKey(sticky=True, beside_home="huggingface"),
+    "UV_INSTALL_DIR": ManagedKey(on_path=True),
+    "UV_TOOL_BIN_DIR": ManagedKey(on_path=True),
+}
+
+
+def sticky_env(theirs: Mapping[str, str], env: dict[str, str]) -> dict[str, str]:
+    """`env` with the sticky keys the host already had carried over."""
+    for key, managed in MANAGED_ENV.items():
+        if managed.sticky and key in theirs:
+            env.setdefault(key, theirs[key])
+    return env
+
+
+def cache_beside(home: str, name: str) -> str:
+    """`<parent of gpuc home>/.cache/<name>`; `<home>/<name>-cache` for a home
+    with no parent to speak of."""
+    parent = home.rstrip("/").rsplit("/", 1)[0] if "/" in home.rstrip("/") else ""
+    return f"{parent}/.cache/{name}" if parent else f"{home.rstrip('/')}/{name}-cache"
 
 
 @dataclass
@@ -641,8 +839,8 @@ class HostConfig:
     def bin_dirs(self) -> list[str]:
         """Directories from `env` to put on PATH, in order, without duplicates."""
         out: list[str] = []
-        for key in HOST_ENV_BIN_KEYS:
-            value = self.env.get(key)
+        for key, managed in MANAGED_ENV.items():
+            value = self.env.get(key) if managed.on_path else None
             if value and value not in out:
                 out.append(value)
         return out

@@ -36,7 +36,7 @@ from gpuc.control.config import (
     read_registry,
 )
 from gpuc.control.s3index import S3IndexError
-from gpuc.control.status import HostView
+from gpuc.control.status import HostState, HostView
 from tests.conftest import host_entry, register_host
 from tests.fakehost import FakeHost
 
@@ -45,8 +45,7 @@ GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 GOOD_ENTRY = {
     "name": "good",
     "kind": "local",
-    "gpus": [GPU],
-    "idle_minutes": 15.0,
+    "cache": {"config": {"host": "good", "gpus": [GPU], "idle_minutes": 15.0}},
 }
 BAD_ENTRY = {"name": "bad", "kind": "a kind that does not exist", "port": "twenty-two"}
 
@@ -154,8 +153,10 @@ def test_status_reports_an_unreachable_host_and_exits_one(
 
     def only_local(entry: HostEntry, *args: object, **kwargs: object) -> HostView:
         if entry.name == "local":
-            return HostView(entry=entry, reachable=True)
-        return HostView(entry=entry, reachable=False, error="ssh: could not resolve hostname")
+            return HostView(entry=entry, state=HostState.ANSWERED)
+        return HostView(
+            entry=entry, state=HostState.UNREACHABLE, error="ssh: could not resolve hostname"
+        )
 
     monkeypatch.setattr(status_mod, "gather", only_local)
     assert main(["status"]) == EXIT_ERROR
@@ -169,7 +170,7 @@ def test_status_reports_a_bad_entry_per_host_and_exits_one(
 ) -> None:
     write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
     monkeypatch.setattr(
-        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, state=HostState.ANSWERED)
     )
     assert main(["status"]) == EXIT_ERROR
     captured = capsys.readouterr()
@@ -183,7 +184,7 @@ def test_a_bad_entry_does_not_fail_a_status_asked_about_another_host(
     """`--host good` was never asked about the entry that would not parse."""
     write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
     monkeypatch.setattr(
-        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, state=HostState.ANSWERED)
     )
     assert main(["status", "--host", "good"]) == EXIT_OK
     assert main(["status", "--host", "good", "--json"]) == EXIT_OK
@@ -195,7 +196,7 @@ def test_status_all_is_one_when_the_index_it_needs_cannot_be_read(
     """`--all` exists to list what a lost host had, and a short list is not that."""
     register_host(name="local", gpus=GPU)
     monkeypatch.setattr(
-        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, state=HostState.ANSWERED)
     )
 
     class _Unreadable:
@@ -334,6 +335,8 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "name",
         "status",
         "reason",
+        "problems",
+        "upload_errors",
         "exit_code",
         "phase",
         "elapsed_s",
@@ -349,6 +352,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "use_shared",
         "starts_in_s",
         "starts_at",
+        "starts_unknown",
         "iso",
         "ended_at",
         "outputs_pending",
@@ -420,7 +424,9 @@ def test_status_json_says_unreachable_rather_than_empty(
     monkeypatch.setattr(
         status_mod,
         "gather",
-        lambda entry, *a, **k: HostView(entry=entry, reachable=False, error="ssh timed out"),
+        lambda entry, *a, **k: HostView(
+            entry=entry, state=HostState.UNREACHABLE, error="ssh timed out"
+        ),
     )
     assert main(["status", "--json"]) == EXIT_ERROR
     host = status_json(capsys)["hosts"][0]
@@ -446,7 +452,7 @@ def test_status_json_carries_the_skipped_entry_as_a_top_level_error(
 ) -> None:
     write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
     monkeypatch.setattr(
-        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, state=HostState.ANSWERED)
     )
     assert main(["status", "--json"]) == EXIT_ERROR
     document = status_json(capsys)
@@ -525,7 +531,7 @@ def test_the_commit_status_judges_is_the_hosts_own_not_the_registrys(
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     # Registry agrees with this build; the host says otherwise, and wins.
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
-    view = HostView(entry=entry, reachable=True, pkg_commit="b" * 40)
+    view = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="b" * 40)
     warnings = status_mod.host_warnings(view)
     assert len(warnings) == 1
     assert "host gpubox is running gpuc " + "b" * 12 in warnings[0]
@@ -542,7 +548,7 @@ def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     entry = host_entry(name="s", pkg_commit="b" * 40)
-    current = HostView(entry=entry, reachable=True, pkg_commit="a" * 40)
+    current = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="a" * 40)
     assert status_mod.host_warnings(current) == []
     # Unreachable: "we could not ask" is not evidence of anything.
     assert status_mod.host_warnings(HostView(entry=entry, pkg_commit="b" * 40)) == []
@@ -595,13 +601,13 @@ def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
-    (warning,) = status_mod.host_warnings(HostView(entry=entry, reachable=True))
+    (warning,) = status_mod.host_warnings(HostView(entry=entry, state=HostState.ANSWERED))
     assert "a build too old to say which" in warning
     assert "gpuc host bootstrap gpubox" in warning
     # With nothing to compare against: a gpuc that cannot name its own
     # commit has no business telling a host it is behind.
     monkeypatch.setattr(version_mod, "local_commit", lambda: None)
-    assert status_mod.host_warnings(HostView(entry=entry, reachable=True)) == []
+    assert status_mod.host_warnings(HostView(entry=entry, state=HostState.ANSWERED)) == []
 
 
 def test_a_dispatcher_older_than_the_package_it_dispatches_is_a_warning(
@@ -617,7 +623,7 @@ def test_a_dispatcher_older_than_the_package_it_dispatches_is_a_warning(
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
     view = HostView(
         entry=entry,
-        reachable=True,
+        state=HostState.ANSWERED,
         pkg_commit="a" * 40,
         dispatcher_pkg_commit="b" * 40,
         heartbeat_age_s=2.0,
@@ -643,7 +649,7 @@ def test_a_host_behind_on_its_package_is_told_that_once_not_twice(
 
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
-    view = HostView(entry=entry, reachable=True, pkg_commit="b" * 40, heartbeat_age_s=2.0)
+    view = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="b" * 40, heartbeat_age_s=2.0)
     assert len(status_mod.host_warnings(view)) == 1
 
 
@@ -658,7 +664,7 @@ def test_a_config_this_machine_has_not_caught_up_with_is_not_a_warning(
     entry = host_entry(
         name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"], pkg_commit="a" * 40
     )
-    view = HostView(entry=entry, reachable=True, pkg_commit="a" * 40, owned=["0", "1"])
+    view = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="a" * 40, owned=["0", "1"])
     assert status_mod.host_warnings(view) == []
 
 

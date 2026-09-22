@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import jobs, paths, preflight, queue, runner, sync
+from gpuc.host import destinations, jobs, paths, preflight, queue, runner
+from gpuc.host.destinations import S3, HuggingFace
 from gpuc.host.jobs import HostConfig
 from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
@@ -34,12 +35,19 @@ class FakeRunner:
 
 @pytest.fixture
 def tools(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/usr/bin/aws")
-    monkeypatch.setattr(sync, "hf_binary", lambda env=None: "/usr/bin/hf")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/usr/bin/{name}")
 
 
-def destinations(commands: Sequence[list[str]]) -> list[str]:
+def copied_to(commands: Sequence[list[str]]) -> list[str]:
     return [argv[-2] for argv in commands if argv[1:3] == ["s3", "cp"]]
+
+
+def yes(repo: str, env: Mapping[str, str] | None) -> bool:
+    return True
+
+
+def no(repo: str, env: Mapping[str, str] | None) -> bool:
+    return False
 
 
 def test_nothing_is_checked_without_outputs_or_a_mirror(gpuc_home: Path, tools: None) -> None:
@@ -59,7 +67,7 @@ def test_every_s3_output_and_the_host_mirror_get_a_preflight_object(
         f"s3://bucket/exp/{spec.job_id}/results",
         f"s3://bucket/gpuc/h/jobs/{spec.job_id}",
     ]
-    assert destinations(fake.commands) == [
+    assert copied_to(fake.commands) == [
         f"s3://bucket/exp/{spec.job_id}/results/.preflight",
         f"s3://bucket/gpuc/h/jobs/{spec.job_id}/.preflight",
     ]
@@ -77,7 +85,7 @@ def test_a_mirror_alone_is_checked_for_a_job_with_no_outputs(gpuc_home: Path, to
 def test_a_missing_aws_binary_fails_with_the_command(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: None)
     with pytest.raises(preflight.PreflightFailed) as caught:
         preflight.run(
             make_spec(), HostConfig(host="h", s3_prefix="s3://b/p"), runner=FakeRunner(), env={}
@@ -97,13 +105,30 @@ def test_a_denied_write_names_the_destination(gpuc_home: Path, tools: None) -> N
     assert "secrets:" in str(caught.value)
 
 
+def test_targets_are_every_output_destination_then_the_mirror(gpuc_home: Path) -> None:
+    spec = make_spec(
+        outputs=[
+            {"path": "results", "s3": "s3://b/{job_id}/results", "hf": "org/repo"},
+            {"path": "logs", "s3": "s3://b/{job_id}/logs"},
+        ]
+    )
+    found = preflight.targets(spec, HostConfig(host="h", s3_prefix="s3://b/gpuc/h/"))
+    assert found == [
+        S3(f"s3://b/{spec.job_id}/results"),
+        HuggingFace("org/repo", spec.job_id),
+        S3(f"s3://b/{spec.job_id}/logs"),
+        S3(f"s3://b/gpuc/h/jobs/{spec.job_id}"),
+    ]
+    assert preflight.targets(spec, HostConfig(host="h"))[-1] == S3(f"s3://b/{spec.job_id}/logs")
+
+
 def test_hf_outputs_check_the_token_and_write_a_preflight_file(
     gpuc_home: Path, tools: None
 ) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/repo", "hf_path": "{job_id}"}])
     fake = FakeRunner()
-    checked = preflight.check_hf(spec, runner=fake, env={}, repo_exists=lambda repo, env: True)
-    assert checked == ["org/repo"]
+    checked = preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=yes)
+    assert checked == [f"hf://org/repo/{spec.job_id}"]
     assert fake.commands[0][1:] == ["auth", "whoami"]
     assert fake.commands[-1][1:4] == [
         "upload",
@@ -117,7 +142,7 @@ def test_a_bad_hf_token_fails_before_the_job_runs(gpuc_home: Path, tools: None) 
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/repo"}])
     fake = FakeRunner(fail_on="auth whoami", output="Invalid user token")
     with pytest.raises(preflight.PreflightFailed) as caught:
-        preflight.check_hf(spec, runner=fake, env={}, repo_exists=lambda repo, env: True)
+        preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=yes)
     assert "auth whoami" in caught.value.command
     assert "HF_TOKEN" in caught.value.detail
 
@@ -126,7 +151,7 @@ def test_a_missing_repo_fails_unless_hf_create_is_set(gpuc_home: Path, tools: No
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/new"}])
     fake = FakeRunner()
     with pytest.raises(preflight.PreflightFailed) as caught:
-        preflight.check_hf(spec, runner=fake, env={}, repo_exists=lambda repo, env: False)
+        preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=no)
     assert "hf_create: true" in caught.value.detail
     assert not any("repos" in " ".join(argv) for argv in fake.commands)
 
@@ -134,7 +159,7 @@ def test_a_missing_repo_fails_unless_hf_create_is_set(gpuc_home: Path, tools: No
 def test_hf_create_creates_the_repo(gpuc_home: Path, tools: None) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/new", "hf_create": True}])
     fake = FakeRunner()
-    preflight.check_hf(spec, runner=fake, env={}, repo_exists=lambda repo, env: False)
+    preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=no)
     assert fake.commands[1][1:] == ["repos", "create", "org/new", "--type", "model", "--exist-ok"]
 
 
@@ -144,7 +169,6 @@ def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
     jobs.write_config(HostConfig(host="test-host", s3_prefix="s3://bucket/gpuc/h"))
     spec = make_spec(command="echo SHOULD-NOT-RUN")
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     fake = FakeRunner(fail_on="s3 cp", output="An error occurred (NoSuchBucket)")
 
@@ -164,7 +188,6 @@ def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, tools: None) -> N
     jobs.write_config(HostConfig(host="test-host", s3_prefix="s3://bucket/gpuc/h"))
     spec = make_spec(command="echo RAN")
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
 
     code = runner.run_job(

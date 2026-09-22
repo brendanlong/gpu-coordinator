@@ -8,6 +8,7 @@ to reproduce every failure the real flow has to survive.
 from __future__ import annotations
 
 import itertools
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -75,6 +76,12 @@ class _FakePod:
 
 
 class FakeProvider(Provider):
+    dead_statuses = ("EXITED", "ERROR", "TERMINATED")
+    gone_statuses = ("TERMINATED",)
+    broken_host = re.compile(
+        r"card[0-9]|device nodes|OCI runtime|runc create|failed to create shim", re.IGNORECASE
+    )
+
     def __init__(
         self,
         offers: list[Offer] | None = None,
@@ -228,6 +235,12 @@ class FakeTransport:
     home: str = "/root"
     commands: list[str] = field(default_factory=list)
     files: dict[str, str] = field(default_factory=dict)
+
+    def argv(self, command: str) -> list[str]:
+        return ["bash", "-c", command]
+
+    def interactive_argv(self, command: str) -> list[str]:
+        return ["bash", "-lc", command]
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
         """`check` means the same thing here as in Local/SshTransport: raise.

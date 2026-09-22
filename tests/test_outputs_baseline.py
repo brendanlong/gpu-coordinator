@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import baseline, jobs, paths, queue, runner, sync
+from gpuc.host import baseline, destinations, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig
 from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
@@ -42,7 +42,6 @@ def prepare(gpuc_home: Path, command: str, **overrides: object) -> tuple[str, Pa
         **overrides,
     )
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     results = paths.workdir(job_id) / "results"
     results.mkdir(parents=True, exist_ok=True)
@@ -52,7 +51,7 @@ def prepare(gpuc_home: Path, command: str, **overrides: object) -> tuple[str, Pa
 
 @pytest.fixture
 def aws(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
 
 
 def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(gpuc_home: Path, aws: None) -> None:
@@ -65,6 +64,7 @@ def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(gpuc_home: Path, a
     assert (code, jobs.read_state(job_id).status) == (0, "succeeded")
     assert "report-elephant.md" in recorder.excluded()
     assert "new.txt" not in recorder.excluded()
+    assert jobs.read_state(job_id).outputs_uploaded(jobs.read_spec(job_id))
 
 
 def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, aws: None) -> None:
@@ -92,6 +92,8 @@ def test_a_job_that_produced_nothing_new_fails_as_no_outputs(gpuc_home: Path, aw
     state = jobs.read_state(job_id)
     assert (code, state.status, state.reason) == (1, "failed", "no-outputs")
     assert recorder.uploads() == []
+    (record,) = state.output_uploads()
+    assert record.ok_at is None and record.error and "nothing new" in record.error
 
 
 def test_the_baseline_is_taken_before_setup_so_setup_output_counts(

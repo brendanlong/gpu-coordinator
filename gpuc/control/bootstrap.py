@@ -27,6 +27,8 @@ from gpuc.control.remote import (
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 from gpuc.control.version import local_commit, package_root, short
+from gpuc.host import jobs, paths
+from gpuc.host.jobs import cache_beside
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
@@ -117,7 +119,8 @@ def remote_path(entry: HostEntry) -> str:
     whose `env` names its own tool directories gets those in front.
     """
     head = "".join(f"{d}:" for d in entry.config.bin_dirs())
-    return f'PATH="{head}$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
+    user = "".join(f"$HOME/{d}:" for d in paths.USER_BIN_DIRS)
+    return f'PATH="{head}{user}$PATH"'
 
 
 def ensure_persistent_root(transport: Transport, entry: HostEntry, report: Reporter) -> None:
@@ -288,19 +291,6 @@ def ensure_hf_cli(transport: Transport, uv: str, entry: HostEntry, report: Repor
     return None
 
 
-def cache_dir_beside(home: str) -> str:
-    """A uv cache on gpuc home's own filesystem: `<parent of gpuc home>/.cache/uv`.
-
-    Beside rather than inside, so `gpuc clean` and a hand-`rm` of gpuc home
-    cannot take the cache with them -- the cache is exactly the thing worth
-    keeping across jobs.
-    """
-    parent = home.rstrip("/").rpartition("/")[0]
-    if not parent:
-        return f"{home.rstrip('/')}/uv-cache"
-    return f"{parent}/.cache/uv"
-
-
 UV_CACHE_PROBE = """\
 set -e
 home={home}
@@ -332,7 +322,7 @@ def resolve_cache_dir(
     there (`--cache-dir`, `--env UV_CACHE_DIR=...`, or an earlier bootstrap):
     this is the one key bootstrap fills in itself, and only when it is empty.
     """
-    pinned = entry.cache_dir
+    pinned = entry.env.get("UV_CACHE_DIR")
     if pinned:
         report(f"uv cache: {pinned} (set for this host; left alone)")
         return None
@@ -355,12 +345,40 @@ def resolve_cache_dir(
     if cache_dev == home_dev:
         report(f"uv cache: {cache}, same filesystem as {home}; uv will link wheels into venvs")
         return None
-    target = cache_dir_beside(home)
+    target = cache_beside(home, "uv")
     report(
         f"uv cache: {cache} is on a different filesystem from gpuc home {home}, so uv would "
         f"copy every wheel into every venv. Setting UV_CACHE_DIR={target} for this host."
     )
     return target
+
+
+def derive_env(
+    transport: Transport, entry: HostEntry, uv: str, home: str, report: Reporter
+) -> dict[str, str]:
+    """The managed env keys this host names nothing for, filled in.
+
+    `UV_CACHE_DIR` is the one with a real decision behind it
+    (`resolve_cache_dir`); every other `beside_home` key in `jobs.MANAGED_ENV`
+    lands beside gpuc home on a host with a persistent root, so the root keeps
+    the Hugging Face cache the way it keeps uv's. A key the host already has is
+    never touched.
+    """
+    derived: dict[str, str] = {}
+    cache_dir = resolve_cache_dir(transport, entry, uv, home, report)
+    if cache_dir:
+        derived["UV_CACHE_DIR"] = cache_dir
+    if entry.root is None:
+        # Only a persistent root moves a cache: on an ordinary host the
+        # default location is the user's own, holding their models and their
+        # `hf auth login` token, and pointing jobs elsewhere would lose both.
+        return derived
+    for key, managed in jobs.MANAGED_ENV.items():
+        if key == "UV_CACHE_DIR" or not managed.beside_home or entry.env.get(key):
+            continue
+        derived[key] = cache_beside(home, managed.beside_home)
+        report(f"{key}: {derived[key]} (beside gpuc home, on the persistent root)")
+    return derived
 
 
 def ensure_layout(transport: Transport, entry: HostEntry, home: str, python: str) -> None:
@@ -549,9 +567,9 @@ def bootstrap_host(
 
     # Before `uv tool install`, so that call already populates the cache this
     # host will actually use.
-    cache_dir = resolve_cache_dir(transport, entry, uv, home, report)
-    if cache_dir:
-        patch["env"] = {**entry.env, "UV_CACHE_DIR": cache_dir}
+    derived = derive_env(transport, entry, uv, home, report)
+    if derived:
+        patch["env"] = {**entry.env, **derived}
         entry = entry.with_config({**entry.cache.config, **patch})
 
     aws_warning = ensure_aws_cli(transport, report)

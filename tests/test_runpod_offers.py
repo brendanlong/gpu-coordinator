@@ -7,8 +7,11 @@ from typing import Any
 
 import pytest
 
+from gpuc.control.actions import make_provider
+from gpuc.control.config import Settings
 from gpuc.control.providers.base import (
     Constraints,
+    Offer,
     Pod,
     PodStatus,
     ProviderError,
@@ -137,6 +140,32 @@ def test_create_requires_our_prefix() -> None:
     with pytest.raises(ProviderError, match="must start with"):
         provider.create(offer, "scratch-pod")
     assert not any(path == "/pods" for _, path, _ in provider.requests)
+
+
+def test_an_offer_with_a_null_field_parses_with_the_default() -> None:
+    """A pod's config records the offer it was rented on, written by whichever
+    build rented it; a null there may not make the pod unreadable."""
+    offer = Offer.model_validate(
+        {"gpu_id": "NVIDIA A40", "vram_gb": None, "price_usd_hr": None, "future": 1}
+    )
+    assert (offer.gpu_id, offer.vram_gb, offer.price_usd_hr) == ("NVIDIA A40", 0, 0.0)
+
+
+def test_an_unknown_provider_kind_is_a_provider_error() -> None:
+    with pytest.raises(ProviderError, match="nosuch"):
+        make_provider(Settings(), "nosuch")
+
+
+def test_runpod_says_which_statuses_are_dead_and_which_are_gone() -> None:
+    provider = RecordedRunPod()
+    assert provider.is_dead(None) and provider.is_gone(None)
+    assert not provider.is_dead(pod("gpuc-a", 0.49))
+    exited = pod("gpuc-a", 0.49, status="EXITED")
+    assert provider.is_dead(exited) and not provider.is_gone(exited)
+    terminated = pod("gpuc-a", 0.49, status="TERMINATED")
+    assert provider.is_dead(terminated) and provider.is_gone(terminated)
+    assert provider.broken_host is not None
+    assert provider.broken_host.search("failed to create shim task: OCI runtime create failed")
 
 
 @pytest.mark.runpod

@@ -36,7 +36,6 @@ from gpuc.control.config import (
     forget_host_locked,
 )
 from gpuc.control.providers.base import Pod, Provider, ProviderError
-from gpuc.control.provision import DEAD_STATUSES, TERMINATE_ATTEMPTS, TERMINATE_RETRY_S
 
 
 class TerminateError(RuntimeError):
@@ -259,7 +258,7 @@ def terminate(
         # is how a terminated entry and a running bill part company.
         resolved.pod = provider.get(resolved.pod_id)
     pod = resolved.pod
-    alive = pod is not None and pod.status not in DEAD_STATUSES
+    alive = not provider.is_dead(pod)
     if alive and not force and (result.busy or not result.checked):
         raise TerminateRefused(refusal(result))
     if result.unasked:
@@ -287,13 +286,13 @@ def _terminate_with_retries(
     """The same retry the provisioning failure path takes: the one call that
     stops the bill is the worst place to give up after a single 5xx."""
     report(f"terminating {target.label}")
-    for attempt in range(1, TERMINATE_ATTEMPTS + 1):
+    for attempt in range(1, provider.terminate_attempts + 1):
         try:
             provider.terminate(target.pod_id)
         except ProviderError as exc:
-            if attempt < TERMINATE_ATTEMPTS:
-                report(f"terminate failed ({exc}); retrying in {TERMINATE_RETRY_S:g}s")
-                sleep(TERMINATE_RETRY_S)
+            if attempt < provider.terminate_attempts:
+                report(f"terminate failed ({exc}); retrying in {provider.terminate_retry_s:g}s")
+                sleep(provider.terminate_retry_s)
                 continue
             raise TerminateFailed(
                 f"could not terminate {target.label} in {attempt} attempts: {exc}\n"
