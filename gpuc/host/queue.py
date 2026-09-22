@@ -1,121 +1,94 @@
-"""The queue itself: empty marker files under ``~/.gpuc/queue`` whose lexical
-order is the dispatch order.
+"""The queue: every job whose state is `queued`, in `(priority, job_id)` order.
 
-Nothing here takes the dispatcher lock. A wedged dispatcher must never be able
-to lose an enqueue, so enqueue only writes files.
+Nothing is stored about the queue except each job's own `state.json`. Nothing
+here takes the dispatcher lock, so a wedged dispatcher can never lose an
+enqueue; every change of a job's state goes through `jobs.transition`, whose
+per-job lock is what keeps a cancel and a dispatch from both winning.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
 from gpuc.host import jobs, paths
-from gpuc.host.jobs import JobSpec, JobState
+from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
+
+PREEMPTED = "preempted"
+"""The reason of an attempt stopped so that something else can have its GPUs.
+
+Its own reason: a preempted job is not a failure of the job, and the log of
+the attempt that was stopped should say what ended it.
+"""
+
+STOP_REASONS = {CANCEL: "cancelled", PREEMPT: PREEMPTED}
+"""What each intent ends the attempt as, when the runner acts on it."""
 
 
-def marker_name(priority: int, job_id: str) -> str:
-    return f"{max(0, min(99, priority)):02d}-{job_id}"
-
-
-def job_id_of_marker(name: str) -> str:
-    return name.split("-", 1)[1]
-
-
-@dataclass
+@dataclass(order=True)
 class QueueEntry:
     priority: int
     job_id: str
-    marker: Path
 
 
 def enqueue(spec: JobSpec) -> str:
+    """Accept a job: write its spec and initial state, then move its dir from
+    `incoming/` into `jobs/` in one rename.
+
+    The rename is the acceptance. `gpuc submit` builds the dir under
+    `incoming/` -- the rsynced workdir lands there first -- so a submit that
+    dies at any point before this leaves nothing under `jobs/` at all, and
+    `cleanup.stale_incoming` sweeps what it left. There is no order of writes
+    inside the dir to get right, because nothing reads it until it has moved.
+    """
     paths.ensure_layout()
-    paths.ensure_job_layout(spec.job_id)
-    jobs.write_spec(spec)
-    jobs.write_state(spec.job_id, JobState(status="queued", attempt=spec.attempt))
-    paths.log_file(spec.job_id).touch()
-    # Marker last: a job is only dispatchable once its spec and state exist.
-    (paths.queue_dir() / marker_name(spec.priority, spec.job_id)).touch()
-    return spec.job_id
+    job_id = spec.job_id
+    accepted = paths.job_dir(job_id)
+    if accepted.exists():
+        raise FileExistsError(f"job {job_id} already exists on this host")
+    staged = paths.incoming_job_dir(job_id)
+    staged.mkdir(parents=True, exist_ok=True)
+    (staged / "workdir").mkdir(exist_ok=True)
+    (staged / "outputs").mkdir(exist_ok=True)
+    jobs.atomic_write_json(staged / "spec.json", spec.to_dict())
+    jobs.atomic_write_json(staged / "state.json", JobState.initial(spec).to_dict())
+    (staged / "log.txt").touch()
+    os.rename(staged, accepted)
+    return job_id
 
 
 def list_queued() -> list[QueueEntry]:
-    directory = paths.queue_dir()
-    if not directory.is_dir():
-        return []
     entries: list[QueueEntry] = []
-    for marker in sorted(directory.iterdir(), key=lambda p: p.name):
-        name = marker.name
-        if name.startswith(".") or "-" not in name:
+    for job_id in jobs.list_job_ids():
+        try:
+            state = jobs.read_state(job_id)
+        except RuntimeError:
             continue
-        prefix = name.split("-", 1)[0]
-        if not prefix.isdigit():
-            continue
-        entries.append(QueueEntry(int(prefix), job_id_of_marker(name), marker))
-    return entries
+        if state.status == "queued":
+            entries.append(QueueEntry(state.priority, job_id))
+    return sorted(entries)
 
 
-def find_marker(job_id: str) -> Path | None:
-    for entry in list_queued():
-        if entry.job_id == job_id:
-            return entry.marker
-    return None
+def is_queued(job_id: str) -> bool:
+    return any(entry.job_id == job_id for entry in list_queued())
 
 
-def leave_queue(entry: QueueEntry, **state: Any) -> None:
-    """Take a job out of the queue and record what became of it.
+def claim(job_id: str, **state: object) -> bool:
+    """Take a job out of the queue, recording what became of it.
 
-    The one place `launch_ready`'s four ways out are written -- dispatched,
-    cancelled, unreadable spec, too big for this host -- so a fifth cannot get
-    the two writes wrong.
-
-    **The state first, then the marker**, and the two orders are not
-    interchangeable. Interrupted between them this way, the job is `running`
-    (or `failed`) with a marker still naming it, and `launch_ready` checks a
-    job's status before it dispatches, so it drops that marker and moves on.
-    The other way round the job is `queued` with no marker -- which is exactly
-    what a `gpuc submit` killed mid-enqueue leaves behind, and that one must
-    never run. One state, two opposite right answers, and nothing able to tell
-    them apart: keeping the dispatcher's own interruptions out of that shape is
-    what makes an uncommitted submit unambiguous.
-
-    By job id, not by `entry.marker`: nothing holds a lock, `gpuc reorder`
-    renames markers, and `launch_ready` can spend a whole pass between listing
-    the queue and reaching a late entry. Unlinking the path that was listed
-    would remove nothing.
+    False when the job was no longer queued: cancelled, or claimed by another
+    pass. The caller lists the queue and then claims each job it acts on, and
+    the two are not one operation.
     """
-    jobs.update_state(entry.job_id, **state)
-    remove_marker(entry.job_id)
-
-
-def remove_marker(job_id: str) -> bool:
-    marker = find_marker(job_id)
-    if marker is None:
-        return False
-    marker.unlink(missing_ok=True)
-    return True
+    return jobs.transition(job_id, expect="queued", **state) is not None
 
 
 def reorder(job_id: str, priority: int) -> bool:
-    """Move a queued job, and record the move in its spec.
-
-    The marker name is what the dispatcher orders by, so renaming it is the
-    move. The spec is updated too because it is the only place a priority
-    survives dispatch: without it `gpuc status` could say what a *queued* job's
-    priority is and nothing at all about a running one's. A spec that cannot be
-    rewritten does not undo the move -- the queue is still in the order that
-    was asked for, and only the report of it is stale.
-    """
-    marker = find_marker(job_id)
-    if marker is None:
+    """Move a queued job. False for a job that is not queued, or not here."""
+    if not paths.job_dir(job_id).is_dir():
         return False
-    marker.rename(marker.parent / marker_name(priority, job_id))
-    with contextlib.suppress(OSError, RuntimeError, ValueError):
-        jobs.update_spec(job_id, priority=priority)
-    return True
+    return jobs.transition(job_id, expect="queued", priority=priority) is not None
 
 
 def cancel(job_id: str) -> str:
@@ -123,96 +96,72 @@ def cancel(job_id: str) -> str:
     `cancelling` for a running one, and a finished job's own status.
 
     A queued job is cancelled here and now, so cancel works with no dispatcher
-    running. A running job gets a marker that the runner (and, as a backstop,
-    the dispatcher) acts on.
+    running. A running job gets the intent, and its runner (or, as a backstop,
+    the dispatcher) acts on it.
     """
     if not paths.job_dir(job_id).is_dir():
         raise FileNotFoundError(f"no such job: {job_id}")
-    paths.cancel_file(job_id).touch()
-    state = jobs.read_state(job_id)
-    if state.finished:
-        remove_marker(job_id)
-        return state.status
-    if state.status == "queued":
-        # State before marker, like `leave_queue` and for the same reason -- and
-        # reading it before either write is what keeps a cancel that arrives
-        # while the job is being dispatched from writing `cancelled` over the
-        # `running` the dispatcher just published. A job already on its way out
-        # is `cancelling`: the runner owns the kill from there.
-        jobs.update_state(job_id, status="cancelled", reason="cancelled", ended_at=jobs.utc_now())
-        remove_marker(job_id)
-        return "cancelled"
-    return "cancelling"
+    with jobs.locked(job_id):
+        state = jobs.read_state(job_id)
+        if state.finished:
+            return state.status
+        if state.status == "queued":
+            state.status, state.reason, state.ended_at = "cancelled", "cancelled", jobs.utc_now()
+            state.intent = None
+            jobs.write_state(job_id, state)
+            return "cancelled"
+        # A cancel overrides a preempt: the job is not coming back.
+        state.intent = CANCEL
+        jobs.write_state(job_id, state)
+        return "cancelling"
 
 
 def is_cancelled(job_id: str) -> bool:
-    return paths.cancel_file(job_id).exists()
-
-
-def request_kill(job_id: str, reason: str) -> None:
-    """Ask the runner to stop this job and record `reason` as why."""
-    jobs.atomic_write_text(paths.kill_file(job_id), f"{reason}\n")
-
-
-def kill_reason(job_id: str) -> str | None:
     try:
-        return paths.kill_file(job_id).read_text().strip() or None
-    except OSError:
+        return jobs.read_state(job_id).intent == CANCEL
+    except RuntimeError:
+        return False
+
+
+def stop_requested(job_id: str) -> str | None:
+    """The reason a running job's runner should stop it now, or None."""
+    try:
+        intent = jobs.read_state(job_id).intent
+    except RuntimeError:
         return None
-
-
-PREEMPTED = "preempted"
-"""The kill reason of a job stopped so that something else can have its GPUs.
-
-Its own reason: a preempted job is not a failure of the job, and the log of
-the attempt that was stopped should say what ended it.
-"""
+    return STOP_REASONS.get(intent or "")
 
 
 def preempt(job_id: str, priority: int | None = None) -> str:
     """Stop a running job and queue it again, from the start.
 
-    Two steps, because the runner owns the kill: the marker says the job is
-    coming back, and the kill request stops it. The dispatcher re-queues it
-    once its runner has stopped it and synced whatever it had produced -- see
-    `requeue_preempted`, which is also what decides the new attempt number.
-
-    The marker is written first. A runner that stops between the two writes
-    would otherwise end the job for good, with nothing left saying it was
-    meant to come back; a kill request that cannot be written takes the marker
-    back off again, because a marker nothing will ever act on re-runs the job
-    the next time it fails for any reason at all.
+    The intent says the job is coming back; the runner owns the kill and the
+    final sync, and the dispatcher re-queues the job once its runner has
+    stopped it (`requeue_preempted`, which also counts the next attempt).
     """
     if not paths.job_dir(job_id).is_dir():
         raise FileNotFoundError(f"no such job: {job_id}")
     if priority is not None and not 0 <= priority <= 99:
         raise ValueError(f"priority must be 0-99 (lower dispatches first), got {priority}")
-    state = jobs.read_state(job_id)
-    if state.finished:
-        raise ValueError(
-            f"job {job_id} has already {state.status}, so there is nothing to preempt; "
-            f"`gpuc requeue {job_id}` submits it again"
-        )
-    if state.status != "running":
-        raise ValueError(
-            f"job {job_id} is {state.status}, not running, so it is already waiting its turn; "
-            f"`gpuc reorder {job_id} --priority N` moves it"
-        )
-    if is_cancelled(job_id):
-        raise ValueError(f"job {job_id} is already being cancelled, so it is not coming back")
-    wanted = jobs.read_spec(job_id).priority if priority is None else priority
-    refuse_if_nothing_else_can_run(job_id, wanted)
-    if priority is not None:
-        # In the spec rather than a marker: the spec is what
-        # `requeue_preempted` queues the job at, and the only copy of a
-        # running job's priority. `reorder` writes it the same way.
-        jobs.update_spec(job_id, priority=priority)
-    paths.preempt_file(job_id).touch()
-    try:
-        request_kill(job_id, PREEMPTED)
-    except OSError:
-        paths.preempt_file(job_id).unlink(missing_ok=True)
-        raise
+    with jobs.locked(job_id):
+        state = jobs.read_state(job_id)
+        if state.finished:
+            raise ValueError(
+                f"job {job_id} has already {state.status}, so there is nothing to preempt; "
+                f"`gpuc requeue {job_id}` submits it again"
+            )
+        if state.status != "running":
+            raise ValueError(
+                f"job {job_id} is {state.status}, not running, so it is already waiting its "
+                f"turn; `gpuc reorder {job_id} --priority N` moves it"
+            )
+        if state.intent == CANCEL:
+            raise ValueError(f"job {job_id} is already being cancelled, so it is not coming back")
+        wanted = state.priority if priority is None else priority
+        refuse_if_nothing_else_can_run(job_id, wanted)
+        state.intent = PREEMPT
+        state.priority = wanted
+        jobs.write_state(job_id, state)
     return "preempting"
 
 
@@ -220,15 +169,15 @@ def queued_ahead_of(job_id: str, priority: int) -> QueueEntry | None:
     """The first queued job that would be dispatched before this one if it came
     back at `priority`, or None if it would go straight to the head of the queue.
 
-    Marker names, because that is what the dispatcher orders by: at the same
-    priority the tie-break is the job id, and a preempted job's id is older
-    than anything queued while it was running, so it sorts ahead of all of them.
+    At the same priority the tie-break is the job id, and a preempted job's id
+    is older than anything queued while it was running, so it sorts ahead of
+    all of them.
     """
-    marker = marker_name(priority, job_id)
+    mine = QueueEntry(priority, job_id)
     for entry in list_queued():
-        if entry.marker.name >= marker:
+        if entry >= mine:
             break  # sorted, so nothing after this sorts earlier either
-        if entry.job_id != job_id and not is_cancelled(entry.job_id):
+        if entry.job_id != job_id:
             return entry
     return None
 
@@ -248,7 +197,7 @@ def refuse_if_nothing_else_can_run(job_id: str, priority: int) -> None:
         )
     if queued_ahead_of(job_id, priority) is not None:
         return
-    ahead = [e for e in list_queued() if e.job_id != job_id and not is_cancelled(e.job_id)]
+    ahead = [e for e in list_queued() if e.job_id != job_id]
     if not ahead:
         raise ValueError(
             f"nothing else is queued on this host, so preempting job {job_id} would stop it "
@@ -259,17 +208,20 @@ def refuse_if_nothing_else_can_run(job_id: str, priority: int) -> None:
     raise ValueError(
         f"job {job_id} would come back at priority {priority} and be dispatched ahead of "
         f"every job now waiting (the next is {first.job_id} at priority {first.priority}), "
-        f"so preempting it would only start it over. Dispatch order is <priority>-<job id> "
+        f"so preempting it would only start it over. Dispatch order is (priority, job id) "
         f"and this job was submitted first, so it wins a tie: give it "
         f"`--priority` above {first.priority} to queue it behind"
     )
 
 
 def is_preempted(job_id: str) -> bool:
-    return paths.preempt_file(job_id).exists()
+    try:
+        return jobs.read_state(job_id).intent == PREEMPT
+    except RuntimeError:
+        return False
 
 
-STOPPED_BY_US = ("preempted", "runner-died", "terminated")
+STOPPED_BY_US = (PREEMPTED, "runner-died", "terminated")
 """Reasons that mean the attempt ended because something stopped it, rather
 than because the job itself was over. Only these come back: a job that failed
 on its own in the seconds before the kill reached it asked for nothing, and
@@ -285,60 +237,46 @@ def stopped_for_preempt(state: JobState) -> bool:
 def requeue_preempted(job_id: str) -> int | None:
     """Put a preempted job back in the queue, and say which attempt it is now.
 
-    None means it is not going back, and the marker goes with the decision so
+    None means it is not going back, and the intent goes with the decision so
     nothing tries again: the job is already queued, it finished under its own
     steam before the kill reached it, it was cancelled while it stopped, or it
     has no workdir left to re-run from.
 
     The state is written fresh rather than patched. The job runs from the
     start, so the exit code, the end time and the GPUs of the attempt that was
-    stopped would all be lies about a queued job.
-
-    Ordering is for a process that dies in the middle of this: the queue marker
-    is written before the preempt marker is removed, so the worst interruption
-    leaves a job that is queued *and* still asking to be queued, which the
-    first branch below turns into a no-op. Removing the preempt marker first --
-    as this did -- loses the job entirely if the write after it fails.
+    stopped would all be lies about a queued job. One write, under the job's
+    lock: there is no half-done requeue to finish after a crash.
     """
-    state = jobs.read_state(job_id)
-    if state.status == "queued":
-        return _finish_interrupted_requeue(job_id, state)
-    if not state.finished or not stopped_for_preempt(state):
-        paths.preempt_file(job_id).unlink(missing_ok=True)
-        return None
-    if is_cancelled(job_id) or not paths.workdir(job_id).is_dir():
-        paths.preempt_file(job_id).unlink(missing_ok=True)
-        return None
-    # Before the new state: it is still the request the stopped attempt was
-    # given, and a runner that found it would kill the new attempt on its
-    # first poll.
-    paths.kill_file(job_id).unlink(missing_ok=True)
-    attempt = state.attempt + 1
-    spec = jobs.update_spec(job_id, attempt=attempt)
-    _log_requeue(job_id, attempt, spec.priority)
-    jobs.write_state(job_id, JobState(status="queued", attempt=attempt))
-    # Marker last, exactly as `enqueue` writes it: a job is only dispatchable
-    # once its spec and state say it is queued.
-    (paths.queue_dir() / marker_name(spec.priority, job_id)).touch()
-    paths.preempt_file(job_id).unlink(missing_ok=True)
+    with jobs.locked(job_id):
+        state = jobs.read_state(job_id)
+        if state.intent != PREEMPT:
+            return None
+        if state.status == "queued":
+            state.intent = None
+            jobs.write_state(job_id, state)
+            return None
+        if (
+            not state.finished
+            or not stopped_for_preempt(state)
+            or not paths.workdir(job_id).is_dir()
+        ):
+            state.intent = None
+            jobs.write_state(job_id, state)
+            return None
+        attempt = state.attempt + 1
+        jobs.write_state(
+            job_id,
+            JobState(
+                status="queued",
+                attempt=attempt,
+                priority=state.priority,
+                estimated_runtime_min=state.estimated_runtime_min,
+                progress_pct=None,
+                workdir_bytes=None,
+            ),
+        )
+    _log_requeue(job_id, attempt, state.priority)
     return attempt
-
-
-def _finish_interrupted_requeue(job_id: str, state: JobState) -> int | None:
-    """Complete a re-queue that got as far as the queued state and no further.
-
-    The attempt has already been counted, so this finishes the move rather
-    than making a second one: the marker if it is missing, then the preempt
-    marker. Returns the attempt when there was something to finish, None when
-    the job was simply already back.
-    """
-    if find_marker(job_id) is not None:
-        paths.preempt_file(job_id).unlink(missing_ok=True)
-        return None
-    priority = jobs.read_spec(job_id).priority
-    (paths.queue_dir() / marker_name(priority, job_id)).touch()
-    paths.preempt_file(job_id).unlink(missing_ok=True)
-    return state.attempt
 
 
 def _log_requeue(job_id: str, attempt: int, priority: int) -> None:

@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gpuc.host import baseline, jobs, paths, queue
+from gpuc.host import baseline, jobs, paths
 from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS, JobState
 
 DEFAULT_WORKDIR_DAYS = 1.0
@@ -50,11 +50,12 @@ weekend, and the mirror precondition means nothing is actually lost either way.
 """
 
 INCOMING_STALE_S = 3600.0
-"""How old an orphaned staged spec must be before `clean` removes it.
+"""How old a job dir under `incoming/` must be before it is removed.
 
-`submit` writes `incoming/<id>.json`, runs `enqueue`, then deletes it, so the
-window in which the file is load-bearing is one SSH round trip. An hour is far
-past that and still cannot race a submit that is merely slow.
+`submit` rsyncs the workdir there and then runs `enqueue`, which renames the
+dir into `jobs/`; a dir still there is a submit that died. Measured from the
+dir's last change, so a large rsync still in progress is never mistaken for
+one that stopped. An hour is far past any ssh round trip.
 """
 
 
@@ -562,79 +563,39 @@ def _too_young(job_id: str, age_days: float | None, older_than_days: float) -> S
     return None
 
 
-def abandoned_submits(now: float | None = None) -> list[str]:
-    """Jobs whose submit never committed: `queued`, but not in the queue.
-
-    `queue.enqueue` writes the spec and the state and *then* the queue marker,
-    so the marker is what makes a job submitted. A job dir stuck without one is
-    a `gpuc submit` whose ssh died between those writes: the host was never
-    asked to run it, so it must not be dispatched -- and left alone it is a
-    phantom `queued` job in `gpuc status` that nothing ever resolves.
-
-    The dispatcher's own writes cannot produce this shape; see
-    `queue.leave_queue`, which is ordered so that they do not.
-
-    Age-gated for exactly the reason `stale_incoming` is, and against the same
-    horizon: the gap between the two writes is two syscalls wide, and an
-    enqueue that is merely slow must not be mistaken for one that died.
-
-    A job `requeue_preempted` is putting back is in this shape mid-move and is
-    excluded outright: its preempt marker is the record that it is coming back,
-    and `_finish_interrupted_requeue` is what completes the move.
-    """
-    moment = now if now is not None else datetime.now(UTC).timestamp()
-    queued = {entry.job_id for entry in queue.list_queued()}
-    abandoned: list[str] = []
-    for job_id in jobs.list_job_ids():
-        if job_id in queued or queue.is_preempted(job_id):
-            continue
-        try:
-            if jobs.read_state(job_id).status != "queued":
-                continue
-        except RuntimeError:
-            continue
-        try:
-            staleness = moment - paths.state_file(job_id).stat().st_mtime
-        except OSError:
-            continue
-        if staleness >= INCOMING_STALE_S:
-            abandoned.append(job_id)
-    return abandoned
-
-
 def stale_incoming(now: float | None = None) -> list[Path]:
-    """Staged spec files in `incoming/` that no submit can still be using.
+    """Job dirs under `incoming/` that no submit can still be building.
 
-    A file is left behind either by a submit that died between staging and
-    deleting, or by one whose delete lost its connection. Two safe signatures:
-    the job it names has finished (so the spec was consumed), or no job dir was
-    ever created for it and the file is older than `INCOMING_STALE_S`.
+    Left behind by a submit that died between the rsync and the enqueue. Old
+    by the dir's own mtime, which every file added to it refreshes.
     """
-    directory = paths.home() / "incoming"
+    directory = paths.incoming_dir()
     if not directory.is_dir():
         return []
     moment = now if now is not None else datetime.now(UTC).timestamp()
     stale: list[Path] = []
     try:
-        entries = sorted(directory.glob("*.json"))
+        entries = sorted(p for p in directory.iterdir() if p.is_dir())
     except OSError:
         return []
     for path in entries:
-        job_id = path.stem
         try:
-            mtime = path.stat().st_mtime
+            changed = max(p.stat().st_mtime for p in [path, *path.rglob("*")])
         except OSError:
             continue
-        if paths.job_dir(job_id).is_dir():
-            try:
-                if jobs.read_state(job_id).finished:
-                    stale.append(path)
-            except RuntimeError:
-                continue
-            continue
-        if moment - mtime > INCOMING_STALE_S:
+        if moment - changed > INCOMING_STALE_S:
             stale.append(path)
     return stale
+
+
+def remove_stale_incoming(now: float | None = None) -> list[str]:
+    """Delete what `stale_incoming` found; the names of what went."""
+    removed: list[str] = []
+    for path in stale_incoming(now):
+        with contextlib.suppress(OSError):
+            shutil.rmtree(path)
+            removed.append(path.name)
+    return removed
 
 
 def clean(
@@ -673,7 +634,7 @@ def clean(
     for path in stale_incoming():
         if not dry_run:
             try:
-                path.unlink()
+                shutil.rmtree(path)
             except OSError as exc:
                 result.errors.append(f"could not remove {path}: {exc}")
                 continue
@@ -848,13 +809,8 @@ def remove_job_dir(job_id: str) -> int:
     size = reclaimable_bytes(directory) if directory.is_dir() else 0
     if directory.is_dir():
         shutil.rmtree(directory)
-    # A finished job has no business in the queue, but a marker left by a
-    # crash would make the next dispatcher launch a job with no spec.
-    queue.remove_marker(job_id)
     with contextlib.suppress(OSError):
         paths.job_env_file(job_id).unlink(missing_ok=True)
-    with contextlib.suppress(OSError):
-        (paths.home() / "incoming" / f"{job_id}.json").unlink(missing_ok=True)
     return size
 
 

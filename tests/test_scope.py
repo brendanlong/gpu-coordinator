@@ -112,7 +112,6 @@ def test_a_cgroup_host_records_its_unit_while_a_phase_runs(monkeypatch: pytest.M
 def prepare(command: str) -> str:
     spec = make_spec(command=command)
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     return job_id
 

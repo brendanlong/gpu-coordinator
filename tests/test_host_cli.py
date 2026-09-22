@@ -144,9 +144,28 @@ def test_cancel_and_reorder(gpuc_home: Path, capsys: pytest.CaptureFixture[str])
 
     code, payload = run(capsys, "cancel", first)
     assert code == 0 and isinstance(payload, dict) and payload["status"] == "cancelled"
+    assert [e.job_id for e in queue.list_queued()] == [second]
 
-    code, _ = run(capsys, "reorder", "no-such-job", "1")
-    assert code == 1
+
+def test_reorder_of_a_job_that_is_not_queued_is_a_refusal_not_a_traceback(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, status="running")
+    code, payload = run(capsys, "reorder", job_id, "1")
+    assert code == 1 and isinstance(payload, dict)
+    assert "not queued (status running)" in str(payload["error"])
+
+
+def test_reorder_of_an_unknown_job_is_a_refusal_not_a_traceback(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control side reads this command's stdout as JSON, so a typed job id
+    has to come back as an error document and exit 1."""
+    code, payload = run(capsys, "reorder", "no-such-job", "1")
+    assert code == 1 and isinstance(payload, dict)
+    assert "no job no-such-job on this host" in str(payload["error"])
+    assert jobs.list_job_ids() == []
 
 
 def test_estimate_sets_a_queued_jobs_runtime(
@@ -156,24 +175,30 @@ def test_estimate_sets_a_queued_jobs_runtime(
     code, payload = run(capsys, "estimate", job_id, "150")
     assert code == 0 and isinstance(payload, dict)
     assert payload["estimated_runtime_min"] == 150.0 and payload["status"] == "queued"
-    assert jobs.read_spec(job_id).estimated_runtime_min == 150.0
+    assert jobs.read_state(job_id).estimated_runtime_min == 150.0
 
     code, payload = run(capsys, "estimate", job_id, "--clear")
     assert code == 0 and isinstance(payload, dict) and payload["estimated_runtime_min"] is None
-    assert jobs.read_spec(job_id).estimated_runtime_min is None
+    assert jobs.read_state(job_id).estimated_runtime_min is None
 
 
-def test_estimate_keeps_the_keys_this_build_does_not_know(gpuc_home: Path) -> None:
-    """A spec written by a newer build round-tripped through `JobSpec` would
-    lose them, and an estimate is not a reason to rewrite somebody's job."""
+def test_estimate_does_not_touch_the_spec(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The live estimate lives in the state, so the spec stays byte for byte
+    what was submitted -- including the fields a newer build wrote into it,
+    which a round trip through `JobSpec` would drop."""
     job_id = queue.enqueue(make_spec())
     document = json.loads(paths.spec_file(job_id).read_text())
     document["some_future_field"] = ["keep", "me"]
     paths.spec_file(job_id).write_text(json.dumps(document))
-    jobs.update_spec(job_id, estimated_runtime_min=42.0)
-    written = json.loads(paths.spec_file(job_id).read_text())
-    assert written["some_future_field"] == ["keep", "me"]
-    assert written["estimated_runtime_min"] == 42.0
+    before = paths.spec_file(job_id).read_text()
+
+    code, _ = run(capsys, "estimate", job_id, "42")
+
+    assert code == 0
+    assert paths.spec_file(job_id).read_text() == before
+    assert jobs.read_state(job_id).estimated_runtime_min == 42.0
 
 
 def test_estimate_refuses_a_finished_job_and_an_unknown_one(
@@ -183,7 +208,7 @@ def test_estimate_refuses_a_finished_job_and_an_unknown_one(
     jobs.update_state(job_id, status="succeeded")
     code, payload = run(capsys, "estimate", job_id, "10")
     assert code == 1 and isinstance(payload, dict) and "already succeeded" in payload["error"]
-    assert jobs.read_spec(job_id).estimated_runtime_min is None
+    assert jobs.read_state(job_id).estimated_runtime_min is None
 
     code, payload = run(capsys, "estimate", "no-such-job", "10")
     assert code == 1 and isinstance(payload, dict) and "no job with that id" in payload["error"]
@@ -199,7 +224,7 @@ def test_estimate_refuses_a_number_that_is_not_a_runtime(
     job_id = queue.enqueue(make_spec())
     code, payload = run(capsys, "estimate", job_id, minutes)
     assert code == 1 and isinstance(payload, dict) and payload["error"]
-    assert jobs.read_spec(job_id).estimated_runtime_min is None
+    assert jobs.read_state(job_id).estimated_runtime_min is None
 
 
 def test_estimate_needs_a_number_or_clear_and_not_both(
@@ -209,7 +234,7 @@ def test_estimate_needs_a_number_or_clear_and_not_both(
     for args in ((job_id,), (job_id, "60", "--clear")):
         code, payload = run(capsys, "estimate", *args)
         assert code == 1 and isinstance(payload, dict) and "not both" in payload["error"]
-    assert jobs.read_spec(job_id).estimated_runtime_min == 30.0
+    assert jobs.read_state(job_id).estimated_runtime_min == 30.0
 
 
 def test_estimate_warns_when_the_job_will_be_killed_first(
@@ -261,11 +286,11 @@ def test_status_resolves_the_owned_gpus(
     assert status["gpus_unavailable"] == ["9"]
 
 
-def test_status_reports_a_queued_jobs_estimate_from_its_spec(
+def test_status_reports_a_queued_jobs_estimate(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A queued job has no eta yet, and its estimate is exactly what somebody
-    deciding whether to queue behind it needs. Only the spec has it."""
+    deciding whether to queue behind it needs."""
     queue.enqueue(make_spec(estimated_runtime_min=360.0))
     queue.enqueue(make_spec())
 
@@ -310,14 +335,14 @@ def test_status_reports_the_commit_the_running_dispatcher_was_started_on(
     assert (status["pkg_commit"], status["dispatcher_pkg_commit"]) == ("d" * 40, "c" * 40)
 
 
-def test_status_reports_each_jobs_priority_and_card_count_from_its_spec(
+def test_status_reports_each_jobs_priority_and_card_count(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The queue marker only carries a priority while the job is queued, and a
-    queued job holds no cards, so the spec is the only place either survives."""
+    """A running job is not in the queue and a queued job holds no cards, so
+    neither number can be read off the queue: the priority is the job's own
+    state and the card count is the spec's."""
     job_id = queue.enqueue(make_spec(priority=12, gpus=2))
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0], FAKE_GPUS[1]])
-    queue.remove_marker(job_id)
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
@@ -325,28 +350,29 @@ def test_status_reports_each_jobs_priority_and_card_count_from_its_spec(
     assert (status["jobs"][0]["priority"], status["jobs"][0]["gpus_requested"]) == (12, 2)
 
 
-def test_reorder_records_the_new_priority_in_the_spec(
+def test_reorder_records_the_new_priority_in_the_state(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Otherwise the priority a job was dispatched at is lost with its marker,
-    and `gpuc status` could only ever report a running job's as its original."""
+    """The state is the one copy of the live priority, and it outlives
+    dispatch: otherwise `gpuc status` could only ever report a running job's
+    priority as the one it was submitted with."""
     job_id = queue.enqueue(make_spec(priority=50))
     run(capsys, "reorder", job_id, "7")
-    assert jobs.read_spec(job_id).priority == 7
+    assert jobs.read_state(job_id).priority == 7
+    assert jobs.read_spec(job_id).priority == 50
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
     assert status["jobs"][0]["priority"] == 7
 
 
-def test_preempt_marks_a_running_job_and_starts_a_dispatcher(
+def test_preempt_records_the_intent_and_starts_a_dispatcher(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The dispatcher is what puts the job back: on a host whose dispatcher had
     died, the kill would land and nothing would ever queue the job again."""
     monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: 4242)
     job_id = queue.enqueue(make_spec(priority=50))
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running")
     queue.enqueue(make_spec(priority=10))  # the job that wants the GPUs
 
@@ -354,7 +380,12 @@ def test_preempt_marks_a_running_job_and_starts_a_dispatcher(
     assert code == 0 and isinstance(payload, dict)
     assert (payload["status"], payload["priority"]) == ("preempting", 70)
     assert payload["dispatcher_pid"] == 4242
-    assert queue.kill_reason(job_id) == "preempted"
+    assert queue.stop_requested(job_id) == "preempted"
+
+    # ...and what was asked of the job is in its status, for anyone watching.
+    _, status = run(capsys, "status", job_id)
+    assert isinstance(status, dict)
+    assert (status["jobs"][0]["intent"], status["jobs"][0]["priority"]) == ("preempt", 70)
 
 
 def test_preempt_of_a_job_that_is_not_running_is_a_refusal_not_a_traceback(
@@ -377,10 +408,9 @@ def test_preempt_that_would_free_the_host_for_nothing_is_refused(
     started: list[int] = []
     monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: started.append(1) or 1)
     job_id = queue.enqueue(make_spec())
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running")
 
     code, payload = run(capsys, "preempt", job_id)
     assert code == 1 and isinstance(payload, dict)
     assert "nothing else is queued" in str(payload["error"])
-    assert (started, queue.kill_reason(job_id)) == ([], None)
+    assert (started, queue.stop_requested(job_id)) == ([], None)

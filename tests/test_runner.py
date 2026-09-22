@@ -27,7 +27,6 @@ from tests.conftest import (
 def prepare(gpus: Sequence[str] = (FAKE_GPUS[0],), **overrides: object) -> str:
     spec = make_spec(**overrides)
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=list(gpus))
     return job_id
 
@@ -381,7 +380,7 @@ def test_sigterm_kills_the_job_group_and_writes_failed_terminated(gpuc_home: Pat
     assert "received SIGTERM" in log_of(job_id)
 
 
-def test_sigterm_after_a_cancel_marker_ends_the_job_as_cancelled(gpuc_home: Path) -> None:
+def test_sigterm_after_a_cancel_request_ends_the_job_as_cancelled(gpuc_home: Path) -> None:
     job_id = prepare(command="sleep 300")
     proc = run_detached(job_id, gpuc_home)
     try:
@@ -405,7 +404,22 @@ def test_a_job_cancelled_during_the_launch_window_never_runs_its_command(
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("cancelled", "cancelled")
     assert not (paths.workdir(job_id) / "RAN").exists()
-    assert "cancel marker present before phase=setup" in log_of(job_id)
+    assert "cancelled before phase=setup; not starting it" in log_of(job_id)
+
+
+def test_a_job_preempted_during_the_launch_window_never_runs_its_command(
+    gpuc_home: Path,
+) -> None:
+    """The intent lands between phases as readily as mid-phase, and a job that
+    is going back in the queue must not spend a single phase's work first."""
+    job_id = prepare(command="touch RAN")
+    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
+    queue.preempt(job_id)
+    assert runner.run_job(job_id, deps()) == runner.TERMINATED_EXIT_CODE
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "preempted")
+    assert not (paths.workdir(job_id) / "RAN").exists()
+    assert "preempted before phase=setup; not starting it" in log_of(job_id)
 
 
 def test_the_secrets_file_is_removed_once_the_job_has_finished(gpuc_home: Path) -> None:

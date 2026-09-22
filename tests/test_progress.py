@@ -140,7 +140,6 @@ def test_poll_kills_the_whole_session_not_just_the_shell(tmp_path: Path) -> None
 def prepare(**overrides: object) -> str:
     spec = make_spec(**overrides)
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     paths.ensure_job_layout(job_id)
     return job_id
@@ -241,17 +240,19 @@ def test_estimated_runtime_min_publishes_an_eta_from_the_first_phase(gpuc_home: 
 
 def test_an_estimate_added_while_the_job_runs_becomes_an_eta(gpuc_home: Path) -> None:
     """The case the whole command exists for: the long job already running when
-    the next person arrives is the one nobody could estimate in time."""
+    the next person arrives is the one nobody could estimate in time. The spec
+    is written once, so `gpuc estimate` puts the new figure in the state and
+    the runner re-reads it from there."""
     job_id = prepare(command="sleep 0.6")
     seen: list[str | None] = []
 
     def watching_sleep(seconds: float) -> None:
         if not seen:
-            jobs.update_spec(job_id, estimated_runtime_min=90.0)
+            jobs.update_state(job_id, estimated_runtime_min=90.0)
         seen.append(jobs.read_state(job_id).eta)
         time.sleep(seconds)
 
-    assert runner.run_job(job_id, deps(sleep=watching_sleep, spec_refresh_s=0.0)) == 0
+    assert runner.run_job(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
     published = [eta for eta in seen if eta]
     assert published, "the estimate never became an eta"
     assert 5000.0 < seconds_from_now(published[-1]) < 5500.0
@@ -294,15 +295,15 @@ def test_a_measured_eta_is_not_overwritten_by_an_estimate(gpuc_home: Path) -> No
             etas.append(eta)
         time.sleep(seconds)
 
-    assert runner.run_job(job_id, deps(sleep=watching_sleep, spec_refresh_s=0.0)) == 0
+    assert runner.run_job(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
     assert etas, "no progress eta was published"
     # Half done after a fraction of a second: the measured eta is seconds away,
-    # nowhere near the ten hours the spec guesses at.
+    # nowhere near the ten hours the submitter's estimate guesses at.
     assert all(seconds_from_now(eta) < 600.0 for eta in etas)
 
 
 def test_an_estimate_added_in_setup_survives_the_phase_that_follows(gpuc_home: Path) -> None:
-    """Each phase gets its own monitor loop. Re-seeding it from the spec loaded
+    """Each phase gets its own monitor loop. Re-seeding it from the state read
     at job start would withdraw the eta at every phase boundary -- and `setup`
     is where somebody most often adds one, because that is the phase that
     looks wedged."""
@@ -311,46 +312,23 @@ def test_an_estimate_added_in_setup_survives_the_phase_that_follows(gpuc_home: P
 
     def watching_sleep(seconds: float) -> None:
         if not etas:
-            jobs.update_spec(job_id, estimated_runtime_min=90.0)
+            jobs.update_state(job_id, estimated_runtime_min=90.0)
         if jobs.read_state(job_id).phase == "main":
             etas.append(jobs.read_state(job_id).eta)
         time.sleep(seconds)
 
-    assert runner.run_job(job_id, deps(sleep=watching_sleep, spec_refresh_s=0.0)) == 0
+    assert runner.run_job(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
     assert etas, "the job never reached main"
     assert all(eta for eta in etas), "the eta was withdrawn when the phase changed"
 
 
-def test_a_progress_command_added_while_the_job_runs_is_polled(gpuc_home: Path) -> None:
-    job_id = prepare(command="sleep 0.8", progress_interval_s=0.02)
-    added = False
-
-    def adding_sleep(seconds: float) -> None:
-        nonlocal added
-        if not added:
-            added = True
-            jobs.update_spec(job_id, progress_command="echo 25%")
-        time.sleep(seconds)
-
-    assert runner.run_job(job_id, deps(sleep=adding_sleep, spec_refresh_s=0.0)) == 0
-    assert jobs.read_state(job_id).progress_pct == 25.0
-
-
-def test_a_spec_that_cannot_be_read_leaves_the_running_job_alone(gpuc_home: Path) -> None:
-    """A spec.json being rewritten under us is a transient state, not a reason
-    to end a job that is running fine."""
-    job_id = prepare(command="sleep 0.4", estimated_runtime_min=90.0)
-    truncated = False
-
-    def truncating_sleep(seconds: float) -> None:
-        nonlocal truncated
-        if not truncated:
-            truncated = True
-            paths.spec_file(job_id).write_text("{ not json")
-        time.sleep(seconds)
-
-    assert runner.run_job(job_id, deps(sleep=truncating_sleep, spec_refresh_s=0.0)) == 0
-    assert jobs.read_state(job_id).status == "succeeded"
+def test_a_state_that_cannot_be_read_leaves_the_estimate_where_it_was(gpuc_home: Path) -> None:
+    """A state.json being replaced under us is a transient condition, not a
+    reason to end a job that is running fine."""
+    job_id = prepare(command="true", estimated_runtime_min=90.0)
+    with live_runner(job_id) as (started, _log):
+        paths.state_file(job_id).write_text("{ not json")
+        assert started._live_estimate() == 90.0  # pyright: ignore[reportPrivateUsage]
 
 
 def test_no_estimate_and_no_progress_command_means_no_eta(gpuc_home: Path) -> None:
@@ -396,7 +374,7 @@ def test_an_unrepresentable_estimate_is_no_estimate_rather_than_a_dead_job(
 def test_an_unusable_progress_interval_falls_back_to_the_default(interval: float) -> None:
     """Zero or negative would fork a shell on every pass of the runner's loop;
     NaN would silently never poll. The control side's `ge=5` is not in the path
-    of a hand-edited spec.json or a staged incoming/<id>.json."""
+    of a hand-edited spec.json or one staged under incoming/<id>/."""
     spec = make_spec(progress_interval_s=interval)
     assert spec.progress_interval_s == progress.DEFAULT_INTERVAL_S
 

@@ -547,12 +547,14 @@ class Dispatcher:
     deps: DispatcherDeps = field(default_factory=DispatcherDeps)
     running: dict[str, _Running] = field(default_factory=dict)
     _queue_empty_since: float | None = None
-    _cancel_sent: dict[str, float] = field(default_factory=dict)
     _terminate_retry_at: float | None = None
     _last_reclaim_at: float | None = None
-    _last_submit_sweep_at: float | None = None
-    _kill_sent: dict[str, float] = field(default_factory=dict)
-    _kill_escalated: set[str] = field(default_factory=set)
+    _last_incoming_sweep_at: float | None = None
+    _stop_sent: dict[str, float] = field(default_factory=dict)
+    """When this dispatcher first saw each running job's stop intent, so the
+    ladder in `escalate_stops` has a clock even for a request another process
+    wrote."""
+    _stop_escalated: set[str] = field(default_factory=set)
     _config: jobs.HostConfig | None = None
     _owned: list[str] | None = None
     _unavailable: tuple[str, ...] = ()
@@ -620,7 +622,7 @@ class Dispatcher:
                 state.runner_pid, state.runner_boot_id, state.runner_starttime
             )
             if state.finished:
-                if queue.is_preempted(job_id):
+                if state.intent == jobs.PREEMPT:
                     # Finished, preempted, and its runner is *still there*: it
                     # is in its final sync, writing to the workdir and to
                     # state.json. Queueing the job now would launch the next
@@ -721,9 +723,8 @@ class Dispatcher:
             if entry.poll() is None:
                 continue
             del self.running[job_id]
-            self._cancel_sent.pop(job_id, None)
-            self._kill_sent.pop(job_id, None)
-            self._kill_escalated.discard(job_id)
+            self._stop_sent.pop(job_id, None)
+            self._stop_escalated.discard(job_id)
             try:
                 state: jobs.JobState | None = jobs.read_state(job_id)
             except RuntimeError:
@@ -753,7 +754,8 @@ class Dispatcher:
             # count its outputs as unconfirmed (that list is finished jobs).
             # Left finished, it keeps its record, its `preempted` reason and
             # its place in the drain's last upload attempt.
-            paths.preempt_file(job_id).unlink(missing_ok=True)
+            with contextlib.suppress(RuntimeError, OSError):
+                jobs.update_state(job_id, intent=None)
             self.log(
                 f"job {job_id} was preempted, but this host is {going}, so it is not going "
                 f"back in the queue: it stays {self._state_or_empty(job_id).status} and "
@@ -783,90 +785,49 @@ class Dispatcher:
             return "draining"
         return None
 
-    def handle_cancels(self) -> None:
-        """Escalate a cancel, without ever killing the runner's own group during
-        the launch window.
+    def escalate_stops(self) -> None:
+        """Make a stop request stick when the runner never acts on it.
 
-        Between spawn and the first phase the runner *is* the only member of its
-        group, so signalling it there would kill the one process that can finish
-        the job cleanly. Until the job's own pgid appears in state.json the
-        cancel marker is the whole mechanism; the runner checks it before every
-        phase and ends as `cancelled`.
+        The runner owns the kill: it polls its state, stops the job's scope or
+        group, syncs and writes the final state. That is right when the runner
+        is healthy and nothing at all when it is wedged, so a request it has
+        not honoured within the grace period gets the ladder: the job's scope
+        and group first, then the runner itself (which handles SIGTERM with a
+        final sync), then the runner's group. Never inside the grace period,
+        and the job's group is only ever the one the state names -- during the
+        launch window the runner is the only member of its own group, and
+        killing that would kill the one process that can finish the job
+        cleanly. By three grace periods the runner is wedged and its group
+        goes regardless.
         """
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
         for job_id, entry in list(self.running.items()):
-            if not queue.is_cancelled(job_id):
+            state = self._state_or_empty(job_id)
+            if state.intent is None:
                 continue
-            sent = self._cancel_sent.get(job_id)
-            if sent is None:
-                self._cancel_sent[job_id] = now
-                state = self._state_or_empty(job_id)
-                job_pgid = self._job_pgid(state, entry)
-                if state.cgroup_unit:
-                    # A cgroup stop reaps the whole tree, daemonised
-                    # grandchildren included; the group kill below cannot.
-                    self.log(f"cancelling job {job_id} (scope {state.cgroup_unit})")
-                    scope.stop_unit(state.cgroup_unit)
-                elif job_pgid:
-                    self.log(f"cancelling job {job_id} (pgid {job_pgid})")
-                    self._signal_group(job_pgid, signal.SIGTERM)
-                else:
-                    self.log(
-                        f"cancelling job {job_id}: the runner has not published a job process "
-                        f"group yet, so the cancel marker alone stops it"
-                    )
-                continue
-            self._escalate(job_id, entry, now - sent, grace)
-
-    def escalate_kills(self) -> None:
-        """Make a kill *request* stick when the runner never acts on it.
-
-        A preempt asks the runner to stop its job and sync, which is right
-        when the runner is healthy and is nothing at all when it is wedged: the
-        marker sits there, the job keeps running, and the job waiting for its
-        cards never starts. So the ask gets the same ladder a cancel gets.
-        """
-        now = self.deps.monotonic()
-        grace = self.deps.kill_grace_s
-        for job_id, entry in list(self.running.items()):
-            if queue.kill_reason(job_id):
-                # A marker somebody else wrote -- `gpuc preempt`, or a
-                # dispatcher we took over from -- needs a clock of its own, or
-                # a runner that never acts on it is never escalated either.
-                self._kill_sent.setdefault(job_id, now)
-            sent = self._kill_sent.get(job_id)
-            # A cancelled job already has an escalation, and one owner is enough.
-            if sent is None or queue.is_cancelled(job_id):
-                continue
-            elapsed = now - sent
+            # A request another process wrote -- `gpuc cancel`, or a
+            # dispatcher we took over from -- needs a clock of its own, or a
+            # runner that never acts on it is never escalated either.
+            elapsed = now - self._stop_sent.setdefault(job_id, now)
             if elapsed <= grace:
                 continue
-            if job_id not in self._kill_escalated:
-                self._kill_escalated.add(job_id)
+            if job_id not in self._stop_escalated:
+                self._stop_escalated.add(job_id)
                 self.log(
                     f"job {job_id}: its runner has not stopped it {elapsed:.0f}s after the "
-                    f"{queue.kill_reason(job_id) or 'kill'} request; escalating"
+                    f"{state.intent} request; escalating"
                 )
-            self._escalate(job_id, entry, elapsed, grace)
-
-    def _escalate(self, job_id: str, entry: _Running, elapsed: float, grace: float) -> None:
-        """The kill ladder: the job's scope and group first, the runner last.
-
-        The runner handles SIGTERM itself (final sync, final state), so it gets
-        a signal of its own -- and the time to use it -- before its group goes.
-        """
-        state = self._state_or_empty(job_id)
-        job_pgid = self._job_pgid(state, entry)
-        if state.cgroup_unit and elapsed > grace:
-            scope.stop_unit(state.cgroup_unit)
-        if job_pgid and elapsed > grace:
-            self._signal_group(job_pgid, signal.SIGKILL)
-        if elapsed > 2 * grace:
-            self._signal_pid(entry.pid, signal.SIGTERM)
-        if elapsed > 3 * grace and process_group_alive(entry.pid):
-            self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
-            self._signal_group(entry.pid, signal.SIGKILL)
+            job_pgid = self._job_pgid(state, entry)
+            if state.cgroup_unit:
+                scope.stop_unit(state.cgroup_unit)
+            if job_pgid:
+                self._signal_group(job_pgid, signal.SIGKILL)
+            if elapsed > 2 * grace:
+                self._signal_pid(entry.pid, signal.SIGTERM)
+            if elapsed > 3 * grace and process_group_alive(entry.pid):
+                self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
+                self._signal_group(entry.pid, signal.SIGKILL)
 
     @staticmethod
     def _state_or_empty(job_id: str) -> jobs.JobState:
@@ -1005,34 +966,6 @@ class Dispatcher:
             )
         return f"needs {spec.gpus} GPUs, {have}"
 
-    def _still_queued(self, entry: queue.QueueEntry) -> bool:
-        """Whether this marker still names a job that is waiting to run.
-
-        The marker says a job was submitted; the state says what has become of
-        it since, and only the state is allowed to start a runner. Without this
-        the queue is dispatched on the marker alone, so anything that leaves one
-        behind -- `leave_queue` interrupted between its two writes, a purge
-        interrupted before `remove_job_dir` got to the marker -- starts a second
-        runner in the workdir the first one is using, or a job with no spec.
-
-        Dropping the marker is the repair: the state has already said where the
-        job went, and a marker disagreeing with it is the stale half.
-        """
-        try:
-            status = jobs.read_state(entry.job_id).status
-        except RuntimeError:
-            self.log(f"job {entry.job_id} is queued but has no readable state; dropping it")
-            entry.marker.unlink(missing_ok=True)
-            return False
-        if status != "queued":
-            self.log(
-                f"job {entry.job_id} is {status} but was still in the queue; dropping its "
-                f"marker rather than dispatching it a second time"
-            )
-            entry.marker.unlink(missing_ok=True)
-            return False
-        return True
-
     def _holds_the_queue(self, spec: jobs.JobSpec, theirs: int) -> bool:
         """Whether a job that cannot start yet keeps the cards it is waiting for.
 
@@ -1100,29 +1033,16 @@ class Dispatcher:
         held_shared = 0
         for entry in queue.list_queued():
             job_id = entry.job_id
-            if not self._still_queued(entry):
-                continue
-            if queue.is_cancelled(job_id):
-                queue.leave_queue(
-                    entry, status="cancelled", reason="cancelled", ended_at=jobs.utc_now()
-                )
-                continue
             try:
                 spec = jobs.read_spec(job_id)
             except (RuntimeError, ValueError) as exc:
                 self.log(f"job {job_id} has an unreadable spec ({exc}); dropping from queue")
-                queue.leave_queue(
-                    entry, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
-                )
+                queue.claim(job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now())
                 continue
             too_big = self._capacity_failure(spec)
             if too_big is not None:
-                queue.leave_queue(
-                    entry,
-                    status="failed",
-                    reason=too_big,
-                    exit_code=1,
-                    ended_at=jobs.utc_now(),
+                queue.claim(
+                    job_id, status="failed", reason=too_big, exit_code=1, ended_at=jobs.utc_now()
                 )
                 continue
             # Owned cards first, always: a job borrows only the shortfall, so a
@@ -1142,15 +1062,13 @@ class Dispatcher:
                     held_shared += len(shared_part)
                 continue
             assigned = [*owned_part, *shared_part]
+            if not queue.claim(
+                job_id, status="running", gpus=assigned, phase="setup", started_at=jobs.utc_now()
+            ):
+                # Cancelled between listing the queue and here; its cards stay free.
+                continue
             free = free[len(owned_part) :]
             borrowable = borrowable[len(shared_part) :] if borrowable is not None else None
-            queue.leave_queue(
-                entry,
-                status="running",
-                gpus=assigned,
-                phase="setup",
-                started_at=jobs.utc_now(),
-            )
             try:
                 proc = self.deps.spawn_runner(job_id)
             except OSError as exc:
@@ -1266,8 +1184,6 @@ class Dispatcher:
         theirs = 0
         sampled = False
         for waiting in queue.list_queued():
-            if queue.is_cancelled(waiting.job_id):
-                continue
             try:
                 spec = jobs.read_spec(waiting.job_id)
             except (RuntimeError, ValueError):
@@ -1332,10 +1248,9 @@ class Dispatcher:
             )
         return found
 
-    @staticmethod
-    def _stopping(job_id: str) -> bool:
+    def _stopping(self, job_id: str) -> bool:
         """Already asked to stop, so its cards are on their way back anyway."""
-        return queue.kill_reason(job_id) is not None or queue.is_cancelled(job_id)
+        return self._state_or_empty(job_id).intent is not None
 
     def _preempt_for(self, candidate: Preemptable, waiting: queue.QueueEntry) -> bool:
         """Stop one auto-preemptable job, saying in both logs who took its place.
@@ -1512,34 +1427,22 @@ class Dispatcher:
         )
 
     # -- retention -------------------------------------------------------
-    def sweep_abandoned_submits(self) -> None:
-        """Resolve jobs whose `gpuc submit` died before it committed them.
+    def sweep_stale_incoming(self) -> None:
+        """Remove job dirs a `gpuc submit` started building and never accepted.
 
-        The client owns everything up to the queue marker, and a submit that
-        never wrote one asked this host for nothing. So this does not put the
-        job in the queue -- it records that the submit did not finish, which is
-        the only thing anybody can act on, and lets the ordinary retention
-        horizons take the job dir afterwards like any other finished job.
+        The client owns a job until `enqueue` renames its dir into `jobs/`, so
+        a dir still under `incoming/` an hour later is a submit that died, and
+        the host was never asked to run it. Hourly, like the other reclaims.
         """
         now = self.deps.monotonic()
         if (
-            self._last_submit_sweep_at is not None
-            and now - self._last_submit_sweep_at < RETENTION_INTERVAL_S
+            self._last_incoming_sweep_at is not None
+            and now - self._last_incoming_sweep_at < RETENTION_INTERVAL_S
         ):
             return
-        self._last_submit_sweep_at = now
-        for job_id in cleanup.abandoned_submits():
-            jobs.update_state(
-                job_id,
-                status="failed",
-                reason="incomplete-submit",
-                exit_code=1,
-                ended_at=jobs.utc_now(),
-            )
-            self.log(
-                f"job {job_id} was never submitted: its spec and state were written but its "
-                f"queue marker never was, so nothing here was asked to run it"
-            )
+        self._last_incoming_sweep_at = now
+        for name in cleanup.remove_stale_incoming():
+            self.log(f"removed incoming/{name}: a submit that never finished enqueueing it")
 
     def maybe_reclaim(self) -> None:
         """Run the two retention horizons at startup, then at most once an hour.
@@ -1599,12 +1502,11 @@ class Dispatcher:
         self._shared = None
         self._borrowable = None
         self.reap()
-        self.handle_cancels()
-        self.escalate_kills()
+        self.escalate_stops()
         self.launch_ready()
         self.preempt_for_waiting()
         self.maybe_reclaim()
-        self.sweep_abandoned_submits()
+        self.sweep_stale_incoming()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:

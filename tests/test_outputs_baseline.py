@@ -42,7 +42,6 @@ def prepare(gpuc_home: Path, command: str, **overrides: object) -> tuple[str, Pa
         **overrides,
     )
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     results = paths.workdir(job_id) / "results"
     results.mkdir(parents=True, exist_ok=True)

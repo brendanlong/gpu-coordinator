@@ -130,16 +130,6 @@ def cmd_status(args: argparse.Namespace) -> int:
             continue
         spec = _spec(job_id)
         entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
-        # From the spec, not the state: a *queued* job has no eta yet, and its
-        # estimate is exactly what somebody deciding whether to queue behind it
-        # needs. The control side never sees the spec.
-        entry["estimated_runtime_min"] = spec.estimated_runtime_min if spec else None
-        # Also from the spec, and for the same reason: the queue marker below
-        # only carries a priority while the job is still queued, so a running
-        # job has one nowhere else. `gpuc reorder` writes the spec too, so this
-        # is the priority the job was dispatched at, not the one it was
-        # submitted with.
-        entry["priority"] = spec.priority if spec else None
         # Whether this job gives its cards up to anything more important. It
         # changes what "running" promises, and only the spec knows.
         entry["auto_preempt"] = spec.auto_preempt if spec else None
@@ -220,15 +210,15 @@ def cmd_preempt(args: argparse.Namespace) -> int:
     except (OSError, ValueError, RuntimeError) as exc:
         print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
         return 1
-    spec = _spec(args.job_id)
+    state = _state_or_none(args.job_id)
     print(
         json.dumps(
             {
                 "job_id": args.job_id,
                 "status": status,
-                # What it will be queued at once its runner stops, which is the
-                # spec's priority whether or not this call changed it.
-                "priority": spec.priority if spec else None,
+                # What it will be queued at once its runner stops, whether or
+                # not this call changed it.
+                "priority": state.priority if state else None,
                 # The dispatcher is what puts the job back, so make sure there
                 # is one: on a host whose dispatcher died, the kill would land
                 # and nothing would ever queue the job again.
@@ -281,8 +271,8 @@ def _estimate_error(job_id: str, minutes: float | None) -> str | None:
 def cmd_estimate(args: argparse.Namespace) -> int:
     """Set (or clear) `estimated_runtime_min` on a job that is already here.
 
-    A running job's runner re-reads `spec.json` on a timer, so this reaches it
-    without any message passing: see `runner.SPEC_REFRESH_S`.
+    A running job's runner re-reads its state on a timer, so this reaches it
+    without any message passing: see `runner.ESTIMATE_REFRESH_S`.
     """
     job_id = args.job_id
     if args.clear is (args.minutes is not None):
@@ -293,26 +283,27 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     if error is not None:
         print(json.dumps({"job_id": job_id, "error": error}))
         return 1
-    spec = jobs.update_spec(job_id, estimated_runtime_min=minutes)
+    state = jobs.transition(job_id, expect=("queued", "running"), estimated_runtime_min=minutes)
+    if state is None:
+        print(json.dumps({"job_id": job_id, "error": f"job {job_id} finished as this ran"}))
+        return 1
+    spec = _spec(job_id)
     warning = None
-    if (
-        spec.estimated_runtime_min is not None
-        and spec.max_runtime_min is not None
-        and spec.estimated_runtime_min > spec.max_runtime_min
-    ):
+    cap = spec.max_runtime_min if spec else None
+    if minutes is not None and cap is not None and minutes > cap:
         # The same contradiction `submit` warns about, and the only place
         # anyone will see it before the job dies as `timeout`.
         warning = (
-            f"estimated_runtime_min ({spec.estimated_runtime_min:g}) is longer than this job's "
-            f"max_runtime_min ({spec.max_runtime_min:g}), so it expects to be killed as "
+            f"estimated_runtime_min ({minutes:g}) is longer than this job's "
+            f"max_runtime_min ({cap:g}), so it expects to be killed as "
             f"`timeout` before it finishes"
         )
     print(
         json.dumps(
             {
                 "job_id": job_id,
-                "estimated_runtime_min": spec.estimated_runtime_min,
-                "status": jobs.read_state(job_id).status,
+                "estimated_runtime_min": minutes,
+                "status": state.status,
                 "warning": warning,
             }
         )

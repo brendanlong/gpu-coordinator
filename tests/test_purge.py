@@ -35,7 +35,6 @@ def make_job(
 ) -> str:
     spec = make_spec(outputs=[OUTPUT] if outputs else [])
     job_id = queue.enqueue(spec)
-    queue.remove_marker(job_id)
     ended = datetime.now(UTC) - timedelta(days=days_old)
     fields: dict[str, Any] = {"status": status}
     if status in jobs.FINISHED_STATUSES:
@@ -282,12 +281,13 @@ def test_purge_implies_the_workdir_clean_for_jobs_it_keeps(gpuc_home: Path) -> N
     assert jobs.read_state(kept).workdir_removed is True
 
 
-def test_a_stray_queue_marker_and_secrets_file_go_with_the_job(gpuc_home: Path) -> None:
+def test_the_secrets_file_goes_with_the_purged_job(gpuc_home: Path) -> None:
+    """It lives outside the job dir, in `secrets/`, so removing the dir alone
+    would leave a job's credentials on the host after its record had gone."""
     job_id = make_job()
-    (paths.queue_dir() / queue.marker_name(50, job_id)).touch()
     paths.job_env_file(job_id).write_text("SECRET=1\n")
     cleanup.purge(older_than_days=7.0)
-    assert queue.find_marker(job_id) is None
+    assert not paths.job_dir(job_id).exists()
     assert not paths.job_env_file(job_id).exists()
 
 

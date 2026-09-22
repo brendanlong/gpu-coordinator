@@ -60,6 +60,11 @@ class HostSession:
     def job_dir(self, job_id: str) -> str:
         return f"{self.home}/jobs/{job_id}"
 
+    def staging_dir(self, job_id: str) -> str:
+        """Where `submit` builds a job before `enqueue` accepts it by renaming
+        the dir into `jobs/`; see `gpuc.host.queue.enqueue`."""
+        return f"{self.home}/incoming/{job_id}"
+
     def run(self, command: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> CommandResult:
         return self.transport.run(command, timeout=timeout, check=False)
 

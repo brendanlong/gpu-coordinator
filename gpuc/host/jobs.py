@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +24,19 @@ incompatible change has something to branch on -- the readers here are
 deliberately tolerant enough that it has not had to."""
 
 FINISHED_STATUSES = ("succeeded", "failed", "cancelled")
+
+CANCEL = "cancel"
+PREEMPT = "preempt"
+INTENTS = (CANCEL, PREEMPT)
+"""What somebody has asked of a job, as distinct from what it is doing.
+
+`status` is the job's own progress; `intent` is the request standing against
+it. A queued job is cancelled outright, so the only intents are ones a running
+job's runner acts on: `cancel` ends it as `cancelled`, `preempt` ends the
+attempt as `failed: preempted` and the dispatcher queues it again. Both live
+in the same file as `status`, written in the same atomic replace, so there is
+no order of writes to get right and nothing to reconcile after a crash.
+"""
 
 ON_SUCCESS = "on_success"
 ALWAYS = "always"
@@ -345,7 +360,18 @@ class JobSpec:
 class JobState:
     status: str = "queued"
     """queued | running | succeeded | failed | cancelled."""
+    intent: str | None = None
+    """`cancel` | `preempt` | null: see `INTENTS`."""
     attempt: int = 1
+    priority: int = 50
+    """The priority the job is (or was) ordered by. Starts as the spec's and
+    is what `gpuc reorder` and `gpuc preempt --priority` change; the queue is
+    every `queued` state sorted by `(priority, job_id)`, so this is the one
+    copy of it."""
+    estimated_runtime_min: float | None = None
+    """The submitter's estimate, as `gpuc estimate` last left it. The spec is
+    never rewritten after enqueue, so the live value is here and the runner
+    re-reads it from here."""
     reason: str | None = None
     exit_code: int | None = None
     gpus: list[str] = field(default_factory=list)
@@ -437,9 +463,13 @@ class JobState:
         that can be written by another build, or by hand.
         """
         fields = fields_of(d)
+        intent = as_opt_str(fields, "intent")
         return JobState(
             status=as_str(fields, "status", "queued") or "queued",
+            intent=intent if intent in INTENTS else None,
             attempt=as_int(fields, "attempt", 1),
+            priority=as_int(fields, "priority", 50),
+            estimated_runtime_min=as_opt_float(fields, "estimated_runtime_min"),
             reason=as_opt_str(fields, "reason"),
             exit_code=as_opt_int(fields, "exit_code"),
             gpus=as_str_list(fields, "gpus"),
@@ -473,29 +503,27 @@ class JobState:
     def finished(self) -> bool:
         return self.status in FINISHED_STATUSES
 
+    @staticmethod
+    def initial(spec: JobSpec) -> JobState:
+        """The state a job is enqueued with: everything the spec said that can
+        change afterwards, copied out of it once."""
+        return JobState(
+            status="queued",
+            attempt=spec.attempt,
+            priority=spec.priority,
+            estimated_runtime_min=spec.estimated_runtime_min,
+        )
+
 
 def write_spec(spec: JobSpec) -> None:
+    """Written once, by `enqueue`. Nothing rewrites a spec after that: the
+    fields a person can change later (`priority`, `estimated_runtime_min`)
+    live in the state, so the spec is always what was submitted."""
     atomic_write_json(paths.spec_file(spec.job_id), spec.to_dict())
 
 
 def read_spec(job_id: str) -> JobSpec:
     return JobSpec.from_dict(read_json(paths.spec_file(job_id)))
-
-
-def update_spec(job_id: str, **fields: Any) -> JobSpec:
-    """Change fields of a job's spec, in place on disk.
-
-    Raw JSON in and raw JSON out rather than a `JobSpec` round trip: a spec
-    written by another build holds keys `from_dict` drops, and setting an
-    estimate is not a reason to lose them.
-    """
-    document = dict(fields_of(read_json(paths.spec_file(job_id))))
-    for key, value in fields.items():
-        if key not in JobSpec.__dataclass_fields__:
-            raise KeyError(f"unknown JobSpec field: {key}")
-        document[key] = value
-    atomic_write_json(paths.spec_file(job_id), document)
-    return JobSpec.from_dict(document)
 
 
 def write_state(job_id: str, state: JobState) -> None:
@@ -506,14 +534,58 @@ def read_state(job_id: str) -> JobState:
     return JobState.from_dict(read_json(paths.state_file(job_id)))
 
 
-def update_state(job_id: str, **fields: Any) -> JobState:
-    state = read_state(job_id)
+@contextlib.contextmanager
+def locked(job_id: str) -> Iterator[None]:
+    """Hold the job's lock for a read-modify-write of its state.
+
+    Three processes update one job's `state.json`: the dispatcher, the job's
+    runner (from two threads), and whatever `python -m gpuc.host` command an
+    ssh session runs. Each write is an atomic replace, so readers never see a
+    torn file, but two read-modify-writes that overlap lose one of them --
+    which, when the lost one was `intent: cancel`, is a job that keeps running.
+    """
+    path = paths.job_lock_file(job_id)
+    if not path.parent.is_dir():
+        raise FileNotFoundError(f"no such job: {job_id}")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _apply(state: JobState, fields: Mapping[str, Any]) -> JobState:
     for key, value in fields.items():
         if key not in JobState.__dataclass_fields__:
             raise KeyError(f"unknown JobState field: {key}")
         setattr(state, key, value)
-    write_state(job_id, state)
     return state
+
+
+def update_state(job_id: str, **fields: Any) -> JobState:
+    with locked(job_id):
+        state = _apply(read_state(job_id), fields)
+        write_state(job_id, state)
+        return state
+
+
+def transition(job_id: str, *, expect: str | tuple[str, ...], **fields: Any) -> JobState | None:
+    """Update the state only if its `status` is still one of `expect`.
+
+    The compare-and-set every change of ownership goes through: the
+    dispatcher claims a queued job, a cancel ends a queued job, a requeue puts
+    a finished one back. Two of those racing on one job -- a cancel landing as
+    the dispatcher launches it -- cannot both win, and the loser learns it
+    from the None rather than from a job that is both running and cancelled.
+    """
+    wanted = (expect,) if isinstance(expect, str) else expect
+    with locked(job_id):
+        state = read_state(job_id)
+        if state.status not in wanted:
+            return None
+        write_state(job_id, _apply(state, fields))
+        return state
 
 
 def list_job_ids() -> list[str]:

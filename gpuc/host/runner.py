@@ -37,12 +37,12 @@ from gpuc.host.jobs import JobSpec
 
 KILL_GRACE_S = 15.0
 SAMPLE_INTERVAL_S = 30.0
-SPEC_REFRESH_S = 30.0
-"""How often the monitor re-reads `spec.json` while a job runs.
+ESTIMATE_REFRESH_S = 30.0
+"""How often the monitor re-reads the job's estimate while it runs.
 
-`gpuc estimate` edits the spec of a job that is already running, and the copy
-loaded at job start would never see it -- which is the job that most needs an
-end time, since nobody can add one before it started."""
+`gpuc estimate` changes the state of a job that is already running, and the
+value loaded at job start would never see it -- which is the job that most
+needs an end time, since nobody can add one before it started."""
 UTIL_SAMPLES_KEPT = 40  # 20 minutes at the default sample interval
 POLL_INTERVAL_S = 0.5
 TERMINATED_EXIT_CODE = 143  # 128 + SIGTERM, the shell convention
@@ -261,7 +261,7 @@ class RunnerDeps:
     now: Callable[[], float] = time.monotonic
     poll_interval_s: float = POLL_INTERVAL_S
     sample_interval_s: float = SAMPLE_INTERVAL_S
-    spec_refresh_s: float = SPEC_REFRESH_S
+    estimate_refresh_s: float = ESTIMATE_REFRESH_S
     kill_grace_s: float = KILL_GRACE_S
     preflight: bool = True
     preflight_command: Callable[[], str] = preflight_command
@@ -318,10 +318,10 @@ class JobRunner:
         """Whether a `progress_command` has produced an eta yet. Once one has,
         the spec's estimate is no longer published: it is a guess, and this is
         a measurement."""
-        self._live = self.spec
-        """The spec as the last re-read found it on disk, which outlives the
-        phase that read it: an estimate added during `setup` must not be
-        undone by `main` starting from the copy loaded at job start."""
+        self._estimate = self.state.estimated_runtime_min
+        """The estimate as the last re-read found it, which outlives the phase
+        that read it: an estimate added during `setup` must not be undone by
+        `main` starting from the value loaded at job start."""
         self._published_estimate: float | None = None
         """The `estimated_runtime_min` behind the eta now in the state file,
         null when that eta is not ours. Kept so the spec re-read only writes
@@ -386,44 +386,36 @@ class JobRunner:
         max_runtime_s = (
             None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
         )
-        # `spec.json` is re-read on a timer, so an estimate (or a progress
-        # command) added after the job started still takes effect. Only what it
-        # *reports* -- `estimated_runtime_min`, `progress_command` and its
-        # interval -- is taken from the re-read: a command, an env or an output
-        # path changing mid-flight would leave the spec describing a run that
-        # never happened.
-        live = self._live
-        next_spec = phase_start + deps.spec_refresh_s
+        # The estimate is re-read on a timer, so one added after the job
+        # started still takes effect. It is the one thing a running job
+        # re-reads: the spec is never rewritten after enqueue.
+        next_estimate = phase_start + deps.estimate_refresh_s
         # The submitter's estimate, published from the first phase on: a job
         # still installing torch is exactly the one somebody wants an end time
         # for. A `progress_command` replaces it with a measured one below.
-        self._publish_estimated_eta(live.estimated_runtime_min, phase_start - job_start)
+        self._publish_estimated_eta(self._estimate, phase_start - job_start)
         # Progress is a fraction of the job's own work, so only `main` can
         # report it: during setup the command would be reading a file the job
         # has not started writing.
-        progress_command = live.progress_command if phase == "main" else None
-        next_progress = phase_start + live.progress_interval_s
+        progress_command = self.spec.progress_command if phase == "main" else None
+        next_progress = phase_start + self.spec.progress_interval_s
 
         while proc.poll() is None:
             deps.sleep(deps.poll_interval_s)
             t = deps.now()
-            if queue.is_cancelled(self.job_id):
-                self._kill(proc, "cancelled", log)
-                break
-            requested = queue.kill_reason(self.job_id)
+            requested = queue.stop_requested(self.job_id)
             if requested:
                 self._kill(proc, requested, log)
                 break
             if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
                 self._kill(proc, "timeout", log)
                 break
-            if t >= next_spec:
-                next_spec = t + deps.spec_refresh_s
-                live = self._live = self._live_spec(live)
-                self._publish_estimated_eta(live.estimated_runtime_min, t - job_start)
-                progress_command = live.progress_command if phase == "main" else None
+            if t >= next_estimate:
+                next_estimate = t + deps.estimate_refresh_s
+                self._estimate = self._live_estimate()
+                self._publish_estimated_eta(self._estimate, t - job_start)
             if progress_command and t >= next_progress:
-                next_progress = t + live.progress_interval_s
+                next_progress = t + self.spec.progress_interval_s
                 self._record_progress(progress_command, t - phase_start, log)
             if record_util and t >= next_sample:
                 next_sample = t + deps.sample_interval_s
@@ -438,13 +430,14 @@ class JobRunner:
                 self._record_util(util)
         return proc.wait()
 
-    def _live_spec(self, previous: JobSpec) -> JobSpec:
-        """The spec as `spec.json` holds it now, or `previous` if it cannot be
-        read -- a spec being rewritten under us may not end a running job."""
+    def _live_estimate(self) -> float | None:
+        """The estimate as the state holds it now, or the last one read if the
+        state cannot be read -- a file being replaced under us may not end a
+        running job."""
         try:
-            return jobs.read_spec(self.job_id)
+            return jobs.read_state(self.job_id).estimated_runtime_min
         except (RuntimeError, OSError, ValueError):
-            return previous
+            return self._estimate
 
     def _publish_estimated_eta(self, estimate: float | None, elapsed_s: float) -> None:
         """The end time the submitter's estimate implies, while that is the
@@ -728,11 +721,13 @@ class JobRunner:
         return None
 
     def _cancelled_before(self, phase: str, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int | None:
-        """A job cancelled during the launch window never starts a phase."""
-        if not queue.is_cancelled(self.job_id):
+        """A job asked to stop between phases never starts the next one."""
+        requested = queue.stop_requested(self.job_id)
+        if requested is None:
             return None
-        self._log(log, f"cancel marker present before phase={phase}; not starting it")
-        return self._finalize(TERMINATED_EXIT_CODE, "cancelled", "cancelled", sync_loop, log)
+        self.kill_reason = requested
+        self._log(log, f"{requested} before phase={phase}; not starting it")
+        return self._finalize(TERMINATED_EXIT_CODE, *self._classify(1, None), sync_loop, log)
 
     def _finalize_terminated(
         self, exc: _Terminated, sync_loop: sync.SyncLoop, log: IO[bytes]
@@ -752,7 +747,7 @@ class JobRunner:
             self._kill(proc, "terminated", log)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
-        cancelled = queue.is_cancelled(self.job_id)
+        cancelled = queue.stop_requested(self.job_id) == "cancelled"
         status, reason = ("cancelled", "cancelled") if cancelled else ("failed", "terminated")
         return self._finalize(TERMINATED_EXIT_CODE, status, reason, sync_loop, log)
 
@@ -775,12 +770,9 @@ class JobRunner:
         skip_output_sync: bool = False,
     ) -> int:
         self._finalizing = True
-        # Read once, and before the final state write below: from that write
-        # on, a dispatcher starting up sees a finished job with a preempt
-        # marker and is entitled to consume the marker. Asked again afterwards
-        # -- as the workdir and secrets decisions used to -- the answer flips
-        # to "no preempt" and this runner deletes the very workdir and secrets
-        # file the next attempt was about to be dispatched with.
+        # The intent survives every write this runner makes, and the
+        # dispatcher only consumes it once this process has exited, so the
+        # workdir and secrets decisions below can trust this reading.
         self._preempting = queue.is_preempted(self.job_id)
         jobs.update_state(self.job_id, phase="sync")
         if skip_output_sync:

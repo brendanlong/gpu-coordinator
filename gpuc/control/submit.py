@@ -382,7 +382,7 @@ def push_workdir(
     use_git: bool = True,
     report: Reporter = print,
 ) -> None:
-    remote = f"{session.job_dir(job_id)}/workdir"
+    remote = f"{session.staging_dir(job_id)}/workdir"
     session.transport.run(f'mkdir -p "{remote}"', check=True)
     if not use_git:
         _push_without_git(session, job_id, workdir, remote, report)
@@ -396,10 +396,10 @@ def push_workdir(
         session.transport.rsync(workdir, remote, summary.files)
     patch = uncommitted_patch(workdir)
     if patch:
-        session.transport.put_file(patch, f"{session.job_dir(job_id)}/uncommitted.patch", 0o644)
+        session.transport.put_file(patch, f"{session.staging_dir(job_id)}/uncommitted.patch", 0o644)
     session.transport.put_file(
         json.dumps(git_source(workdir), indent=2) + "\n",
-        f"{session.job_dir(job_id)}/source.json",
+        f"{session.staging_dir(job_id)}/source.json",
         0o644,
     )
 
@@ -421,17 +421,20 @@ def _push_without_git(
     source = {"submitted_from": str(workdir), "submitted_at": utc_now(), "git": None}
     session.transport.put_file(
         json.dumps(source, indent=2) + "\n",
-        f"{session.job_dir(job_id)}/source.json",
+        f"{session.staging_dir(job_id)}/source.json",
         0o644,
     )
 
 
 def enqueue_spec(session: HostSession, spec: JobSpec) -> dict[str, Any]:
-    """Hand the spec to the host over stdin; `enqueue` starts the dispatcher."""
-    staged = f"{session.home}/incoming/{spec.job_id}.json"
+    """Put the spec in the staged job dir and ask the host to accept it.
+
+    `enqueue` rewrites the spec normalised, writes the initial state beside
+    it, and renames the whole dir into `jobs/`; it also starts the dispatcher.
+    """
+    staged = f"{session.staging_dir(spec.job_id)}/spec.json"
     session.transport.put_file(json.dumps(spec.to_dict(), indent=2) + "\n", staged, 0o644)
-    response = session.host_json(f"enqueue - < {shlex.quote(staged)}")
-    session.run(f'rm -f "{staged}"')
+    response = session.host_json(f"enqueue {shlex.quote(staged)}")
     if not isinstance(response, dict):
         raise SubmitError(f"unexpected enqueue response from {session.entry.name}: {response!r}")
     return response
