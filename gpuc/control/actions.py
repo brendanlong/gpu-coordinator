@@ -807,3 +807,49 @@ def logs_from_s3(
     fallback = f"falling back to the S3 mirror at {uri}"
     report(fallback)
     return LogText("s3", uri, s3.get_uri(uri), [fallback])
+
+
+def unhosted_jobs(
+    settings: Settings, seen: set[str], host: str | None = None
+) -> tuple[list[IndexEntry], set[str], bool]:
+    """The index's view of jobs no host admitted to having, and whether that is
+    all of it: an S3 index that could not be read leaves this list short.
+
+    After a host loses its state -- a container whose $HOME was wiped, a pod
+    that is gone -- this is the only list of what was on it, and `gpuc requeue
+    <id> --host <name>` is how each one comes back, so `--host H --all` narrows
+    it to the host being recovered.
+
+    Returns the entries, the ids among them whose outputs the mirror records as
+    lost, and whether the index was read in full.
+    """
+    index = JobIndex(settings)
+    entries, complete = index.all()
+    elsewhere = [
+        entry
+        for job_id, entry in sorted(entries.items())
+        if job_id not in seen and (host is None or entry.host == host)
+    ]
+    if not elsewhere:
+        return [], set(), complete
+    return elsewhere, _outputs_lost_ids(index, elsewhere[:MIRROR_STATE_LOOKUPS]), complete
+
+
+MIRROR_STATE_LOOKUPS = 25
+"""How many index-only jobs `--all` reads `state.json` for. One GET each, and
+the answer (did this job's outputs make it off the host?) matters most for the
+handful at the top of a recovery list."""
+
+
+def _outputs_lost_ids(index: JobIndex, entries: Sequence[IndexEntry]) -> set[str]:
+    """Which of these jobs the mirror records as having lost their outputs.
+
+    Best effort: a job whose state.json is missing or unreadable simply does not
+    get the flag, because this is a note on a listing, not a decision.
+    """
+    return {
+        entry.job_id
+        for entry in entries
+        if (document := index.mirrored_state(entry.job_id, entry.s3_prefix))
+        and document.get("outputs_lost")
+    }

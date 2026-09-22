@@ -359,9 +359,13 @@ def test_use_shared_is_an_override_of_the_spec_and_only_when_it_is_passed(
         seen.append(dict(overrides or {}))
         return SubmitResult(job_id="j", host="gpubox", attempt=1)
 
-    monkeypatch.setattr("gpuc.control.cli.submit_file", capture)
-    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
-    monkeypatch.setattr("gpuc.control.cli.placement_after", lambda *a, **k: placement_unknown())
+    monkeypatch.setattr("gpuc.control.submitting.submit_file", capture)
+    monkeypatch.setattr(
+        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
+    )
+    monkeypatch.setattr(
+        "gpuc.control.submitting.placement_after", lambda *a, **k: placement_unknown()
+    )
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
@@ -429,8 +433,8 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
         seen["job_id"] = kwargs["job_id"]
         return SubmitResult(job_id=str(kwargs["job_id"]), host=entry.name, attempt=1)
 
-    monkeypatch.setattr("gpuc.control.cli.runpod_host", fake_runpod_host)
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit_spec)
+    monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit_spec)
 
     assert (
         main(
@@ -503,8 +507,8 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
         seen["attempt"] = kwargs["attempt"]
         return SubmitResult(job_id="new", host=entry.name, attempt=2)
 
-    monkeypatch.setattr("gpuc.control.cli.runpod_host", fake_runpod_host)
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit_spec)
+    monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit_spec)
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 0
     assert seen == {"gpu_names": ["A40"], "attempt": 2}
@@ -607,7 +611,7 @@ def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     created: list[object] = []
     monkeypatch.setattr(
-        "gpuc.control.cli.runpod_host",
+        "gpuc.control.submitting.runpod_host",
         lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
     )
 
@@ -628,7 +632,7 @@ def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
     created: list[object] = []
     monkeypatch.delenv("GPUC_DEFINITELY_UNSET", raising=False)
     monkeypatch.setattr(
-        "gpuc.control.cli.runpod_host",
+        "gpuc.control.submitting.runpod_host",
         lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
     )
 
@@ -1093,7 +1097,7 @@ def test_a_bad_workdir_days_value_is_rejected(
 
 
 def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:
-    from gpuc.control.cli import _outputs_lost_ids
+    from gpuc.control.actions import _outputs_lost_ids
     from gpuc.control.s3index import IndexEntry, JobIndex, S3Index
 
     client = FakeS3Client(
@@ -1143,16 +1147,16 @@ def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | N
         restored = config or entry.initial_config().to_dict()
         return entry.with_config({**restored, "pkg_commit": "b" * 40})
 
-    monkeypatch.setattr("gpuc.control.cli.resync_package", fake_resync)
+    monkeypatch.setattr("gpuc.control.submitting.resync_package", fake_resync)
 
     def open_or_fail(*_: object, **__: object) -> Any:
         if config is None:
             raise RemoteError("gpubox", "printf %s", "could not reach host gpubox")
         return fake_session
 
-    monkeypatch.setattr("gpuc.control.cli.open_session", open_or_fail)
+    monkeypatch.setattr("gpuc.control.submitting.open_session", open_or_fail)
     monkeypatch.setattr(
-        "gpuc.control.cli.submit_file",
+        "gpuc.control.submitting.submit_file",
         lambda *a, **k: SubmitResult(job_id="j", host="gpubox", attempt=1),
     )
     return resynced
@@ -1250,7 +1254,7 @@ def test_submit_records_the_hosts_commit_without_clobbering_the_rest_of_the_entr
         return {"pkg_commit": "c" * 40}
 
     monkeypatch.setattr(
-        "gpuc.control.cli.open_session",
+        "gpuc.control.submitting.open_session",
         lambda *a, **k: SimpleNamespace(
             transport=SimpleNamespace(host="gpubox"), read_config=concurrent_probe
         ),
@@ -1475,7 +1479,7 @@ def test_submit_json_is_the_queued_job_and_its_notes(
             job_id="20260915-120000-abc123", host=entry.name, attempt=1, notes=["s3_bucket unset"]
         )
 
-    monkeypatch.setattr("gpuc.control.cli.submit_file", fake_submit_file)
+    monkeypatch.setattr("gpuc.control.submitting.submit_file", fake_submit_file)
     capsys.readouterr()
     assert main(["submit", str(job), "--host", "local", "--json"]) == 0
     captured = capsys.readouterr()
@@ -1510,7 +1514,7 @@ def test_requeue_json_names_the_job_it_came_from(
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
-        "gpuc.control.cli.submit_spec",
+        "gpuc.control.submitting.submit_spec",
         lambda entry, *a, **k: SubmitResult(job_id="new", host=entry.name, attempt=2),
     )
     register_host(name="local", gpus=GPU)
@@ -1551,14 +1555,18 @@ def _requeue_setup(
         "gpuc.control.actions.open_session",
         lambda entry, *a, **k: _KnowsJobs(entry.name, known.get(entry.name, set()), asked),
     )
-    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
-    monkeypatch.setattr("gpuc.control.cli.placement_after", lambda *a, **k: placement_unknown())
+    monkeypatch.setattr(
+        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
+    )
+    monkeypatch.setattr(
+        "gpuc.control.submitting.placement_after", lambda *a, **k: placement_unknown()
+    )
 
     def fake_submit(entry: Any, *a: Any, **k: Any) -> SubmitResult:
         submitted.append(entry.name)
         return SubmitResult(job_id="new", host=entry.name, attempt=k["attempt"])
 
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
     for name in known:
         register_host(name=name, kind="ssh", ssh=f"me@{name}", gpus=GPU)
     return asked, submitted
@@ -1621,7 +1629,7 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
         submitted.append(model)
         return SubmitResult(job_id="new", host=entry.name, attempt=2)
 
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
@@ -1641,7 +1649,7 @@ def test_requeue_refuses_a_mirrored_spec_that_asks_for_no_gpu(
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
-        "gpuc.control.cli.submit_spec",
+        "gpuc.control.submitting.submit_spec",
         lambda *a, **k: pytest.fail("a spec asking for no GPU must not be submitted"),
     )
     register_host(name="local", gpus=GPU)
@@ -1673,7 +1681,9 @@ def test_requeue_refuses_a_mirror_an_older_build_expanded(
         }
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
-    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
+    monkeypatch.setattr(
+        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
+    )
     monkeypatch.setattr(
         "gpuc.control.submit.open_session",
         lambda *a, **k: pytest.fail("a spec pointed at an earlier run's outputs must not ship"),
@@ -1702,7 +1712,7 @@ def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
-        "gpuc.control.cli.runpod_host",
+        "gpuc.control.submitting.runpod_host",
         lambda *a, **k: pytest.fail("no pod may be bought for a spec that is refused"),
     )
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 1
@@ -1729,7 +1739,7 @@ def test_requeue_expands_the_mirrored_template_with_the_new_id(
         submitted.append(model)
         return SubmitResult(job_id="new", host=entry.name, attempt=2)
 
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
@@ -2224,7 +2234,7 @@ def bootstrapping(
             raise error
         return fake_bootstrap(entry, settings, **kwargs)
 
-    monkeypatch.setattr("gpuc.control.cli.bootstrap_host", fake)
+    monkeypatch.setattr("gpuc.control.hosts.bootstrap_host", fake)
     return attempted
 
 
@@ -2433,7 +2443,7 @@ def adoptable(monkeypatch: pytest.MonkeyPatch, fake_host: FakeHost) -> FakeProvi
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda settings: provider)
     fake_host.put_file(
         json.dumps(
             {
@@ -2502,7 +2512,7 @@ def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda settings: provider)
 
     assert main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111"]) == 0
 
@@ -2598,3 +2608,45 @@ def test_reorder_refuses_to_report_a_move_the_host_did_not_say_it_made(
     assert document["exit_code"] == EXIT_ERROR
     assert "did not say what it did with 20260101-000000-aaaaaa" in str(document["error"])
     assert "priority" not in document
+
+
+def test_the_commands_the_dashboard_could_want_live_outside_the_cli() -> None:
+    """cli.py is argparse and text; what a command *does* is somewhere the web can call.
+
+    A structural pin, not a behavioural one: the logic that used to live in
+    these `cmd_*` bodies must stay importable without the CLI.
+    """
+    import inspect
+
+    from gpuc.control import actions, cli, hosts, submitting
+
+    moved = {
+        submitting: ["submit_job", "requeue_job", "ensure_package_current", "mirror_spec_first"],
+        hosts: ["add_host", "set_host", "bootstrap_and_record", "bootstrap_every_host"],
+        actions: ["unhosted_jobs"],
+    }
+    for module, names in moved.items():
+        for name in names:
+            assert hasattr(module, name), f"{module.__name__} lost {name}"
+    for name in [
+        "ensure_package_current",
+        "mirror_spec_first",
+        "check_runpod_args",
+        "runpod_target",
+        "BootstrapTally",
+        "_print_unhosted",
+        "_outputs_lost_ids",
+        "_pod_address",
+        "_refuse_a_taken_name",
+    ]:
+        assert not hasattr(cli, name), f"cli.py defines {name} again"
+    calls = {
+        cli.cmd_submit: "submit_job",
+        cli.cmd_requeue: "requeue_job",
+        cli.cmd_host_add: "add_host",
+        cli.cmd_host_set: "set_host",
+        cli.cmd_host_bootstrap: "bootstrap_every_host",
+        cli.cmd_status: "status_views",
+    }
+    for command, callee in calls.items():
+        assert f"{callee}(" in inspect.getsource(command), f"{command.__name__} skips {callee}"

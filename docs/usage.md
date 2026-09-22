@@ -490,7 +490,8 @@ SIGTERMs its process group and SIGKILLs it 15 s later, then runs the final sync
 and writes the final state. A queued job is cancelled on the spot. If the
 runner does not act the dispatcher escalates: the scope and a SIGKILL of the
 job's group at 15 s, a SIGTERM of the runner at 30 s, a SIGKILL of its group at
-45 s. `gpuc preempt` is the same request with a different ending.
+45 s. A runner already in its final upload is left alone however long that
+takes. `gpuc preempt` is the same request with a different ending.
 
 Each phase runs in a transient `systemd --user` scope where the host has one and
 in its own process group where it does not (`isolation: cgroup` or `pgid` in

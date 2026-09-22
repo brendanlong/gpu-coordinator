@@ -36,6 +36,8 @@ gpuc/
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command
     actions.py     # one function per command returning its --json document; the CLI and the web call these
+    hosts.py       # the actions of `host add`, `host set` and `host bootstrap`
+    submitting.py  # the actions of `submit` and `requeue`: rent or look up the host, re-ship, enqueue
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
@@ -515,6 +517,10 @@ hold to, whatever the flags:
   host, and the precedence is written once. Every per-job verb runs through
   `actions.job_verb`: find the host, ask it, insist on a verdict, re-mirror a
   spec field it changed. The CLI and the dashboard call the same functions.
+- What a command does lives in `actions` (with `hosts` and `submitting` for
+  the host and submit commands), one function per command returning the
+  document its `--json` form prints; `cli.py` holds only argparse, the
+  parsing of flags into plain arguments, and the text rendering.
 - Nothing runs in the background on this side except, if installed, the web
   dashboard's service.
 

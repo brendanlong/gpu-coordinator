@@ -87,7 +87,6 @@ def host_entry(
         document.setdefault("provider", {"kind": "runpod", "pod_id": pod_id})
     return HostEntry(
         name=name,
-        kind=kind,
         ssh=ssh,
         port=port,
         gpuc_home=gpuc_home,

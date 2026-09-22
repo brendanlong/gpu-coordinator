@@ -946,9 +946,7 @@ def test_the_placement_of_a_job_in_its_hosts_queue() -> None:
 
 def test_an_unreachable_host_places_nothing_rather_than_reporting_an_empty_queue() -> None:
     """Null is not `not queued`: the job was enqueued before anything asked."""
-    view = HostView(
-        entry=HostEntry(name="gpubox", kind="ssh", ssh="me@box"), state=HostState.UNREACHABLE
-    )
+    view = HostView(entry=HostEntry(name="gpubox", ssh="me@box"), state=HostState.UNREACHABLE)
     placement = queue_placement(view, "j-next")
     assert set(placement.values()) == {None}
     assert queue_note(placement) is None

@@ -8,7 +8,7 @@ from tests.fakeprovider import make_offer, running_pod
 
 
 def test_the_provider_block_a_pod_is_given_holds_its_own_record() -> None:
-    address = HostEntry(name="gpuc-a-111", kind="runpod", pod_id="pod1")
+    address = HostEntry(name="gpuc-a-111", pod_id="pod1")
     record = pod_record(address, make_offer(), "2026-09-15T12:00:00+00:00")
     assert record["kind"] == "runpod" and record["pod_id"] == "pod1"
     assert record["offer"]["name"] == "A40"
@@ -16,7 +16,7 @@ def test_the_provider_block_a_pod_is_given_holds_its_own_record() -> None:
 
 
 def test_the_offer_is_read_back_off_the_pods_own_record() -> None:
-    address = HostEntry(name="gpuc-a-111", kind="runpod", pod_id="pod1")
+    address = HostEntry(name="gpuc-a-111", pod_id="pod1")
     offer = offer_of(pod_record(address, make_offer(), "2026-09-15T12:00:00+00:00"))
     assert offer is not None
     assert offer.name == "A40" and offer.price_usd_hr == 0.49
