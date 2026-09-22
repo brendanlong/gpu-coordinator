@@ -24,4 +24,24 @@
   would need to know.
 - Open issues track where the code has not yet caught up with the spec.
 
+## Writing the docs
+
+Each doc has an altitude, and a fact belongs at exactly one of them:
+
+- **SPEC.md** -- the requirement, stated once and straightforwardly. That there
+  is a command to wait for jobs, not how it polls, and never a requirement plus
+  the exceptions it has grown.
+- **ARCHITECTURE.md** -- the invariant a second implementation would have to
+  hold to, not a walkthrough of the code that holds it.
+- **usage.md**, **setup.md** -- what a user does and what the tool does back:
+  flags, refusals, exit codes, schemas. Not why it works that way.
+- **docstrings** -- the *why*. Every "because", the incident that motivated a
+  rule, the option that was rejected.
+
+The test when cutting: **would a reader act differently without this
+sentence?** Commentary fails it and a rule passes -- but the two look alike
+while you are cutting, so check a candidate against the code, not against the
+prose around it. A kill ladder reads like implementation detail right up until
+you are the one trapping SIGTERM to checkpoint.
+
 @docs/SPEC.md
