@@ -578,12 +578,13 @@ def test_runpod_commands_fail_fast_without_an_api_key(
         ["submit", "job.yaml", "--runpod", "--gpu", "A40"],
         ["pods"],
         ["host", "add", "rented", "--pod", "pod1"],
+        ["host", "terminate", "gpuc-e2e-aaa"],
     ):
         assert main(argv) == 1
         err = capsys.readouterr().err
         assert err.strip().splitlines() == [
             "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc host add --pod` or `gpuc pods`"
+            "`gpuc host add --pod`, `gpuc host terminate` or `gpuc pods`"
         ]
 
 
@@ -2258,6 +2259,55 @@ def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(
     assert "wrote its first config" in out
     assert "nothing has bootstrapped this pod" in out
     assert "gpuc host bootstrap rented" in out
+
+
+# -- ending a pod on purpose ---------------------------------------------------
+
+
+def rented_host(monkeypatch: pytest.MonkeyPatch) -> FakeProvider:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    provider = FakeProvider()
+    provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    register_host(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", pod_id="pod1")
+    return provider
+
+
+def test_host_terminate_ends_the_pod_and_says_what_it_cost(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = rented_host(monkeypatch)
+    monkeypatch.setattr(
+        "gpuc.control.status.open_session",
+        lambda *a, **k: as_session(StubSession([{"host": "gpuc-e2e-aaa", "jobs": []}])),
+    )
+
+    assert main(["host", "terminate", "gpuc-e2e-aaa"]) == 0
+
+    assert provider.terminated == ["pod1"]
+    out = capsys.readouterr().out
+    assert "terminated gpuc-e2e-aaa (pod1) (was $0.490/h)" in out
+    assert "forgotten here" in out
+
+
+def test_host_terminate_of_a_busy_pod_is_exit_1_and_says_how_to_insist(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = rented_host(monkeypatch)
+    payload = {
+        "host": "gpuc-e2e-aaa",
+        "jobs": [{"job_id": "j1", "name": "train", "status": "running", "phase": "main"}],
+    }
+    monkeypatch.setattr(
+        "gpuc.control.status.open_session", lambda *a, **k: as_session(StubSession([payload]))
+    )
+
+    assert main(["host", "terminate", "gpuc-e2e-aaa"]) == EXIT_ERROR
+
+    assert provider.terminated == []
+    assert "gpuc-e2e-aaa" in load_registry().hosts
+    err = capsys.readouterr().err
+    assert "train (j1)" in err and "--force" in err
 
 
 def test_an_existing_gpu_overlap_does_not_block_every_other_host_set(

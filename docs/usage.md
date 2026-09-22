@@ -432,11 +432,44 @@ it is registered under here, and how long ago its dispatcher last beat — with
 the hourly total, plus other people's pods by name only, never touched. A pod
 with a fresh heartbeat will end itself; one with none, and nothing running, will
 not: `gpuc host set <host> --idle-min 0` hurries one that still has a
-dispatcher, and the RunPod console ends one that does not. `--no-heartbeat`
-skips the per-pod ssh check. A pod registered nowhere here is named at the
-bottom with how to adopt it, and one younger than the 15-minute provisioning
-ceiling is flagged as possibly still being set up by a `submit` elsewhere.
-`gpuc pods` never terminates anything.
+dispatcher, and `gpuc host terminate` ends either. `--no-heartbeat` skips the
+per-pod ssh check. A pod registered nowhere here is named at the bottom with how
+to adopt or end it, and one younger than the 15-minute provisioning ceiling is
+flagged as possibly still being set up by a `submit` elsewhere. `gpuc pods`
+never terminates anything.
+
+<a name="terminate"></a>
+**`gpuc host terminate <host|pod-id|pod-name> [--force]`** — end a rental now
+and forget it here.
+
+**Without `--force`, the host has to say it is idle.**
+
+| what happened | the refusal (exit 1) says |
+| --- | --- |
+| a job is running or queued, or a finished job's outputs are not confirmed uploaded | which jobs, and both ways on |
+| the host did not answer | why, and that nothing is known about its queue |
+| the pod is not registered | that, plus `gpuc host add --pod` to adopt it first |
+
+```
+gpuc-sweep-3f21aa (rzk1n8x) is not idle:
+  running   lego-s4 (20260915-231241-f880d9)
+  unsynced  hello (20260915-074344-1d4db4) (its outputs are not confirmed uploaded)
+Terminating now kills those jobs and loses anything not already uploaded.
+  gpuc host set gpuc-sweep-3f21aa --idle-min 0   let it finish, then stop by itself
+  gpuc host terminate gpuc-sweep-3f21aa --force   end it now anyway
+```
+
+`--force` does not ask at all, and is the way past all three.
+
+A pod the provider calls dead — `TERMINATED`, `EXITED`, `ERROR` or missing — is
+never refused over: the command ends what is left of the rental and drops the
+registry entry with no flag.
+
+The terminate is retried and confirmed with the provider before the registry
+entry goes. One that still cannot be confirmed is exit 1 and **keeps** the
+entry, so a pod that may be billing stays in `gpuc status` and `gpuc pods`. A
+`local` or `ssh` host has no rental to end and is refused; `gpuc host remove`
+forgets one of those.
 
 A rental that ended itself — a pod the provider reports missing or `TERMINATED`
 — is **forgotten where it is found**: `gpuc status`, `gpuc host bootstrap --all`
@@ -605,7 +638,7 @@ Rules for anything automated:
 `status`, `submit`, `requeue`, `logs`, `wait`, `cancel`, `preempt`, `reorder`,
 `estimate`, `pods`, `version`, `clean`, `config show`, `config init`,
 `host list`, `host probe`, `host add`, `host set`, `host bootstrap`,
-`host clean` and `host remove` take `--json`: **stdout is exactly one JSON
+`host clean`, `host remove` and `host terminate` take `--json`: **stdout is exactly one JSON
 object**, it carries `schema_version`, and everything the text output would print
 alongside it — progress, warnings, `note:` lines — goes to stderr. Exit codes are
 unchanged by the flag. The commands without it have no answer to give: `ssh`
@@ -641,7 +674,8 @@ per-job trouble the command reported rather than stopped for.
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to. `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. Job objects are `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
 | `host add`, `host set` | the host as `host list --json` reports one entry (the address, the host's own config flattened beside it, `cache`, `remote_home`, `ephemeral`), as the registry holds it once the command is done, plus `adopted` (the host already had a config, which `add` took as it stood), `config_path` (that config on the host), `changes[]` (one line per config field this command wrote through to the host, empty when it held that already) and `warnings[]` (`host list`'s re-bootstrap note, and for `add` a host that owns no card or a pod nothing has bootstrapped). `host set` adds `address{}`: the fields it changed here rather than on the host (`persistent_root`, `gpuc_home`), by name and new value |
-| `host remove` | `{host, kind, pod_id, notes[]}` — what was forgotten here. Nothing on the host changes, and a rental is **not** terminated: it bills until it idles out, and `notes` says so |
+| `host remove` | `{host, kind, pod_id, notes[]}` — what was forgotten here. Nothing on the host changes, and a rental is **not** terminated: it bills until it idles out, and `notes` says so, naming `host terminate` |
+| `host terminate` | `{host, pod_id, pod_name, pod_status, cost_usd_hr, checked, running[], queued[], outputs_pending[], terminated, forgotten, notes[]}` — `pod_status` and `cost_usd_hr` are what the provider said **before** the terminate, so `"TERMINATED"` with `terminated: false` is a pod that was already gone. `checked` is whether the host itself answered: false means `running`, `queued` and `outputs_pending` are empty because nothing could be asked, not because there was nothing there. `forgotten` is whether the registry entry went. A refusal is the error document, exit 1 |
 | `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}` — the gpuc home the package went to, how many files, the commit the host now runs, the dispatcher started, and every warning the run printed. With `--all`: `{hosts[], total, bootstrapped[], failed[], gone[], unreadable[], interrupted, errors[]}` — one `hosts[]` entry per registered host, `{name, outcome, error, ephemeral}` plus the single-host fields (null unless it was bootstrapped). `outcome` is `bootstrapped`, `failed` (with `error` saying why), `gone` (a rental the provider no longer has, forgotten rather than failed), `interrupted` (the host a Ctrl-C landed in) or `not_attempted` (the ones after it); `unreadable` names entries this build could not read and so never tried. Exit 1 if any host failed or the run was interrupted; a registry that stops being readable mid-run is the error document and exit 3 |
 | `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` — the cache pruned and its size either side, in bytes and as a human-readable string derived from them. All four size fields are null when `du` on the host failed |
 | `config init` | `{config_file, existed}` — the path written, and whether a file was already there (only ever true with `--force`; without it an existing file is refused, exit 1) |
@@ -788,6 +822,7 @@ nothing until the snapshot expires.
 | a warning names one skipped host entry | that entry did not validate; every other host still works and is written back untouched | fix it by hand, or `gpuc host add <name> --ssh ...` to connect to that host again |
 | `status` warns `host X is running gpuc <sha> and this machine has <sha>` | the host was last bootstrapped from a different build than this one, in either direction | `gpuc host bootstrap X`, or `gpuc host bootstrap --all` for every host at once — safe while jobs run; the new dispatcher adopts them |
 | `status` warns `host X has gpuc <sha> on disk but its running dispatcher was started on <sha>` | the dispatcher outlived the package under it, so nothing shipped since is in effect. A newer dispatcher normally takes over by itself | `gpuc host bootstrap X` — safe while jobs run; the new dispatcher adopts them |
-| `status` says `POD GONE` | the provider reports the pod stopped, so nothing can be run on it. A pod that is terminated or missing is the end of the rental, and `status` forgets that entry as it prints it | nothing for a rental that ended; `gpuc host remove <name>` for a stopped pod the provider still has |
-| `gpuc pods` shows a pod with no heartbeat and nothing running | its dispatcher died, or the machine that was provisioning it was killed before it could clean up; nothing here will end it | terminate it in the RunPod console. A pod that still answers ssh can be re-bootstrapped instead (`gpuc host add <name> --pod <id>`, then `gpuc host bootstrap <name>`) |
+| `status` says `POD GONE` | the provider reports the pod stopped, so nothing can be run on it. A pod that is terminated or missing is the end of the rental, and `status` forgets that entry as it prints it | nothing for a rental that ended; for a stopped pod the provider still has, `gpuc host terminate <name>` ends it and `gpuc host remove <name>` only forgets it |
+| `gpuc pods` shows a pod with no heartbeat and nothing running | its dispatcher died, or the machine that was provisioning it was killed before it could clean up; it will never idle out | `gpuc host terminate <pod-id> --force`. A pod that still answers ssh can be re-bootstrapped instead (`gpuc host add <name> --pod <id>`, then `gpuc host bootstrap <name>`) |
+| `host terminate` says the pod could not be confirmed gone | the provider refused or did not answer the terminate, three times | the registry entry is kept and the pod may still be billing: run it again, and check the RunPod console if it keeps failing |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | the runbook in [setup.md](setup.md#hosts-whose-home-is-wiped-on-restart) |

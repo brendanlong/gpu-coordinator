@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gpuc.control import jsonout, rented
+from gpuc.control import jsonout, rented, teardown
 from gpuc.control import pods as pods_mod
 from gpuc.control import ssh as ssh_mod
 from gpuc.control import status as status_mod
@@ -526,6 +526,39 @@ def cmd_host_remove(args: argparse.Namespace) -> int:
         return EXIT_OK
     print(f"removed host {args.name}")
     for text in document["notes"]:
+        print(f"  {text}")
+    return EXIT_OK
+
+
+def cmd_host_terminate(args: argparse.Namespace) -> int:
+    """End a rental now: the provider call, then forget the host here.
+
+    Progress goes to stderr so that `--json` keeps its single document on
+    stdout, and the result line is printed whatever happened -- a terminate
+    that could not be confirmed raises, and the pod is still billing, which is
+    the one outcome nobody may miss.
+    """
+    settings = load_settings()
+    result = teardown.terminate(
+        args.name,
+        settings,
+        registry=named_registry(),
+        provider=make_provider(settings),
+        force=args.force,
+        report=lambda line: print(line, file=sys.stderr),
+    )
+    if args.json:
+        jsonout.emit(result.document())
+        return EXIT_OK
+    pod = result.target.pod
+    if result.terminated:
+        cost = f" (was ${pod.cost_usd_hr:.3f}/h)" if pod and pod.cost_usd_hr else ""
+        print(f"terminated {result.target.label}{cost}")
+    else:
+        print(f"nothing to terminate: {result.target.label}")
+    if result.forgotten:
+        print("  forgotten here; the provider lists it as TERMINATED for a while yet")
+    for text in result.notes:
         print(f"  {text}")
     return EXIT_OK
 
@@ -1851,6 +1884,25 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(remove, "what was forgotten: the entry's name, kind and pod id")
     remove.set_defaults(func=cmd_host_remove)
 
+    terminate = host.add_parser(
+        "terminate",
+        help="end a rented pod now and forget it here (the pod stops billing)",
+    )
+    terminate.add_argument(
+        "name",
+        help="a registered runpod host, or a pod id or pod name from `gpuc pods`",
+    )
+    terminate.add_argument(
+        "--force",
+        action="store_true",
+        help="terminate without asking the host whether it is idle: kills whatever is "
+        "running and loses anything not yet uploaded",
+    )
+    add_json_flag(
+        terminate, "what was ended, what it was running, and whether the pod is confirmed gone"
+    )
+    terminate.set_defaults(func=cmd_host_terminate)
+
     submit = sub.add_parser("submit", help="submit a job file to a host")
     submit.add_argument("job_file")
     submit.add_argument(
@@ -2255,6 +2307,8 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
 def wants_runpod(args: argparse.Namespace) -> bool:
     if getattr(args, "pod", None):
         return True  # `gpuc host add --pod` asks the provider where that pod is
+    if args.command == "host" and args.host_command == "terminate":
+        return True
     return bool(getattr(args, "runpod", False)) or args.command == "pods"
 
 
@@ -2297,7 +2351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return failed(
             args,
             "RUNPOD_API_KEY is not set; export it before using --runpod, "
-            "`gpuc host add --pod` or `gpuc pods`",
+            "`gpuc host add --pod`, `gpuc host terminate` or `gpuc pods`",
             EXIT_ERROR,
         )
     if args.command not in ("config", "skill"):

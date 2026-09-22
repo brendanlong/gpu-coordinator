@@ -3,8 +3,9 @@
 Pods without our prefix are counted and named and nothing else: they belong to
 someone else and this command is the place that habit is most easily broken.
 Nothing here terminates anything: a pod with a dispatcher ends itself when its
-queue goes idle (`gpuc host set <host> --idle-min 0` hurries it), and one
-without is the provider console's to end.
+queue goes idle (`gpuc host set <host> --idle-min 0` hurries it), and
+`gpuc host terminate <name-or-pod-id>` ends any of ours outright, including one
+with no dispatcher to ask.
 """
 
 from __future__ import annotations
@@ -146,8 +147,8 @@ def render(view: PodsView) -> str:
         names = ", ".join(f"{pod.name} ({pod.id})" for pod in unregistered)
         lines.append(
             f"not registered here: {names}. `gpuc host add <name> --pod <id>` drives one "
-            f"from this machine; nothing here ends a pod, so one whose dispatcher is gone "
-            f"bills until you end it in the provider's console."
+            f"from this machine; one whose dispatcher is gone will never idle out and bills "
+            f"until `gpuc host terminate <id> --force` (or the provider's console) ends it."
         )
         young = [pod for pod in unregistered if _may_be_provisioning(pod)]
         if young:

@@ -328,7 +328,8 @@ def provision(
             progress(f"offer {label} failed: {first}")
     cleanup = (
         f"Pod(s) {', '.join(billing)} could NOT be terminated and are still billing: "
-        f"`gpuc pods` shows them, and the provider's console ends them."
+        f"`gpuc pods` shows them, and `gpuc host terminate <pod-id> --force` (or the "
+        f"provider's console) ends them."
         if billing
         else "All pods created here were terminated."
     )
@@ -473,8 +474,8 @@ def _terminate_now(
                 continue
             progress(
                 f"WARNING: could not terminate {name} ({pod_id}) in {attempt} attempts: {exc}\n"
-                f"  It is still billing until you end it: `gpuc pods` shows it, and the "
-                f"provider's console terminates it."
+                f"  It is still billing until you end it: `gpuc pods` shows it, and "
+                f"`gpuc host terminate {pod_id} --force` ends it."
             )
             return False
         progress(f"{name} terminated and confirmed gone")

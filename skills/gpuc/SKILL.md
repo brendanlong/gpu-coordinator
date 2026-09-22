@@ -273,6 +273,7 @@ scraping any of the text output.
 | `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}`; with `--all`, `{hosts[], total, bootstrapped[], failed[], gone[], unreadable[], interrupted, errors[]}` where each of `hosts[]` is `{name, outcome, error, ...}` and `outcome` is `bootstrapped`, `failed`, `gone` (a rental the provider no longer has, forgotten rather than failed), `interrupted` or `not_attempted` |
 | `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` |
 | `host remove` | `{host, kind, pod_id, notes[]}`; a rental is not terminated by this, and `notes` says so |
+| `host terminate` | `{host, pod_id, pod_name, pod_status, cost_usd_hr, checked, running[], queued[], outputs_pending[], terminated, forgotten, notes[]}`; `checked` false means the host could not be asked, so the three lists are empty for want of an answer, not for want of jobs |
 | `config init` | `{config_file, existed}` |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
 
@@ -312,16 +313,25 @@ Rules, and they are not optional:
   enough cards, the provider says it is RUNNING, its dispatcher heartbeat is
   under 30 s old, and it is not draining. `--no-reuse` forces a new one.
 - There is **no overall pod lifetime**; per-job `max_runtime_min` is the cap,
-  and the idle timer (`--idle-min`) is the only thing that ends a healthy pod.
-- **Nothing on this machine watches or terminates a pod after it is set up.**
-  A pod whose dispatcher dies bills until a person ends it: `gpuc pods` shows
-  every pod with our prefix, its hourly cost and its heartbeat, and the pod
-  ends in the RunPod console. `gpuc host set <host> --idle-min 0` hurries a
-  pod that still has a dispatcher.
+  and the idle timer (`--idle-min`) is the only thing that ends a healthy pod
+  without being told to.
+- **Nothing on this machine watches a pod after it is set up, or ends one on
+  its own.** A pod whose dispatcher dies never idles out and bills until a
+  person ends it: `gpuc pods` shows every pod with our prefix, its hourly cost
+  and its heartbeat.
+- `gpuc host terminate <host|pod-id>` ends a rental now and forgets it here.
+  **Without `--force` the host has to say it is idle**: work in flight, a host
+  that did not answer, and a pod registered nowhere here are all exit 1, naming
+  what it found. `--force` asks nothing and is the way past all three, which is
+  how you end a pod whose dispatcher is dead. To let the pod finish instead,
+  `gpuc host set <host> --idle-min 0` has it stop itself once its queue empties.
+  **Do not `--force` past a refusal on your own**: ask the user — those jobs are
+  not yours to discard.
 - A rental that ended itself is forgotten when it is found: `status` and
   `host bootstrap --all` drop the registry entry and say so, rather than
   reporting a host nobody can reach. A pod that is merely stopped shows as
-  `POD GONE` and stays until `gpuc host remove <name>`.
+  `POD GONE` and stays until `gpuc host terminate <name>` ends it, or
+  `gpuc host remove <name>` forgets it and leaves it billing.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
   create, reading the config the pod already has.
 - Only act on pods named `gpuc-*`. Others belong to other people.
