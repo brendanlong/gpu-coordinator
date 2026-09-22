@@ -28,6 +28,7 @@ from gpuc.control.config import (
 )
 from gpuc.control.remote import read_remote_config, resolve_home, write_remote_config
 from gpuc.control.transport import Transport
+from gpuc.host import jobs
 from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import HostConfig
 
@@ -187,19 +188,18 @@ def _with_env(
     theirs = HostConfig.from_dict(existing).env
     if not env_updates and "env" not in patch:
         return patch
-    env = dict(patch.get("env", theirs))
-    # `--env` replaces what somebody set by hand; it is not where the uv cache
-    # bootstrap derived from the host's own filesystem lives, and dropping that
-    # silently costs every job on the host a full copy of every wheel. Only
-    # `--cache-dir` (below) moves or clears it.
-    if "UV_CACHE_DIR" in theirs:
-        env.setdefault("UV_CACHE_DIR", theirs["UV_CACHE_DIR"])
+    # `--env` replaces what somebody set by hand; the keys bootstrap derived
+    # from the host's own filesystem (`jobs.MANAGED_ENV`) are carried over,
+    # and only an explicit update moves or clears one of those.
+    env = jobs.sticky_env(theirs, dict(patch.get("env", theirs)))
     for key, value in (env_updates or {}).items():
         if value is None:
             env.pop(key, None)
         else:
             env[key] = value
-    return {**patch, "env": env}
+    # `--env K=` with nothing after the sign removes K, sticky or not: the one
+    # way to say "no HF_HOME at all" on a host bootstrap gave one.
+    return {**patch, "env": {k: v for k, v in env.items() if v != ""}}
 
 
 def _refuse_overlapping_gpus(

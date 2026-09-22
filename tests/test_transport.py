@@ -106,6 +106,32 @@ def test_ssh_argv_runs_a_non_login_bash_with_the_command_last(tmp_path: Path) ->
     assert argv[-1] == "bash -c 'uname -a'"
 
 
+def test_the_ssh_argv_is_the_one_run_uses(tmp_path: Path) -> None:
+    transport = make_ssh(tmp_path)
+    assert transport.argv("uname -a") == transport.ssh_argv("uname -a")
+
+
+def test_the_interactive_ssh_argv_keeps_every_option_but_batch_mode_and_adds_a_tty(
+    tmp_path: Path,
+) -> None:
+    transport = make_ssh(tmp_path)
+    options = transport.ssh_options()
+    batch = options.index("BatchMode=yes")
+    without_batch = options[: batch - 1] + options[batch + 1 :]
+    assert transport.interactive_argv("exec bash -l") == [
+        "ssh",
+        *without_batch,
+        "-t",
+        "user@box",
+        "exec bash -l",
+    ]
+
+
+def test_the_local_argv_is_a_non_login_bash_and_the_interactive_one_a_login_bash() -> None:
+    assert LocalTransport().argv("uname -a") == ["bash", "-c", "uname -a"]
+    assert LocalTransport().interactive_argv("exec bash -l") == ["bash", "-lc", "exec bash -l"]
+
+
 def test_put_file_never_puts_the_secret_in_argv(tmp_path: Path) -> None:
     argv = make_ssh(tmp_path).put_file_argv("~/.gpuc/secrets/job.env")
     command = argv[-1]

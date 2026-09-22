@@ -128,8 +128,8 @@ an `s3_prefix`, with the region from `AWS_REGION`, `AWS_DEFAULT_REGION`, else
 
 **RunPod.** Export `RUNPOD_API_KEY`. `gpuc submit --runpod`, `gpuc pods`,
 `gpuc host add --pod` and `gpuc host terminate` check it first and exit 1 with
-one line if it is missing. The key is delivered to each pod as
-`~/.gpuc/secrets/runpod` so it can terminate itself.
+one line if it is missing. A pod terminates itself with the pod-scoped key
+RunPod leaves in its own `/etc/rp_environment`; nothing of yours is delivered.
 
 **Hugging Face.** Put `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) in the job's
 `secrets:`. The sync preflight runs `hf auth whoami` with it and fails the job
@@ -210,9 +210,9 @@ host has to answer) and reports each change as `host <- …`.
 | `--gpus 2,3` or `--gpus GPU-8064…,3` | every card nvidia-smi reports, on a host with no config; what the host has, on one that does | nvidia-smi **indices**, UUIDs, or a mix, stored as typed; the host re-resolves indices to UUIDs on every dispatch pass, so a renumbered driver cannot hand your job somebody else's card. An owned card the host cannot see is `UNAVAILABLE` and jobs wait for it |
 | `--shared-gpus 4,5` | none | cards gpuc may **borrow** but does not own, spelled like `--gpus` and never overlapping it; see [shared GPUs](usage.md#shared-gpus) |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | override where gpuc home lives on the host |
-| `--cache-dir PATH` | bootstrap decides | `UV_CACHE_DIR` in the host's `env`. Bootstrap sets one on gpuc home's filesystem when they differ (uv only links a venv out of its cache within one filesystem), and never overrides one the config already names |
+| `--cache-dir PATH` | bootstrap decides | `UV_CACHE_DIR` in the host's `env`, the same as `--env UV_CACHE_DIR=PATH`. Bootstrap sets one on gpuc home's filesystem when they differ (uv only links a venv out of its cache within one filesystem), and never overrides one the config already names. `HF_HOME` is handled the same way: bootstrap points it beside gpuc home unless the config names one, so a persistent root keeps the Hugging Face cache too |
 | `--persistent-root R` | none | gpuc home moves to `R/gpuc` (below) |
-| `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. Nothing populates it automatically. It replaces the whole set, except `UV_CACHE_DIR`, which is bootstrap's and `--cache-dir`'s |
+| `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. It replaces the whole set, except the two keys bootstrap derives (`UV_CACHE_DIR`, `HF_HOME`), which survive an `--env` that does not name them; `--env K=` with nothing after the sign removes a key, those included |
 | `--s3-prefix s3://…` | none | this host's own log/state mirror |
 | `--retention-days N` | none | auto-purge whole job dirs this old, only ones whose log and state are confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` turns it off |
 | `--workdir-days N` | `1` on a host being configured for the first time | auto-sweep a finished job's `workdir/` (never its log or state) once it ended this long ago; no mirror needed. `''` turns it off. A host whose config already exists keeps whatever it says |
@@ -244,9 +244,10 @@ and moving gpuc home puts every job's venv and workdir on a network volume,
 which drags uv's cache there too (the `--cache-dir` row above), since a cache on
 the other filesystem is copied into every venv rather than linked. Where that
 trade is worth it, `--persistent-root R` moves **gpuc home and only
-gpuc home** to `R/gpuc`: `config.json`, `queue/` and every `jobs/<id>/` with its
-spec, state, log and workdir — the things that cannot be reinstalled. uv, its
-Pythons and the `aws` bundle stay in `$HOME`. `R` is created 0700 if gpuc
+gpuc home** to `R/gpuc`: `config.json` and every `jobs/<id>/` with its spec,
+state, log and workdir — the things that cannot be reinstalled — and puts the
+uv and Hugging Face caches beside it. uv, its Pythons and the `aws` bundle stay
+in `$HOME`. `R` is created 0700 if gpuc
 creates it; an existing `R` keeps its mode.
 
 ```sh

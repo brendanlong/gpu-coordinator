@@ -14,7 +14,7 @@ import shlex
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -247,8 +247,9 @@ def kill_process_group(
         os.killpg(pgid, signal.SIGKILL)
 
 
-def preflight_command() -> str:
-    return f"uv run --no-sync python -c {shlex.quote(PREFLIGHT_SOURCE)}"
+def preflight_command(spec: JobSpec) -> str:
+    """The GPU check, run through the interpreter the spec says is the job's."""
+    return f"{spec.python} -c {shlex.quote(PREFLIGHT_SOURCE)}"
 
 
 @dataclass
@@ -264,7 +265,7 @@ class RunnerDeps:
     estimate_refresh_s: float = ESTIMATE_REFRESH_S
     kill_grace_s: float = KILL_GRACE_S
     preflight: bool = True
-    preflight_command: Callable[[], str] = preflight_command
+    preflight_command: Callable[[JobSpec], str] = preflight_command
     sync_preflight: bool = True
     isolation: str | None = None
     """`cgroup`, `pgid`, or None to ask `scope.isolation()` at job start."""
@@ -276,8 +277,21 @@ class RunnerDeps:
 
 
 def build_env(
-    spec: JobSpec, assigned: Sequence[str], config: jobs.HostConfig | None = None
+    spec: JobSpec,
+    assigned: Sequence[str],
+    config: jobs.HostConfig | None = None,
+    indices: Mapping[str, int] | None = None,
 ) -> dict[str, str]:
+    """The job's environment: the host's, the secrets file, the spec's, then
+    the cards -- last, so a spec `env` typo cannot hand the job the wrong ones.
+
+    `CUDA_VISIBLE_DEVICES` names the cards by nvidia-smi index when the runner
+    has just resolved every one (vLLM and others `int()` each entry, and a
+    UUID there fails inside a subprocess with an error that points at the
+    model), pinned to nvidia-smi's numbering by `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+    so the index means the same card to CUDA. Without a full index map the
+    UUIDs go through as they are, which every torch accepts.
+    """
     env = dict(os.environ)
     # The host's own env and PATH go first, so a job may still pin either
     # explicitly. The dispatcher normally passes these down already; doing it
@@ -286,8 +300,11 @@ def build_env(
     (config or jobs.read_config()).apply_env(env)
     env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
     env.update(spec.env)
-    # Last, so a spec `env` typo cannot hand the job the wrong cards.
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned)
+    if indices is not None and assigned and all(uuid in indices for uuid in assigned):
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(indices[uuid]) for uuid in assigned)
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned)
     env["GPUC_JOB_ID"] = spec.job_id
     env["GPUC_JOB_DIR"] = str(paths.job_dir(spec.job_id))
     env["GPUC_OUTPUTS"] = str(paths.outputs_dir(spec.job_id))
@@ -563,7 +580,7 @@ class JobRunner:
         paths.ensure_job_layout(self.job_id)
         job_start = self.deps.now()
         gpu_error = self._resolve_assigned()
-        env = build_env(self.spec, self.assigned, self.config)
+        env = build_env(self.spec, self.assigned, self.config, self._indices())
         # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
         # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
         # credential file anywhere on the host.
@@ -604,6 +621,14 @@ class JobRunner:
             # actually on. The dispatcher resolves what it adopts either way.
             jobs.update_state(self.job_id, gpus=self.assigned)
         return None
+
+    def _indices(self) -> dict[str, int] | None:
+        """uuid -> nvidia-smi index, from the same table the assignment was
+        resolved against; None if it cannot be read."""
+        try:
+            return {gpu.uuid: gpu.index for gpu in gpus.list_gpus(self.deps.smi)}
+        except gpus.GpuError:
+            return None
 
     def _run_phases(
         self,
@@ -650,7 +675,9 @@ class JobRunner:
             cancelled = self._cancelled_before("preflight", sync_loop, log)
             if cancelled is not None:
                 return cancelled
-            code = self._run_phase("preflight", self.deps.preflight_command(), env, log, job_start)
+            code = self._run_phase(
+                "preflight", self.deps.preflight_command(self.spec), env, log, job_start
+            )
             if code != 0 or self.kill_reason:
                 return self._finalize(code, *self._classify(code, "gpu-preflight"), sync_loop, log)
 
@@ -775,20 +802,22 @@ class JobRunner:
         # workdir and secrets decisions below can trust this reading.
         self._preempting = queue.is_preempted(self.job_id)
         jobs.update_state(self.job_id, phase="sync")
+        problems: list[str] = []
         if skip_output_sync:
             # The job never ran (a failed preflight, a card that is not here),
-            # so a second failure would only add a confusing `+no-outputs` to a
-            # reason that is already exact.
+            # so its outputs cannot exist and there is nothing to upload.
             self._log(log, "skipping the final output sync: the job never ran")
         else:
             try:
                 sync_loop.final()
             except sync.MissingOutput as exc:
                 self._log(log, f"final sync found no outputs: {exc}")
-                status, reason, exit_code = self._blame(status, reason, exit_code, "no-outputs")
+                status, reason, exit_code = self._blame(
+                    status, reason, exit_code, "no-outputs", problems
+                )
             except sync.SyncError as exc:
                 self._log(log, f"final sync FAILED: {exc}")
-                status, reason, exit_code = self._blame(status, reason, exit_code, "sync")
+                status, reason, exit_code = self._blame(status, reason, exit_code, "sync", problems)
             if sync_loop.last_error and status == "succeeded":
                 self._log(log, f"periodic sync had errors: {sync_loop.last_error}")
 
@@ -796,6 +825,7 @@ class JobRunner:
             self.job_id,
             status=status,
             reason=reason,
+            problems=problems,
             exit_code=exit_code,
             ended_at=jobs.utc_now(),
             phase=None,
@@ -807,7 +837,6 @@ class JobRunner:
             # the useful part. A surviving `eta` would read as a promise the
             # job is still going.
             eta=None,
-            outputs_synced_at=sync_loop.outputs_synced_at,
         )
         self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")
         # After the final state write, and only then: the outputs the sync just
@@ -833,15 +862,15 @@ class JobRunner:
             if warning:
                 self._log(log, f"WARNING: {warning}")
         except sync.SyncError as exc:
-            # meta_synced_at stays null, so `purge` will refuse to delete this
-            # job dir: the only copy of the log lives here.
+            # No mirror record, so `purge` will refuse to delete this job dir:
+            # the only copy of the log lives here.
             self._log(log, f"final state upload failed: {exc}")
         # Only now: the final sync and the state upload authenticate with the
         # secrets this file holds, so removing it earlier would break exactly
         # the upload that matters most. On an ephemeral host with outputs still
         # unconfirmed it stays: the drain gets one more go at uploading them,
         # and the file dies with the pod in minutes either way.
-        if self._keep_secrets_for_drain(sync_loop):
+        if self._keep_secrets_for_drain():
             self._log(
                 log,
                 "outputs are not confirmed uploaded; keeping this job's secrets file so the "
@@ -856,8 +885,10 @@ class JobRunner:
             paths.job_env_file(self.job_id).unlink(missing_ok=True)
         return exit_code
 
-    def _keep_secrets_for_drain(self, sync_loop: sync.SyncLoop) -> bool:
-        if not (self.config.ephemeral and self.spec.outputs and not sync_loop.outputs_synced_at):
+    def _keep_secrets_for_drain(self) -> bool:
+        if not (self.config.ephemeral and self.spec.outputs):
+            return False
+        if jobs.read_state(self.job_id).outputs_uploaded(self.spec):
             return False
         # The same question the drain asks before it retries anything: a job
         # that wrote no outputs is skipped there, so keeping its credentials on
@@ -893,11 +924,17 @@ class JobRunner:
 
     @staticmethod
     def _blame(
-        status: str, reason: str | None, exit_code: int, sync_reason: str
+        status: str, reason: str | None, exit_code: int, sync_reason: str, problems: list[str]
     ) -> tuple[str, str | None, int]:
+        """A job that succeeded and then lost its outputs failed, for that
+        reason. One that was already over for a reason of its own keeps it,
+        and the upload failure is a problem noted beside it."""
         if status == "succeeded":
             return "failed", sync_reason, 1
-        return status, f"{reason}+{sync_reason}" if reason else sync_reason, exit_code
+        if reason is None:
+            return status, sync_reason, exit_code
+        problems.append(sync_reason)
+        return status, reason, exit_code
 
 
 def run_job(job_id: str, deps: RunnerDeps | None = None) -> int:

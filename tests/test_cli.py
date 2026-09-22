@@ -660,8 +660,8 @@ def purged_entry(job_id: str, prefix: str | None = "s3://bucket/gpuc/gpubox") ->
         "status": "succeeded",
         "bytes": 1024,
         "age_days": 30.0,
-        "meta_synced_at": "2026-01-01T00:00:00+00:00",
-        "meta_synced_to": prefix,
+        "mirrored_at": "2026-01-01T00:00:00+00:00",
+        "mirror": None if prefix is None else f"{prefix}/jobs/{job_id}",
         "forced": False,
     }
 
@@ -1351,6 +1351,80 @@ def test_requeue_json_names_the_job_it_came_from(
     assert (document["job_id"], document["attempt"]) == ("new", 2)
 
 
+class _KnowsJobs:
+    """A session on a host that knows exactly the jobs it is given."""
+
+    def __init__(self, name: str, known: set[str], asked: list[str]) -> None:
+        self.name, self.known, self.asked = name, known, asked
+
+    def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+        self.asked.append(f"{self.name}: {args}")
+        job_id = args.split()[-1]
+        return {"jobs": [{"job_id": job_id}] if job_id in self.known else []}
+
+
+def _requeue_setup(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch, known: dict[str, set[str]]
+) -> tuple[list[str], list[str]]:
+    """A mirrored spec, no local index entry (this is a second client), and
+    one fake session per registered host. Returns (hosts asked, hosts submitted to)."""
+    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
+    s3 = FakeS3Client()
+    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
+        {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 1}
+    ).encode()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    asked: list[str] = []
+    submitted: list[str] = []
+    monkeypatch.setattr(
+        "gpuc.control.actions.open_session",
+        lambda entry, *a, **k: _KnowsJobs(entry.name, known.get(entry.name, set()), asked),
+    )
+    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
+    monkeypatch.setattr("gpuc.control.cli.placement_after", lambda *a, **k: placement_unknown())
+
+    def fake_submit(entry: Any, *a: Any, **k: Any) -> SubmitResult:
+        submitted.append(entry.name)
+        return SubmitResult(job_id="new", host=entry.name, attempt=k["attempt"])
+
+    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    for name in known:
+        register_host(name=name, kind="ssh", ssh=f"me@{name}", gpus=GPU)
+    return asked, submitted
+
+
+def test_requeue_without_a_host_finds_the_job_on_a_host_this_client_never_submitted_to(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second client has no index entry for the job, so it asks every host,
+    the same lookup every other job command makes."""
+    asked, submitted = _requeue_setup(
+        control_env, monkeypatch, {"a": set(), "b": {"20260101-000000-aaaaaa"}}
+    )
+    capsys.readouterr()
+
+    assert main(["requeue", "20260101-000000-aaaaaa", "--json"]) == 0
+    document = one_document(capsys)
+    assert submitted == ["b"]
+    assert document["host"] == "b"
+    assert document["requeued_from"] == "20260101-000000-aaaaaa"
+    # No index entry here, so the attempt counts on from the first.
+    assert document["attempt"] == 2
+    assert "b: status 20260101-000000-aaaaaa" in asked
+
+
+def test_requeue_without_a_host_of_a_job_no_host_knows_is_exit_four(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked, submitted = _requeue_setup(control_env, monkeypatch, {"a": set(), "b": set()})
+    capsys.readouterr()
+
+    assert main(["requeue", "20260101-000000-aaaaaa"]) == EXIT_NOT_FOUND
+    assert "no registered host knows job 20260101-000000-aaaaaa" in capsys.readouterr().err
+    assert submitted == []
+    assert len(asked) == 2
+
+
 def test_requeue_ignores_spec_keys_an_older_build_mirrored(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1616,8 +1690,8 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
                 "dispatcher_heartbeat_age_s": 1.0,
                 "queue": [{"priority": 10, "job_id": moved}, {"priority": 50, "job_id": "other"}],
                 "jobs": [
-                    {"job_id": moved, "status": "queued", "gpus_requested": 1},
-                    {"job_id": "other", "status": "queued", "gpus_requested": 1},
+                    {"job_id": moved, "status": "queued", "priority": 10, "starts_in_s": 0.0},
+                    {"job_id": "other", "status": "queued", "priority": 50, "starts_in_s": 0.0},
                 ],
             }
 
@@ -2043,6 +2117,12 @@ class _NoPods:
     def get(self, pod_id: str) -> Pod | None:
         return self._pod
 
+    def is_gone(self, pod: Pod | None) -> bool:
+        return pod is None or pod.status == "TERMINATED"
+
+    def is_dead(self, pod: Pod | None) -> bool:
+        return pod is None or pod.status in ("EXITED", "TERMINATED")
+
 
 def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -2325,11 +2405,12 @@ def test_an_existing_gpu_overlap_does_not_block_every_other_host_set(
     assert fake_host.config is not None and fake_host.config["idle_minutes"] == 30.0
 
 
-def test_reorder_accepts_the_answer_of_a_host_build_from_before_the_verdict_shape(
+def test_reorder_refuses_to_report_a_move_the_host_did_not_say_it_made(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An older host prints `{"reordered": true}` and exits 0. The move happened,
-    and reporting failure would leave the mirror at the old priority."""
+    """A host answer with no `status` (an older build's `{"reordered": true}`
+    shape included) is an error: success for a job the host may never have
+    touched is worse than a failure."""
 
     class Older:
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
@@ -2341,5 +2422,8 @@ def test_reorder_accepts_the_answer_of_a_host_build_from_before_the_verdict_shap
     monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Older())
     capsys.readouterr()
     argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
-    assert main(argv) == 0
-    assert one_document(capsys)["priority"] == 5
+    assert main(argv) == EXIT_ERROR
+    document = one_document(capsys)
+    assert document["exit_code"] == EXIT_ERROR
+    assert "did not say what it did with 20260101-000000-aaaaaa" in str(document["error"])
+    assert "priority" not in document

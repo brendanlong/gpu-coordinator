@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.bootstrap import bootstrap_host, cache_dir_beside, resolve_cache_dir
+from gpuc.control.bootstrap import bootstrap_host, resolve_cache_dir
 from gpuc.control.probe import parse_probe
 from gpuc.control.remote import HostSession, env_prefix
 from gpuc.host import dispatcher, health, jobs, runner
@@ -78,10 +78,8 @@ def test_a_job_can_still_override_the_host_cache(gpuc_home: Path) -> None:
 
 
 def test_the_hosts_cache_dir_reaches_every_remote_step() -> None:
-    """One variable in the host's own `env`, which is where it lives: the
-    registry's `cache_dir` is a reading of it, not a second copy."""
+    """One variable in the host's own `env`, which is where it lives."""
     host = host_entry(name="h", cache_dir="/vol/me/.cache/uv")
-    assert host.cache_dir == "/vol/me/.cache/uv"
     assert host.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
     assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in env_prefix(host.env)
     session = HostSession(host, ScriptedHost(), "/vol/me/gpuc", "/usr/bin/python3")
@@ -90,7 +88,6 @@ def test_the_hosts_cache_dir_reaches_every_remote_step() -> None:
 
 def test_no_cache_dir_means_no_variable() -> None:
     assert "UV_CACHE_DIR" not in host_entry(name="h").env
-    assert host_entry(name="h").cache_dir is None
 
 
 # -- (b) the bootstrap rule ---------------------------------------------------
@@ -98,10 +95,19 @@ def test_no_cache_dir_means_no_variable() -> None:
 
 def test_the_cache_goes_beside_gpuc_home_not_inside_it() -> None:
     # Inside would make `rm -rf` of gpuc home take the cache with it.
-    assert cache_dir_beside("/workspace/me/gpuc") == "/workspace/me/.cache/uv"
-    assert cache_dir_beside("/workspace/me/gpuc/") == "/workspace/me/.cache/uv"
-    assert cache_dir_beside("/home/u/.gpuc") == "/home/u/.cache/uv"
-    assert cache_dir_beside("/gpuc") == "/gpuc/uv-cache"
+    assert jobs.cache_beside("/workspace/me/gpuc", "uv") == "/workspace/me/.cache/uv"
+    assert jobs.cache_beside("/workspace/me/gpuc/", "uv") == "/workspace/me/.cache/uv"
+    assert jobs.cache_beside("/home/u/.gpuc", "uv") == "/home/u/.cache/uv"
+    assert jobs.cache_beside("/gpuc", "uv") == "/gpuc/uv-cache"
+
+
+def test_every_managed_cache_goes_beside_gpuc_home_under_its_own_name() -> None:
+    assert jobs.cache_beside("/workspace/me/gpuc", "huggingface") == (
+        "/workspace/me/.cache/huggingface"
+    )
+    assert jobs.cache_beside("/gpuc", "huggingface") == "/gpuc/huggingface-cache"
+    beside = {key for key, managed in jobs.MANAGED_ENV.items() if managed.beside_home}
+    assert beside == {"UV_CACHE_DIR", "HF_HOME"}
 
 
 def test_one_filesystem_leaves_the_cache_alone(control_env: Path) -> None:
@@ -132,17 +138,20 @@ def test_a_cache_the_host_already_names_is_never_overridden(control_env: Path) -
 def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="99")
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert updated.cache_dir == "/home/u/.cache/uv"
+    assert updated.env.get("UV_CACHE_DIR") == "/home/u/.cache/uv"
     assert host.config is not None
-    assert host.config["env"] == {"UV_CACHE_DIR": "/home/u/.cache/uv"}
+    assert host.config["env"] == {
+        "UV_CACHE_DIR": "/home/u/.cache/uv",
+        "HF_HOME": "/home/u/.cache/huggingface",
+    }
 
 
 def test_bootstrap_on_one_filesystem_writes_no_cache_dir(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="66")
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert updated.cache_dir is None
+    assert "UV_CACHE_DIR" not in updated.env
     assert host.config is not None
-    assert host.config["env"] == {}
+    assert host.config["env"] == {"HF_HOME": "/home/u/.cache/huggingface"}
 
 
 def test_the_cache_is_resolved_before_uv_tool_install(control_env: Path) -> None:

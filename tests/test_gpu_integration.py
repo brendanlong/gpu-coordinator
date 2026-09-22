@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import dispatcher, jobs, paths, queue
+from gpuc.host import dispatcher, gpus, jobs, paths, queue
 from gpuc.host.jobs import HostConfig, JobSpec
 from tests.conftest import LOCAL_GPU_UUID, requires_gpu
 
@@ -86,7 +86,7 @@ def spec_for(command: str, **overrides: object) -> JobSpec:
     return JobSpec.from_dict(document)
 
 
-def test_a_real_gpu_job_runs_with_the_uuid_and_succeeds(
+def test_a_real_gpu_job_runs_on_the_assigned_card_and_succeeds(
     gpu_home: Path, torch_project: Path
 ) -> None:
     job_id = enqueue_in_project(spec_for(PROBE), torch_project)
@@ -101,7 +101,9 @@ def test_a_real_gpu_job_runs_with_the_uuid_and_succeeds(
     assert state.status == "succeeded", log[-3000:]
     assert state.exit_code == 0
     assert state.gpus == [LOCAL_GPU_UUID]
-    assert f"CVD={LOCAL_GPU_UUID}" in log
+    # By nvidia-smi index, not UUID: vLLM and others `int()` each entry.
+    index = next(gpu.index for gpu in gpus.list_gpus() if gpu.uuid == LOCAL_GPU_UUID)
+    assert f"CVD={index}" in log
     assert "COUNT=1" in log
     assert "SUM=8" in log
     assert "gpu preflight ok" in log

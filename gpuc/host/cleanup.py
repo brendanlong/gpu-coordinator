@@ -7,9 +7,9 @@ recreated: `gpuc requeue` re-syncs it from git. `spec.json`, `state.json` and
 `log.txt` are the record of what happened, and `clean` never touches them.
 
 `purge` is the one thing here that does: it deletes a whole `jobs/<id>/` once
-the job is old enough *and* its own `state.json` says both the record
-(`meta_synced_at`) and whatever the job produced (`outputs_synced_at`) are
-somewhere else. Without those, a purge is the only copy of a run's log and its
+the job is old enough *and* its own `state.json` upload records say both the
+record (the mirror) and whatever the job produced (every output destination)
+are somewhere else. Without those, a purge is the only copy of a run's log and its
 checkpoints going in the bin, which is why it is refused unless the caller
 passes `--force` -- and then told, loudly, what it just did.
 """
@@ -28,6 +28,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from gpuc.host import baseline, jobs, paths
 from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS, JobState
@@ -393,11 +394,23 @@ class Candidate:
     bytes: int
     ended_at: str | None = None
     age_days: float | None = None
-    meta_synced_at: str | None = None
-    meta_synced_to: str | None = None
+    mirrored_at: str | None = None
+    """When the job's log and state last reached its mirror, and where."""
+    mirror: str | None = None
     forced: bool = False
     """Purged without a confirmed mirror or confirmed outputs, because the
     caller passed `--force`."""
+
+    @staticmethod
+    def of(state: JobState, **fields: Any) -> Candidate:
+        mirror = state.mirror if state.mirrored else None
+        return Candidate(
+            status=state.status,
+            ended_at=state.ended_at,
+            mirrored_at=mirror.ok_at if mirror else None,
+            mirror=mirror.to if mirror else None,
+            **fields,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -406,8 +419,8 @@ class Candidate:
             "bytes": self.bytes,
             "ended_at": self.ended_at,
             "age_days": None if self.age_days is None else round(self.age_days, 2),
-            "meta_synced_at": self.meta_synced_at,
-            "meta_synced_to": self.meta_synced_to,
+            "mirrored_at": self.mirrored_at,
+            "mirror": self.mirror,
             "forced": self.forced,
         }
 
@@ -527,15 +540,7 @@ def candidates(
                 skipped.append(Skipped(job_id, why))
                 continue
         picked.append(
-            Candidate(
-                job_id=job_id,
-                status=state.status,
-                bytes=reclaimable_bytes(workdir),
-                ended_at=state.ended_at,
-                age_days=age_days,
-                meta_synced_at=state.meta_synced_at,
-                meta_synced_to=state.meta_synced_to,
-            )
+            Candidate.of(state, job_id=job_id, bytes=reclaimable_bytes(workdir), age_days=age_days)
         )
     return picked, skipped
 
@@ -653,40 +658,6 @@ def host_s3_prefix() -> str | None:
         return None
 
 
-def _holds_content(root: Path, entries: baseline.Entries) -> bool:
-    """Is there anything under `root` that the job did not find already there?
-
-    `baseline.has_new_content` asks the same question for `sync`, where a wrong
-    "nothing here" costs an upload that can be retried. Here it decides whether
-    a job dir may be deleted, so every way of not knowing has to count as
-    content: a path that cannot be read, a symlink (which `aws s3 sync` follows
-    and `rglob` does not), a walk that errors part way down.
-    """
-    try:
-        info = root.lstat()
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    if stat.S_ISLNK(info.st_mode):
-        return True
-    if not stat.S_ISDIR(info.st_mode):
-        return baseline.has_new_content(root, entries)
-    unreadable = False
-
-    def note(_: OSError) -> None:
-        nonlocal unreadable
-        unreadable = True
-
-    files = 0
-    for parent, dirs, names in os.walk(root, onerror=note):
-        for name in (*dirs, *names):
-            if Path(parent, name).is_symlink():
-                return True
-        files += len(names)
-    return unreadable or files > len(baseline.unchanged(root, entries))
-
-
 def produced_outputs(job_id: str, spec: jobs.JobSpec) -> bool:
     """Did any declared `outputs:` path actually gain content?
 
@@ -704,7 +675,7 @@ def produced_outputs(job_id: str, spec: jobs.JobSpec) -> bool:
             key = baseline.output_key(output, job_id)
         except (KeyError, IndexError, ValueError):
             return True
-        if _holds_content(workdir / key, entries.get(key, {})):
+        if baseline.has_new_content(workdir / key, entries.get(key, {})):
             return True
     return False
 
@@ -714,19 +685,17 @@ def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | No
 
     `outputs:` paths resolve *inside* `workdir/`, and a failed or cancelled job
     keeps its workdir by default, so a job that ended `failed: sync` can be
-    holding the only copy of a checkpoint. Four ways to be satisfied: the final
-    upload was confirmed, the spec declared no outputs, the workdir is already
-    gone (whatever it held went with `cleanup:`, not with us), or the job never
-    wrote its outputs in the first place. An unreadable spec cannot answer the
-    question, so it fails closed.
+    holding the only copy of a checkpoint. Satisfied when the upload records
+    say every destination has the last upload, or when there is nothing here
+    to lose: no outputs declared, the workdir already gone (whatever it held
+    went with `cleanup:`, not with us), or nothing ever written to the output
+    paths. An unreadable spec cannot answer the question, so it fails closed.
     """
-    if state.outputs_synced_at:
-        return True, None
     try:
         spec = jobs.read_spec(job_id)
     except RuntimeError:
         return False, "spec.json is unreadable, so its outputs cannot be checked"
-    if not spec.outputs:
+    if not spec.outputs or state.outputs_uploaded(spec):
         return True, None
     if not paths.workdir(job_id).is_dir():
         return True, None
@@ -753,7 +722,7 @@ def purge_candidates(
 
     Fails closed exactly as `clean` does -- unreadable state, not finished, no
     usable `ended_at`, too young -- and then adds the two preconditions that
-    make deleting the record itself safe: `meta_synced_at` (log and state are
+    make deleting the record itself safe: the mirror record (log and state are
     mirrored) and confirmed outputs. `force` overrides only those last two, and
     the candidate is marked `forced` so the report can say so.
     """
@@ -780,7 +749,7 @@ def purge_candidates(
                 skipped.append(too_young)
                 continue
         reasons: list[str] = []
-        if not state.meta_synced_at:
+        if not state.mirrored:
             reasons.append(_not_backed_up(prefix))
         confirmed, why = outputs_confirmed(job_id, state)
         if not confirmed and why:
@@ -789,14 +758,11 @@ def purge_candidates(
             skipped.append(Skipped(job_id, "; ".join(reasons)))
             continue
         picked.append(
-            Candidate(
+            Candidate.of(
+                state,
                 job_id=job_id,
-                status=state.status,
                 bytes=reclaimable_bytes(paths.job_dir(job_id)),
-                ended_at=state.ended_at,
                 age_days=age_days,
-                meta_synced_at=state.meta_synced_at,
-                meta_synced_to=state.meta_synced_to,
                 forced=bool(reasons),
             )
         )

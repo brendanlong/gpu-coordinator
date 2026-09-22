@@ -5,13 +5,9 @@ from a real local registry -- including a RunPod host carrying the
 `"ttl_hours": null` that started all this, with its endpoint and pod id
 redacted -- and `config.json` as bootstrap rendered one). `ttl_hours` has since
 been removed altogether, so every fixture now also proves that a key this build
-no longer knows is ignored. `hosts.presplit.json` is the same
-registry as a build from before the address/config split wrote it, with the
-host's config flat beside the address; today's reader treats every one of
-those fields as a cache of what the host holds. `*.older.json`
-are hand-written in the shape a build from before `ttl_hours` became optional
-wrote -- no `schema_version`, no `retention_days`, no `gpu_info`, a concrete
-`ttl_hours: 24.0`. `*.newer.json` are hand-written as a *future* build might:
+no longer knows is ignored. `*.older.json` are hand-written in the shape a
+build from before `ttl_hours` became optional wrote -- no `schema_version`, no
+`retention_days`, no `gpu_info`, a concrete `ttl_hours: 24.0`. `*.newer.json` are hand-written as a *future* build might:
 unknown keys, and explicit nulls where a field has since become optional.
 
 Every one of them must parse under today's models. That is the regression test

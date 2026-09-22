@@ -91,7 +91,6 @@ def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:
         1.0,
         "s3://bucket/gpuc/pod1",
     )
-    assert entry.cache_dir == "/vol/uv"
     assert entry.env == {"HF_HOME": "/big", "UV_CACHE_DIR": "/vol/uv"}
     assert entry.config.ephemeral
     assert entry.seen_at == SEEN_AT
@@ -109,10 +108,21 @@ def test_the_provider_block_comes_from_the_address_for_a_config_we_initialise() 
     assert initial.created_at
 
 
-def test_a_pre_split_registry_entry_becomes_a_cache_of_the_hosts_config() -> None:
-    """The compatibility rule: a registry written when this machine believed it
-    owned a host's config still parses, and what it holds is treated as the
-    last thing seen rather than as an instruction."""
+def test_a_rental_is_an_address_with_a_pod_behind_it() -> None:
+    """`kind` is stored but decides nothing: only a pod id makes an entry a
+    rental, and only a rental implies a provider block."""
+    assert HostEntry(name="pod1", kind="runpod", pod_id="abc").ephemeral
+    assert HostEntry(name="box", kind="ssh", ssh="me@box", pod_id="abc").ephemeral
+    podless = HostEntry(name="pod1", kind="runpod")
+    assert not podless.ephemeral
+    assert podless.provider() is None
+    assert not HostEntry(name="local").ephemeral
+
+
+def test_a_pre_split_registry_entry_parses_as_an_address_with_an_empty_cache() -> None:
+    """A registry written when this machine believed it owned a host's config
+    still parses; the keys it no longer knows are ignored, not folded into the
+    cache, so nothing about the host is believed until the host is read."""
     entry = HostEntry.model_validate(
         {
             "name": "gpubox",
@@ -126,13 +136,11 @@ def test_a_pre_split_registry_entry_becomes_a_cache_of_the_hosts_config() -> Non
             "pkg_commit": "a" * 40,
         }
     )
-    assert entry.gpus == ["2", "3"]
-    assert entry.python == "/usr/bin/python3.12"
-    assert entry.env == {"HF_HOME": "/big", "UV_CACHE_DIR": "/mnt/ssd/uv"}
-    assert entry.retention_days == 24.0
-    assert entry.pkg_commit == "a" * 40
-    assert entry.config.host == "gpubox"
-    # It is a cache now, and one that nothing has confirmed.
+    assert (entry.name, entry.kind, entry.ssh) == ("gpubox", "ssh", "me@box")
+    assert entry.gpus == []
+    assert entry.python is None
+    assert entry.env == {}
+    assert entry.pkg_commit is None
     assert entry.seen_at is None
 
 

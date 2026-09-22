@@ -36,11 +36,13 @@ from gpuc.control.cli import (
     main,
 )
 from gpuc.control.config import config_file, registry_transaction
+from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
-from gpuc.control.transport import tail_command
+from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
 from tests.conftest import host_entry
+from tests.fakeprovider import FakeProvider
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 JOB = "20260915-120000-abc123"
@@ -350,6 +352,49 @@ def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
     assert "succeeded" in out
     assert "from the S3 mirror" in out
     assert f"lego-s4 ({JOB})" in out
+
+
+def test_wait_reads_a_terminated_rental_from_the_mirror_without_waiting_out_the_grace(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pod the provider says has ended will never answer again, so the
+    five-minute grace for an ssh blip would only be five minutes of nothing:
+    the mirror is read on the first poll that fails."""
+    from tests.fakes3 import FakeS3Client
+
+    prefix = "s3://bucket/gpuc/gpuc-pod"
+    key = f"bucket/gpuc/gpuc-pod/jobs/{JOB}/state.json"
+    state = json.dumps({"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0})
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client",
+        property(lambda self: FakeS3Client(objects={key: state.encode()})),
+    )
+    config_file().write_text('s3_bucket = "bucket"\n')
+    with registry_transaction() as registry:
+        registry.put(
+            host_entry(
+                name="gpuc-pod", kind="runpod", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=prefix
+            )
+        )
+    ended = Pod(id="pod-1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
+    monkeypatch.setattr(
+        "gpuc.control.actions.make_provider",
+        lambda *_a, **_k: FakeProvider(existing=[ended]),
+    )
+
+    def unreachable(*_a: Any, **_k: Any) -> Any:
+        raise TransportError(message="ssh: connect to 1.2.3.4 port 22: Connection refused")
+
+    monkeypatch.setattr(wait_mod, "open_session", unreachable)
+    sleeps = [0]
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: sleeps.__setitem__(0, sleeps[0] + 1))
+
+    assert wait_mod.TROUBLE_GRACE_S >= 60, "the grace is left as it ships"
+    assert main(["wait", JOB, "--host", "gpuc-pod"]) == EXIT_OK
+    captured = capsys.readouterr()
+    assert "succeeded" in captured.out
+    assert "from the S3 mirror" in captured.out
+    assert sleeps[0] == 0, "read on the first failed poll, not after a second one"
 
 
 def test_the_mirror_still_shouts_when_a_dead_host_lost_the_outputs(

@@ -38,7 +38,7 @@ from gpuc.control.transport import (
     git_tracked_files,
     uncommitted_patch,
 )
-from gpuc.host import jobs, progress
+from gpuc.host import jobs, plan, progress
 from gpuc.host.jobs import JobSpec
 
 
@@ -232,35 +232,48 @@ def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -
     return "".join(f"{line}\n" for line in lines)
 
 
-def precheck_local(
+@dataclass
+class Prepared:
+    """A spec checked for everything a submit can fail on without a host."""
+
+    spec: JobSpec
+    secrets_body: str
+    warnings: list[str] = field(default_factory=list)
+
+
+def prepare(
     model: JobSpecModel,
     workdir: Path,
     *,
-    gpu_count: int | None = None,
+    job_id: str | None = None,
+    attempt: int = 1,
     environ: Mapping[str, str] | None = None,
     use_git: bool = True,
-) -> None:
-    """Everything a submit can fail on without a host, checked before we buy one.
+) -> Prepared:
+    """The checks every submit runs, once, before a host is involved.
 
-    `submit --runpod` provisions first and enqueues second, so a missing secret
-    or a non-git workdir would otherwise be discovered by a pod that is already
-    billing and now has nothing to run.
+    `submit --runpod` provisions first and enqueues second, so a missing
+    secret or a non-git workdir found here costs nothing, where the same
+    failure discovered by a pod that is already billing costs a pod.
     """
+    spec = expand_job_id(model.to_spec(job_id or jobs.new_job_id(), attempt))
+    secrets_body = gather_secrets(spec.secrets, environ)
+    if use_git:
+        try:
+            git_tracked_files(workdir)
+        except TransportError as exc:
+            raise _not_a_repo(workdir, exc) from exc
+    warnings = [*preexisting_output_warnings(spec, workdir), *timeout_warnings(spec)]
+    return Prepared(spec, secrets_body, warnings)
+
+
+def check_gpu_count(model: JobSpecModel, gpu_count: int | None) -> None:
+    """A rental is bought with `--gpu-count` cards; the spec must fit it."""
     if gpu_count is not None and model.gpus > gpu_count:
         raise SubmitError(
             f"the spec asks for {model.gpus} GPU(s) but this request would create a pod with "
             f"{gpu_count}.\nRaise --gpu-count, or lower `gpus:` in the spec."
         )
-    # The id the job will get is not assigned yet; any id shows whether the
-    # destinations would carry one.
-    expand_job_id(model.to_spec(jobs.new_job_id()))
-    gather_secrets(model.secrets, environ)
-    if not use_git:
-        return
-    try:
-        git_tracked_files(workdir)
-    except TransportError as exc:
-        raise _not_a_repo(workdir, exc) from exc
 
 
 def _not_a_repo(workdir: Path, exc: Exception) -> SubmitError:
@@ -443,31 +456,27 @@ def enqueue_spec(session: HostSession, spec: JobSpec) -> dict[str, Any]:
 def wont_fit(spec: JobSpec, entry: HostEntry) -> str | None:
     """Why this host could never run this job, or None if it could.
 
-    The same rule the dispatcher applies (`HostConfig.may_borrow`), run here
-    against the config the host itself answered with a moment ago, so the
-    answer arrives before the code is shipped rather than as a failed job.
-
-    A shared card counts only for a job that asked for one, and when it did not
-    the message says so -- that is the whole point of checking here rather than
-    letting the host say `needs 4 GPUs, host owns 2` and leaving somebody to
-    look for a bigger host when a word in the spec was the answer.
+    The dispatcher's own rule (`plan.capacity_failure`), run here against the
+    config the host itself answered with a moment ago, so the answer arrives
+    before the code is shipped rather than as a failed job -- with the way
+    out added, since this is the moment somebody is looking.
     """
     config = entry.config
-    if spec.gpus <= len(config.gpus) + len(config.borrowable(spec)):
-        return None
-    owns = f"job asks for {spec.gpus} GPU(s) but host {entry.name} owns {len(config.gpus)}"
-    if not config.shared_gpus:
-        return f"{owns}.\nSubmit to a bigger host, or lower `gpus:` in the spec."
-    shares = f"{len(config.shared_gpus)} shared card(s)"
-    if config.may_borrow(spec):
-        return (
-            f"{owns} and may borrow {shares}.\n"
-            f"Submit to a bigger host, or lower `gpus:` in the spec."
-        )
-    return (
-        f"{owns}. It also has {shares} this job did not ask for: add `use_shared: true` "
-        f"to the spec to let it wait for them, or lower `gpus:`."
+    failure = plan.capacity_failure(
+        spec.gpus,
+        len(config.gpus),
+        len(config.shared_entries()),
+        borrows=config.may_borrow(spec),
     )
+    if failure is None:
+        return None
+    fix = "Submit to a bigger host, or lower `gpus:` in the spec."
+    if config.shared_gpus and not config.may_borrow(spec):
+        fix = (
+            "Add `use_shared: true` to the spec to let it wait for the shared cards, "
+            "or lower `gpus:`."
+        )
+    return f"host {entry.name} cannot run this job: it {failure}.\n{fix}"
 
 
 def submit_spec(
@@ -485,18 +494,22 @@ def submit_spec(
     spec_uri: str | None = None,
     use_git: bool = True,
     report: Reporter = print,
+    prepared: Prepared | None = None,
 ) -> SubmitResult:
     settings = settings or Settings()
     workdir = workdir or Path.cwd()
     notes: list[str] = []
 
-    spec = expand_job_id(spec_model.to_spec(job_id or jobs.new_job_id(), attempt))
-    secrets_body = gather_secrets(spec.secrets, environ)
+    if prepared is None:
+        prepared = prepare(
+            spec_model, workdir, job_id=job_id, attempt=attempt, environ=environ, use_git=use_git
+        )
+    spec, secrets_body = prepared.spec, prepared.secrets_body
     too_big = wont_fit(spec, entry)
     if too_big:
         raise SubmitError(too_big)
 
-    for warning in [*preexisting_output_warnings(spec, workdir), *timeout_warnings(spec)]:
+    for warning in prepared.warnings:
         report(f"WARNING: {warning}")
         notes.append(warning)
 

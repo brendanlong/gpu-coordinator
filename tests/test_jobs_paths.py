@@ -104,13 +104,17 @@ def test_the_layout_is_private_to_the_owner(gpuc_home: Path) -> None:
     assert stat.S_IMODE(paths.secrets_dir().stat().st_mode) == 0o700
 
 
-def test_state_round_trips_the_new_identity_and_sync_fields(gpuc_home: Path) -> None:
+def test_state_round_trips_the_new_identity_and_upload_fields(gpuc_home: Path) -> None:
     state = jobs.JobState(
         status="running",
         runner_pid=7,
         runner_boot_id="boot",
         runner_starttime="123",
-        sync_error="s3 said no",
+        uploads=[
+            jobs.Upload(to="s3://b/gpuc/h/jobs/j1", ok_at="2026-01-01T00:00:00+00:00"),
+            jobs.Upload(to="s3://bucket/j1", output="results", error="s3 said no"),
+        ],
+        problems=["sync"],
         util_recent=[1.0, None],
     )
     jobs.write_state("j1", state)

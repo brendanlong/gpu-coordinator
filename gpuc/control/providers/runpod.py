@@ -56,6 +56,12 @@ def _rate_limit_pause(header: str | None) -> float:
 
 
 class RunPodProvider(Provider):
+    dead_statuses = ("EXITED", "ERROR", "TERMINATED")
+    gone_statuses = ("TERMINATED",)
+    broken_host = re.compile(
+        r"card[0-9]|device nodes|OCI runtime|runc create|failed to create shim", re.IGNORECASE
+    )
+
     def __init__(
         self,
         api_key: str | None = None,

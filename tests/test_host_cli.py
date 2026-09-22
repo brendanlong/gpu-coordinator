@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,7 @@ import pytest
 from gpuc.host import __main__ as cli
 from gpuc.host import dispatcher, jobs, paths, queue
 from gpuc.host.jobs import HostConfig
-from tests.conftest import FAKE_GPUS, make_spec
+from tests.conftest import FAKE_GPUS, fake_smi, make_spec
 
 
 def run(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, object]:
@@ -414,3 +416,166 @@ def test_preempt_that_would_free_the_host_for_nothing_is_refused(
     assert code == 1 and isinstance(payload, dict)
     assert "nothing else is queued" in str(payload["error"])
     assert (started, queue.stop_requested(job_id)) == ([], None)
+
+
+# -- the start projection the status document publishes -----------------------
+
+SHARED_UUID = "GPU-00000000-0000-0000-0000-00000000000s"
+
+
+def use_smi(
+    monkeypatch: pytest.MonkeyPatch, uuids: list[str], **readings: dict[str, float]
+) -> None:
+    """Point every nvidia-smi read `status` makes at `fake_smi(uuids, ...)`.
+
+    Each reader in gpus.py takes the real runner as a default argument, bound
+    when the module was imported, so that default is what gets replaced."""
+    smi = fake_smi(uuids, **readings)
+    real = cli.gpus.run_nvidia_smi
+    for value in vars(cli.gpus).values():
+        defaults = getattr(value, "__defaults__", None)
+        if inspect.isfunction(value) and defaults and real in defaults:
+            patched = tuple(smi if d is real else d for d in defaults)
+            monkeypatch.setattr(value, "__defaults__", patched)
+
+
+def in_minutes(minutes: float) -> str:
+    return (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()
+
+
+def start_running(gpus: list[str], eta_minutes: float | None, **spec: object) -> str:
+    job_id = queue.enqueue(make_spec(**spec))
+    eta = None if eta_minutes is None else in_minutes(eta_minutes)
+    jobs.update_state(job_id, status="running", gpus=gpus, phase="main", eta=eta)
+    return job_id
+
+
+def projection(capsys: pytest.CaptureFixture[str]) -> dict[str, tuple[float | None, str | None]]:
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    return {j["job_id"]: (j["starts_in_s"], j["starts_unknown"]) for j in status["jobs"]}
+
+
+def test_status_publishes_when_each_queued_job_starts(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_smi(monkeypatch, FAKE_GPUS)
+    running = start_running([FAKE_GPUS[0]], 20)
+    other = start_running([FAKE_GPUS[1]], 130)
+    first = queue.enqueue(make_spec(priority=10, estimated_runtime_min=60.0))
+    second = queue.enqueue(make_spec(priority=20, estimated_runtime_min=60.0))
+
+    got = projection(capsys)
+    assert got[running] == (None, None) and got[other] == (None, None)
+    starts, why = got[first]
+    assert starts is not None and 19 * 60 < starts < 21 * 60 and why is None
+    # `first` holds the 20m card for its own hour: 1h20m, before the 2h10m one.
+    starts, why = got[second]
+    assert starts is not None and 79 * 60 < starts < 81 * 60 and why is None
+
+
+def test_status_projects_from_the_live_estimate_not_the_spec(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`gpuc estimate` writes state.json; the projection has to read it there."""
+    use_smi(monkeypatch, FAKE_GPUS)
+    start_running([FAKE_GPUS[1]], None)
+    first = queue.enqueue(make_spec(priority=10))
+    second = queue.enqueue(make_spec(priority=20))
+    assert projection(capsys)[second] == (
+        None,
+        "the jobs holding the cards it needs gave no end time",
+    )
+
+    assert run(capsys, "estimate", first, "30")[0] == 0
+    got = projection(capsys)
+    assert got[first] == (0.0, None)
+    starts, _ = got[second]
+    assert starts is not None and 29 * 60 < starts < 31 * 60
+
+
+def test_status_says_why_a_queued_job_has_no_start(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_smi(monkeypatch, FAKE_GPUS)
+    start_running([FAKE_GPUS[0]], None)
+    start_running([FAKE_GPUS[1]], 90)
+    wide = queue.enqueue(make_spec(priority=10, gpus=2))
+    narrow = queue.enqueue(make_spec(priority=20))
+
+    got = projection(capsys)
+    assert got[wide] == (None, "the jobs holding the cards it needs gave no end time")
+    assert got[narrow] == (None, f"job {wide} is ahead of it and has no start time yet")
+
+
+def test_status_projects_nothing_on_a_draining_host(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_smi(monkeypatch, FAKE_GPUS)
+    job_id = queue.enqueue(make_spec())
+    assert projection(capsys)[job_id] == (0.0, None)
+    paths.draining_file().touch()
+    assert projection(capsys)[job_id] == (
+        None,
+        "the host is draining, so nothing more will be dispatched",
+    )
+
+
+def test_status_holds_the_queue_for_a_missing_owned_card(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owned by index, and index 9 is not there: the host holds for it, and
+    the job at the front is told which card is the problem."""
+    use_smi(monkeypatch, FAKE_GPUS[:1])
+    jobs.write_config(HostConfig(host="test-host", gpus=["0", "9"]))
+    start_running([FAKE_GPUS[0]], 45)
+    wide = queue.enqueue(make_spec(priority=10, gpus=2))
+    narrow = queue.enqueue(make_spec(priority=20))
+
+    got = projection(capsys)
+    assert got[wide] == (
+        None,
+        "it needs 2 card(s) and only 1 of the 2 this host owns answer to nvidia-smi "
+        "(9 missing), so it is held until they do",
+    )
+    assert got[narrow] == (None, f"job {wide} is ahead of it and has no start time yet")
+
+
+def test_status_lets_a_borrower_start_on_an_idle_shared_card(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owned cards are six hours from free; the idle shared one is the
+    next pass's, but only for a job that asked for it."""
+    use_smi(monkeypatch, [*FAKE_GPUS, SHARED_UUID])
+    jobs.write_config(HostConfig(host="test-host", gpus=list(FAKE_GPUS), shared_gpus=[SHARED_UUID]))
+    start_running(list(FAKE_GPUS), 360)
+    borrower = queue.enqueue(make_spec(priority=10, use_shared=True))
+    purist = queue.enqueue(make_spec(priority=20))
+
+    got = projection(capsys)
+    assert got[borrower] == (0.0, None)
+    starts, _ = got[purist]
+    assert starts is not None and abs(starts - 360 * 60) < 60
+
+
+def test_status_steps_over_a_borrower_short_of_somebody_elses_card(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_smi(
+        monkeypatch,
+        [*FAKE_GPUS, SHARED_UUID],
+        utilization={SHARED_UUID: 98.0},
+        memory_used={SHARED_UUID: 21504.0},
+    )
+    jobs.write_config(HostConfig(host="test-host", gpus=list(FAKE_GPUS), shared_gpus=[SHARED_UUID]))
+    wide = queue.enqueue(make_spec(priority=10, gpus=3, use_shared=True))
+    narrow = queue.enqueue(make_spec(priority=20))
+
+    got = projection(capsys)
+    assert got[narrow] == (0.0, None)
+    starts, why = got[wide]
+    assert starts is None
+    assert why == (
+        "it needs 1 shared card(s) somebody else is using, and when they stop "
+        "is not something this host can predict"
+    )

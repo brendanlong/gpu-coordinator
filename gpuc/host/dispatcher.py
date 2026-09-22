@@ -17,13 +17,13 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from gpuc._version import is_other_build
-from gpuc.host import baseline, cleanup, gpus, jobs, paths, queue, scope, sync, terminate
+from gpuc.host import baseline, cleanup, gpus, jobs, paths, plan, queue, scope, sync, terminate
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.runner import (
     KILL_GRACE_S,
@@ -940,170 +940,103 @@ class Dispatcher:
         unused, theirs = self._borrowable
         return [uuid for uuid in unused if uuid not in busy], theirs
 
-    def _capacity_failure(self, spec: jobs.JobSpec) -> str | None:
-        """Why this host can *never* run this job, or None if it could.
-
-        This is a deletion: the caller unlinks the queue marker and writes the
-        job `failed`. So everything it reads has to be fixed for the life of a
-        queued job -- the *configured* card counts, which a card that is
-        missing this minute does not change (that makes a job wait, it must
-        not fail one the host is perfectly well set up to run), and
-        `use_shared`, which nothing changes after submit.
-        """
-        if spec.gpus < 1:
-            return f"needs at least 1 GPU, asked for {spec.gpus}"
-        config = self.config
-        shared = config.borrowable(spec)
-        if spec.gpus <= len(config.gpus) + len(shared):
-            return None
-        have = f"host owns {len(config.gpus)}"
-        if shared:
-            have += f" and may borrow {len(shared)} shared"
-        elif config.shared_gpus:
-            have += (
-                f" and shares {len(config.shared_gpus)} this job did not ask for "
-                f"(`use_shared: true` would let it)"
+    def _requests(self) -> list[tuple[queue.QueueEntry, plan.Request]]:
+        """The queue as `plan` sees it. A job whose spec cannot be read is
+        failed here: it is the one thing about a queued job that only the
+        dispatcher can decide."""
+        requests: list[tuple[queue.QueueEntry, plan.Request]] = []
+        for entry in queue.list_queued():
+            try:
+                spec = jobs.read_spec(entry.job_id)
+            except (RuntimeError, ValueError) as exc:
+                self.log(f"job {entry.job_id} has an unreadable spec ({exc}); dropping from queue")
+                queue.claim(
+                    entry.job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
+                )
+                continue
+            requests.append(
+                (entry, plan.Request(entry.job_id, spec.gpus, self.config.may_borrow(spec)))
             )
-        return f"needs {spec.gpus} GPUs, {have}"
+        return requests
 
-    def _holds_the_queue(self, spec: jobs.JobSpec, theirs: int) -> bool:
-        """Whether a job that cannot start yet keeps the cards it is waiting for.
-
-        The strict order and its one exemption, in one place: a job that could
-        not fit even once every job of ours ends is stepped over, because what
-        it is short of is a shared card somebody else is using and that is not
-        ours to wait on. What it could have is the owned cards as configured,
-        missing ones included, plus the shared cards nobody else is on if it
-        may borrow -- `theirs` being how many of those the pass's one
-        nvidia-smi reading found somebody else on.
-
-        `preempt_for_waiting` asks the same question about the same queue: a
-        job that is stepped over there is one the cards a preempt hands back
-        would pass by, and one that holds is a job they would not get past.
-        """
-        ours = len(self.config.gpus)
-        if self.config.may_borrow(spec):
-            ours += len(self.shared_gpus()) - theirs
-        return spec.gpus <= ours
+    def _pool(
+        self, *, extra_owned: Sequence[str] = (), extra_shared: Sequence[str] = ()
+    ) -> plan.Pool:
+        """This pass's cards. `extra_*` are the ones a stop in flight will hand
+        back, which `preempt_for_waiting` counts as free."""
+        return plan.Pool(
+            owned_free=[*self.free_gpus(), *extra_owned],
+            owned_configured=len(self.config.gpus),
+            shared_configured=len(self.config.shared_entries()),
+            shared_visible=len(self.shared_gpus()),
+            sample=self.borrowable_gpus,
+            shared_extra=list(extra_shared),
+        )
 
     def launch_ready(self) -> None:
-        """Dispatch in queue order, and hold cards for a job that does not fit.
-
-        The queue is in priority order, so a job that cannot start yet keeps
-        the free cards it is waiting for: nothing behind it may take them. Any
-        other rule makes priority advisory the moment the job at the front is
-        wider than the free pool -- a two-card job at priority 10 starved
-        indefinitely behind a stream of one-card jobs at 50, each of which fit
-        the one card it was waiting for -- and it is what made automatic
-        preemption livelock, since the card a preempted job handed back was
-        offered straight to the job that had just given it up.
-
-        It costs utilization: a card waiting for the rest of a job's cards runs
-        nothing, and on a rented pod that is billed. The one job that does not
-        hold is one that could not fit even once every job of ours ends: it
-        needs more cards than the host owns plus the shared cards nobody else
-        is on, so what it is short of is a shared card somebody else is using,
-        which comes free when *their* job ends, and that is not ours to wait
-        on. It is stepped over, not failed, since the configured host is big
-        enough for it. Width alone is not the test: a job wider than the owned
-        pool whose shortfall is an owned card of ours, with the shared card it
-        wants idle, holds like any other, or a stream of narrow jobs behind it
-        takes that owned card every time it frees and the job never runs.
+        """Act on `plan`: start what fits, fail what never will, hold the rest.
 
         A job waiting for an owned card that has dropped off nvidia-smi holds
         like any other: `config.gpus` says the host has that card, so the host
         is misconfigured or broken, and idling the queue behind the job is how
         that gets noticed rather than quietly worked around.
-
-        A job that holds holds what it could take this pass, borrowed cards
-        included: having taken one of somebody else's spare cards towards its
-        total, giving it to the job behind would leave it short again.
         """
         if paths.draining_file().exists():
             return
-        free = self.free_gpus()
-        # Sampled at most once per pass, and only if a job actually needs it:
-        # see `borrowable_gpus`. `theirs` is how many shared cards that reading
-        # found somebody else on.
-        borrowable: list[str] | None = None
-        theirs = 0
-        # Cards spoken for by a job ahead in the queue that could not start.
-        # Counts, not identities: one card of ours is as good as another.
-        held = 0
-        held_shared = 0
-        for entry in queue.list_queued():
-            job_id = entry.job_id
-            try:
-                spec = jobs.read_spec(job_id)
-            except (RuntimeError, ValueError) as exc:
-                self.log(f"job {job_id} has an unreadable spec ({exc}); dropping from queue")
-                queue.claim(job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now())
-                continue
-            too_big = self._capacity_failure(spec)
-            if too_big is not None:
+        requests = self._requests()
+        decisions = plan.plan([request for _, request in requests], self._pool())
+        for decision in decisions:
+            job_id = decision.job_id
+            if isinstance(decision, plan.Fails):
                 queue.claim(
-                    job_id, status="failed", reason=too_big, exit_code=1, ended_at=jobs.utc_now()
-                )
-                continue
-            # Owned cards first, always: a job borrows only the shortfall, so a
-            # shared card is held for the shortest time that runs the job. The
-            # cards a job ahead is waiting for are not on offer to this one.
-            owned_part = free[: min(spec.gpus, max(0, len(free) - held))]
-            shared_part: list[str] = []
-            short = spec.gpus - len(owned_part)
-            if short and self.config.may_borrow(spec):
-                if borrowable is None:
-                    borrowable, theirs = self.borrowable_gpus()
-                shared_part = borrowable[: min(short, max(0, len(borrowable) - held_shared))]
-                short -= len(shared_part)
-            if short:
-                if self._holds_the_queue(spec, theirs):
-                    held += len(owned_part)
-                    held_shared += len(shared_part)
-                continue
-            assigned = [*owned_part, *shared_part]
-            if not queue.claim(
-                job_id, status="running", gpus=assigned, phase="setup", started_at=jobs.utc_now()
-            ):
-                # Cancelled between listing the queue and here; its cards stay free.
-                continue
-            free = free[len(owned_part) :]
-            borrowable = borrowable[len(shared_part) :] if borrowable is not None else None
-            try:
-                proc = self.deps.spawn_runner(job_id)
-            except OSError as exc:
-                # The state said `running` a line ago; leaving it there would
-                # leave a job nothing is running, with no runner pid to notice
-                # the absence of, holding its GPUs against every later pass.
-                self.log(f"job {job_id}: could not spawn a runner ({exc})")
-                jobs.update_state(
                     job_id,
                     status="failed",
-                    reason="spawn-failed",
+                    reason=decision.reason,
                     exit_code=1,
                     ended_at=jobs.utc_now(),
-                    phase=None,
                 )
-                free = [*owned_part, *free]
-                if borrowable is not None:
-                    borrowable = [*shared_part, *borrowable]
                 continue
-            # pgid stays unset until the runner publishes the *job's* group: it
-            # is what `cancel` signals, and the runner's own group is not it.
+            if not isinstance(decision, plan.Assigned):
+                continue
+            self._launch(job_id, decision.gpus)
+
+    def _launch(self, job_id: str, assigned: list[str]) -> None:
+        if not queue.claim(
+            job_id, status="running", gpus=assigned, phase="setup", started_at=jobs.utc_now()
+        ):
+            # Cancelled between listing the queue and here; its cards stay free.
+            return
+        try:
+            proc = self.deps.spawn_runner(job_id)
+        except OSError as exc:
+            # The state said `running` a line ago; leaving it there would leave
+            # a job nothing is running, with no runner pid to notice the
+            # absence of, holding its GPUs against every later pass.
+            self.log(f"job {job_id}: could not spawn a runner ({exc})")
             jobs.update_state(
                 job_id,
-                pid=proc.pid,
-                pgid=None,
-                runner_pid=proc.pid,
-                runner_boot_id=boot_id(),
-                runner_starttime=starttime(proc.pid),
+                status="failed",
+                reason="spawn-failed",
+                exit_code=1,
+                ended_at=jobs.utc_now(),
+                phase=None,
             )
-            self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
-            borrowed = f", borrowing {','.join(shared_part)}" if shared_part else ""
-            self.log(
-                f"launched {job_id} (pid {proc.pid}) on "
-                f"{','.join(assigned) if assigned else 'cpu'}{borrowed}"
-            )
+            return
+        # pgid stays unset until the runner publishes the *job's* group: it
+        # is what a stop signals, and the runner's own group is not it.
+        jobs.update_state(
+            job_id,
+            pid=proc.pid,
+            pgid=None,
+            runner_pid=proc.pid,
+            runner_boot_id=boot_id(),
+            runner_starttime=starttime(proc.pid),
+        )
+        self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
+        shared = set(self.shared_gpus())
+        borrowed = [uuid for uuid in assigned if uuid in shared]
+        note = f", borrowing {','.join(borrowed)}" if borrowed else ""
+        self.log(f"launched {job_id} (pid {proc.pid}) on {','.join(assigned) or 'cpu'}{note}")
 
     # -- automatic preemption --------------------------------------------
     def preempt_for_waiting(self) -> None:
@@ -1165,12 +1098,10 @@ class Dispatcher:
         candidates = self.auto_preemptable()
         if not candidates:
             return
-        # Cards held by a job that is already stopping, plus the free ones: a
-        # gap the cards of a preempt already in flight will cover needs no
-        # second job stopped for it. Kept in two lists because a borrowed card
-        # is only on offer to a job that asked to borrow -- and a card that has
-        # dropped off nvidia-smi is in neither, since it is never handed out at
-        # all and counting it would stop a job for nothing.
+        # Cards held by a job that is already stopping count as free: a gap the
+        # cards of a preempt already in flight will cover needs no second job
+        # stopped for it. A card that has dropped off nvidia-smi is in neither
+        # list, since it is never handed out at all.
         owned = set(self.owned_gpus())
         shared = set(self.shared_gpus())
         stopping = [
@@ -1179,37 +1110,18 @@ class Dispatcher:
             if self._stopping(job_id)
             for uuid in entry.gpus
         ]
-        pool = [*self.free_gpus(), *(uuid for uuid in stopping if uuid in owned)]
-        shared_pool = [uuid for uuid in stopping if uuid in shared]
-        theirs = 0
-        sampled = False
-        for waiting in queue.list_queued():
-            try:
-                spec = jobs.read_spec(waiting.job_id)
-            except (RuntimeError, ValueError):
-                continue  # `launch_ready` is what drops an unreadable spec
-            borrowing = self.config.may_borrow(spec)
-            if borrowing and not sampled:
-                # The shared cards nobody else is on. `launch_ready` offered
-                # these to this very job a moment ago, so a gap counted without
-                # them is one somebody would be stopped to cover twice. This
-                # costs no reading: a queued borrower is a job `launch_ready`
-                # asked the same question of, against the same reading.
-                free_shared, theirs = self.borrowable_gpus()
-                shared_pool = [*free_shared, *shared_pool]
-                sampled = True
-            take = pool[: spec.gpus]
-            take_shared = shared_pool[: spec.gpus - len(take)] if borrowing else []
-            gap = spec.gpus - len(take) - len(take_shared)
-            if gap <= 0:
-                # Starting the moment those cards come back, so they are not on
-                # offer to the job behind it.
-                pool, shared_pool = pool[len(take) :], shared_pool[len(take_shared) :]
+        requests = self._requests()
+        by_id = {request.job_id: (entry, request) for entry, request in requests}
+        pool = self._pool(
+            extra_owned=[u for u in stopping if u in owned],
+            extra_shared=[u for u in stopping if u in shared],
+        )
+        for decision in plan.plan([request for _, request in requests], pool):
+            if not isinstance(decision, plan.Holds):
                 continue
-            if not self._holds_the_queue(spec, theirs):
-                continue
+            waiting, request = by_id[decision.job_id]
             for candidate in enough_to_start(
-                candidates, waiting.priority, gap, borrowing=borrowing
+                candidates, waiting.priority, decision.gap, borrowing=request.borrows
             ):
                 if not self._preempt_for(candidate, waiting):
                     # The gap is not covered any more, so the rest of the set
@@ -1359,7 +1271,7 @@ class Dispatcher:
             # A job that failed its sync preflight proved these uploads cannot
             # work *before* it ran, and produced nothing. Retrying it three
             # times here only burns the budget the jobs with real outputs need.
-            if (state.reason or "").startswith("sync-preflight"):
+            if state.reason == "sync-preflight":
                 continue
             if not cleanup.outputs_confirmed(job_id, state)[0]:
                 pending.append(job_id)
@@ -1391,7 +1303,7 @@ class Dispatcher:
                     continue
                 pending.remove(job_id)
                 with contextlib.suppress(RuntimeError, OSError, KeyError):
-                    jobs.update_state(job_id, outputs_synced_at=jobs.utc_now(), outputs_lost=False)
+                    jobs.update_state(job_id, outputs_lost=False)
                 self.log(f"drain: job {job_id} outputs uploaded on attempt {attempt}")
             if not pending or attempt == OUTPUT_RETRY_ATTEMPTS:
                 break
@@ -1403,7 +1315,7 @@ class Dispatcher:
             error = last_error.get(job_id, "outputs were never confirmed uploaded")
             self.log(f"drain: job {job_id} OUTPUTS LOST: {error}")
             with contextlib.suppress(RuntimeError, OSError, KeyError):
-                jobs.update_state(job_id, outputs_lost=True, sync_error=error)
+                jobs.update_state(job_id, outputs_lost=True)
 
     def _upload_outputs(self, job_id: str, config: jobs.HostConfig, timeout: float) -> None:
         spec = jobs.read_spec(job_id)

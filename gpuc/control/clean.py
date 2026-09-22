@@ -87,7 +87,7 @@ class CleanReport:
         if self.incoming_removed:
             staged = ", ".join(self.incoming_removed)
             lines.append(
-                f"  removed {len(self.incoming_removed)} leftover staged spec(s): {staged}"
+                f"  removed {len(self.incoming_removed)} leftover staged job dir(s): {staged}"
             )
         for error in self.errors:
             lines.append(f"  ERROR {error}")
@@ -309,7 +309,7 @@ def purge_host(
 ) -> CleanReport:
     """Remove whole job dirs on a host, optionally checking the mirror first.
 
-    Without `--verify` this trusts `meta_synced_at`, which the host wrote only
+    Without `--verify` this trusts the host's mirror record, which it wrote only
     after its own upload returned 0 -- the cheap answer, and the only one
     available to a host with no credentials of ours. With it we HEAD the
     mirrored `log.txt` ourselves: a dry run then *labels* each candidate, and a
@@ -398,11 +398,13 @@ def verify_mirror(
     unverified: list[tuple[str, str]] = []
     for job in report.purged:
         job_id = str(job["job_id"])
-        prefix = job.get("meta_synced_to") or entry.s3_prefix
-        if not prefix:
+        mirror = job.get("mirror")
+        if not mirror and entry.s3_prefix:
+            mirror = job_log_uri(entry.s3_prefix, job_id).removesuffix("/log.txt")
+        if not mirror:
             unverified.append((job_id, "no mirror prefix to verify against"))
             continue
-        uri = job_log_uri(str(prefix), job_id)
+        uri = f"{mirror}/log.txt"
         bucket, key = split_uri(uri)
         try:
             s3.head_object(Bucket=bucket, Key=key)

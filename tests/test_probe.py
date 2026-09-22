@@ -238,6 +238,12 @@ class OneAnswerTransport:
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
         return CommandResult(self.host, ["tail"], 0, "", "")
 
+    def argv(self, command: str) -> list[str]:
+        return ["sh", "-c", command]
+
+    def interactive_argv(self, command: str) -> list[str]:
+        return ["sh", "-c", command]
+
 
 def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
     """The seam every other test here stubs: the registry's `--gpus` reaches the report."""

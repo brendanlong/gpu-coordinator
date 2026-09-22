@@ -33,7 +33,6 @@ from tests.conftest import host_entry
 FIXTURES = Path(__file__).parent / "fixtures" / "schema"
 HOSTS_SHAPES = (
     "hosts.current.json",
-    "hosts.presplit.json",
     "hosts.older.json",
     "hosts.newer.json",
 )
@@ -75,23 +74,6 @@ def test_the_older_registry_drops_its_ttl_and_defaults_what_it_never_had(
     assert entry.retention_days is None
     assert entry.gpu_info == {}
     assert entry.pkg_commit is None
-
-
-def test_a_pre_split_registry_reads_as_a_cache_of_each_hosts_config(control_env: Path) -> None:
-    """The shape this build wrote until the host became the owner of its config:
-    everything it says about a host is now the last thing seen, not the truth."""
-    (control_env / "state" / "hosts.json").write_text(
-        (FIXTURES / "hosts.presplit.json").read_text()
-    )
-    entry = read_registry().registry.hosts["gpubox"]
-    assert entry.ssh == "gpubox-ssh"
-    assert entry.gpus[0] == "GPU-80646905-50a9-afc1-4375-43ca475b15e4"
-    assert entry.s3_prefix == "s3://brendanlong-experiments/gpuc/gpubox"
-    assert entry.retention_days == 14.0
-    assert entry.python is not None and entry.python.endswith("python3.12")
-    assert entry.config.host == "gpubox"
-    # Nothing has confirmed any of it with the host yet, and it says so.
-    assert entry.seen_at is None
 
 
 def test_the_newer_registry_ignores_what_it_does_not_know(control_env: Path) -> None:

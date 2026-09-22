@@ -27,8 +27,10 @@ from gpuc.control.actions import (
     find_job_host,
     named_registry,
     note,
+    provider_for_status,
 )
 from gpuc.control.config import ConfigError, HostEntry, Reporter, Settings, load_settings
+from gpuc.control.providers.base import Provider
 from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.s3index import LocalIndex, S3Index, S3IndexError, S3ObjectMissing, job_uri
 from gpuc.control.status import JobView
@@ -157,11 +159,13 @@ class Watch:
         settings: Settings | None = None,
         *,
         report: Reporter = note,
+        provider: Provider | None = None,
     ) -> None:
         # Resolved once here rather than per use: the mirror fallback needs a
         # real `Settings` to find a bucket in, and a watch outlives many reads.
         self.settings = settings if settings is not None else load_settings()
         self.report = report
+        self.provider = provider
         self.entries = {entry.name: entry for _, entry in targets}
         self.jobs = {
             job_id: Watched(job_id, entry.name, mirror_prefix=mirror_prefix(job_id, entry))
@@ -294,7 +298,11 @@ class Watch:
         if said != why:
             self.report(f"host {name}: {why}; still waiting")
         self._trouble[name] = (since, why)
-        if now - since < TROUBLE_GRACE_S:
+        # A rental the provider says has ended is not going to answer, however
+        # long we wait: it is the one case the mirror exists for, so it is read
+        # now rather than after the grace period.
+        gone = status_mod.rental_gone(self.entries[name], self.provider, self.report)
+        if gone is None and now - since < TROUBLE_GRACE_S:
             return
         waited = status_mod.format_duration(now - since)
         # One index, not one per job: it holds a boto3 client, and twenty jobs
@@ -378,7 +386,9 @@ def start(
         # neither polls twice nor prints the outcome twice.
         for job_id in dict.fromkeys(job_ids)
     ]
-    return Watch(targets, settings, report=report)
+    settings = settings if settings is not None else load_settings()
+    provider = provider_for_status([entry for _, entry in targets], settings, report)
+    return Watch(targets, settings, report=report, provider=provider)
 
 
 def document(waited: Sequence[Watched]) -> dict[str, Any]:

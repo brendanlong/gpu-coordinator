@@ -176,15 +176,25 @@ def named_registry() -> Registry:
     return read.registry
 
 
-def make_provider(settings: Settings) -> Provider:
-    return RunPodProvider(prefix=settings.runpod_pod_prefix)
+PROVIDERS: dict[str, Callable[[Settings], Provider]] = {
+    "runpod": lambda settings: RunPodProvider(prefix=settings.runpod_pod_prefix),
+}
+"""Every rental provider, by the `kind` a host's `provider` block names."""
+
+
+def make_provider(settings: Settings, kind: str = "runpod") -> Provider:
+    try:
+        factory = PROVIDERS[kind]
+    except KeyError:
+        raise ProviderError(f"no such provider: {kind!r} (known: {', '.join(PROVIDERS)})") from None
+    return factory(settings)
 
 
 def provider_for_status(
     entries: Sequence[HostEntry], settings: Settings, report: Callable[[str], None] = note
 ) -> Provider | None:
     """Only build a provider when an ephemeral host is on screen, and never fail on it."""
-    if not any(entry.kind == "runpod" for entry in entries):
+    if not any(entry.ephemeral for entry in entries):
         return None
     try:
         return make_provider(settings)
@@ -286,29 +296,6 @@ def forget_gone_rentals(
             forget_host_locked(view.entry.name, view.entry.pod_id, report)
 
 
-def rental_gone(
-    entry: HostEntry, provider: Provider | None, report: Callable[[str], None] = note
-) -> str | None:
-    """Why this host's pod no longer exists, or None if it does.
-
-    Asked only once a host has failed to answer: a rental that ended itself
-    when its queue went idle is how one is meant to die, not a failure. A
-    provider that cannot be asked leaves the failure as it was.
-    """
-    if provider is None or entry.kind != "runpod" or not entry.pod_id:
-        return None
-    try:
-        pod = provider.get(entry.pod_id)
-    except ProviderError as exc:
-        report(f"could not ask the provider about pod {entry.pod_id}: {exc}")
-        return None
-    if pod is None:
-        return f"pod {entry.pod_id} no longer exists"
-    if pod.status == "TERMINATED":
-        return f"pod {entry.pod_id} is TERMINATED"
-    return None
-
-
 def registry_exit(read: RegistryRead) -> int:
     """Exit code for reporting on the registry: 0 only if all of it parsed.
 
@@ -373,7 +360,7 @@ def host_document(entry: HostEntry) -> dict[str, Any]:
         **config,
         "env": names,
         "cache": cache,
-        "cache_dir": entry.cache_dir,
+        "cache_dir": entry.env.get("UV_CACHE_DIR"),
         "config_seen_at": entry.seen_at,
         "remote_home": entry.remote_home,
         "ephemeral": entry.ephemeral,
@@ -509,7 +496,7 @@ def find_job_host(
             payload = open_session(entry).host_json(f"status {shlex.quote(job_id)}", timeout=60.0)
         except (RemoteError, TransportError):
             continue
-        if payload.get("jobs"):
+        if isinstance(payload, dict) and payload.get("jobs"):
             return entry, index
     raise NotFound(
         f"no registered host knows job {job_id}.\n"
@@ -517,12 +504,56 @@ def find_job_host(
     )
 
 
-def cancel_job(job_id: str, host: str | None, settings: Settings) -> dict[str, Any]:
+def job_verb(
+    verb: str,
+    job_id: str,
+    host: str | None,
+    settings: Settings,
+    *,
+    args: str = "",
+    mirror: tuple[str, Any] | None = None,
+) -> tuple[HostEntry, HostSession, dict[str, Any], list[str]]:
+    """Run one on-host verb against one job: the path every job command takes.
+
+    Find the host, ask it, insist on a verdict, and put any spec change in the
+    mirror too. Returns the host, the session (for a follow-up question like
+    the queue placement), the host's document and the warnings so far.
+
+    `check=False` on the host call: a refusal (a finished job, an id this host
+    does not know) *is* the host's document, and raising on the exit code
+    would throw away the reason it gave. An answer with no `status` is an
+    error too: reporting success for a job the host never touched is worse
+    than any exception.
+
+    `mirror` is `(spec field, value)`: `requeue` submits what S3 holds, so a
+    priority or estimate changed on the host and not in the mirror would hand
+    a re-run back with the old one, silently. A mirror that cannot be updated
+    is a warning, never a failure: the change is already where `status` reads
+    it, which is what was asked for.
+    """
     entry, _ = find_job_host(job_id, named_registry(), host)
-    payload = open_session(entry, settings).host_json(f"cancel {shlex.quote(job_id)}")
+    session = open_session(entry, settings)
+    payload = session.host_json(f"{verb} {shlex.quote(job_id)}{args}", check=False)
+    document = payload if isinstance(payload, dict) else {}
+    if document.get("error"):
+        raise CliError(f"host {entry.name} did not {verb} {job_id}: {document['error']}")
+    if not document.get("status"):
+        raise CliError(
+            f"host {entry.name} did not say what it did with {job_id}: {json.dumps(payload)[:200]}"
+        )
+    warnings: list[str] = []
+    if mirror is not None:
+        note = mirror_spec_field(job_id, mirror[0], mirror[1], settings, what=mirror[0])
+        if note:
+            warnings.append(note)
+    return entry, session, document, warnings
+
+
+def cancel_job(job_id: str, host: str | None, settings: Settings) -> dict[str, Any]:
+    entry, _, document, _ = job_verb("cancel", job_id, host, settings)
     # The host's own word for what it did: `cancelled` for a queued job it
     # dequeued, `cancelling` for a running one whose runner has been marked.
-    return {"job_id": job_id, "host": entry.name, "status": payload.get("status")}
+    return {"job_id": job_id, "host": entry.name, "status": document["status"]}
 
 
 def check_priority(priority: int) -> None:
@@ -530,59 +561,16 @@ def check_priority(priority: int) -> None:
         raise UsageError(f"priority must be 0-99 (lower dispatches first), got {priority}")
 
 
-def host_answer(
-    session: HostSession,
-    entry: HostEntry,
-    request: str,
-    job_id: str,
-    verb: str,
-    *,
-    legacy_key: str | None = None,
-) -> dict[str, Any]:
-    """Run a host subcommand that answers with its own verdict, refusal included.
-
-    `check=False`: a refusal (a finished job, an id this host does not know) *is*
-    the host's document, and raising on the exit code would throw away the
-    reason it gave. An answer with no `status` -- a build too old to know the
-    command, or something else entirely -- is an error too: reporting success
-    for a job the host never touched is worse than any exception.
-    """
-    payload = session.host_json(request, check=False)
-    document = payload if isinstance(payload, dict) else {}
-    if document.get("error"):
-        raise CliError(f"host {entry.name} did not {verb} {job_id}: {document['error']}")
-    if not document.get("status"):
-        if legacy_key and document.get(legacy_key) is True:
-            # A build from before the command answered with a status: it did
-            # the thing, and said so in the shape it knew.
-            return document
-        raise CliError(
-            f"host {entry.name} did not say what it did with {job_id}: {json.dumps(payload)[:200]}"
-        )
-    return document
-
-
 def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings) -> dict[str, Any]:
     check_priority(priority)
-    entry, _ = find_job_host(job_id, named_registry(), host)
-    session = open_session(entry, settings)
-    host_answer(
-        session,
-        entry,
-        f"reorder {shlex.quote(job_id)} {priority}",
-        job_id,
-        "reorder",
-        legacy_key="reordered",
+    entry, session, _, warnings = job_verb(
+        "reorder", job_id, host, settings, args=f" {priority}", mirror=("priority", priority)
     )
-    # The mirror, for the same reason `estimate` updates it: `requeue` submits
-    # what S3 holds, so a reorder left out of it would hand the re-run back at
-    # the priority the job was first submitted with.
-    warning = mirror_spec_field(job_id, "priority", priority, settings, what="priority")
     return {
         "job_id": job_id,
         "host": entry.name,
         "priority": priority,
-        "warnings": [warning] if warning else [],
+        "warnings": warnings,
         **placement_after(entry, job_id, settings, session=session),
     }
 
@@ -600,19 +588,14 @@ def preempt_job(
     """
     if priority is not None:
         check_priority(priority)
-    entry, _ = find_job_host(job_id, named_registry(), host)
-    session = open_session(entry, settings)
-    request = f"preempt {shlex.quote(job_id)}"
-    if priority is not None:
-        request += f" --priority {priority}"
-    document = host_answer(session, entry, request, job_id, "preempt")
-    warnings = []
-    if priority is not None:
-        # The same reason `reorder` re-mirrors: `requeue` submits what S3
-        # holds, and would otherwise hand the job back at its old priority.
-        warning = mirror_spec_field(job_id, "priority", priority, settings, what="priority")
-        if warning:
-            warnings.append(warning)
+    entry, _, document, warnings = job_verb(
+        "preempt",
+        job_id,
+        host,
+        settings,
+        args="" if priority is None else f" --priority {priority}",
+        mirror=None if priority is None else ("priority", priority),
+    )
     return {
         "job_id": job_id,
         "host": entry.name,
@@ -688,11 +671,13 @@ def estimate_job(
 
     `wanted` has been through `check_estimate`; None clears the estimate.
     """
-    entry, _ = find_job_host(job_id, named_registry(), host)
-    session = open_session(entry, settings)
-    request = "--clear" if wanted is None else repr(wanted)
-    document = host_answer(
-        session, entry, f"estimate {shlex.quote(job_id)} {request}", job_id, "set the estimate on"
+    entry, _, document, warnings = job_verb(
+        "estimate",
+        job_id,
+        host,
+        settings,
+        args=" --clear" if wanted is None else f" {wanted!r}",
+        mirror=("estimated_runtime_min", wanted),
     )
     recorded = document.get("estimated_runtime_min")
     expected = recorded is None if wanted is None else isinstance(recorded, (int, float))
@@ -703,12 +688,8 @@ def estimate_job(
             f"host {entry.name} did not say what estimate it recorded for {job_id}: "
             f"{json.dumps(document)[:200]}"
         )
-    warnings = [str(document["warning"])] if document.get("warning") else []
-    mirror_note = mirror_spec_field(
-        job_id, "estimated_runtime_min", wanted, settings, what="estimate"
-    )
-    if mirror_note:
-        warnings.append(mirror_note)
+    if document.get("warning"):
+        warnings.insert(0, str(document["warning"]))
     return {
         "job_id": job_id,
         "host": entry.name,

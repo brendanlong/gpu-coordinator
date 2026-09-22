@@ -14,9 +14,10 @@ from gpuc.control.remote import HostSession
 from gpuc.control.s3index import LocalIndex, S3Index, spec_key
 from gpuc.control.submit import (
     SubmitError,
+    check_gpu_count,
     gather_secrets,
     load_document,
-    precheck_local,
+    prepare,
     submit_file,
     submit_spec,
     validate,
@@ -61,6 +62,12 @@ class FakeHost:
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
         return CommandResult(self.host, ["tail"], 0, "", "")
+
+    def argv(self, command: str) -> list[str]:
+        return ["ssh", self.host, command]
+
+    def interactive_argv(self, command: str) -> list[str]:
+        return ["ssh", "-t", self.host, command]
 
 
 def session(host: FakeHost) -> HostSession:
@@ -178,7 +185,7 @@ def test_submit_expands_job_id_in_output_destinations(control_env: Path, repo: P
         environ={},
         report=lambda _: None,
     )
-    spec = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"][0])
+    spec = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/spec.json"][0])
     assert spec["outputs"][0]["s3"] == f"s3://b/exp/{result.job_id}/results"
     assert spec["outputs"][1]["hf_path"] == result.job_id
     assert "{job_id}" not in json.dumps(spec["outputs"])
@@ -204,7 +211,7 @@ def test_the_mirror_keeps_the_job_id_unexpanded_so_a_requeue_gets_its_own_namesp
     mirrored = json.loads(client.objects[f"bkt/{spec_key(result.job_id)}"])
     assert mirrored["outputs"][0]["s3"] == "s3://b/exp/{job_id}/results"
     assert (mirrored["job_id"], mirrored["attempt"]) == (result.job_id, 1)
-    shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"][0])
+    shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/spec.json"][0])
     assert shipped["outputs"][0]["s3"] == f"s3://b/exp/{result.job_id}/results"
 
 
@@ -252,7 +259,7 @@ def test_an_hf_repo_per_run_with_a_fixed_path_is_a_unique_location(
         environ={},
         report=lambda _: None,
     )
-    shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"][0])
+    shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/spec.json"][0])
     assert shipped["outputs"][0]["hf"] == f"org/run-{result.job_id}"
     assert shipped["outputs"][0]["hf_path"] == "weights"
 
@@ -294,7 +301,7 @@ def test_a_destination_carrying_this_jobs_literal_id_is_accepted(
         report=lambda _: None,
     )
     assert result.job_id == job_id
-    assert f"{REMOTE_HOME}/incoming/{job_id}.json" in host.puts
+    assert f"{REMOTE_HOME}/incoming/{job_id}/spec.json" in host.puts
 
 
 def test_an_hf_output_without_hf_path_uploads_under_the_job_id_itself(
@@ -310,18 +317,18 @@ def test_an_hf_output_without_hf_path_uploads_under_the_job_id_itself(
         environ={},
         report=lambda _: None,
     )
-    spec = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"][0])
+    spec = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/spec.json"][0])
     assert spec["outputs"][0]["hf_path"] is None
 
 
-def test_precheck_refuses_an_output_without_the_job_id_before_a_pod_is_bought(
+def test_prepare_refuses_an_output_without_the_job_id_before_a_pod_is_bought(
     repo: Path,
 ) -> None:
     with pytest.raises(SubmitError, match="does not include the job id"):
-        precheck_local(
+        prepare(
             validate(job_document(outputs=[{"path": "results", "s3": "s3://b/results"}])),
             repo,
-            gpu_count=1,
+            environ={},
         )
 
 
@@ -342,15 +349,15 @@ def test_submit_ships_tracked_and_untracked_files_but_not_ignored_ones(
     )
     root, dest, files = host.rsyncs[0]
     assert root == repo
-    assert dest == f"{REMOTE_HOME}/jobs/{result.job_id}/workdir"
+    assert dest == f"{REMOTE_HOME}/incoming/{result.job_id}/workdir"
     assert sorted(files or []) == [".gitignore", "new.py", "src/train.py"]
     assert any(
         line == "syncing 3 files (1 modified, 2 untracked, ignoring .gitignore'd)" for line in lines
     )
-    patch, _ = host.puts[f"{REMOTE_HOME}/jobs/{result.job_id}/uncommitted.patch"]
+    patch, _ = host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/uncommitted.patch"]
     assert "print('changed')" in patch
     assert "just written, not added" in patch
-    source = json.loads(host.puts[f"{REMOTE_HOME}/jobs/{result.job_id}/source.json"][0])
+    source = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/source.json"][0])
     assert len(source["commit"]) == 40
 
 
@@ -389,11 +396,11 @@ def test_no_git_syncs_everything_except_the_default_excludes(
         report=lines.append,
     )
     root, dest, files = host.rsyncs[0]
-    assert (root, dest) == (plain, f"{REMOTE_HOME}/jobs/{result.job_id}/workdir")
+    assert (root, dest) == (plain, f"{REMOTE_HOME}/incoming/{result.job_id}/workdir")
     assert files is None
     assert host.excludes == [".venv", "__pycache__", ".git", "*.pyc", "node_modules", ".uv-cache"]
     assert any("WARNING: --no-git" in line for line in lines)
-    assert f"{REMOTE_HOME}/jobs/{result.job_id}/uncommitted.patch" not in host.puts
+    assert f"{REMOTE_HOME}/incoming/{result.job_id}/uncommitted.patch" not in host.puts
 
 
 def test_a_non_repo_without_no_git_says_how_to_fix_it(control_env: Path, tmp_path: Path) -> None:
@@ -441,7 +448,7 @@ def test_submit_enqueues_over_stdin_and_records_the_index(control_env: Path, rep
         report=lambda _: None,
     )
     enqueue = next(c for c in host.commands if "gpuc.host enqueue" in c)
-    assert f"enqueue - < {REMOTE_HOME}/incoming/{result.job_id}.json" in enqueue
+    assert f"enqueue {REMOTE_HOME}/incoming/{result.job_id}/spec.json" in enqueue
     assert f'GPUC_HOME="{REMOTE_HOME}"' in enqueue
     assert f'PYTHONPATH="{REMOTE_HOME}/pkg"' in enqueue
     index = LocalIndex().get(result.job_id)
@@ -504,7 +511,10 @@ def test_a_job_bigger_than_the_host_is_refused_early(control_env: Path, repo: Pa
             environ={},
             report=lambda _: None,
         )
-    assert "host gpubox owns 1" in str(exc.value)
+    assert str(exc.value).startswith(
+        "host gpubox cannot run this job: it needs 4 GPUs, host owns 1"
+    )
+    assert "Submit to a bigger host" in str(exc.value)
     assert host.rsyncs == []
 
 
@@ -537,7 +547,7 @@ def test_a_job_that_did_not_ask_is_not_given_the_shared_cards_as_capacity(
     entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"])
     with pytest.raises(SubmitError) as exc:
         submit_to(entry, repo, job_document(gpus=2))
-    assert "1 shared card(s) this job did not ask for" in str(exc.value)
+    assert "host owns 1 and shares 1 this job did not ask for" in str(exc.value)
     assert "use_shared: true" in str(exc.value)
 
 
@@ -547,14 +557,15 @@ def test_a_job_bigger_than_owned_and_shared_together_is_still_refused(
     entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"])
     with pytest.raises(SubmitError) as exc:
         submit_to(entry, repo, job_document(gpus=4, use_shared=True))
-    assert "owns 1 and may borrow 1 shared card(s)" in str(exc.value)
+    assert "needs 4 GPUs, host owns 1 and may borrow 1 shared" in str(exc.value)
+    assert "Submit to a bigger host" in str(exc.value)
 
 
 def test_use_shared_reaches_the_host_in_the_spec(control_env: Path, repo: Path) -> None:
     host = FakeHost()
     entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-b"])
     result = submit_to(entry, repo, job_document(gpus=1, use_shared=True), host)
-    staged, _mode = host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}.json"]
+    staged, _mode = host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/spec.json"]
     assert json.loads(staged)["use_shared"] is True
 
 
@@ -591,12 +602,68 @@ def test_submit_file_reads_yaml(control_env: Path, repo: Path) -> None:
 def test_the_gpu_count_of_a_pod_to_be_is_checked_before_it_is_bought() -> None:
     model = validate(job_document(gpus=2))
     with pytest.raises(SubmitError) as caught:
-        precheck_local(model, Path.cwd(), gpu_count=1)
+        check_gpu_count(model, 1)
     assert "--gpu-count" in str(caught.value)
 
 
+def test_a_spec_that_fits_the_pod_or_names_no_count_passes_the_gpu_count_check() -> None:
+    check_gpu_count(validate(job_document(gpus=2)), 2)
+    check_gpu_count(validate(job_document(gpus=8)), None)
+
+
 def test_a_long_job_is_fine_on_a_pod(repo: Path) -> None:
-    precheck_local(validate(job_document(max_runtime_min=6000)), repo, gpu_count=1)
+    prepared = prepare(validate(job_document(max_runtime_min=6000)), repo, environ={})
+    assert prepared.warnings == []
+
+
+def test_prepare_expands_the_job_id_and_gathers_the_secrets_in_one_call(repo: Path) -> None:
+    prepared = prepare(
+        validate(
+            job_document(
+                secrets=["HF_TOKEN"],
+                outputs=[{"path": "results", "s3": "s3://b/{job_id}"}],
+            )
+        ),
+        repo,
+        job_id="j-fixed",
+        attempt=3,
+        environ={"HF_TOKEN": "hf_secret"},
+    )
+    assert prepared.spec.job_id == "j-fixed"
+    assert prepared.spec.attempt == 3
+    assert prepared.spec.outputs[0].s3 == "s3://b/j-fixed"
+    assert prepared.secrets_body == "HF_TOKEN=hf_secret\n"
+
+
+def test_prepare_refuses_a_missing_secret_before_a_host_is_involved(repo: Path) -> None:
+    with pytest.raises(SubmitError, match="HF_TOKEN"):
+        prepare(validate(job_document(secrets=["HF_TOKEN"])), repo, environ={})
+
+
+def test_prepare_refuses_a_workdir_that_is_not_a_repo_unless_git_is_off(tmp_path: Path) -> None:
+    model = validate(job_document())
+    with pytest.raises(SubmitError, match="not a git repository"):
+        prepare(model, tmp_path, environ={})
+    assert prepare(model, tmp_path, environ={}, use_git=False).spec.command == model.command
+
+
+def test_prepare_collects_the_warnings_a_submit_prints(repo: Path) -> None:
+    (repo / "results").mkdir()
+    (repo / "results" / "old.txt").write_text("stale\n")
+    prepared = prepare(
+        validate(
+            job_document(
+                estimated_runtime_min=120,
+                max_runtime_min=60,
+                outputs=[{"path": "results", "s3": "s3://b/{job_id}"}],
+            )
+        ),
+        repo,
+        environ={},
+    )
+    assert len(prepared.warnings) == 2
+    assert "pre-existing file(s) under results/" in prepared.warnings[0]
+    assert "expects to be killed as `timeout`" in prepared.warnings[1]
 
 
 def test_submit_warns_about_files_already_under_an_output_path(

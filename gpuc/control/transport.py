@@ -120,6 +120,15 @@ class Transport(Protocol):
 
     def tail(self, remote_path: str, lines: int = ..., follow: bool = ...) -> CommandResult: ...
 
+    def argv(self, command: str) -> list[str]:
+        """The argv that runs `command` on the host, for a caller that streams
+        or prints it rather than waiting on `run`."""
+        ...
+
+    def interactive_argv(self, command: str) -> list[str]:
+        """The argv for a session a person types into: a tty, and no BatchMode."""
+        ...
+
 
 def _execute(
     host: str,
@@ -166,12 +175,18 @@ def _execute(
 class LocalTransport:
     host: str = "local"
 
+    def argv(self, command: str) -> list[str]:
+        # Not a login shell: a profile that prints a banner (or edits PATH)
+        # would end up in the output we parse as JSON.
+        return ["bash", "-c", command]
+
+    def interactive_argv(self, command: str) -> list[str]:
+        return ["bash", "-lc", command]
+
     def run(
         self, command: str, *, timeout: float = DEFAULT_TIMEOUT_S, check: bool = True
     ) -> CommandResult:
-        # Not a login shell: a profile that prints a banner (or edits PATH)
-        # would end up in the output we parse as JSON.
-        return _execute(self.host, ["bash", "-c", command], timeout=timeout, check=check)
+        return _execute(self.host, self.argv(command), timeout=timeout, check=check)
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
         path = Path(remote_path).expanduser()
@@ -250,6 +265,22 @@ class SshTransport:
         # The remote login shell may be anything; bash -c makes the command we
         # send mean the same thing everywhere, without sourcing a profile.
         return ["ssh", *self.ssh_options(), self.target, f"bash -c {shlex.quote(command)}"]
+
+    def argv(self, command: str) -> list[str]:
+        return self.ssh_argv(command)
+
+    def interactive_argv(self, command: str) -> list[str]:
+        """`-t` forces a tty: without it the remote shell has no job control,
+        no prompt and no `clear`. BatchMode is dropped, because the user may
+        well need to type a key passphrase; it is right for every automated
+        call, where a prompt would hang a polling loop for ever."""
+        kept: list[str] = []
+        for opt in self.ssh_options():
+            if opt.startswith("BatchMode") and kept and kept[-1] == "-o":
+                kept.pop()
+                continue
+            kept.append(opt)
+        return ["ssh", *kept, "-t", self.target, command]
 
     def _prepare(self) -> None:
         if self.control_dir is not None:

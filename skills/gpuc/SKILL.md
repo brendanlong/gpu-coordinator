@@ -62,6 +62,8 @@ the job, never from the checkout.
 name: lego-s4                      # label only
 setup: uv sync --frozen            # phase "setup"; venv is cached across jobs on the host
 command: uv run --no-sync python -m experiments.lego.train --k-max 6 --device cuda
+# python: .venv/bin/python        # only for a repo that is not a uv project: how the
+                                  # GPU check before `main` runs Python in the job's env
 gpus: 1                            # at least 1
 use_shared: false                  # also use cards the host borrows rather than owns
 env:
@@ -181,7 +183,12 @@ credentials missing), `timeout` (`max_runtime_min`), `preempted`
 (`gpuc preempt` -- or the job's own `auto_preempt` -- stopped that attempt; the job is
 queued again as the next one), `sync`
 (final upload failed; results exist only on the host), `no-outputs` (the output
-path was never written), `terminated`, `runner-died`.
+path was never written), `terminated`, `runner-died`. A job that ended for a
+reason of its own and *also* lost its upload keeps its reason and lists `sync`
+or `no-outputs` under `problems`. A **running** job whose output is not
+reaching its destination says `UPLOAD FAILING` on its status line: an
+`outputs:` path that does not exist yet is the usual cause, and it is worth
+checking before the job runs for hours.
 
 `gpuc status` also flags jobs, not just failures: `outputs not uploaded` means
 the results are still only on that host, and **`OUTPUTS LOST`** means an
@@ -235,9 +242,10 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
 `name, kind, reachable, pkg_commit, dispatcher{alive, heartbeat_age_s},
 provider_util, gpus, shared_gpus, queued, running, finished, errors`; each job in those three
-lists has `job_id, name, status, reason, phase, priority, elapsed_s, util,
-progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
-gpus_requested, use_shared, starts_in_s, starts_at, iso, ended_at,
+lists has `job_id, name, status, reason, problems, upload_errors, phase,
+priority, elapsed_s, util, progress_pct, eta, eta_s, estimated_runtime_min,
+progress_error, gpus, gpus_requested, use_shared, starts_in_s, starts_at,
+starts_unknown, iso, ended_at,
 outputs_pending` (`starts_*` are null unless the job is queued). Each entry in
 `shared_gpus` adds `memory_mib`, `utilization_pct` and `unused` — the host's own
 verdict on whether gpuc would borrow that card right now.

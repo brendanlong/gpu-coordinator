@@ -20,7 +20,7 @@ from gpuc.control.actions import host_document
 from gpuc.control.config import HostCache, HostEntry
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.providers.base import Pod
-from gpuc.control.status import HostView, JobView, SharedGpu
+from gpuc.control.status import HostState, HostView, JobView, SharedGpu
 
 NOW = datetime.now(UTC)
 
@@ -79,7 +79,7 @@ def views() -> list[HostView]:
             model="NVIDIA GeForce RTX 4090",
             vram_mib=24564,
         ),
-        reachable=True,
+        state=HostState.ANSWERED,
         pkg_commit=version_mod.local_commit(),
         dispatcher_pkg_commit=version_mod.local_commit(),
         heartbeat_age_s=2.0,
@@ -124,7 +124,7 @@ def views() -> list[HostView]:
             model="NVIDIA A40",
             vram_mib=49140,
         ),
-        reachable=True,
+        state=HostState.ANSWERED,
         pkg_commit=version_mod.local_commit(),
         dispatcher_pkg_commit=version_mod.local_commit(),
         heartbeat_age_s=1.0,
@@ -208,7 +208,7 @@ def views() -> list[HostView]:
             model="NVIDIA A100 80GB PCIe",
             vram_mib=81920,
         ),
-        reachable=True,
+        state=HostState.ANSWERED,
         pkg_commit=version_mod.local_commit(),
         dispatcher_pkg_commit=version_mod.local_commit(),
         heartbeat_age_s=3.0,

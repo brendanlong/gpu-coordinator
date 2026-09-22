@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import pytest
 
-from gpuc.host import cleanup, jobs, paths, queue, sync, terminate
+from gpuc.host import cleanup, destinations, jobs, paths, queue, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
@@ -303,7 +303,7 @@ def configure_pod(idle_minutes: float = 15.0, age_h: float = 0.0) -> None:
 def test_idle_terminate_drains_syncs_and_calls_the_provider(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     monkeypatch.setenv("RUNPOD_POD_ID", "pod-1")
     configure_pod(idle_minutes=15.0)
@@ -415,7 +415,7 @@ def test_a_failed_final_drain_sync_still_terminates(
     stayed broken.
     """
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: None)
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: None)
     configure_pod(idle_minutes=0.0)
     terminated: list[str] = []
     dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: terminated.append(pod) or "")
@@ -738,13 +738,9 @@ def test_spawned_children_get_the_home_tool_dirs_on_path(
 def finished_job(days_old: float = 30.0, *, mirrored: bool = True) -> str:
     job_id = queue.enqueue(make_spec())
     ended = (datetime.now(UTC) - timedelta(days=days_old)).isoformat()
-    jobs.update_state(
-        job_id,
-        status="succeeded",
-        ended_at=ended,
-        meta_synced_at=ended if mirrored else None,
-        meta_synced_to="s3://b/gpuc/h" if mirrored else None,
-    )
+    jobs.update_state(job_id, status="succeeded", ended_at=ended)
+    if mirrored:
+        jobs.record_upload(job_id, f"s3://b/gpuc/h/jobs/{job_id}", None, ok_at=ended)
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
     return job_id
@@ -935,23 +931,26 @@ def job_with_pending_outputs() -> str:
     return job_id
 
 
+def outputs_uploaded(job_id: str) -> bool:
+    return jobs.read_state(job_id).outputs_uploaded(jobs.read_spec(job_id))
+
+
 def test_the_drain_retries_unconfirmed_outputs_and_records_success(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     dispatcher, _ = make_dispatcher()
     dispatcher.drain_and_terminate("test")
-    state = jobs.read_state(job_id)
-    assert state.outputs_synced_at is not None
-    assert state.outputs_lost is False
+    assert outputs_uploaded(job_id)
+    assert jobs.read_state(job_id).outputs_lost is False
 
 
 def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     attempts: list[list[str]] = []
@@ -978,16 +977,50 @@ def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     assert slept == [60.0, 60.0]
     state = jobs.read_state(job_id)
     assert state.outputs_lost is True
-    assert state.sync_error and "AccessDenied" in state.sync_error
+    assert any("AccessDenied" in error for error in state.upload_errors())
     # The pod still goes away: it is billing, and a bucket we cannot reach is
     # no reason to keep paying for it.
     assert terminated == ["pod-1"]
 
 
+def test_giving_up_on_outputs_marks_them_lost_and_changes_nothing_else(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`outputs_lost` is the drain's whole verdict. The job's outcome is the
+    runner's, and the failure itself is already in the destination's upload
+    record, where `status` reads it from."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    configure_pod(idle_minutes=0.0)
+    job_id = job_with_pending_outputs()
+    before = jobs.read_state(job_id).to_dict()
+
+    def outputs_fail(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        broken = "s3://bucket/" in " ".join(argv)
+        return sync.CommandResult(argv, 1 if broken else 0, "AccessDenied" if broken else "")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.command_runner = outputs_fail
+    dispatcher.deps.sleep = lambda seconds: None
+    dispatcher.drain_and_terminate("test")
+
+    after = jobs.read_state(job_id)
+    assert after.outputs_lost is True
+    changed = {k for k, v in after.to_dict().items() if before.get(k) != v}
+    assert changed == {"outputs_lost", "uploads"}
+    assert (after.status, after.reason, after.problems) == ("succeeded", "sync", [])
+    output_records = after.output_uploads()
+    assert [(u.output, u.to, u.ok_at) for u in output_records] == [
+        ("results", f"s3://bucket/{job_id}", None)
+    ]
+    assert output_records[0].error and "AccessDenied" in output_records[0].error
+    assert after.mirrored  # the mirror record is the final meta sync's, not the drain's
+
+
 def test_the_drain_records_the_meta_backup_for_every_job(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     job_id = queue.enqueue(make_spec())
@@ -995,7 +1028,8 @@ def test_the_drain_records_the_meta_backup_for_every_job(
     dispatcher, _ = make_dispatcher()
     dispatcher.drain_and_terminate("test")
     state = jobs.read_state(job_id)
-    assert state.meta_synced_at and state.meta_synced_to == "s3://b/gpuc/pod"
+    assert state.mirrored
+    assert state.mirror is not None and state.mirror.to == f"s3://b/gpuc/pod/jobs/{job_id}"
 
 
 def test_an_ancient_idle_pod_is_only_ever_stopped_by_its_idle_timer(
@@ -1108,7 +1142,7 @@ def test_the_drain_bounds_each_upload_and_skips_sync_preflight_failures(
     """An unbounded upload can hang a billing pod for hours, and a job that
     failed its sync preflight proved before it ran that these uploads cannot
     work -- retrying it three times only burns the budget."""
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     pending = job_with_pending_outputs()
@@ -1132,7 +1166,7 @@ def test_the_drain_bounds_each_upload_and_skips_sync_preflight_failures(
         for _argv, timeout in uploads
     )
     assert not any(hopeless in " ".join(argv) for argv, _timeout in uploads)
-    assert jobs.read_state(pending).outputs_synced_at is not None
+    assert outputs_uploaded(pending)
     assert jobs.read_state(hopeless).outputs_lost is False
 
 
@@ -1367,7 +1401,7 @@ def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     """The stopped attempt's results are still in that workdir, and the drain
     is the last thing that will ever look at them. Filtering the retry list on
     `finished` alone hid them the moment the job went back in the queue."""
-    monkeypatch.setattr(sync, "aws_binary", lambda env=None: "/fake/aws")
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     queue.enqueue(make_spec(priority=1))  # what the preempt is making room for
@@ -1379,7 +1413,7 @@ def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     dispatcher, _ = make_dispatcher()
     assert dispatcher.unconfirmed_output_jobs() == [job_id]
     dispatcher.drain_and_terminate("test")
-    assert jobs.read_state(job_id).outputs_synced_at is not None
+    assert outputs_uploaded(job_id)
 
 
 def test_a_running_jobs_outputs_are_left_to_its_own_runner(gpuc_home: Path) -> None:

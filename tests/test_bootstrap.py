@@ -130,6 +130,12 @@ class ScriptedHost:
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
         return CommandResult(self.host, ["tail"], 0, "", "")
 
+    def argv(self, command: str) -> list[str]:
+        return ["sh", "-c", command]
+
+    def interactive_argv(self, command: str) -> list[str]:
+        return ["sh", "-c", command]
+
     def index_of(self, needle: str) -> int:
         return next(i for i, event in enumerate(self.events) if needle in event)
 

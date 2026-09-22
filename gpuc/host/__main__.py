@@ -11,10 +11,11 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from gpuc.host import cleanup, dispatcher, gpus, health, jobs, paths, queue, runner
+from gpuc.host import cleanup, dispatcher, gpus, health, jobs, paths, plan, queue, runner
 from gpuc.host.jobs import JobSpec, JobState
 
 
@@ -118,18 +119,93 @@ def wandb_hints(env: dict[str, str]) -> dict[str, str]:
     return {name: env[key] for key, name in WANDB_HINTS.items() if env.get(key)}
 
 
+def _seconds_until(stamp: str | None) -> float | None:
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
+def projected_starts(
+    config: jobs.HostConfig, table: dict[str, Any], states: dict[str, JobState]
+) -> plan.Projection:
+    """When each queued job is expected to start, from what this host knows:
+    its cards, who holds them and until when, and the queue in order.
+
+    Here rather than on the control side because every input is the host's:
+    the resolved cards, the one nvidia-smi reading of the shared ones, the
+    running jobs' etas and the queue. A client only renders the answer.
+    """
+    running = {job_id: s for job_id, s in states.items() if s.status == "running"}
+    holder = {uuid: s for s in running.values() for uuid in s.gpus}
+
+    def release(uuid: str) -> float | None:
+        state = holder.get(uuid)
+        return 0.0 if state is None else _seconds_until(state.eta)
+
+    cards = [plan.Card(row["uuid"], False, release(row["uuid"])) for row in table["gpus_resolved"]]
+    theirs = 0
+    for row in table["shared_gpus_resolved"]:
+        if row["uuid"] in holder or row["unused"]:
+            cards.append(plan.Card(row["uuid"], True, release(row["uuid"])))
+        else:
+            theirs += 1
+    requests: list[plan.Request] = []
+    for entry in queue.list_queued():
+        spec = _spec(entry.job_id)
+        state = states.get(entry.job_id)
+        if spec is None or state is None:
+            # Accepted since `states` was read, or a spec the dispatcher is
+            # about to fail: the next call will say.
+            continue
+        estimate = state.estimated_runtime_min
+        requests.append(
+            plan.Request(
+                entry.job_id,
+                spec.gpus,
+                config.may_borrow(spec),
+                None if estimate is None else estimate * 60.0,
+            )
+        )
+    return plan.project(
+        requests,
+        cards,
+        owned_configured=len(config.gpus),
+        owned_missing=table["gpus_unavailable"],
+        shared_configured=len(config.shared_entries()),
+        theirs=theirs,
+        draining=paths.draining_file().exists(),
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = jobs.read_config()
     job_ids = [args.job_id] if args.job_id else jobs.list_job_ids()
     measuring_until = time.monotonic() + cleanup.MEASURING_BUDGET_S
+    states: dict[str, JobState] = {}
+    for job_id in jobs.list_job_ids():
+        try:
+            states[job_id] = jobs.read_state(job_id)
+        except (RuntimeError, FileNotFoundError):
+            continue
+    table = _gpu_table(config)
+    projection = projected_starts(config, table, states)
     entries: list[dict[str, Any]] = []
     for job_id in job_ids:
-        try:
-            state = jobs.read_state(job_id)
-        except (RuntimeError, FileNotFoundError):
+        state = states.get(job_id)
+        if state is None:
             continue
         spec = _spec(job_id)
         entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
+        # When a queued job's turn is expected, and why not if it cannot be
+        # said. Null on anything that is not queued.
+        entry["starts_in_s"] = projection.starts_in_s.get(job_id)
+        entry["starts_unknown"] = projection.unknown.get(job_id)
         # Whether this job gives its cards up to anything more important. It
         # changes what "running" promises, and only the spec knows.
         entry["auto_preempt"] = spec.auto_preempt if spec else None
@@ -178,7 +254,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 # once and keeps serving the queue from it however many times
                 # the package underneath is replaced.
                 "dispatcher_pkg_commit": dispatcher.holder_pkg_commit(),
-                **_gpu_table(config),
+                **table,
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),
                 "dispatcher_heartbeat_age_s": None if heartbeat is None else round(heartbeat, 1),

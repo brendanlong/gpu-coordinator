@@ -61,7 +61,6 @@ SSH_REPORT_INTERVAL_S = 60.0
 REUSE_HEARTBEAT_MAX_S = 30.0
 """How stale a pod's heartbeat may be for `submit` to reuse it rather than buy another."""
 AWS_KEY_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
-DEAD_STATUSES = ("EXITED", "ERROR", "TERMINATED")
 
 SSH_MISCONFIGURED = re.compile(
     r"Bad configuration option|no such identity file|WARNING: UNPROTECTED PRIVATE KEY",
@@ -445,10 +444,6 @@ def _first_line(exc: BaseException) -> str:
     return lines[0] if lines else f"{type(exc).__name__} (interrupted)"
 
 
-TERMINATE_ATTEMPTS = 3
-TERMINATE_RETRY_S = 5.0
-
-
 def _terminate_now(
     provider: Provider,
     name: str,
@@ -464,13 +459,14 @@ def _terminate_now(
     try again once this process has moved on to the next offer.
     """
     progress(f"terminating {name} ({pod_id}): {reason}")
-    for attempt in range(1, TERMINATE_ATTEMPTS + 1):
+    for attempt in range(1, provider.terminate_attempts + 1):
         try:
             provider.terminate(pod_id)
         except ProviderError as exc:
-            if attempt < TERMINATE_ATTEMPTS:
-                progress(f"terminate {pod_id} failed ({exc}); retrying in {TERMINATE_RETRY_S:g}s")
-                deps.sleep(TERMINATE_RETRY_S)
+            if attempt < provider.terminate_attempts:
+                retry = provider.terminate_retry_s
+                progress(f"terminate {pod_id} failed ({exc}); retrying in {retry:g}s")
+                deps.sleep(retry)
                 continue
             progress(
                 f"WARNING: could not terminate {name} ({pod_id}) in {attempt} attempts: {exc}\n"
@@ -528,7 +524,7 @@ def _wait_for_ssh_direct(
         if state != last_state:
             progress(f"pod {pod.id}: {state}")
             last_state = state
-        if current.status in DEAD_STATUSES:
+        if provider.is_dead(current):
             raise ProvisionError(
                 f"pod {pod.id} reached {current.status} before it was ready:\n"
                 f"{_log_tail(provider, pod.id)}"
@@ -636,7 +632,7 @@ def pick_reusable_host(
 ) -> HostEntry | None:
     """An existing gpuc pod that is RUNNING, matches the constraints, and dispatches."""
     for entry in list(load_registry().hosts.values()):
-        if entry.kind != "runpod" or not entry.pod_id:
+        if not entry.pod_id:
             continue
         offer = rented.offer_of(entry.config.provider)
         if offer is None:
@@ -659,13 +655,13 @@ def pick_reusable_host(
             )
             continue
         pod = provider.get(entry.pod_id)
-        if pod is None or pod.status == "TERMINATED":
+        if pod is None or provider.is_gone(pod):
             # The pod is gone for good, so the entry can only mislead `status`,
             # `logs` and the next reuse pass. Drop it here rather than leaving
             # submit to fail on an ssh to an address someone else now owns.
             report(
                 f"reuse: forgetting {entry.name}, its pod "
-                f"{'is gone' if pod is None else 'is TERMINATED'}"
+                f"{'is gone' if pod is None else f'is {pod.status}'}"
             )
             forget_host_locked(entry.name, entry.pod_id, report)
             continue

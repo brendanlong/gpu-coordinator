@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from gpuc.host import __main__ as host_cli
-from gpuc.host import cleanup, jobs, paths, queue, runner
+from gpuc.host import cleanup, destinations, jobs, paths, queue, runner
 from gpuc.host.jobs import JobSpec
 from tests.conftest import make_spec
 from tests.test_runner import deps, log_of, prepare
@@ -271,7 +271,9 @@ def test_the_automatic_sweep_leaves_outputs_that_are_still_only_here(gpuc_home: 
     assert any(s.job_id == job_id and "outputs" in s.why for s in result.skipped)
 
     # ...and once they are somewhere else, it is free to go.
-    jobs.update_state(job_id, outputs_synced_at=jobs.utc_now())
+    for output in jobs.read_spec(job_id).outputs:
+        for destination in destinations.of(output, job_id):
+            jobs.record_upload(job_id, destination.uri, output.path, ok_at=jobs.utc_now())
     assert [c.job_id for c in cleanup.clean(all_finished=True, automatic=True).removed] == [job_id]
 
 
