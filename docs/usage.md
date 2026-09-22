@@ -252,7 +252,8 @@ memory and utilization.
 `--host H` narrows it; `--recent N` (default 5) and `--since 24h|7d|90m` (a bare
 number means hours) choose how much of the finished list to show; `--all` adds
 jobs only the local index and the S3 index know, which is how you find what was
-on a host that lost its state; `--json` is [below](#exit-codes-and---json). Card
+on a host that lost its state, and is exit 1 if the S3 index could not be read,
+since that list would be short; `--json` is [below](#exit-codes-and---json). Card
 UUIDs are in `gpuc host list`, and everything a host can say about itself is in
 `gpuc host probe`.
 
@@ -477,9 +478,10 @@ on, and `gpuc pods` never terminates anything.
 
 A rental that ended itself is **forgotten where it is found**: `gpuc status`,
 `gpuc host bootstrap --all` and the next `submit --runpod` reuse pass each drop
-the registry entry and say so, rather than reporting a host nobody can reach. A
-pod the provider still has but has stopped shows as `POD GONE` in `gpuc status`
-and stays until `gpuc host remove <name>`.
+the registry entry and say so, rather than reporting a host nobody can reach.
+That is a pod the provider reports missing or `TERMINATED`. A pod it still has
+but has stopped (`EXITED`, `ERROR`) is a host nothing can be run on: `POD GONE`
+in `gpuc status`, exit 1, and it stays until `gpuc host remove <name>`.
 
 ## How a job is killed
 
@@ -541,13 +543,16 @@ Every `failed: <reason>`:
 | 4 | the job or host named on the command line does not exist |
 | 130 | a Ctrl-C |
 
-**A failure never costs you the rest of the answer.** One host that cannot be
-reached, or one registry entry this build cannot parse, is reported where it
-belongs — per host in `gpuc status`, on stderr for a skipped entry, which is
-written back untouched — every other host is still reported in full, and the
-command exits 1. A rental whose pod the provider says is gone is not a failure:
-gpuc forgets that host and says so. Only a `hosts.json` that cannot be parsed at
-all is exit 3, and it prints the error, the path, and that a `.bak` was kept.
+**A failure never costs you the rest of the answer.** A host that cannot be
+reached is reported in its own block, every other host is still reported in
+full, and the command exits 1. A registry entry this build cannot parse is the
+same thing: a warning on stderr, the entry written back untouched, and exit 1
+from the commands that were reporting on every host (`status`, `host list`,
+`version`) — a command given one host, or one job, is not failed by an entry it
+was never asked about. A rental whose pod the provider says has ended is not a
+failure at all: gpuc forgets that host and says so. Only a `hosts.json` that
+cannot be parsed at all is exit 3, and it prints the error, the path, and that a
+`.bak` was kept.
 
 ```sh
 gpuc status --json | jq '.hosts[] | {name, reachable, running: (.running | length)}'
@@ -619,8 +624,9 @@ Beyond what the example shows:
   `provider_util` is the provider's per-GPU reading for the whole pod, null
   elsewhere. Two measurements that will differ.
 
-Per host: `target`, `draining`, `pod_gone`, `pod` (the provider's view of an
-ephemeral host's pod) and `pkg_commit`, the host's own answer for the build it
+Per host: `target`, `draining`, `pod_gone`, `pod_terminated` (that pod is gone
+for good, so the next `gpuc status` forgets the host), `pod` (the provider's
+view of an ephemeral host's pod) and `pkg_commit`, the host's own answer for the build it
 runs — `null` means it did not say, never "up to date". A card the host cannot
 see appears in `gpus` as `{"owned_as": "3", "available": false}`; `shared_gpus`
 has the same shape plus `unused` (no memory held, no work running) and
@@ -673,9 +679,9 @@ per-job trouble the command reported rather than stopped for.
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the spec holds now (null after `--clear`) and `status` is the job's, since only a queued or running one can be set; `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], host, heartbeat_age_s}`; `host` is the registry name this machine drives it under, null if none; `others` are pods without our prefix, `{id, name, status}` only, because we never touch them |
-| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` here is the commit the host was running when this machine last read it, not what it runs now — that is `status --json`'s `pkg_commit`. Exit 3 if the registry is unreadable |
+| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` here is the commit the host was running when this machine last read it, not what it runs now — that is `status --json`'s `pkg_commit`. Exit 1 for an entry that could not be parsed, 3 if the whole registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}` — the effective settings, file or not |
-| `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at`, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]`. Nothing here asks the host. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`). A skipped entry is an `errors` string, not a host, and exit 1. Exit 3 if the registry is unreadable |
+| `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `pod_id`), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at`, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]`. Nothing here asks the host. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`). A skipped entry is an `errors` string, not a host, and exit 1. Exit 3 if the whole registry is unreadable |
 | `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, uv_cache{}, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to (always empty on a host with no nvidia-smi, which has nothing to answer with). `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. Job objects are `{job_id, status, bytes, age_days}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup |
 | `host add`, `host set` | the host as `host list --json` reports one entry (the address, the host's own config flattened beside it, `cache`, `remote_home`, `ephemeral`), as the registry holds it once the command is done, plus `adopted` (the host already had a config, which `add` took as it stood), `config_path` (that config on the host), `changes[]` (one line per config field this command wrote through to the host, empty when it held that already) and `warnings[]` (`host list`'s re-bootstrap note, and for `add` a host that owns no card or a pod nothing has bootstrapped). `host set` adds `address{}`: the fields it changed here rather than on the host (`persistent_root`, `gpuc_home`), by name and new value |
@@ -833,6 +839,6 @@ expires.
 | a warning names one skipped host entry | that entry did not validate; every other host still works and is written back untouched | fix it by hand, or `gpuc host add <name> --ssh ...` to connect to that host again |
 | `status` warns `host X is running gpuc <sha> and this machine has <sha>` | the host was last bootstrapped from a different build than this one, in either direction | `gpuc host bootstrap X`, or `gpuc host bootstrap --all` for every host at once — safe while jobs run; the new dispatcher adopts them |
 | `status` warns `host X has gpuc <sha> on disk but its running dispatcher was started on <sha>` | the dispatcher outlived the package under it, so nothing shipped since is in effect. A newer dispatcher normally takes over by itself | `gpuc host bootstrap X` — safe while jobs run; the new dispatcher adopts them |
-| `status` says `POD GONE` | the provider reports the pod stopped, so nothing can be run on it. A pod that is terminated or missing is the end of the rental and `status` forgets the entry as it prints it | nothing for a rental that ended; `gpuc host remove <name>` for a pod the provider still has |
+| `status` says `POD GONE` | the provider reports the pod stopped, so nothing can be run on it. A pod that is terminated or missing is the end of the rental, and `status` forgets that entry as it prints it | nothing for a rental that ended; `gpuc host remove <name>` for a stopped pod the provider still has |
 | `gpuc pods` shows a pod with no heartbeat and nothing running | its dispatcher died, or the machine that was provisioning it was killed before it could clean up; nothing here will end it | terminate it in the RunPod console. A pod that still answers ssh can be re-bootstrapped instead (`gpuc host add <name> --pod <id>`, then `gpuc host bootstrap <name>`) |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | the runbook in [setup.md](setup.md#hosts-whose-home-is-wiped-on-restart) |

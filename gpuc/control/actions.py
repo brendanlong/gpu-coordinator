@@ -248,15 +248,12 @@ def status_views(
 ) -> list[status_mod.HostView]:
     """Every host `gpuc status` reports on, asked at once and in registry order.
 
-    Rentals the provider no longer has are forgotten on the way through. The
-    text output gathers the same views itself, so that it can print each host
-    as soon as it has answered rather than waiting for the slowest.
+    The text output gathers the same views itself, so that it can print each
+    host as soon as it has answered rather than waiting for the slowest.
     """
     entries = hosts_for(read.registry, host) if not read.unreadable else []
     provider = provider_for_status(entries, settings, report) if entries else None
-    views = list(gather_all(entries, settings, provider))
-    forget_gone_rentals(views, report)
-    return views
+    return list(gather_all(entries, settings, provider))
 
 
 def status_errors(read: RegistryRead) -> list[str]:
@@ -275,17 +272,20 @@ def forget_gone_rentals(
     """Drop the registry entry of every rental the provider says no longer exists.
 
     A rental ends itself when its queue goes idle, so this is the ordinary end
-    of one rather than something gone wrong. The view already says so; leaving
-    the entry would have the next command ssh to an address somebody else now
-    owns.
+    of one rather than something gone wrong; leaving the entry would have the
+    next command ssh to an address somebody else now owns. Only a command
+    somebody typed does this: deleting a registry entry off the back of a
+    dashboard's poll would mean a stray 404 costing a live host its record with
+    nobody watching.
     """
     for view in views:
         if view.pod_terminated:
+            report(f"forgetting host {view.entry.name}: its pod is gone")
             forget_host_locked(view.entry.name, view.entry.pod_id, report)
 
 
 def rental_gone(
-    entry: HostEntry, settings: Settings, report: Callable[[str], None] = note
+    entry: HostEntry, provider: Provider | None, report: Callable[[str], None] = note
 ) -> str | None:
     """Why this host's pod no longer exists, or None if it does.
 
@@ -293,10 +293,10 @@ def rental_gone(
     when its queue went idle is how one is meant to die, not a failure. A
     provider that cannot be asked leaves the failure as it was.
     """
-    if entry.kind != "runpod" or not entry.pod_id:
+    if provider is None or entry.kind != "runpod" or not entry.pod_id:
         return None
     try:
-        pod = make_provider(settings).get(entry.pod_id)
+        pod = provider.get(entry.pod_id)
     except ProviderError as exc:
         report(f"could not ask the provider about pod {entry.pod_id}: {exc}")
         return None
@@ -319,12 +319,19 @@ def registry_exit(read: RegistryRead) -> int:
     return EXIT_ERROR if read.errors else EXIT_OK
 
 
-def status_exit(read: RegistryRead, views: Sequence[status_mod.HostView]) -> int:
-    """Exit code for `gpuc status`: 0 only if every host was read."""
-    code = registry_exit(read)
-    if code != EXIT_OK:
-        return code
-    return EXIT_ERROR if any(view.failure for view in views) else EXIT_OK
+def status_exit(
+    read: RegistryRead, views: Sequence[status_mod.HostView], *, every_host: bool = True
+) -> int:
+    """Exit code for `gpuc status`: 0 only if the whole answer is here.
+
+    A skipped registry entry counts only under `every_host` -- with `--host X`
+    the answer was never meant to cover an entry that is not X.
+    """
+    if read.unreadable:
+        return EXIT_LOCAL_STATE
+    if any(view.failure for view in views):
+        return EXIT_ERROR
+    return EXIT_ERROR if every_host and read.errors else EXIT_OK
 
 
 def shipped_note(entry: HostEntry) -> str | None:

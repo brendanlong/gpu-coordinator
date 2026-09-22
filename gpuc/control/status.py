@@ -294,10 +294,12 @@ class HostView:
     def failure(self) -> str | None:
         """Why this host could not be read, if that is what happened.
 
-        A pod the provider says is gone is not that: the provider answered, and
-        a rental that ended itself is a state rather than a failure.
+        A rental that has ended is not that: it is the state every rental
+        reaches, and the entry is forgotten rather than reported. A pod the
+        provider still has and cannot run anything on is a failure like any
+        other host nothing can be read from.
         """
-        return None if self.pod_gone else self.error
+        return None if self.pod_terminated else self.error
 
     @property
     def dispatcher_alive(self) -> bool:
@@ -468,7 +470,7 @@ def gather(
         status = "missing" if view.pod is None else view.pod.status
         view.pod_terminated = view.pod is None or view.pod.status == "TERMINATED"
         view.error = (
-            f"pod {entry.pod_id} is {status}; forgetting this host"
+            f"pod {entry.pod_id} is {status}; this rental has ended"
             if view.pod_terminated
             else f"pod {entry.pod_id} is {status}; `gpuc host remove {entry.name}` forgets it"
         )
@@ -1024,6 +1026,10 @@ def render(
     if flags:
         header += "  " + " ".join(flags)
     lines = [header]
+    if view.error:
+        # A host that answered can still carry one -- the provider could not be
+        # asked about its pod -- and it is this command's exit code.
+        lines.append(f"  ERROR {view.error}")
     lines += [f"  WARNING {warning}" for warning in host_warnings(view)]
     lines.append(f"  {dispatcher}")
     lines += _gpu_lines(view)
@@ -1303,6 +1309,7 @@ def host_json(
         "target": entry.ssh,
         "reachable": view.reachable,
         "pod_gone": view.pod_gone,
+        "pod_terminated": view.pod_terminated,
         "draining": view.draining,
         # The host's own answer, so null means the host did not say, never
         # "current".

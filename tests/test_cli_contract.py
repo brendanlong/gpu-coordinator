@@ -35,6 +35,7 @@ from gpuc.control.config import (
     pod_known_hosts_file,
     read_registry,
 )
+from gpuc.control.s3index import S3IndexError
 from gpuc.control.status import HostView
 from tests.conftest import host_entry, register_host
 from tests.fakehost import FakeHost
@@ -174,6 +175,45 @@ def test_status_reports_a_bad_entry_per_host_and_exits_one(
     captured = capsys.readouterr()
     assert "host good" in captured.out
     assert "skipping host 'bad'" in captured.err
+
+
+def test_a_bad_entry_does_not_fail_a_status_asked_about_another_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--host good` was never asked about the entry that would not parse."""
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    monkeypatch.setattr(
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+    )
+    assert main(["status", "--host", "good"]) == EXIT_OK
+    assert main(["status", "--host", "good", "--json"]) == EXIT_OK
+
+
+def test_status_all_is_one_when_the_index_it_needs_cannot_be_read(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--all` exists to list what a lost host had, and a short list is not that."""
+    register_host(name="local", gpus=GPU)
+    monkeypatch.setattr(
+        status_mod, "gather", lambda entry, *a, **k: HostView(entry=entry, reachable=True)
+    )
+
+    class _Unreadable:
+        def list_index(self) -> list[object]:
+            raise S3IndexError("no credentials")
+
+    monkeypatch.setattr("gpuc.control.cli.S3Index.from_settings", lambda settings: _Unreadable())
+    assert main(["status", "--all"]) == EXIT_ERROR
+    assert "could not read the S3 index" in capsys.readouterr().err
+
+
+def test_version_exits_one_for_an_entry_it_could_not_read(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "bad": BAD_ENTRY}})
+    assert main(["version"]) == EXIT_ERROR
+    assert main(["version", "--json"]) == EXIT_ERROR
+    assert "skipping host 'bad'" in capsys.readouterr().err
 
 
 def test_a_named_host_that_does_not_exist_is_four(

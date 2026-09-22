@@ -648,16 +648,20 @@ anything (exit 3, a `.bak` kept).
 
 The table is in usage.md. The contract behind it: a command reports everything
 it found out and exits non-zero if any part of it failed. `gpuc status` prints
-every host that answered **and** exits 1 for one it could not read, or for a
-registry entry this build could not parse; `gpuc status --json` prints its one
-document either way. 3 means local state could not be read at all, so the answer
+every host that answered **and** exits 1 for one it could not read, or -- when
+it was asked about every host rather than one -- for a registry entry this build
+could not parse; `gpuc status --json` prints its one document either way. 3 means local state could not be read at all, so the answer
 is *unknown*, and 4 is a name that does not exist. Automation keys on
 `hosts[].running` and treats exit 3 as unknown, never as "nothing running".
 
-A rental the provider says is gone is not a failure. `status` and `host
-bootstrap --all` forget that registry entry where they find it
+A rental the provider reports missing or TERMINATED is not a failure. `status`
+and `host bootstrap --all` forget that registry entry where they find it
 (`forget_gone_rentals`, `rental_gone`) and say so, which is what stops a rental
-that ended itself from being reported as a host nobody can reach.
+that ended itself from being reported as a host nobody can reach. A pod the
+provider still has and nothing can run on (EXITED, ERROR) is a failure like any
+other host that could not be read, and is kept for `gpuc host remove`. Only a
+command somebody typed forgets: the dashboard's poll is a view, so a stray 404
+cannot cost a live host its entry with nobody watching.
 
 `--json` is on every command that has an answer to give, and means the same
 thing on each: stdout is one object carrying `schema_version`, everything else
@@ -1022,8 +1026,11 @@ What `status` prints, and every flag, is usage.md. The invariants:
 - An ephemeral host whose pod the provider reports missing or dead is
   `POD GONE`: no ssh is attempted, and the line says what the provider said
   rather than printing a connection error. Missing or TERMINATED is the end of
-  that rental, so the entry is forgotten as it is printed; a pod the provider
-  still has is left for `gpuc host remove`.
+  that rental (`pod_terminated`), so the entry is forgotten as it is printed; a
+  pod the provider still has is a failure left for `gpuc host remove`.
+- A host that answered and still carries an `error` -- the provider could not be
+  asked about its pod -- prints it as an `ERROR` line under the header. Nothing
+  that decides an exit code may be visible only under `--json`.
 - A finished job that produced `outputs:` which never reached S3/HF is flagged
   (`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
   those are the jobs a purge -- or a pod going away -- would take with them. One

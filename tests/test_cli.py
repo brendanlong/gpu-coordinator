@@ -26,7 +26,7 @@ from gpuc.control.config import (
     load_settings,
     registry_transaction,
 )
-from gpuc.control.providers.base import Constraints
+from gpuc.control.providers.base import Constraints, Pod
 from gpuc.control.remote import HostSession, RemoteError
 from gpuc.control.status import placement_unknown
 from gpuc.control.submit import JobSpecModel, SubmitResult, expand_job_id
@@ -2036,8 +2036,11 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
 class _NoPods:
     """A provider whose account has no pod by that id any more."""
 
-    def get(self, pod_id: str) -> None:
-        return None
+    def __init__(self, pod: Pod | None = None) -> None:
+        self._pod = pod
+
+    def get(self, pod_id: str) -> Pod | None:
+        return self._pod
 
 
 def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
@@ -2058,6 +2061,48 @@ def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
     assert "1/2 host(s) bootstrapped" in out
     assert "forgotten, their pods are gone: pod" in out
     assert "pod" not in load_registry().hosts
+
+
+def test_host_bootstrap_all_forgets_a_terminated_rental_too(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case #68 describes: the pod is still in the account, TERMINATED."""
+    from gpuc.control.bootstrap import BootstrapError
+
+    with registry_transaction() as registry:
+        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+    bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
+    terminated = Pod(id="p1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: _NoPods(terminated))
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all"]) == 0
+    assert "p1 is TERMINATED" in capsys.readouterr().out
+    assert load_registry().hosts == {}
+
+
+def test_host_bootstrap_all_keeps_a_rental_the_provider_cannot_be_asked_about(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No answer is not `it ended`: the failure stands and the entry stays."""
+    from gpuc.control.bootstrap import BootstrapError
+    from gpuc.control.providers.base import ProviderError
+
+    with registry_transaction() as registry:
+        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+    bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
+
+    def unavailable(settings: Settings) -> object:
+        raise ProviderError("RUNPOD_API_KEY is not set")
+
+    monkeypatch.setattr("gpuc.control.actions.make_provider", unavailable)
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all"]) == 1
+    captured = capsys.readouterr()
+    assert "failed: pod" in captured.out
+    assert "pod status unavailable" in captured.out
+    assert "pod" in load_registry().hosts
 
 
 def test_host_bootstrap_all_counts_the_hosts_it_could_not_read(

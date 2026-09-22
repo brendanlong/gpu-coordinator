@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -123,7 +124,23 @@ def test_status_forgets_a_rental_the_provider_no_longer_has(
     capsys.readouterr()
 
     assert main(["status"]) == EXIT_OK
-    out = capsys.readouterr().out
-    assert "POD GONE" in out
-    assert "forgetting this host" in out
+    captured = capsys.readouterr()
+    assert "POD GONE" in captured.out
+    assert "this rental has ended" in captured.out
+    assert "forgetting host gpuc-e2e-aaa" in captured.err
+    assert load_registry().hosts == {}
+
+
+def test_status_json_forgets_the_rental_it_just_reported(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The document still lists the host; the entry is gone once it is printed."""
+    _register("gpuc-e2e-aaa", "pod1")
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: FakeProvider())
+    capsys.readouterr()
+
+    assert main(["status", "--json"]) == EXIT_OK
+    document = json.loads(capsys.readouterr().out)
+    (host,) = document["hosts"]
+    assert host["pod_gone"] is True and host["pod_terminated"] is True
     assert load_registry().hosts == {}

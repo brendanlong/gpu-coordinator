@@ -646,6 +646,13 @@ class BootstrapTally:
             lines.append(f"forgotten, their pods are gone: {', '.join(self.gone)}")
         if self.failed:
             lines.append(f"failed: {', '.join(o['name'] for o in self.failed)}")
+            if any(o["ephemeral"] for o in self.failed):
+                # Not one of the forgotten: the provider still has this pod, so
+                # somebody has to decide whether to fix it or drop it.
+                lines.append(
+                    "an ephemeral host the provider still has is forgotten by "
+                    "`gpuc host remove <name>`"
+                )
         if self.unreadable:
             lines.append(
                 f"{len(self.unreadable)} host(s) in the registry could not be read (warnings above)"
@@ -693,6 +700,9 @@ def bootstrap_every_host(
             print(NO_HOSTS)
         return EXIT_OK
     code = EXIT_OK
+    # Built once, and only when a rental is registered: a host that fails to
+    # answer may simply have ended, and only the provider knows which.
+    provider = provider_for_status(hosts, settings, report)
     for index, entry in enumerate(hosts, start=1):
         if index > 1:
             report("")
@@ -716,7 +726,7 @@ def bootstrap_every_host(
             report(f"\n{tally.render()}")
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
-            gone = rental_gone(entry, settings, report)
+            gone = rental_gone(entry, provider, report)
             if gone is not None:
                 report(f"{gone}; forgetting this host")
                 tally.record(entry, "gone")
@@ -1142,7 +1152,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 views, errors=status_errors(read), recent=args.recent, since_s=since_s
             )
         )
-        return status_exit(read, views)
+        forget_gone_rentals(views)
+        return status_exit(read, views, every_host=args.host is None)
     entries = hosts_for(read.registry, args.host) if not read.unreadable else []
     if not entries:
         if read.unreadable:
@@ -1155,8 +1166,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(NO_HOSTS)
         # ...but `--all` still has something to say: the index remembers jobs
         # whose host has since been removed.
-        if args.all:
-            _print_unhosted(settings, set(), args.host)
+        if args.all and not _print_unhosted(settings, set(), args.host):
+            return EXIT_ERROR
         return registry_exit(read)
     provider = provider_for_status(entries, settings)
     seen: set[str] = set()
@@ -1166,19 +1177,21 @@ def cmd_status(args: argparse.Namespace) -> int:
         seen.update(job.job_id for job in view.queue + view.running + view.finished)
         print(status_mod.render(view, recent=args.recent, since_s=since_s))
     forget_gone_rentals(views)
-    if args.all:
-        _print_unhosted(settings, seen, args.host)
-    return status_exit(read, views)
+    if args.all and not _print_unhosted(settings, seen, args.host):
+        return EXIT_ERROR
+    return status_exit(read, views, every_host=args.host is None)
 
 
-def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None) -> None:
-    """The index's view of jobs no host admitted to having.
+def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None) -> bool:
+    """The index's view of jobs no host admitted to having, and whether that is
+    all of it: an S3 index that could not be read leaves this list short.
 
     After a host loses its state -- a container whose $HOME was wiped, a pod
     that is gone -- this is the only list of what was on it, and `gpuc requeue
     <id> --host <name>` is how each one comes back, so `--host H --all` narrows
     it to the host being recovered.
     """
+    complete = True
     entries = {entry.job_id: entry for entry in LocalIndex().list()}
     s3 = S3Index.from_settings(settings)
     if s3 is not None:
@@ -1186,13 +1199,14 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
             entries.update({e.job_id: e for e in s3.list_index()})
         except S3IndexError as exc:
             note(f"could not read the S3 index: {exc}")
+            complete = False
     elsewhere = [
         entry
         for job_id, entry in sorted(entries.items())
         if job_id not in seen and (host is None or entry.host == host)
     ]
     if not elsewhere:
-        return
+        return complete
     scope = f" for host {host}" if host else ""
     print(f"jobs known only to the index{scope} (their host is gone, or lost its state):")
     lost = _outputs_lost_ids(s3, elsewhere[:MIRROR_STATE_LOOKUPS])
@@ -1208,6 +1222,7 @@ def _print_unhosted(settings: Settings, seen: set[str], host: str | None = None)
             f"submitted {status_mod.format_age(entry.submitted_at)}{flag}"
         )
     print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")
+    return complete
 
 
 MIRROR_STATE_LOOKUPS = 25

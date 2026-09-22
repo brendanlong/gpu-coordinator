@@ -243,29 +243,34 @@ def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
     view = gather(_runpod_entry(), session=cast(Any, explode), provider=cast(Any, _GoneProvider()))
     assert view.pod_gone and view.pod_terminated and not view.reachable
     assert "missing" in (view.error or "")
-    # The provider answered, so this is a rental that ended rather than a host
-    # the command could not read.
+    # The rental ended, which is not a host the command could not read.
     assert view.failure is None
     text = render(view)
     assert "POD GONE" in text
-    assert "forgetting this host" in text
+    assert "this rental has ended" in text
     assert "host probe" not in text
 
 
 def test_a_terminated_pod_reads_as_gone_too() -> None:
-    terminated = _pod("TERMINATED")
-    view = gather(_runpod_entry(), provider=cast(Any, _GoneProvider(terminated)))
-    assert view.pod_gone and view.pod_terminated
+    view = gather(_runpod_entry(), provider=cast(Any, _GoneProvider(_pod("TERMINATED"))))
+    assert view.pod_gone and view.pod_terminated and view.failure is None
     assert "TERMINATED" in render(view)
-    assert "forgetting this host" in (view.error or "")
 
 
-def test_a_stopped_pod_is_gone_but_not_forgotten() -> None:
-    """An EXITED pod is one the provider still has, so the entry is left alone."""
+def test_a_stopped_pod_is_a_failure_and_is_not_forgotten() -> None:
+    """An EXITED pod is one the provider still has: nothing runs on it, and only
+    a person decides whether to fix it or drop it."""
     view = gather(_runpod_entry(), provider=cast(Any, _GoneProvider(_pod("EXITED"))))
     assert view.pod_gone and not view.pod_terminated
-    assert view.failure is None
+    assert view.failure is not None
     assert "gpuc host remove gpuc-e2e-1" in (view.error or "")
+
+
+def test_a_host_that_answered_still_prints_a_provider_error() -> None:
+    """It is the command's exit code, so `--json` must not be the only place it is."""
+    view = HostView(entry=_runpod_entry(), reachable=True, error="could not read pod pod-1: 503")
+    assert view.failure == "could not read pod pod-1: 503"
+    assert "ERROR could not read pod pod-1: 503" in render(view)
 
 
 class _RefusingSession:
