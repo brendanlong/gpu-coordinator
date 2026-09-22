@@ -219,6 +219,17 @@ def waiting_job(priority: int = 1) -> str:
     return queue.enqueue(make_spec(priority=priority))
 
 
+def test_a_job_in_its_final_sync_cannot_be_preempted(gpuc_home: Path) -> None:
+    """The runner has already snapshotted the intent and is about to delete the
+    secrets and the workdir; a preempt now would come back with neither."""
+    waiting_job()
+    job_id = running_job()
+    jobs.update_state(job_id, phase="sync")
+    with pytest.raises(ValueError, match="final sync"):
+        queue.preempt(job_id)
+    assert jobs.read_state(job_id).intent is None
+
+
 def test_preempt_asks_the_runner_to_stop_and_leaves_the_job_running(gpuc_home: Path) -> None:
     waiting = waiting_job()
     job_id = running_job()

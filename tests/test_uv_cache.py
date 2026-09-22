@@ -140,10 +140,8 @@ def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path)
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
     assert updated.env.get("UV_CACHE_DIR") == "/home/u/.cache/uv"
     assert host.config is not None
-    assert host.config["env"] == {
-        "UV_CACHE_DIR": "/home/u/.cache/uv",
-        "HF_HOME": "/home/u/.cache/huggingface",
-    }
+    # No persistent root, so the user's own Hugging Face cache is left alone.
+    assert host.config["env"] == {"UV_CACHE_DIR": "/home/u/.cache/uv"}
 
 
 def test_bootstrap_on_one_filesystem_writes_no_cache_dir(control_env: Path) -> None:
@@ -151,7 +149,7 @@ def test_bootstrap_on_one_filesystem_writes_no_cache_dir(control_env: Path) -> N
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
     assert "UV_CACHE_DIR" not in updated.env
     assert host.config is not None
-    assert host.config["env"] == {"HF_HOME": "/home/u/.cache/huggingface"}
+    assert host.config["env"] == {}
 
 
 def test_the_cache_is_resolved_before_uv_tool_install(control_env: Path) -> None:

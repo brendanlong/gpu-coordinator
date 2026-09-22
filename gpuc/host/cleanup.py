@@ -599,6 +599,9 @@ def remove_stale_incoming(now: float | None = None) -> list[str]:
     for path in stale_incoming(now):
         with contextlib.suppress(OSError):
             shutil.rmtree(path)
+            # The secrets file was delivered before the enqueue that never
+            # came, and nothing else will ever unlink it.
+            paths.job_env_file(path.name).unlink(missing_ok=True)
             removed.append(path.name)
     return removed
 
@@ -640,6 +643,7 @@ def clean(
         if not dry_run:
             try:
                 shutil.rmtree(path)
+                paths.job_env_file(path.name).unlink(missing_ok=True)
             except OSError as exc:
                 result.errors.append(f"could not remove {path}: {exc}")
                 continue

@@ -1,9 +1,9 @@
 """`gpuc submit`: validate a spec, ship the code and secrets, enqueue on a host.
 
 Order matters. Everything that can fail cheaply (spec validation, missing
-secrets in the submitter's environment) fails before we touch the host, and the
-queue marker is written last, so a job is only dispatchable once its workdir,
-secrets and spec are all in place.
+secrets in the submitter's environment) fails before we touch the host, and
+the job is built under `incoming/` and accepted by one rename, so it is only
+dispatchable once its workdir, secrets and spec are all in place.
 """
 
 from __future__ import annotations
@@ -515,7 +515,7 @@ def submit_spec(
 
     session = session or open_session(entry, settings, transport)
     push_workdir(session, spec.job_id, workdir, use_git=use_git, report=report)
-    report(f"synced to {session.job_dir(spec.job_id)}/workdir")
+    report(f"synced to {session.staging_dir(spec.job_id)}/workdir")
 
     if secrets_body:
         session.transport.put_file(secrets_body, f"{session.home}/secrets/{spec.job_id}.env", 0o600)

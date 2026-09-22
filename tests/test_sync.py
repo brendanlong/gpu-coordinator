@@ -388,12 +388,18 @@ def test_a_missing_output_dir_is_warned_about_on_a_periodic_tick(
 def test_a_periodic_missing_output_is_the_destinations_error_and_the_loop_goes_on(
     gpuc_home: Path, fake_aws: str
 ) -> None:
+    """Once it has stayed missing: the first ticks are a warning in the log and
+    nothing in the record, since a job that writes its first checkpoint late
+    has not failed anything yet."""
     job_id = jobs.new_job_id()
     runner = RecordingRunner()
     loop = loop_for(job_id, runner)
     loop.start()
     try:
+        _wait_for(lambda: loop._missing_ticks >= 1)
+        assert jobs.read_state(job_id).upload_errors() == []
         _wait_for(lambda: jobs.read_state(job_id).upload_errors() != [])
+        assert loop._missing_ticks > sync.MISSING_TICKS
         (record,) = jobs.read_state(job_id).output_uploads()
         assert (record.to, record.output) == ("s3://b/o", "outputs")
         assert record.error and "does not exist" in record.error

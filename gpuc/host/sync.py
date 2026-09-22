@@ -47,6 +47,11 @@ __all__ = [
 
 MIN_AGE_S = 10.0
 MAX_EXCLUDES = 200
+MISSING_TICKS = 2
+"""Periodic ticks an output path may be missing before that is recorded as the
+destination's failure. A job that writes its first checkpoint late is not
+failing at the first tick; one whose path is still missing at the third has
+an `outputs:` that does not match what it writes (issue #72)."""
 
 
 class TooManyRecentFiles(SyncError):
@@ -108,8 +113,14 @@ def sync_output(
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
     baseline_entries: baseline.Entries | None = None,
+    record_missing: bool = True,
 ) -> None:
-    """Upload one output to each of its destinations, recording each result."""
+    """Upload one output to each of its destinations, recording each result.
+
+    `record_missing` is whether a path that is not there yet goes in the
+    record: the loop withholds it for the first few ticks, since a job that
+    writes its first checkpoint an hour in has not failed anything.
+    """
     local = workdir / output.path.format(job_id=job_id)
     entries = baseline_entries or {}
     # Files that were in the checkout and have not been touched are not this
@@ -137,7 +148,8 @@ def sync_output(
             )
         except SyncError as exc:
             errors.append(exc)
-            jobs.record_upload(job_id, destination.uri, output.path, error=str(exc))
+            if record_missing or not isinstance(exc, MissingOutput):
+                jobs.record_upload(job_id, destination.uri, output.path, error=str(exc))
             continue
         jobs.record_upload(job_id, destination.uri, output.path, ok_at=jobs.utc_now())
     if errors:
@@ -161,6 +173,7 @@ def sync_outputs(
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
     baseline_map: baseline.Baseline | None = None,
+    record_missing: bool = True,
 ) -> None:
     errors: list[SyncError] = []
     for output in outputs:
@@ -174,6 +187,7 @@ def sync_outputs(
                 timeout=timeout,
                 env=env,
                 baseline_entries=(baseline_map or {}).get(baseline.output_key(output, job_id)),
+                record_missing=record_missing,
             )
         except SyncError as exc:
             errors.append(exc)
@@ -266,11 +280,19 @@ class SyncLoop:
         self._thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
         self.last_error: str | None = None
+        self._missing_ticks = 0
+        """Consecutive periodic ticks that found an output path missing."""
 
     def _note(self, message: str) -> None:
         queue.note(self._spec.job_id, f"sync: {message}")
 
-    def _tick(self, min_age_s: float, timeout: float | None = DEFAULT_TIMEOUT_S) -> None:
+    def _tick(
+        self,
+        min_age_s: float,
+        timeout: float | None = DEFAULT_TIMEOUT_S,
+        *,
+        record_missing: bool = True,
+    ) -> None:
         with self._tick_lock:
             sync_outputs(
                 self._spec.outputs,
@@ -281,6 +303,7 @@ class SyncLoop:
                 timeout=timeout,
                 env=self._env,
                 baseline_map=baseline.read(self._spec.job_id),
+                record_missing=record_missing,
             )
             sync_job_meta(
                 self._spec.job_id,
@@ -294,11 +317,14 @@ class SyncLoop:
         interval = max(1, self._spec.sync_interval_s)
         while not self._stop.wait(interval):
             try:
-                self._tick(self._min_age_s)
-            except (TooManyRecentFiles, MissingOutput) as exc:
+                self._tick(self._min_age_s, record_missing=self._missing_ticks >= MISSING_TICKS)
+            except MissingOutput as exc:
                 # Not an error yet: the job may simply not have written the
-                # path. It is in the upload record, which is where `status`
-                # shows a path that stays missing tick after tick.
+                # path. Once it has stayed missing for `MISSING_TICKS` it goes
+                # in the upload record, which is where `status` shows it.
+                self._missing_ticks += 1
+                self._note(f"WARNING: {exc}")
+            except TooManyRecentFiles as exc:
                 self._note(f"WARNING: {exc}")
             except SyncError as exc:
                 self.last_error = str(exc)
@@ -306,6 +332,8 @@ class SyncLoop:
             except BaseException as exc:
                 self.last_error = f"periodic sync raised {exc!r}"
                 self._note(f"{self.last_error}\n{traceback.format_exc()}")
+            else:
+                self._missing_ticks = 0
 
     def start(self) -> None:
         if not self._spec.outputs and not self._s3_prefix:

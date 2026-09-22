@@ -467,8 +467,10 @@ Two rules follow:
 `HostConfig.env` is otherwise opaque, and the keys the tool has an opinion
 about are one table, `jobs.MANAGED_ENV`: `UV_CACHE_DIR` and `HF_HOME` are
 *sticky* (an `--env` that does not name them keeps them) and *derived* by
-bootstrap beside gpuc home when the host names nothing, so a persistent root
-keeps both caches; `UV_INSTALL_DIR` and `UV_TOOL_BIN_DIR` name directories
+bootstrap beside gpuc home when the host names nothing -- the uv cache wherever
+gpuc home and `$HOME` are on different filesystems, `HF_HOME` only under a
+persistent root, so the root keeps both caches and an ordinary host keeps the
+user's own; `UV_INSTALL_DIR` and `UV_TOOL_BIN_DIR` name directories
 that go on every child's PATH. Nothing else in `env` means anything to gpuc.
 
 The check compares filesystems rather than sizes because `du` cannot see a
@@ -678,7 +680,7 @@ that bootstrapped it first matters afterwards.
    it and merges back only what it derived, through the host's own `config
    --merge`: the commit just shipped, and the managed env keys the host names
    none of (`UV_CACHE_DIR` by filesystem comparison, `HF_HOME` beside gpuc
-   home). The one exception is a host with **no** config at all, where the last
+   home under a persistent root). The one exception is a host with **no** config at all, where the last
    config this machine read off it is restored.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `$HOME/.local/bin` and `$HOME/.cargo/bin` on PATH,

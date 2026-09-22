@@ -155,6 +155,14 @@ def preempt(job_id: str, priority: int | None = None) -> str:
                 f"job {job_id} is {state.status}, not running, so it is already waiting its "
                 f"turn; `gpuc reorder {job_id} --priority N` moves it"
             )
+        if state.phase == "sync":
+            # The runner snapshots the intent at the top of its final sync and
+            # then deletes the secrets and, on success, the workdir; a preempt
+            # that arrived after that snapshot would come back with neither.
+            raise ValueError(
+                f"job {job_id} is in its final sync, so there is nothing left to preempt; "
+                f"`gpuc requeue {job_id}` runs it again once it has finished"
+            )
         if state.intent == CANCEL:
             raise ValueError(f"job {job_id} is already being cancelled, so it is not coming back")
         wanted = state.priority if priority is None else priority

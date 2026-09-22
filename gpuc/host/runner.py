@@ -623,8 +623,8 @@ class JobRunner:
         return None
 
     def _indices(self) -> dict[str, int] | None:
-        """uuid -> nvidia-smi index, from the same table the assignment was
-        resolved against; None if it cannot be read."""
+        """uuid -> nvidia-smi index, read now, just after the assignment was
+        resolved against the same driver; None if it cannot be read."""
         try:
             return {gpu.uuid: gpu.index for gpu in gpus.list_gpus(self.deps.smi)}
         except gpus.GpuError:
@@ -650,8 +650,8 @@ class JobRunner:
         )
         if gpu_error:
             self._log(log, f"GPU assertion failed: {gpu_error}")
-            # The job never ran, so its `outputs:` cannot exist and a second
-            # failure would only add a confusing `+no-outputs`.
+            # The job never ran, so its `outputs:` cannot exist and there is
+            # nothing to upload.
             return self._finalize(1, "failed", "gpu-assert", sync_loop, log, skip_output_sync=True)
 
         self._log(

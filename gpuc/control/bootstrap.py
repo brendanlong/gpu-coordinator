@@ -360,18 +360,24 @@ def derive_env(
 
     `UV_CACHE_DIR` is the one with a real decision behind it
     (`resolve_cache_dir`); every other `beside_home` key in `jobs.MANAGED_ENV`
-    simply lands beside gpuc home, so a persistent root keeps the Hugging Face
-    cache the way it keeps uv's. A key the host already has is never touched.
+    lands beside gpuc home on a host with a persistent root, so the root keeps
+    the Hugging Face cache the way it keeps uv's. A key the host already has is
+    never touched.
     """
     derived: dict[str, str] = {}
     cache_dir = resolve_cache_dir(transport, entry, uv, home, report)
     if cache_dir:
         derived["UV_CACHE_DIR"] = cache_dir
+    if entry.root is None:
+        # Only a persistent root moves a cache: on an ordinary host the
+        # default location is the user's own, holding their models and their
+        # `hf auth login` token, and pointing jobs elsewhere would lose both.
+        return derived
     for key, managed in jobs.MANAGED_ENV.items():
         if key == "UV_CACHE_DIR" or not managed.beside_home or entry.env.get(key):
             continue
         derived[key] = cache_beside(home, managed.beside_home)
-        report(f"{key}: {derived[key]} (beside gpuc home; set for this host)")
+        report(f"{key}: {derived[key]} (beside gpuc home, on the persistent root)")
     return derived
 
 

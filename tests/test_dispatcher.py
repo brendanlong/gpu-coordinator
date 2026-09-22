@@ -242,6 +242,39 @@ def test_a_runner_that_dies_without_final_state_fails_the_job(gpuc_home: Path) -
     assert dispatcher.running == {}
 
 
+def test_a_runner_that_dies_leaves_no_output_confirmed(gpuc_home: Path) -> None:
+    """A periodic tick's success says nothing about what the job wrote after
+    it, and the final upload never ran: the sweep must not take the workdir."""
+    spec = make_spec(gpus=1, outputs=[{"path": "out", "s3": "s3://b/{job_id}"}])
+    job_id = queue.enqueue(spec)
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    jobs.record_upload(job_id, f"s3://b/{job_id}", "out", ok_at=jobs.utc_now())
+    (paths.workdir(job_id) / "out").mkdir()
+    (paths.workdir(job_id) / "out" / "late.pt").write_text("x")
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert state.reason == "runner-died"
+    assert not state.outputs_uploaded(jobs.read_spec(job_id))
+    assert cleanup.outputs_confirmed(job_id, state) == (False, "outputs not confirmed uploaded")
+
+
+def test_a_stop_asked_for_as_the_runner_dies_is_not_written_over(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=1, priority=1))
+    queue.preempt(job_id)
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    # The intent was seen: runner-died is a stop of ours, so the job comes back
+    # as its next attempt (and may already be running again on the freed card).
+    state = jobs.read_state(job_id)
+    assert (state.attempt, state.intent) == (2, None)
+    assert state.status in ("queued", "running")
+
+
 def test_orphans_from_a_dead_dispatcher_are_reconciled(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=2**30)
@@ -566,6 +599,21 @@ def staged_submit(job_id: str, *, age_s: float = 0.0) -> Path:
     for path in (staging, staging / "workdir", staging / "workdir" / "train.py"):
         os.utime(path, (stamp, stamp))
     return staging
+
+
+def test_a_dead_submits_secrets_go_with_its_staged_dir(gpuc_home: Path) -> None:
+    """The secrets file was delivered before the enqueue that never came, and
+    nothing else would ever unlink it."""
+    abandoned = staged_submit("20260101-000000-secret", age_s=cleanup.INCOMING_STALE_S + 60)
+    secrets = paths.job_env_file("20260101-000000-secret")
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text("AWS_SECRET_ACCESS_KEY=hunter2\n")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+
+    assert not abandoned.exists()
+    assert not secrets.exists()
 
 
 def test_a_dir_left_under_incoming_is_removed_after_an_hour(gpuc_home: Path) -> None:
@@ -1700,6 +1748,20 @@ def test_an_auto_preempt_job_gives_its_cards_to_a_more_important_one(gpuc_home: 
     assert jobs.read_state(urgent).status == "running"
     state = jobs.read_state(cheap)
     assert (state.status, state.attempt) == ("queued", 2)
+
+
+def test_auto_preempt_judges_a_job_by_the_priority_it_runs_at(gpuc_home: Path) -> None:
+    """Submitted at 10, moved to 60 while queued: it is a 60 job now, and a 30
+    job waiting is strictly more important than it."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=10, auto_preempt=True))
+    assert queue.reorder(cheap, 60)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(cheap).status == "running"
+
+    queue.enqueue(make_spec(gpus=2, priority=30))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
 
 
 @pytest.mark.parametrize("priority", [80, 50])

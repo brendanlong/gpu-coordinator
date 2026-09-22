@@ -51,7 +51,7 @@ def _polling_interval(fields: Any) -> float:
     """`progress_interval_s`, with anything unusable meaning the default.
 
     A zero, a negative or a NaN reaches here from a hand-edited `spec.json`, a
-    staged `incoming/<id>.json`, or another build -- the control side's
+    staged `incoming/<id>/spec.json`, or another build -- the control side's
     validation is not in that path. Zero and negative would poll on every pass
     of the runner's loop, forking a shell twice a second for the life of the
     job; NaN would silently never poll at all.

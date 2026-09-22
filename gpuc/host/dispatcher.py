@@ -689,17 +689,29 @@ class Dispatcher:
             self.log(f"job {job_id} has an unreadable state.json ({exc}); treating as runner-died")
             state = None
         self._kill_orphaned_group(job_id, state.pgid if state else None, state)
-        final = state or jobs.JobState()
-        final.status = "failed"
-        final.reason = "runner-died"
-        final.exit_code = final.exit_code or 1
-        final.ended_at = jobs.utc_now()
-        final.phase = None
-        # The runner clears this itself on every path it survives; here it did
-        # not survive, and a finished job carrying an eta reads to anything
-        # keying on it as a job that is still going.
-        final.eta = None
-        jobs.write_state(job_id, final)
+        with jobs.locked(job_id):
+            # Re-read under the lock: a cancel or preempt that landed since
+            # the read above must not be written over.
+            try:
+                final = jobs.read_state(job_id)
+            except RuntimeError:
+                final = jobs.JobState()
+            final.status = "failed"
+            final.reason = "runner-died"
+            final.exit_code = final.exit_code or 1
+            final.ended_at = jobs.utc_now()
+            final.phase = None
+            # The runner clears this itself on every path it survives; here it
+            # did not survive, and a finished job carrying an eta reads to
+            # anything keying on it as a job that is still going.
+            final.eta = None
+            # A periodic tick's success says nothing about what the job wrote
+            # after it, and the final upload that would have never ran: these
+            # outputs are not confirmed anywhere, and the sweep must not take
+            # them.
+            for record in final.output_uploads():
+                record.ok_at = None
+            jobs.write_state(job_id, final)
         self.log(f"job {job_id} failed: runner died without writing final state")
 
     def _kill_orphaned_group(
@@ -1059,7 +1071,7 @@ class Dispatcher:
         What the walk does pass is a job that is not stuck: one already holding
         every card it needs, because a stop in flight is bringing them, and the
         one job the strict order steps over, which is short of a shared card
-        somebody else is using and so holds nothing (`_holds_the_queue`).
+        somebody else is using and so holds nothing (`plan.SteppedOver`).
 
         Three things then have to hold for the job it settles on, and they are
         what keep this from being a way to lose work for nothing:
@@ -1151,7 +1163,7 @@ class Dispatcher:
             found.append(
                 Preemptable(
                     job_id,
-                    spec.priority,
+                    state.priority,
                     list(entry.gpus),
                     state.started_at or "",
                     owned=sum(1 for uuid in entry.gpus if uuid in owned),

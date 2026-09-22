@@ -309,7 +309,9 @@ job's `estimated_runtime_min`; see [job length estimates](#job-length-estimates)
 again as attempt+1, with the workdir re-synced from your *current* directory. It
 therefore **needs `s3_bucket`** and cannot rebuild a `--no-git` workdir.
 `--host H` sends it somewhere else, `--runpod` provisions for it, and with
-neither it goes back to the host the local index names. The new run gets its own
+neither it goes back to the host that ran it, found the way every job command
+finds one: the local index, then every registered host. A job whose host is a
+rental that has since ended needs `--host` or `--runpod`. The new run gets its own
 output namespace. A mirrored spec this build will not accept is refused rather
 than queued to fail; submitting the job file again is the way round it. Keys
 this build does not know are dropped rather than refused.
