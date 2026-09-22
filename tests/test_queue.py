@@ -430,14 +430,19 @@ def test_a_job_that_ended_on_its_own_before_the_kill_landed_is_not_re_run(
     assert jobs.read_state(job_id).intent is None
 
 
-@pytest.mark.parametrize("reason", ["preempted", "preempted+sync", "runner-died", "terminated"])
+@pytest.mark.parametrize(
+    ("reason", "problems"),
+    [("preempted", []), ("preempted", ["sync"]), ("runner-died", []), ("terminated", [])],
+)
 def test_every_way_the_stop_itself_can_end_the_attempt_comes_back(
-    gpuc_home: Path, reason: str
+    gpuc_home: Path, reason: str, problems: list[str]
 ) -> None:
-    """`preempted+sync` is a preempt whose final upload also failed, and the two
-    others are the escalation ladder taking the runner down."""
+    """A preempt whose final upload also failed is still a preempt: the upload
+    failure is a problem beside the reason. The two other reasons are the
+    escalation ladder taking the runner down."""
     waiting_job()
     job_id = running_job()
     queue.preempt(job_id)
     stopped(job_id, reason=reason)
+    jobs.update_state(job_id, problems=problems)
     assert queue.requeue_preempted(job_id) == 2
