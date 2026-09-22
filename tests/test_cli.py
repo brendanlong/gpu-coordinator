@@ -2028,11 +2028,36 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
     assert "error: host pod: ssh to pod failed" in captured.err
     assert "2/3 host(s) bootstrapped" in captured.out
     assert "failed: pod" in captured.out
-    # The one failure that is somebody else's job to clean up says whose.
-    assert "gpuc host remove <name>" in captured.out
     registry = load_registry()
     assert all(registry.require(name).bootstrapped_at for name in ("gpubox", "zbox"))
     assert registry.require("pod").bootstrapped_at is None
+
+
+class _NoPods:
+    """A provider whose account has no pod by that id any more."""
+
+    def get(self, pod_id: str) -> None:
+        return None
+
+
+def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rental that ended itself is how one is meant to die, so exit 0."""
+    from gpuc.control.bootstrap import BootstrapError
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    with registry_transaction() as registry:
+        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+    bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: _NoPods())
+    capsys.readouterr()
+
+    assert main(["host", "bootstrap", "--all"]) == 0
+    out = capsys.readouterr().out
+    assert "1/2 host(s) bootstrapped" in out
+    assert "forgotten, their pods are gone: pod" in out
+    assert "pod" not in load_registry().hosts
 
 
 def test_host_bootstrap_all_counts_the_hosts_it_could_not_read(

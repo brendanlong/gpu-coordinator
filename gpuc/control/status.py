@@ -255,6 +255,9 @@ class HostView:
     error: str | None = None
     heartbeat_age_s: float | None = None
     pod_gone: bool = False
+    pod_terminated: bool = False
+    """The provider says this pod no longer exists, so the registry entry can
+    only mislead: whoever gathered this view forgets it."""
     draining: bool = False
     owned: list[str] = field(default_factory=list)
     """The UUIDs this host owns, as the host itself resolved them: `config.gpus`
@@ -286,6 +289,15 @@ class HostView:
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
+
+    @property
+    def failure(self) -> str | None:
+        """Why this host could not be read, if that is what happened.
+
+        A pod the provider says is gone is not that: the provider answered, and
+        a rental that ended itself is a state rather than a failure.
+        """
+        return None if self.pod_gone else self.error
 
     @property
     def dispatcher_alive(self) -> bool:
@@ -449,13 +461,16 @@ def gather(
         except ProviderError as exc:
             view.error = f"could not read pod {entry.pod_id}: {exc}"
     if view.pod_gone:
-        # The pod is gone but the registry still lists it. SSH would hang and
-        # then print a stack about a refused connection, which tells nobody
-        # anything: say what happened and what removes the entry.
+        # An ssh here would hang and then print a stack about a refused
+        # connection, which tells nobody anything. A pod that is gone for good
+        # is forgotten by the caller; one that is merely stopped is left alone,
+        # since the provider still has it.
         status = "missing" if view.pod is None else view.pod.status
+        view.pod_terminated = view.pod is None or view.pod.status == "TERMINATED"
         view.error = (
-            f"pod {entry.pod_id} is {status}; the registry entry is stale. "
-            f"Run `gpuc host remove {entry.name}` to forget it."
+            f"pod {entry.pod_id} is {status}; forgetting this host"
+            if view.pod_terminated
+            else f"pod {entry.pod_id} is {status}; `gpuc host remove {entry.name}` forgets it"
         )
         return view
     try:

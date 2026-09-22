@@ -646,13 +646,18 @@ anything (exit 3, a `.bak` kept).
 
 ## Exit codes
 
-The table is in usage.md. The contract behind it: 0 covers an unreachable host,
-a dead dispatcher and a pod that is gone (data about a host, reported per host),
-3 means local state could not be read at all so the answer is *unknown*, and 4
-is a name that does not exist. `gpuc status` never exits non-zero because of one
-bad host entry or one unreachable host, and `gpuc status --json` always prints
-one document. Automation keys on `hosts[].running` and treats exit 3 as unknown,
-never as "nothing running".
+The table is in usage.md. The contract behind it: a command reports everything
+it found out and exits non-zero if any part of it failed. `gpuc status` prints
+every host that answered **and** exits 1 for one it could not read, or for a
+registry entry this build could not parse; `gpuc status --json` prints its one
+document either way. 3 means local state could not be read at all, so the answer
+is *unknown*, and 4 is a name that does not exist. Automation keys on
+`hosts[].running` and treats exit 3 as unknown, never as "nothing running".
+
+A rental the provider says is gone is not a failure. `status` and `host
+bootstrap --all` forget that registry entry where they find it
+(`forget_gone_rentals`, `rental_gone`) and say so, which is what stops a rental
+that ended itself from being reported as a host nobody can reach.
 
 `--json` is on every command that has an answer to give, and means the same
 thing on each: stdout is one object carrying `schema_version`, everything else
@@ -662,19 +667,14 @@ an exit code. `gpuc logs --json` is the tail as `lines[]` plus where it was read
 from; with either follow it is exit 2, because the document is printed once and
 a follow is a stream. Each command's schema is the table in usage.md.
 
-`gpuc wait` and `gpuc logs -f` are the two exceptions to "1 means the command
-failed", and deliberately -- the spec's *Monitoring* section says so: their exit
-code is the *job's*, so 0 means every job named succeeded and 1 means one of
-them did not, exactly as `gpuc ssh <host> -- cmd` exits with the remote
-command's code. A wait that could not find out -- a host that stayed unreachable
-past `wait.TROUBLE_GRACE_S` and whose mirror had nothing -- is 1 as well, with
-the reason on the job's line and in `errors[]`. 3 and 4 keep their usual
-meanings, and **130** is added: a Ctrl-C must not be exit 0 where 0 means the
-job succeeded. It is raised in one place -- `main` turns any `KeyboardInterrupt`
-into the same exit and the same `--json` error document, and a command with
-something specific to say about what was in flight raises `Interrupted` to add
-it. Both blocking commands got that wrong while they each handled it
-themselves.
+`gpuc wait` and `gpuc logs -f` exit with the *job's* outcome rather than their
+own -- 0 only if every job named succeeded -- as `gpuc ssh <host> -- cmd` does
+with the remote command's code. A wait that could not find out (a host
+unreachable past `wait.TROUBLE_GRACE_S` whose mirror had nothing) is 1 too, with
+the reason on the job's line and in `errors[]`. **130** is a Ctrl-C, raised in
+one place: `main` turns any `KeyboardInterrupt` into that exit and the matching
+`--json` error document, and a command with something to say about what was in
+flight raises `Interrupted` to add it.
 
 ## Waiting for a job to end (`control/wait.py`)
 
@@ -683,23 +683,17 @@ free to be killed, and a host does not change what it does because somebody is
 watching. `Watch` holds the jobs being waited on plus one `HostSession` per
 host, and each round sends **one `status` per host** rather than one per job --
 a sweep is usually twenty ids on one box. `status <job-id>` is used when only
-one job on that host is left, so the common case does not walk the host's whole
-job list.
+one job on that host is left.
 
-- The pace backs off from 2s to 30s unless `--interval` pins it: a job that
-  dies in its preflight dies in the first minute, and a job still running after
-  ten has hours left.
-- A host that cannot be asked is *trouble*, not an answer. It is reported once
-  on stderr and retried for `TROUBLE_GRACE_S` (5 min); only then is the **S3
-  mirror** read -- the spec's "the mirror is read only when the host is gone",
-  and the answer for a rental that finished the job and idled itself down --
-  and only if that has no terminal `state.json` does each job get an `error`.
-  An ssh blip must not end a six-hour wait; a pod that has gone must not hang
-  one for ever; and a job that succeeded must not be reported as a failure
-  because the machine that ran it has since been billed off.
+- The pace backs off from 2s to 30s unless `--interval` pins it.
+- A host that cannot be asked is *trouble*, not an answer: reported once on
+  stderr and retried for `TROUBLE_GRACE_S` (5 min), then read from the **S3
+  mirror** -- the spec's "the mirror is read only when the host is gone", and
+  the answer for a rental that finished the job and idled itself down. Only if
+  that has no terminal `state.json` does each job get an `error`.
 - A reachable host whose dispatcher heartbeat is stale is said once and waited
-  through. Its queued jobs will not start, but the queue is intact and one
-  `gpuc host bootstrap` serves it again, so this is a note and not an ending.
+  through: its queued jobs will not start, but the queue is intact and one
+  `gpuc host bootstrap` serves it again.
 - An id whose host answers and does not list it is exit 4, checked after the
   first poll -- `find_job_host` believes the local index and an explicit
   `--host` without asking anybody. A job that *was* listed and then vanishes is
@@ -709,12 +703,11 @@ job list.
   it: the runner writes its terminal state before it logs the outcome, so the
   poll is always slightly ahead of the log. The stop is in a `finally` inside
   `_end_tail`, so a second Ctrl-C landing in that grace cannot leave a `tail`
-  writing into a terminal gpuc has left. `-F` rather than `-f` so a job that
-  has not been dispatched yet is followed rather than refused -- and only from
-  the follow path: `Transport.tail()` keeps `-f`, because a missing log's
-  non-zero exit is what routes `gpuc logs` to the mirror. A tail that dies
-  before the job does (an ssh that gave up) is a note, not an ending; the poll
-  has its own connection.
+  writing into a terminal gpuc has left. `-F` rather than `-f` follows a log
+  that does not exist yet, and only from the follow path: `Transport.tail()`
+  keeps `-f`, whose non-zero exit on a missing log is what routes `gpuc logs`
+  to the mirror. A tail that dies before the job does is a note, not an ending;
+  the poll has its own connection.
 
 ## Transport
 
@@ -1026,9 +1019,11 @@ it.
 
 What `status` prints, and every flag, is usage.md. The invariants:
 
-- An ephemeral host whose pod the provider reports missing or TERMINATED is
-  `POD GONE`: no ssh is attempted, and the line says to run `gpuc host remove
-  <name>` rather than printing a connection error.
+- An ephemeral host whose pod the provider reports missing or dead is
+  `POD GONE`: no ssh is attempted, and the line says what the provider said
+  rather than printing a connection error. Missing or TERMINATED is the end of
+  that rental, so the entry is forgotten as it is printed; a pod the provider
+  still has is left for `gpuc host remove`.
 - A finished job that produced `outputs:` which never reached S3/HF is flagged
   (`outputs not uploaded`, or `OUTPUTS LOST` once a drain has given up), because
   those are the jobs a purge -- or a pod going away -- would take with them. One

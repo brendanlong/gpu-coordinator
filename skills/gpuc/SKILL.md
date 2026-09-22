@@ -202,32 +202,30 @@ id=$(gpuc submit job.yaml --host gpubox --json | jq -r .job_id)
 gpuc wait "$id" || gpuc logs "$id" -n 50     # exit 1 means it did not succeed
 ```
 
-It backs its polling off from 2s to 30s and takes several ids so a sweep is one
+It backs its polling off from 2s to 30s and takes several ids, so a sweep is one
 command. `gpuc logs <jobid> -f` is the same wait for a single job with the log on
 screen. Both exit with the **job's** outcome, not their own: 0 only if every job
-succeeded, 1 if any did not, and **130** if you Ctrl-C out — never 0, so the
-difference between "it worked" and "I stopped looking" survives into `$?`.
+succeeded, 1 if any did not, 130 if you Ctrl-C out.
 
-A host that stops answering does not end the wait: it rides out a blip for five
-minutes, then reads the job's state from the S3 mirror (which is where a pod
-that finished the job and idled itself down leaves it) and says the answer came
-from there. Only if the mirror has nothing is it exit 1. A reachable host whose
+A host that stops answering does not end the wait: gpuc keeps asking for five
+minutes, then reads the job's final state from the S3 mirror (where a pod that
+finished the job and idled itself down leaves it) and says the answer came from
+there. Only if the mirror has nothing is it exit 1. A reachable host whose
 dispatcher is down is called out once and waited through — `gpuc host bootstrap
 <host>` restarts the queue.
 
-Neither command is a background job. A wait that is killed changes nothing about
-the run, because the host owns the job.
+Neither command is a background job, and killing one leaves the run alone.
 
 ## Exit codes and `--json` (read this before scripting anything)
 
 | code | meaning |
 | --- | --- |
-| 0 | ok — **including** a host that is unreachable or whose dispatcher is down; that is reported per host, not as a failure |
-| 1 | the command failed (transport, provider, refused submit). For `gpuc wait` and `gpuc logs -f` it means the **job** did not succeed: their exit code is the job's, like `gpuc ssh -- cmd` |
+| 0 | everything the command was asked to do worked. For `gpuc wait` and `gpuc logs -f`, the job succeeded |
+| 1 | something failed: transport, provider, a refused submit, **a host that could not be read**. Whatever did work is still reported, so read the output before retrying — one host being down does not cost you the others. For `gpuc wait` and `gpuc logs -f` it is the **job** that did not succeed |
 | 2 | usage: a bad or missing flag |
 | 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
 | 4 | the job or host named does not exist |
-| 130 | a Ctrl-C. Not 0, because for `gpuc wait` and `gpuc logs -f` 0 means the job succeeded |
+| 130 | a Ctrl-C |
 
 ```bash
 gpuc status --json | jq -r '.hosts[] | "\(.name) reachable=\(.reachable) running=\(.running | length)"'
@@ -320,9 +318,10 @@ Rules, and they are not optional:
   every pod with our prefix, its hourly cost and its heartbeat, and the pod
   ends in the RunPod console. `gpuc host set <host> --idle-min 0` hurries a
   pod that still has a dispatcher.
-- `status` says `POD GONE` for a registry entry whose pod is terminated:
-  `gpuc host remove <name>` forgets it (the next `submit --runpod` does so on
-  its own).
+- A rental that ended itself is forgotten when it is found: `status` and
+  `host bootstrap --all` drop the registry entry and say so, rather than
+  reporting a host nobody can reach. A pod that is merely stopped shows as
+  `POD GONE` and stays until `gpuc host remove <name>`.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
   create, reading the config the pod already has.
 - Only act on pods named `gpuc-*`. Others belong to other people.

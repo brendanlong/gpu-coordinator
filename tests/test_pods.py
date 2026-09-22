@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from gpuc.control import pods as pods_mod
-from gpuc.control.config import Settings, registry_transaction
+from gpuc.control.cli import EXIT_OK, main
+from gpuc.control.config import Settings, load_registry, registry_transaction
 from gpuc.control.status import HostView, render
 from tests.conftest import host_entry
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
@@ -111,3 +112,18 @@ def test_status_shows_the_pod_even_when_the_host_is_unreachable() -> None:
     view = HostView(entry=entry, reachable=False, error="ssh timed out", pod=running_pod("n", "p"))
     text = render(view)
     assert "UNREACHABLE" in text and "pod     p RUNNING" in text
+
+
+def test_status_forgets_a_rental_the_provider_no_longer_has(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rental that ended itself is a state, not a host nobody can reach."""
+    _register("gpuc-e2e-aaa", "pod1")
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: FakeProvider())
+    capsys.readouterr()
+
+    assert main(["status"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "POD GONE" in out
+    assert "forgetting this host" in out
+    assert load_registry().hosts == {}

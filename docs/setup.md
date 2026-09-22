@@ -302,11 +302,12 @@ adopting the running jobs — nothing is interrupted. `gpuc status` reports the
 apart.
 
 `--all` takes every registered host in turn, including ephemeral ones. A host
-that fails does not stop the others (a pod that has already gone away is the
-ordinary case; `gpuc host remove <name>` forgets it): the run ends with a tally
-naming each failure, including host entries this build could not read, and exits
-1, while the hosts that did upgrade stay upgraded. `--json` prints that tally as
-one entry per host ([usage.md](usage.md#--json-everywhere-else)).
+that fails does not stop the others: the run ends with a tally naming each
+failure, including host entries this build could not read, and exits 1, while
+the hosts that did upgrade stay upgraded. A rental the provider no longer has is
+not a failure -- it ended itself, so the entry is forgotten and the tally says
+so. `--json` prints that tally as one entry per host
+([usage.md](usage.md#--json-everywhere-else)).
 
 A host nothing has ever bootstrapped is refused by `gpuc submit` rather than
 half-installed on the way past: it has no uv to run a dispatcher with.

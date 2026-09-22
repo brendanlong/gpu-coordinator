@@ -6,7 +6,7 @@ from typing import Any, cast
 import pytest
 
 from gpuc.control.config import HostEntry
-from gpuc.control.providers.base import Pod
+from gpuc.control.providers.base import Pod, PodStatus
 from gpuc.control.status import (
     HostView,
     JobView,
@@ -22,6 +22,7 @@ from gpuc.control.status import (
     queue_start_estimates,
     render,
 )
+from gpuc.control.transport import TransportError
 from tests.conftest import host_entry
 
 GPU = "GPU-a"
@@ -213,6 +214,10 @@ def test_null_utilization_samples_are_dropped() -> None:
     assert running[0].util_recent == [90.0, 80.0]
 
 
+def _pod(status: PodStatus) -> Pod:
+    return Pod(id="pod-1", name="gpuc-e2e-1", status=status, cost_usd_hr=0.0, gpu_name="A40")
+
+
 class _GoneProvider:
     """A provider that knows nothing about the pod the registry still lists."""
 
@@ -236,26 +241,44 @@ def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
         raise AssertionError("status must not ssh to a pod that no longer exists")
 
     view = gather(_runpod_entry(), session=cast(Any, explode), provider=cast(Any, _GoneProvider()))
-    assert view.pod_gone and not view.reachable
+    assert view.pod_gone and view.pod_terminated and not view.reachable
     assert "missing" in (view.error or "")
+    # The provider answered, so this is a rental that ended rather than a host
+    # the command could not read.
+    assert view.failure is None
     text = render(view)
     assert "POD GONE" in text
-    assert "gpuc host remove gpuc-e2e-1" in text
+    assert "forgetting this host" in text
     assert "host probe" not in text
 
 
 def test_a_terminated_pod_reads_as_gone_too() -> None:
-    terminated = Pod(
-        id="pod-1",
-        name="gpuc-e2e-1",
-        status="TERMINATED",
-        cost_usd_hr=0.0,
-        gpu_name="A40",
-    )
+    terminated = _pod("TERMINATED")
     view = gather(_runpod_entry(), provider=cast(Any, _GoneProvider(terminated)))
-    assert view.pod_gone
+    assert view.pod_gone and view.pod_terminated
     assert "TERMINATED" in render(view)
+    assert "forgetting this host" in (view.error or "")
+
+
+def test_a_stopped_pod_is_gone_but_not_forgotten() -> None:
+    """An EXITED pod is one the provider still has, so the entry is left alone."""
+    view = gather(_runpod_entry(), provider=cast(Any, _GoneProvider(_pod("EXITED"))))
+    assert view.pod_gone and not view.pod_terminated
+    assert view.failure is None
     assert "gpuc host remove gpuc-e2e-1" in (view.error or "")
+
+
+class _RefusingSession:
+    """A host that is registered and does not answer."""
+
+    def host_json(self, *_: Any, **__: Any) -> Any:
+        raise TransportError(message="ssh: connect to 1.2.3.4 port 22: No route to host")
+
+
+def test_a_host_that_could_not_be_read_is_a_failure() -> None:
+    view = gather(_runpod_entry(), session=cast(Any, _RefusingSession()), provider=None)
+    assert not view.reachable
+    assert view.failure == "ssh: connect to 1.2.3.4 port 22: No route to host"
 
 
 # -- leftover workdirs --------------------------------------------------------
