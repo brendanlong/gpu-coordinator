@@ -322,10 +322,10 @@ saying so, and `--no-bootstrap` skips it. A checkout with uncommitted changes
 is its own build (`<commit>-dirty`): a host bootstrapped from it never reads as
 running that commit.
 Re-bootstrapping is safe at any time: **running jobs are not disturbed and do
-not block it.** A dispatcher that is already alive keeps the lock and finishes
-on its own (older) code; every new runner uses the new package, and whichever
-dispatcher takes over adopts the running jobs from their `state.json`. Only the
-dispatcher is ever replaced, never a runner.
+not block it.** A dispatcher on another build hands over to the one bootstrap
+starts, which adopts the running jobs from their `state.json`; every new
+runner uses the new package. Only the dispatcher is ever replaced, never a
+runner.
 
 Two sessions on different builds are fine: each ignores fields it does not know.
 

@@ -333,8 +333,8 @@ reason, never "no such job".
 writes it to `DIR/.claude/skills/gpuc/SKILL.md` instead (default: the current
 directory) and refuses to overwrite without `--force`.
 
-**`gpuc version`** — this build, its commit, and the commit this machine last
-shipped to each bootstrapped host, marking the ones to re-bootstrap. It reads
+**`gpuc version`** — this build, its commit, and the commit each host's config
+named when this machine last read it, marking the ones to re-bootstrap. It reads
 the registry's cache and never touches a host; what a host is *running* is
 `gpuc status`.
 
@@ -494,7 +494,7 @@ A rental that ended itself — a pod the provider reports missing or `TERMINATED
 — is **forgotten where it is found**: `gpuc status`, `gpuc host bootstrap --all`
 and the next `submit --runpod` reuse pass each drop the registry entry and say
 so. A pod the provider still has but has stopped (`EXITED`, `ERROR`) is a host
-nothing can run on: `POD GONE` in `gpuc status`, exit 1, and it stays until
+nothing can run on: `POD EXITED` (its status) in `gpuc status`, exit 1, and it stays until
 `gpuc host remove <name>`.
 
 ## How a job is killed
@@ -582,7 +582,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
       "reachable": true,
       "pod_gone": false,
       "pkg_commit": "8f1c2d0a9b34",
-      "dispatcher": { "alive": true, "heartbeat_age_s": 2.0 },
+      "dispatcher": { "alive": true, "heartbeat_age_s": 2.0, "pkg_commit": "8f1616c..." },
       "provider_util": null,
       "gpus": [
         { "index": 0, "uuid": "GPU-8064...", "name": "NVIDIA A40", "vram_mib": 46068,
@@ -710,7 +710,7 @@ per-job trouble the command reported rather than stopped for.
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` here is the commit the host was running when this machine last read it, not what it runs now — that is `status --json`'s `pkg_commit`. Exit 1 for an entry that could not be parsed, 3 if the whole registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}` — the effective settings, file or not |
 | `host list` | `{hosts[], errors[]}` — each registry entry: the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `rental` -- `{provider, pod_id}` or null -- and `pod_id` beside it), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at`, the raw `cache` it came from, plus `remote_home`, `ephemeral` and `warnings[]`. Nothing here asks the host. The host's `env` is reported by **name only** (`{"HF_TOKEN": "<set>"}`). A skipped entry is an `errors` string, not a host, and exit 1. Exit 3 if the whole registry is unreadable |
-| `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], home_fs_type, home_is_overlay, persistent_root, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to. `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
+| `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], shared_gpus[], shared_missing[], home_fs_type, home_is_overlay, persistent_root, notes[]}`. `gpus` is **every** card the host has whatever `--all-gpus` said, each one `{uuid, name, vram_mib, index, assigned, shared}`; `assigned_gpus` is this host's `--gpus` as registered and `assigned_missing` the entries in it no card answered to; `shared_gpus` and `shared_missing` are the same for `--shared-gpus`. `sections` is the probe script's raw output section by section, so anything this build does not interpret is still there |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. Job objects are `{job_id, status, bytes, age_days, mirrored_at, mirror}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup; `incoming_removed` names job dirs a submit never finished |
 | `host add`, `host set` | the host as `host list --json` reports one entry (the address, the host's own config flattened beside it, `cache`, `remote_home`, `ephemeral`), as the registry holds it once the command is done, plus `adopted` (the host already had a config, which `add` took as it stood), `config_path` (that config on the host), `changes[]` (one line per config field this command wrote through to the host, empty when it held that already) and `warnings[]` (`host list`'s re-bootstrap note, and for `add` a host that owns no card or a pod nothing has bootstrapped). `host set` adds `address{}`: the fields it changed here rather than on the host (`persistent_root`, `gpuc_home`), by name and new value |
 | `host remove` | `{host, kind, pod_id, notes[]}` — what was forgotten here. Nothing on the host changes, and a rental is **not** terminated: it bills until it idles out, and `notes` says so, naming `host terminate` |

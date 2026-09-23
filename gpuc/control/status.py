@@ -1196,9 +1196,9 @@ def document(
     """The whole of `gpuc status --json`: one object, always this shape.
 
     Top-level `errors` are the ones that belong to no host -- an unreadable
-    registry, a skipped entry, an index that could not be read -- and they are
-    the reason exit 3 exists: a consumer that sees them must not read `hosts`
-    as the whole truth. `unhosted` is `--all`'s list of jobs only the index
+    registry (exit 3), a skipped entry or an index that could not be read
+    (exit 1) -- and a consumer that sees any of them must not read `hosts` as
+    the whole truth. `unhosted` is `--all`'s list of jobs only the index
     knows, empty without the flag.
     """
     return {

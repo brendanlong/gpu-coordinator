@@ -18,7 +18,6 @@ from pydantic import ValidationError
 from gpuc._version import user_agent
 from gpuc.control.config import HostEntry, Settings, index_dir
 from gpuc.control.tolerant import TolerantModel
-from gpuc.host.jobs import JobSpec
 
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
@@ -176,9 +175,6 @@ class S3Index:
             if _is_missing(exc):
                 raise S3ObjectMissing(f"no object at s3://{self.bucket}/{key}") from exc
             raise S3IndexError(f"could not read s3://{self.bucket}/{key}: {exc}") from exc
-
-    def put_spec(self, spec: JobSpec) -> str:
-        return self._put(spec_key(spec.job_id), json.dumps(spec.to_dict(), indent=2) + "\n")
 
     def put_spec_document(self, job_id: str, document: dict[str, Any]) -> str:
         """Re-mirror a spec as raw JSON, for an edit to a spec already up there.

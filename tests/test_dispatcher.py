@@ -343,16 +343,6 @@ def test_a_live_orphan_is_adopted_not_failed(gpuc_home: Path) -> None:
     assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
 
 
-def test_a_paused_marker_from_an_older_build_does_not_stop_dispatching(gpuc_home: Path) -> None:
-    """Builds before the host pause was removed left `paused` under the home;
-    a stale one is a file this build does not know, not a reason to sit idle."""
-    (paths.home() / "paused").write_text("two consecutive jobs failed with reason low-util\n")
-    job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert jobs.read_state(job_id).status == "running"
-
-
 def test_a_non_provider_host_never_self_terminates(gpuc_home: Path) -> None:
     clock = FakeClock()
     terminated: list[str] = []

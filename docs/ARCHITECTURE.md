@@ -24,6 +24,7 @@ gpuc/
     dispatcher.py  # lock+heartbeat, act on the plan, launch runners, escalate stops, idle terminate
     runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, wall-clock limit, sync, exit code
     scope.py       # systemd --user scope probe/wrap/stop; the cgroup kill path
+    procs.py       # process facts, and JobProcesses: the one object every stop goes through
     destinations.py # where files go: one Destination per store (S3, Hugging Face); upload, put_file, preflight
     preflight.py   # sync preflight: prove every destination can be written before the job runs
     baseline.py    # what was already under `outputs:` before the job started
@@ -506,7 +507,7 @@ policy, the two horizons and every refusal are
   at most once an hour: job dirs older than `retention_days` first, then one
   workdir sweep at the shorter of the two horizons that are set.
   `workdir_days` defaults to `cleanup.DEFAULT_WORKDIR_DAYS` only in the first
-  config `connect` writes, never on the `HostConfig` field: nothing that
+  config `config.first_config` builds, never on the `HostConfig` field: nothing that
   merely reads a config may turn a sweep on.
 - An ephemeral host's drain retries unconfirmed outputs
   (`OUTPUT_RETRY_ATTEMPTS`, a minute apart), then records `outputs_lost` and
@@ -701,8 +702,8 @@ that reach outside the module:
   missing id.
 - `logs -f` runs `tail -F` as a child writing straight to stdout while the loop
   polls, and gives the stream `FLUSH_GRACE_S` to catch up before stopping it:
-  the runner writes its terminal state before it logs the outcome, so the poll
-  is always slightly ahead of the log. `-F` rather than `-f` follows a log that
+  the runner's last log lines come after its terminal write, so the poll
+  can be slightly ahead of the log. `-F` rather than `-f` follows a log that
   does not exist yet, and only from this path -- `Transport.tail()` keeps `-f`,
   whose non-zero exit on a missing log is what routes `gpuc logs` to the mirror.
 
@@ -992,7 +993,7 @@ once it returns there is no host left to own any state.
   exit 1 on work in flight (running, queued, or finished with outputs not
   confirmed uploaded, each named), on a host that did not answer, or on a
   target with no registry entry to ask. `--force` does not ask at all.
-- A pod the provider reports in `DEAD_STATUSES` is never refused over.
+- A pod the provider reports dead (`Provider.dead_statuses`) is never refused over.
 - The terminate is `Provider.terminate_confirmed`, the same one provisioning
   ends a pod with: the provider must confirm the pod gone before anything
   local changes. Only then is the entry dropped,

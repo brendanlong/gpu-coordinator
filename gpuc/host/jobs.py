@@ -845,7 +845,8 @@ class HostConfig:
     nothing of the caller. `retention_days` is the one that deletes `log.txt`.
 
     Null here, and `cleanup.DEFAULT_WORKDIR_DAYS` only in a host's very first
-    config, written by `connect`: nothing that merely reads a config may turn
+    config (the control side's `first_config`): nothing that merely reads a
+    config may turn
     a sweep on, so a host configured with the key unset stays that way however
     many packages are shipped to it."""
     env: dict[str, str] = field(default_factory=dict)

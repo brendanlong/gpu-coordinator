@@ -42,7 +42,7 @@ def test_local_index_ignores_a_corrupt_file(control_env: Path) -> None:
 
 def test_s3_spec_round_trips_for_requeue() -> None:
     s3 = S3Index("bkt", FakeS3Client())
-    uri = s3.put_spec(spec())
+    uri = s3.put_spec_document(spec().job_id, spec().to_dict())
     assert uri == "s3://bkt/gpuc/specs/20260101-000000-abc123.json"
     document = s3.get_spec("20260101-000000-abc123")
     assert document["command"] == "true"
@@ -58,7 +58,7 @@ def test_s3_index_lists_entries_for_status_all() -> None:
 def test_a_write_failure_says_what_to_check() -> None:
     s3 = S3Index("bkt", FakeS3Client(fail_put=True))
     with pytest.raises(S3IndexError) as exc:
-        s3.put_spec(spec())
+        s3.put_spec_document(spec().job_id, spec().to_dict())
     assert "AccessDenied" in str(exc.value)
     assert "Check AWS credentials" in str(exc.value)
 

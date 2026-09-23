@@ -60,10 +60,10 @@ afternoon.
 FLUSH_GRACE_S = 2.0
 """What `logs -f` gives the stream to catch up before it stops it.
 
-The runner writes its terminal state *then* logs the outcome line and whatever
-its workdir cleanup has to say, so a poll that sees `succeeded` is by
-construction a little ahead of the log. A cleanup that takes longer than this
-loses its last lines from the stream, never from the log itself.
+The runner logs the outcome line before its terminal write, but what it
+says about the secrets file comes after it, so a poll that sees `succeeded`
+can be a little ahead of the log's last lines. A runner slower than this
+loses those lines from the stream, never from the log itself.
 """
 
 

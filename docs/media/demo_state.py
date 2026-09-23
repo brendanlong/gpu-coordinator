@@ -35,7 +35,6 @@ def uuid(n: int) -> str:
 
 def entry(
     name: str,
-    kind: str,  # the call sites still say it; the entry derives it from the address
     *,
     ssh: str | None = None,
     gpus: list[str],
@@ -72,7 +71,6 @@ def views() -> list[HostView]:
     desktop = HostView(
         entry=entry(
             "desktop",
-            "local",
             gpus=[uuid(1)],
             s3_prefix="s3://my-bucket/gpuc/desktop",
             model="NVIDIA GeForce RTX 4090",
@@ -115,7 +113,6 @@ def views() -> list[HostView]:
     lab = HostView(
         entry=entry(
             "lab",
-            "ssh",
             ssh="me@lab-gpu-03",
             gpus=[uuid(2), uuid(3)],
             shared=[uuid(4)],
@@ -199,7 +196,6 @@ def views() -> list[HostView]:
     rented = HostView(
         entry=entry(
             "a100-burst",
-            "runpod",
             ssh="root@1.2.3.4",
             pod_id="k7q2m9x4v1",
             gpus=[uuid(5), uuid(6)],

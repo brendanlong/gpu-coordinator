@@ -84,7 +84,7 @@ class LockBody:
     A dispatcher runs the code it imported at exec and nothing re-imports it,
     so a long-lived one goes on dispatching last week's package however many
     times the host is re-bootstrapped underneath it. This is what lets the next
-    one tell that it is the newer build and take over (`_holder_is_superseded`).
+    one tell that it is another build and take over (`_is_another_build`).
     """
 
     def render(self) -> str:
@@ -115,7 +115,7 @@ def running_pkg_commit() -> str | None:
     """The commit of the package a dispatcher starting now would be running.
 
     `config.pkg_commit` is written by whoever shipped the package, *before* the
-    dispatcher that serves it is started (`bootstrap.resync_package`), so it
+    dispatcher that serves it is started (`bootstrap.ensure_build`), so it
     names the code on disk. Read once, when the lock object is built -- which
     is the first thing a dispatcher does -- and then recorded rather than
     re-read: the point is to remember which build this process is, and a later

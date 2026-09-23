@@ -23,34 +23,33 @@ def user_agent() -> str:
     return f"gpuc/{__version__} (+{HOMEPAGE}; {CONTACT})"
 
 
-def same_commit(one: str | None, other: str | None) -> bool:
-    """Compare two commits that may be recorded at different lengths.
-
-    Here rather than in `control.version` because the host side asks it too --
-    the dispatcher lock records which build its holder was started on -- and
-    `gpuc.host` may not import anything outside the stdlib.
-    """
-    if not one or not other:
-        return True  # nothing recorded is not evidence of a mismatch
-    return one.startswith(other) or other.startswith(one)
+DIRTY = "-dirty"
+"""The suffix `control.version.local_commit` adds for a checkout with
+uncommitted changes: the tree behind it is not the commit it names."""
 
 
 def is_other_build(recorded: str | None, current: str | None) -> bool:
     """Is `recorded` a different build from `current`?
 
     Different, deliberately, and not "older": a commit id carries no ordering,
-    so nothing here can tell which of two came first. Both callers want the
+    so nothing here can tell which of two came first. Every caller wants the
     same thing anyway -- the host should be running the build this machine
     has, and a host running one from *ahead* of it is the same problem with
-    the same fix.
+    the same fix. Here rather than in `control.version` because the host side
+    asks it too: the dispatcher lock records which build its holder started
+    on, and `gpuc.host` may not import anything outside the stdlib.
 
-    The asymmetry is in the unknowns, and it is the judgement `same_commit`
-    will not make on its own. A record of *no* commit is a host nothing has
-    bootstrapped, so it cannot be running this build; reading that as
-    "probably fine" is how last week's code goes on running. An unknown
-    `current` is the other way round -- there is nothing to compare against,
-    so nothing is claimed.
+    Unknowns are asymmetric. A host that names no commit was never shipped by
+    a build that records one, so it cannot be running this one; reading that
+    as "probably fine" is how last week's code goes on running. An unknown
+    `current` is the other way round -- nothing to compare against, so nothing
+    is claimed. Commits may be recorded at different lengths, so a prefix
+    matches, but `-dirty` is part of the identity.
     """
     if not current:
         return False
-    return not recorded or not same_commit(current, recorded)
+    if not recorded:
+        return True
+    if recorded.endswith(DIRTY) != current.endswith(DIRTY):
+        return True
+    return not (recorded.startswith(current) or current.startswith(recorded))

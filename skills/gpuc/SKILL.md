@@ -27,9 +27,11 @@ own `config.json`, so there is nothing else to keep in step between machines.
 to `DIR/.claude/skills/gpuc/SKILL.md`.
 
 If `gpuc` is not on PATH, run it as `uv run gpuc` from a checkout. A host that
-`gpuc version` marks `DIFFERS: re-bootstrap` needs nothing from you: `gpuc submit` and `gpuc requeue`
-re-sync the package and restart that host's dispatcher before enqueueing (pass
-`--no-bootstrap` to skip it). Registering, bootstrapping and configuring hosts
+`gpuc version` marks `DIFFERS: re-bootstrap` needs nothing from you if it was
+ever bootstrapped: `gpuc submit` and `gpuc requeue` re-sync the package and
+restart that host's dispatcher before enqueueing (pass `--no-bootstrap` to skip
+it). A host whose config names no build at all was never bootstrapped, and
+`submit` refuses it until `gpuc host bootstrap <host>` has run. Registering, bootstrapping and configuring hosts
 is `docs/setup.md` in the repo, not this guide.
 
 ## Pick a host

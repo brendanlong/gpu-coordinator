@@ -18,11 +18,12 @@ from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
 
 import gpuc
+from gpuc._version import DIRTY
 from gpuc._version import __version__ as __version__
+from gpuc._version import is_other_build as is_other_build
 
 DIST_NAME = "gpu-coordinator"
 SHORT = 12
-DIRTY = "-dirty"
 
 
 def short(commit: str | None) -> str:
@@ -98,32 +99,6 @@ def local_commit() -> str | None:
 def dirty() -> bool:
     """Whether the source checkout has uncommitted changes."""
     return bool((_git("status", "--porcelain") or "").strip())
-
-
-def is_other_build(recorded: str | None, current: str | None) -> bool:
-    """Is `recorded` (a host's answer) a different build from `current` (ours)?
-
-    Different, deliberately, and not "older": a commit id carries no ordering,
-    so nothing here can tell which of two came first. Both callers want the
-    same thing anyway -- the host should be running the build this machine
-    has, and a host running one from *ahead* of it is the same problem with
-    the same fix.
-
-    Unknowns are asymmetric. A host that names no commit was never shipped by
-    a build that records one, so it cannot be running this one; reading that
-    as "probably fine" is how last week's code goes on running. An unknown
-    `current` is the other way round -- nothing to compare against, so nothing
-    is claimed. Commits may be recorded at different lengths, so a prefix
-    matches, but `-dirty` is part of the identity: the tree behind it is not
-    the commit it names.
-    """
-    if not current:
-        return False
-    if not recorded:
-        return True
-    if recorded.endswith(DIRTY) != current.endswith(DIRTY):
-        return True
-    return not (recorded.startswith(current) or current.startswith(recorded))
 
 
 def host_build_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
