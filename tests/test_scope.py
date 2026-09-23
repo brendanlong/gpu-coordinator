@@ -81,7 +81,10 @@ def test_isolation_honours_what_the_dispatcher_probed(monkeypatch: pytest.Monkey
 def test_a_pgid_host_records_its_isolation_in_state() -> None:
     job_id = prepare("true")
     runner.run_job(
-        job_id, [FAKE_GPUS[0]], RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02)
+        job_id,
+        [FAKE_GPUS[0]],
+        1,
+        RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02),
     )
     state = jobs.read_state(job_id)
     assert (state.isolation, state.cgroup_unit) == ("pgid", None)
@@ -121,6 +124,7 @@ def _run_in_background(job_id: str) -> threading.Thread:
         args=(
             job_id,
             [FAKE_GPUS[0]],
+            1,
             RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.05, kill_grace_s=5.0),
         ),
         daemon=True,

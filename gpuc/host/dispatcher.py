@@ -478,11 +478,21 @@ def _spawn_host_process(*args: str, label: str) -> subprocess.Popen[bytes]:
         )
 
 
-def default_spawn_runner(job_id: str, assigned: Sequence[str]) -> subprocess.Popen[bytes]:
-    """Start the runner for `job_id` on `assigned`. The assignment travels on
-    the command line: it is UUIDs, not a secret, and the runner claims the job
-    with it as its first act."""
-    return _spawn_host_process("run", job_id, "--gpus", ",".join(assigned), label=f"run-{job_id}")
+def default_spawn_runner(
+    job_id: str, assigned: Sequence[str], attempt: int
+) -> subprocess.Popen[bytes]:
+    """Start the runner for `job_id` on `assigned`, for `attempt`. Both travel
+    on the command line: UUIDs and a number, not a secret, and the runner
+    claims exactly that attempt with them as its first act."""
+    return _spawn_host_process(
+        "run",
+        job_id,
+        "--gpus",
+        ",".join(assigned),
+        "--attempt",
+        str(attempt),
+        label=f"run-{job_id}",
+    )
 
 
 def spawn_detached_dispatcher() -> int:
@@ -502,7 +512,9 @@ class DispatcherDeps:
     smi: SmiRunner = gpus.run_nvidia_smi
     command_runner: sync.CommandRunner = sync.run_command
     terminate_call: TerminateCall | None = None
-    spawn_runner: Callable[[str, Sequence[str]], subprocess.Popen[bytes]] = default_spawn_runner
+    spawn_runner: Callable[[str, Sequence[str], int], subprocess.Popen[bytes]] = (
+        default_spawn_runner
+    )
     monotonic: Callable[[], float] = time.monotonic
     utcnow: Callable[[], datetime] = lambda: datetime.now(UTC)
     sleep: Callable[[float], None] = time.sleep
@@ -620,6 +632,9 @@ class Dispatcher:
     _queued: list[queue.QueueEntry] | None = None
     """This pass's one listing of the queue. Every state file is parsed to
     list it, and a pass asks three times."""
+    _claimed: set[str] | None = None
+    """This pass's one reading of the cards every `running` state on disk
+    names; see `_busy_gpus`."""
     _shared_in_use: tuple[str, ...] | None = None
     """The shared cards somebody else was on, last time this was asked.
 
@@ -900,7 +915,35 @@ class Dispatcher:
         return self._cards
 
     def _busy_gpus(self) -> set[str]:
-        return {uuid for entry in self.running.values() for uuid in entry.gpus}
+        """Cards nothing may be handed this pass: those of every runner this
+        dispatcher spawned or adopted, and those every `running` state on
+        disk names.
+
+        The first set covers the window before a claim, when nothing is on
+        disk yet. The second covers a claim this dispatcher did not make: a
+        runner the dispatcher we took over from had spawned, which claimed the
+        job -- with the cards *it* was given -- after we launched our own for
+        it. Until that lost claim is reaped and adopted, `running` names the
+        cards we chose and the state names the ones actually in use, and
+        counting only the former handed the latter to the next job in the
+        queue.
+        """
+        return {
+            uuid for entry in self.running.values() for uuid in entry.gpus
+        } | self._claimed_gpus()
+
+    def _claimed_gpus(self) -> set[str]:
+        if self._claimed is None:
+            claimed: set[str] = set()
+            for job_id in jobs.list_job_ids():
+                try:
+                    state = jobs.read_state(job_id)
+                except RuntimeError:
+                    continue
+                if state.status == "running":
+                    claimed.update(state.gpus)
+            self._claimed = claimed
+        return self._claimed
 
     def free_gpus(self) -> list[str]:
         busy = self._busy_gpus()
@@ -1008,7 +1051,7 @@ class Dispatcher:
         `running` is what keeps the next pass from launching it twice.
         """
         try:
-            proc = self.deps.spawn_runner(job_id, assigned)
+            proc = self.deps.spawn_runner(job_id, assigned, attempt)
         except OSError as exc:
             self.log(f"job {job_id}: could not spawn a runner ({exc})")
             self._fail_queued(job_id, "spawn-failed")
@@ -1399,6 +1442,7 @@ class Dispatcher:
         self._cards = None
         self._borrowable = None
         self._queued = None
+        self._claimed = None
         self._draining = None
         self.reap()
         self.escalate_stops()

@@ -59,6 +59,7 @@ def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(gpuc_home: Path, a
     code = runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
+        1,
         RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
     )
     assert (code, jobs.read_state(job_id).status) == (0, "succeeded")
@@ -74,6 +75,7 @@ def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, aws: None) ->
         runner.run_job(
             job_id,
             [FAKE_GPUS[0]],
+            1,
             RunnerDeps(
                 smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
             ),
@@ -89,6 +91,7 @@ def test_a_job_that_produced_nothing_new_fails_as_no_outputs(gpuc_home: Path, aw
     code = runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
+        1,
         RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
     )
     state = jobs.read_state(job_id)
@@ -107,6 +110,7 @@ def test_the_baseline_is_taken_before_setup_so_setup_output_counts(
         runner.run_job(
             job_id,
             [FAKE_GPUS[0]],
+            1,
             RunnerDeps(
                 smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
             ),
@@ -147,6 +151,7 @@ def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, aws: None) -> N
     runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
+        1,
         RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
     )
     # The final pass drops the min-age exclusions but keeps the baseline ones.
@@ -167,14 +172,14 @@ def test_a_preempted_re_run_keeps_the_baseline_the_first_attempt_took(
     deps = RunnerDeps(
         smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
     )
-    runner.run_job(job_id, [FAKE_GPUS[0]], deps)
+    runner.run_job(job_id, [FAKE_GPUS[0]], 1, deps)
     first = baseline.read(job_id)
     assert "report-elephant.md" in first["results"]
 
     # ...and then a preempted attempt leaves a checkpoint of its own behind.
     (results / "ckpt-100.bin").write_text("weights\n")
     jobs.update_state(job_id, status="queued", attempt=2, ended_at=None)
-    runner.run_job(job_id, [FAKE_GPUS[0]], deps)
+    runner.run_job(job_id, [FAKE_GPUS[0]], 2, deps)
 
     assert baseline.read(job_id) == first
     assert "ckpt-100.bin" not in baseline.read(job_id)["results"]

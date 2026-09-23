@@ -75,14 +75,18 @@ def list_queued() -> list[QueueEntry]:
     return sorted(entries)
 
 
-def claim(job_id: str, **state: object) -> bool:
-    """Take a job out of the queue, recording what became of it.
+def claim(job_id: str, attempt: int, **state: object) -> bool:
+    """Take a job out of the queue, recording what became of it: the runner's
+    first act, for the job and the attempt it was started for.
 
-    False when the job was no longer queued: cancelled, or claimed by another
-    process. The runner claims the job it was started for this way, as its
-    first act, and the dispatcher claims one it is failing without a runner.
+    A compare-and-set on `(queued, attempt)`. False when the job is no longer
+    queued -- cancelled, or claimed by another process -- and also when it is
+    queued at a later attempt than `attempt`: a runner spawned for attempt N
+    that was slow to start, lost that claim, and arrives after the attempt it
+    lost to has been preempted and queued again was assigned its cards for a
+    pass that is over, and must not take them now.
     """
-    return jobs.transition(job_id, expect="queued", **state) is not None
+    return jobs.transition(job_id, expect="queued", attempt=attempt, **state) is not None
 
 
 def reorder(job_id: str, priority: int) -> bool:

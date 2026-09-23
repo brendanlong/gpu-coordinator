@@ -36,8 +36,12 @@ def prepare(gpus: Sequence[str] = (FAKE_GPUS[0],), **overrides: object) -> str:
     return job_id
 
 
-def run(job_id: str, deps_: RunnerDeps | None = None) -> int:
-    return runner.run_job(job_id, ASSIGNED.get(job_id, [FAKE_GPUS[0]]), deps_ or deps())
+def run(job_id: str, deps_: RunnerDeps | None = None, attempt: int | None = None) -> int:
+    """Run the job as the dispatcher would launch it: for the attempt its
+    state is queued at, unless the test says otherwise."""
+    if attempt is None:
+        attempt = jobs.read_state(job_id).attempt
+    return runner.run_job(job_id, ASSIGNED.get(job_id, [FAKE_GPUS[0]]), attempt, deps_ or deps())
 
 
 def stopping_after_claim(job_id: str, how: Callable[[str], object]) -> SmiRunner:
@@ -183,6 +187,26 @@ def test_a_runner_whose_claim_fails_writes_nothing_and_exits_quietly(gpuc_home: 
     assert (state.status, state.reason, state.runner_pid) == ("cancelled", "cancelled", None)
     assert not (paths.workdir(job_id) / "RAN").exists()
     assert log_of(job_id) == ""
+
+
+def test_a_runner_started_for_an_earlier_attempt_claims_nothing(gpuc_home: Path) -> None:
+    """Spawned for attempt 1 and slow to start, it finds the job queued again
+    at attempt 2 after a preempt: its cards were a decision about a pass that
+    is over, and taking them now could put two runners on one job."""
+    job_id = prepare(command="touch RAN")
+    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
+    jobs.update_state(job_id, status="running")
+    queue.preempt(job_id)
+    assert queue.next_attempt(job_id) == 2
+
+    assert run(job_id, attempt=1) == 0
+    state = jobs.read_state(job_id)
+    assert (state.status, state.attempt, state.runner_pid) == ("queued", 2, None)
+    assert not (paths.workdir(job_id) / "RAN").exists()
+
+    assert run(job_id, attempt=2) == 0
+    state = jobs.read_state(job_id)
+    assert (state.status, state.attempt, state.runner_pid) == ("succeeded", 2, os.getpid())
 
 
 def test_an_assigned_card_the_host_does_not_have_fails_the_job(gpuc_home: Path) -> None:
@@ -428,7 +452,17 @@ def run_detached(job_id: str, home: Path) -> subprocess.Popen[bytes]:
     env["PATH"] = f"{home / 'fake-bin'}{os.pathsep}{env['PATH']}"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     return subprocess.Popen(
-        [sys.executable, "-m", "gpuc.host", "run", job_id, "--gpus", ",".join(ASSIGNED[job_id])],
+        [
+            sys.executable,
+            "-m",
+            "gpuc.host",
+            "run",
+            job_id,
+            "--gpus",
+            ",".join(ASSIGNED[job_id]),
+            "--attempt",
+            str(jobs.read_state(job_id).attempt),
+        ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

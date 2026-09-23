@@ -382,7 +382,9 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    return runner.run_job(args.job_id, [uuid for uuid in args.gpus.split(",") if uuid])
+    return runner.run_job(
+        args.job_id, [uuid for uuid in args.gpus.split(",") if uuid], args.attempt
+    )
 
 
 def _selection(value: str | None) -> list[str] | None:
@@ -502,6 +504,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="UUIDS",
         help="the cards the dispatcher assigned, comma-separated; the runner claims the job "
         "with them",
+    )
+    run.add_argument(
+        "--attempt",
+        required=True,
+        type=int,
+        help="the attempt the dispatcher launched; the claim is for that attempt only",
     )
     run.set_defaults(func=cmd_run)
 

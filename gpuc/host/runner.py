@@ -146,10 +146,13 @@ def build_env(
 
 class JobRunner:
     def __init__(
-        self, job_id: str, assigned: Sequence[str], deps: RunnerDeps | None = None
+        self, job_id: str, assigned: Sequence[str], attempt: int, deps: RunnerDeps | None = None
     ) -> None:
         self.job_id = job_id
         self.assigned: list[str] = list(assigned)
+        self.attempt = attempt
+        """The attempt the dispatcher launched this runner for; the claim is
+        for exactly that one."""
         self.deps = deps or RunnerDeps()
         self.spec = jobs.read_spec(job_id)
         self.state = jobs.read_state(job_id)
@@ -391,8 +394,9 @@ class JobRunner:
     def run(self) -> int:
         """Claim the job, run it, end it. Zero, quietly, if the claim failed:
         the job was cancelled between the dispatcher's decision and this
-        process starting, or another runner got here first, and either way it
-        is not ours to touch."""
+        process starting, another runner got here first, or the attempt this
+        runner was started for is over, and either way it is not ours to
+        touch."""
         if not self._claim():
             return 0
         paths.ensure_job_layout(self.job_id)
@@ -419,14 +423,16 @@ class JobRunner:
     def _claim(self) -> bool:
         """Take the job out of the queue, naming this process as its runner.
 
-        One compare-and-set, carrying the assignment the dispatcher decided
-        and the identity a later dispatcher needs to tell this process from a
-        reused pid. So a state that says `running` always names a runner that
-        existed, and a cancel that landed first simply wins.
+        One compare-and-set on the attempt this runner was started for,
+        carrying the assignment the dispatcher decided and the identity a
+        later dispatcher needs to tell this process from a reused pid. So a
+        state that says `running` always names a runner that existed, and a
+        cancel that landed first simply wins.
         """
         pid = os.getpid()
         return queue.claim(
             self.job_id,
+            self.attempt,
             status="running",
             gpus=self.assigned,
             phase="setup",
@@ -781,5 +787,7 @@ class JobRunner:
         return outcome
 
 
-def run_job(job_id: str, assigned: Sequence[str], deps: RunnerDeps | None = None) -> int:
-    return JobRunner(job_id, assigned, deps).run()
+def run_job(
+    job_id: str, assigned: Sequence[str], attempt: int, deps: RunnerDeps | None = None
+) -> int:
+    return JobRunner(job_id, assigned, attempt, deps).run()

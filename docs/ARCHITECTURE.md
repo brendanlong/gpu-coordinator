@@ -266,14 +266,21 @@ The rules it holds to:
   construction; a dir left under `incoming/` an hour after its last change is
   a submit that died, and is removed.
 - **A launch is a spawn; the runner claims the job.** The dispatcher starts
-  `python -m gpuc.host run <id> --gpus <uuids>` and writes nothing: the
-  runner's first act is the compare-and-set that turns `queued` into
-  `running`, recording the assignment and its own pid, boot id and start time
-  in that write. A cancel that lands first costs a runner that exits quietly.
-  Until the claim the job is taken in the dispatcher's memory (`running`
-  holds the spawned process), so a pass never launches it twice; a runner
-  that dies before claiming leaves the job `queued` at the attempt it was
-  launched for, and is failed `runner-died` from there.
+  `python -m gpuc.host run <id> --gpus <uuids> --attempt <n>` and writes
+  nothing: the runner's first act is the compare-and-set that turns `queued`
+  at that attempt into `running`, recording the assignment and its own pid,
+  boot id and start time in that write. A cancel that lands first costs a
+  runner that exits quietly, and so does a runner arriving for an attempt
+  that is over. Until the claim the job is taken in the dispatcher's memory
+  (`running` holds the spawned process), so a pass never launches it twice;
+  a runner that dies before claiming leaves the job `queued` at the attempt
+  it was launched for, and is failed `runner-died` from there.
+- **A card is busy if any runner holds it**: the cards of every runner this
+  dispatcher spawned or adopted, and the cards every `running` state on disk
+  names. The two differ only for a claim this dispatcher lost -- a runner the
+  dispatcher it took over from had spawned, claiming with the cards it was
+  given after the successor launched its own -- and until that claim is
+  reaped and adopted, both sets of cards are taken.
 - **Adoption at startup** (`adopt_orphans`): every job whose state says
   `running` is adopted if the runner it names is alive -- the recorded
   `runner_pid` *with* the boot id and start time recorded beside it -- and

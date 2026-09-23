@@ -744,19 +744,22 @@ def update_state(job_id: str, **fields: Any) -> JobState:
         return state
 
 
-def transition(job_id: str, *, expect: str | tuple[str, ...], **fields: Any) -> JobState | None:
-    """Update the state only if its `status` is still one of `expect`.
+def transition(
+    job_id: str, *, expect: str | tuple[str, ...], attempt: int | None = None, **fields: Any
+) -> JobState | None:
+    """Update the state only if its `status` is still one of `expect` -- and,
+    when `attempt` is given, only if that is still the attempt.
 
-    The compare-and-set every change of ownership goes through: the
-    dispatcher claims a queued job, a cancel ends a queued job, a requeue puts
-    a finished one back. Two of those racing on one job -- a cancel landing as
-    the dispatcher launches it -- cannot both win, and the loser learns it
-    from the None rather than from a job that is both running and cancelled.
+    The compare-and-set every change of ownership goes through: the runner
+    claims a queued job, a cancel ends a queued job, a requeue puts a finished
+    one back. Two of those racing on one job -- a cancel landing as the
+    dispatcher launches it -- cannot both win, and the loser learns it from
+    the None rather than from a job that is both running and cancelled.
     """
     wanted = (expect,) if isinstance(expect, str) else expect
     with locked(job_id):
         state = read_state(job_id)
-        if state.status not in wanted:
+        if state.status not in wanted or (attempt is not None and state.attempt != attempt):
             return None
         write_state(job_id, _apply(state, fields))
         return state

@@ -174,6 +174,7 @@ def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
     code = runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
+        1,
         RunnerDeps(smi=fake_smi(), command_runner=fake, preflight=False, poll_interval_s=0.02),
     )
 
@@ -192,6 +193,7 @@ def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, tools: None) -> N
     code = runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
+        1,
         RunnerDeps(
             smi=fake_smi(), command_runner=FakeRunner(), preflight=False, poll_interval_s=0.02
         ),

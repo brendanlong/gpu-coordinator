@@ -27,17 +27,21 @@ class FakeRunnerProcess:
 
     _next_pid = 500000
 
-    def __init__(self, job_id: str, gpus: Sequence[str], *, claim: bool = True) -> None:
+    def __init__(
+        self, job_id: str, gpus: Sequence[str], attempt: int = 1, *, claim: bool = True
+    ) -> None:
         FakeRunnerProcess._next_pid += 1
         self.pid = FakeRunnerProcess._next_pid
         self.job_id = job_id
         self.gpus = list(gpus)
+        self.attempt = attempt
         self.returncode: int | None = None
         self.claimed = claim and self.claim()
 
     def claim(self) -> bool:
         return queue.claim(
             self.job_id,
+            self.attempt,
             status="running",
             gpus=self.gpus,
             phase="setup",
@@ -82,8 +86,8 @@ def make_dispatcher(
     have not claimed their job yet, for the window between spawn and claim."""
     spawned: dict[str, FakeRunnerProcess] = {}
 
-    def spawn(job_id: str, gpus: Sequence[str]) -> subprocess.Popen[bytes]:
-        proc = FakeRunnerProcess(job_id, gpus, claim=claim)
+    def spawn(job_id: str, gpus: Sequence[str], attempt: int) -> subprocess.Popen[bytes]:
+        proc = FakeRunnerProcess(job_id, gpus, attempt, claim=claim)
         spawned[job_id] = proc
         return cast("subprocess.Popen[bytes]", proc)
 
@@ -748,12 +752,21 @@ def test_the_runner_is_started_with_its_assignment(
 
     monkeypatch.setattr(host_dispatcher.subprocess, "Popen", FakePopen)
     monkeypatch.setenv(host_dispatcher.scope.ISOLATION_ENV, host_dispatcher.scope.PGID)
-    host_dispatcher.default_spawn_runner(job_id, FAKE_GPUS)
+    host_dispatcher.default_spawn_runner(job_id, FAKE_GPUS, 2)
     monkeypatch.setenv(host_dispatcher.scope.ISOLATION_ENV, host_dispatcher.scope.CGROUP)
-    host_dispatcher.default_spawn_runner(job_id, FAKE_GPUS)
+    host_dispatcher.default_spawn_runner(job_id, FAKE_GPUS, 2)
 
     plain, scoped = captured
-    assert plain[1:] == ["-m", "gpuc.host", "run", job_id, "--gpus", ",".join(FAKE_GPUS)]
+    assert plain[1:] == [
+        "-m",
+        "gpuc.host",
+        "run",
+        job_id,
+        "--gpus",
+        ",".join(FAKE_GPUS),
+        "--attempt",
+        "2",
+    ]
     assert scoped[:3] == ["systemd-run", "--user", "--scope"]
     assert scoped[scoped.index("--") + 1 :] == plain
     unit = next(arg for arg in scoped if arg.startswith("--unit="))
@@ -864,6 +877,34 @@ def test_a_claim_lost_to_another_runner_is_adopted_not_failed(gpuc_home: Path) -
     assert "adopted" in paths.dispatcher_log().read_text()
 
 
+def test_a_claim_lost_on_other_cards_keeps_both_sets_busy_until_it_is_adopted(
+    gpuc_home: Path,
+) -> None:
+    """The runner we lost the claim to was given its cards by the dispatcher
+    we took over from, and they need not be the ones we chose. From its claim
+    until our runner is reaped and the job adopted, the cards on disk are in
+    use and the cards in `running` are what stops a second launch; a job may
+    be handed neither."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher(claim=False)
+    dispatcher.run_once()
+    assert dispatcher.running[job_id].gpus == [FAKE_GPUS[0]]
+
+    theirs = FakeRunnerProcess(job_id, [FAKE_GPUS[1]], claim=False)
+    theirs.pid = os.getpid()
+    assert theirs.claim()
+    waiting = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    assert dispatcher.free_gpus() == []
+    assert jobs.read_state(waiting).status == "queued"
+
+    assert not spawned[job_id].claim()
+    spawned[job_id].returncode = 0
+    dispatcher.run_once()
+    assert dispatcher.running[job_id].gpus == [FAKE_GPUS[1]]
+    assert spawned[waiting].gpus == [FAKE_GPUS[0]]
+
+
 def test_a_long_final_sync_after_a_cancel_is_never_sigkilled(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -898,6 +939,7 @@ def test_a_long_final_sync_after_a_cancel_is_never_sigkilled(
     code = runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
+        1,
         runner_deps(
             command_runner=lambda argv, timeout=None, env=None: sync.CommandResult(argv, 0, "")
         ),
@@ -1279,7 +1321,7 @@ def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_runnin
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, _ = make_dispatcher()
 
-    def refuse(_job_id: str, _gpus: Sequence[str]) -> subprocess.Popen[bytes]:
+    def refuse(_job_id: str, _gpus: Sequence[str], _attempt: int) -> subprocess.Popen[bytes]:
         raise OSError("fork: Resource temporarily unavailable")
 
     dispatcher.deps.spawn_runner = refuse

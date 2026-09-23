@@ -144,7 +144,7 @@ def prepare(**overrides: object) -> str:
 
 
 def run(job_id: str, deps_: runner.RunnerDeps | None = None) -> int:
-    return runner.run_job(job_id, [FAKE_GPUS[0]], deps_ or deps())
+    return runner.run_job(job_id, [FAKE_GPUS[0]], 1, deps_ or deps())
 
 
 def deps(**overrides: object) -> runner.RunnerDeps:
@@ -156,7 +156,7 @@ def deps(**overrides: object) -> runner.RunnerDeps:
 @contextlib.contextmanager
 def live_runner(job_id: str) -> Iterator[tuple[runner.JobRunner, IO[bytes]]]:
     """A runner set up as far as `_record_progress` needs, without a job."""
-    started = runner.JobRunner(job_id, [FAKE_GPUS[0]], deps())
+    started = runner.JobRunner(job_id, [FAKE_GPUS[0]], 1, deps())
     started.env = {"PATH": os.environ["PATH"]}
     with paths.log_file(job_id).open("ab", buffering=0) as log:
         yield started, log

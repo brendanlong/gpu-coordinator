@@ -99,7 +99,7 @@ def test_claim_takes_a_job_out_of_the_queue_and_records_what_became_of_it(
     gpuc_home: Path,
 ) -> None:
     job_id = queue.enqueue(make_spec())
-    assert queue.claim(job_id, status="running", gpus=["GPU-x"], started_at=jobs.utc_now())
+    assert queue.claim(job_id, 1, status="running", gpus=["GPU-x"], started_at=jobs.utc_now())
     state = jobs.read_state(job_id)
     assert (state.status, state.gpus) == ("running", ["GPU-x"])
     assert queue.list_queued() == []
@@ -113,7 +113,7 @@ def test_claim_loses_to_a_cancel_that_landed_first(gpuc_home: Path) -> None:
     listed = queue.list_queued()[0]
     assert queue.cancel(job_id) == "cancelled"
 
-    assert not queue.claim(listed.job_id, status="running", gpus=["GPU-x"])
+    assert not queue.claim(listed.job_id, listed.attempt, status="running", gpus=["GPU-x"])
 
     state = jobs.read_state(job_id)
     assert (state.status, state.gpus) == ("cancelled", [])
@@ -121,9 +121,19 @@ def test_claim_loses_to_a_cancel_that_landed_first(gpuc_home: Path) -> None:
 
 def test_only_one_claim_of_a_job_can_win(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec())
-    assert queue.claim(job_id, status="running")
-    assert not queue.claim(job_id, status="failed", reason="bad-spec")
+    assert queue.claim(job_id, 1, status="running")
+    assert not queue.claim(job_id, 1, status="failed", reason="bad-spec")
     assert jobs.read_state(job_id).status == "running"
+
+
+def test_a_claim_is_for_one_attempt(gpuc_home: Path) -> None:
+    """A runner launched for attempt 1 that arrives after a preempt queued
+    the job again at attempt 2 was given its cards for a pass that is over."""
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, attempt=2)
+    assert not queue.claim(job_id, 1, status="running")
+    assert jobs.read_state(job_id).status == "queued"
+    assert queue.claim(job_id, 2, status="running")
 
 
 # -- reordering ---------------------------------------------------------------
