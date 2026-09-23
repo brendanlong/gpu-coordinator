@@ -213,8 +213,8 @@ class HostCache(TolerantModel):
 class Rental(TolerantModel):
     """The pod behind an address: which provider is billing for it, and as what.
 
-    The one spelling of "this host is rented". Everything that used to ask
-    `kind == "runpod"`, `pod_id is not None` or `ephemeral` reads this.
+    The one spelling of "this host is rented": `kind`, `pod_id` and
+    `ephemeral` are all read off it.
     """
 
     provider: str = "runpod"

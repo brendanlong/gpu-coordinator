@@ -656,7 +656,8 @@ is 1, else 0; `exits.http_status` is the one table from those codes to HTTP
 statuses (0 → 200, 1 → 500, 2 → 400, 3 → 503, 4 → 404). `gpuc status` prints
 every host that answered *and* exits 1 for one it could not read, or -- when
 it was asked about every host rather than one -- for a registry entry this
-build could not parse. 3 means local state could not be read at all, so the
+build could not parse; `host bootstrap --all` does the same for an entry it
+could not read and so never attempted. 3 means local state could not be read at all, so the
 answer is *unknown*; 4 is a name that does not exist. Automation keys on
 `hosts[].running` and treats exit 3 as unknown, never as "nothing running".
 
@@ -1062,7 +1063,7 @@ What `status` prints, and every flag, is usage.md. The invariants:
   `util` is the host's own nvidia-smi sampler over that job's cards. They are
   labelled separately and never merged.
 - Every job carries the `priority` it is (or was) ordered by, from its state,
-  which is the one copy there is. A host too old to report it says `null`,
+  which is the one copy there is. A host that does not report it says `null`,
   never a default.
 - The host's `status` reports each job's `outputs` (the spec's, `{job_id}`
   expanded) and `wandb` (`entity`, `project`, `run_id` from the job's `WANDB_*`

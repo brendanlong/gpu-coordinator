@@ -188,7 +188,7 @@ nothing reads `.gitignore` in that mode, and **`gpuc requeue` cannot rebuild a
 
 **`gpuc submit <job.yaml|-> --host NAME`** — validate, sync the workdir, deliver
 secrets, enqueue. `--no-git` is above; `--no-bootstrap` enqueues without first
-re-shipping the package to a host on an older build (see
+re-shipping the package to a host on another build (see
 [setup.md](setup.md#upgrading)); `--use-shared` is `use_shared: true` from the
 command line; `--runpod` and its flags are [below](#runpod).
 
@@ -302,7 +302,7 @@ making room for first, at a lower number, then preempt**. A preempt that would
 only re-run the same job is refused (exit 1), as are queued and finished jobs,
 which `gpuc reorder` and `gpuc requeue` are for. The stopped attempt is not
 queued again if it had already ended on its own, was cancelled while stopping,
-lost its workdir, or the host is draining. `auto_preempt: true` has the host do
+or the host is draining. `auto_preempt: true` has the host do
 this with no command at all ([above](#automatic-preemption)).
 
 **`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or running
@@ -551,7 +551,7 @@ Every `failed: <reason>`:
 | code | meaning |
 | --- | --- |
 | 0 | everything the command was asked to do worked. For `gpuc wait` and `gpuc logs -f`, the job succeeded |
-| 1 | something failed: a transport, a provider, a refused submit, a host that could not be read, a `clean` the host reported errors for, a host `host bootstrap --all` failed on. For `gpuc wait` and `gpuc logs -f` it is the **job** that did not succeed |
+| 1 | something failed: a transport, a provider, a refused submit, a host that could not be read, a `clean` the host reported errors for, a host `host bootstrap --all` failed on or a registry entry it could not read. For `gpuc wait` and `gpuc logs -f` it is the **job** that did not succeed |
 | 2 | usage: a bad flag, a missing required one, a bad `--since` |
 | 3 | local state is unreadable (`hosts.json` or `config.toml`), so the answer is **unknown** |
 | 4 | the job or host named on the command line does not exist |

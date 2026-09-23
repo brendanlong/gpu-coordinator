@@ -317,9 +317,9 @@ def cmd_host_list(args: argparse.Namespace) -> Answer:
         summary = summarize(config.gpus, entry.gpu_info) if config.gpus else "no GPUs"
         driver = f", driver {entry.driver_version}" if entry.driver_version else ""
         # One block per host, shaped like `gpuc status`: what the host is, then
-        # its cards, then the bootstrap facts. The interpreter path used to sit
-        # in the header and was longer than everything else on the line put
-        # together; `gpuc host list --json` and `gpuc host probe` still have it.
+        # its cards, then the bootstrap facts. The interpreter path is in
+        # `gpuc host list --json` and `gpuc host probe`, not here: it is longer
+        # than everything else on the line put together.
         lines.append(
             f"host {entry.name} [{entry.kind}] {entry.ssh or 'this machine'}  "
             f"gpus {len(config.gpus)} ({summary}{driver})"
@@ -1243,7 +1243,7 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument(
         "--follow-forever",
         action="store_true",
-        help="stream the log and never stop, as -f used to: for watching a host's own "
+        help="stream the log and never stop: for watching a host's own "
         "writing past the end of a run. Ctrl-C is the only way out",
     )
     logs.add_argument(

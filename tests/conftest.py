@@ -23,8 +23,8 @@ from gpuc.control.config import (
     registry_transaction,
 )
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.host import jobs, paths, scope
-from gpuc.host.jobs import HostConfig, JobSpec
+from gpuc.host import jobs, paths, queue, scope
+from gpuc.host.jobs import HostConfig, JobSpec, JobState
 from tests import fake_nvidia_smi
 
 pytest_plugins = ["tests.fakehost"]
@@ -139,6 +139,16 @@ def _gpus(gpus: str | list[str] | None) -> list[str]:
     if isinstance(gpus, str):
         return [part for part in gpus.split(",") if part]
     return list(gpus or [])
+
+
+def accept_job(spec: JobSpec, **state: Any) -> str:
+    """A job on the host, accepted the way `gpuc submit` gets one accepted
+    (`queue.enqueue`: spec and initial state written under `incoming/`, then
+    the rename), then in whatever state the test needs."""
+    job_id = queue.enqueue(spec)
+    if state:
+        jobs.write_state(job_id, JobState(**state))
+    return job_id
 
 
 def make_spec(**overrides: object) -> JobSpec:

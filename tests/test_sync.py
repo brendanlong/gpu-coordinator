@@ -11,7 +11,7 @@ import pytest
 from gpuc.host import destinations, jobs, paths, sync
 from gpuc.host.destinations import S3, HuggingFace
 from gpuc.host.jobs import Output
-from tests.conftest import make_spec
+from tests.conftest import accept_job, make_spec
 
 
 class RecordingRunner:
@@ -291,13 +291,8 @@ def test_sync_job_meta_uploads_log_and_state(gpuc_home: Path, fake_aws: str) -> 
 
 
 def test_sync_loop_final_runs_one_pass_and_stops(gpuc_home: Path, fake_aws: str) -> None:
-    job_id = jobs.new_job_id()
-    paths.ensure_job_layout(job_id)
-    spec = make_spec(
-        job_id=job_id, sync_interval_s=1, outputs=[{"path": "outputs", "s3": "s3://b/o"}]
-    )
-    jobs.write_spec(spec)
-    jobs.write_state(job_id, jobs.JobState())
+    spec = make_spec(sync_interval_s=1, outputs=[{"path": "outputs", "s3": "s3://b/o"}])
+    job_id = accept_job(spec)
     (paths.workdir(job_id) / "outputs").mkdir()
     runner = RecordingRunner()
     loop = sync.SyncLoop(spec, paths.workdir(job_id), None, runner=runner)
@@ -315,10 +310,7 @@ def loop_for(job_id: str, runner: sync.CommandRunner, **overrides: object) -> sy
     }
     document.update(overrides)
     spec = make_spec(**document)
-    paths.ensure_job_layout(job_id)
-    jobs.write_spec(spec)
-    jobs.write_state(job_id, jobs.JobState())
-    paths.log_file(job_id).touch()
+    accept_job(spec)
     return sync.SyncLoop(spec, paths.workdir(job_id), None, runner=runner)
 
 

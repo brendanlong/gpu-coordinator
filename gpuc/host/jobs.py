@@ -696,13 +696,6 @@ def clear_output_uploads(job_id: str) -> None:
         write_state(job_id, state)
 
 
-def write_spec(spec: JobSpec) -> None:
-    """Written once, by `enqueue`. Nothing rewrites a spec after that: the
-    fields a person can change later (`priority`, `estimated_runtime_min`)
-    live in the state, so the spec is always what was submitted."""
-    atomic_write_json(paths.spec_file(spec.job_id), spec.to_dict())
-
-
 def read_spec(job_id: str) -> JobSpec:
     return JobSpec.from_dict(read_json(paths.spec_file(job_id)))
 
@@ -864,7 +857,9 @@ class HostConfig:
     """
     pkg_commit: str | None = None
     """The gpuc commit bootstrap shipped to this host, for `gpuc version` and
-    the `status` warning that a host is running an older build than this one."""
+    the `status` warning that a host is running another build than this one.
+    None is a host nothing has bootstrapped: `submit` refuses it and `status`
+    warns."""
 
     @staticmethod
     def from_dict(d: Any) -> HostConfig:

@@ -2467,7 +2467,8 @@ def test_host_bootstrap_all_keeps_a_rental_the_provider_cannot_be_asked_about(
 def test_host_bootstrap_all_counts_the_hosts_it_could_not_read(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A host this build cannot parse was not bootstrapped either: never say "all"."""
+    """A host this build cannot parse was not bootstrapped either: never say
+    "all", and never exit 0 over it."""
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     document = json.loads(hosts_file().read_text())
     document["hosts"]["bad"] = {"name": "bad", "kind": "not a kind", "port": "twenty-two"}
@@ -2475,7 +2476,7 @@ def test_host_bootstrap_all_counts_the_hosts_it_could_not_read(
     bootstrapping(monkeypatch)
     capsys.readouterr()
 
-    assert main(["host", "bootstrap", "--all"]) == 0
+    assert main(["host", "bootstrap", "--all"]) == 1
     captured = capsys.readouterr()
     assert "skipping host 'bad'" in captured.err
     assert "1/1 host(s) bootstrapped" in captured.out

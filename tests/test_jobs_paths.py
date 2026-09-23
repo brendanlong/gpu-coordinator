@@ -9,6 +9,7 @@ import pytest
 
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
+from tests.conftest import accept_job
 
 
 def test_gpuc_home_honours_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,7 +64,7 @@ def test_spec_round_trip_applies_defaults(gpuc_home: Path) -> None:
             "outputs": [{"path": "results", "s3": "s3://b/{job_id}/results"}],
         }
     )
-    jobs.write_spec(spec)
+    accept_job(spec)
     loaded = jobs.read_spec("j1")
     assert loaded.gpus == 1
     assert loaded.priority == 50

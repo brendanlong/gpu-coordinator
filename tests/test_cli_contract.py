@@ -37,7 +37,7 @@ from gpuc.control.config import (
 )
 from gpuc.control.s3index import S3IndexError
 from gpuc.control.status import HostState, HostView
-from tests.conftest import host_entry, load_registry, register_host
+from tests.conftest import accept_job, host_entry, load_registry, register_host
 from tests.fakehost import FakeHost
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -310,21 +310,18 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
 
     started = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
     ended = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
-    jobs.write_spec(
-        JobSpec.from_dict({"job_id": RUNNING_JOB, "name": "lego-s4", "command": "train", "gpus": 1})
-    )
-    jobs.write_state(
-        RUNNING_JOB,
-        JobState(
-            status="running",
-            phase="main",
-            gpus=[GPU],
-            started_at=started,
-            util_recent=[90.0, 95.0],
-            isolation="cgroup",
+    accept_job(
+        JobSpec.from_dict(
+            {"job_id": RUNNING_JOB, "name": "lego-s4", "command": "train", "gpus": 1}
         ),
+        status="running",
+        phase="main",
+        gpus=[GPU],
+        started_at=started,
+        util_recent=[90.0, 95.0],
+        isolation="cgroup",
     )
-    jobs.write_spec(
+    accept_job(
         JobSpec.from_dict(
             {
                 "job_id": FINISHED_JOB,
@@ -1241,6 +1238,8 @@ def test_logs_json_says_when_it_fell_back_to_the_mirror(
     entry = load_registry().require("local")
     entry = entry.with_config({**entry.cache.config, "s3_prefix": "s3://bucket/gpuc/local"})
     write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
+    # The host lost the log; the mirror still has it.
+    (real_local_host / "jobs" / RUNNING_JOB / "log.txt").unlink()
 
     assert main(["logs", RUNNING_JOB, "--json"]) == EXIT_OK
     document = document_of(capsys)

@@ -276,7 +276,7 @@ class DispatcherLock:
     def _ask_to_stand_down(self, incumbent: LockBody) -> bool:
         """SIGTERM the incumbent. False when there was nothing safe to signal."""
         was = incumbent.pkg_commit
-        running = f"gpuc {was[:12]}" if was else "a build too old to say which"
+        running = f"gpuc {was[:12]}" if was else "a build that recorded no commit"
         return self._signal_holder(
             signal.SIGTERM,
             incumbent,

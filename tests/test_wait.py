@@ -41,7 +41,7 @@ from gpuc.control.s3index import IndexEntry, LocalIndex
 from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
-from tests.conftest import host_entry
+from tests.conftest import accept_job, host_entry
 from tests.fakeprovider import FakeProvider
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -77,12 +77,18 @@ def host_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env: Path
 
 
 def put_job(home: Path, job_id: str = JOB, *, name: str = "lego-s4", **state: Any) -> None:
-    """A job on the host, in whatever state the test needs it to be in."""
+    """A job on the host, in whatever state the test needs it to be in:
+    accepted the way `submit` gets one accepted the first time, and only its
+    state re-written after that, as the runner would."""
     with mock.patch.dict(os.environ, {"GPUC_HOME": str(home)}):
-        jobs.write_spec(
-            JobSpec.from_dict({"job_id": job_id, "name": name, "command": "train", "gpus": 1})
+        wanted = JobState(**{"status": "running", "phase": "main", **state})
+        if paths.job_dir(job_id).exists():
+            jobs.write_state(job_id, wanted)
+            return
+        accept_job(
+            JobSpec.from_dict({"job_id": job_id, "name": name, "command": "train", "gpus": 1}),
+            **wanted.to_dict(),
         )
-        jobs.write_state(job_id, JobState(**{"status": "running", "phase": "main", **state}))
 
 
 def after_polls(

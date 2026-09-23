@@ -45,11 +45,11 @@ def is_other_build(recorded: str | None, current: str | None) -> bool:
     the same fix.
 
     The asymmetry is in the unknowns, and it is the judgement `same_commit`
-    will not make on its own. A record of *no* commit is a build from before
-    anything wrote one, so it cannot be this one; reading that as "probably
-    fine" is how last week's code goes on running. An unknown `current` is the
-    other way round -- there is nothing to compare against, so nothing is
-    claimed.
+    will not make on its own. A record of *no* commit is a host nothing has
+    bootstrapped, so it cannot be running this build; reading that as
+    "probably fine" is how last week's code goes on running. An unknown
+    `current` is the other way round -- there is nothing to compare against,
+    so nothing is claimed.
     """
     if not current:
         return False

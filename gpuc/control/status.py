@@ -309,8 +309,8 @@ class HostView:
     package replaces it, and this is how a host where that did not happen says
     so. Read from a lock file that outlives its writer, so it is only a fact
     about what is *running* next to a live heartbeat -- which is what
-    `host_warnings` checks before saying anything. Null when the host is on a
-    build too old to answer."""
+    `host_warnings` checks before saying anything. Null when the host did not
+    say."""
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
@@ -380,8 +380,8 @@ class HostView:
 
         The host answers for all but the finished job it ran out of measuring
         budget for, and that one is measured by the next call. A null that
-        never resolves means a host too old to answer, which is what the build
-        warning in `host_warnings` is for.
+        never resolves is a host that does not answer the question, which is
+        what the build warning in `host_warnings` is for.
         """
         return sum(job.workdir_bytes or 0 for job in self.finished)
 
@@ -571,9 +571,11 @@ def _fmt_eta(job: JobView) -> str:
     has neither. The tag matters: one of those numbers is evidence.
 
     A running job whose host published no `eta` falls back to the estimate the
-    same host reports, rendered as a total rather than a remaining time: in
-    the window after `gpuc estimate` and before the runner next re-reads the
-    spec, `--json` would otherwise carry an estimate the text does not show."""
+    same host reports, rendered as a total rather than a remaining time. The
+    runner re-reads the estimate every `ESTIMATE_REFRESH_S`, which bounds the
+    window after `gpuc estimate` but does not close it, and inside it `--json`
+    carries an estimate the text would otherwise not show -- a scripted caller
+    seeing what the operator cannot, which `tests/test_control_e2e.py` pins."""
     remaining = job.eta_seconds
     if remaining is None:
         return _fmt_estimate(job, total=True)

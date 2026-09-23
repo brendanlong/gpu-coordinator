@@ -393,12 +393,12 @@ class BootstrapTally:
         }
 
     def answer(self, text: str | None) -> Answer:
-        """Exit 1 if any host failed: nobody may read a wall of output as
-        "all upgraded" over the top of one that did not. An entry this build
-        could not read was never attempted, and is named rather than failed."""
-        return Answer(
-            self.document(), text, failures=[o["error"] or o["name"] for o in self.failed]
-        )
+        """Exit 1 if any host failed, or was never attempted because this build
+        could not read its entry: nobody may read a wall of output as "all
+        upgraded" over the top of one that did not get done, whichever way."""
+        failures = [o["error"] or o["name"] for o in self.failed]
+        failures += [f"registry entry {name} could not be read" for name in self.unreadable]
+        return Answer(self.document(), text, failures=failures)
 
 
 def bootstrap_every_host(
