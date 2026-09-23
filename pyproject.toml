@@ -22,6 +22,8 @@ dev = [
     "pyright>=1.1.400",
     "types-pyyaml",
     "boto3-stubs[s3]",
+    "snakemake>=9.27.0",
+    "snakemake-interface-executor-plugins>=9.4.0",
 ]
 
 [build-system]
@@ -29,7 +31,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["gpuc"]
+packages = ["gpuc", "snakemake_executor_plugin_gpuc"]
 
 # The agent guide lives at skills/gpuc/SKILL.md because the docs link to it there;
 # `gpuc skill` needs it inside the package for anyone who installed the wheel and
@@ -45,7 +47,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.pyright]
-include = ["gpuc", "tests", "docs/media"]
+include = ["gpuc", "snakemake_executor_plugin_gpuc", "tests", "docs/media"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 

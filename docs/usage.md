@@ -2,7 +2,8 @@
 
 Installing gpuc and registering hosts is [setup.md](setup.md). `gpuc --help`, and
 `--help` on every subcommand, is the authoritative list of flags; this page is
-what they mean together.
+what they mean together. A workflow of many dependent jobs is
+[snakemake.md](snakemake.md).
 
 ## The job spec
 

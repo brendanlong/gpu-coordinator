@@ -77,6 +77,7 @@ then training steps and a checkpoint upload to S3.](docs/media/web-logs.png)
 | [`docs/SPEC.md`](docs/SPEC.md) | the goals and non-goals every change is checked against |
 | [`docs/setup.md`](docs/setup.md) | install, config keys, credentials, registering hosts, upgrading, teardown |
 | [`docs/usage.md`](docs/usage.md) | the job spec, every command, RunPod, how a job is killed, exit codes and `--json`, cleanup and retention, troubleshooting |
+| [`docs/snakemake.md`](docs/snakemake.md) | `snakemake --executor gpuc`: a workflow of many jobs, each one a gpuc job |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | the contract: on-host state, dispatcher and runner behaviour, transport, provisioning rules, testing rules |
 | [`skills/gpuc/SKILL.md`](skills/gpuc/SKILL.md) | the agent-facing quick guide, self-contained |
 | [`job.example.yaml`](job.example.yaml) | a fully commented job spec |

@@ -67,6 +67,7 @@ class JobSpecModel(BaseModel):
     command: str
     name: str = ""
     setup: str | None = None
+    python: str = jobs.DEFAULT_PYTHON
     gpus: int = Field(default=1, ge=1)
     use_shared: bool = False
     """Let this job be dispatched to the host's shared cards -- ones gpuc does

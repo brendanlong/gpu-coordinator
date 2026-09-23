@@ -157,6 +157,12 @@ def test_bad_values_point_at_the_field(overrides: dict[str, Any], needle: str) -
     assert needle in str(exc.value)
 
 
+def test_a_job_names_the_python_its_gpu_check_runs_under() -> None:
+    assert validate(job_document()).to_spec("j").python == jobs.DEFAULT_PYTHON
+    spec = validate(job_document(python=".venv/bin/python")).to_spec("j")
+    assert spec.python == ".venv/bin/python"
+
+
 def test_a_job_must_ask_for_at_least_one_gpu() -> None:
     with pytest.raises(SubmitError) as exc:
         validate(job_document(gpus=0), "job.yaml")
