@@ -312,10 +312,11 @@ The rules it holds to:
   workdir, the secrets file and the outputs baseline. The job goes from
   `running` straight to `queued`; nothing sees it finished in between. It
   does not go back when the attempt ended for a reason of its own before the
-  kill landed (it ends that way), when a cancel landed while it stopped (the
-  later request wins: `cancelled`), or when the host is going away
-  (`failed: preempted`). A runner that dies while preempting is a dead
-  runner like any other: `failed: runner-died`, intent cleared.
+  kill landed (it ends that way) or when a cancel landed while it stopped
+  (the later request wins: `cancelled`). A draining host never has a preempt
+  standing: the drain starts only once nothing is running, and refuses one
+  after. A runner that dies while preempting is a dead runner like any
+  other: `failed: runner-died`, intent cleared.
 - **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
   `auto_preempt` jobs that together cover the whole gap -- least important

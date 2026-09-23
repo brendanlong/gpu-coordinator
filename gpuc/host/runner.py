@@ -683,16 +683,13 @@ class JobRunner:
         Only an attempt the preempt itself stopped: a job that ended for a
         reason of its own before the kill landed asked for nothing, and
         re-running it would be a retry nobody requested (`gpuc requeue` is
-        that). Not on a host that is going away, where nothing would run it:
-        it finishes as `failed: preempted`, keeps its record and its place in
-        the drain's last upload. The decision is remade under the lock by
-        `queue.next_attempt`; this reading only says what the workdir is for.
+        that). This reading decides what the workdir is kept for; the write
+        is `queue.next_attempt`'s own compare-and-set, which refuses if a
+        cancel has landed since, and `_end` then ends the job `cancelled`.
+        Nothing here asks whether the host is draining: a drain starts only
+        when nothing is running, and a preempt is refused once it has.
         """
-        return (
-            outcome.reason == queue.PREEMPTED
-            and queue.is_preempted(self.job_id)
-            and not paths.draining_file().exists()
-        )
+        return outcome.reason == queue.PREEMPTED and queue.is_preempted(self.job_id)
 
     def _cleanup_workdir(self, status: str, log: IO[bytes]) -> int:
         """Apply the spec's `cleanup:` to `workdir/`, through the one delete

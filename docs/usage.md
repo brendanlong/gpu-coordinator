@@ -535,7 +535,7 @@ Every `failed: <reason>`:
 | `gpu-preflight` | a real GPU op inside the job's venv failed, or `device_count()` did not match `gpus:` — usually a CPU-only torch |
 | `sync-preflight` | the uploads the job would do at the end cannot work (no `aws`/`hf`, a missing secret, an unwritable bucket or repo) |
 | `timeout` | `max_runtime_min` elapsed |
-| `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt while the host was draining, so it was not queued again. Anywhere else a preempted job is `queued` again as its next attempt and never shows this |
+| `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt and it could not be queued again because its state had been changed by hand underneath the runner. Otherwise a preempted job is `queued` again as its next attempt (or `cancelled`, if a cancel landed while it stopped) and never shows this |
 | `terminated` | the runner itself was signalled (and the job was not cancelled) |
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`; a job that was already over for a reason of its own keeps that reason and lists `sync` in its `problems` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. A problem beside the reason, the same way. Never reported for a job whose `main` never started: it has no result, and its final upload is skipped |

@@ -19,9 +19,11 @@ PREEMPTED = "preempted"
 """The reason of an attempt stopped so that something else can have its GPUs.
 
 Its own reason: a preempted job is not a failure of the job, and the log of
-the attempt that was stopped should say what ended it. It is a terminal
-reason only on a host that is draining; anywhere else the runner queues the
-job again instead of finishing it.
+the attempt that was stopped should say what ended it. The runner queues the
+job again instead of finishing with it, or ends the job `cancelled` when a
+cancel overrode the preempt; `failed: preempted` is written only as the
+fallback for an attempt that can do neither because its state was changed
+under the runner.
 """
 
 STOP_REASONS = {CANCEL: "cancelled", PREEMPT: PREEMPTED}

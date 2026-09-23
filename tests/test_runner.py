@@ -1040,30 +1040,6 @@ def test_a_cancel_that_lands_while_a_preempt_is_stopping_wins(
     assert not paths.job_env_file(job_id).exists()
 
 
-def test_a_preempt_on_a_host_that_is_draining_ends_the_attempt_instead(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Queued onto a host about to stop existing, the job would be lost
-    outright. Finished, it keeps its record, its reason and its place in the
-    drain's last upload; `gpuc requeue` is what re-runs it."""
-    job_id = prepare(command="sleep 30")
-    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
-
-    def drain_during_final_sync(_self: sync.SyncLoop) -> None:
-        paths.draining_file().write_text("idle\n")
-
-    monkeypatch.setattr(sync.SyncLoop, "final", drain_during_final_sync)
-    assert run(job_id, deps(smi=stopping_after_claim(job_id, preempt_in_main))) != 0
-    state = jobs.read_state(job_id)
-    assert (state.status, state.reason, state.attempt, state.intent) == (
-        "failed",
-        "preempted",
-        1,
-        None,
-    )
-    assert paths.workdir(job_id).is_dir()
-
-
 def test_a_preempt_that_lands_in_the_final_sync_changes_nothing(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
