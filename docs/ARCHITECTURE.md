@@ -1103,7 +1103,13 @@ bootstrap and reported back by `python -m gpuc.host status`.
   too: `addopts` in `pyproject.toml` excludes the `runpod` marker, so the tests
   that rent hardware never run by accident -- opt in with `pytest -m runpod`.
   Nothing else is excluded by default.
-- Unit tests run without a GPU (mock `nvidia-smi` output, temp `~/.gpuc`).
+- Unit tests run without a GPU (one fake `nvidia-smi`, `tests/fake_nvidia_smi.py`,
+  answering in-process and on `PATH`; temp `~/.gpuc`). The CLI and provisioning
+  tests drive a real host in a temporary home (`tests/fakehost.py`): every
+  command runs through `bash -c` with `$HOME` moved, so the probe script, the
+  host's own config reads and writes, the on-host package and a bootstrap run
+  for real. Only nvidia-smi, the `uv`/`aws`/`hf` installs, the provider API
+  and S3 are stood in for.
 - Local GPU integration tests (`gpu`) **run by default**: they use tiny tensors
   (`torch.zeros(8)`), never more than ~100 MB VRAM because other people's jobs
   share the card, and they skip themselves on a machine whose `nvidia-smi` does

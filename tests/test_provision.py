@@ -1,6 +1,6 @@
 """Provisioning against a scripted provider: every path that can cost money.
 
-The host behind each pod is a real one in a temporary home (`TempHost`), so
+The host behind each pod is a real one in a temporary home (`FakeHost`), so
 the probe, the connect, the bootstrap and the host's own `status` all run
 for real; only the provider and `nvidia-smi` are stood in for.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 import json
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -34,6 +34,7 @@ from gpuc.control.provision import (
 )
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, load_registry
+from tests.fakehost import FakeHost
 from tests.fakeprovider import (
     BROKEN_LOG,
     CAPACITY_ERROR,
@@ -42,7 +43,6 @@ from tests.fakeprovider import (
     make_offer,
     running_pod,
 )
-from tests.temphost import TempHost
 
 CONSTRAINTS = Constraints(gpu_names=["A40"], max_price_usd_hr=0.60, cuda_min="12.8")
 POD_GPUS = ("GPU-1111", "GPU-2222")
@@ -59,14 +59,10 @@ def ssh_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TempHost]:
-    """The pod's host, in a temporary home; every ssh in the flow lands here."""
-    pod_host = TempHost(tmp_path / "pod", gpus=POD_GPUS)
-    monkeypatch.setattr("gpuc.control.remote.transport_for", lambda entry, settings=None: pod_host)
-    try:
-        yield pod_host
-    finally:
-        pod_host.close()
+def host(fake_host: FakeHost) -> FakeHost:
+    """The pod's host: every ssh in the flow lands on the temporary home."""
+    fake_host.set_gpus(POD_GPUS)
+    return fake_host
 
 
 @pytest.fixture
@@ -78,7 +74,7 @@ def offline_health(tmp_path: Path) -> HealthOptions:
     return HealthOptions(download_url=blob.as_uri(), min_free_gb=0.0)
 
 
-def deps(host: TempHost, **overrides: object) -> ProvisionDeps:
+def deps(host: FakeHost, **overrides: object) -> ProvisionDeps:
     return ProvisionDeps(
         sleep=lambda _: None,
         transport_factory=lambda entry, settings: host,
@@ -96,7 +92,7 @@ def ticking(step: float = 100.0) -> Callable[[], float]:
 
 def run(
     provider: FakeProvider,
-    host: TempHost,
+    host: FakeHost,
     health: HealthOptions,
     *,
     now: Callable[[], float] | None = None,
@@ -117,7 +113,7 @@ def run(
 
 
 def test_happy_path_registers_a_bootstrapped_host(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider([make_offer()], scripts=[PodScript(ssh_after_polls=3)])
     host.refuse = 2
@@ -144,7 +140,7 @@ def test_happy_path_registers_a_bootstrapped_host(
 
 
 def test_create_uses_the_spec_defaults(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider([make_offer()])
     run(provider, host, offline_health, image="runpod/pytorch:test", disk_gb=20)
@@ -157,7 +153,7 @@ def test_create_uses_the_spec_defaults(
 
 
 def test_the_one_cuda_floor_reaches_the_catalog_query_and_the_create(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     asked: list[str] = []
 
@@ -180,7 +176,7 @@ def test_the_one_cuda_floor_reaches_the_catalog_query_and_the_create(
 
 
 def test_capacity_error_advances_to_the_next_offer(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider(
         [make_offer(price=0.20, gpu_id="cheap"), make_offer(price=0.40, gpu_id="dearer")],
@@ -193,7 +189,7 @@ def test_capacity_error_advances_to_the_next_offer(
 
 
 def test_broken_host_log_terminates_and_replaces(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider(
         [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")],
@@ -209,7 +205,7 @@ def test_broken_host_log_terminates_and_replaces(
 
 
 def test_the_broken_host_signature_is_the_providers(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """Provisioning reads the pattern off the provider it was given, not a
     copy of its own: a provider with another vocabulary changes nothing here."""
@@ -232,7 +228,7 @@ def test_the_broken_host_signature_is_the_providers(
 
 
 def test_dead_pod_status_is_a_placement_failure(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider(
         [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")],
@@ -244,7 +240,7 @@ def test_dead_pod_status_is_a_placement_failure(
 
 
 def test_one_ceiling_bounds_the_whole_attempt(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """Two offers, neither pod ever gets an endpoint. The ceiling is the
     attempt's, so once the first pod has used it up the second is never
@@ -263,7 +259,7 @@ def test_one_ceiling_bounds_the_whole_attempt(
 
 
 def test_an_offer_that_fails_late_leaves_the_next_untried_past_the_ceiling(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """The first pod dies for a reason of its own, but only once the ceiling
     has passed: the next offer is reported as untried, not bought."""
@@ -287,7 +283,7 @@ def test_an_offer_that_fails_late_leaves_the_next_untried_past_the_ceiling(
 
 
 def test_ssh_never_answers_terminates(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider([make_offer()])
     host.refuse = 99
@@ -299,7 +295,7 @@ def test_ssh_never_answers_terminates(
 
 
 def test_a_local_ssh_misconfiguration_ends_the_attempt_at_the_first_pod(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """No offer fixes a broken local ssh config: every pod would be bought,
     waited on and terminated identically. So the first one is terminated and
@@ -320,7 +316,7 @@ def test_a_local_ssh_misconfiguration_ends_the_attempt_at_the_first_pod(
 
 
 def test_health_failure_terminates_and_forgets(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """A real health failure: the disk floor is one no host meets."""
     provider = FakeProvider([make_offer()])
@@ -333,7 +329,7 @@ def test_health_failure_terminates_and_forgets(
 
 
 def test_a_failed_terminate_keeps_the_pod_visible(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """A terminate is retried, and one that still fails is not retried by
     anything after this process moves on: the pod bills until a person ends
@@ -360,7 +356,7 @@ def test_a_failed_terminate_keeps_the_pod_visible(
 
 
 def test_a_terminate_that_fails_once_is_retried_and_confirmed(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider([make_offer()])
     real_terminate = provider.terminate
@@ -383,7 +379,7 @@ def test_a_terminate_that_fails_once_is_retried_and_confirmed(
 
 
 def test_a_terminate_the_provider_will_not_confirm_is_a_failure(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """The POST is accepted and the pod never leaves RUNNING: that is a pod
     still billing, however politely the API answered."""
@@ -417,7 +413,7 @@ def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_pa
 
 
 def test_no_offers_says_what_to_relax(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     with pytest.raises(ProvisionError) as error:
         run(FakeProvider([]), host, offline_health)
@@ -425,7 +421,7 @@ def test_no_offers_says_what_to_relax(
 
 
 def test_every_offer_failing_lists_them(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider(
         [make_offer(price=0.2, gpu_id="a"), make_offer(price=0.3, gpu_id="b")],
@@ -461,7 +457,7 @@ def test_offer_satisfies_checks_every_constraint() -> None:
 
 
 def _register_reusable(
-    pod: Pod, host: TempHost, *, price: float = 0.49, gpus: list[str] | None = None
+    pod: Pod, host: FakeHost, *, price: float = 0.49, gpus: list[str] | None = None
 ) -> HostEntry:
     """A pod registered here, whose own `config.json` on the host says what it
     was bought as and which cards it owns. The registry's cache deliberately
@@ -493,12 +489,12 @@ def _register_reusable(
     return entry
 
 
-def _beating(host: TempHost) -> None:
+def _beating(host: FakeHost) -> None:
     (host.path(host.home) / "dispatcher.heartbeat").touch()
 
 
 def test_reuse_picks_a_live_matching_host_by_asking_it(
-    control_env: Path, ssh_key: Path, host: TempHost
+    control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     pod = running_pod("gpuc-e2e-aaa", "pod9")
     provider = FakeProvider([make_offer()])
@@ -517,7 +513,7 @@ def test_reuse_picks_a_live_matching_host_by_asking_it(
 
 
 def test_reuse_judges_the_card_count_by_the_hosts_answer_not_the_cache(
-    control_env: Path, ssh_key: Path, host: TempHost
+    control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     """The cache says four cards; the host says one. The host wins."""
     pod = running_pod("gpuc-e2e-aaa", "pod9")
@@ -531,7 +527,7 @@ def test_reuse_judges_the_card_count_by_the_hosts_answer_not_the_cache(
     assert any("owns 1 GPU(s)" in line for line in reports)
 
 
-def test_reuse_skips_a_stale_dispatcher(control_env: Path, ssh_key: Path, host: TempHost) -> None:
+def test_reuse_skips_a_stale_dispatcher(control_env: Path, ssh_key: Path, host: FakeHost) -> None:
     pod = running_pod("gpuc-e2e-aaa", "pod9")
     provider = FakeProvider([make_offer()])
     provider.adopt(pod)
@@ -545,7 +541,7 @@ def test_reuse_skips_a_stale_dispatcher(control_env: Path, ssh_key: Path, host: 
 
 
 def test_reuse_skips_a_host_that_cannot_be_asked(
-    control_env: Path, ssh_key: Path, host: TempHost
+    control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     pod = running_pod("gpuc-e2e-aaa", "pod9")
     provider = FakeProvider([make_offer()])
@@ -561,7 +557,7 @@ def test_reuse_skips_a_host_that_cannot_be_asked(
 
 
 def test_reuse_skips_a_pod_that_is_too_expensive(
-    control_env: Path, ssh_key: Path, host: TempHost
+    control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     pod = running_pod("gpuc-e2e-aaa", "pod9")
     provider = FakeProvider([make_offer()])
@@ -575,7 +571,7 @@ def test_reuse_skips_a_pod_that_is_too_expensive(
 
 
 def test_reuse_skips_a_pod_that_is_not_running(
-    control_env: Path, ssh_key: Path, host: TempHost
+    control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     pod = running_pod("gpuc-e2e-aaa", "pod9").model_copy(update={"status": "EXITED"})
     provider = FakeProvider([make_offer()])
@@ -592,7 +588,7 @@ def test_reuse_skips_a_pod_that_is_not_running(
 
 
 def test_no_reuse_always_provisions(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     pod = running_pod("gpuc-e2e-aaa", "pod9")
     provider = FakeProvider([make_offer()])
@@ -614,7 +610,7 @@ def test_no_reuse_always_provisions(
 
 
 def test_ctrl_c_during_bootstrap_terminates_the_pod(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """A KeyboardInterrupt is not a narrow provisioning error, and still owns a pod."""
 
@@ -636,7 +632,7 @@ def test_ctrl_c_during_bootstrap_terminates_the_pod(
 
 
 def test_a_transient_provider_error_while_polling_does_not_burn_the_pod(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     class Flaky(FakeProvider):
         gets = 0
@@ -656,7 +652,7 @@ def test_a_transient_provider_error_while_polling_does_not_burn_the_pod(
 
 
 def test_a_provider_that_never_answers_still_stops_at_the_ceiling(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     class Down(FakeProvider):
         def get(self, pod_id: str) -> Pod | None:
@@ -669,7 +665,7 @@ def test_a_provider_that_never_answers_still_stops_at_the_ceiling(
     assert provider.terminated == ["pod1"]
 
 
-def test_reuse_skips_a_draining_host(control_env: Path, ssh_key: Path, host: TempHost) -> None:
+def test_reuse_skips_a_draining_host(control_env: Path, ssh_key: Path, host: FakeHost) -> None:
     """A draining pod is terminating itself; a job enqueued there dies with it."""
     pod = running_pod("gpuc-e2e-aaa", "pod9")
     provider = FakeProvider([make_offer()])
@@ -686,7 +682,7 @@ def test_reuse_skips_a_draining_host(control_env: Path, ssh_key: Path, host: Tem
 
 
 def test_reuse_forgets_a_host_whose_pod_is_gone(
-    control_env: Path, ssh_key: Path, host: TempHost
+    control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     """A registry entry for a dead pod must be cleaned, not left to break submit."""
     pod = running_pod("gpuc-e2e-aaa", "podGONE")
@@ -704,7 +700,7 @@ def test_reuse_forgets_a_host_whose_pod_is_gone(
 
 
 def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     pod = running_pod("gpuc-e2e-aaa", "podGONE")
     provider = FakeProvider([make_offer()])
@@ -723,7 +719,7 @@ def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
 
 
 def test_the_pod_is_given_its_own_record_of_what_it_was_bought_as(
-    control_env: Path, ssh_key: Path, host: TempHost, offline_health: HealthOptions
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     """Nothing about the pod lives only on this machine: a second machine
     reads what it was rented as off the pod itself (`rented`), and so does the

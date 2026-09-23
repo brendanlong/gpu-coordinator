@@ -342,11 +342,13 @@ def add(*args: str) -> int:
 def test_host_add_records_a_persistent_root(
     control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert add("--persistent-root", ROOT) == 0
-    assert load_registry().require("gpubox").remote_home == f"{ROOT}/gpuc"
-    assert f"persistent root {ROOT}" in capsys.readouterr().out
-    # The root is this machine's; what the host is went to the host.
+    root = fake_host.root("vol")
+    assert add("--persistent-root", root) == 0
+    assert load_registry().require("gpubox").remote_home == f"{root}/gpuc"
+    assert f"persistent root {root}" in capsys.readouterr().out
+    # The root is this machine's; what the host is went to the host, under the root.
     assert fake_host.config is not None and fake_host.config["gpus"] == ["GPU-a"]
+    assert fake_host.config_path == f"{root}/gpuc/config.json"
 
 
 def test_host_add_records_env_pairs(control_env: Path, fake_host: FakeHost) -> None:
@@ -369,9 +371,10 @@ def test_host_set_edits_one_field_and_leaves_the_rest(
     control_env: Path, fake_host: FakeHost
 ) -> None:
     main(["host", "add", "gpubox", "--ssh", "gpubox", "--gpus", "GPU-a,GPU-b", "--idle-min", "7"])
-    assert main(["host", "set", "gpubox", "--persistent-root", ROOT]) == 0
+    root = fake_host.root("vol")
+    assert main(["host", "set", "gpubox", "--persistent-root", root]) == 0
     entry = load_registry().require("gpubox")
-    assert entry.persistent_root == ROOT
+    assert entry.persistent_root == root
     assert entry.config.gpus == ["GPU-a", "GPU-b"]
     assert entry.config.idle_minutes == 7.0
     assert entry.ssh == "gpubox"
@@ -394,7 +397,7 @@ def test_host_set_can_hand_every_gpu_back(control_env: Path, fake_host: FakeHost
 
 
 def test_host_set_can_clear_the_root(control_env: Path, fake_host: FakeHost) -> None:
-    add("--persistent-root", ROOT)
+    add("--persistent-root", fake_host.root("vol"))
     main(["host", "set", "gpubox", "--persistent-root", ""])
     entry = load_registry().require("gpubox")
     assert entry.persistent_root is None
@@ -418,7 +421,7 @@ def test_host_set_keeps_the_hf_home_a_new_env_did_not_mention(
     send every model download back to a `$HOME` that a pod wipes."""
     fake_host.put_file(
         json.dumps({"host": "gpubox", "gpus": ["0"], "env": {"HF_HOME": f"{ROOT}/.cache/hf"}}),
-        "/home/u/.gpuc/config.json",
+        fake_host.config_path,
     )
     assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
     assert main(["host", "set", "gpubox", "--env", "A=1"]) == 0
@@ -455,9 +458,10 @@ def test_host_set_says_which_change_is_local_and_which_reached_the_host(
 ) -> None:
     add()
     capsys.readouterr()
-    main(["host", "set", "gpubox", "--persistent-root", ROOT, "--idle-min", "3"])
+    root = fake_host.root("vol")
+    main(["host", "set", "gpubox", "--persistent-root", root, "--idle-min", "3"])
     out = capsys.readouterr().out
-    assert f"here <- persistent_root='{ROOT}'" in out
+    assert f"here <- persistent_root='{root}'" in out
     assert "host <- idle_minutes 15.0 -> 3.0" in out
     # The address moved gpuc home, and only a bootstrap moves the host to it.
     assert "gpuc host bootstrap gpubox" in out
@@ -466,10 +470,11 @@ def test_host_set_says_which_change_is_local_and_which_reached_the_host(
 def test_host_list_shows_the_root(
     control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    add("--persistent-root", ROOT)
+    root = fake_host.root("vol")
+    add("--persistent-root", root)
     capsys.readouterr()
     main(["host", "list"])
-    assert f"root    {ROOT} (gpuc home {ROOT}/gpuc)" in capsys.readouterr().out
+    assert f"root    {root} (gpuc home {root}/gpuc)" in capsys.readouterr().out
 
 
 # -- finding what was on a host that lost its state -----------------------

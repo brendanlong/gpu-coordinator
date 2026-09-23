@@ -18,7 +18,7 @@ def test_driver_version() -> None:
 
 def test_the_table_carries_index_uuid_name_and_memory() -> None:
     (first, _second) = gpus.list_gpus(fake_smi())
-    assert first == gpus.Gpu(0, FAKE_GPUS[0], "", None)
+    assert first == gpus.Gpu(0, FAKE_GPUS[0], "Fake A40", 46068)
     with_units = gpus.parse_table("0, GPU-a, NVIDIA A40, 46068 MiB\n1, GPU-b, NVIDIA A40, 46068\n")
     assert with_units == [
         gpus.Gpu(0, "GPU-a", "NVIDIA A40", 46068),

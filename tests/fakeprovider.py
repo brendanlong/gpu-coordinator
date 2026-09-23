@@ -3,7 +3,7 @@
 Pods follow a script: how many `get` polls before `ssh.direct` appears, what
 the pod log says, whether `create` fails with a capacity error. That is enough
 to reproduce every failure the real flow has to survive. The host behind a
-pod is `temphost.TempHost`, a real one in a temporary home.
+pod is `fakehost.FakeHost`, a real one in a temporary home.
 """
 
 from __future__ import annotations

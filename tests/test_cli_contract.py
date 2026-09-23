@@ -868,7 +868,7 @@ def test_host_add_json_is_the_host_as_list_reports_it_plus_what_add_did(
     assert (document["name"], document["kind"], document["ssh"]) == ("gpubox", "ssh", "me@box")
     assert document["gpus"] == ["GPU-a", "GPU-b"]
     assert document["adopted"] is False
-    assert document["config_path"] == "/home/u/.gpuc/config.json"
+    assert document["config_path"] == fake_host.config_path
     assert document["warnings"] == []
     assert isinstance(document["changes"], list)
     assert fake_host.config is not None
