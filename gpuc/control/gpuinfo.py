@@ -43,11 +43,11 @@ def vram_text(vram_mib: int | None) -> str:
 
 
 def parse_smi(text: str) -> dict[str, GpuInfo]:
-    """`[index,] uuid, name, memory` rows, with or without a `MiB` unit suffix.
+    """`index, uuid, name, memory` rows, with or without a `MiB` unit suffix.
 
-    The leading index is optional: `gpuc host probe` runs its own query and
-    hands the rows here, and a registry written before indices were recorded
-    has none.
+    The leading index is optional only because `gpuc host probe` hands rows
+    here from its own query, which asks for it, and `discover` from one that
+    does too; a row without one is simply a card with no index recorded.
     """
     found: dict[str, GpuInfo] = {}
     for line in text.splitlines():

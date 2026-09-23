@@ -12,7 +12,6 @@ import pytest
 from gpuc.control.config import (
     HostEntry,
     Settings,
-    load_registry,
     registry_transaction,
     utc_now,
 )
@@ -27,7 +26,7 @@ from gpuc.control.provision import (
     provision,
     runpod_host,
 )
-from tests.conftest import host_entry
+from tests.conftest import host_entry, load_registry
 from tests.fakeprovider import (
     BROKEN_LOG,
     CAPACITY_ERROR,
@@ -96,13 +95,13 @@ def test_happy_path_registers_a_bootstrapped_host(control_env: Path, ssh_key: Pa
     reports: list[str] = []
     entry = run(provider, transport, reports=reports)
 
-    assert entry.kind == "runpod"
+    assert entry.kind == "rental"
     assert entry.name.startswith("gpuc-e2e-")
     assert entry.ssh == "root@1.2.3.4"
     assert entry.port == 22000
-    assert entry.gpus == ["GPU-1111", "GPU-2222"]
+    assert entry.config.gpus == ["GPU-1111", "GPU-2222"]
     assert entry.python and entry.bootstrapped_at
-    assert entry.idle_minutes == 2.0
+    assert entry.config.idle_minutes == 2.0
 
     assert load_registry().hosts[entry.name].pod_id == entry.pod_id
     assert provider.terminated == []
@@ -374,7 +373,7 @@ def test_offer_satisfies_checks_every_constraint() -> None:
 def _register_reusable(pod: Pod, price: float = 0.49) -> HostEntry:
     entry = host_entry(
         name=pod.name,
-        kind="runpod",
+        kind="rental",
         ssh="root@1.2.3.4",
         port=22000,
         pod_id=pod.id,
@@ -483,7 +482,7 @@ def test_no_reuse_always_provisions(
 
 def test_s3_credentials_are_delivered_0600_when_configured(control_env: Path) -> None:
     transport = FakeTransport()
-    entry = host_entry(name="gpuc-x", kind="runpod", s3_prefix="s3://bucket/gpuc/gpuc-x")
+    entry = host_entry(name="gpuc-x", kind="rental", s3_prefix="s3://bucket/gpuc/gpuc-x")
     progress: list[str] = []
 
     class _P:
@@ -503,7 +502,7 @@ def test_s3_credentials_are_delivered_0600_when_configured(control_env: Path) ->
 
 def test_s3_credentials_are_skipped_without_a_prefix(control_env: Path) -> None:
     transport = FakeTransport()
-    entry = host_entry(name="gpuc-x", kind="runpod")
+    entry = host_entry(name="gpuc-x", kind="rental")
     assert not deliver_s3_credentials(transport, entry, lambda m: None, {})  # type: ignore[arg-type]
     assert transport.files == {}
 
@@ -656,5 +655,5 @@ def test_the_pod_is_given_its_own_record_of_what_it_was_bought_as(
     assert provider_block["kind"] == "runpod"
     assert provider_block["pod_id"] == entry.pod_id
     assert provider_block["offer"]["name"] == "A40"
-    assert provider_block["created_at"] == entry.created_at
+    assert provider_block["created_at"] == entry.config.created_at
     assert entry.config.provider == provider_block

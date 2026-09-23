@@ -10,12 +10,15 @@ variable and letting the cache drift onto another volume.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from gpuc.control.bootstrap import bootstrap_host, resolve_cache_dir
+from gpuc.control.config import HostEntry
 from gpuc.control.probe import parse_probe
-from gpuc.control.remote import HostSession, env_prefix
+from gpuc.control.remote import HostConfigRead, HostSession, env_prefix
+from gpuc.control.transport import Transport
 from gpuc.host import dispatcher, health, jobs, runner
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, make_spec
@@ -80,14 +83,17 @@ def test_a_job_can_still_override_the_host_cache(gpuc_home: Path) -> None:
 def test_the_hosts_cache_dir_reaches_every_remote_step() -> None:
     """One variable in the host's own `env`, which is where it lives."""
     host = host_entry(name="h", cache_dir="/vol/me/.cache/uv")
-    assert host.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
-    assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in env_prefix(host.env)
-    session = HostSession(host, ScriptedHost(), "/vol/me/gpuc", "/usr/bin/python3")
+    assert host.config.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
+    assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in env_prefix(host.config.env)
+    # The session's env is the config it read off the host, not the cache.
+    session = session_for(host, ScriptedHost())
     assert session.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
+    session.config_read = HostConfigRead({"host": "h"})
+    assert "UV_CACHE_DIR" not in session.env
 
 
 def test_no_cache_dir_means_no_variable() -> None:
-    assert "UV_CACHE_DIR" not in host_entry(name="h").env
+    assert "UV_CACHE_DIR" not in host_entry(name="h").config.env
 
 
 # -- (b) the bootstrap rule ---------------------------------------------------
@@ -112,18 +118,28 @@ def test_every_managed_cache_goes_beside_gpuc_home_under_its_own_name() -> None:
 
 def test_one_filesystem_leaves_the_cache_alone(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="66")
-    assert resolve_cache_dir(host, entry(), "/uv", "/home/u/.gpuc", lambda _: None) is None
+    assert (
+        resolve_cache_dir(host, "h", entry().config.env, "/uv", "/home/u/.gpuc", lambda _: None)
+        is None
+    )
 
 
 def test_two_filesystems_move_the_cache_next_to_gpuc_home(control_env: Path) -> None:
     host = ScriptedHost(uv_cache="/root/.cache/uv", cache_dev="66", home_dev="99")
-    picked = resolve_cache_dir(host, entry(), "/uv", "/workspace/me/gpuc", lambda _: None)
+    picked = resolve_cache_dir(
+        host, "h", entry().config.env, "/uv", "/workspace/me/gpuc", lambda _: None
+    )
     assert picked == "/workspace/me/.cache/uv"
 
 
 def test_an_unreadable_filesystem_changes_nothing(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="unknown", home_dev="99")
-    assert resolve_cache_dir(host, entry(), "/uv", "/workspace/me/gpuc", lambda _: None) is None
+    assert (
+        resolve_cache_dir(
+            host, "h", entry().config.env, "/uv", "/workspace/me/gpuc", lambda _: None
+        )
+        is None
+    )
 
 
 def test_a_cache_the_host_already_names_is_never_overridden(control_env: Path) -> None:
@@ -132,13 +148,18 @@ def test_a_cache_the_host_already_names_is_never_overridden(control_env: Path) -
     itself, and only when it is empty."""
     host = ScriptedHost(cache_dev="66", home_dev="99")
     for pinned in (entry(cache_dir="/mnt/big/uv"), entry(env={"UV_CACHE_DIR": "/mnt/big/uv"})):
-        assert resolve_cache_dir(host, pinned, "/uv", "/workspace/me/gpuc", lambda _: None) is None
+        assert (
+            resolve_cache_dir(
+                host, "h", pinned.config.env, "/uv", "/workspace/me/gpuc", lambda _: None
+            )
+            is None
+        )
 
 
 def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="99")
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert updated.env.get("UV_CACHE_DIR") == "/home/u/.cache/uv"
+    assert updated.config.env.get("UV_CACHE_DIR") == "/home/u/.cache/uv"
     assert host.config is not None
     # No persistent root, so the user's own Hugging Face cache is left alone.
     assert host.config["env"] == {"UV_CACHE_DIR": "/home/u/.cache/uv"}
@@ -147,7 +168,7 @@ def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path)
 def test_bootstrap_on_one_filesystem_writes_no_cache_dir(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="66")
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert "UV_CACHE_DIR" not in updated.env
+    assert "UV_CACHE_DIR" not in updated.config.env
     assert host.config is not None
     assert host.config["env"] == {}
 
@@ -250,11 +271,20 @@ class PruningHost(ScriptedHost):
         return super()._answer(command)
 
 
+def session_for(entry: HostEntry, host: ScriptedHost) -> HostSession:
+    return HostSession(
+        entry, cast("Transport", host), "/home/u/.gpuc", "/py", HostConfigRead(entry.cache.config)
+    )
+
+
 def test_host_clean_prunes_rather_than_cleans(control_env: Path) -> None:
     from gpuc.control.clean import prune_uv_cache
 
     host = PruningHost()
-    report = prune_uv_cache(entry(uv="/home/u/.local/bin/uv"), transport=host)
+    report = prune_uv_cache(
+        entry(uv="/home/u/.local/bin/uv"),
+        session=session_for(entry(uv="/home/u/.local/bin/uv"), host),
+    )
     assert "pruned 18.0 GiB -> ?" in report.render()
     # A side whose `du` failed is null, not zero, and so is what was freed.
     assert report.document() == {
@@ -276,7 +306,10 @@ def test_host_clean_passes_the_hosts_cache_dir(control_env: Path) -> None:
     from gpuc.control.clean import prune_uv_cache
 
     host = PruningHost()
-    prune_uv_cache(entry(cache_dir="/vol/me/.cache/uv"), transport=host)
+    prune_uv_cache(
+        entry(cache_dir="/vol/me/.cache/uv"),
+        session=session_for(entry(cache_dir="/vol/me/.cache/uv"), host),
+    )
     pruned = next(e for e in host.events if "cache prune" in e)
     assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in pruned
 
@@ -291,4 +324,4 @@ def test_a_failed_prune_is_an_error_not_a_silent_no_op(control_env: Path) -> Non
             return super()._answer(command)
 
     with pytest.raises(CleanError, match="read-only"):
-        prune_uv_cache(entry(), transport=Broken())
+        prune_uv_cache(entry(), session=session_for(entry(), Broken()))

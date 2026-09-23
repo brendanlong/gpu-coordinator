@@ -12,6 +12,7 @@ from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, transport_for
 from gpuc.control.gpuinfo import GpuInfo, parse_smi
+from gpuc.control.remote import usable_python
 from gpuc.control.transport import Transport
 
 SECTION_ORDER = [
@@ -107,9 +108,6 @@ fi
 OVERLAY_FS_TYPES = frozenset({"overlay", "overlayfs", "aufs"})
 """Filesystem types that mean "this is a container's throwaway upper layer"."""
 
-PYTHON_FLOOR = (3, 11)
-"""What the on-host package needs; bootstrap spells the same tuple for `uv`."""
-
 
 @dataclass
 class ProbeReport:
@@ -198,14 +196,7 @@ class ProbeReport:
         replaces it with the interpreter uv picks, which is the one the
         dispatcher runs under.
         """
-        parts = self.sections.get("python3", "").split()
-        if len(parts) < 2 or not parts[0].startswith("/"):
-            return None
-        try:
-            version = tuple(int(piece) for piece in parts[1].split(".")[:2])
-        except ValueError:
-            return None
-        return parts[0] if version >= PYTHON_FLOOR else None
+        return usable_python(self.sections.get("python3", ""))
 
     @property
     def driver_version(self) -> str | None:
@@ -420,4 +411,5 @@ def probe_host(
 ) -> ProbeReport:
     transport = transport or transport_for(entry, settings)
     result = transport.run(probe_script(entry.remote_home), timeout=240.0, check=False)
-    return parse_probe(entry.name, result.output, entry.root, entry.gpus, entry.config.shared_gpus)
+    config = entry.config
+    return parse_probe(entry.name, result.output, entry.root, config.gpus, config.shared_gpus)
