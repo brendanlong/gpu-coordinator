@@ -480,7 +480,7 @@ def wont_fit(spec: JobSpec, config: HostConfig, host: str) -> str | None:
     failure = plan.capacity_failure(
         spec.gpus,
         len(config.gpus),
-        len(config.shared_entries()),
+        len(config.shared_gpus),
         borrows=config.may_borrow(spec),
     )
     if failure is None:

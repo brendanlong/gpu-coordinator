@@ -36,8 +36,47 @@ def run_nvidia_smi(args: list[str], timeout: float = DEFAULT_TIMEOUT_S) -> str:
 
 @dataclass(frozen=True)
 class Gpu:
-    index: int
+    """One row of the table: what the driver calls a card this boot (`index`),
+    what it is for ever (`uuid`), and what it is (`name`, `memory_mib`).
+    `index` is None only for a row rebuilt from a registry's cache that never
+    recorded one."""
+
+    index: int | None
     uuid: str
+    name: str = ""
+    memory_mib: int | None = None
+
+
+TABLE_FIELDS = ("index", "uuid", "name", "memory.total")
+"""The one `--query-gpu` both halves read cards with, so there is one parser."""
+
+
+def parse_table(text: str) -> list[Gpu]:
+    """`index, uuid, name, memory.total` rows, with or without a unit suffix.
+
+    The one nvidia-smi parser: the host queries it live (`list_gpus`), the
+    probe reads it off its own shell output (`--format=csv,noheader`, units
+    on), and the registry's cache is rebuilt into the same rows. Anything that
+    is not a row -- a MOTD, `nvidia-smi: command not found` -- is skipped, so
+    a driver that is missing reads as no cards rather than a parse error.
+    """
+    rows: list[Gpu] = []
+    for line in text.splitlines():
+        cells = [cell.strip() for cell in line.split(",")]
+        if len(cells) < 2 or not cells[1].startswith("GPU-"):
+            continue
+        if not cells[0].isdigit():
+            continue
+        memory = cells[3].split()[0] if len(cells) > 3 and cells[3] else ""
+        rows.append(
+            Gpu(
+                int(cells[0]),
+                cells[1],
+                cells[2] if len(cells) > 2 else "",
+                int(float(memory)) if memory.replace(".", "", 1).isdigit() else None,
+            )
+        )
+    return rows
 
 
 def _query(fields: list[str], smi: SmiRunner, extra: list[str] | None = None) -> list[list[str]]:
@@ -57,14 +96,6 @@ def _query(fields: list[str], smi: SmiRunner, extra: list[str] | None = None) ->
     return rows
 
 
-def _as_int(cell: str, field: str) -> int:
-    """nvidia-smi prints `[N/A]` or `[Not Supported]` instead of failing."""
-    try:
-        return int(cell)
-    except ValueError as exc:
-        raise GpuError(f"nvidia-smi reported {field}={cell!r}, which is not a number") from exc
-
-
 def _as_float(cell: str, field: str) -> float:
     try:
         return float(cell)
@@ -81,7 +112,15 @@ def _maybe_float(cell: str) -> float | None:
 
 
 def list_gpus(smi: SmiRunner = run_nvidia_smi) -> list[Gpu]:
-    return [Gpu(_as_int(index, "index"), uuid) for index, uuid in _query(["index", "uuid"], smi)]
+    """Every card the driver reports right now, as `TABLE_FIELDS` rows."""
+    text = smi([f"--query-gpu={','.join(TABLE_FIELDS)}", "--format=csv,noheader,nounits"])
+    table = parse_table(text)
+    if not table and text.strip():
+        raise GpuError(
+            f"nvidia-smi --query-gpu={','.join(TABLE_FIELDS)} returned no card rows: "
+            f"{text.strip()[-200:]!r}"
+        )
+    return table
 
 
 def driver_version(smi: SmiRunner = run_nvidia_smi) -> str:
@@ -91,97 +130,71 @@ def driver_version(smi: SmiRunner = run_nvidia_smi) -> str:
     return rows[0][0]
 
 
-def index_uuids(smi: SmiRunner = run_nvidia_smi) -> dict[str, str]:
-    """`{index: uuid}`, as nvidia-smi numbers this host's cards right now."""
-    return {str(gpu.index): gpu.uuid for gpu in list_gpus(smi)}
+@dataclass(frozen=True)
+class Resolution:
+    """What a host's owned and shared entries name against one table.
+
+    `owned` and `shared` are UUIDs, each card once and in entry order, with a
+    shared entry that names an owned card left out of `shared`: owning is
+    the stronger claim, and the dispatcher hands the card out as its own.
+    `missing` and `shared_missing` are the entries no card answers to, as
+    spelled. `duplicates` are the entries that named a card already named --
+    an index and its own UUID, or a card in both lists -- also as spelled,
+    which is how a health check refuses them and a listing explains them.
+    """
+
+    owned: list[str]
+    shared: list[str]
+    missing: list[str]
+    shared_missing: list[str]
+    duplicates: list[str]
 
 
-def is_index(entry: str) -> bool:
-    """Is this owned entry an nvidia-smi index rather than a UUID?"""
-    return entry.isdigit()
+def resolve(owned: Sequence[str], table: Sequence[Gpu], shared: Sequence[str] = ()) -> Resolution:
+    """Entries -- nvidia-smi indices, UUIDs, or a mix -- against `table`.
 
+    Pure, and the one rule: the dispatcher and the runner apply it to what
+    nvidia-smi says now, the health check to the same, and the control side
+    to the probe's rows or the registry's cache of them. An absent UUID is
+    missing here exactly as an absent index is; nothing passes an entry
+    through unresolved, so a card the driver stopped reporting is never
+    handed out to fail inside a job.
+    """
+    by_index = {str(gpu.index): gpu.uuid for gpu in table if gpu.index is not None}
+    present = {gpu.uuid for gpu in table}
 
-def _against_table(entries: Sequence[str], table: dict[str, str]) -> tuple[list[str], list[str]]:
-    present = set(table.values())
-    resolved: list[str] = []
+    def lookup(entry: str) -> str | None:
+        if entry.isdigit():
+            return by_index.get(entry)
+        return entry if entry in present else None
+
+    owned_uuids: list[str] = []
+    shared_uuids: list[str] = []
     missing: list[str] = []
-    for entry in entries:
-        uuid = table.get(entry) if is_index(entry) else (entry if entry in present else None)
+    shared_missing: list[str] = []
+    duplicates: list[str] = []
+    for entry in owned:
+        uuid = lookup(entry)
         if uuid is None:
             missing.append(entry)
-        elif uuid not in resolved:
-            resolved.append(uuid)
-    return resolved, missing
+        elif uuid in owned_uuids:
+            duplicates.append(entry)
+        else:
+            owned_uuids.append(uuid)
+    for entry in shared:
+        uuid = lookup(entry)
+        if uuid is None:
+            shared_missing.append(entry)
+        elif uuid in owned_uuids or uuid in shared_uuids:
+            duplicates.append(entry)
+        else:
+            shared_uuids.append(uuid)
+    return Resolution(owned_uuids, shared_uuids, missing, shared_missing, duplicates)
 
 
-def resolve_owned(
-    owned: Sequence[str], smi: SmiRunner = run_nvidia_smi
-) -> tuple[list[str], list[str]]:
-    """Owned entries -> (the UUIDs that are on this host, the entries that are not).
-
-    Ownership on a shared box is an agreement written in nvidia-smi numbering
-    -- "you have 2 and 3" -- so an index has to be sayable, and it is stored
-    exactly as it was given. Everything downstream is UUIDs: an index names
-    whichever card the driver is calling 2 *this boot*, and a job pinned with
-    `CUDA_VISIBLE_DEVICES=2` after a renumber would quietly train on somebody
-    else's GPU. So the mapping is redone from the host each dispatch pass, and
-    an entry that does not resolve is simply not handed out.
-
-    Owning UUIDs only needs no lookup at all, and does not get one: that is
-    every pod and most boxes, and one nvidia-smi exec per pass for a mapping
-    that is the identity would be pure cost.
-    """
-    entries = list(owned)
-    if not entries or not any(is_index(entry) for entry in entries):
-        return entries, []
-    return _against_table(entries, index_uuids(smi))
-
-
-def _describe(table: dict[str, str]) -> str:
-    return ", ".join(f"{index}={uuid}" for index, uuid in sorted(table.items())) or "(no GPUs)"
-
-
-def describe_table(smi: SmiRunner = run_nvidia_smi) -> str:
+def describe_table(table: Sequence[Gpu]) -> str:
     """`0=GPU-..., 1=GPU-...`, for an error that has to say what is here."""
-    try:
-        return _describe(index_uuids(smi))
-    except GpuError as exc:
-        return f"(nvidia-smi could not be read: {exc})"
-
-
-def resolve_present(
-    entries: Sequence[str], what: str = "assigned GPUs", *, smi: SmiRunner = run_nvidia_smi
-) -> list[str]:
-    """`resolve_owned`, for the places where a card was already promised.
-
-    A job's assignment and a health check of `config.gpus` both describe cards
-    that are supposed to be here, so an entry that names nothing is a failure
-    rather than one to quietly skip. Entries are indices or UUIDs, the same as
-    everywhere else, so the message names the *entry* that could not be found.
-
-    Unlike `resolve_owned` this always asks the host, UUID entries included: a
-    UUID that the driver no longer reports is exactly what has to fail here.
-    """
-    entries = list(entries)
-    if not entries:
-        return []
-    table = index_uuids(smi)
-    resolved, missing = _against_table(entries, table)
-    if missing:
-        raise GpuError(
-            f"{what} not present on this host: {', '.join(missing)}; "
-            f"nvidia-smi reports: {_describe(table)}"
-        )
-    if len(resolved) != len(entries):
-        # `_against_table` folds an index and its own UUID into one card, which
-        # is right for counting what a host owns and wrong here: these entries
-        # are a promise of *n* cards, and quietly returning fewer would run a
-        # two-GPU job on one.
-        raise GpuError(
-            f"{what} name {len(resolved)} card(s), not {len(entries)}: "
-            f"{', '.join(entries)} against {_describe(table)}"
-        )
-    return resolved
+    return ", ".join(f"{gpu.index}={gpu.uuid}" for gpu in table) or "(no GPUs)"
 
 
 def sample_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> dict[str, float]:

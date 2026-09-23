@@ -88,6 +88,7 @@ def make_dispatcher(
         return cast("subprocess.Popen[bytes]", proc)
 
     deps = DispatcherDeps(
+        smi=fake_smi(),
         spawn_runner=spawn,
         monotonic=clock or FakeClock(),
         terminate_call=terminate_call or (lambda pod, key: "{}"),

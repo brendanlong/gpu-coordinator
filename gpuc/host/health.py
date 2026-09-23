@@ -58,33 +58,47 @@ def check_gpu_uuids(
     owned: Sequence[str], smi: SmiRunner = gpus.run_nvidia_smi, *, shared: Sequence[str] = ()
 ) -> Check:
     """Every entry in `config.gpus` and `config.shared_gpus` -- index or UUID --
-    names a card that is here, and no card is in both lists.
+    names a card that is here, and no card is named twice.
 
     An index that does not resolve is the failure this exists to catch early: a
     shared box renumbered, or the agreement moved, and the host would otherwise
-    just quietly have fewer cards to hand out than anyone thinks. A card in
-    both lists is the other way round: it would be handed out as ours *and*
-    have its usage second-guessed as somebody else's.
+    just quietly have fewer cards to hand out than anyone thinks. A card named
+    twice is the other way round: as an index and its own UUID it is a promise
+    of two cards, and in both lists it would be handed out as ours *and* have
+    its usage second-guessed as somebody else's. `gpus.resolve` is the rule,
+    the same one the dispatcher hands cards out by.
     """
     if not owned and not shared:
         return Check("gpu_uuids", True, "no GPUs owned by this host", 0)
     try:
-        resolved = gpus.resolve_present(owned, "config.gpus entries", smi=smi)
-        borrowable = gpus.resolve_present(shared, "config.shared_gpus entries", smi=smi)
+        table = gpus.list_gpus(smi)
     except gpus.GpuError as exc:
         return Check("gpu_uuids", False, str(exc))
-    both = [uuid for uuid in borrowable if uuid in set(resolved)]
-    if both:
+    cards = gpus.resolve(owned, table, shared)
+    problems: list[str] = []
+    if cards.missing:
+        problems.append(f"config.gpus entries not present on this host: {', '.join(cards.missing)}")
+    if cards.shared_missing:
+        problems.append(
+            f"config.shared_gpus entries not present on this host: "
+            f"{', '.join(cards.shared_missing)}"
+        )
+    if cards.duplicates:
+        problems.append(
+            f"entries naming a card already named: {', '.join(cards.duplicates)}. An index "
+            f"and its own UUID are one card, and a card is either ours to hand out or "
+            f"somebody else's to borrow, not both"
+        )
+    if problems:
         return Check(
             "gpu_uuids",
             False,
-            f"in both config.gpus and config.shared_gpus: {', '.join(both)}. A card is "
-            f"either ours to hand out or somebody else's to borrow, not both",
+            f"{'; '.join(problems)}; nvidia-smi reports: {gpus.describe_table(table)}",
         )
-    detail = f"{len(resolved)} owned GPU(s) present"
-    if borrowable:
-        detail += f", {len(borrowable)} shared"
-    return Check("gpu_uuids", True, detail, len(resolved))
+    detail = f"{len(cards.owned)} owned GPU(s) present"
+    if cards.shared:
+        detail += f", {len(cards.shared)} shared"
+    return Check("gpu_uuids", True, detail, len(cards.owned))
 
 
 def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:
@@ -105,14 +119,18 @@ def uv_cache_dir(config: jobs.HostConfig | None = None) -> Path:
     """Where uv will cache wheels for this host's jobs.
 
     The host config's `env` first, because that is what the dispatcher exports
-    to every job; then this process's own environment; then uv's default.
+    to every job; then this process's own environment; then uv's own default
+    (`$XDG_CACHE_HOME/uv`, else `~/.cache/uv`). The one place this question
+    is answered: the health check reports it, and bootstrap asks the host's
+    own code for it (`uv_cache_placement`) before deciding `UV_CACHE_DIR`.
     """
     configured = (config.env.get("UV_CACHE_DIR") if config else None) or os.environ.get(
         "UV_CACHE_DIR"
     )
     if configured:
         return Path(configured).expanduser()
-    return Path.home() / ".cache/uv"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "uv"
 
 
 def _nearest_existing(path: Path) -> Path:
@@ -134,6 +152,20 @@ def same_filesystem(left: Path, right: Path) -> bool | None:
         return None
 
 
+def uv_cache_placement(config: jobs.HostConfig | None = None) -> dict[str, Any]:
+    """The uv cache's location, size, and whether it shares gpuc home's
+    filesystem (None when that could not be read). What `check_uv_cache`
+    reports and what bootstrap decides `UV_CACHE_DIR` on, so both agree."""
+    cache = uv_cache_dir(config)
+    home = paths.home()
+    return {
+        "dir": str(cache),
+        "gpuc_home": str(home),
+        "shares_gpuc_home_fs": same_filesystem(cache, home),
+        "size_bytes": cleanup.dir_size(cache) if cache.is_dir() else 0,
+    }
+
+
 def check_uv_cache(config: jobs.HostConfig | None = None) -> Check:
     """Report the uv cache's size and whether uv can link out of it into a venv.
 
@@ -141,10 +173,11 @@ def check_uv_cache(config: jobs.HostConfig | None = None) -> Check:
     and the venv are on different filesystems, so this costs a full ~6.5 GB
     torch venv per job in disk and minutes in wall clock, but nothing breaks.
     """
-    cache = uv_cache_dir(config)
+    placement = uv_cache_placement(config)
+    cache = Path(placement["dir"])
     home = paths.home()
-    shared = same_filesystem(cache, home)
-    size = cleanup.dir_size(cache) if cache.is_dir() else 0
+    shared = placement["shares_gpuc_home_fs"]
+    size = placement["size_bytes"]
     where = f"{cache} holds {cleanup.human_bytes(size)}" if cache.is_dir() else f"{cache} is empty"
     if shared is True:
         return Check("uv_cache", True, f"{where}, on the same filesystem as {home}", size)

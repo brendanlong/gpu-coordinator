@@ -896,18 +896,6 @@ class HostConfig:
     def ephemeral(self) -> bool:
         return self.provider is not None
 
-    def shared_entries(self) -> list[str]:
-        """`shared_gpus`, minus anything spelled identically in `gpus`.
-
-        Owning a card beats borrowing it, which is how `Dispatcher.shared_gpus`
-        resolves the same collision once nvidia-smi has said which entries are
-        the same card. This is the counting version and can only catch the
-        identical spelling; `gpuc host add|set` and the host's own `gpu_uuids`
-        check refuse the rest, so what is left here is a hand-edited file.
-        """
-        owned = set(self.gpus)
-        return [entry for entry in self.shared_gpus if entry not in owned]
-
     def may_borrow(self, spec: JobSpec) -> bool:
         """May this job be given one of this host's shared cards?
 

@@ -50,13 +50,6 @@ def _spec(job_id: str) -> JobSpec | None:
         return None
 
 
-def _resolve(entries: list[str]) -> tuple[list[str], list[str]]:
-    try:
-        return gpus.resolve_owned(entries)
-    except gpus.GpuError:
-        return [], list(entries)
-
-
 def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     """What `config.gpus` and `config.shared_gpus` resolve to on this host now.
 
@@ -64,24 +57,23 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     only the host knows what its driver is calling them today. The shared cards
     carry their current memory and utilization too, because whether one is
     borrowable is a fact about this second that only nvidia-smi here can answer
-    -- and when it is not, the numbers are how somebody sees why.
+    -- and when it is not, the numbers are how somebody sees why. The same
+    `gpus.resolve` the dispatcher decides with, over one reading; a driver
+    that will not answer reads as every entry unavailable, as it does there.
     """
     try:
-        indices = {gpu.uuid: gpu.index for gpu in gpus.list_gpus()}
+        table = gpus.list_gpus()
     except gpus.GpuError:
-        indices = {}
-    resolved, unavailable = _resolve(config.gpus)
-    # Owning a card beats borrowing it, exactly as the dispatcher decides it.
-    shared, shared_unavailable = _resolve(config.shared_gpus)
-    owned = set(resolved)
-    shared = [uuid for uuid in shared if uuid not in owned]
+        table = []
+    indices = {gpu.uuid: gpu.index for gpu in table}
+    cards = gpus.resolve(config.gpus, table, config.shared_gpus)
     # Through the same reader the dispatcher borrows on, so an absent entry
     # means here exactly what it means there: not a card we would take.
-    usage, _failure = gpus.usage_or_nothing(shared)
+    usage, _failure = gpus.usage_or_nothing(cards.shared)
     return {
         "gpus": config.gpus,
-        "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in resolved],
-        "gpus_unavailable": unavailable,
+        "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in cards.owned],
+        "gpus_unavailable": cards.missing,
         "shared_gpus": config.shared_gpus,
         "shared_gpus_resolved": [
             {
@@ -91,9 +83,10 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
                 "utilization_pct": usage[uuid].utilization_pct if uuid in usage else None,
                 "unused": uuid in usage and usage[uuid].unused,
             }
-            for uuid in shared
+            for uuid in cards.shared
         ],
-        "shared_gpus_unavailable": shared_unavailable,
+        "shared_gpus_unavailable": cards.shared_missing,
+        "shared_configured": len(cards.shared) + len(cards.shared_missing),
     }
 
 
@@ -169,7 +162,7 @@ def projected_starts(
         cards,
         owned_configured=len(config.gpus),
         owned_missing=table["gpus_unavailable"],
-        shared_configured=len(config.shared_entries()),
+        shared_configured=table["shared_configured"],
         theirs=theirs,
         draining=paths.draining_file().exists(),
     )

@@ -143,7 +143,7 @@ gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach ove
 gpuc host add gpubox --ssh me@gpubox                       # …one somebody already set up: adopt it
 gpuc host set gpubox --shared-gpus 4,5                     # two more it may borrow while nobody else is on them
 gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] name vram uuid`,
-                             # disk, $HOME's filesystem, systemd --user, uv cache, network speed
+                             # disk, $HOME's filesystem, systemd --user, uv, python3
 gpuc host probe gpubox --all-gpus   # every card in the box, `(assigned)` on the ones this host owns
 gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idempotent
 ```

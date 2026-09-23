@@ -450,14 +450,20 @@ class JobRunner:
             table = gpus.list_gpus(self.deps.smi)
         except gpus.GpuError as exc:
             return str(exc)
-        self._indices = {gpu.uuid: gpu.index for gpu in table}
-        missing = [uuid for uuid in self.assigned if uuid not in self._indices]
-        if missing:
-            listed = ", ".join(f"{gpu.index}={gpu.uuid}" for gpu in table) or "(no GPUs)"
+        cards = gpus.resolve(self.assigned, table)
+        if cards.missing:
             return (
-                f"assigned GPUs not present on this host: {', '.join(missing)}; "
-                f"nvidia-smi reports: {listed}"
+                f"assigned GPUs not present on this host: {', '.join(cards.missing)}; "
+                f"nvidia-smi reports: {gpus.describe_table(table)}"
             )
+        if cards.duplicates:
+            # A promise of *n* cards that names one twice would run a two-GPU
+            # job on one.
+            return (
+                f"assigned GPUs name one card twice: {', '.join(cards.duplicates)}; "
+                f"nvidia-smi reports: {gpus.describe_table(table)}"
+            )
+        self._indices = {gpu.uuid: gpu.index for gpu in table if gpu.index is not None}
         return None
 
     def _run_phases(

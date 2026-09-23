@@ -31,7 +31,7 @@ from gpuc.control.config import (
     utc_now,
 )
 from gpuc.control.connect import refuse_unreadable
-from gpuc.control.gpuinfo import discover, summarize
+from gpuc.control.gpuinfo import summarize
 from gpuc.control.remote import (
     PYTHON_FLOOR,
     HostConfigRead,
@@ -408,25 +408,28 @@ def ensure_hf_cli(
     return None
 
 
-UV_CACHE_PROBE = """\
-set -e
-home={home}
-mkdir -p "$home" 2>/dev/null || true
-cache=$({env}{uv} cache dir 2>/dev/null || true)
-[ -n "$cache" ] || cache="$HOME/.cache/uv"
-mkdir -p "$cache" 2>/dev/null || true
-echo "cache=$cache"
-echo "cache_dev=$(stat -c %d "$cache" 2>/dev/null || echo unknown)"
-echo "home_dev=$(stat -c %d "$home" 2>/dev/null || echo unknown)"
-"""
+def uv_cache_placement(session: HostSession) -> dict[str, Any] | None:
+    """The host's own answer to where uv's cache is and whether it shares gpuc
+    home's filesystem (`health.uv_cache_placement`), or None when the host
+    could not say. The same code the health check reports with, run under
+    the host's env, so bootstrap decides on exactly what health will show."""
+    command = (
+        f"{host_python(session.python, session.home, session.env)} -c "
+        f'"import json; from gpuc.host import health; '
+        f'print(json.dumps(health.uv_cache_placement()))"'
+    )
+    result = session.run(command)
+    document = parse_last_json(result.stdout) if result.returncode == 0 else _NO_JSON
+    return document if isinstance(document, dict) else None
 
 
-def resolve_cache_dir(
-    transport: Transport, name: str, env: Mapping[str, str], uv: str, home: str, report: Reporter
-) -> str | None:
+_NO_JSON = object()
+
+
+def resolve_cache_dir(session: HostSession, report: Reporter) -> str | None:
     """Decide this host's `UV_CACHE_DIR`. `None` means uv's default is right.
 
-    uv builds a venv by reflinking or hardlinking wheels out of `~/.cache/uv`,
+    uv builds a venv by reflinking or hardlinking wheels out of its cache,
     and both only work inside a single filesystem; across one it silently falls
     back to copying. On a host whose gpuc home is on a network volume and whose
     `$HOME` is a container's overlay (a RunPod pod with `--persistent-root
@@ -439,25 +442,23 @@ def resolve_cache_dir(
     there (`--cache-dir`, `--env UV_CACHE_DIR=...`, or an earlier bootstrap):
     this is the one key bootstrap fills in itself, and only when it is empty.
     """
-    pinned = env.get("UV_CACHE_DIR")
+    pinned = session.env.get("UV_CACHE_DIR")
     if pinned:
         report(f"uv cache: {pinned} (set for this host; left alone)")
         return None
-    script = UV_CACHE_PROBE.format(home=shlex.quote(home), env=env_prefix(env), uv=shlex.quote(uv))
-    result = transport.run(script, check=False)
-    if result.returncode != 0:
-        report(f"WARNING: could not read the uv cache location on {name}; leaving it default")
+    placement = uv_cache_placement(session)
+    if placement is None:
+        report(
+            f"WARNING: could not read the uv cache location on {session.entry.name}; "
+            f"leaving it default"
+        )
         return None
-    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if line.count("=") >= 1)
-    cache, cache_dev, home_dev = (
-        values.get("cache", ""),
-        values.get("cache_dev", "unknown"),
-        values.get("home_dev", "unknown"),
-    )
-    if "unknown" in (cache_dev, home_dev) or not cache:
+    cache, shared = placement.get("dir"), placement.get("shares_gpuc_home_fs")
+    home = session.home
+    if not cache or shared is None:
         report(f"uv cache: {cache or 'unknown'} (could not compare filesystems; left alone)")
         return None
-    if cache_dev == home_dev:
+    if shared:
         report(f"uv cache: {cache}, same filesystem as {home}; uv will link wheels into venvs")
         return None
     target = cache_beside(home, "uv")
@@ -468,9 +469,7 @@ def resolve_cache_dir(
     return target
 
 
-def derive_env(
-    transport: Transport, entry: HostEntry, config: HostConfig, uv: str, home: str, report: Reporter
-) -> dict[str, str]:
+def derive_env(session: HostSession, report: Reporter) -> dict[str, str]:
     """The managed env keys this host names nothing for, filled in.
 
     `UV_CACHE_DIR` is the one with a real decision behind it
@@ -480,18 +479,18 @@ def derive_env(
     never touched.
     """
     derived: dict[str, str] = {}
-    cache_dir = resolve_cache_dir(transport, entry.name, config.env, uv, home, report)
+    cache_dir = resolve_cache_dir(session, report)
     if cache_dir:
         derived["UV_CACHE_DIR"] = cache_dir
-    if entry.root is None:
+    if session.entry.root is None:
         # Only a persistent root moves a cache: on an ordinary host the
         # default location is the user's own, holding their models and their
         # `hf auth login` token, and pointing jobs elsewhere would lose both.
         return derived
     for key, managed in jobs.MANAGED_ENV.items():
-        if key == "UV_CACHE_DIR" or not managed.beside_home or config.env.get(key):
+        if key == "UV_CACHE_DIR" or not managed.beside_home or session.env.get(key):
             continue
-        derived[key] = cache_beside(home, managed.beside_home)
+        derived[key] = cache_beside(session.home, managed.beside_home)
         report(f"{key}: {derived[key]} (beside gpuc home, on the persistent root)")
     return derived
 
@@ -647,12 +646,24 @@ def bootstrap_host(
     python = ensure_python(transport, uv, config.env, report)
     report(f"python: {python}")
 
+    # The host's first config, if it has none, goes down before anything runs
+    # against the host; the package next, so the questions below are answered
+    # by the host's own code and `pkg_commit` says which commit this is while
+    # `gpuc status` is still watching.
+    ensure_layout(transport, config.env, home, python)
+    session = HostSession(entry, transport, home, python, read)
+    if patch:
+        session.write_config(patch)
+        report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
+    files = ensure_build(session, report, always=True, restart=False) or 0
+
     # Before `uv tool install`, so that call already populates the cache this
     # host will actually use.
-    derived = derive_env(transport, entry, config, uv, home, report)
+    derived = derive_env(session, report)
     if derived:
-        patch["env"] = {**config.env, **derived}
-        config = HostConfig.from_dict({**(read.document or {}), **patch})
+        session.write_config({"env": {**session.env, **derived}})
+        report(f"{home}/config.json: env <- {', '.join(sorted(derived))}")
+    config = session.config
 
     aws_warning = ensure_aws_cli(transport, report)
     if aws_warning and config.s3_prefix:
@@ -675,16 +686,6 @@ def bootstrap_host(
             warnings.append(warning)
             report(f"WARNING: {warning}")
 
-    # Written before health runs, so the checks judge the config the host is
-    # about to dispatch with, and so its `pkg_commit` says which commit this
-    # package came from while `gpuc status` is still watching.
-    ensure_layout(transport, config.env, home, python)
-    session = HostSession(entry, transport, home, python, read)
-    if patch:
-        session.write_config(patch)
-        report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
-    files = ensure_build(session, report, always=True, restart=False) or 0
-
     health = run_health(session, health_options)
     report("health: " + "; ".join(f"{c['name']} ok" for c in health.get("checks", [])))
     for warning in health.get("warnings", []):
@@ -694,16 +695,12 @@ def bootstrap_host(
     pid = start_dispatcher(session)
     report(f"dispatcher running (pid {pid})")
 
-    gpu_info = discover(transport)
+    # The cards are the probe's to record (`host add`, `host probe`); this
+    # keeps what the entry has and adds the driver health just reported.
     if session.config.gpus:
-        report(f"gpus: {summarize(session.config.gpus, gpu_info or entry.gpu_info)}")
+        report(f"gpus: {summarize(session.config.gpus, entry.gpu_info)}")
     updated = (
-        entry.with_cache(
-            uv=uv,
-            python=python,
-            gpu_info=gpu_info or None,
-            driver_version=driver_version(health),
-        )
+        entry.with_cache(uv=uv, python=python, driver_version=driver_version(health))
         .with_config(session.config_read.document or {})
         .model_copy(update={"bootstrapped_at": utc_now()})
     )

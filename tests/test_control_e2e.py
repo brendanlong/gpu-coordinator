@@ -212,7 +212,6 @@ def test_probe_reports_this_machine(
     out = capsys.readouterr().out
     assert "host local" in out
     assert "systemd_scope:" in out
-    assert "MB/s" in out or "B/s" in out
 
 
 def test_submit_runs_a_job_and_logs_and_status_find_it(

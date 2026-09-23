@@ -27,9 +27,10 @@ from gpuc.control.config import (
     load_settings,
     transport_for,
 )
+from gpuc.control.gpuinfo import table_of
 from gpuc.control.remote import HostConfigRead, read_config, resolve_home, write_config
 from gpuc.control.transport import Transport
-from gpuc.host import jobs
+from gpuc.host import gpus, jobs
 from gpuc.host.jobs import HostConfig
 
 
@@ -221,12 +222,12 @@ def _refuse_overlapping_gpus(
     wanted = patch.get("gpus")
     if not isinstance(wanted, list) or force:
         return
-    cards = _by_uuid(address)
-    mine = {cards.get(str(item), str(item)) for item in wanted}
+    table = table_of(address.gpu_info)
+    mine = _cards([str(item) for item in wanted], table)
     theirs = HostConfig.from_dict(existing).gpus
     # Named as the *host* spells them, which is how the sentence below reads.
-    shared = [item for item in theirs if cards.get(item, item) in mine]
-    if not shared or {cards.get(item, item) for item in theirs} == mine:
+    shared = [item for item in theirs if _cards([item], table) & mine]
+    if not shared or _cards(theirs, table) == mine:
         return
     named = sorted(str(item) for item in wanted)
     raise ConnectError(
@@ -239,48 +240,42 @@ def _refuse_overlapping_gpus(
     )
 
 
+def _cards(entries: list[str], table: list[gpus.Gpu]) -> set[str]:
+    """The cards `entries` name, through the cards the probe saw; an entry the
+    probe did not see is left as typed -- a typo or a card this container was
+    not given, which the health check refuses at bootstrap, not something to
+    guess at here."""
+    cards = gpus.resolve(entries, table)
+    return set(cards.owned) | set(cards.missing)
+
+
 def _refuse_shared_overlap(
     entry: HostEntry, existing: Mapping[str, Any], patch: Mapping[str, Any]
 ) -> None:
-    """Refuse a config that has one card both owned and shared.
+    """Refuse a config that names one card twice: owned and shared, or as an
+    index and its own UUID.
 
     The two lists say opposite things about a card -- hand this out, and borrow
     this only while nobody else is on it -- so a card in both is never what
     anybody meant, and the dispatcher has to resolve it somehow (it keeps the
     owned claim). Judged on the *result*, patch over what the host holds, so
     `--shared-gpus 3` on a host that already owns 3 is caught as readily as
-    both flags in one command.
-
-    The host's own health check refuses this too, at bootstrap. This is the
-    copy that fires where it was typed: on every write, so a hand-edited
-    config in that state is refused by the next `host set` about anything,
-    and adopting one unchanged is not a write.
+    both flags in one command -- by `gpus.resolve`'s `duplicates`, the same
+    verdict the host's own health check gives at bootstrap. This is the copy
+    that fires where it was typed: on every write, so a hand-edited config in
+    that state is refused by the next `host set` about anything, and adopting
+    one unchanged is not a write.
     """
     if not patch:
         return
     merged = {**(existing if isinstance(existing, dict) else {}), **patch}
     config = HostConfig.from_dict(merged)
-    cards = _by_uuid(entry)
-    owned = {cards.get(item, item) for item in config.gpus}
-    both = [item for item in config.shared_gpus if cards.get(item, item) in owned]
+    both = gpus.resolve(config.gpus, table_of(entry.gpu_info), config.shared_gpus).duplicates
     if not both:
         return
     raise ConnectError(
-        f"host {entry.name} would have {', '.join(both)} in both --gpus and --shared-gpus, "
-        f"and a card is either ours to hand out or somebody else's to borrow.\n"
+        f"host {entry.name} would have {', '.join(both)} named twice, in both --gpus and "
+        f"--shared-gpus or as an index and its own UUID, and a card is either ours to hand "
+        f"out or somebody else's to borrow, and one card once.\n"
         f"Owned: {', '.join(config.gpus) or 'none'}. Shared: {', '.join(config.shared_gpus)}."
     )
-
-
-def _by_uuid(address: HostEntry) -> dict[str, str]:
-    """`index -> uuid` for the cards this host's probe saw, plus uuid -> itself.
-
-    Cards the probe did not see are left as they were typed: an unresolvable
-    entry is a typo or a card this container was not given, which the health
-    check refuses at bootstrap, not something to guess at here.
-    """
-    cards = {uuid: uuid for uuid in address.gpu_info}
-    for uuid, info in address.gpu_info.items():
-        if info.index is not None:
-            cards[str(info.index)] = uuid
-    return cards

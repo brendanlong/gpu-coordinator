@@ -8,7 +8,7 @@ from gpuc.control.probe import parse_probe, probe_host, probe_script
 from gpuc.control.transport import CommandResult
 from tests.conftest import host_entry
 
-PROBE_SCRIPT = probe_script("$HOME/.gpuc")
+PROBE_SCRIPT = probe_script()
 
 SAMPLE = """===system===
 Linux 6.8.0 x86_64
@@ -28,8 +28,6 @@ no
 not installed
 ===python3===
 /usr/bin/python3 3.13.1
-===download===
-20 MB in 0.4s = 50.0 MB/s
 """
 
 BARE = """===system===
@@ -48,32 +46,28 @@ no
 not installed
 ===python3===
 not installed
-===download===
-no python3 and no curl: cannot time a download
 """
 
 
 def test_probe_script_is_posix_sh_with_no_gpuc_dependency() -> None:
-    # The gpuc home *path* appears (the uv-cache check compares filesystems
-    # with it), but nothing in the script runs gpuc code: probe has to work on
-    # a host where nothing is installed yet.
+    # Nothing in the script runs gpuc code: probe has to work on a host where
+    # nothing is installed yet. What needs the tool's own rules is health's.
     assert "-m gpuc" not in PROBE_SCRIPT
     assert "bash" not in PROBE_SCRIPT
-    assert "python3 -" in PROBE_SCRIPT
+    assert "download" not in PROBE_SCRIPT and "uv_cache" not in PROBE_SCRIPT
 
 
 def test_parse_finds_every_section() -> None:
     report = parse_probe("gpubox", SAMPLE)
     assert report.sections["driver"] == "580.173.02"
     assert report.sections["systemd_scope"] == "no"
-    assert report.sections["download"].endswith("50.0 MB/s")
 
 
-def test_gpu_rows_are_index_uuid_name() -> None:
-    rows = parse_probe("gpubox", SAMPLE).gpu_rows
-    assert [row[0] for row in rows] == ["0", "1"]
-    assert rows[0][1] == "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
-    assert rows[1][2] == "NVIDIA A40"
+def test_the_gpus_section_is_read_by_the_hosts_own_parser() -> None:
+    table = parse_probe("gpubox", SAMPLE).table
+    assert [gpu.index for gpu in table] == [0, 1]
+    assert table[0].uuid == "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+    assert (table[1].name, table[1].memory_mib) == ("NVIDIA A40", 46068)
 
 
 def test_render_warns_about_logind_and_missing_uv() -> None:
@@ -88,10 +82,9 @@ def test_render_warns_about_logind_and_missing_uv() -> None:
 def test_a_host_with_nothing_still_renders() -> None:
     report = parse_probe("bare", BARE)
     assert not report.has_nvidia_smi
-    assert report.gpu_rows == []
+    assert report.table == []
     rendered = report.render()
     assert "no nvidia-smi, so this host cannot run jobs" in rendered
-    assert "cannot time a download" in rendered
 
 
 OVERLAY_HOME = """===system===
@@ -169,7 +162,7 @@ def test_all_gpus_shows_the_whole_box_with_ours_marked() -> None:
 
 def test_an_assignment_by_uuid_is_matched_as_well_as_by_index() -> None:
     report = parse_probe("gpubox", SAMPLE, None, [A40])
-    assert [cells[1] for cells in report.owned_rows] == [A40]
+    assert [gpu.uuid for gpu in report.owned_rows] == [A40]
     assert report.owned_missing == []
 
 
@@ -250,7 +243,7 @@ def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["1"])
     report = probe_host(entry, transport=OneAnswerTransport(SAMPLE))
     assert report.owned == ["1"]
-    assert [cells[1] for cells in report.owned_rows] == [A40]
+    assert [gpu.uuid for gpu in report.owned_rows] == [A40]
     assert TI not in report.render()
 
 
@@ -267,8 +260,8 @@ def test_probe_host_carries_the_registered_persistent_root_too() -> None:
 def test_two_entries_naming_one_card_is_called_out() -> None:
     """`gpuc host bootstrap` refuses this, so the probe has to be the one to say why."""
     report = parse_probe("gpubox", SAMPLE, None, ["1", A40])
-    assert [cells[1] for cells in report.owned_rows] == [A40]
-    assert "2 of the assigned entries name only 1 card(s)" in report.render()
+    assert [gpu.uuid for gpu in report.owned_rows] == [A40]
+    assert f"{A40} name a card already named" in report.render()
 
 
 def test_an_assignment_that_resolves_to_nothing_is_not_blamed_on_other_owners() -> None:

@@ -87,10 +87,13 @@ class ScriptedHost:
             return 0, ""
         if ".local/bin/hf" in command and "-x" in command:
             return 0, "/home/u/.local/bin/hf\n" if self.hf_present else ""
-        if "cache dir" in command:
-            return 0, (
-                f"cache={self.uv_cache}\ncache_dev={self.cache_dev}\nhome_dev={self.home_dev}\n"
+        if "uv_cache_placement" in command:
+            shared = (
+                None
+                if "unknown" in (self.cache_dev, self.home_dev)
+                else self.cache_dev == self.home_dev
             )
+            return 0, json.dumps({"dir": self.uv_cache, "shares_gpuc_home_fs": shared})
         if "tool install huggingface_hub" in command:
             if self.hf_install_fails:
                 return 1, "no network"
@@ -102,8 +105,6 @@ class ScriptedHost:
             return 0, "4242\n"
         if command.startswith("printf %s"):
             return 0, "/home/u/.gpuc"
-        if "nvidia-smi --query-gpu=index,uuid" in command:
-            return 0, "0, GPU-a, NVIDIA A40, 46068\n"
         return 0, ""
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
@@ -400,11 +401,17 @@ def test_a_host_without_a_mirror_only_warns_about_a_missing_aws_cli(control_env:
     assert any("aws CLI install failed" in warning for warning in result.warnings)
 
 
-def test_bootstrap_records_what_the_cards_are(control_env: Path) -> None:
-    updated, _ = bootstrap_host(entry(), transport=ScriptedHost(), report=lambda _: None)
+def test_bootstrap_keeps_the_probes_cards_and_records_the_driver(control_env: Path) -> None:
+    """The cards are the probe's one look at nvidia-smi; bootstrap does not
+    take a second, and the driver version is what health just reported."""
+    from gpuc.control.gpuinfo import GpuInfo
+
+    probed = entry(gpu_info={"GPU-a": GpuInfo(name="NVIDIA A40", vram_mib=46068, index=0)})
+    host = ScriptedHost()
+    updated, _ = bootstrap_host(probed, transport=host, report=lambda _: None)
     assert updated.gpu_info["GPU-a"].name == "NVIDIA A40"
-    assert updated.gpu_info["GPU-a"].vram_mib == 46068
     assert updated.driver_version == "580.173.02"
+    assert not any("nvidia-smi" in event for event in host.events)
 
 
 def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_env: Path) -> None:

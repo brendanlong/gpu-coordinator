@@ -21,11 +21,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from gpuc.control.gpuinfo import GpuInfo
+from gpuc.control.gpuinfo import GpuInfo, table_of
 from gpuc.control.jsonout import warn
 from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX
 from gpuc.control.tolerant import TolerantModel
 from gpuc.control.transport import Transport, make_transport
+from gpuc.host import gpus
 from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
@@ -381,7 +382,8 @@ def first_config(
     file.
     """
     overrides = dict(overrides or {})
-    shared = {_resolved(entry, item) for item in overrides.get("shared_gpus") or []}
+    shared_entries = [str(item) for item in overrides.get("shared_gpus") or []]
+    shared = set(gpus.resolve(shared_entries, table_of(entry.gpu_info)).owned)
     document: dict[str, Any] = {
         "host": entry.name,
         "gpus": [uuid for uuid in entry.gpu_info if uuid not in shared],
@@ -391,15 +393,6 @@ def first_config(
         "provider": entry.provider_block(),
     }
     return {**document, **overrides}
-
-
-def _resolved(entry: HostEntry, item: Any) -> str:
-    """A `--gpus` entry as a UUID, through the cards the probe saw; an index
-    no card answers to is left as typed for the health check to refuse."""
-    for uuid, info in entry.gpu_info.items():
-        if info.index is not None and str(info.index) == str(item):
-            return uuid
-    return str(item)
 
 
 NOT_DRIFT = {"schema_version", "pkg_commit", "created_at"}

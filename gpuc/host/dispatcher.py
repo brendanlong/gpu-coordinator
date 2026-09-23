@@ -607,10 +607,13 @@ class Dispatcher:
     wrote."""
     _stop_escalated: set[str] = field(default_factory=set)
     _config: jobs.HostConfig | None = None
-    _owned: list[str] | None = None
+    _cards: gpus.Resolution | None = None
+    """This pass's one resolution of `config.gpus` and `config.shared_gpus`
+    against nvidia-smi. Reset every pass; see `owned_gpus`."""
     _unavailable: tuple[str, ...] = ()
-    _shared: list[str] | None = None
     _shared_unavailable: tuple[str, ...] = ()
+    _duplicates: tuple[str, ...] = ()
+    _table_error: str | None = None
     _borrowable: tuple[list[str], int] | None = None
     """This pass's one reading of the shared cards: the ones nobody else was
     on, and how many they were on. Reset every pass; see `borrowable_gpus`."""
@@ -844,41 +847,57 @@ class Dispatcher:
         here rather than trusted. Everything downstream -- assignment, free/busy
         accounting, `CUDA_VISIBLE_DEVICES` -- is UUIDs.
         """
-        if self._owned is None:
-            self._owned, missing = gpus.resolve_owned(self.config.gpus, self.deps.smi)
-            if tuple(missing) != self._unavailable:
-                self._unavailable = tuple(missing)
-                if missing:
-                    self.log(
-                        f"config.gpus lists {', '.join(missing)}, which nvidia-smi does not "
-                        f"report on this host ({gpus.describe_table(self.deps.smi)}); those "
-                        f"cards are not being handed out"
-                    )
-        return self._owned
+        return self._resolution().owned
 
     def shared_gpus(self) -> list[str]:
         """The UUIDs of the cards this host may *borrow*, this pass.
 
-        Resolved exactly as `owned_gpus` is -- a shared card is named by
-        nvidia-smi index or UUID like any other -- and then minus anything this
-        host owns outright. A card listed in both is a configuration mistake
-        somebody will make, and owning it is the stronger claim: it would
-        otherwise be handed out freely as owned and then have its usage
-        second-guessed as shared.
+        Resolved in the same call as `owned_gpus` -- a shared card is named by
+        nvidia-smi index or UUID like any other -- and minus anything this host
+        owns outright, which `gpus.resolve` decides: owning is the stronger
+        claim, and a card in both lists would otherwise be handed out freely
+        as owned and then have its usage second-guessed as shared.
         """
-        if self._shared is None:
-            owned = set(self.owned_gpus())
-            resolved, missing = gpus.resolve_owned(self.config.shared_gpus, self.deps.smi)
-            if tuple(missing) != self._shared_unavailable:
-                self._shared_unavailable = tuple(missing)
-                if missing:
+        return self._resolution().shared
+
+    def _resolution(self) -> gpus.Resolution:
+        """One nvidia-smi read per pass, both lists against it; every change
+        in what could not be resolved is logged once, not every two seconds.
+        A driver that will not answer costs the pass its cards and nothing
+        more: jobs wait for the next pass, they do not fail."""
+        if self._cards is None:
+            try:
+                table = gpus.list_gpus(self.deps.smi)
+                error = None
+            except gpus.GpuError as exc:
+                table, error = [], str(exc)
+            if error != self._table_error:
+                self._table_error = error
+                if error:
+                    self.log(f"nvidia-smi could not be read, so no card is handed out: {error}")
+            self._cards = gpus.resolve(self.config.gpus, table, self.config.shared_gpus)
+            described = gpus.describe_table(table)
+            for what, missing, seen in (
+                ("config.gpus", self._cards.missing, "_unavailable"),
+                ("config.shared_gpus", self._cards.shared_missing, "_shared_unavailable"),
+            ):
+                if tuple(missing) != getattr(self, seen):
+                    setattr(self, seen, tuple(missing))
+                    if missing:
+                        self.log(
+                            f"{what} lists {', '.join(missing)}, which nvidia-smi does not "
+                            f"report on this host ({described}); those cards are not being "
+                            f"{'handed out' if what == 'config.gpus' else 'borrowed'}"
+                        )
+            if tuple(self._cards.duplicates) != self._duplicates:
+                self._duplicates = tuple(self._cards.duplicates)
+                if self._duplicates:
                     self.log(
-                        f"config.shared_gpus lists {', '.join(missing)}, which nvidia-smi does "
-                        f"not report on this host ({gpus.describe_table(self.deps.smi)}); those "
-                        f"cards are not being borrowed"
+                        f"{', '.join(self._duplicates)} name a card already named (an index and "
+                        f"its own UUID are one card, and owning beats sharing); each card is "
+                        f"handed out once"
                     )
-            self._shared = [uuid for uuid in resolved if uuid not in owned]
-        return self._shared
+        return self._cards
 
     def _busy_gpus(self) -> set[str]:
         return {uuid for entry in self.running.values() for uuid in entry.gpus}
@@ -951,7 +970,7 @@ class Dispatcher:
         return plan.Pool(
             owned_free=[*self.free_gpus(), *extra_owned],
             owned_configured=len(self.config.gpus),
-            shared_configured=len(self.config.shared_entries()),
+            shared_configured=len(self.shared_gpus()) + len(self._shared_unavailable),
             shared_visible=len(self.shared_gpus()),
             sample=self.borrowable_gpus,
             shared_extra=list(extra_shared),
@@ -1377,8 +1396,7 @@ class Dispatcher:
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
         self._config = jobs.read_config()
-        self._owned = None
-        self._shared = None
+        self._cards = None
         self._borrowable = None
         self._queued = None
         self._draining = None

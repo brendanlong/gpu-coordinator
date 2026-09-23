@@ -28,10 +28,10 @@ gpuc/
     preflight.py   # sync preflight: prove every destination can be written before the job runs
     baseline.py    # what was already under `outputs:` before the job started
     cleanup.py     # `cleanup:` policy, workdir sizing, the `clean`/`purge` sweeps
-    gpus.py        # nvidia-smi parsing, index<->UUID resolution, utilization sampling
+    gpus.py        # the one nvidia-smi table parser and the one index/UUID resolver (`resolve`); utilization sampling
     progress.py    # the optional `progress_command`: run it, read a percentage off it
     sync.py        # periodic upload loop, recording each destination's result in the job's state
-    health.py      # host preflight: driver, owned GPUs, disk, network download timing
+    health.py      # host preflight: driver, owned GPUs, disk, uv cache placement, the one network throughput test
     terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
@@ -56,7 +56,7 @@ gpuc/
     ssh.py         # `gpuc ssh`: the interactive form of the transport
     clean.py       # `gpuc clean` / `gpuc host clean --uv-cache` over the transport
     s3index.py     # the S3 mirror of specs and the job index, and the local index
-    gpuinfo.py     # per-GPU name/VRAM for the registry and every listing
+    gpuinfo.py     # per-GPU name/VRAM for the registry and every listing, over the host's own table and resolver
     version.py     # this build's commit, and comparing it with a host's
     jsonout.py     # the `--json` rules
     skill.py       # `gpuc skill`: the agent guide, from the wheel or the checkout
@@ -551,8 +551,12 @@ The check compares filesystems rather than sizes because `du` cannot see a
 reflink. The case it exists for is a pod with `--persistent-root`: gpuc home on
 the network volume, `~/.cache` on the container's overlay.
 
-`gpuc host probe` and the health check both report the cache's size and whether
-it shares a filesystem with gpuc home; the health check is warn-only. `gpuc host
+One question, answered on the host: `health.uv_cache_placement` says where
+the cache is (`UV_CACHE_DIR` from the host's env, else the environment, else
+uv's default), its size, and whether it shares a filesystem with gpuc home.
+The health check reports it (warn-only) and bootstrap decides `UV_CACHE_DIR`
+on the same answer, asked of the host's own code once the package is there;
+the probe, which runs before anything is installed, does not ask. `gpuc host
 clean <host> --uv-cache` runs `uv cache prune`, never `clean`, which would throw
 away the wheels the next job wants to link.
 
@@ -803,10 +807,10 @@ that bootstrapped it first matters afterwards.
 3. **Never rewrite `~/.gpuc/config.json`.** The host owns it, so bootstrap reads
    it and merges back only what it derived (`remote.write_config`): the
    commit just shipped, and the managed env keys the host names none of
-   (`UV_CACHE_DIR` by filesystem comparison, `HF_HOME` beside gpuc home under
-   a persistent root). The one exception is a host with **no** config at all,
-   which gets `first_config` with the last config this machine read off it on
-   top.
+   (`UV_CACHE_DIR` by the host's own filesystem comparison, asked after the
+   package is shipped; `HF_HOME` beside gpuc home under a persistent root).
+   The one exception is a host with **no** config at all, which gets
+   `first_config` with the last config this machine read off it on top.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `$HOME/.local/bin` and `$HOME/.cargo/bin` on PATH,
    and record the commit this build came from in the host's `config.json` --
@@ -815,10 +819,10 @@ that bootstrapped it first matters afterwards.
    `requeue` also run when the host's config names another build. Bootstrap
    is never blocked by running jobs: the package is replaced, and whichever
    dispatcher takes over adopts them from their `state.json`.
-6. Record the host's cards and driver version into the registry's cache, best
-   effort, so `gpuc host list` and `gpuc status` can name them. `gpuc host
-   probe` records the same before a host is bootstrapped, and a RunPod host
-   falls back to its offer's GPU name and VRAM.
+6. Record the driver version health reported into the registry's cache. The
+   cards are the probe's to record (`gpuc host add`, `gpuc host probe`,
+   provisioning), the one look at nvidia-smi the control side takes; bootstrap
+   keeps what the entry has.
 
 ## GPU ownership: indices in, UUIDs out
 
@@ -827,21 +831,28 @@ that bootstrapped it first matters afterwards.
 shared box is agreed, and resolving at registration would freeze one boot's
 numbering into a file nobody looks at again.
 
-Everything downstream is UUIDs. The dispatcher re-runs `nvidia-smi
---query-gpu=index,uuid` each pass, maps the owned entries to whatever the driver
-calls those cards now, and assigns and accounts by UUID. The runner resolves
-its assignment again on the way in and writes the UUIDs back to the job
-state, and the dispatcher resolves what it adopts at startup: an index
-mistaken for a busy card's name is a card handed out twice. The one place an
-index appears again is the job's own `CUDA_VISIBLE_DEVICES`, translated from
-the UUIDs by the runner at that instant and pinned with
-`CUDA_DEVICE_ORDER=PCI_BUS_ID`, because that is the form every CUDA stack
-accepts.
+Everything downstream is UUIDs. **One table and one rule**: `gpus.parse_table`
+reads `nvidia-smi --query-gpu=index,uuid,name,memory.total` wherever it is
+read -- the dispatcher's pass, the runner, the health check, the probe's
+shell output -- and `gpus.resolve(owned, table, shared)` is the pure function
+that turns entries into cards, live on the host and offline on the control
+side over the table rebuilt from the registry's cache. The dispatcher reads
+the table once each pass, maps the owned entries to whatever the driver calls
+those cards now, and assigns and accounts by UUID; the runner resolves its
+assignment again on the way in and writes the UUIDs back to the job state,
+and the dispatcher resolves what it adopts at startup: an index mistaken for a
+busy card's name is a card handed out twice. The one place an index appears
+again is the job's own `CUDA_VISIBLE_DEVICES`, translated from the UUIDs by
+the runner at that instant and pinned with `CUDA_DEVICE_ORDER=PCI_BUS_ID`,
+because that is the form every CUDA stack accepts.
 
-An owned entry that resolves to nothing is logged, treated as unavailable (jobs
-wait, they do not fail), and reported by `gpuc status` and the health check's
-`gpu_uuids`. Shared entries resolve the same way and are checked for overlap
-with the owned ones.
+An entry that resolves to nothing -- an index the driver no longer uses or a
+UUID it no longer reports, the same verdict for both -- is logged, treated as
+unavailable (jobs wait, they do not fail), and reported by `gpuc status` and
+the health check's `gpu_uuids`. An entry naming a card already named (an
+index and its own UUID, or a card in both lists) is a `duplicate`: the health
+check and `gpuc host add|set` refuse it, the dispatcher hands the card out
+once, and the runner fails an assignment that carries one.
 
 A host given its first config with no `--gpus` owns every card the probe saw, as
 UUIDs, less any named by `--shared-gpus`. A host that already has a config is
@@ -870,8 +881,9 @@ spelled and resolved the same way. What it means for a submitter is
   owner is not detected, and `gpuc preempt` is the way out.
 - No per-host floor on which jobs may borrow. Borrowing is not a reservation, so
   a floor never protects an important job from a trivial one.
-- A card in both lists is refused by `gpuc host add|set` and by the host's own
-  `gpu_uuids` health check; should one reach a dispatcher, owning wins.
+- A card in both lists is a `duplicate` of `gpus.resolve`, refused by `gpuc
+  host add|set` and by the host's own `gpu_uuids` health check on that one
+  verdict; should one reach a dispatcher, owning wins.
 
 ## Persistent root (a host whose `$HOME` is wiped on restart)
 

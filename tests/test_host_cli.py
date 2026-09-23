@@ -219,7 +219,6 @@ def test_status_resolves_the_owned_gpus(
     """The control side cannot: `gpus` may name cards by index, and only the
     host knows today's numbering."""
     monkeypatch.setattr(cli.gpus, "list_gpus", lambda *_: [cli.gpus.Gpu(3, FAKE_GPUS[0])])
-    monkeypatch.setattr(cli.gpus, "resolve_owned", lambda owned, *_: ([FAKE_GPUS[0]], ["9"]))
     jobs.write_config(HostConfig(host="test-host", gpus=["3", "9"]))
 
     _, status = run(capsys, "status")
