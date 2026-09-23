@@ -7,8 +7,11 @@ run as they do on a box. What is faked is only what a laptop does not have:
 
 - `nvidia-smi`: `conftest.install_fake_nvidia_smi`, answering for `gpus`;
 - `uv`, `aws` and `hf`: shims in the places bootstrap looks first, answering
-  the questions it asks (`uv python find` is this test's own interpreter,
-  `uv cache dir` is `$HOME/.cache/uv`) and installing nothing;
+  the questions it asks (`uv cache dir` is `$HOME/.cache/uv`) and installing
+  nothing. `uv python find` is a bare venv of this test's interpreter with no
+  packages in it, as a uv-managed Python on a fresh box is: the shipped
+  package under `PYTHONPATH` is the only `gpuc` the host can import, so a
+  bootstrap that runs the host's code before shipping it fails here too;
 - the provider API (`fakeprovider.FakeProvider`) and S3 (`fakes3`).
 
 A bootstrap here starts a real dispatcher in the temporary home; `close`
@@ -22,8 +25,8 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import time
+import venv
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -74,7 +77,7 @@ class FakeHost:
         bin_dir = self.home_dir / ".local" / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         self.set_gpus(gpus)
-        _shim(bin_dir / "uv", UV_SHIM.format(python=shlex.quote(sys.executable)))
+        _shim(bin_dir / "uv", UV_SHIM.format(python=shlex.quote(_bare_python(root / "python"))))
         _shim(bin_dir / "hf", "#!/bin/sh\nexit 0\n")
         _shim(self.home_dir / ".local/aws-cli/v2/current/bin/aws", "#!/bin/sh\nexit 0\n")
 
@@ -111,6 +114,16 @@ class FakeHost:
             _shim(bin_dir / "nvidia-smi", NO_NVIDIA_SMI)
         else:
             install_fake_nvidia_smi(bin_dir, list(uuids))
+
+    def ship_package(self) -> None:
+        """Put this checkout's package where a bootstrap would have, for a
+        test about a host somebody already set up: without it the host has
+        no `gpuc` to answer `status` with, as a real one would not."""
+        pkg = self.path(self.home) / "pkg"
+        pkg.mkdir(parents=True, exist_ok=True)
+        link = pkg / "gpuc"
+        if not link.exists():
+            link.symlink_to(Path(__file__).resolve().parents[1] / "gpuc")
 
     def wipe(self) -> None:
         """Take the host's gpuc home away, as a re-imaged pod would."""
@@ -161,12 +174,15 @@ class FakeHost:
             self.refuse -= 1
             result = CommandResult(self.host, ["ssh", command], 255, "", self.refusal)
         else:
+            # In the host's home, as an ssh command lands: run from the
+            # repository, `python -c` would import `gpuc` from the cwd.
             proc = subprocess.run(
                 self.argv(command),
                 capture_output=True,
                 timeout=timeout,
                 check=False,
                 env=self.env(),
+                cwd=self.home_dir,
                 stdin=subprocess.DEVNULL,
             )
             result = CommandResult(
@@ -218,6 +234,15 @@ def _shim(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     path.chmod(0o755)
+
+
+def _bare_python(root: Path) -> str:
+    """An interpreter with nothing installed: this test's own, in a venv of
+    its own with no site-packages. A `-S` wrapper would not do -- the probe
+    records `sys.executable`, which a wrapper cannot change -- and a venv is
+    what `uv python find` answers with on a real host anyway."""
+    venv.create(root, with_pip=False, symlinks=True)
+    return str(root / "bin" / "python3")
 
 
 @pytest.fixture

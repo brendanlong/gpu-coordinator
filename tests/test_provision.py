@@ -139,6 +139,24 @@ def test_happy_path_registers_a_bootstrapped_host(
     assert any("ceiling" in line and "whole attempt" in line for line in reports)
 
 
+def test_a_fresh_host_runs_none_of_its_own_code_before_the_package_lands(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    """The pod's interpreter has nothing installed, so the first `from
+    gpuc.host import ...` before the rsync is a ModuleNotFoundError -- which
+    provisioning read as "next offer" and bought a pod per offer to reproduce."""
+    run(FakeProvider([make_offer()]), host, offline_health)
+    first_host_code = next(
+        i for i, command in enumerate(host.commands) if "from gpuc.host" in command
+    )
+    shipped = next(
+        i
+        for i, command in enumerate(host.commands)
+        if 'mkdir -p "' in command and "/pkg" in command
+    )
+    assert shipped < first_host_code
+
+
 def test_create_uses_the_spec_defaults(
     control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
@@ -474,6 +492,7 @@ def _register_reusable(
         },
     )
     host.put_file(json.dumps(on_host.to_dict()), f"{host.home}/config.json", 0o644)
+    host.ship_package()
     entry = host_entry(
         name=pod.name,
         kind="rental",
