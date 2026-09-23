@@ -43,7 +43,7 @@ holding them, is `gpuc status`.
 |---|---|---|
 | `local` | the job fits on this machine's own cards | free, and shared with everything else using that GPU |
 | `ssh` | a bigger or shared box already registered | free to you; only the cards registered to that host are ever used, and some such boxes wipe `$HOME` on restart |
-| `runpod` (`--runpod`) | nothing registered is big enough, or they are all busy | costs money; provisions the cheapest matching pod, idles down after 15 min |
+| `rental` (`--runpod`) | nothing registered is big enough, or they are all busy | costs money; provisions the cheapest matching pod, idles down after 15 min |
 
 Prefer a host you already have over a pod you pay for, and check `gpuc status`
 first: a busy host queues your job behind the running one, which is usually
@@ -172,7 +172,7 @@ gpuc estimate <jobid> --minutes 150
                                  # set estimated_runtime_min on a queued or running job
                                  # (--clear removes it); a running job picks it up within a minute
 gpuc requeue <jobid> --host <host>
-                                 # re-run from the mirrored spec, attempt+1; needs s3_bucket set,
+                                 # re-run from the mirrored spec as a new job; needs s3_bucket set,
                                  # and re-syncs the workdir from your current directory
 gpuc pods                        # RunPod: every pod we own, cost, age, util, host name
 ```
@@ -231,7 +231,7 @@ Neither command is a background job, and killing one leaves the run alone.
 | 1 | something failed: transport, provider, a refused submit, **a host that could not be read**. Whatever did work is still reported, so read the output before retrying — one host being down does not cost you the others. For `gpuc wait` and `gpuc logs -f` it is the **job** that did not succeed |
 | 2 | usage: a bad or missing flag |
 | 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
-| 4 | the job or host named does not exist |
+| 4 | the job or host named does not exist. Only when every host answered: a job whose host could not be reached is exit 1 with the reason, and may well still be on it |
 | 130 | a Ctrl-C |
 
 ```bash
@@ -239,14 +239,21 @@ gpuc status --json | jq -r '.hosts[] | "\(.name) reachable=\(.reachable) running
 gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, util}]'
 ```
 
-The document is `{schema_version, hosts: [...], errors: [...]}`. Each host has
-`name, kind, reachable, pkg_commit, dispatcher{alive, heartbeat_age_s},
-provider_util, gpus, shared_gpus, queued, running, finished, errors`; each job in those three
-lists has `job_id, name, status, reason, problems, upload_errors, phase,
-priority, elapsed_s, util, progress_pct, eta, eta_s, estimated_runtime_min,
-progress_error, gpus, gpus_requested, use_shared, starts_in_s, starts_at,
-starts_unknown, iso, ended_at,
-outputs_pending` (`starts_*` are null unless the job is queued). Each entry in
+The document is `{schema_version, hosts: [...], unhosted: [...], errors: [...]}`.
+Each host has `name, kind, state, reachable, pod_gone, pkg_commit,
+dispatcher{alive, heartbeat_age_s}, provider_util, gpus, shared_gpus, queued,
+running, finished, errors, warnings`; `state` is one of `answered`,
+`unreachable`, `pod_dead` (the provider still has the pod: a failure) and
+`pod_gone` (the rental ended: not a failure, and the entry is forgotten);
+`warnings` is the build mismatch, apart from the `errors` that decide the exit
+code. Each job in the three lists has `job_id, name, status, reason, problems,
+upload_errors, phase, priority, attempt, requeued_from, elapsed_s, util,
+progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
+gpus_requested, use_shared, starts_in_s, starts_at, starts_unknown, iso,
+ended_at, outputs_pending` (`starts_*` are null unless the job is queued).
+`unhosted` is `--all`'s list of jobs only the index knows, each
+`{job_id, name, host, requeued_from, submitted_at, s3_prefix, outputs_lost}`,
+and empty without the flag. Each entry in
 `shared_gpus` adds `memory_mib`, `utilization_pct` and `unused` — the host's own
 verdict on whether gpuc would borrow that card right now.
 
@@ -266,7 +273,7 @@ scraping any of the text output.
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, attempt, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a draining host, a job ahead that estimated nothing, a job wider than the host, an owned card it needs that nvidia-smi no longer reports — and is null when there is one |
+| `submit`, `requeue` | `{job_id, host, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are looked up just after the enqueue, and are all null when the host could not be asked again (the job is queued regardless). `starts_unknown` is why there is no start time — a draining host, a job ahead that estimated nothing, a job wider than the host, an owned card it needs that nvidia-smi no longer reports — and is null when there is one |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` uses, plus `host`, `source` (`host` or `mirror`) and `error` — except a job nothing was ever heard about, which is only `job_id`, `host`, `source`, `error` and a null `status`. **Check `error`, not `status`**: it is null for a job that ended, and when it is not, `status` is only the last thing its host managed to say (`running` for a host that vanished mid-run, null for one never heard from). Exit 1 unless every job succeeded |
 | `cancel` | `{job_id, host, status}` |
@@ -278,7 +285,7 @@ scraping any of the text output.
 | `host list` | `{hosts[], errors[]}` |
 | `host probe` | `{host, sections{}, driver_version, gpus[] each with assigned, assigned_gpus[], uv_cache{}, notes[], ...}` |
 | `host add`, `host set` | one `host list` entry as the registry now holds it, plus `adopted`, `config_path`, `changes[]`, `warnings[]` (`set` adds `address{}`) |
-| `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}`; with `--all`, `{hosts[], total, bootstrapped[], failed[], gone[], unreadable[], interrupted, errors[]}` where each of `hosts[]` is `{name, outcome, error, ...}` and `outcome` is `bootstrapped`, `failed`, `gone` (a rental the provider no longer has, forgotten rather than failed), `interrupted` or `not_attempted` |
+| `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}`; with `--all`, `{hosts[], total, bootstrapped[], failed[], gone[], unreadable[], interrupted, errors[]}` where each of `hosts[]` is `{name, outcome, error, ...}` and `outcome` is `bootstrapped`, `failed`, `gone` (a rental the provider no longer has, forgotten rather than failed), `interrupted` or `not_attempted`. A Ctrl-C is exit 130 and the error document carries the same tally |
 | `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` |
 | `host remove` | `{host, kind, pod_id, notes[]}`; a rental is not terminated by this, and `notes` says so |
 | `host terminate` | `{host, pod_id, pod_name, pod_status, cost_usd_hr, checked, running[], queued[], outputs_pending[], terminated, forgotten, notes[]}`; `checked` false means the host could not be asked, so the three lists are empty for want of an answer, not for want of jobs |
@@ -338,8 +345,8 @@ Rules, and they are not optional:
 - A rental that ended itself is forgotten when it is found: `status` and
   `host bootstrap --all` drop the registry entry and say so, rather than
   reporting a host nobody can reach. A pod that is merely stopped shows as
-  `POD GONE` and stays until `gpuc host terminate <name>` ends it, or
-  `gpuc host remove <name>` forgets it and leaves it billing.
+  `POD EXITED` (its status), is exit 1, and stays until `gpuc host terminate
+  <name>` ends it, or `gpuc host remove <name>` forgets it and leaves it billing.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
   create, reading the config the pod already has.
 - Only act on pods named `gpuc-*`. Others belong to other people.

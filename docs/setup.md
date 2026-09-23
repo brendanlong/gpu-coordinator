@@ -184,7 +184,7 @@ file the host is running on, so nothing replaces it, and the error says to fix
 or delete it.
 
 RunPod pods are never *created* by hand: `gpuc submit --runpod ...` creates the
-pod, registers it as kind `runpod`, and bootstraps it
+pod, registers it as a `rental`, and bootstraps it
 ([usage.md](usage.md#runpod)). A pod that already exists is adopted the same way
 any other host is, from any machine holding the API key:
 
@@ -213,10 +213,10 @@ host has to answer) and reports each change as `host <- …`.
 | `--cache-dir PATH` | bootstrap decides | `UV_CACHE_DIR` in the host's `env`, the same as `--env UV_CACHE_DIR=PATH`. Bootstrap sets one on gpuc home's filesystem when they differ (uv only links a venv out of its cache within one filesystem), and never overrides one the config already names. On a host with `--persistent-root`, `HF_HOME` is handled the same way: bootstrap points it beside gpuc home unless the config names one, so the root keeps the Hugging Face cache too; elsewhere it is left to the user's own default |
 | `--persistent-root R` | none | gpuc home moves to `R/gpuc` (below) |
 | `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. It replaces the whole set, except the two keys bootstrap derives (`UV_CACHE_DIR`, `HF_HOME`), which survive an `--env` that does not name them; `--env K=` with nothing after the sign removes a key, those included |
-| `--s3-prefix s3://…` | none | this host's own log/state mirror |
+| `--s3-prefix s3://…` | `s3://<s3_bucket>/gpuc/<name>` on a host being configured for the first time, when `s3_bucket` is set; none otherwise | this host's own log/state mirror; `''` turns it off |
 | `--retention-days N` | none | auto-purge whole job dirs this old, only ones whose log and state are confirmed mirrored — so with no `--s3-prefix` it deletes nothing. `''` turns it off |
 | `--workdir-days N` | `1` on a host being configured for the first time | auto-sweep a finished job's `workdir/` (never its log or state) once it ended this long ago; no mirror needed. `''` turns it off. A host whose config already exists keeps whatever it says |
-| `--idle-min N` | `15` | how long an ephemeral host may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |
+| `--idle-min N` | `15` | how long a rental may sit with an empty queue before terminating itself. **Inert on `local` and `ssh` hosts**, which never terminate themselves |
 
 On a box you share, pass `--gpus`: it is the whole of what gpuc may touch, so
 `host probe` lists only those cards and says how many it hid (`2 of 8 assigned to
@@ -302,7 +302,7 @@ adopting the running jobs — nothing is interrupted. `gpuc status` reports the
 *running* dispatcher's commit alongside the package's and warns if they come
 apart.
 
-`--all` takes every registered host in turn, including ephemeral ones. A host
+`--all` takes every registered host in turn, including rentals. A host
 that fails does not stop the others: the run ends with a tally naming each
 failure, including host entries this build could not read, and exits 1, while
 the hosts that did upgrade stay upgraded. A rental the provider no longer has is
@@ -315,9 +315,12 @@ half-installed on the way past: it has no uv to run a dispatcher with.
 
 `gpuc submit` and `gpuc requeue` do this themselves when the host they are about
 to enqueue on is not on this commit — read from the host's own `config.json`,
-which is also the read that tells them what the host's cards and mirror are, and
-including a host with no commit recorded. They re-sync the package and restart
-the dispatcher first, print one line saying so, and `--no-bootstrap` skips it.
+which is also the read that tells them what the host's cards and mirror are. A
+config that names no commit is a host nothing has bootstrapped, and is refused.
+They re-sync the package and restart the dispatcher first, print one line
+saying so, and `--no-bootstrap` skips it. A checkout with uncommitted changes
+is its own build (`<commit>-dirty`): a host bootstrapped from it never reads as
+running that commit.
 Re-bootstrapping is safe at any time: **running jobs are not disturbed and do
 not block it.** A dispatcher that is already alive keeps the lock and finishes
 on its own (older) code; every new runner uses the new package, and whichever
