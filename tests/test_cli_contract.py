@@ -9,6 +9,7 @@ running". Both halves of that have to be impossible now.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -37,10 +38,17 @@ from gpuc.control.config import (
 )
 from gpuc.control.s3index import S3IndexError
 from gpuc.control.status import HostState, HostView
-from tests.conftest import accept_job, host_entry, load_registry, register_host
+from tests.conftest import (
+    FAKE_GPUS,
+    accept_job,
+    host_entry,
+    install_fake_nvidia_smi,
+    load_registry,
+    register_host,
+)
 from tests.fakehost import FakeHost
 
-GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+GPU = FAKE_GPUS[0]
 
 GOOD_ENTRY = {
     "name": "good",
@@ -304,6 +312,10 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
 
     home = tmp_path / "host-home"
     monkeypatch.setenv("GPUC_HOME", str(home))
+    # The host's own card, answered by the fake driver whatever this machine
+    # has: the projection below holds only for a card nvidia-smi reports.
+    install_fake_nvidia_smi(tmp_path / "bin", [GPU])
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
     paths.ensure_layout()
     jobs.write_config(HostConfig(host="local", gpus=[GPU]))
     paths.heartbeat_file().touch()
