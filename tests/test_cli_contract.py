@@ -85,6 +85,35 @@ def test_one_bad_host_entry_is_skipped_and_the_rest_still_work(
     assert "skipping host 'bad'" in captured.err
 
 
+LEGACY_RENTAL = {"name": "gpuc-old", "kind": "runpod", "ssh": "root@1.2.3.4", "pod_id": "podOLD"}
+"""A rental as a build before `rental: {provider, pod_id}` wrote one."""
+
+
+def test_a_rental_an_earlier_build_registered_is_refused_not_read_as_ssh(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Read tolerantly it parses as an ssh host, and then nothing about it being
+    a rental works: no terminate, no reuse, never forgotten when its pod ends.
+    So it is one more entry this build cannot read -- skipped with the reason
+    and the way back, written back untouched, exit 1 -- not a quiet ssh host."""
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "gpuc-old": LEGACY_RENTAL}})
+    read = read_registry()
+    assert set(read.registry.hosts) == {"good"}
+    assert read.skipped["gpuc-old"] == LEGACY_RENTAL
+    assert "earlier build" in read.errors[0]
+    assert "gpuc host add <name> --pod podOLD" in read.errors[0]
+
+    assert main(["host", "list"]) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "good" in captured.out
+    assert "gpuc host add <name> --pod podOLD" in captured.err
+    # A rental spelled the one way this build spells it is still a rental.
+    spelled = HostEntry.model_validate(
+        {"name": "n", "rental": {"provider": "runpod", "pod_id": "p"}}
+    )
+    assert spelled.kind == "rental"
+
+
 def test_a_write_puts_back_the_entry_this_build_could_not_read(
     control_env: Path, fake_host: FakeHost
 ) -> None:

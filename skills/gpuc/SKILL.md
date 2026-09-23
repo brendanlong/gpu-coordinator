@@ -353,7 +353,9 @@ Rules, and they are not optional:
   `POD EXITED` (its status), is exit 1, and stays until `gpuc host terminate
   <name>` ends it, or `gpuc host remove <name>` forgets it and leaves it billing.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
-  create, reading the config the pod already has.
+  create, reading the config the pod already has. It is also the fix when a
+  command warns `skipping host ... registered by an earlier build`: that entry
+  is ignored (and the command exits 1) until it is re-added.
 - Only act on pods named `gpuc-*`. Others belong to other people.
 
 ## Housekeeping

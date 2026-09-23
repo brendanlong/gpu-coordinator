@@ -198,6 +198,10 @@ rented as — so nothing about the machine that created it matters afterwards. A
 pod nobody has bootstrapped has no dispatcher and so will never end itself;
 `host add` says so, and `gpuc host bootstrap <name>` gives it one.
 
+A rental registered by an earlier build of gpuc is not read: every command
+warns `registered by an earlier build` for that entry, works with the rest,
+and exits 1 until you run `gpuc host add <name> --pod <pod-id>` again.
+
 The address is the top two rows, kept here (`here <- …`) and applied to the
 host by the next `gpuc host bootstrap`. Every other flag is the host's own
 config: `host set` writes it through to the host's `config.json` at once (the

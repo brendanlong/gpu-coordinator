@@ -562,7 +562,8 @@ reported in its own block, every other host is reported in full, and the command
 exits 1. A registry entry this build cannot parse is the same: a warning on
 stderr, the entry written back untouched, and exit 1 from the commands reporting
 on every host (`status`, `host list`, `version`) — not from one given a single
-host or job. A rental whose pod has ended is not a failure at all; gpuc forgets
+host or job. A rental an earlier build registered is one of those entries, and
+its warning says to `gpuc host add <name> --pod <pod-id>` it again. A rental whose pod has ended is not a failure at all; gpuc forgets
 that host. Only a `hosts.json` that cannot be parsed at all is exit 3, which
 prints the error, the path, and that a `.bak` was kept.
 

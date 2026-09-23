@@ -644,7 +644,10 @@ this repository wrote are not kept, pre-release.
 A host entry that still does not validate is **skipped, not fatal**: `gpuc`
 warns, works with the rest, and writes that entry back untouched on the next
 registry write. Only a `hosts.json` that cannot be parsed at all stops
-anything (exit 3, a `.bak` kept).
+anything (exit 3, a `.bak` kept). One shape is refused on purpose rather
+than read: a rental an earlier build spelled with a top-level `pod_id` and no
+`rental` would otherwise pass as an ssh host, and the warning says to
+`gpuc host add <name> --pod <id>` it again.
 
 ## Exit codes
 
