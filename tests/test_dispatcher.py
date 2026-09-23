@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -333,6 +334,7 @@ def test_a_runner_that_dies_leaves_no_output_confirmed(gpuc_home: Path) -> None:
     job_id = queue.enqueue(spec)
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
+    jobs.update_state(job_id, ran=True)  # as the runner writes it when main begins
     jobs.record_upload(job_id, f"s3://b/{job_id}", "out", ok_at=jobs.utc_now())
     (paths.workdir(job_id) / "out").mkdir()
     (paths.workdir(job_id) / "out" / "late.pt").write_text("x")
@@ -2387,3 +2389,59 @@ def test_the_job_the_queue_is_stuck_on_is_the_last_one_asked(gpuc_home: Path) ->
     assert not queue.is_preempted(borrower)
     assert jobs.read_state(stuck).status == "queued"
     assert jobs.read_state(waiting).status == "queued"
+
+
+def test_a_runner_that_dies_before_main_leaves_nothing_pending_and_no_secrets(
+    gpuc_home: Path,
+) -> None:
+    """The runner writes `ran` as main begins, and a dead runner's terminal
+    write keeps that answer rather than guessing from its claim: a job that
+    died in setup on a pod has no result, so the checkout's own files under
+    `outputs:` are not held for the drain to upload, and the secrets go."""
+    configure_pod()
+    job_id = queue.enqueue(make_spec(gpus=1, outputs=[{"path": "out", "s3": "s3://b/{job_id}"}]))
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    (paths.workdir(job_id) / "out").mkdir(parents=True)
+    (paths.workdir(job_id) / "out" / "committed.pt").write_text("came with the checkout")
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.ran) == ("failed", "runner-died", False)
+    assert cleanup.outputs_pending(job_id, jobs.read_spec(job_id), state) is None
+    assert not paths.job_env_file(job_id).exists()
+
+
+def test_a_card_claimed_between_the_plan_and_the_launch_is_not_handed_out(
+    gpuc_home: Path,
+) -> None:
+    """The last window of the handover race: a runner the previous dispatcher
+    started claims a card after this pass planned around it being free. The
+    launch re-reads the claims and leaves that job for the next pass."""
+    both = {queue.enqueue(make_spec(gpus=1)), queue.enqueue(make_spec(gpus=1))}
+    dispatcher, spawned = make_dispatcher(claim=False)
+    real_spawn = dispatcher.deps.spawn_runner
+    foreign: list[FakeRunnerProcess] = []
+
+    def spawn_then_lose_the_other_card(
+        job_id: str, gpus: Sequence[str], attempt: int
+    ) -> subprocess.Popen[bytes]:
+        proc = real_spawn(job_id, gpus, attempt)
+        if not foreign:
+            # While the first launch of the pass is under way, a runner the
+            # old dispatcher started claims the other job on the other card.
+            (other,) = both - {job_id}
+            (card,) = set(FAKE_GPUS) - set(gpus)
+            theirs = FakeRunnerProcess(other, [card], claim=True)
+            theirs.pid = os.getpid()
+            foreign.append(theirs)
+        return proc
+
+    dispatcher.deps = replace(dispatcher.deps, spawn_runner=spawn_then_lose_the_other_card)
+    dispatcher.run_once()
+    (launched,) = spawned
+    (other,) = both - {launched}
+    assert other not in dispatcher.running
+    assert jobs.read_state(other).gpus == foreign[0].gpus
+    assert "claimed by a runner since this pass began" in paths.dispatcher_log().read_text()

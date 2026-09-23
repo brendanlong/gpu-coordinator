@@ -1074,3 +1074,23 @@ def test_a_sigterm_to_a_preempting_runner_still_queues_the_job_again(gpuc_home: 
     state = jobs.read_state(job_id)
     assert (state.status, state.attempt, state.intent) == ("queued", 2, None)
     assert "queued again as attempt 2" in log_of(job_id)
+
+
+def test_a_cancel_overriding_a_preempt_before_main_keeps_that_main_never_started(
+    gpuc_home: Path,
+) -> None:
+    """The later request wins and the job ends `cancelled`; what it must not
+    do on the way is claim `main` ran, or a pod's drain would hold the
+    checkout's files under `outputs:` as this job's results."""
+    job_id = prepare(command="touch RAN", outputs=[{"path": "out", "s3": "s3://b/{job_id}"}])
+    queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
+
+    def preempt_then_cancel(job: str) -> None:
+        queue.preempt(job)
+        queue.cancel(job)
+
+    code = run(job_id, deps(smi=stopping_after_claim(job_id, preempt_then_cancel)))
+    assert code == runner.TERMINATED_EXIT_CODE
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.ran) == ("cancelled", "cancelled", False)
+    assert not (paths.workdir(job_id) / "RAN").exists()

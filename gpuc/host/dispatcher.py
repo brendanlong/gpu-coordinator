@@ -750,9 +750,13 @@ class Dispatcher:
             lambda m: self.log(f"job {job_id}: {m} before freeing its GPUs")
         )
         try:
+            # `ran=False` here is not a claim that main never started: `finish`
+            # keeps the `ran` the runner wrote as main began, and a runner that
+            # died in setup on a pod must not have the checkout's files under
+            # `outputs:` counted as pending and uploaded by the drain.
             written = jobs.finish(
                 job_id,
-                Outcome("failed", "runner-died", ran=expect == "running"),
+                Outcome("failed", "runner-died", ran=False),
                 expect=expect,
                 forget_output_uploads=True,
             )
@@ -1059,7 +1063,22 @@ class Dispatcher:
         cancel that lands in between costs nothing but a runner that exits.
         Until that claim the job is still `queued` on disk, and the entry in
         `running` is what keeps the next pass from launching it twice.
+
+        The on-disk claims are read again here, not trusted from the start of
+        the pass: a runner the dispatcher we took over from started can claim
+        one of these cards between the plan and this spawn, and a card two
+        runners hold is the one thing the whole accounting exists to prevent.
+        A card claimed since is left alone this pass; the next one plans
+        around it.
         """
+        self._claimed = None
+        taken = set(assigned) & self._claimed_gpus()
+        if taken:
+            self.log(
+                f"job {job_id}: {','.join(sorted(taken))} claimed by a runner since this "
+                f"pass began; not launching it on those"
+            )
+            return
         try:
             proc = self.deps.spawn_runner(job_id, assigned, attempt)
         except OSError as exc:

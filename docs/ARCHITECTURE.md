@@ -357,7 +357,8 @@ The order is the contract; each step is in `runner.py`.
    the dispatcher to everything it spawns.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json` (path,
    size, mtime), **before `setup`** -- a setup step writing there is this job's
-   doing, a committed file that was already there is not -- and once per job:
+   doing and counts as its result once `main` starts, a committed file that
+   was already there is not -- and once per job:
    a later attempt keeps the baseline the first took. Every upload excludes
    files that still match, and a path holding only those is `failed:
    no-outputs`. Above `baseline.MAX_TRACKED` files the exclusion is dropped with

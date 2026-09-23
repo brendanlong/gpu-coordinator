@@ -24,7 +24,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO
 
@@ -751,7 +751,7 @@ class JobRunner:
         if coming_back and queue.next_attempt(self.job_id, ran=outcome.ran) is not None:
             return "queued"
         if outcome.reason == queue.PREEMPTED and queue.stop_requested(self.job_id) == "cancelled":
-            outcome = Outcome("cancelled", "cancelled", outcome.exit_code)
+            outcome = replace(outcome, status="cancelled", reason="cancelled")
         if jobs.finish(self.job_id, outcome, problems=problems) is None:
             self._log(log, "state was no longer `running` at the end; nothing written")
             return None
