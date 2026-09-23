@@ -504,7 +504,9 @@ hold to, whatever the flags:
   and that is the answer, exit 0; an `Unaskable` one may still hold the job,
   so `wait` retries it for `wait.TROUBLE_GRACE_S` before the mirror, `logs`
   prints the mirror's copy but exits 1 with the reason, and every other verb
-  is exit 1 with the reason. A `Gone` rental's registry entry is forgotten
+  is exit 1 with the reason. What a `Gone` host's job became is read by
+  `actions.read_mirror` and nothing else: its final state, or why there is
+  none, and then the job went with its host and the command fails saying so. A `Gone` rental's registry entry is forgotten
   where it is found (`forget_gone_rentals`) by a command somebody typed, never
   by the dashboard's poll.
 - A session (`remote.open_session`) reads the host's own `config.json` fresh
@@ -516,9 +518,12 @@ hold to, whatever the flags:
   `reorder`, `estimate`, `requeue` and `ssh` resolve a job id the same way
   (`actions.locate`): the job index (`s3index.JobIndex`, the local index then
   the mirror's), then asking each host. An id no host knows is exit 4 only
-  once every host has answered. A host the index names that this machine has
-  no entry for is `Gone`; one whose registry entry this build could not read
-  is `Unaskable`. Every per-job verb runs through `actions.job_verb`: locate
+  once every host has answered. A host name this machine has no entry for,
+  whether the index or `--host` gave it, is `Gone`; one whose registry entry
+  this build could not read is `Unaskable`. (`requeue --host` and `ssh --host`
+  name a destination, not the job's host, and are exit 4 for an unknown one.)
+  A per-job verb on a `Gone` host answers from the mirror: `cancel` with the
+  job's final status, the rest refused with it. Every per-job verb runs through `actions.job_verb`: locate
   the job, ask its host over the one session the lookup opened, insist on a
   verdict, re-mirror a spec field it changed. A host's refusal is its
   `{error}` document; one that also says `missing` is "no such job", exit 4.
@@ -602,7 +607,7 @@ free to be killed. Each round sends **one `status` per host** rather than one
 per job, backing off from 2 s to 30 s unless `--interval` pins it.
 
 - A host in trouble is handled by the one rule under *Control side*;
-  `actions.mirrored_outcome` is the one reader of a mirrored `state.json`, and
+  `actions.read_mirror` is the one reader of a mirrored `state.json`, and
   only if that has no terminal state does the job get an `error`.
 - An id whose host answers and does not list it is exit 4, decided after the
   first poll: for `logs -f` at once, for `wait` once the other jobs named have
@@ -892,7 +897,10 @@ What `status` prints, and every flag, is usage.md. The invariants:
 - A host is in one of three states (`status.HostState`), the three answers of
   `remote.ask` under *Control side*, read everywhere else: `UNASKABLE` is
   printed with the reason as its `ERROR` line and is a failure; `GONE` is not,
-  and the entry is forgotten as it is printed. For a pod the provider reports
+  its finished jobs are the mirror's, and the entry is forgotten as it is
+  printed. A gone host is shown when it was found gone this run, is named with
+  `--host`, or with `--since` has a job the mirror says ended in the window;
+  each reads at most `actions.MIRROR_STATE_LOOKUPS` `state.json`s. For a pod the provider reports
   stopped or gone no ssh is attempted, and the reason is what the provider
   said. One `actions.status` builds the text form, `--json` and the
   dashboard's document, including `--all`'s `unhosted` list, each job in it

@@ -29,6 +29,7 @@ from gpuc.control.actions import (
     EXIT_NOT_FOUND,
     EXIT_OK,
     EXIT_USAGE,
+    INDEX_SHORT,
     Answer,
     CliError,
     Interrupted,
@@ -552,7 +553,9 @@ def cmd_status(args: argparse.Namespace) -> Answer:
         if args.json
         else lambda v: print(status_mod.render(v, recent=args.recent, since_s=since_s))
     )
-    result = status(read, settings, host=args.host, all_jobs=args.all, on_view=show)
+    result = status(
+        read, settings, host=args.host, all_jobs=args.all, since_s=since_s, on_view=show
+    )
     forget_gone_rentals(result.views)
     lines: list[str] = []
     if read.unreadable:
@@ -563,7 +566,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
     elif not result.views:
         lines.append(NO_HOSTS)
     if result.index_error:
-        note(f"{result.index_error}; the list of index-only jobs may be short")
+        note(f"{result.index_error}; {INDEX_SHORT}")
     unhosted = result.unhosted_text(args.host)
     if unhosted:
         lines.append(unhosted)
@@ -582,7 +585,13 @@ def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
     entry = registry.hosts.get(args.target)
     if entry is not None:
         return entry, entry.remote_home, None
-    entry = locate(args.target, registry, args.host, skipped=read.skipped).require_entry()
+    # A shell needs a host to open, so a `--host` this machine does not have
+    # is "no host named", not the gone host every read of a job treats it as.
+    entry = (
+        registry.require(args.host)
+        if args.host
+        else locate(args.target, registry, None, skipped=read.skipped).require_entry()
+    )
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
     return entry, f"{job_dir}/workdir", job_dir
 

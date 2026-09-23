@@ -24,11 +24,12 @@ from gpuc.control.actions import (
     EXIT_NOT_FOUND,
     EXIT_OK,
     Answer,
+    Mirrored,
     NotFound,
     locate,
     mirror_is_the_answer,
-    mirrored_outcome,
     provider_for,
+    read_mirror,
 )
 from gpuc.control.config import HostEntry, Reporter, Settings, load_settings, open_registry
 from gpuc.control.jsonout import note
@@ -345,24 +346,23 @@ class Watch:
             # is gone. A rental that idled itself down after finishing the job
             # is exactly that, and reporting its success as "could not ask"
             # would be wrong about the one run the user was waiting for.
-            if self._from_mirror(watched):
+            mirrored = self._from_mirror(watched)
+            if mirrored.view is not None:
                 continue
             watched.error = (
-                f"host {name} cannot be asked and the mirror has no final state for this job: {why}"
+                f"host {name} is gone ({why}), and {mirrored.lost}"
                 if gone
                 else f"host {name} could not be asked for {waited}: {why}"
             )
 
-    def _from_mirror(self, watched: Watched) -> bool:
+    def _from_mirror(self, watched: Watched) -> Mirrored:
         """This job's outcome from S3, if the mirror has a terminal one."""
-        found = mirrored_outcome(self.index, watched.job_id, watched.mirror_prefix)
-        if found is None:
-            return False
-        view, uri = found
-        self.report(f"read {watched.job_id} from the mirror at {uri}")
-        watched.view = view
-        watched.source = "mirror"
-        return True
+        mirrored = read_mirror(self.index, watched.job_id, watched.mirror_prefix)
+        if mirrored.view is not None:
+            self.report(f"read {watched.job_id} from the mirror at {mirrored.uri}")
+            watched.view = mirrored.view
+            watched.source = "mirror"
+        return mirrored
 
     def _clear_trouble(self, name: str) -> None:
         if self._trouble.pop(name, None) is not None:

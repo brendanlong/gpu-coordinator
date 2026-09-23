@@ -1304,7 +1304,7 @@ def test_a_bad_workdir_days_value_is_rejected(
 
 
 def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:
-    from gpuc.control.actions import _outputs_lost_ids
+    from gpuc.control.actions import _mirrored_states
     from gpuc.control.s3index import IndexEntry, JobIndex, S3Index
 
     client = FakeS3Client(
@@ -1319,9 +1319,10 @@ def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path)
     ]
     index = JobIndex(Settings(s3_bucket="bucket"))
     index.s3 = S3Index("bucket", client)
-    assert _outputs_lost_ids(index, entries) == {"lost"}
+    states = _mirrored_states(index, entries)
+    assert {job_id for job_id, state in states.items() if state.get("outputs_lost")} == {"lost"}
     # No bucket configured: no mirror to read, so nothing is flagged.
-    assert _outputs_lost_ids(JobIndex(Settings()), entries) == set()
+    assert _mirrored_states(JobIndex(Settings()), entries) == {}
 
 
 def test_submit_and_requeue_both_take_no_git() -> None:

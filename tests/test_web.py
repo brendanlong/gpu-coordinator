@@ -356,7 +356,7 @@ def test_status_narrows_to_one_host_and_refuses_a_bad_since(
     status, document = logged_in.get_json("/api/status?host=gpubox&recent=1&since=24h")
     assert status == 200 and len(document["hosts"]) == 1
     status, document = logged_in.get_json("/api/status?host=nope")
-    assert status == 404 and "no host named 'nope'" in document["error"]
+    assert status == 200 and document["hosts"][0]["state"] == "gone"
     status, document = logged_in.get_json("/api/status?since=soon")
     assert status == 400 and document["exit_code"] == EXIT_USAGE
 
@@ -466,6 +466,7 @@ def test_cancel_is_the_cancel_command(logged_in: Client, stub: StubSession) -> N
         "job_id": RUNNING_JOB,
         "host": "gpubox",
         "status": "cancelling",
+        "source": "host",
     }
     assert stub.commands == [f"cancel {RUNNING_JOB}"]
 

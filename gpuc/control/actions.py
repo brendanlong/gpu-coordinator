@@ -270,10 +270,11 @@ class StatusResult:
     was never meant to cover an entry that is not X."""
     unhosted: list[IndexEntry] = field(default_factory=list)
     """`--all`: the jobs only the index knows, in id order."""
-    lost: set[str] = field(default_factory=set)
-    """Which of `unhosted` the mirror records as having lost their outputs."""
+    mirrored: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """The mirrored `state.json` of the first of `unhosted`, by id."""
     index_error: str | None = None
-    """Why `unhosted` may be short: an S3 index that could not be read."""
+    """Why `unhosted`, or a gone host's jobs, may be short: an S3 index that
+    could not be read."""
 
     @property
     def errors(self) -> list[str]:
@@ -284,7 +285,7 @@ class StatusResult:
                 f"{hosts_file()} could not be read, so `hosts` is empty because nothing is known"
             )
         if self.index_error:
-            errors.append(f"{self.index_error}; the list of index-only jobs may be short")
+            errors.append(f"{self.index_error}; {INDEX_SHORT}")
         return errors
 
     @property
@@ -305,6 +306,18 @@ class StatusResult:
             job.job_id for view in self.views for job in view.queue + view.running + view.finished
         }
 
+    def lost(self, entry: IndexEntry) -> bool:
+        """The mirror records this job as having lost its outputs."""
+        return bool((self.mirrored.get(entry.job_id) or {}).get("outputs_lost"))
+
+    def final_status(self, entry: IndexEntry) -> str | None:
+        """The mirror's final status for a job whose host is gone, and only
+        then: for any other host the mirror is not the answer."""
+        if self.host_state(entry) is not status_mod.HostState.GONE:
+            return None
+        found = (self.mirrored.get(entry.job_id) or {}).get("status")
+        return found if found in FINISHED_STATUSES else None
+
     def host_state(self, entry: IndexEntry) -> status_mod.HostState:
         """What this run found the job's host to be. A host with no registry
         entry here is gone (a rental that ended was forgotten); one whose
@@ -324,7 +337,10 @@ class StatusResult:
             errors=self.errors,
             unhosted=[
                 status_mod.unhosted_json(
-                    entry, lost=entry.job_id in self.lost, state=self.host_state(entry)
+                    entry,
+                    lost=self.lost(entry),
+                    state=self.host_state(entry),
+                    final=self.final_status(entry),
                 )
                 for entry in self.unhosted
             ],
@@ -339,7 +355,10 @@ class StatusResult:
         lines = [f"jobs known only to the index{scope}:"]
         lines += [
             status_mod.unhosted_line(
-                entry, lost=entry.job_id in self.lost, state=self.host_state(entry)
+                entry,
+                lost=self.lost(entry),
+                state=self.host_state(entry),
+                final=self.final_status(entry),
             )
             for entry in self.unhosted
         ]
@@ -370,12 +389,38 @@ class StatusResult:
         )
 
 
+INDEX_SHORT = "the jobs read from the index may be short"
+
+
+class IndexRead:
+    """The job index, read at most once per command and only if something
+    needs it: listing the S3 index is a request per job."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.index = JobIndex(settings)
+        self._read: tuple[dict[str, IndexEntry], str | None] | None = None
+
+    def all(self) -> tuple[dict[str, IndexEntry], str | None]:
+        if self._read is None:
+            self._read = self.index.all()
+        return self._read
+
+    @property
+    def error(self) -> str | None:
+        """Why what was read may be short; None if nothing was read."""
+        return self._read[1] if self._read is not None else None
+
+    def on(self, host: str) -> list[IndexEntry]:
+        return [entry for entry in self.all()[0].values() if entry.host == host]
+
+
 def status(
     read: RegistryRead,
     settings: Settings,
     *,
     host: str | None = None,
     all_jobs: bool = False,
+    since_s: float | None = None,
     on_view: Callable[[status_mod.HostView], None] | None = None,
     report: Callable[[str], None] = note,
 ) -> StatusResult:
@@ -387,19 +432,111 @@ def status(
     the text form can print each block without waiting for the slowest.
     Nothing here writes the registry: forgetting a rental that has ended is
     `forget_gone_rentals`, which only a typed command calls.
+
+    A gone host's jobs are the mirror's (`gone_view`). Which gone hosts are
+    shown: one found gone this run, one named with `--host`, and with
+    `--since` one the index knows that has a job that ended in the window --
+    every rental ever used would bury the hosts that exist, and a job that
+    ended last month is not what anyone polling `status` is waiting for.
     """
     result = StatusResult(read, every_host=host is None)
-    entries = read.registry.listing(host) if not read.unreadable else []
-    provider = provider_for(entries, settings, report) if entries else None
-    for view in gather_all(entries, settings, provider):
+    index = IndexRead(settings)
+    registry = read.registry if not read.unreadable else Registry()
+    entries = [entry for name, entry in registry.hosts.items() if host in (None, name)]
+
+    def shown(view: status_mod.HostView) -> None:
         result.views.append(view)
         if on_view is not None:
             on_view(view)
+
+    provider = provider_for(entries, settings, report) if entries else None
+    for view in gather_all(entries, settings, provider):
+        if view.gone:
+            fill_from_mirror(view, index.index, index.on(view.entry.name))
+        shown(view)
+    if host is not None and host not in registry.hosts and not read.unreadable:
+        if host in read.skipped:
+            shown(
+                status_mod.HostView(
+                    HostEntry(name=host), error=unreadable_entry(host).reason, registered=False
+                )
+            )
+        else:
+            shown(gone_view(host, index.index, index.on(host)))
+    elif host is None and since_s is not None and not read.unreadable:
+        for view in gone_since(index, registry, read.skipped, since_s, report):
+            shown(view)
+    result.index_error = index.error
     if all_jobs:
-        result.unhosted, result.lost, result.index_error = unhosted_jobs(
-            settings, result.seen, host
-        )
+        result.unhosted, result.mirrored, short = unhosted_jobs(index, result.seen, host)
+        result.index_error = result.index_error or short
     return result
+
+
+def gone_view(name: str, index: JobIndex, entries: Sequence[IndexEntry]) -> status_mod.HostView:
+    """A host this machine has no entry for, with what the mirror holds of it."""
+    view = status_mod.HostView(
+        HostEntry(name=name),
+        state=status_mod.HostState.GONE,
+        error=not_registered(name).reason,
+        registered=False,
+    )
+    fill_from_mirror(view, index, entries)
+    return view
+
+
+def fill_from_mirror(
+    view: status_mod.HostView, index: JobIndex, entries: Sequence[IndexEntry]
+) -> None:
+    """A gone host's finished jobs, as the mirror has them.
+
+    The newest `MIRROR_STATE_LOOKUPS` of them, one GET each. A job with no
+    final state in the mirror is not listed: it went with its host, and
+    `--all` lists it for `gpuc requeue`.
+    """
+    cached = view.entry.config.s3_prefix if view.registered else None
+    view.mirror_prefix = cached
+    newest = sorted(entries, key=lambda entry: entry.job_id, reverse=True)
+    for entry in newest[:MIRROR_STATE_LOOKUPS]:
+        found = read_mirror(index, entry.job_id, entry.s3_prefix or cached, entry)
+        if found.view is not None:
+            view.finished.append(found.view)
+    view.finished.sort(key=lambda job: job.ended_at or "", reverse=True)
+
+
+def gone_since(
+    index: IndexRead,
+    registry: Registry,
+    skipped: Collection[str],
+    since_s: float,
+    report: Callable[[str], None],
+) -> list[status_mod.HostView]:
+    """`--since`: every host the index knows and this machine does not, that
+    has a job the mirror says ended in the window.
+
+    The mirror is read for the newest `MIRROR_STATE_LOOKUPS` of their jobs in
+    all, not per host: the index keeps every rental ever used, and a job
+    that ended in the window was, nearly always, submitted recently too.
+    """
+    candidates = sorted(
+        (
+            entry
+            for entry in index.all()[0].values()
+            if entry.host and entry.host not in registry.hosts and entry.host not in skipped
+        ),
+        key=lambda entry: entry.job_id,
+        reverse=True,
+    )
+    if len(candidates) > MIRROR_STATE_LOOKUPS:
+        report(
+            f"read the newest {MIRROR_STATE_LOOKUPS} of {len(candidates)} jobs on hosts that "
+            f"are gone from the mirror; `gpuc status --host <name>` reads one host's"
+        )
+    by_host: dict[str, list[IndexEntry]] = {}
+    for entry in candidates[:MIRROR_STATE_LOOKUPS]:
+        by_host.setdefault(entry.host, []).append(entry)
+    views = [gone_view(name, index.index, by_host[name]) for name in sorted(by_host)]
+    return [view for view in views if any(status_mod.within(job, since_s) for job in view.finished)]
 
 
 def forget_gone_rentals(
@@ -415,7 +552,7 @@ def forget_gone_rentals(
     nobody watching.
     """
     for view in views:
-        if view.gone:
+        if view.gone and view.registered:
             report(f"forgetting host {view.entry.name}: its pod is gone")
             forget_host(view.entry.name, view.entry.pod_id, report)
 
@@ -646,6 +783,25 @@ class Location:
         return self.entry
 
 
+def not_registered(name: str) -> Gone:
+    """A host name this machine has no entry for. The same state as a pod the
+    provider reports terminated, because it becomes one: the first `gpuc
+    status` that sees a rental's pod gone forgets its entry, and the next
+    command about one of its jobs must not start answering differently."""
+    return Gone(
+        f"host {name} is not registered on this machine (a rental that ended is "
+        f"forgotten), so it cannot be asked"
+    )
+
+
+def unreadable_entry(name: str) -> Unaskable:
+    return Unaskable(
+        f"host {name}'s registry entry could not be read (see the warning above), so it "
+        f"was not asked; fix the entry, or register the host again with "
+        f"`gpuc host add {name} --pod <id>`"
+    )
+
+
 def locate(
     job_id: str,
     registry: Registry,
@@ -656,7 +812,9 @@ def locate(
     skipped: Collection[str] = (),
 ) -> Location:
     """The host a job is on: `--host` if given, else the index (local, then
-    the mirror), else whichever registered host admits to it.
+    the mirror), else whichever registered host admits to it. A `--host` this
+    machine has no entry for is `Gone`, like any other name it does not have:
+    naming the host must not make the answer worse than leaving it out.
 
     A name in the mirror's index is the *submitting* client's name for the
     host, which need not be this machine's: it is asked first, not believed.
@@ -673,27 +831,22 @@ def locate(
     connection error.
     """
     settings = settings if settings is not None else load_settings()
-    if explicit:
-        # The local index only: the caller already knows the host, and the
-        # entry is a convenience for whoever wants the mirror prefix.
-        entry = registry.require(explicit)
-        return Location(entry.name, entry, LocalIndex().get(job_id))
     local = LocalIndex().get(job_id)
+    if explicit:
+        # Not asked: the caller already knows the host, and the poll or the
+        # verb that follows asks it anyway.
+        entry = registry.hosts.get(explicit)
+        if entry is not None:
+            return Location(entry.name, entry, local)
+        if explicit in skipped:
+            return Location(explicit, None, local, unreadable_entry(explicit))
+        return Location(explicit, None, local, not_registered(explicit))
     if local is not None and local.host in registry.hosts:
         return Location(local.host, registry.hosts[local.host], local)
     index = local or JobIndex(settings).get(job_id)
     named = registry.hosts.get(index.host) if index is not None else None
     if index is not None and named is None and index.host in skipped:
-        return Location(
-            index.host,
-            None,
-            index,
-            Unaskable(
-                f"host {index.host}'s registry entry could not be read (see the warning "
-                f"above), so it was not asked; fix the entry, or register the host again "
-                f"with `gpuc host add {index.host} --pod <id>`"
-            ),
-        )
+        return Location(index.host, None, index, unreadable_entry(index.host))
     rest = [entry for entry in registry.hosts.values() if entry is not named]
     provider = provider or provider_for(list(registry.hosts.values()), settings)
     named_trouble: Asked | None = None
@@ -711,15 +864,7 @@ def locate(
     if named is not None and named_trouble is not None:
         return Location(named.name, named, index, named_trouble)
     if index is not None and named is None and not unasked:
-        return Location(
-            index.host,
-            None,
-            index,
-            Gone(
-                f"host {index.host} is not registered on this machine (a rental that ended "
-                f"is forgotten), so it cannot be asked"
-            ),
-        )
+        return Location(index.host, None, index, not_registered(index.host))
     if unasked:
         raise CliError(
             f"no host that answered knows job {job_id}, and these could not be asked:\n"
@@ -732,6 +877,23 @@ def locate(
     )
 
 
+def find_job(job_id: str, host: str | None, settings: Settings) -> Location:
+    read = open_registry()
+    return locate(job_id, read.named(), host, settings, skipped=read.skipped)
+
+
+def mirrored_end(job_id: str, location: Location, settings: Settings) -> Mirrored:
+    """What became of a job whose host is gone, or a failure saying it is lost."""
+    index = JobIndex(settings)
+    mirrored = read_mirror(index, job_id, index.mirror_prefix(job_id, location.entry))
+    if mirrored.view is None:
+        raise CliError(
+            f"job {job_id} was on host {location.host}, which is gone "
+            f"({location.trouble_reason}), and {mirrored.lost}"
+        )
+    return mirrored
+
+
 def job_verb(
     verb: str,
     job_id: str,
@@ -740,6 +902,7 @@ def job_verb(
     *,
     args: str = "",
     mirror: tuple[str, Any] | None = None,
+    location: Location | None = None,
 ) -> tuple[Location, HostSession, dict[str, Any], list[str]]:
     """Run one on-host verb against one job: the path every job command takes.
 
@@ -761,15 +924,24 @@ def job_verb(
     a re-run back with the old one, silently. A mirror that cannot be updated
     is a warning, never a failure: the change is already where `status` reads
     it, which is what was asked for.
+
+    A job whose host is gone has ended, and the verb is refused with how, from
+    the mirror -- as a host refuses a verb on a job that has finished.
     """
-    read = open_registry()
-    location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
+    location = location or find_job(job_id, host, settings)
     trouble = location.trouble
-    if location.entry is None or trouble is not None:
-        gone = trouble is not None and mirror_is_the_answer(trouble)
+    if trouble is not None and mirror_is_the_answer(trouble):
+        ended = mirrored_end(job_id, location, settings)
+        assert ended.view is not None
         raise CliError(
-            f"job {job_id} is on host {location.host}, which "
-            f"{'is gone' if gone else 'could not be asked'}: {location.trouble_reason}"
+            f"cannot {verb} job {job_id}: it ended {ended.view.status} on host "
+            f"{location.host}, which is gone ({trouble.reason}); read from the S3 mirror "
+            f"at {ended.uri}"
+        )
+    if location.entry is None or trouble is not None:
+        raise CliError(
+            f"job {job_id} is on host {location.host}, which could not be asked: "
+            f"{location.trouble_reason}"
         )
     entry = location.entry
     asked = ask(
@@ -805,10 +977,22 @@ def job_verb(
 
 
 def cancel_job(job_id: str, host: str | None, settings: Settings) -> dict[str, Any]:
-    location, _, document, _ = job_verb("cancel", job_id, host, settings)
-    # The host's own word for what it did: `cancelled` for a queued job it
-    # dequeued, `cancelling` for a running one whose runner has been marked.
-    return {"job_id": job_id, "host": location.host, "status": document["status"]}
+    """The host's own word for what it did: `cancelled` for a queued job it
+    dequeued, `cancelling` for a running one whose runner has been marked, a
+    finished job's own status. A job whose host is gone has already ended,
+    and the mirror says how -- the same answer its host would have given."""
+    location = find_job(job_id, host, settings)
+    if isinstance(location.asked, Gone):
+        ended = mirrored_end(job_id, location, settings)
+        assert ended.view is not None
+        return {
+            "job_id": job_id,
+            "host": location.host,
+            "status": ended.view.status,
+            "source": "mirror",
+        }
+    _, _, document, _ = job_verb("cancel", job_id, host, settings, location=location)
+    return {"job_id": job_id, "host": location.host, "status": document["status"], "source": "host"}
 
 
 def check_priority(priority: int) -> None:
@@ -999,8 +1183,7 @@ def read_log(
     asked, the mirror is printed and the command still fails, because the
     host may hold a newer log than the copy.
     """
-    read = open_registry()
-    location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
+    location = find_job(job_id, host, settings)
     reached = location.asked
     if reached is None:
         entry = location.require_entry()
@@ -1054,67 +1237,93 @@ def logs_from_s3(
     purged: bool = False,
     report: Callable[[str], None] = note,
 ) -> LogText:
-    s3 = S3Index.from_settings(settings)
-    prefix = JobIndex(settings).mirror_prefix(job_id, location.entry)
-    if s3 is None or not prefix:
-        gone = (
-            f"Its job dir was purged from host {location.host}, so this log no longer exists "
-            f"anywhere.\n"
+    index = JobIndex(settings)
+    prefix = index.mirror_prefix(job_id, location.entry)
+    missing = unmirrored(index, job_id, prefix)
+    if index.s3 is None or not prefix:
+        purge = (
+            f"; its job dir was purged from host {location.host}, so this log no longer exists "
+            f"anywhere"
             if purged
             else ""
         )
-        raise CliError(
-            f"no S3 mirror to fall back on for {job_id}.\n"
-            f"{gone}"
-            f"Set s3_bucket in ~/.config/gpu-coordinator/config.toml to keep logs after a "
-            f"host goes away."
-        )
+        raise CliError(f"no S3 mirror to fall back on: {missing}{purge}")
+    s3 = index.s3
     uri = job_log_uri(prefix, job_id)
     fallback = f"falling back to the S3 mirror at {uri}"
     report(fallback)
     return LogText("s3", uri, s3.get_uri(uri), [fallback])
 
 
-def mirrored_outcome(
-    index: JobIndex, job_id: str, prefix: str | None
-) -> tuple[status_mod.JobView, str] | None:
-    """A job's terminal state from the S3 mirror, and where it was read, or
-    None when the mirror has no terminal state for it.
+@dataclass
+class Mirrored:
+    """What the mirror holds of a job whose host is gone: its final state and
+    where that was read, or -- `view` None -- why there is none, which means
+    the job went with its host."""
 
-    The one reader of a mirrored `state.json`: what `gpuc wait` and `gpuc logs
-    -f` fall back to once a host is gone, per the spec's "the mirror is read
-    only when the host is gone". Through `job_views`, so another build's
-    state.json is read as tolerantly here as a host's own answer is. The two
-    fields the file cannot carry are supplied: `name` lives in the spec, and
-    `outputs_pending` is the host's own check against the spec, which is why a
-    mirrored `outputs_lost` has to stand on its own here -- this is the
-    dead-rental case, and it is the same case that loses outputs.
+    view: status_mod.JobView | None = None
+    uri: str | None = None
+    lost: str = ""
+
+
+def unmirrored(index: JobIndex, job_id: str, prefix: str | None) -> str | None:
+    """Why this job has no mirror to read at all, or None when it has one."""
+    if index.s3 is None:
+        return f"s3_bucket is unset in {config_file()}, so nothing of job {job_id} is mirrored"
+    if not prefix:
+        return f"no mirror location is known for job {job_id}"
+    return None
+
+
+def read_mirror(
+    index: JobIndex, job_id: str, prefix: str | None, indexed: IndexEntry | None = None
+) -> Mirrored:
+    """A job's final state from the S3 mirror: what every command answers
+    with once the job's host is gone, per the spec's "the mirror is read only
+    when the host is gone".
+
+    The one reader of a mirrored `state.json`, through `job_views`, so another
+    build's state.json is read as tolerantly here as a host's own answer is.
+    The two fields the file cannot carry are supplied: `name` lives in the
+    spec, and `outputs_pending` is the host's own check against the spec,
+    which is why a mirrored `outputs_lost` has to stand on its own here --
+    this is the dead-rental case, and it is the same case that loses outputs.
+    A state that is not terminal is no answer: the host went before the job
+    ended, or before the mirror caught up, and either way nothing will end it.
     """
+    missing = unmirrored(index, job_id, prefix)
+    if missing is not None or prefix is None:
+        return Mirrored(lost=f"{missing}, so it went with its host")
+    uri = job_uri(prefix, job_id, "state.json")
     document = index.mirrored_state(job_id, prefix)
-    if document is None or not prefix:
-        return None
-    indexed = index.get(job_id)
-    _, _, finished = status_mod.job_views(
-        {
-            "jobs": [
-                {
-                    **document,
-                    "job_id": job_id,
-                    "name": (indexed.name if indexed else "") or "",
-                    "outputs_pending": bool(document.get("outputs_lost")),
-                }
-            ]
-        }
-    )
-    view = next((v for v in finished if v.status in FINISHED_STATUSES), None)
+    view = None
+    if document is not None:
+        indexed = indexed or index.get(job_id)
+        _, _, finished = status_mod.job_views(
+            {
+                "jobs": [
+                    {
+                        **document,
+                        "job_id": job_id,
+                        "name": (indexed.name if indexed else "") or "",
+                        "outputs_pending": bool(document.get("outputs_lost")),
+                    }
+                ]
+            }
+        )
+        view = next((v for v in finished if v.status in FINISHED_STATUSES), None)
     if view is None:
-        return None
-    return view, job_uri(prefix, job_id, "state.json")
+        return Mirrored(
+            uri=uri,
+            lost=f"the mirror has no final state for job {job_id} at {uri}, so its host went "
+            f"before it ended and it never will",
+        )
+    return Mirrored(view, uri)
 
 
 def unhosted_jobs(
-    settings: Settings, seen: set[str], host: str | None = None
-) -> tuple[list[IndexEntry], set[str], str | None]:
+    index: IndexRead, seen: set[str], host: str | None = None
+) -> tuple[list[IndexEntry], dict[str, dict[str, Any]], str | None]:
     """The index's view of jobs no host admitted to having, and whether that is
     all of it: an S3 index that could not be read leaves this list short.
 
@@ -1125,10 +1334,10 @@ def unhosted_jobs(
     host that could not be asked, so each entry is labelled with what its
     host was found to be (`StatusResult.host_state`) before anyone acts on it.
 
-    Returns the entries, the ids among them whose outputs the mirror records as
-    lost, and why the list may be short (None when the index was read in full).
+    Returns the entries, the mirrored `state.json` of the first
+    `MIRROR_STATE_LOOKUPS` of them by id, and why the list may be short (None
+    when the index was read in full).
     """
-    index = JobIndex(settings)
     entries, short = index.all()
     elsewhere = [
         entry
@@ -1136,23 +1345,22 @@ def unhosted_jobs(
         if job_id not in seen and (host is None or entry.host == host)
     ]
     if not elsewhere:
-        return [], set(), short
-    return elsewhere, _outputs_lost_ids(index, elsewhere[:MIRROR_STATE_LOOKUPS]), short
+        return [], {}, short
+    return elsewhere, _mirrored_states(index.index, elsewhere[:MIRROR_STATE_LOOKUPS]), short
 
 
 MIRROR_STATE_LOOKUPS = 25
-"""How many index-only jobs `--all` reads `state.json` for. One GET each, and
-the answer (did this job's outputs make it off the host?) matters most for the
-handful at the top of a recovery list."""
+"""How many jobs a `status` reads `state.json` for, per list it reads them
+for. One GET each, and the answer matters most for the handful at the top."""
 
 
-def _outputs_lost_ids(index: JobIndex, entries: Sequence[IndexEntry]) -> set[str]:
-    """Which of these jobs the mirror records as having lost their outputs.
-    Best effort: a job whose state.json is missing or unreadable is not
-    flagged, which is a note missing from a listing and nothing more."""
-    lost: set[str] = set()
+def _mirrored_states(index: JobIndex, entries: Sequence[IndexEntry]) -> dict[str, dict[str, Any]]:
+    """Each job's mirrored `state.json`, by id. Best effort: a job whose
+    state.json is missing or unreadable is left out, which is a note missing
+    from a listing and nothing more."""
+    found: dict[str, dict[str, Any]] = {}
     for entry in entries:
         document = index.mirrored_state(entry.job_id, entry.s3_prefix)
-        if document and document.get("outputs_lost"):
-            lost.add(entry.job_id)
-    return lost
+        if document is not None:
+            found[entry.job_id] = document
+    return found

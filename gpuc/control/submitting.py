@@ -242,20 +242,26 @@ def requeue_job(
         check_gpu_count(model, rental.gpu_count)
         entry = rent_host(rental, settings, report)
     else:
-        # Where the job ran, by the same lookup every other job command uses:
-        # the index, then every registered host. A second client with no
-        # index of its own still finds it, and an id nobody knows is exit 4.
+        # `--host` is where it goes, so it has to be one this machine has.
+        # Otherwise where the job ran, by the same lookup every other job
+        # command uses: the index, then every registered host. A second
+        # client with no index of its own still finds it, and an id nobody
+        # knows is exit 4.
         read = open_registry()
-        location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
-        trouble = location.trouble
-        if location.entry is None or trouble is not None:
-            gone = trouble is not None and mirror_is_the_answer(trouble)
-            raise CliError(
-                f"job {job_id} ran on host {location.host}, which "
-                f"{'is gone' if gone else 'could not be asked'}: {location.trouble_reason}\n"
-                f"Name another host with --host, or --runpod."
-            )
-        entry, session = location.entry, location.session
+        if host:
+            entry = read.require(host)
+        else:
+            location = locate(job_id, read.named(), None, settings, skipped=read.skipped)
+            trouble = location.trouble
+            if location.entry is None or trouble is not None:
+                gone = trouble is not None and mirror_is_the_answer(trouble)
+                raise CliError(
+                    f"job {job_id} ran on host {location.host}, which "
+                    f"{'is gone' if gone else 'could not be asked'}: "
+                    f"{location.trouble_reason}\n"
+                    f"Name another host with --host, or --runpod."
+                )
+            entry, session = location.entry, location.session
     return enqueue(
         entry,
         prepared,

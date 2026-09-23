@@ -265,8 +265,8 @@ class HostState(Enum):
     """Could not be asked and may still hold its jobs: a failure, with the
     reason in `error`."""
     GONE = "gone"
-    """Does not exist any more. Not a failure; `actions.forget_gone_rentals`
-    forgets the entry."""
+    """Does not exist any more. Not a failure: its finished jobs are the
+    mirror's, and `actions.forget_gone_rentals` forgets the entry."""
 
 
 @dataclass
@@ -274,6 +274,9 @@ class HostView:
     entry: HostEntry
     state: HostState = HostState.UNASKABLE
     error: str | None = None
+    registered: bool = True
+    """False for a name this machine has no entry for, whose `entry` is only
+    the name: there is no address to print and none to forget."""
     heartbeat_age_s: float | None = None
     draining: bool = False
     owned: list[str] = field(default_factory=list)
@@ -777,6 +780,35 @@ def within(job: JobView, since_s: float | None, now: datetime | None = None) -> 
     return ((now or datetime.now(UTC)) - ended).total_seconds() <= since_s
 
 
+def _finished_lines(view: HostView, *, recent: int, since_s: float | None) -> list[str]:
+    lines: list[str] = []
+    finished = [job for job in view.finished if within(job, since_s)]
+    for job in finished[:recent]:
+        # `cancelled (cancelled)` says nothing twice: only a reason that adds
+        # to the status is worth the parenthesis.
+        reason = job.reason if job.reason != job.status else None
+        detail = reason or (f"exit {job.exit_code}" if job.exit_code else "")
+        if job.problems:
+            detail = ", ".join(filter(None, [detail, *job.problems]))
+        flag = ""
+        if job.outputs_lost and job.outputs_pending:
+            # `outputs_lost` is written once and never cleared, so it outlives
+            # the thing it describes: a job the host now reports as holding
+            # nothing is not a lost result, whatever a past drain concluded.
+            flag = "  OUTPUTS LOST"
+        elif job.outputs_pending:
+            flag = "  outputs not uploaded"
+        lines.append(
+            f"  done    {job_label(job)} {job.status}"
+            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
+        )
+    if since_s is not None and not finished and view.finished:
+        lines.append(
+            f"  done    none in the last {int(since_s // 60)} min ({len(view.finished)} older)"
+        )
+    return lines
+
+
 def render(
     view: HostView,
     *,
@@ -788,18 +820,21 @@ def render(
     if not view.reachable:
         # A gone host's reason is not a failure, so it is not an ERROR line.
         state, prefix = ("GONE", "") if view.gone else ("UNASKABLE", "ERROR ")
-        lines = [
-            f"host {entry.name} [{entry.kind}] {target}: {state}",
-            f"  {prefix}{view.error}",
-        ]
+        where = f" [{entry.kind}] {target}" if view.registered else ""
+        lines = [f"host {entry.name}{where}: {state}", f"  {prefix}{view.error}"]
         pod = pod_line(view.pod)
         if pod:
             lines.append(pod)
-        elif not view.gone:
+        elif not view.gone and view.registered:
             # No provider's word to read next, so the probe is the next step;
             # a pod line is what to read when there is one, and a stopped
             # pod's reason already names the commands that end or forget it.
             lines.append(f"  try: gpuc host probe {entry.name}")
+        if view.gone:
+            finished = _finished_lines(view, recent=recent, since_s=since_s)
+            if finished:
+                lines.append("  from the S3 mirror:")
+            lines += finished
         return "\n".join(lines)
     flags = []
     if view.draining:
@@ -854,30 +889,7 @@ def render(
     free = next_free_line(view)
     if free:
         lines.append(free)
-    finished = [job for job in view.finished if within(job, since_s)]
-    for job in finished[:recent]:
-        # `cancelled (cancelled)` says nothing twice: only a reason that adds
-        # to the status is worth the parenthesis.
-        reason = job.reason if job.reason != job.status else None
-        detail = reason or (f"exit {job.exit_code}" if job.exit_code else "")
-        if job.problems:
-            detail = ", ".join(filter(None, [detail, *job.problems]))
-        flag = ""
-        if job.outputs_lost and job.outputs_pending:
-            # `outputs_lost` is written once and never cleared, so it outlives
-            # the thing it describes: a job the host now reports as holding
-            # nothing is not a lost result, whatever a past drain concluded.
-            flag = "  OUTPUTS LOST"
-        elif job.outputs_pending:
-            flag = "  outputs not uploaded"
-        lines.append(
-            f"  done    {job_label(job)} {job.status}"
-            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
-        )
-    if since_s is not None and not finished and view.finished:
-        lines.append(
-            f"  done    none in the last {int(since_s // 60)} min ({len(view.finished)} older)"
-        )
+    lines += _finished_lines(view, recent=recent, since_s=since_s)
     at_risk = view.outputs_at_risk
     if at_risk:
         # Worth a line of its own: these are the jobs whose results a purge (or
@@ -1103,10 +1115,13 @@ def host_json(
     finished = [job for job in view.finished if within(job, since_s)][:recent]
     return {
         "name": entry.name,
-        "kind": entry.kind,
+        "kind": entry.kind if view.registered else None,
         "target": entry.ssh,
         "state": view.state.value,
         "reachable": view.reachable,
+        # Where the job lists came from: a gone host's finished jobs are the
+        # mirror's, and nothing else is listed for it.
+        "source": {HostState.ANSWERED: "host", HostState.GONE: "mirror"}.get(view.state),
         "draining": view.draining,
         # The host's own answer, so null means the host did not say, never
         # "current".
@@ -1161,13 +1176,17 @@ def requeue_offered(state: HostState) -> bool:
     return state in (HostState.ANSWERED, HostState.GONE)
 
 
-def unhosted_json(entry: IndexEntry, *, lost: bool, state: HostState) -> dict[str, Any]:
-    """One job only the index knows, as `status --all --json` lists it."""
+def unhosted_json(
+    entry: IndexEntry, *, lost: bool, state: HostState, final: str | None = None
+) -> dict[str, Any]:
+    """One job only the index knows, as `status --all --json` lists it.
+    `final` is the mirror's final status for a job whose host is gone."""
     return {
         "job_id": entry.job_id,
         "name": entry.name,
         "host": entry.host,
         "host_state": state.value,
+        "status": final,
         "requeue": requeue_offered(state),
         "requeued_from": entry.requeued_from,
         "submitted_at": entry.submitted_at,
@@ -1176,13 +1195,16 @@ def unhosted_json(entry: IndexEntry, *, lost: bool, state: HostState) -> dict[st
     }
 
 
-def unhosted_line(entry: IndexEntry, *, lost: bool, state: HostState) -> str:
+def unhosted_line(
+    entry: IndexEntry, *, lost: bool, state: HostState, final: str | None = None
+) -> str:
     flag = " OUTPUTS LOST (the host went away before they uploaded)" if lost else ""
     label = f"{entry.name} ({entry.job_id})" if entry.name else entry.job_id
     origin = f" requeued from {entry.requeued_from}" if entry.requeued_from else ""
+    ended = f", and ended {final} per the S3 mirror" if final else ""
     return (
         f"  {label} host={entry.host}{origin} submitted {format_age(entry.submitted_at)}: "
-        f"{UNHOSTED_LABELS[state]}{flag}"
+        f"{UNHOSTED_LABELS[state]}{ended}{flag}"
     )
 
 
