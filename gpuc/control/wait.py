@@ -332,7 +332,7 @@ class Watch:
         now = time.monotonic()
         since, said = self._trouble.get(name, (now, ""))
         if said != why:
-            self.report(f"host {name}: {why}; still waiting")
+            self.report(f"host {name}: {why}" if gone else f"host {name}: {why}; still waiting")
         self._trouble[name] = (since, why)
         # A host that is gone (`mirror_is_the_answer`) is not going to answer,
         # however long we wait: it is the one case the mirror exists for, so

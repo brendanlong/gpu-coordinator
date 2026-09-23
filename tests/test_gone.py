@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from gpuc.control import wait as wait_mod
-from gpuc.control.cli import EXIT_ERROR, EXIT_OK, main
+from gpuc.control.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
 from gpuc.control.config import config_file, registry_transaction
 from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
@@ -232,3 +232,51 @@ def test_ssh_to_a_job_on_a_host_this_machine_does_not_have_is_still_no_such_host
     """A shell needs a host to open: there `--host` names a destination."""
     assert main(["ssh", "--host", "nope", "--print", JOB]) == 4
     assert "no host named 'nope'" in capsys.readouterr().err
+
+
+# -- a typo is not a rental that ended ------------------------------------------
+
+
+def test_a_typod_host_for_a_job_the_index_puts_elsewhere_is_no_such_host(
+    control_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    no_sleep: None,
+) -> None:
+    """Otherwise the mirror's stale copy of a job still running on its real
+    host would be printed as the answer, or the job reported lost."""
+    mirror(monkeypatch, {JOB: {"status": "running", "started_at": ago(hours=1)}}, host="box")
+    with registry_transaction() as registry:
+        registry.put(host_entry(name="box", kind="ssh", ssh="me@box"))
+    for command in ("logs", "wait", "cancel"):
+        assert main([command, JOB, "--host", "boxx"]) == EXIT_NOT_FOUND, command
+        err = capsys.readouterr().err
+        assert "no host named 'boxx'" in err and "on host box" in err, command
+
+
+def test_status_of_a_name_nothing_knows_is_no_such_host(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mirror(monkeypatch, {JOB: succeeded(minutes=5)})
+    assert main(["status", "--host", "gpuc-pdo"]) == EXIT_NOT_FOUND
+    assert "no host named 'gpuc-pdo'" in capsys.readouterr().err
+
+
+def test_status_says_which_of_a_gone_hosts_jobs_went_with_it(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mirror(monkeypatch, {JOB: {"status": "running", "started_at": ago(hours=1)}})
+    assert main(["status", "--host", POD]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert f"lost    1 job(s) ({JOB})" in out and "went with the host" in out
+    assert main(["status", "--host", POD, "--json"]) == EXIT_OK
+    host = json.loads(capsys.readouterr().out)["hosts"][0]
+    assert host["lost"]["jobs"] == [JOB] and host["finished"] == []
+
+
+def test_with_no_bucket_status_says_a_gone_hosts_jobs_are_lost(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    LocalIndex().record(IndexEntry(job_id=JOB, host=POD))
+    assert main(["status", "--host", POD]) == EXIT_OK
+    assert "s3_bucket is unset" in capsys.readouterr().out

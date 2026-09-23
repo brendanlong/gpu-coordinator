@@ -222,9 +222,11 @@ jobs only the local index and the S3 index know, and is exit 1 if the S3 index
 could not be read; `--json` is [below](#exit-codes-and---json). A host prints
 `UNASKABLE` or `GONE` in place of its status ([the host
 rule](#exit-codes-and---json)); a gone rental is forgotten as it is printed.
-A gone host lists its finished jobs from the S3 mirror (the newest 25 of them).
-It is shown when it was found gone this run, when `--host` names it, or, with
-`--since`, when one of its jobs ended in that window.
+A gone host lists its finished jobs from the S3 mirror (the newest 25 of them),
+and as `lost` the ones the mirror has no final state for. It is shown when it
+was found gone this run, when `--host` names it, or, with `--since`, when one
+of its jobs ended in that window. `--host` with a name neither registered here
+nor in the job index is exit 4.
 Card UUIDs are in `gpuc host list`, and everything a host can say about itself
 is in `gpuc host probe`.
 
@@ -297,8 +299,9 @@ Keys this build does not know are dropped.
 `--host` is optional on `logs`, `wait`, `cancel`, `preempt`, `reorder`,
 `estimate` and `requeue`: the local job index is tried first, then every
 registered host is asked whether it knows the id. A `--host` not registered
-here is a gone host, the same as a rental that ended, and `requeue --host` and
-`ssh --host` (which name where to go) are exit 4 for it. A job no host knows is
+here is a gone host, the same as a rental that ended, if the job index says the
+job ran there, and exit 4 otherwise; `requeue --host` and `ssh --host` (which
+name where to go) are always exit 4 for it. A job no host knows is
 exit 4 once every host has answered, and so is a job the host you named
 answers it does not have.
 
@@ -526,9 +529,9 @@ command reports and exits by them:
   pod but nothing can run on it; the provider could not be read), and it may
   still hold its jobs. Exit 1 with the reason. `logs` prints the mirror's copy
   first; `wait` keeps asking for five minutes before reading the mirror.
-- **gone**: its rental ended, or its name (from the index, or from `--host`)
-  is not registered here. Not a failure: the S3 mirror's copy of each job is
-  the answer. `logs` prints the mirrored log, `wait` and `cancel` report the
+- **gone**: its rental ended, or its name (from the job index, or a `--host`
+  the index agrees with) is not registered here. Not a failure: the S3
+  mirror's copy of each job is the answer. `logs` prints the mirrored log, `wait` and `cancel` report the
   mirrored final status, `status` lists the host's finished jobs from it, and
   `preempt`, `reorder` and `estimate` are exit 1 saying how the job ended.
   `status` and `host bootstrap --all` forget the registry entry and say so. A
@@ -612,7 +615,8 @@ Beyond what the example shows:
   elsewhere.
 
 Per host: `target`, `draining`, `source` (`host`, `mirror` for a gone host, null
-for an unaskable one), `state` (`answered`, `unaskable` or `gone`, as
+for an unaskable one), `lost` (a gone host's `{jobs, reason}` for the jobs that
+went with it, else null), `state` (`answered`, `unaskable` or `gone`, as
 above; `errors[]` carries the reason and decides the exit code, `warnings[]`
 carries the build mismatch and does not), `pod` (the provider's view of a
 rental's pod), `pkg_commit` (the host's own answer for the build it runs; `null`

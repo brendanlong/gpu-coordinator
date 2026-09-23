@@ -188,9 +188,10 @@ leaves the run alone.
 run on its pod) is exit 1 with the reason from every command, and may still
 hold its jobs; `gpuc wait` keeps asking for five minutes before it reads the
 job's final state from the S3 mirror. **A host that is gone** (its rental
-ended, or its name -- from the index or from `--host` -- is not registered on
-this machine) is read from the mirror at once by `gpuc logs`, `gpuc wait`,
-`gpuc cancel` and `gpuc status`, and that is the answer, exit 0. A job the
+ended, or its name -- from the job index, or a `--host` the index agrees with
+-- is not registered on this machine) is read from the mirror at once by `gpuc
+logs`, `gpuc wait`, `gpuc cancel` and `gpuc status`, and that is the answer,
+exit 0. A job the
 mirror has no final state for (or any job, with no `s3_bucket`) went with its
 host: exit 1, saying so. `gpuc status` shows gone hosts found gone this run,
 named with `--host`, or with a job that ended within `--since`.

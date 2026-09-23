@@ -277,6 +277,10 @@ class HostView:
     registered: bool = True
     """False for a name this machine has no entry for, whose `entry` is only
     the name: there is no address to print and none to forget."""
+    lost: list[str] = field(default_factory=list)
+    """A gone host's jobs the mirror has no final state for."""
+    lost_reason: str | None = None
+    """Why those jobs went with the host."""
     heartbeat_age_s: float | None = None
     draining: bool = False
     owned: list[str] = field(default_factory=list)
@@ -835,6 +839,10 @@ def render(
             if finished:
                 lines.append("  from the S3 mirror:")
             lines += finished
+            if view.lost_reason:
+                shown = ", ".join(view.lost[:3]) + (" ..." if len(view.lost) > 3 else "")
+                ids = f"{len(view.lost)} job(s) ({shown}): " if view.lost else ""
+                lines.append(f"  lost    {ids}{view.lost_reason}")
         return "\n".join(lines)
     flags = []
     if view.draining:
@@ -1140,6 +1148,7 @@ def host_json(
         "finished": [job_json(job, view.mirror_prefix) for job in finished],
         "errors": [view.error] if view.error else [],
         "warnings": host_warnings(view),
+        "lost": {"jobs": view.lost, "reason": view.lost_reason} if view.lost_reason else None,
     }
 
 

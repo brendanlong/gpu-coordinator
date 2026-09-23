@@ -353,20 +353,11 @@ def test_version_exits_one_for_an_entry_it_could_not_read(
     assert "skipping host 'bad'" in capsys.readouterr().err
 
 
-def test_a_named_host_this_machine_does_not_have_is_gone(
+def test_a_named_host_that_does_not_exist_is_four(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The same answer as a host the index names and this machine forgot: a
-    rental's jobs must not turn into exit 4 because somebody named it."""
-    assert main(["status", "--host", "nope", "--json"]) == EXIT_OK
-    host = json.loads(capsys.readouterr().out)["hosts"][0]
-    assert (host["name"], host["state"], host["kind"], host["source"]) == (
-        "nope",
-        "gone",
-        None,
-        "mirror",
-    )
-    assert "not registered on this machine" in host["errors"][0]
+    assert main(["status", "--host", "nope"]) == EXIT_NOT_FOUND
+    assert "no host named 'nope'" in capsys.readouterr().err
 
 
 def test_a_bad_duration_is_usage(control_env: Path, capsys: pytest.CaptureFixture[str]) -> None:

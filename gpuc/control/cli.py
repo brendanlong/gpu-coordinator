@@ -637,8 +637,13 @@ def _job_answer(document: dict[str, Any], *text: str | None) -> Answer:
 
 def cmd_cancel(args: argparse.Namespace) -> Answer:
     document = cancel_job(args.job_id, args.host, load_settings())
+    whence = (
+        ", which is gone: it had already ended (from the S3 mirror)"
+        if document["source"] == "mirror"
+        else ""
+    )
     return _job_answer(
-        document, f"job {args.job_id} on host {document['host']}: {document['status']}"
+        document, f"job {args.job_id} on host {document['host']}{whence}: {document['status']}"
     )
 
 

@@ -449,11 +449,6 @@ def status(
         if on_view is not None:
             on_view(view)
 
-    provider = provider_for(entries, settings, report) if entries else None
-    for view in gather_all(entries, settings, provider):
-        if view.gone:
-            fill_from_mirror(view, index.index, index.on(view.entry.name))
-        shown(view)
     if host is not None and host not in registry.hosts and not read.unreadable:
         if host in read.skipped:
             shown(
@@ -461,10 +456,18 @@ def status(
                     HostEntry(name=host), error=unreadable_entry(host).reason, registered=False
                 )
             )
-        else:
+        elif index.on(host):
             shown(gone_view(host, index.index, index.on(host)))
-    elif host is None and since_s is not None and not read.unreadable:
-        for view in gone_since(index, registry, read.skipped, since_s, report):
+        else:
+            # Neither here nor in the index: a typo, not a rental that ended.
+            registry.require(host)
+    provider = provider_for(entries, settings, report) if entries else None
+    for view in gather_all(entries, settings, provider):
+        if view.gone:
+            fill_from_mirror(view, index.index, jobs_of_registered(view, index))
+        shown(view)
+    if host is None and since_s is not None and not read.unreadable:
+        for view in gone_since(index, registry, read.skipped, result.seen, since_s, report):
             shown(view)
     result.index_error = index.error
     if all_jobs:
@@ -485,22 +488,60 @@ def gone_view(name: str, index: JobIndex, entries: Sequence[IndexEntry]) -> stat
     return view
 
 
+def jobs_of_registered(view: status_mod.HostView, index: IndexRead) -> list[IndexEntry]:
+    """A registered gone host's jobs: the ones mirrored under its cached
+    `s3_prefix`, one LIST, rather than a read of the whole index -- the
+    dashboard asks again every poll until a typed command forgets the entry.
+    The index's list when there is no prefix, or it could not be listed."""
+    name, prefix = view.entry.name, view.entry.config.s3_prefix
+    if not prefix or index.index.s3 is None:
+        return index.on(name)
+    try:
+        ids = index.index.s3.mirrored_job_ids(prefix)
+    except S3IndexError:
+        return index.on(name)
+    local = index.index.local
+    return [
+        local.get(job_id) or IndexEntry(job_id=job_id, host=name, s3_prefix=prefix)
+        for job_id in ids[-MIRROR_STATE_LOOKUPS:]
+    ]
+
+
 def fill_from_mirror(
     view: status_mod.HostView, index: JobIndex, entries: Sequence[IndexEntry]
 ) -> None:
-    """A gone host's finished jobs, as the mirror has them.
+    """A gone host's finished jobs, as the mirror has them, and the ones it
+    has no final state for: those went with the host, and say so.
 
-    The newest `MIRROR_STATE_LOOKUPS` of them, one GET each. A job with no
-    final state in the mirror is not listed: it went with its host, and
-    `--all` lists it for `gpuc requeue`.
+    The newest `MIRROR_STATE_LOOKUPS` of them, one GET each, all at once.
     """
     cached = view.entry.config.s3_prefix if view.registered else None
     view.mirror_prefix = cached
-    newest = sorted(entries, key=lambda entry: entry.job_id, reverse=True)
-    for entry in newest[:MIRROR_STATE_LOOKUPS]:
-        found = read_mirror(index, entry.job_id, entry.s3_prefix or cached, entry)
-        if found.view is not None:
-            view.finished.append(found.view)
+    newest = sorted(entries, key=lambda entry: entry.job_id, reverse=True)[:MIRROR_STATE_LOOKUPS]
+    if index.s3 is None:
+        view.lost = [entry.job_id for entry in newest]
+        view.lost_reason = (
+            f"s3_bucket is unset in {config_file()}, so nothing of this host is mirrored "
+            f"and its jobs went with it"
+        )
+        return
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_HOSTS) as pool:
+        found = list(
+            pool.map(
+                lambda entry: read_mirror(index, entry.job_id, entry.s3_prefix or cached, entry),
+                newest,
+            )
+        )
+    for entry, mirrored in zip(newest, found, strict=True):
+        if mirrored.view is not None:
+            view.finished.append(mirrored.view)
+        else:
+            view.lost.append(entry.job_id)
+    if view.lost:
+        view.lost_reason = (
+            "the mirror has no final state for these, so they went with the host; "
+            "`gpuc status --all` lists them for `gpuc requeue`"
+        )
     view.finished.sort(key=lambda job: job.ended_at or "", reverse=True)
 
 
@@ -508,6 +549,7 @@ def gone_since(
     index: IndexRead,
     registry: Registry,
     skipped: Collection[str],
+    seen: Collection[str],
     since_s: float,
     report: Callable[[str], None],
 ) -> list[status_mod.HostView]:
@@ -516,13 +558,18 @@ def gone_since(
 
     The mirror is read for the newest `MIRROR_STATE_LOOKUPS` of their jobs in
     all, not per host: the index keeps every rental ever used, and a job
-    that ended in the window was, nearly always, submitted recently too.
+    that ended in the window was, nearly always, submitted recently too. A
+    job a host already answered for is left out: the index's host name is the
+    submitting client's, and may be one a live host here goes by another name.
     """
     candidates = sorted(
         (
             entry
             for entry in index.all()[0].values()
-            if entry.host and entry.host not in registry.hosts and entry.host not in skipped
+            if entry.host
+            and entry.host not in registry.hosts
+            and entry.host not in skipped
+            and entry.job_id not in seen
         ),
         key=lambda entry: entry.job_id,
         reverse=True,
@@ -813,8 +860,9 @@ def locate(
 ) -> Location:
     """The host a job is on: `--host` if given, else the index (local, then
     the mirror), else whichever registered host admits to it. A `--host` this
-    machine has no entry for is `Gone`, like any other name it does not have:
-    naming the host must not make the answer worse than leaving it out.
+    machine has no entry for is `Gone`, like any other name it does not have,
+    when the index says the job ran there: naming the host must not make the
+    answer worse than leaving it out.
 
     A name in the mirror's index is the *submitting* client's name for the
     host, which need not be this machine's: it is asked first, not believed.
@@ -840,7 +888,17 @@ def locate(
             return Location(entry.name, entry, local)
         if explicit in skipped:
             return Location(explicit, None, local, unreadable_entry(explicit))
-        return Location(explicit, None, local, not_registered(explicit))
+        # Gone only where the index agrees the job ran there. A typo'd host
+        # name is not a rental that ended, and treating it as one would read
+        # the mirror's copy of a job that is still running somewhere else.
+        indexed = local or JobIndex(settings).get(job_id)
+        if indexed is None or indexed.host != explicit:
+            where = f"\nThe index has job {job_id} on host {indexed.host}." if indexed else ""
+            try:
+                registry.require(explicit)
+            except HostNotFound as exc:
+                raise HostNotFound(f"{exc}{where}") from None
+        return Location(explicit, None, indexed, not_registered(explicit))
     if local is not None and local.host in registry.hosts:
         return Location(local.host, registry.hosts[local.host], local)
     index = local or JobIndex(settings).get(job_id)
