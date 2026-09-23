@@ -1165,12 +1165,35 @@ def pod_json(view: HostView) -> dict[str, Any] | None:
     }
 
 
-def unhosted_json(entry: IndexEntry, *, lost: bool) -> dict[str, Any]:
+NOT_REGISTERED = "not_registered"
+"""The `host_state` of an index-only job whose host this machine has no entry
+for: a rental that ended and was forgotten, or another client's name for a
+box. Beside the four `HostState` values, which are this run's answer."""
+
+UNHOSTED_LABELS: dict[str, str] = {
+    HostState.ANSWERED.value: "its host answered and does not have it (lost its state, or purged)",
+    HostState.UNREACHABLE.value: "its host could not be asked, so it may still be running there",
+    HostState.POD_DEAD.value: "its pod is stopped and still there",
+    HostState.POD_GONE.value: "its rental has ended",
+    NOT_REGISTERED: "its host is not registered here",
+}
+"""What each `host_state` means for a job only the index knows."""
+
+REQUEUEABLE = {HostState.ANSWERED.value, HostState.POD_GONE.value, NOT_REGISTERED}
+"""The states under which `gpuc requeue` is the way back. A host that could
+not be asked, or a stopped pod that still has its disk, may still hold the
+job -- running, or finished with its outputs -- and a requeue offered on the
+strength of a connection error is how a run ends up done twice."""
+
+
+def unhosted_json(entry: IndexEntry, *, lost: bool, host_state: str) -> dict[str, Any]:
     """One job only the index knows, as `status --all --json` lists it."""
     return {
         "job_id": entry.job_id,
         "name": entry.name,
         "host": entry.host,
+        "host_state": host_state,
+        "requeue": host_state in REQUEUEABLE,
         "requeued_from": entry.requeued_from,
         "submitted_at": entry.submitted_at,
         "s3_prefix": entry.s3_prefix,
@@ -1178,11 +1201,15 @@ def unhosted_json(entry: IndexEntry, *, lost: bool) -> dict[str, Any]:
     }
 
 
-def unhosted_line(entry: IndexEntry, *, lost: bool) -> str:
+def unhosted_line(entry: IndexEntry, *, lost: bool, host_state: str) -> str:
     flag = " OUTPUTS LOST (the host went away before they uploaded)" if lost else ""
     label = f"{entry.name} ({entry.job_id})" if entry.name else entry.job_id
     origin = f" requeued from {entry.requeued_from}" if entry.requeued_from else ""
-    return f"  {label} host={entry.host}{origin} submitted {format_age(entry.submitted_at)}{flag}"
+    why = UNHOSTED_LABELS.get(host_state, host_state)
+    return (
+        f"  {label} host={entry.host}{origin} submitted {format_age(entry.submitted_at)}: "
+        f"{why}{flag}"
+    )
 
 
 def document(

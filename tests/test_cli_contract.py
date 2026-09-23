@@ -256,8 +256,55 @@ def test_status_all_json_carries_the_jobs_only_the_index_knows(
     )
     assert entry["requeued_from"] == "20250101-000000-000000"
     assert entry["outputs_lost"] is False
+    assert (entry["host_state"], entry["requeue"]) == ("not_registered", True)
     assert main(["status", "--json"]) == EXIT_OK
     assert status_json(capsys)["unhosted"] == []
+
+
+def test_status_all_labels_an_index_only_job_by_what_its_host_is(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job whose host is only unreachable may still be running there, so it
+    is listed with that said and no requeue offered for it; one whose host
+    answered without it, or is gone, is the recovery case the hint is for."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="down", kind="ssh", ssh="me@down")
+
+    def gather(entry: HostEntry, *a: object, **k: object) -> HostView:
+        if entry.name == "down":
+            return HostView(entry=entry, state=HostState.UNREACHABLE, error="ssh timed out")
+        return HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=1.0)
+
+    monkeypatch.setattr(status_mod, "gather", gather)
+    for job_id, host in [
+        ("20260101-000000-aaaaaa", "down"),
+        ("20260101-000000-bbbbbb", "gpubox"),
+        ("20260101-000000-cccccc", "gone-pod"),
+    ]:
+        LocalIndex().record(IndexEntry(job_id=job_id, host=host, name="j"))
+    capsys.readouterr()
+    assert main(["status", "--all", "--json"]) == EXIT_ERROR
+    by_host = {e["host"]: e for e in status_json(capsys)["unhosted"]}
+    assert (by_host["down"]["host_state"], by_host["down"]["requeue"]) == ("unreachable", False)
+    assert (by_host["gpubox"]["host_state"], by_host["gpubox"]["requeue"]) == ("answered", True)
+    assert (by_host["gone-pod"]["host_state"], by_host["gone-pod"]["requeue"]) == (
+        "not_registered",
+        True,
+    )
+
+    assert main(["status", "--all"]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "host=down" in out and "may still be running there" in out
+    assert "host=gpubox" in out and "does not have it" in out
+    assert "bring one back with: gpuc requeue 20260101-000000-bbbbbb" in out
+
+    # Only the unreachable host's job left: nothing to offer a requeue for.
+    (LocalIndex().directory / "20260101-000000-bbbbbb.json").unlink()
+    (LocalIndex().directory / "20260101-000000-cccccc.json").unlink()
+    assert main(["status", "--all"]) == EXIT_ERROR
+    assert "bring one back" not in capsys.readouterr().out
 
 
 def _answered_with_no_jobs(entry: HostEntry, *a: object, **k: object) -> HostView:

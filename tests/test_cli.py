@@ -1034,7 +1034,9 @@ def test_logs_of_a_job_on_a_host_this_machine_has_forgotten_are_the_mirrors(
     document = one_document(capsys)
     assert (document["source"], document["host"]) == ("s3", "gpuc-pod")
     assert document["lines"] == ["epoch 1", "epoch 2"]
-    assert any("not registered on this machine" in note for note in cast("list[str]", document["notes"]))
+    assert any(
+        "not registered on this machine" in note for note in cast("list[str]", document["notes"])
+    )
 
 
 def test_logs_of_a_job_on_an_unreachable_host_print_the_mirror_and_still_fail(

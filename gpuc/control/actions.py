@@ -306,6 +306,14 @@ class StatusResult:
             job.job_id for view in self.views for job in view.queue + view.running + view.finished
         }
 
+    def host_state(self, entry: IndexEntry) -> str:
+        """What this run found the job's host to be: one of `HostState`, or
+        `NOT_REGISTERED`. Only a host that answered and does not list the job,
+        or is gone, makes the job the index's alone; one that could not be
+        asked may still be running it."""
+        view = next((view for view in self.views if view.entry.name == entry.host), None)
+        return view.state.value if view is not None else status_mod.NOT_REGISTERED
+
     def document(
         self, *, recent: int = status_mod.RECENT_FINISHED, since_s: float | None = None
     ) -> dict[str, Any]:
@@ -313,7 +321,9 @@ class StatusResult:
             self.views,
             errors=self.errors,
             unhosted=[
-                status_mod.unhosted_json(entry, lost=entry.job_id in self.lost)
+                status_mod.unhosted_json(
+                    entry, lost=entry.job_id in self.lost, host_state=self.host_state(entry)
+                )
                 for entry in self.unhosted
             ],
             recent=recent,
@@ -324,17 +334,21 @@ class StatusResult:
         if not self.unhosted:
             return None
         scope = f" for host {host}" if host else ""
-        first = self.unhosted[0]
-        return "\n".join(
-            [
-                f"jobs known only to the index{scope} (their host is gone, or lost its state):",
-                *[
-                    status_mod.unhosted_line(entry, lost=entry.job_id in self.lost)
-                    for entry in self.unhosted
-                ],
-                f"  bring one back with: gpuc requeue {first.job_id} --host {first.host}",
-            ]
+        lines = [f"jobs known only to the index{scope}:"]
+        lines += [
+            status_mod.unhosted_line(
+                entry, lost=entry.job_id in self.lost, host_state=self.host_state(entry)
+            )
+            for entry in self.unhosted
+        ]
+        # The hint names a job whose host cannot still be running it: a
+        # requeue offered over a connection error is a run done twice.
+        first = next(
+            (e for e in self.unhosted if self.host_state(e) in status_mod.REQUEUEABLE), None
         )
+        if first is not None:
+            lines.append(f"  bring one back with: gpuc requeue {first.job_id} --host <name>")
+        return "\n".join(lines)
 
     def answer(
         self,
@@ -1105,7 +1119,9 @@ def unhosted_jobs(
     After a host loses its state -- a container whose $HOME was wiped, a pod
     that is gone -- this is the only list of what was on it, and `gpuc requeue
     <id> --host <name>` is how each one comes back, so `--host H --all` narrows
-    it to the host being recovered.
+    it to the host being recovered. "No host admitted to having" includes a
+    host that could not be asked, so each entry is labelled with what its
+    host was found to be (`StatusResult.host_state`) before anyone acts on it.
 
     Returns the entries, the ids among them whose outputs the mirror records as
     lost, and why the list may be short (None when the index was read in full).

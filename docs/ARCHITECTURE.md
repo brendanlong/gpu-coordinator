@@ -1065,7 +1065,11 @@ What `status` prints, and every flag, is usage.md. The invariants:
   nothing else. For either pod state no ssh is attempted, and the line says
   what the provider said rather than printing a connection error. One
   `actions.status` builds the text form, `--json` and the dashboard's
-  document, including `--all`'s `unhosted` list; per host, `errors` decide
+  document, including `--all`'s `unhosted` list -- each job in it labelled
+  with what the same run found its host to be, and `gpuc requeue` offered
+  only where that host cannot still be running it (it answered without the
+  job, its pod is gone, or it is not registered here), never over a
+  connection error; per host, `errors` decide
   the exit code and `warnings` (the build) do not.
 - A host that answered and still carries an `error` -- the provider could not be
   asked about its pod -- prints it as an `ERROR` line under the header. Nothing

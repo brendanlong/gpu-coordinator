@@ -260,8 +260,10 @@ progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
 gpus_requested, use_shared, starts_in_s, starts_at, starts_unknown, iso,
 ended_at, outputs_pending` (`starts_*` are null unless the job is queued).
 `unhosted` is `--all`'s list of jobs only the index knows, each
-`{job_id, name, host, requeued_from, submitted_at, s3_prefix, outputs_lost}`,
-and empty without the flag. Each entry in
+`{job_id, name, host, host_state, requeue, requeued_from, submitted_at,
+s3_prefix, outputs_lost}`, and empty without the flag. **Requeue one only if
+`requeue` is true**: a `host_state` of `unreachable` or `pod_dead` means the
+host may still be running that job, and a second copy is not recovery. Each entry in
 `shared_gpus` adds `memory_mib`, `utilization_pct` and `unused` — the host's own
 verdict on whether gpuc would borrow that card right now.
 
