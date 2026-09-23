@@ -198,6 +198,10 @@ rented as — so nothing about the machine that created it matters afterwards. A
 pod nobody has bootstrapped has no dispatcher and so will never end itself;
 `host add` says so, and `gpuc host bootstrap <name>` gives it one.
 
+A rental registered by an earlier build of gpuc is not read: every command
+warns `registered by an earlier build` for that entry, works with the rest,
+and exits 1 until you run `gpuc host add <name> --pod <pod-id>` again.
+
 The address is the top two rows, kept here (`here <- …`) and applied to the
 host by the next `gpuc host bootstrap`. Every other flag is the host's own
 config: `host set` writes it through to the host's `config.json` at once (the
@@ -319,8 +323,8 @@ which is also the read that tells them what the host's cards and mirror are. A
 config that names no commit is a host nothing has bootstrapped, and is refused.
 They re-sync the package and restart the dispatcher first, print one line
 saying so, and `--no-bootstrap` skips it. A checkout with uncommitted changes
-is its own build (`<commit>-dirty`): a host bootstrapped from it never reads as
-running that commit.
+is its own build (`<commit>-dirty-<hash>`): a host bootstrapped from it never
+reads as running that commit, and the next edit to the tree is re-shipped too.
 Re-bootstrapping is safe at any time: **running jobs are not disturbed and do
 not block it.** A dispatcher on another build hands over to the one bootstrap
 starts, which adopts the running jobs from their `state.json`; every new

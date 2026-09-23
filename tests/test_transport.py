@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 
 from gpuc.control import transport
-from gpuc.control.transport import LocalTransport, SshTransport, SshUnusable, TransportError
+from gpuc.control.transport import (
+    LocalToolMissing,
+    LocalTransport,
+    SshTransport,
+    SshUnusable,
+    TransportError,
+)
 
 # A real ControlPath has to fit in sun_path, so the fixtures use a short one;
 # pytest's own tmp_path is deliberately too long (see the control-path tests).
@@ -211,10 +217,14 @@ def test_make_transport_picks_the_right_kind(tmp_path: Path) -> None:
     assert remote.known_hosts == tmp_path / "known_hosts"
 
 
-def test_a_missing_binary_is_a_transport_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    with pytest.raises(TransportError) as excinfo:
+def test_a_missing_binary_is_a_transport_error_about_this_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its own class: no host and no retry changes what is installed here."""
+    with pytest.raises(LocalToolMissing) as excinfo:
         transport._execute("h", ["definitely-not-a-binary"], timeout=5, check=True)
-    assert "not found" in str(excinfo.value)
+    assert "not found on this machine" in str(excinfo.value)
+    assert isinstance(excinfo.value, TransportError)
 
 
 def test_ssh_transport_against_localhost(ssh_localhost: None, tmp_path: Path) -> None:

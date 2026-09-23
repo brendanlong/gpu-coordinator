@@ -23,7 +23,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from gpuc.control.config import Reporter, Settings, default_s3_prefix, utc_now
-from gpuc.control.remote import HostSession
+from gpuc.control.remote import HostSession, config_file
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
 from gpuc.control.status import placement_unknown
 from gpuc.control.transport import (
@@ -469,18 +469,35 @@ def enqueue_spec(session: HostSession, prepared: Prepared) -> dict[str, Any]:
     return response
 
 
+def refuse_unreadable_config(session: HostSession) -> None:
+    """A host whose config is there and could not be read is neither "no gpuc
+    yet" nor a host with no cards: it is a file the host may be running on,
+    and the reason it could not be read is the only useful thing to say."""
+    if session.config_read.unreadable:
+        raise SubmitError(
+            f"host {session.entry.name}'s own config could not be read, so nothing here can "
+            f"say what it runs or which cards it owns: {session.config_read.unreadable}\n"
+            f"Check {config_file(session.home)} on the host."
+        )
+
+
 def wont_fit(spec: JobSpec, config: HostConfig, host: str) -> str | None:
     """Why this host could never run this job, or None if it could.
 
     The dispatcher's own rule (`plan.capacity_failure`), run here against the
     config the host itself answered with a moment ago, so the answer arrives
     before the code is shipped rather than as a failed job -- with the way
-    out added, since this is the moment somebody is looking.
+    out added, since this is the moment somebody is looking. A card listed
+    as both owned and shared counts once: the dispatcher resolves both lists
+    against the live card table and health refuses the overlap, but a submit
+    has no table, so spelled-identically is the best it can do here.
     """
+    owned = list(config.gpus)
+    shared = [card for card in config.shared_gpus if card not in owned]
     failure = plan.capacity_failure(
         spec.gpus,
-        len(config.gpus),
-        len(config.shared_gpus),
+        len(owned),
+        len(shared),
         borrows=config.may_borrow(spec),
     )
     if failure is None:
@@ -518,6 +535,7 @@ def submit_spec(
     spec = prepared.spec
     notes: list[str] = []
 
+    refuse_unreadable_config(session)
     if session.config_read.missing:
         raise SubmitError(
             f"host {entry.name} has no config.json, so nothing says which cards it owns.\n"

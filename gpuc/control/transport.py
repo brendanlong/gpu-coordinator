@@ -65,6 +65,17 @@ class TransportError(RuntimeError):
         self.result = result
 
 
+class LocalToolMissing(TransportError):
+    """The `ssh` or `rsync` this machine needs is not installed.
+
+    Its own class because it is the one transport failure that is about this
+    machine and not the host: nothing on the other end changes it, so no
+    retry and no other pod can succeed. Provisioning reads it as abort
+    rather than "next offer", which for a missing `rsync` was one pod bought
+    and terminated per offer.
+    """
+
+
 class SshUnusable(TransportError):
     """A local ssh misconfiguration that retrying cannot fix.
 
@@ -148,8 +159,8 @@ def _execute(
             check=False,
         )
     except FileNotFoundError as exc:
-        result = CommandResult(host, argv, 127, "", f"{argv[0]} not found: {exc}")
-        raise TransportError(result) from exc
+        result = CommandResult(host, argv, 127, "", f"{argv[0]} not found on this machine: {exc}")
+        raise LocalToolMissing(result) from exc
     except subprocess.TimeoutExpired as exc:
         result = CommandResult(host, argv, 124, "", f"timed out after {timeout}s: {exc}")
         raise TransportError(result) from exc

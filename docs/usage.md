@@ -247,7 +247,11 @@ UUIDs are in `gpuc host list`, and everything a host can say about itself is in
 **`gpuc logs <job-id> [-f] [-n N] [--host H]`** — tails `log.txt` on the host
 (`-n` defaults to 200). If the host cannot produce it, gpuc says why — including
 "was purged" when the whole job dir is gone — and falls back to the S3 mirror,
-which needs `s3_bucket` set here **and** an `s3_prefix` for that job.
+which needs `s3_bucket` set here **and** an `s3_prefix` for that job. When the
+host is gone (its rental ended, or it is no longer registered here) or the job
+was purged, the mirror is the answer and the exit is 0; when the host merely
+could not be reached, the mirror's copy is printed and the exit is 1 with the
+reason, since the host may hold a newer log.
 
 **`-f` follows until the job ends**, prints the job's outcome as its last line,
 and exits 0 only if the job succeeded. A job that has already finished prints
@@ -268,11 +272,14 @@ gpuc submit job.yaml --host spar --json | jq -r .job_id | xargs gpuc wait || ech
 Killing either wait leaves the run alone: the host owns the job.
 
 A host that stops answering does not end the wait: gpuc keeps asking for five
-minutes, then reads the job's final state from the S3 mirror and says so. Only
-if the mirror has nothing is that job exit 1. A reachable host whose dispatcher
-is down is reported once and waited through — nothing there will start a queued
-job until `gpuc host bootstrap <host>` restarts it. An id no host has is exit 4.
-`--interval` is as above, and `--json` is [below](#exit-codes-and---json).
+minutes, then reads the job's final state from the S3 mirror and says so. A host
+that is gone — its rental ended, or it is no longer registered here — is read
+from the mirror at once. Only if the mirror has nothing is that job exit 1. A
+reachable host whose dispatcher is down is reported once and waited through —
+nothing there will start a queued job until `gpuc host bootstrap <host>`
+restarts it. An id no host has is exit 4, after every other job named has been
+waited for and reported. `--interval` is as above, and `--json` is
+[below](#exit-codes-and---json).
 
 **`gpuc ssh <host|job-id> [--print] [-- CMD ...]`** — an ssh with gpuc's own key,
 port, `known_hosts` and ControlMaster socket, none of which are in your
@@ -323,10 +330,14 @@ this build does not know are dropped rather than refused.
 `--host` is optional on `logs`, `wait`, `cancel`, `preempt`, `reorder`,
 `estimate` and `requeue`: the local job index is tried first, then every
 registered host is asked whether it knows the id. An unknown host is exit 4, and
-so is a job no host knows -- once every host has answered. A host the index
+so is a job no host knows -- once every host has answered -- and a job the host
+you named answers it does not have. A host the index
 names that cannot be reached still holds the job as far as anything knows:
-`logs` and `wait` read the mirror, and every other verb is exit 1 with the
-reason, never "no such job".
+`logs` and `wait` read the mirror (`logs` exits 1 for it, `wait` after waiting
+for the host), and every other verb is exit 1 with the reason, never "no such
+job". A host the index names that is no longer registered here -- a rental that
+ended -- is gone: `logs` and `wait` read the mirror as the answer, and every
+other verb is exit 1 saying so.
 
 **`gpuc skill`** — prints the agent guide
 ([`skills/gpuc/SKILL.md`](../skills/gpuc/SKILL.md)) to stdout. `--install [DIR]`
@@ -417,8 +428,9 @@ The same flags work on `gpuc submit` and `gpuc requeue`:
 SSH endpoint, bootstrap, health check, enqueue. A failure of that pod
 terminates it and moves to the next offer, all inside **one 15-minute ceiling
 for the whole attempt**; an offer the ceiling leaves no time for is listed as
-untried. A failure no pod could fix -- a local ssh misconfiguration -- ends the
-attempt at the first pod instead of buying another.
+untried. A failure no pod could fix -- a local ssh misconfiguration, an unreadable
+key file, or an `ssh`/`rsync` this machine does not have -- ends the attempt at
+the first pod instead of buying another.
 
 **Reuse** is the default: a registered rental whose recorded offer still
 matches the request, that owns at least `--gpu-count` cards, whose pod is
@@ -562,7 +574,8 @@ reported in its own block, every other host is reported in full, and the command
 exits 1. A registry entry this build cannot parse is the same: a warning on
 stderr, the entry written back untouched, and exit 1 from the commands reporting
 on every host (`status`, `host list`, `version`) — not from one given a single
-host or job. A rental whose pod has ended is not a failure at all; gpuc forgets
+host or job. A rental an earlier build registered is one of those entries, and
+its warning says to `gpuc host add <name> --pod <pod-id>` it again. A rental whose pod has ended is not a failure at all; gpuc forgets
 that host. Only a `hosts.json` that cannot be parsed at all is exit 3, which
 prints the error, the path, and that a `.bak` was kept.
 
@@ -660,7 +673,14 @@ has the same shape plus `unused` (no memory held, no work running) and
 `busy_job` (one of *our* jobs has it), and a missing one is
 `{"shared_as": "5", "available": false}`. `--recent` and `--since` apply to
 `--json`; `--all` fills `unhosted[]` with the jobs only the index knows, each
-`{job_id, name, host, requeued_from, submitted_at, s3_prefix, outputs_lost}`.
+`{job_id, name, host, host_state, requeue, requeued_from, submitted_at,
+s3_prefix, outputs_lost}`. `host_state` is what this run found the job's host
+to be -- `answered` (and it does not have the job: the host lost its state, or
+purged it), `unreachable`, `pod_dead`, `pod_gone` or `not_registered` -- and
+`requeue` is whether `gpuc requeue` is the way back: true for `answered`,
+`pod_gone` and `not_registered`, false for a host that could not be asked or
+a stopped pod, which may still hold the job. The text form says the same after
+each line and offers the hint only for a job it is true of.
 
 Rules for anything automated:
 
@@ -700,8 +720,8 @@ per-job trouble the command reported rather than stopped for.
 | command | the document |
 | --- | --- |
 | `submit`, `requeue` | `{job_id, host, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is null on `submit`; `notes` are the text output's `note:` lines. The queue fields are the host's answer just after the enqueue: `queue_position` is 1-based in dispatch order, `dispatched` is true for a job the host started before we could look, and `starts_unknown` says why there is no start time (null when there is one). All of them are null when the host could not be asked again — never a reason to think the job was not queued |
-| `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines. **Not with either follow** (exit 2): the document is printed once and a follow is a stream, so `gpuc wait --json` is the JSON form of waiting |
-| `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` gives a job, plus `host`, `source` (`"host"`, or `"mirror"` for a state read from S3 after the host went away) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say — `"running"` for a host that vanished mid-run, null for a job nothing was heard about, which carries only `job_id`, `host`, `source`, `error` and a null `status`. Every `error` is in `errors[]` too. Under `"source": "mirror"` the `outputs_*` fields come from the mirrored state rather than the host's own check. The per-job outcome lines go to stderr. Exit 1 unless every job succeeded |
+| `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"` and `location` is the remote path or the `s3://` uri it was read from; `lines` is the log with no trailing newlines; `notes` says why the mirror was read, when it was. Exit 1 with `"source": "s3"` means the host only could not be reached and may hold a newer log; exit 0 with it means the host is gone or the job was purged. **Not with either follow** (exit 2): the document is printed once and a follow is a stream, so `gpuc wait --json` is the JSON form of waiting |
+| `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` gives a job, plus `host`, `source` (`"host"`, or `"mirror"` for a state read from S3 after the host went away) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say — `"running"` for a host that vanished mid-run, null for a job nothing was heard about, which carries only `job_id`, `host`, `source`, `error` and a null `status`. Every `error` is in `errors[]` too. Under `"source": "mirror"` the `outputs_*` fields come from the mirrored state rather than the host's own check. The per-job outcome lines go to stderr. Exit 1 unless every job succeeded; exit 4 when an id no host has is among them, with the rest still reported |
 | `cancel` | `{job_id, host, status}` — the host's own word, `cancelled` for a queued job or `cancelling` for a running one |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is the host's own word (`preempting`); `priority` is what it will be queued again at, which is the job's own unless `--priority` changed it. `warnings` carries a mirrored spec that could not be updated, exactly as `reorder` does |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`, so a move can be checked without a second call. `warnings` carries a mirrored spec that could not be updated, which means `gpuc requeue` would re-run the job at its old priority |

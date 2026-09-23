@@ -612,16 +612,25 @@ hold to, whatever the flags:
   (`actions.locate`): the job index, then asking each host. An id no host
   knows is exit 4 only once every host has answered; a host the index names
   that could not be asked still holds the job as far as anything knows, and
-  the location carries that trouble for the caller to judge -- `logs` and
-  `wait` read the mirror, a verb is exit 1 with the reason -- and never hides
-  it. The job index is one facade (`s3index.JobIndex`) over the local index
+  the location carries that trouble for the caller to judge, never hidden.
+  A host the index names that this machine has no entry for is the same
+  trouble in its final form (`Forgotten`: a rental that ended and was
+  forgotten). One rule, `actions.mirror_is_the_answer`, says what the
+  trouble costs: a host that is *gone* (its pod ended, or forgotten) is read
+  from the mirror now, and that is the answer, exit 0; one that is merely
+  unreachable may still hold the job, so `wait` retries it for
+  `TROUBLE_GRACE_S` before the mirror, `logs` prints the mirror's copy but
+  exits 1 with the reason, and every other verb is exit 1 with the reason.
+  The job index is one facade (`s3index.JobIndex`) over the local index
   and the mirror's, in that order, and the precedence is written once. A host
   name from the mirror's index is the *submitting* client's name for it, so
   it is asked first rather than believed; the local index's name is this
   machine's and is trusted. Every per-job verb runs through
   `actions.job_verb`: locate the job, ask its host over the one session the
-  lookup opened, insist on a verdict, re-mirror a spec field it changed. The
-  CLI and the dashboard call the same functions.
+  lookup opened, insist on a verdict, re-mirror a spec field it changed. A
+  host's refusal is its `{error}` document; one that also says `missing`
+  is the host answering "no such job", and is exit 4 like any other unknown
+  name. The CLI and the dashboard call the same functions.
 - What a command does lives in `actions` (with `hosts` and `submitting` for
   the host and submit commands), one function per command returning an
   `Answer`: the document its `--json` form prints, the text form, and what
@@ -668,7 +677,10 @@ this repository wrote are not kept, pre-release.
 A host entry that still does not validate is **skipped, not fatal**: `gpuc`
 warns, works with the rest, and writes that entry back untouched on the next
 registry write. Only a `hosts.json` that cannot be parsed at all stops
-anything (exit 3, a `.bak` kept).
+anything (exit 3, a `.bak` kept). One shape is refused on purpose rather
+than read: a rental an earlier build spelled with a top-level `pod_id` and no
+`rental` would otherwise pass as an ssh host, and the warning says to
+`gpuc host add <name> --pod <id>` it again.
 
 ## Exit codes
 
@@ -718,14 +730,18 @@ that reach outside the module:
 - A host that cannot be asked is *trouble*, not an answer: retried for
   `TROUBLE_GRACE_S`, then read from the **S3 mirror** (the spec's "the mirror is
   read only when the host is gone") through `actions.mirrored_outcome`, the
-  one reader of a mirrored `state.json`. A rental whose pod `ask` reports gone
-  skips the grace and is read from the mirror at once. Only if that has no
-  terminal state does the job get an `error`.
-- An id whose host answers and does not list it is exit 4, checked after the
-  first poll. A job that *was* listed and then vanishes is trouble, not a
-  missing id.
+  one reader of a mirrored `state.json`. A host `mirror_is_the_answer` calls
+  gone -- a rental whose pod `ask` reports gone, or one the locator found
+  forgotten -- skips the grace and is read from the mirror at once, without
+  a poll. Only if that has no terminal state does the job get an `error`.
+- An id whose host answers and does not list it is exit 4, decided after the
+  first poll -- for `logs -f` at once, for `wait` once the other jobs named
+  have been waited for and reported. A job that *was* listed and then
+  vanishes is trouble, not a missing id.
 - `logs -f` runs `tail -F` as a child writing straight to stdout while the loop
-  polls, and gives the stream `FLUSH_GRACE_S` to catch up before stopping it:
+  polls, started on the first poll the host answers (a host in trouble is the
+  loop's to retry, as for `wait`), and gives the stream `FLUSH_GRACE_S` to
+  catch up before stopping it:
   the runner's last log lines come after its terminal write, so the poll
   can be slightly ahead of the log. `-F` rather than `-f` follows a log that
   does not exist yet, and only from this path -- `Transport.tail()` keeps `-f`,
@@ -993,8 +1009,9 @@ name to its class. Adding a provider is one class and one table entry.
    failed while the pod is still coming up), *next offer* (the pod is dead,
    its host is broken by the provider's `broken_host` signature, its health
    failed, or anything else about that pod or the provider), or *abort* (a
-   local ssh misconfiguration, the ceiling, a Ctrl-C or a bug -- nothing
-   another pod could fix). The pod is terminated on the way out of either of
+   local ssh misconfiguration, an `ssh` or `rsync` this machine does not
+   have (`transport.LocalToolMissing`), the ceiling, a Ctrl-C or a bug --
+   nothing another pod could fix). The pod is terminated on the way out of either of
    the last two, through the one `Provider.terminate_confirmed`, which retries
    the call and waits for the provider to confirm; a terminate it could not
    confirm is reported loudly and leaves the registry entry in place, and
@@ -1073,7 +1090,11 @@ What `status` prints, and every flag, is usage.md. The invariants:
   nothing else. For either pod state no ssh is attempted, and the line says
   what the provider said rather than printing a connection error. One
   `actions.status` builds the text form, `--json` and the dashboard's
-  document, including `--all`'s `unhosted` list; per host, `errors` decide
+  document, including `--all`'s `unhosted` list -- each job in it labelled
+  with what the same run found its host to be, and `gpuc requeue` offered
+  only where that host cannot still be running it (it answered without the
+  job, its pod is gone, or it is not registered here), never over a
+  connection error; per host, `errors` decide
   the exit code and `warnings` (the build) do not.
 - A host that answered and still carries an `error` -- the provider could not be
   asked about its pod -- prints it as an `ERROR` line under the header. Nothing
@@ -1116,7 +1137,8 @@ bootstrap and reported back by `python -m gpuc.host status`.
   enqueue and re-ship the package (`ensure_build`) when it does not match this
   build. One comparison, `version.is_other_build`, and it is strict: a host
   that names no commit was never bootstrapped and is refused, and a checkout
-  with uncommitted changes is `<commit>-dirty`, never the commit it sits on.
+  with uncommitted changes is `<commit>-dirty-<hash of the changes>`, never
+  the commit it sits on and never another dirty tree on it.
   That same read is what the rest of the submit works from -- the `gpus` the
   spec is judged against, the `s3_prefix` its outputs are recorded under --
   and it replaces the registry's cache on the way past.

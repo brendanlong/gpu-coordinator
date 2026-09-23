@@ -581,7 +581,7 @@ def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
     entry = registry.hosts.get(args.target)
     if entry is not None:
         return entry, entry.remote_home, None
-    entry = locate(args.target, registry, args.host).entry
+    entry = locate(args.target, registry, args.host).require_entry()
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
     return entry, f"{job_dir}/workdir", job_dir
 
@@ -713,13 +713,13 @@ def cmd_logs(args: argparse.Namespace) -> Answer:
     settings = load_settings()
     if args.follow_forever:
         location = locate(args.job_id, open_registry().named(), args.host, settings)
-        session = location.session or open_session(location.entry, settings)
+        session = location.session or open_session(location.require_entry(), settings)
         return _follow_forever(session, args.job_id, args.lines)
     if args.follow:
         return _follow_until_done(args, settings)
-    entry, log = read_log(args.job_id, args.host, args.lines, settings)
+    host, log = read_log(args.job_id, args.host, args.lines, settings)
     # Bytes for a human; lines plus where they came from for a script.
-    return Answer(log.document(args.job_id, entry.name), log.text)
+    return log.answer(args.job_id, host)
 
 
 def _follow_forever(session: HostSession, job_id: str, lines: int) -> Answer:
@@ -736,9 +736,16 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
     thing that does. So `tail` runs as a child writing straight to our stdout
     while this thread asks the host, and the job's own outcome becomes the exit
     code, which is what makes `gpuc logs -f "$id"` a foreground wait on its own.
+
+    The stream is started on the first poll the host answers, not before: a
+    host in trouble is the wait's business (`Watch` retries it and reads the
+    mirror once it is gone), and opening a session to it here would turn an
+    ssh blip into exit 1 before the wait had its say.
     """
     watched: wait_mod.Watched | None = None
     ended = False
+    tail: subprocess.Popen[bytes] | None = None
+    reported_stream_end = False
     # Everything is inside, not just the polling: finding the job's host can
     # ask every registered host in turn, 60s each, which is exactly where
     # somebody who mistyped an id reaches for Ctrl-C.
@@ -753,41 +760,52 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
             _, log = read_log(args.job_id, watched.host, args.lines, settings)
             sys.stdout.write(log.text)
             return wait_mod.answer([watched], watched.line())
-        if watched.status == "queued":
-            # Said before tail is started, because tail then says `cannot open
-            # ... No such file or directory` about a log the host has not
-            # opened yet, and alone that reads like a failure not a queue.
-            note(f"job {args.job_id} is queued; following the log from when it starts")
-        # The watch's own session, rather than a second one: opening another
-        # costs a round trip to resolve the same home on the same host.
-        session = watch.session(watched.host)
-        argv = _follow_argv(
-            session.transport, f"{session.job_dir(args.job_id)}/log.txt", args.lines
-        )
-        reported_stream_end = False
 
-        def check_tail(tail: subprocess.Popen[bytes]) -> None:
-            """Say so once if the stream died, rather than freeze the log in silence.
+        def each_round() -> None:
+            """Start the stream once the host answers; after that, say so once
+            if it died, rather than freeze the log in silence.
 
             An ssh whose keepalives ran out takes the tail with it. The wait
             itself is fine -- it polls over its own connection -- so this is a
             note and not an ending.
             """
-            nonlocal reported_stream_end
+            nonlocal tail, reported_stream_end
+            assert watched is not None
+            if tail is None:
+                if watched.settled or watch.troubled(watched.host):
+                    return
+                if watched.status == "queued":
+                    # Said before tail is started, because tail then says
+                    # `cannot open ... No such file or directory` about a log
+                    # the host has not opened yet, and alone that reads like a
+                    # failure not a queue.
+                    note(f"job {args.job_id} is queued; following the log from when it starts")
+                # The watch's own session, rather than a second one: opening
+                # another costs a round trip to resolve the same home.
+                session = watch.session(watched.host)
+                remote = f"{session.job_dir(args.job_id)}/log.txt"
+                tail = subprocess.Popen(_follow_argv(session.transport, remote, args.lines))
+                return
             if reported_stream_end or tail.poll() is None:
                 return
             reported_stream_end = True
             note("the log stream ended before the job did; still waiting for the job")
 
-        # Nothing between the spawn and the `try` that owns its cleanup.
-        tail = subprocess.Popen(argv)
         try:
-            wait_mod.block(watch, interval=args.interval, each_round=lambda: check_tail(tail))
+            each_round()
+            wait_mod.block(watch, interval=args.interval, each_round=each_round)
             ended = True
         finally:
             # Only a job that ended has last lines worth waiting for; an
             # interrupt wants the stream gone now.
-            _end_tail(tail, flush=ended)
+            if tail is not None:
+                _end_tail(tail, flush=ended)
+        if tail is None and watched.error is None:
+            # The host never answered and the job settled from the mirror:
+            # its log is there too. (A job that settled with an error has
+            # the wait's line to say so, and nothing to read.)
+            _, log = read_log(args.job_id, watched.host, args.lines, settings)
+            sys.stdout.write(log.text)
     except KeyboardInterrupt:
         # Ctrl-C reached the tail too: it shares this process group. The job
         # does not care either way -- its host owns it, not us. A second one,

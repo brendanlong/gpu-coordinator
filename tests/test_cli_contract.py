@@ -85,6 +85,35 @@ def test_one_bad_host_entry_is_skipped_and_the_rest_still_work(
     assert "skipping host 'bad'" in captured.err
 
 
+LEGACY_RENTAL = {"name": "gpuc-old", "kind": "runpod", "ssh": "root@1.2.3.4", "pod_id": "podOLD"}
+"""A rental as a build before `rental: {provider, pod_id}` wrote one."""
+
+
+def test_a_rental_an_earlier_build_registered_is_refused_not_read_as_ssh(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Read tolerantly it parses as an ssh host, and then nothing about it being
+    a rental works: no terminate, no reuse, never forgotten when its pod ends.
+    So it is one more entry this build cannot read -- skipped with the reason
+    and the way back, written back untouched, exit 1 -- not a quiet ssh host."""
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "gpuc-old": LEGACY_RENTAL}})
+    read = read_registry()
+    assert set(read.registry.hosts) == {"good"}
+    assert read.skipped["gpuc-old"] == LEGACY_RENTAL
+    assert "earlier build" in read.errors[0]
+    assert "gpuc host add <name> --pod podOLD" in read.errors[0]
+
+    assert main(["host", "list"]) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "good" in captured.out
+    assert "gpuc host add <name> --pod podOLD" in captured.err
+    # A rental spelled the one way this build spells it is still a rental.
+    spelled = HostEntry.model_validate(
+        {"name": "n", "rental": {"provider": "runpod", "pod_id": "p"}}
+    )
+    assert spelled.kind == "rental"
+
+
 def test_a_write_puts_back_the_entry_this_build_could_not_read(
     control_env: Path, fake_host: FakeHost
 ) -> None:
@@ -227,8 +256,55 @@ def test_status_all_json_carries_the_jobs_only_the_index_knows(
     )
     assert entry["requeued_from"] == "20250101-000000-000000"
     assert entry["outputs_lost"] is False
+    assert (entry["host_state"], entry["requeue"]) == ("not_registered", True)
     assert main(["status", "--json"]) == EXIT_OK
     assert status_json(capsys)["unhosted"] == []
+
+
+def test_status_all_labels_an_index_only_job_by_what_its_host_is(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job whose host is only unreachable may still be running there, so it
+    is listed with that said and no requeue offered for it; one whose host
+    answered without it, or is gone, is the recovery case the hint is for."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="down", kind="ssh", ssh="me@down")
+
+    def gather(entry: HostEntry, *a: object, **k: object) -> HostView:
+        if entry.name == "down":
+            return HostView(entry=entry, state=HostState.UNREACHABLE, error="ssh timed out")
+        return HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=1.0)
+
+    monkeypatch.setattr(status_mod, "gather", gather)
+    for job_id, host in [
+        ("20260101-000000-aaaaaa", "down"),
+        ("20260101-000000-bbbbbb", "gpubox"),
+        ("20260101-000000-cccccc", "gone-pod"),
+    ]:
+        LocalIndex().record(IndexEntry(job_id=job_id, host=host, name="j"))
+    capsys.readouterr()
+    assert main(["status", "--all", "--json"]) == EXIT_ERROR
+    by_host = {e["host"]: e for e in status_json(capsys)["unhosted"]}
+    assert (by_host["down"]["host_state"], by_host["down"]["requeue"]) == ("unreachable", False)
+    assert (by_host["gpubox"]["host_state"], by_host["gpubox"]["requeue"]) == ("answered", True)
+    assert (by_host["gone-pod"]["host_state"], by_host["gone-pod"]["requeue"]) == (
+        "not_registered",
+        True,
+    )
+
+    assert main(["status", "--all"]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "host=down" in out and "may still be running there" in out
+    assert "host=gpubox" in out and "does not have it" in out
+    assert "bring one back with: gpuc requeue 20260101-000000-bbbbbb" in out
+
+    # Only the unreachable host's job left: nothing to offer a requeue for.
+    (LocalIndex().directory / "20260101-000000-bbbbbb.json").unlink()
+    (LocalIndex().directory / "20260101-000000-cccccc.json").unlink()
+    assert main(["status", "--all"]) == EXIT_ERROR
+    assert "bring one back" not in capsys.readouterr().out
 
 
 def _answered_with_no_jobs(entry: HostEntry, *a: object, **k: object) -> HostView:
@@ -360,6 +436,32 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
     )
     write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
     return home
+
+
+def test_a_verb_on_an_id_the_host_does_not_have_is_exit_four_with_its_reason(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host's own `no such job` answer, through `cancel` and `reorder`
+    for real: exit 4, not "the host could not be asked" or a refusal."""
+    assert main(["cancel", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    assert document["exit_code"] == EXIT_NOT_FOUND
+    assert "no such job" in document["error"] and "host local has no job" in document["error"]
+    assert (
+        main(["reorder", "20260101-000000-aaaaaa", "--priority", "1", "--host", "local"])
+        == EXIT_NOT_FOUND
+    )
+    assert "no job 20260101-000000-aaaaaa on this host" in capsys.readouterr().err
+
+
+def test_a_verb_the_host_refuses_for_a_job_it_has_is_exit_one(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The job is there and the host will not: that is a refusal, never 4."""
+    assert main(["reorder", RUNNING_JOB, "--priority", "1", "--host", "local"]) == EXIT_ERROR
+    assert "not queued (status running)" in capsys.readouterr().err
+    assert main(["estimate", FINISHED_JOB, "--minutes", "5", "--host", "local"]) == EXIT_ERROR
+    assert "already failed" in capsys.readouterr().err
 
 
 def test_status_json_is_one_document_with_the_promised_shape(

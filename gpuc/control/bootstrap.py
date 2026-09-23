@@ -647,15 +647,17 @@ def bootstrap_host(
     report(f"python: {python}")
 
     # The host's first config, if it has none, goes down before anything runs
-    # against the host; the package next, so the questions below are answered
-    # by the host's own code and `pkg_commit` says which commit this is while
-    # `gpuc status` is still watching.
-    ensure_layout(transport, config.env, home, python)
+    # against the host (and creates gpuc home 0700 on the way); the package
+    # next, so `pkg_commit` says which commit this is while `gpuc status` is
+    # still watching; and only then anything that imports the host's own code,
+    # `ensure_layout` included -- on a fresh box it is the package just shipped
+    # that provides it.
     session = HostSession(entry, transport, home, python, read)
     if patch:
         session.write_config(patch)
         report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
     files = ensure_build(session, report, always=True, restart=False) or 0
+    ensure_layout(transport, config.env, home, python)
 
     # Before `uv tool install`, so that call already populates the cache this
     # host will actually use.

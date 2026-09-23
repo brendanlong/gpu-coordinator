@@ -25,7 +25,9 @@ def user_agent() -> str:
 
 DIRTY = "-dirty"
 """The suffix `control.version.local_commit` adds for a checkout with
-uncommitted changes: the tree behind it is not the commit it names."""
+uncommitted changes, followed by a short hash of those changes
+(`<commit>-dirty-1a2b3c4d`): the tree behind it is not the commit it names,
+and two different dirty trees on one commit are two builds."""
 
 
 def is_other_build(recorded: str | None, current: str | None) -> bool:
@@ -44,12 +46,16 @@ def is_other_build(recorded: str | None, current: str | None) -> bool:
     as "probably fine" is how last week's code goes on running. An unknown
     `current` is the other way round -- nothing to compare against, so nothing
     is claimed. Commits may be recorded at different lengths, so a prefix
-    matches, but `-dirty` is part of the identity.
+    matches, but `-dirty` and what follows it is part of the identity and
+    compared exactly: a bare `-dirty` from an earlier build, or another
+    hash, is another tree on the same commit and is re-shipped.
     """
     if not current:
         return False
     if not recorded:
         return True
-    if recorded.endswith(DIRTY) != current.endswith(DIRTY):
+    recorded_base, _, recorded_tag = recorded.partition(DIRTY)
+    current_base, _, current_tag = current.partition(DIRTY)
+    if (DIRTY in recorded) != (DIRTY in current) or recorded_tag != current_tag:
         return True
-    return not (recorded.startswith(current) or current.startswith(recorded))
+    return not (recorded_base.startswith(current_base) or current_base.startswith(recorded_base))

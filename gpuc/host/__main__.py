@@ -264,8 +264,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _no_such_job(job_id: str, why: str) -> int:
+    """The answer every job verb gives for an id this host does not have.
+
+    `missing` is what tells the control side apart "no such job" (its exit 4)
+    from a refusal of a job that is here (exit 1): both are an `error`
+    document, and the words alone are not something to parse.
+    """
+    print(json.dumps({"job_id": job_id, "error": why, "missing": True}))
+    return 1
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
-    status = queue.cancel(args.job_id)
+    try:
+        status = queue.cancel(args.job_id)
+    except FileNotFoundError as exc:
+        return _no_such_job(args.job_id, str(exc))
     print(json.dumps({"job_id": args.job_id, "status": status}))
     return 0
 
@@ -278,6 +292,8 @@ def cmd_preempt(args: argparse.Namespace) -> int:
     """
     try:
         status = queue.preempt(args.job_id, args.priority)
+    except FileNotFoundError as exc:
+        return _no_such_job(args.job_id, str(exc))
     except (OSError, ValueError, RuntimeError) as exc:
         print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
         return 1
@@ -304,11 +320,11 @@ def cmd_reorder(args: argparse.Namespace) -> int:
     for a job that is not queued, like `preempt` and `estimate` answer."""
     if not queue.reorder(args.job_id, args.priority):
         state = _state_or_none(args.job_id)
+        if state is None:
+            return _no_such_job(args.job_id, f"no job {args.job_id} on this host")
         why = (
             f"job {args.job_id} is not queued (status {state.status}); only a queued job "
             f"can be reordered"
-            if state
-            else f"no job {args.job_id} on this host"
         )
         print(json.dumps({"job_id": args.job_id, "error": why}))
         return 1
@@ -349,6 +365,8 @@ def cmd_estimate(args: argparse.Namespace) -> int:
         print(json.dumps({"job_id": job_id, "error": "give MINUTES, or --clear, not both"}))
         return 1
     minutes = None if args.clear else args.minutes
+    if not paths.job_dir(job_id).is_dir():
+        return _no_such_job(job_id, f"no job with that id on this host: {job_id}")
     error = _estimate_error(job_id, minutes)
     if error is not None:
         print(json.dumps({"job_id": job_id, "error": error}))

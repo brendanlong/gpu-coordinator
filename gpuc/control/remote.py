@@ -42,6 +42,28 @@ class RemoteError(RuntimeError):
         super().__init__(f"{detail}\n  host: {host}\n  command: {command}")
 
 
+def reason_of(exc: BaseException) -> str:
+    """One line saying why a host could not be asked.
+
+    The last non-empty line of the stderr the failed command carried, when
+    the error carries a `CommandResult` -- or is a `RemoteError` wrapping one,
+    whose own first line repeats the argv: that is where ssh puts `Connection
+    refused`, `Permission denied (publickey)` and `Host key verification
+    failed`, while the first line of a `TransportError` is the argv, which
+    names nothing. Otherwise the first line of the message: an error with
+    words of its own keeps them.
+    """
+    result = getattr(exc, "result", None)
+    if result is None and isinstance(exc, RemoteError):
+        result = getattr(exc.__cause__, "result", None)
+    if isinstance(result, CommandResult):
+        lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return lines[0] if lines else type(exc).__name__
+
+
 def env_prefix(env: Mapping[str, str] | None) -> str:
     """``K="v" `` assignments for a remote command, or ``""`` for most hosts.
 
@@ -109,7 +131,7 @@ def read_config(
     try:
         result = transport.run(command, timeout=timeout, check=False)
     except TransportError as exc:
-        return HostConfigRead(unreadable=str(exc).splitlines()[0])
+        return HostConfigRead(unreadable=reason_of(exc))
     if result.returncode != 0:
         return HostConfigRead(
             unreadable=f"`cat {path}` exited {result.returncode}: {_tail(result.output, 3)}"
@@ -494,7 +516,7 @@ def ask(
         session = session or open_session(entry, settings, record=record)
         payload = session.host_json(verb, timeout=timeout, check=check) if verb else None
     except (RemoteError, TransportError, ConfigError, OSError) as exc:
-        return Unreachable(str(exc).splitlines()[0], pod, pod_error)
+        return Unreachable(reason_of(exc), pod, pod_error)
     if verb is not None and not isinstance(payload, dict):
         kind = type(payload).__name__
         return Unreachable(

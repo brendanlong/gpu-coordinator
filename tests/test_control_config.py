@@ -17,6 +17,7 @@ from gpuc.control.config import (
     first_config,
     forget_host,
     load_settings,
+    pod_known_hosts_file,
     registry_transaction,
     save_registry,
     transport_for,
@@ -132,12 +133,12 @@ def test_first_config_owns_every_card_seen_less_the_shared_ones() -> None:
 
 def test_a_rental_is_an_address_with_a_pod_behind_it() -> None:
     """Only `rental` makes an entry a rental; `ssh` says nothing about it."""
-    assert HostEntry(name="pod1", rental=Rental(pod_id="abc")).ephemeral
+    assert HostEntry(name="pod1", rental=Rental(pod_id="abc")).kind == "rental"
     assert HostEntry(name="box", ssh="me@box", rental=Rental(pod_id="abc")).pod_id == "abc"
     podless = HostEntry(name="pod1", ssh="root@1.2.3.4")
-    assert not podless.ephemeral and podless.pod_id is None
+    assert podless.rental is None and podless.pod_id is None
     assert podless.provider_block() is None
-    assert not HostEntry(name="local").ephemeral
+    assert HostEntry(name="local").rental is None
 
 
 @pytest.mark.parametrize(
@@ -295,9 +296,14 @@ def test_forgetting_a_pod_leaves_a_different_host_of_the_same_name_alone(
     mine = host_entry(name="shared", kind="ssh", ssh="me@box")
     with registry_transaction() as registry:
         registry.put(mine)
+    pinned = pod_known_hosts_file("shared")
+    pinned.parent.mkdir(parents=True, exist_ok=True)
+    pinned.write_text("[1.2.3.4]:22 ssh-ed25519 AAAA\n")
 
     assert not forget_host("shared", "podX")
     assert load_registry().hosts["shared"].ssh == "me@box"  # not this pod's entry
+    assert pinned.exists()  # and its pinned host key was not this pod's to drop
 
     assert forget_host("shared", None)  # no pod named: forget the host too
     assert load_registry().hosts == {}
+    assert not pinned.exists()

@@ -60,9 +60,17 @@ from gpuc.control.providers.base import (
     Provider,
     ProviderError,
 )
-from gpuc.control.remote import Answered, PodDead, PodGone, RemoteError, Unreachable, ask
+from gpuc.control.remote import (
+    Answered,
+    PodDead,
+    PodGone,
+    RemoteError,
+    Unreachable,
+    ask,
+    reason_of,
+)
 from gpuc.control.status import parse_status
-from gpuc.control.transport import SshUnusable, Transport, TransportError
+from gpuc.control.transport import LocalToolMissing, SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
 """How long one `submit --runpod` may spend buying, waiting for and proving a
@@ -74,7 +82,8 @@ LOG_CHECK_INTERVAL_S = 30.0
 SSH_REPORT_INTERVAL_S = 60.0
 
 SSH_MISCONFIGURED = re.compile(
-    r"Bad configuration option|no such identity file|WARNING: UNPROTECTED PRIVATE KEY",
+    r"Bad configuration option|no such identity file|Identity file .* not accessible"
+    r"|WARNING: UNPROTECTED PRIVATE KEY",
     re.IGNORECASE,
 )
 """Local ssh problems that no amount of waiting -- and no other offer -- can fix.
@@ -110,11 +119,11 @@ def verdict(exc: BaseException, *, polling: bool = False) -> Verdict:
     `polling` is the wait for a pod's endpoint or its sshd, where a provider
     read that failed or an ssh that was refused is the ordinary state of a
     pod still booting. The same failures at any other point are the offer's.
-    A local ssh misconfiguration is never the offer's: every pod would be
-    bought, waited on and terminated identically, so it ends the attempt at
-    the first one.
+    A local ssh misconfiguration, or an `ssh`/`rsync` this machine does not
+    have, is never the offer's: every pod would be bought, waited on and
+    terminated identically, so it ends the attempt at the first one.
     """
-    if isinstance(exc, (SshUnusable, Unprovisionable)):
+    if isinstance(exc, (SshUnusable, LocalToolMissing, Unprovisionable)):
         return Verdict.ABORT
     if isinstance(exc, TransportError) and SSH_MISCONFIGURED.search(str(exc)):
         return Verdict.ABORT
@@ -219,9 +228,9 @@ def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
     return offer.matches_cuda_floor(constraints.cuda_min)
 
 
-def address_for(name: str, pod: Pod) -> HostEntry:
+def address_for(name: str, pod: Pod, provider: Provider) -> HostEntry:
     """How to reach this pod, and nothing about what it is."""
-    address = rented.address_for(name, pod)
+    address = rented.address_for(name, pod, provider.name)
     if address is None:
         raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
     return address
@@ -368,7 +377,7 @@ def _try_offer(
             f"ssh.direct {pod.ssh_direct.username}@{pod.ssh_direct.host}:{pod.ssh_direct.port} "
             f"(cuda {pod.cuda_version or '?'}, ${pod.cost_usd_hr:.3f}/h)"
         )
-        address = address_for(name, pod)
+        address = address_for(name, pod, provider)
         transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
         # The one look at the pod's cards, the same probe `gpuc host add`
@@ -429,8 +438,11 @@ def _left(deadline: float, deps: ProvisionDeps) -> float:
 
 
 def _first_line(exc: BaseException) -> str:
-    lines = str(exc).strip().splitlines()
-    return lines[0] if lines else f"{type(exc).__name__} (interrupted)"
+    """One line for a failure: what ssh said last, else the first line of the
+    message (`remote.reason_of`); an interrupt has no message at all."""
+    if not str(exc).strip():
+        return f"{type(exc).__name__} (interrupted)"
+    return reason_of(exc)
 
 
 def _abandon(

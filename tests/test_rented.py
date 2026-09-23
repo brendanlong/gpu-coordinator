@@ -34,7 +34,7 @@ def test_a_record_with_no_offer_or_an_unreadable_one_costs_a_reuse_not_a_crash()
 
 def test_an_address_is_only_what_the_provider_says() -> None:
     pod = running_pod("gpuc-a-111", "pod1")
-    address = address_for("gpuc-a-111", pod)
+    address = address_for("gpuc-a-111", pod, "runpod")
     assert address is not None
     assert (address.kind, address.ssh, address.port, address.pod_id) == (
         "rental",
@@ -47,4 +47,4 @@ def test_an_address_is_only_what_the_provider_says() -> None:
 
 def test_a_pod_with_no_ssh_endpoint_has_no_address_yet() -> None:
     doorless = running_pod("gpuc-a-111", "pod1").model_copy(update={"ssh_direct": None})
-    assert address_for("gpuc-a-111", doorless) is None
+    assert address_for("gpuc-a-111", doorless, "runpod") is None

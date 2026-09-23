@@ -74,7 +74,7 @@ def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEnt
             f"pod {pod_id} is {'gone' if pod is None else pod.status} on this account, so "
             f"there is nothing to add. `gpuc pods` lists the pods it can see."
         )
-    reached = rented.address_for(address.name, pod)
+    reached = rented.address_for(address.name, pod, provider.name)
     if reached is None:
         raise CliError(
             f"pod {pod_id} ({pod.name}) is {pod.status} and has no direct SSH endpoint yet, so "
@@ -339,7 +339,7 @@ class BootstrapTally:
                 "name": entry.name,
                 "outcome": outcome,
                 "error": error,
-                "ephemeral": entry.ephemeral,
+                "ephemeral": entry.rental is not None,
                 **detail,
             }
         )

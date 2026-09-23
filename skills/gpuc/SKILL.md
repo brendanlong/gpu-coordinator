@@ -220,9 +220,14 @@ succeeded, 1 if any did not, 130 if you Ctrl-C out.
 A host that stops answering does not end the wait: gpuc keeps asking for five
 minutes, then reads the job's final state from the S3 mirror (where a pod that
 finished the job and idled itself down leaves it) and says the answer came from
-there. Only if the mirror has nothing is it exit 1. A reachable host whose
-dispatcher is down is called out once and waited through — `gpuc host bootstrap
-<host>` restarts the queue.
+there. Only if the mirror has nothing is it exit 1. A host that is *gone* — its
+rental ended, or it is no longer registered on this machine — is read from the
+mirror at once. A reachable host whose dispatcher is down is called out once
+and waited through — `gpuc host bootstrap <host>` restarts the queue.
+
+A host that is only unreachable is not gone: `gpuc logs` on its job prints the
+mirror's copy but exits 1 with the reason, because the host may hold a newer
+log. Exit 0 from `gpuc logs` after a fallback means the host really is gone.
 
 Neither command is a background job, and killing one leaves the run alone.
 
@@ -234,7 +239,7 @@ Neither command is a background job, and killing one leaves the run alone.
 | 1 | something failed: transport, provider, a refused submit, **a host that could not be read**. Whatever did work is still reported, so read the output before retrying — one host being down does not cost you the others. For `gpuc wait` and `gpuc logs -f` it is the **job** that did not succeed |
 | 2 | usage: a bad or missing flag |
 | 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
-| 4 | the job or host named does not exist. Only when every host answered: a job whose host could not be reached is exit 1 with the reason, and may well still be on it |
+| 4 | the job or host named does not exist. Only when every host answered: a job whose host could not be reached is exit 1 with the reason, and may well still be on it. `gpuc wait` on several ids reports the ones it found and exits 4 for the unknown one |
 | 130 | a Ctrl-C |
 
 ```bash
@@ -255,8 +260,10 @@ progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
 gpus_requested, use_shared, starts_in_s, starts_at, starts_unknown, iso,
 ended_at, outputs_pending` (`starts_*` are null unless the job is queued).
 `unhosted` is `--all`'s list of jobs only the index knows, each
-`{job_id, name, host, requeued_from, submitted_at, s3_prefix, outputs_lost}`,
-and empty without the flag. Each entry in
+`{job_id, name, host, host_state, requeue, requeued_from, submitted_at,
+s3_prefix, outputs_lost}`, and empty without the flag. **Requeue one only if
+`requeue` is true**: a `host_state` of `unreachable` or `pod_dead` means the
+host may still be running that job, and a second copy is not recovery. Each entry in
 `shared_gpus` adds `memory_mib`, `utilization_pct` and `unused` — the host's own
 verdict on whether gpuc would borrow that card right now.
 
@@ -353,7 +360,9 @@ Rules, and they are not optional:
   `POD EXITED` (its status), is exit 1, and stays until `gpuc host terminate
   <name>` ends it, or `gpuc host remove <name>` forgets it and leaves it billing.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
-  create, reading the config the pod already has.
+  create, reading the config the pod already has. It is also the fix when a
+  command warns `skipping host ... registered by an earlier build`: that entry
+  is ignored (and the command exits 1) until it is re-added.
 - Only act on pods named `gpuc-*`. Others belong to other people.
 
 ## Housekeeping

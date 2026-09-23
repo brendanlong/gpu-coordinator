@@ -15,6 +15,7 @@ from gpuc.control.remote import (
     host_python,
     parse_last_json,
     read_config,
+    reason_of,
     usable_python,
     write_config,
 )
@@ -141,6 +142,45 @@ def test_a_pretty_printed_report_is_not_mistaken_for_its_last_nested_object() ->
 
 def test_the_last_of_two_documents_wins() -> None:
     assert parse_last_json('{"first": 1}\n{"second": 2}\n') == {"second": 2}
+
+
+SSH_STDERR = """\
+Warning: Permanently added '[1.2.3.4]:22000' (ED25519) to the list of known hosts.
+root@1.2.3.4: Permission denied (publickey).
+"""
+
+
+def test_the_reason_a_host_could_not_be_asked_is_what_ssh_said_last() -> None:
+    """A `TransportError`'s first line is the argv dump; what a person needs
+    -- refused, denied, key changed -- is the last thing ssh wrote."""
+    refused = TransportError(
+        CommandResult("gpubox", ["ssh", "-p", "22000", "u@h"], 255, "", SSH_STDERR)
+    )
+    assert reason_of(refused) == "root@1.2.3.4: Permission denied (publickey)."
+    # Wrapped once on the way out of `resolve_home`: the cause still carries it.
+    wrapped = RemoteError("gpubox", "printf", f"could not reach host gpubox: {refused}")
+    wrapped.__cause__ = refused
+    assert reason_of(wrapped) == "root@1.2.3.4: Permission denied (publickey)."
+    # No stderr to quote: the first line of the message, never an empty string.
+    assert reason_of(RemoteError("gpubox", "status", "expected JSON on stdout, got:\nbanner")) == (
+        "expected JSON on stdout, got:"
+    )
+    assert reason_of(TransportError(CommandResult("h", ["ssh"], 124, "", "  \n"))).startswith(
+        "`ssh` on host h exited 124"
+    )
+    assert reason_of(OSError()) == "OSError"
+
+
+def test_ask_reports_the_reason_ssh_gave_not_the_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gpuc.control.remote import Unreachable, ask
+
+    def down(*_: object, **__: object) -> object:
+        raise TransportError(CommandResult("gpubox", ["ssh", "u@h", "printf"], 255, "", SSH_STDERR))
+
+    monkeypatch.setattr("gpuc.control.remote.open_session", down)
+    asked = ask(host_entry(name="gpubox", kind="ssh", ssh="u@h"), "status")
+    assert isinstance(asked, Unreachable)
+    assert asked.reason == "root@1.2.3.4: Permission denied (publickey)."
 
 
 def test_the_remote_config_is_read_from_the_host_not_the_registry() -> None:

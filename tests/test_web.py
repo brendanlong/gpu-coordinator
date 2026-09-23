@@ -361,6 +361,24 @@ def test_status_narrows_to_one_host_and_refuses_a_bad_since(
     assert status == 400 and document["exit_code"] == EXIT_USAGE
 
 
+def test_all_is_a_flag_and_zero_means_no(logged_in: Client, one_host: None) -> None:
+    """`bool("0")` is True: `?all=0` used to list every index-only job."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    LocalIndex().record(IndexEntry(job_id="20260101-000000-aaaaaa", host="gone-box", name="lost"))
+    for query, listed in [
+        ("all=1", True),
+        ("all=true", True),
+        ("all=0", False),
+        ("all=false", False),
+        ("all=", False),
+        ("", False),
+    ]:
+        status, document = logged_in.get_json(f"/api/status?{query}")
+        assert status == 200, query
+        assert bool(document["unhosted"]) is listed, query
+
+
 def test_hosts_and_version_are_the_list_and_version_documents(
     logged_in: Client, one_host: None
 ) -> None:

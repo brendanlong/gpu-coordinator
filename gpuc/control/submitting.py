@@ -21,6 +21,7 @@ from gpuc.control.actions import (
     UsageError,
     locate,
     make_provider,
+    mirror_is_the_answer,
     placement_after,
 )
 from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build, host_build
@@ -35,6 +36,7 @@ from gpuc.control.submit import (
     check_gpu_count,
     load_document,
     prepare,
+    refuse_unreadable_config,
     submit_spec,
     validate,
     with_overrides,
@@ -116,6 +118,7 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
     """
     if not bootstrap:
         return
+    refuse_unreadable_config(session)
     if session.config_read.missing or host_build(session) is None:
         raise CliError(
             f"host {session.entry.name} has no gpuc on it yet: its own config records no "
@@ -130,7 +133,8 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
         f"machine has {version_mod.short(local)}: re-syncing the package and restarting the "
         f"dispatcher before enqueueing"
     )
-    ensure_build(session, _quiet)
+    # Decided above; `always` keeps `ensure_build` from asking the same question.
+    ensure_build(session, _quiet, always=True)
 
 
 def _quiet(_: str) -> None:
@@ -242,10 +246,13 @@ def requeue_job(
         # the index, then every registered host. A second client with no
         # index of its own still finds it, and an id nobody knows is exit 4.
         location = locate(job_id, open_registry().named(), host, settings)
-        if location.trouble is not None:
+        trouble = location.trouble
+        if location.entry is None or trouble is not None:
+            gone = trouble is not None and mirror_is_the_answer(trouble)
             raise CliError(
-                f"job {job_id} ran on host {location.entry.name}, which could not be asked: "
-                f"{location.trouble_reason}\nName another host with --host, or --runpod."
+                f"job {job_id} ran on host {location.host}, which "
+                f"{'is gone' if gone else 'could not be asked'}: {location.trouble_reason}\n"
+                f"Name another host with --host, or --runpod."
             )
         entry, session = location.entry, location.session
     return enqueue(

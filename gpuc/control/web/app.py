@@ -277,7 +277,7 @@ class Dashboard:
         except ValueError as exc:
             raise UsageError(f"since: {exc}") from exc
         result = status(
-            read, settings, host=request.param("host") or None, all_jobs=bool(request.param("all"))
+            read, settings, host=request.param("host") or None, all_jobs=flag_param(request, "all")
         )
         return Response.answer(result.answer(recent=recent, since_s=since_s), gathered_at=utc_now())
 
@@ -301,8 +301,8 @@ class Dashboard:
     def api_logs(self, request: Request) -> Response:
         job_id = job_id_of(request)
         lines = min(int_param(request, "lines", 200), MAX_LOG_LINES)
-        entry, log = read_log(job_id, request.param("host") or None, lines, self.load_settings())
-        return Response.json(log.document(job_id, entry.name))
+        host, log = read_log(job_id, request.param("host") or None, lines, self.load_settings())
+        return Response.answer(log.answer(job_id, host))
 
     def api_cancel(self, request: Request) -> Response:
         job_id = job_id_of(request)
@@ -354,6 +354,16 @@ def host_of(body: dict[str, Any]) -> str | None:
     if not isinstance(host, str):
         raise UsageError("`host` must be a host name")
     return host
+
+
+FALSE_WORDS = {"", "0", "false", "no", "off"}
+
+
+def flag_param(request: Request, name: str) -> bool:
+    """A boolean query parameter: absent, empty, `0`, `false`, `no` and `off`
+    are false. `bool("0")` is True, which is how `?all=0` asked for everything."""
+    raw = request.param(name)
+    return raw is not None and raw.strip().lower() not in FALSE_WORDS
 
 
 def int_param(request: Request, name: str, default: int) -> int:
