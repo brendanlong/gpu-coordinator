@@ -25,14 +25,13 @@ from pathlib import Path
 from gpuc._version import is_other_build
 from gpuc.host import baseline, cleanup, gpus, jobs, paths, plan, queue, scope, sync, terminate
 from gpuc.host.gpus import SmiRunner
+from gpuc.host.jobs import Outcome
 from gpuc.host.procs import (
     KILL_GRACE_S,
     JobProcesses,
     boot_id,
     cmdline,
     is_gpuc_process,
-    live_runner_pids,
-    pid_alive,
     recorded_process_alive,
     starttime,
 )
@@ -433,8 +432,6 @@ def _child_env(package_root: Path) -> dict[str, str]:
     env = dict(os.environ)
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{package_root}{os.pathsep}{existing}" if existing else str(package_root)
-    # Probed once and handed down: creating a throwaway scope per phase to ask
-    # the same question again would be one exec per phase for one bit.
     env[scope.ISOLATION_ENV] = scope.isolation()
     config = jobs.HostConfig()
     with contextlib.suppress(RuntimeError, OSError, ValueError):
@@ -442,7 +439,7 @@ def _child_env(package_root: Path) -> dict[str, str]:
     return config.apply_env(env)
 
 
-def _spawn_host_process(*args: str) -> subprocess.Popen[bytes]:
+def _spawn_host_process(*args: str, label: str) -> subprocess.Popen[bytes]:
     """`python -m gpuc.host <args>` in its own session -- and, where the host
     has user systemd, its own transient scope.
 
@@ -457,8 +454,8 @@ def _spawn_host_process(*args: str) -> subprocess.Popen[bytes]:
     package_root = Path(__file__).resolve().parents[2]
     paths.ensure_layout()
     argv = [sys.executable, "-m", "gpuc.host", *args]
-    if scope.probe():
-        unit = f"gpuc-{'-'.join(args)}-{os.getpid()}-{int(time.time())}.scope"
+    if scope.isolation() == scope.CGROUP:
+        unit = f"gpuc-{label}-{os.getpid()}-{int(time.time())}.scope"
         argv = [
             "systemd-run",
             "--user",
@@ -481,8 +478,11 @@ def _spawn_host_process(*args: str) -> subprocess.Popen[bytes]:
         )
 
 
-def default_spawn_runner(job_id: str) -> subprocess.Popen[bytes]:
-    return _spawn_host_process("run", job_id)
+def default_spawn_runner(job_id: str, assigned: Sequence[str]) -> subprocess.Popen[bytes]:
+    """Start the runner for `job_id` on `assigned`. The assignment travels on
+    the command line: it is UUIDs, not a secret, and the runner claims the job
+    with it as its first act."""
+    return _spawn_host_process("run", job_id, "--gpus", ",".join(assigned), label=f"run-{job_id}")
 
 
 def spawn_detached_dispatcher() -> int:
@@ -494,7 +494,7 @@ def spawn_detached_dispatcher() -> int:
     see `DispatcherLock.acquire` -- which is why it is worth firing even on a
     host whose dispatcher is demonstrably healthy.
     """
-    return _spawn_host_process("dispatch").pid
+    return _spawn_host_process("dispatch", label="dispatch").pid
 
 
 @dataclass
@@ -502,7 +502,7 @@ class DispatcherDeps:
     smi: SmiRunner = gpus.run_nvidia_smi
     command_runner: sync.CommandRunner = sync.run_command
     terminate_call: TerminateCall | None = None
-    spawn_runner: Callable[[str], subprocess.Popen[bytes]] = default_spawn_runner
+    spawn_runner: Callable[[str, Sequence[str]], subprocess.Popen[bytes]] = default_spawn_runner
     monotonic: Callable[[], float] = time.monotonic
     utcnow: Callable[[], datetime] = lambda: datetime.now(UTC)
     sleep: Callable[[float], None] = time.sleep
@@ -512,15 +512,38 @@ class DispatcherDeps:
 
 @dataclass
 class _Running:
-    job_id: str
-    pid: int
-    gpus: list[str]
-    popen: subprocess.Popen[bytes] | None = None
+    """A job whose cards this dispatcher counts as taken: one it spawned a
+    runner for, whether or not that runner has claimed the job yet, or one it
+    adopted by the runner the job's state named."""
 
-    def poll(self) -> int | None:
+    job_id: str
+    gpus: list[str]
+    attempt: int
+    """Which launch of the job this is, so a runner that died before claiming
+    it can be told from one that queued the job again."""
+    popen: subprocess.Popen[bytes] | None = None
+    runner_pid: int | None = None
+    runner_boot_id: str | None = None
+    runner_starttime: str | None = None
+
+    @staticmethod
+    def adopted(job_id: str, state: jobs.JobState) -> _Running:
+        return _Running(
+            job_id,
+            list(state.gpus),
+            state.attempt,
+            runner_pid=state.runner_pid,
+            runner_boot_id=state.runner_boot_id,
+            runner_starttime=state.runner_starttime,
+        )
+
+    def alive(self) -> bool:
+        """Is the runner still there? A spawned one is asked directly; an
+        adopted one by the identity its state recorded, since a bare pid is
+        reused within a boot and from 1 again after one."""
         if self.popen is not None:
-            return self.popen.poll()
-        return None if pid_alive(self.pid) else -1
+            return self.popen.poll() is None
+        return recorded_process_alive(self.runner_pid, self.runner_boot_id, self.runner_starttime)
 
 
 @dataclass
@@ -602,6 +625,8 @@ class Dispatcher:
     a job being allowed onto somebody else's card, and it is the first thing
     anybody looks for when one was not.
     """
+    _draining: bool | None = None
+    """This pass's one reading of the draining marker; see `going_away`."""
     consecutive_failures: int = 0
     should_exit: bool = False
 
@@ -626,207 +651,141 @@ class Dispatcher:
             self._queued = queue.list_queued()
         return self._queued
 
-    def _claim(self, job_id: str, **state: object) -> bool:
-        """`queue.claim`, and the cached listing forgets the job with it."""
-        taken = queue.claim(job_id, **state)
-        if taken and self._queued is not None:
+    @property
+    def going_away(self) -> str | None:
+        """Why this host will not be running anything else, or None. Read
+        once per pass, like the config: a drain that starts mid-pass is the
+        next pass's business."""
+        if self._draining is None:
+            self._draining = paths.draining_file().exists()
+        return "draining" if self._draining else None
+
+    def _fail_queued(self, job_id: str, reason: str) -> None:
+        """End a queued job without a runner: a spec that cannot be read, a
+        request this host can never meet, a runner that could not be spawned.
+        The listing forgets the job with it."""
+        try:
+            written = jobs.finish(job_id, Outcome("failed", reason, ran=False), expect="queued")
+        except RuntimeError as exc:
+            self.log(f"job {job_id}: could not fail it as {reason} ({exc}); left alone")
+            return
+        if written is None:
+            return
+        self.log(f"job {job_id} failed: {reason}")
+        if self._queued is not None:
             self._queued = [entry for entry in self._queued if entry.job_id != job_id]
-        return taken
 
     # -- startup ---------------------------------------------------------
     def adopt_orphans(self) -> None:
-        """Reconcile jobs left `running` by a dispatcher that died."""
-        # Walked at most once, and only for a job whose state names no live
-        # runner: `launch_ready` writes `running` before it has a process to
-        # name and the pid only after the spawn, so a dispatcher killed between
-        # the two -- every first takeover by a newer build, and both SIGKILL
-        # paths -- leaves a live runner nothing points at. Failing that job
-        # would lose it *and* put its cards back in the free pool underneath a
-        # process still training on them, with no pgid recorded to kill it by:
-        # the runner does not publish the job's own group until later.
-        runners: dict[str, int] | None = None
+        """Take over the jobs a previous dispatcher was running.
 
-        def live_runner(job_id: str) -> int | None:
-            nonlocal runners
-            if runners is None:
-                runners = live_runner_pids()
-            return runners.get(job_id)
-
+        A `running` state names the runner that claimed it, with the boot id
+        and start time that make a pid an identity, so the question is only
+        whether that process is still there: adopted if so, `runner-died` if
+        not. Nothing else is inferred, and nothing is written back.
+        """
         for job_id in jobs.list_job_ids():
             try:
                 state = jobs.read_state(job_id)
             except RuntimeError as exc:
                 self.log(f"job {job_id} has an unreadable state.json ({exc}); skipping")
                 continue
-            # A recorded pid means nothing across a reboot, and little after a
-            # pid rollover: the boot id and start time recorded at launch are
-            # what make "still running" a real answer.
-            alive = bool(state.runner_pid) and recorded_process_alive(
-                state.runner_pid, state.runner_boot_id, state.runner_starttime
-            )
-            if state.finished:
-                if state.intent == jobs.PREEMPT:
-                    # Finished, preempted, and its runner is *still there*: it
-                    # is in its final sync, writing to the workdir and to
-                    # state.json. Queueing the job now would launch the next
-                    # attempt into that same workdir. Adopt the runner instead
-                    # and let `reap` do it when the runner is really gone.
-                    syncing = state.runner_pid if alive else live_runner(job_id)
-                    if syncing is not None:
-                        self.running[job_id] = _Running(
-                            job_id, syncing, self._held_gpus(job_id, state)
-                        )
-                        self.log(f"job {job_id} was preempted and is still syncing; waiting for it")
-                        continue
-                # Otherwise its runner is gone and nothing was left to put it
-                # back: that is this dispatcher's job now.
-                self.requeue_if_preempted(job_id)
-                continue
             if state.status != "running" or job_id in self.running:
                 continue
-            runner_pid = state.runner_pid if alive else live_runner(job_id)
-            if runner_pid is not None:
-                self.running[job_id] = _Running(job_id, runner_pid, self._held_gpus(job_id, state))
-                # Not written back to the state: the runner records its own
-                # identity a moment later (`_run_phases`), and a read-modify-
-                # write from here would race the one it makes in between --
-                # `_resolve_assigned`, whose resolved UUIDs would be the loss.
-                unrecorded = "" if alive else ", which its dispatcher died before recording"
-                self.log(f"adopted running job {job_id} (runner pid {runner_pid}{unrecorded})")
+            if recorded_process_alive(
+                state.runner_pid, state.runner_boot_id, state.runner_starttime
+            ):
+                self.running[job_id] = _Running.adopted(job_id, state)
+                self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
             else:
-                self._mark_runner_died(job_id)
-                # A job stopped by `gpuc preempt` whose runner then died still
-                # asked to come back, and `reap` will never see this one: it
-                # belongs to a dispatcher that is gone.
-                self.requeue_if_preempted(job_id)
+                self._mark_runner_died(job_id, expect="running")
 
-    def _held_gpus(self, job_id: str, state: jobs.JobState) -> list[str]:
-        """The cards an adopted job is holding, as UUIDs.
-
-        Through the resolver: a job launched before assignments were resolved
-        host-side has indices in its state, and busy/free accounting is in
-        UUIDs. An index adopted as-is would match nothing owned, so the card
-        would read free and be handed out a second time while the job is still
-        training on it.
-        """
-        try:
-            held, _ = gpus.resolve_owned(state.gpus, self.deps.smi)
-        except gpus.GpuError as exc:
-            # Adoption runs once, at startup: a job left unadopted here is
-            # never picked up, so an unreadable nvidia-smi must cost the
-            # resolution, not the adoption.
-            self.log(f"could not resolve the GPUs of {job_id} ({exc}); adopting as given")
-            held = list(state.gpus)
-        return held
-
-    def _mark_runner_died(self, job_id: str) -> None:
-        """Fail the job, after making sure nothing of it is left on the GPUs.
+    def _mark_runner_died(self, job_id: str, *, expect: str) -> None:
+        """Fail the job whose runner is gone, after making sure nothing of it
+        is left on the GPUs.
 
         The GPUs go back in the free pool the moment this returns, so a job
         process that outlived its runner has to die first; otherwise it keeps
-        computing on a card the next job is about to be handed.
+        computing on a card the next job is about to be handed. The one
+        verdict for a dead runner, whatever was asked of the job: a preempt
+        needs its runner to queue the job again, and a runner that is gone
+        queued nothing.
         """
         try:
-            state: jobs.JobState | None = jobs.read_state(job_id)
+            state = jobs.read_state(job_id)
         except RuntimeError as exc:
-            self.log(f"job {job_id} has an unreadable state.json ({exc}); treating as runner-died")
-            state = None
-        if state is not None:
-            JobProcesses.of(state).kill(
-                lambda m: self.log(f"job {job_id}: {m} before freeing its GPUs")
+            self.log(
+                f"job {job_id}: its runner is gone and its state.json is unreadable ({exc}); "
+                f"left alone"
             )
-        with jobs.locked(job_id):
-            # Re-read under the lock: a cancel or preempt that landed since
-            # the read above must not be written over.
-            try:
-                final = jobs.read_state(job_id)
-            except RuntimeError:
-                final = jobs.JobState()
-            final.status = "failed"
-            final.reason = "runner-died"
-            final.exit_code = final.exit_code or 1
-            final.ended_at = jobs.utc_now()
-            final.phase = None
-            # The runner clears this itself on every path it survives; here it
-            # did not survive, and a finished job carrying an eta reads to
-            # anything keying on it as a job that is still going.
-            final.eta = None
-            # A periodic tick's success says nothing about what the job wrote
-            # after it, and the final upload that would have never ran: these
-            # outputs are not confirmed anywhere, and the sweep must not take
-            # them.
-            for record in final.output_uploads():
-                record.ok_at = None
-            jobs.write_state(job_id, final)
+            return
+        JobProcesses.of(state).kill(
+            lambda m: self.log(f"job {job_id}: {m} before freeing its GPUs")
+        )
+        try:
+            written = jobs.finish(
+                job_id,
+                Outcome("failed", "runner-died", ran=expect == "running"),
+                expect=expect,
+                forget_output_uploads=True,
+            )
+        except RuntimeError as exc:
+            self.log(f"job {job_id}: could not record runner-died ({exc}); left alone")
+            return
+        if written is None:
+            self.log(f"job {job_id}: its runner is gone but its state moved on; nothing written")
+            return
         self.log(f"job {job_id} failed: runner died without writing final state")
 
     # -- loop pieces -----------------------------------------------------
     def reap(self) -> None:
         for job_id, entry in list(self.running.items()):
-            if entry.poll() is None:
+            if entry.alive():
                 continue
             del self.running[job_id]
             self._stop_sent.pop(job_id, None)
             self._stop_escalated.discard(job_id)
-            try:
-                state: jobs.JobState | None = jobs.read_state(job_id)
-            except RuntimeError:
-                state = None
-            if state is None or not state.finished:
-                self._mark_runner_died(job_id)
-            else:
-                self.log(
-                    f"job {job_id} {state.status}"
-                    f"{f' ({state.reason})' if state.reason else ''} "
-                    f"exit={state.exit_code}"
-                )
-            self.requeue_if_preempted(job_id)
+            self._settle(job_id, entry)
 
-    def requeue_if_preempted(self, job_id: str) -> None:
-        """Put a job `gpuc preempt` stopped back in the queue.
+    def _settle(self, job_id: str, entry: _Running) -> None:
+        """What became of a job whose runner is gone.
 
-        Here rather than in the runner: the queue is the dispatcher's, and a
-        job whose runner died on the way out must still come back.
+        The runner's last write says: a finished status, or `queued` at the
+        next attempt for a preempt. A state still `running` under a live
+        runner other than ours is a claim we lost -- the runner a dispatcher we
+        took over from had already started -- and is adopted. Anything else
+        is a runner that died: before claiming the job (still `queued` at the
+        attempt we launched) or after.
         """
-        if not queue.is_preempted(job_id):
-            return
-        going = self._going_away()
-        if going is not None:
-            # The job would be queued onto a host that is about to stop
-            # existing, where nothing would run it and the drain would not even
-            # count its outputs as unconfirmed (that list is finished jobs).
-            # Left finished, it keeps its record, its `preempted` reason and
-            # its place in the drain's last upload attempt.
-            with contextlib.suppress(RuntimeError, OSError):
-                jobs.update_state(job_id, intent=None)
-            self.log(
-                f"job {job_id} was preempted, but this host is {going}, so it is not going "
-                f"back in the queue: it stays {self._state_or_empty(job_id).status} and "
-                f"`gpuc requeue` is what re-runs it"
-            )
-            return
         try:
-            attempt = queue.requeue_preempted(job_id)
-        except (OSError, RuntimeError, ValueError) as exc:
+            state = jobs.read_state(job_id)
+        except RuntimeError as exc:
             self.log(
-                f"job {job_id} was preempted but could not be queued again ({exc}); "
-                f"it stays finished"
+                f"job {job_id}: its runner is gone and its state.json is unreadable ({exc}); "
+                f"left alone"
             )
             return
-        if attempt is None:
+        if state.finished:
             self.log(
-                f"job {job_id} was preempted but is not going back in the queue: it "
-                f"{self._state_or_empty(job_id).status} before the kill reached it, it was "
-                f"cancelled while it stopped, or its workdir is gone"
+                f"job {job_id} {state.status}"
+                f"{f' ({state.reason})' if state.reason else ''} "
+                f"exit={state.exit_code}"
             )
             return
-        self.log(f"job {job_id} was preempted; queued again as attempt {attempt}")
-
-    def _going_away(self) -> str | None:
-        """Why this host will not be running anything else, or None."""
-        if paths.draining_file().exists():
-            return "draining"
-        return None
+        if state.status == "queued":
+            if state.attempt > entry.attempt:
+                self.log(f"job {job_id} was preempted; queued again as attempt {state.attempt}")
+            else:
+                self._mark_runner_died(job_id, expect="queued")
+            return
+        ours = entry.popen.pid if entry.popen is not None else entry.runner_pid
+        if state.runner_pid != ours and recorded_process_alive(
+            state.runner_pid, state.runner_boot_id, state.runner_starttime
+        ):
+            self.running[job_id] = _Running.adopted(job_id, state)
+            self.log(f"job {job_id} is running under runner pid {state.runner_pid}; adopted")
+            return
+        self._mark_runner_died(job_id, expect="running")
 
     def escalate_stops(self) -> None:
         """Make a stop request stick when the runner never acts on it.
@@ -842,7 +801,7 @@ class Dispatcher:
         """
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
-        for job_id, entry in list(self.running.items()):
+        for job_id in list(self.running):
             state = self._state_or_empty(job_id)
             if state.intent is None:
                 continue
@@ -864,7 +823,7 @@ class Dispatcher:
                     f"job {job_id}: its runner has not stopped it {elapsed:.0f}s after the "
                     f"{state.intent} request; escalating"
                 )
-            JobProcesses.of(state, entry.pid).escalate(
+            JobProcesses.of(state).escalate(
                 elapsed - patience + grace,
                 grace,
                 (lambda m, job_id=job_id: self.log(f"job {job_id}: {m}")) if first else None,
@@ -965,18 +924,19 @@ class Dispatcher:
         return [uuid for uuid in unused if uuid not in busy], theirs
 
     def _requests(self) -> list[tuple[queue.QueueEntry, plan.Request]]:
-        """The queue as `plan` sees it. A job whose spec cannot be read is
+        """The queue as `plan` sees it: every queued job this dispatcher has
+        not already started a runner for. A job whose spec cannot be read is
         failed here: it is the one thing about a queued job that only the
         dispatcher can decide."""
         requests: list[tuple[queue.QueueEntry, plan.Request]] = []
         for entry in self.queued():
+            if entry.job_id in self.running:
+                continue
             try:
                 spec = jobs.read_spec(entry.job_id)
             except (RuntimeError, ValueError) as exc:
                 self.log(f"job {entry.job_id} has an unreadable spec ({exc}); dropping from queue")
-                self._claim(
-                    entry.job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
-                )
+                self._fail_queued(entry.job_id, "bad-spec")
                 continue
             requests.append(
                 (entry, plan.Request(entry.job_id, spec.gpus, self.config.may_borrow(spec)))
@@ -1005,58 +965,36 @@ class Dispatcher:
         is misconfigured or broken, and idling the queue behind the job is how
         that gets noticed rather than quietly worked around.
         """
-        if paths.draining_file().exists():
+        if self.going_away is not None:
             return
         requests = self._requests()
+        attempts = {entry.job_id: entry.attempt for entry, _ in requests}
         decisions = plan.plan([request for _, request in requests], self._pool())
         for decision in decisions:
             job_id = decision.job_id
             if isinstance(decision, plan.Fails):
-                self._claim(
-                    job_id,
-                    status="failed",
-                    reason=decision.reason,
-                    exit_code=1,
-                    ended_at=jobs.utc_now(),
-                )
+                self._fail_queued(job_id, decision.reason)
                 continue
             if not isinstance(decision, plan.Assigned):
                 continue
-            self._launch(job_id, decision.gpus)
+            self._launch(job_id, decision.gpus, attempts[job_id])
 
-    def _launch(self, job_id: str, assigned: list[str]) -> None:
-        if not self._claim(
-            job_id, status="running", gpus=assigned, phase="setup", started_at=jobs.utc_now()
-        ):
-            # Cancelled between listing the queue and here; its cards stay free.
-            return
+    def _launch(self, job_id: str, assigned: list[str], attempt: int) -> None:
+        """Start a runner for the job, and count its cards as taken from now.
+
+        The state is not touched: the runner claims the job itself, as its
+        first act, so a `running` state always names a live runner and a
+        cancel that lands in between costs nothing but a runner that exits.
+        Until that claim the job is still `queued` on disk, and the entry in
+        `running` is what keeps the next pass from launching it twice.
+        """
         try:
-            proc = self.deps.spawn_runner(job_id)
+            proc = self.deps.spawn_runner(job_id, assigned)
         except OSError as exc:
-            # The state said `running` a line ago; leaving it there would leave
-            # a job nothing is running, with no runner pid to notice the
-            # absence of, holding its GPUs against every later pass.
             self.log(f"job {job_id}: could not spawn a runner ({exc})")
-            jobs.update_state(
-                job_id,
-                status="failed",
-                reason="spawn-failed",
-                exit_code=1,
-                ended_at=jobs.utc_now(),
-                phase=None,
-            )
+            self._fail_queued(job_id, "spawn-failed")
             return
-        # pgid stays unset until the runner publishes the *job's* group: it
-        # is what a stop signals, and the runner's own group is not it.
-        jobs.update_state(
-            job_id,
-            pid=proc.pid,
-            pgid=None,
-            runner_pid=proc.pid,
-            runner_boot_id=boot_id(),
-            runner_starttime=starttime(proc.pid),
-        )
-        self.running[job_id] = _Running(job_id, proc.pid, assigned, proc)
+        self.running[job_id] = _Running(job_id, list(assigned), attempt, popen=proc)
         shared = set(self.shared_gpus())
         borrowed = [uuid for uuid in assigned if uuid in shared]
         note = f", borrowing {','.join(borrowed)}" if borrowed else ""
@@ -1117,7 +1055,7 @@ class Dispatcher:
         it would rather start over than hold a card something better wants, and
         a host with a steady supply of better work may never run it at all.
         """
-        if self._going_away() is not None:
+        if self.going_away is not None:
             return
         candidates = self.auto_preemptable()
         if not candidates:
@@ -1279,25 +1217,22 @@ class Dispatcher:
 
     # -- outputs the pod would otherwise take with it --------------------
     def unconfirmed_output_jobs(self) -> list[str]:
-        """Jobs whose `outputs:` are still only on this host."""
+        """Jobs whose `outputs:` are still only on this host.
+
+        Every job that is not running -- a running job's files are its
+        runner's, and `queued` is what a preempted job is while still holding
+        the outputs the stopped attempt produced.
+        """
         pending: list[str] = []
         for job_id in jobs.list_job_ids():
             try:
                 state = jobs.read_state(job_id)
-            except RuntimeError:
+                spec = jobs.read_spec(job_id)
+            except (RuntimeError, ValueError):
                 continue
             if state.status == "running":
-                # Still being written to; the runner owns those files. Every
-                # other status is fair game -- including `queued`, which is
-                # what a preempted job is while still holding the outputs the
-                # stopped attempt produced.
                 continue
-            # A job that failed its sync preflight proved these uploads cannot
-            # work *before* it ran, and produced nothing. Retrying it three
-            # times here only burns the budget the jobs with real outputs need.
-            if state.reason == "sync-preflight":
-                continue
-            if not cleanup.outputs_confirmed(job_id, state)[0]:
+            if cleanup.outputs_pending(job_id, spec, state):
                 pending.append(job_id)
         return pending
 
@@ -1377,8 +1312,11 @@ class Dispatcher:
         ):
             return
         self._last_incoming_sweep_at = now
-        for name in cleanup.remove_stale_incoming():
+        removed, errors = cleanup.remove_stale_incoming()
+        for name in removed:
             self.log(f"removed incoming/{name}: a submit that never finished enqueueing it")
+        for error in errors:
+            self.log(f"incoming: {error}")
 
     def maybe_reclaim(self) -> None:
         """Run the two retention horizons at startup, then at most once an hour.
@@ -1394,30 +1332,31 @@ class Dispatcher:
         nobody asked for off a job that said `cleanup: never` or whose
         `outputs:` have not reached the mirror yet.
 
-        Purge first: it takes whole job dirs, and the workdir sweep afterwards
-        should not spend its report on dirs that are already gone.
+        Purge first, then one workdir sweep at the shorter horizon: a purge
+        that refuses a job dir still reclaims its workdir once it is old
+        enough, which is the same rule `gpuc clean --purge` implies, and
+        `workdir_days` only shortens it.
         """
         now = self.deps.monotonic()
         if self._last_reclaim_at is not None and now - self._last_reclaim_at < RETENTION_INTERVAL_S:
             return
         self._last_reclaim_at = now
         purge_days = self.config.retention_days
-        workdir_days = self.config.workdir_days
         if purge_days is not None:
             self._purge(purge_days)
-        if workdir_days is not None:
-            self._sweep_workdirs(workdir_days)
+        horizons = [d for d in (self.config.workdir_days, purge_days) if d is not None]
+        if horizons:
+            self._sweep_workdirs(min(horizons))
 
     def _purge(self, days: float) -> None:
-        result = cleanup.purge(
+        result = cleanup.purge_job_dirs(
             older_than_days=days, now=self.deps.utcnow(), evidence=cleanup.Evidence(automatic=True)
         )
-        if result.purged or result.removed:
-            purged = ", ".join(c.job_id for c in result.purged) or "none"
+        if result.purged:
             self.log(
-                f"retention ({days:g} days): purged {len(result.purged)} job dir(s) and "
-                f"{len(result.removed)} workdir(s), freeing "
-                f"{cleanup.human_bytes(result.freed_bytes)}; purged: {purged}"
+                f"retention ({days:g} days): purged {len(result.purged)} job dir(s), freeing "
+                f"{cleanup.human_bytes(result.freed_bytes)}; purged: "
+                f"{', '.join(c.job_id for c in result.purged)}"
             )
         for error in result.errors:
             self.log(f"retention: {error}")
@@ -1442,6 +1381,7 @@ class Dispatcher:
         self._shared = None
         self._borrowable = None
         self._queued = None
+        self._draining = None
         self.reap()
         self.escalate_stops()
         self.launch_ready()
@@ -1503,36 +1443,12 @@ class Dispatcher:
         return True
 
 
-def _stop_on_sigterm(dispatcher: Dispatcher) -> None:
-    """Finish the pass, then exit -- the polite half of a handoff.
-
-    A dispatcher asked to stand down for another build is SIGTERMed before it
-    is killed (`DispatcherLock.acquire`), and this is what makes the asking
-    worth anything: the loop finishes what it is doing, releases the lock, and
-    the newcomer takes it without a signal landing between two writes. The
-    window that matters is in `launch_ready`, between the state that says a job
-    is running and the runner pid that proves it: a dispatcher killed there
-    leaves a job the next one reads as `runner-died`.
-
-    Installed before the lock is taken, not after: the several seconds
-    `acquire` can spend negotiating are exactly when the SIGTERM of a *third*
-    dispatcher may arrive, and dying there with the lock held helps nobody.
-    Setting a flag no loop is reading yet is harmless.
-
-    It cannot help on the first takeover of any host, whose incumbent is by
-    definition a build without this handler and dies where it stands.
-    """
-
-    def stop(_signum: int, _frame: object) -> None:
-        dispatcher.should_exit = True
-
-    with contextlib.suppress(ValueError, OSError):
-        signal.signal(signal.SIGTERM, stop)
-
-
 def main(_: object = None) -> int:
+    """A dispatcher dies where the handover's SIGTERM finds it, and may: every
+    write it makes is one atomic compare-and-set, its runners are in sessions
+    of their own and claim their jobs themselves, and the successor adopts
+    what it finds running. There is no pass worth finishing first."""
     dispatcher = Dispatcher()
-    _stop_on_sigterm(dispatcher)
     lock = DispatcherLock()
     if not lock.acquire():
         return 0

@@ -36,21 +36,6 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_config(args: argparse.Namespace) -> int:
-    """Merge a patch into this host's config.json and print the result.
-
-    The host owns its config, so the control side never writes the file
-    itself: `gpuc host set` and `gpuc host bootstrap` send the keys they
-    change and this applies them, atomically, on the host.
-
-    The patch is a file rather than an argument because `env` may hold a token,
-    and argv is readable by every other user of a shared box.
-    """
-    document = jobs.merge_config(_read_json_object(args.merge, "a config patch"))
-    print(json.dumps(document, indent=2, sort_keys=True))
-    return 0
-
-
 def _state_or_none(job_id: str) -> JobState | None:
     try:
         return jobs.read_state(job_id)
@@ -229,6 +214,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # its own business and never leaves the host.
         entry["outputs"] = [asdict(o) for o in spec.outputs] if spec else []
         entry["wandb"] = wandb_hints(spec.env) if spec else {}
+        # Which job this one was resubmitted from; the host only carries it.
+        entry["requeued_from"] = spec.requeued_from if spec else None
         # Null for a job that is not over -- a running job's workdir is being
         # written to, so any size for it would be a lie -- and for a finished
         # one only when the call's measuring budget is spent. Otherwise free
@@ -241,8 +228,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         # "this job produced something that is still only here": the control
         # side cannot work it out, since it never sees the spec's `outputs:`.
-        entry["outputs_pending"] = (
-            not cleanup.outputs_confirmed(job_id, state)[0] if state.finished else False
+        # A running job's files are its runner's; a queued one may be holding
+        # what a preempted attempt produced.
+        entry["outputs_pending"] = bool(
+            spec is not None
+            and state.status != "running"
+            and cleanup.outputs_pending(job_id, spec, state)
         )
         entries.append(entry)
     heartbeat = dispatcher.heartbeat_age()
@@ -306,9 +297,8 @@ def cmd_preempt(args: argparse.Namespace) -> int:
                 # What it will be queued at once its runner stops, whether or
                 # not this call changed it.
                 "priority": state.priority if state else None,
-                # The dispatcher is what puts the job back, so make sure there
-                # is one: on a host whose dispatcher died, the kill would land
-                # and nothing would ever queue the job again.
+                # The runner queues the job again; the dispatcher is what
+                # launches the next attempt, so make sure there is one.
                 "dispatcher_pid": dispatcher.spawn_detached_dispatcher(),
             }
         )
@@ -399,7 +389,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    return runner.run_job(args.job_id)
+    return runner.run_job(args.job_id, [uuid for uuid in args.gpus.split(",") if uuid])
 
 
 def _selection(value: str | None) -> list[str] | None:
@@ -485,16 +475,6 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("spec", help="path to a JSON spec, or - for stdin")
     enqueue.set_defaults(func=cmd_enqueue)
 
-    config = sub.add_parser("config", help="merge a patch into this host's config.json")
-    config.add_argument(
-        "--merge",
-        required=True,
-        metavar="PATH",
-        help="a JSON object (or - for stdin) whose keys replace those in config.json "
-        "before it is printed; `env` is replaced wholesale, never merged",
-    )
-    config.set_defaults(func=cmd_config)
-
     status = sub.add_parser("status", help="host and job status as JSON")
     status.add_argument("job_id", nargs="?")
     status.set_defaults(func=cmd_status)
@@ -523,6 +503,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run one job in the foreground (used by the dispatcher)")
     run.add_argument("job_id")
+    run.add_argument(
+        "--gpus",
+        required=True,
+        metavar="UUIDS",
+        help="the cards the dispatcher assigned, comma-separated; the runner claims the job "
+        "with them",
+    )
     run.set_defaults(func=cmd_run)
 
     clean = sub.add_parser("clean", help="remove finished jobs' workdirs")

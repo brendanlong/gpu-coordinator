@@ -37,7 +37,7 @@ from tests.conftest import (
 )
 from tests.fakehost import FakeHost
 from tests.test_bootstrap import ScriptedHost
-from tests.test_runner import deps, log_of, prepare
+from tests.test_runner import log_of, prepare, run
 
 ROOT = "/mnt/ssd-2/brendan"
 HOST_ENV = {"UV_CACHE_DIR": "/mnt/ssd-2/brendan/uv-cache", "HF_HOME": "/scratch/hf"}
@@ -138,17 +138,16 @@ def test_a_missing_config_leaves_the_dispatcher_env_alone(
     assert "UV_CACHE_DIR" not in dispatcher._child_env(Path("/pkg"))
 
 
-def test_build_env_gives_the_job_the_host_env(gpuc_home: Path) -> None:
-    with_host_env()
-    spec = make_spec(job_id="j1")
-    jobs.write_state("j1", JobState())
-    env = runner.build_env(spec, [FAKE_GPUS[0]])
-    assert env["UV_CACHE_DIR"] == HOST_ENV["UV_CACHE_DIR"]
-    assert env["HF_HOME"] == "/scratch/hf"
+def inherited_from_the_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner's own environment is the dispatcher's child env; it applies
+    nothing of the host config itself."""
+    for key, value in dispatcher._child_env(Path("/pkg")).items():
+        monkeypatch.setenv(key, value)
 
 
-def test_a_job_can_override_the_host_env(gpuc_home: Path) -> None:
+def test_a_job_can_override_the_host_env(gpuc_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with_host_env()
+    inherited_from_the_dispatcher(monkeypatch)
     spec = make_spec(job_id="j2", env={"UV_CACHE_DIR": "/tmp/mine"})
     jobs.write_state("j2", JobState())
     env = runner.build_env(spec, [])
@@ -156,10 +155,13 @@ def test_a_job_can_override_the_host_env(gpuc_home: Path) -> None:
     assert env["HF_HOME"] == "/scratch/hf"
 
 
-def test_the_job_command_really_sees_the_host_env(gpuc_home: Path) -> None:
+def test_the_job_command_really_sees_the_host_env(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with_host_env()
+    inherited_from_the_dispatcher(monkeypatch)
     job_id = prepare(command='echo "cache=$UV_CACHE_DIR"')
-    assert runner.run_job(job_id, deps()) == 0
+    assert run(job_id) == 0
     assert f"cache={HOST_ENV['UV_CACHE_DIR']}" in log_of(job_id)
 
 

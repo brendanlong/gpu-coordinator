@@ -100,7 +100,6 @@ class JobSpecModel(BaseModel):
     def to_spec(self, job_id: str, attempt: int = 1) -> JobSpec:
         document = self.model_dump()
         document["job_id"] = job_id
-        document["attempt"] = attempt
         return JobSpec.from_dict(document)
 
 

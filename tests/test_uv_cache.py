@@ -46,7 +46,7 @@ def test_the_runner_does_not_invent_a_uv_cache_dir(
 ) -> None:
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     monkeypatch.delenv("UV_LINK_MODE", raising=False)
-    env = runner.build_env(make_spec(), [], jobs.read_config())
+    env = runner.build_env(make_spec(), [])
     assert "UV_CACHE_DIR" not in env
     assert "UV_LINK_MODE" not in env
 
@@ -62,16 +62,18 @@ def test_the_dispatcher_does_not_invent_a_uv_cache_dir(
 
 
 def test_the_host_config_env_is_the_only_thing_that_sets_the_cache(gpuc_home: Path) -> None:
-    config = HostConfig(host="h", env={"UV_CACHE_DIR": "/vol/me/.cache/uv"})
-    jobs.write_config(config)
-    assert runner.build_env(make_spec(), [], config)["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
+    """Applied once, by the dispatcher, to everything it spawns; the runner
+    inherits it and adds nothing of its own."""
+    jobs.write_config(HostConfig(host="h", env={"UV_CACHE_DIR": "/vol/me/.cache/uv"}))
     assert dispatcher._child_env(Path("/pkg"))["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
 
 
-def test_a_job_can_still_override_the_host_cache(gpuc_home: Path) -> None:
-    config = HostConfig(host="h", env={"UV_CACHE_DIR": "/vol/me/.cache/uv"})
+def test_a_job_can_still_override_the_host_cache(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UV_CACHE_DIR", "/vol/me/.cache/uv")
     spec = make_spec(env={"UV_CACHE_DIR": "/tmp/mine"})
-    assert runner.build_env(spec, [], config)["UV_CACHE_DIR"] == "/tmp/mine"
+    assert runner.build_env(spec, [])["UV_CACHE_DIR"] == "/tmp/mine"
 
 
 # -- the host's UV_CACHE_DIR reaches everything that runs on the host ---------

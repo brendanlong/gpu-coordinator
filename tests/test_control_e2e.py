@@ -226,7 +226,6 @@ def test_submit_runs_a_job_and_logs_and_status_find_it(
     state = state_of(home, job_id)
     assert (state["status"], state["exit_code"], state["attempt"]) == ("succeeded", 0, 1)
     assert (home / "jobs" / job_id / "workdir" / "hello.txt").exists()
-    assert state["workdir_removed"] is False
 
     assert main(["logs", job_id]) == 0
     assert "hello" in capsys.readouterr().out
@@ -430,7 +429,9 @@ def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
 
     wait_until(lambda: finished(home, second), 120, f"job {second} to finish")
     state = state_of(home, second)
-    assert (state["status"], state["attempt"]) == ("succeeded", 2)
+    # The host's `attempt` counts the launches of *this* id: a requeue is a
+    # new job, so it is 1 there however many times the spec has been run.
+    assert (state["status"], state["attempt"]) == ("succeeded", 1)
     assert "hello" in log_tail(home, second)
 
 
@@ -509,7 +510,7 @@ def test_clean_dry_run_then_real(
     real = capsys.readouterr().out
     assert job_id in real and "freed" in real
     assert not (home / "jobs" / job_id / "workdir").exists()
-    assert state_of(home, job_id)["workdir_removed"] is True
+    assert state_of(home, job_id)["workdir_bytes"] == 0
     assert (home / "jobs" / job_id / "log.txt").exists()
 
 

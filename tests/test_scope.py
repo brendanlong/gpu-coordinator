@@ -80,7 +80,9 @@ def test_isolation_honours_what_the_dispatcher_probed(monkeypatch: pytest.Monkey
 
 def test_a_pgid_host_records_its_isolation_in_state() -> None:
     job_id = prepare("true")
-    runner.run_job(job_id, RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02))
+    runner.run_job(
+        job_id, [FAKE_GPUS[0]], RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02)
+    )
     state = jobs.read_state(job_id)
     assert (state.isolation, state.cgroup_unit) == ("pgid", None)
 
@@ -110,10 +112,7 @@ def test_a_cgroup_host_records_its_unit_while_a_phase_runs(monkeypatch: pytest.M
 
 
 def prepare(command: str) -> str:
-    spec = make_spec(command=command)
-    job_id = queue.enqueue(spec)
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
-    return job_id
+    return queue.enqueue(make_spec(command=command))
 
 
 def _run_in_background(job_id: str) -> threading.Thread:
@@ -121,6 +120,7 @@ def _run_in_background(job_id: str) -> threading.Thread:
         target=runner.run_job,
         args=(
             job_id,
+            [FAKE_GPUS[0]],
             RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.05, kill_grace_s=5.0),
         ),
         daemon=True,

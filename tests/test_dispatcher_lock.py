@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -228,14 +227,6 @@ def test_a_holder_recorded_under_a_different_boot_id_is_simply_gone(gpuc_home: P
     assert "is gone" in paths.dispatcher_log().read_text()
 
 
-def test_a_legacy_lock_body_is_taken_over_without_killing_anything(gpuc_home: Path) -> None:
-    paths.lock_file().write_text(f"{os.getpgid(0)}\n")
-    lock = DispatcherLock()
-    lock._evict_stale_holder()
-    assert lock.takeover_pgid is None
-    assert "records no pid" in paths.dispatcher_log().read_text()
-
-
 def test_a_missing_heartbeat_counts_as_stale(gpuc_home: Path) -> None:
     holder = start_wedged_holder(heartbeat_age_s=120.0)
     try:
@@ -371,34 +362,6 @@ def test_acquire_records_the_commit_this_dispatcher_is_running(gpuc_home: Path) 
     lock.release()
     assert LockBody.parse(paths.lock_file().read_text()).pkg_commit == SHIPPED
     assert dispatcher.holder_pkg_commit() == SHIPPED
-
-
-def test_sigterm_lets_the_loop_finish_its_pass_before_it_exits(gpuc_home: Path) -> None:
-    """The whole value of asking rather than killing: the pass that was in
-    flight completes, and the lock is released rather than dropped."""
-    on_this_host(SHIPPED)
-    loop, _ = make_dispatcher()
-    passes: list[int] = []
-
-    def run_once() -> None:
-        passes.append(1)
-        os.kill(os.getpid(), signal.SIGTERM)  # mid-pass, as a takeover sends it
-        passes.append(2)
-
-    loop.run_once = run_once  # type: ignore[method-assign]
-    loop.deps.sleep = lambda _seconds: None
-    previous = signal.getsignal(signal.SIGTERM)
-    lock = DispatcherLock()
-    assert lock.acquire()
-    try:
-        dispatcher._stop_on_sigterm(loop)
-        assert loop.run(lock) == 0
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-
-    assert passes == [1, 2], "the signal ended the loop, not the pass"
-    assert lock._fd is None, "the lock was released rather than dropped"
-    assert "dispatcher exiting" in paths.dispatcher_log().read_text()
 
 
 def test_a_holder_that_stands_down_is_never_killed_afterwards(gpuc_home: Path) -> None:

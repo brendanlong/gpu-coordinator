@@ -210,7 +210,7 @@ def test_the_mirror_keeps_the_job_id_unexpanded_so_a_requeue_gets_its_own_namesp
     )
     mirrored = json.loads(client.objects[f"bkt/{spec_key(result.job_id)}"])
     assert mirrored["outputs"][0]["s3"] == "s3://b/exp/{job_id}/results"
-    assert (mirrored["job_id"], mirrored["attempt"]) == (result.job_id, 1)
+    assert mirrored["job_id"] == result.job_id
     shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/spec.json"][0])
     assert shipped["outputs"][0]["s3"] == f"s3://b/exp/{result.job_id}/results"
 
@@ -630,7 +630,6 @@ def test_prepare_expands_the_job_id_and_gathers_the_secrets_in_one_call(repo: Pa
         environ={"HF_TOKEN": "hf_secret"},
     )
     assert prepared.spec.job_id == "j-fixed"
-    assert prepared.spec.attempt == 3
     assert prepared.spec.outputs[0].s3 == "s3://b/j-fixed"
     assert prepared.secrets_body == "HF_TOKEN=hf_secret\n"
 

@@ -22,7 +22,7 @@ from tests.fakes3 import FakeS3Client
 
 
 def spec(job_id: str = "20260101-000000-abc123") -> JobSpec:
-    return JobSpec.from_dict({"job_id": job_id, "command": "true", "name": "t", "attempt": 2})
+    return JobSpec.from_dict({"job_id": job_id, "command": "true", "name": "t"})
 
 
 def test_local_index_round_trips(control_env: Path) -> None:
@@ -47,7 +47,6 @@ def test_s3_spec_round_trips_for_requeue() -> None:
     assert uri == "s3://bkt/gpuc/specs/20260101-000000-abc123.json"
     document = s3.get_spec("20260101-000000-abc123")
     assert document["command"] == "true"
-    assert document["attempt"] == 2
 
 
 def test_s3_index_lists_entries_for_status_all() -> None:
