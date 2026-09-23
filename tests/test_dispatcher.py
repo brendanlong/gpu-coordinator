@@ -667,7 +667,11 @@ def test_an_occasional_failure_does_not_stop_the_loop(gpuc_home: Path) -> None:
     assert dispatcher.consecutive_failures == 0
 
 
-def test_an_orphan_from_a_previous_boot_is_not_adopted(gpuc_home: Path) -> None:
+def test_an_orphan_from_a_previous_boot_is_not_adopted_and_nothing_of_it_is_killed(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failed `runner-died`, and its recorded group left alone: after a
+    reboot that number belongs to whatever the kernel gave it to next."""
     job_id = queue.enqueue(make_spec(gpus=1))
     jobs.update_state(
         job_id,
@@ -675,10 +679,14 @@ def test_an_orphan_from_a_previous_boot_is_not_adopted(gpuc_home: Path) -> None:
         gpus=[FAKE_GPUS[0]],
         runner_pid=os.getpid(),
         runner_boot_id="0000-a-previous-boot",
+        pgid=os.getpid(),
     )
+    signals = record_signals(monkeypatch)
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
     assert jobs.read_state(job_id).reason == "runner-died"
+    assert signals == []
+    assert dispatcher.free_gpus() == FAKE_GPUS
 
 
 def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:

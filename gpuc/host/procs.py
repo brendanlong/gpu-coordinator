@@ -121,7 +121,18 @@ class JobProcesses:
     def of(state: JobState) -> JobProcesses:
         """From a state file: the job's group is the one the runner published
         for the phase now running, and the runner is the one that claimed the
-        job. Neither is ever inferred."""
+        job. Neither is ever inferred.
+
+        A state written in another boot names nothing: the processes died
+        with that boot, its scopes with them, and the kernel has been issuing
+        pids from 1 again since -- so a `pgid` from it is whatever happens to
+        hold that number now, and adoption after a reboot SIGKILLed exactly
+        that. The same identity rule as `recorded_process_alive`: only a boot
+        id recorded *and* readable *and* different says so.
+        """
+        current = boot_id()
+        if state.runner_boot_id and current and state.runner_boot_id != current:
+            return JobProcesses()
         return JobProcesses(state.cgroup_unit, state.pgid or None, state.runner_pid)
 
     def stop(

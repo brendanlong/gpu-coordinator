@@ -289,8 +289,9 @@ The rules it holds to:
   `running` is adopted if the runner it names is alive -- the recorded
   `runner_pid` *with* the boot id and start time recorded beside it -- and
   failed `runner-died` otherwise, its leftovers killed (`cgroup_unit`, then
-  `pgid`) before its cards go back in the pool. Nothing is inferred from the
-  process table and nothing is written back. A job found `running` under a
+  `pgid`) before its cards go back in the pool. A state from another boot
+  has no leftovers: nothing recorded in it is signalled. Nothing is inferred
+  from the process table and nothing is written back. A job found `running` under a
   live runner this dispatcher did not spawn -- the claim it raced for and
   lost after a takeover -- is adopted the same way.
 - **A stop is an intent** in the job's state: `cancel` or `preempt`. The

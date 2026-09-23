@@ -62,6 +62,17 @@ def test_job_processes_are_exactly_what_the_state_recorded() -> None:
     assert JobProcesses.of(JobState(pgid=0)).job_pgid is None
 
 
+def test_a_state_from_another_boot_names_no_processes() -> None:
+    """Its pids were reissued from 1 and its scopes did not survive: a kill
+    at any of them would land on whatever this boot put at those numbers."""
+    other = JobState(runner_pid=500, pgid=600, cgroup_unit="u.scope", runner_boot_id="not-this")
+    assert JobProcesses.of(other) == JobProcesses()
+    same = JobState(
+        runner_pid=500, pgid=600, cgroup_unit="u.scope", runner_boot_id=procinfo.boot_id()
+    )
+    assert JobProcesses.of(same) == JobProcesses("u.scope", 600, 500)
+
+
 JOB_GROUP = 4242
 RUNNER = 4343
 
