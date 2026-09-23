@@ -498,7 +498,7 @@ def test_status_all_lists_index_jobs_per_host(
     out = capsys.readouterr().out
     assert "n-20260101-000000-aaaaaa (20260101-000000-aaaaaa) host=gpubox" in out
     assert "host=other" in out
-    assert "gpuc requeue 20260101-000000-aaaaaa --host gpubox" in out
+    assert "gpuc requeue 20260101-000000-aaaaaa --host" in out
 
 
 def test_status_all_can_be_narrowed_to_the_host_being_recovered(

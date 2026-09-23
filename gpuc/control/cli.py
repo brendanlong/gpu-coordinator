@@ -800,9 +800,10 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
             # interrupt wants the stream gone now.
             if tail is not None:
                 _end_tail(tail, flush=ended)
-        if tail is None:
+        if tail is None and watched.error is None:
             # The host never answered and the job settled from the mirror:
-            # its log is there too, or nowhere.
+            # its log is there too. (A job that settled with an error has
+            # the wait's line to say so, and nothing to read.)
             _, log = read_log(args.job_id, watched.host, args.lines, settings)
             sys.stdout.write(log.text)
     except KeyboardInterrupt:

@@ -347,7 +347,12 @@ class StatusResult:
             (e for e in self.unhosted if self.host_state(e) in status_mod.REQUEUEABLE), None
         )
         if first is not None:
-            lines.append(f"  bring one back with: gpuc requeue {first.job_id} --host <name>")
+            # The host is named only when it answered: it is there and empty,
+            # which is the wiped-home case; a gone or unregistered host is not
+            # a place to send anything.
+            answered = self.host_state(first) == status_mod.HostState.ANSWERED.value
+            target = first.host if answered else "<name>"
+            lines.append(f"  bring one back with: gpuc requeue {first.job_id} --host {target}")
         return "\n".join(lines)
 
     def answer(
