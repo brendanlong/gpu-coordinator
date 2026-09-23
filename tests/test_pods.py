@@ -108,13 +108,13 @@ def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
     assert "pod     pod1 RUNNING NVIDIA A40 $0.490/h cuda 12.8 age 20m" in text
 
 
-def test_status_shows_the_pod_even_when_the_host_is_unreachable() -> None:
+def test_status_shows_the_pod_even_when_the_host_is_unaskable() -> None:
     entry = host_entry(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4")
     view = HostView(
-        entry=entry, state=HostState.UNREACHABLE, error="ssh timed out", pod=running_pod("n", "p")
+        entry=entry, state=HostState.UNASKABLE, error="ssh timed out", pod=running_pod("n", "p")
     )
     text = render(view)
-    assert "UNREACHABLE" in text and "pod     p RUNNING" in text
+    assert "UNASKABLE" in text and "pod     p RUNNING" in text
 
 
 def test_status_forgets_a_rental_the_provider_no_longer_has(
@@ -127,7 +127,7 @@ def test_status_forgets_a_rental_the_provider_no_longer_has(
 
     assert main(["status"]) == EXIT_OK
     captured = capsys.readouterr()
-    assert "POD GONE" in captured.out
+    assert "GONE" in captured.out
     assert "this rental has ended" in captured.out
     assert "forgetting host gpuc-e2e-aaa" in captured.err
     assert load_registry().hosts == {}
@@ -144,5 +144,5 @@ def test_status_json_forgets_the_rental_it_just_reported(
     assert main(["status", "--json"]) == EXIT_OK
     document = json.loads(capsys.readouterr().out)
     (host,) = document["hosts"]
-    assert host["pod_gone"] is True and host["state"] == "pod_gone"
+    assert host["state"] == "gone" and "pod_gone" not in host
     assert load_registry().hosts == {}

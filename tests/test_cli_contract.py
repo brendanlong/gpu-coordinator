@@ -181,7 +181,7 @@ def test_a_missing_registry_is_simply_no_hosts(control_env: Path) -> None:
 # -- exit codes ---------------------------------------------------------------
 
 
-def test_status_reports_an_unreachable_host_and_exits_one(
+def test_status_reports_an_unaskable_host_and_exits_one(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The host it could not read is the failure; the ones it could are the answer."""
@@ -192,13 +192,13 @@ def test_status_reports_an_unreachable_host_and_exits_one(
         if entry.name == "local":
             return HostView(entry=entry, state=HostState.ANSWERED)
         return HostView(
-            entry=entry, state=HostState.UNREACHABLE, error="ssh: could not resolve hostname"
+            entry=entry, state=HostState.UNASKABLE, error="ssh: could not resolve hostname"
         )
 
     monkeypatch.setattr(status_mod, "gather", only_local)
     assert main(["status"]) == EXIT_ERROR
     out = capsys.readouterr().out
-    assert "UNREACHABLE" in out
+    assert "UNASKABLE" in out and "ERROR ssh: could not resolve hostname" in out
     assert "host local" in out
 
 
@@ -256,9 +256,8 @@ def test_status_all_json_carries_the_jobs_only_the_index_knows(
     )
     assert entry["requeued_from"] == "20250101-000000-000000"
     assert entry["outputs_lost"] is False
-    # Not registered here, and no mirror to say the job ended: for all this
-    # machine knows, `gone-box` is another machine's name for a live host.
-    assert (entry["host_state"], entry["requeue"]) == ("not_registered", False)
+    # Not registered here: a rental that ended and was forgotten.
+    assert (entry["host_state"], entry["requeue"]) == ("gone", True)
     assert main(["status", "--json"]) == EXIT_OK
     assert status_json(capsys)["unhosted"] == []
 
@@ -266,9 +265,11 @@ def test_status_all_json_carries_the_jobs_only_the_index_knows(
 def test_status_all_labels_an_index_only_job_by_what_its_host_is(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A job whose host is only unreachable may still be running there, so it
+    """A job whose host could not be asked may still be running there, so it
     is listed with that said and no requeue offered for it; one whose host
-    answered without it, or is gone, is the recovery case the hint is for."""
+    answered without it, or is gone, is the recovery case the hint is for.
+    A host with no registry entry here is gone; one whose entry this build
+    refuses to read was not asked."""
     from gpuc.control.s3index import IndexEntry, LocalIndex
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
@@ -276,32 +277,17 @@ def test_status_all_labels_an_index_only_job_by_what_its_host_is(
 
     def gather(entry: HostEntry, *a: object, **k: object) -> HostView:
         if entry.name == "down":
-            return HostView(entry=entry, state=HostState.UNREACHABLE, error="ssh timed out")
+            return HostView(entry=entry, state=HostState.UNASKABLE, error="ssh timed out")
         return HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=1.0)
 
     monkeypatch.setattr(status_mod, "gather", gather)
-    prefix = "s3://bucket/gpuc/gone-pod"
     for job_id, host in [
         ("20260101-000000-aaaaaa", "down"),
         ("20260101-000000-bbbbbb", "gpubox"),
         ("20260101-000000-cccccc", "gone-pod"),
-        ("20260101-000000-dddddd", "gone-pod"),
         ("20260101-000000-eeeeee", "gpuc-old"),
     ]:
-        LocalIndex().record(IndexEntry(job_id=job_id, host=host, name="j", s3_prefix=prefix))
-    # The mirror shows one of the unregistered host's jobs ended and the other
-    # still running: only the first is anyone's to requeue.
-    from tests.fakes3 import FakeS3Client
-
-    states = {
-        "bucket/gpuc/gone-pod/jobs/20260101-000000-cccccc/state.json": b'{"status": "succeeded"}',
-        "bucket/gpuc/gone-pod/jobs/20260101-000000-dddddd/state.json": b'{"status": "running"}',
-    }
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client(objects=states))
-    )
-    config_file().write_text('s3_bucket = "bucket"\n')
-    # A registry entry this build refuses to read is a host that was not asked.
+        LocalIndex().record(IndexEntry(job_id=job_id, host=host, name="j"))
     write_hosts(
         {
             **json.loads(hosts_file().read_text()),
@@ -313,23 +299,22 @@ def test_status_all_labels_an_index_only_job_by_what_its_host_is(
     by_job = {e["job_id"]: e for e in status_json(capsys)["unhosted"]}
     state_of = {job_id: (e["host_state"], e["requeue"]) for job_id, e in by_job.items()}
     assert state_of == {
-        "20260101-000000-aaaaaa": ("unreachable", False),
+        "20260101-000000-aaaaaa": ("unaskable", False),
         "20260101-000000-bbbbbb": ("answered", True),
-        "20260101-000000-cccccc": ("not_registered", True),
-        "20260101-000000-dddddd": ("not_registered", False),
-        "20260101-000000-eeeeee": ("unreadable_entry", False),
+        "20260101-000000-cccccc": ("gone", True),
+        "20260101-000000-eeeeee": ("unaskable", False),
     }
 
     assert main(["status", "--all"]) == EXIT_ERROR
     out = capsys.readouterr().out
     assert "host=down" in out and "may still be running there" in out
     assert "host=gpubox" in out and "does not have it" in out
-    assert "20260101-000000-dddddd" in out and "does not show it ended" in out
-    assert "host=gpuc-old" in out and "registry entry could not be read" in out
+    assert "host=gone-pod" in out and "is gone" in out
+    assert "host=gpuc-old" in out and "could not be asked" in out
     assert "bring one back with: gpuc requeue 20260101-000000-bbbbbb" in out
 
-    # Only the unreachable host's job left: nothing to offer a requeue for.
-    for job_id in ("bbbbbb", "cccccc", "dddddd", "eeeeee"):
+    # Only the unaskable hosts' jobs left: nothing to offer a requeue for.
+    for job_id in ("bbbbbb", "cccccc"):
         (LocalIndex().directory / f"20260101-000000-{job_id}.json").unlink()
     assert main(["status", "--all"]) == EXIT_ERROR
     assert "bring one back" not in capsys.readouterr().out
@@ -568,7 +553,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
     assert (link["kind"], link["path"], link["target"]) == ("s3", "results", "s3://bucket/{job_id}")
     assert link["url"].startswith("https://s3.console.aws.amazon.com/s3/buckets/bucket?prefix=")
     assert host["pod"] is None
-    assert (host["draining"], host["pod_gone"]) == (False, False)
+    assert host["draining"] is False and "pod_gone" not in host
 
     # One row for the owned card. Which shape it takes says whether nvidia-smi
     # on *this* machine could resolve it, which is not what this test is about.
@@ -595,7 +580,7 @@ def test_config_show_json_is_the_effective_settings(
     assert document["notes"] == []
 
 
-def test_status_json_says_unreachable_rather_than_empty(
+def test_status_json_says_unaskable_rather_than_empty(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
@@ -604,7 +589,7 @@ def test_status_json_says_unreachable_rather_than_empty(
         status_mod,
         "gather",
         lambda entry, *a, **k: HostView(
-            entry=entry, state=HostState.UNREACHABLE, error="ssh timed out"
+            entry=entry, state=HostState.UNASKABLE, error="ssh timed out"
         ),
     )
     assert main(["status", "--json"]) == EXIT_ERROR
@@ -731,7 +716,7 @@ def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
     entry = host_entry(name="s", pkg_commit="b" * 40)
     current = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="a" * 40)
     assert status_mod.host_warnings(current) == []
-    # Unreachable: "we could not ask" is not evidence of anything.
+    # Unaskable: "we could not ask" is not evidence of anything.
     assert status_mod.host_warnings(HostView(entry=entry, pkg_commit="b" * 40)) == []
 
 

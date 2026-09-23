@@ -81,9 +81,10 @@ class Termination:
     unasked: str | None = None
     """Why it did not answer, when it was asked and did not. None under
     `--force`, which does not ask."""
-    pod_dead: bool = False
-    """The provider itself said the pod is dead or gone, so nothing on it can
-    be running. Not the same as a pod it could not describe."""
+    nothing_can_run: bool = False
+    """The provider itself said the pod is stopped, terminated or missing, so
+    nothing on it can be running and the host is owed no question. Not the
+    same as a pod the provider could not describe."""
     running: list[str] = field(default_factory=list)
     queued: list[str] = field(default_factory=list)
     outputs_pending: list[str] = field(default_factory=list)
@@ -169,19 +170,22 @@ def inspect(target: Target, settings: Settings, provider: Provider) -> Terminati
         )
         # Only what the provider actually said: a read that failed leaves
         # `target.pod` None, and None is not a dead pod.
-        result.pod_dead = target.pod is not None and provider.is_dead(target.pod)
+        result.nothing_can_run = target.pod is not None and provider.is_dead(target.pod)
         return result
     view = status_mod.gather(target.entry, settings, provider=provider)
     target.pod = view.pod or target.pod
-    if view.pod_gone or view.pod_dead:
-        # No ssh was attempted and none would have answered. What became of the
-        # pod is the whole answer, and the caller has it in `target.pod`.
-        result.pod_dead = True
-        return result
     if not view.reachable:
-        result.unasked = (
-            f"could not ask {target.entry.name} what it is doing: {view.error or 'no answer'}"
+        # Gone, or unaskable with a pod the provider itself calls dead: what
+        # became of the pod is the whole answer, and the caller has it in
+        # `target.pod`. Unaskable otherwise -- an ssh that blipped, a provider
+        # that could not be read -- may be hiding six hours of training.
+        result.nothing_can_run = view.gone or (
+            target.pod is not None and provider.is_dead(target.pod)
         )
+        if not result.nothing_can_run:
+            result.unasked = (
+                f"could not ask {target.entry.name} what it is doing: {view.error or 'no answer'}"
+            )
         return result
     result.checked = True
     result.running = [status_mod.job_label(job) for job in view.running]
@@ -258,7 +262,7 @@ def terminate(
         result = Termination(target=resolved)
     else:
         result = inspect(resolved, settings, provider)
-        if not result.pod_dead and (result.busy or not result.checked):
+        if not result.nothing_can_run and (result.busy or not result.checked):
             raise TerminateRefused(refusal(result))
     if resolved.pod is None:
         # What is being billed, for the result to report -- and whether there
@@ -303,7 +307,7 @@ def _forget(target: Target, report: Reporter) -> bool:
     must stay visible in `gpuc status`. The answer is what `forget_host`
     reports rather than what it was asked to do -- a lock another session is
     holding leaves the entry there, and saying otherwise is how a caller ends
-    up believing a POD GONE line is a bug.
+    up believing a `GONE` line in `gpuc status` is a bug.
     """
     if target.entry is None:
         return False

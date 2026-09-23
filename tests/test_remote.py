@@ -179,14 +179,14 @@ def test_the_reason_a_host_could_not_be_asked_is_what_ssh_said_last() -> None:
 
 
 def test_ask_reports_the_reason_ssh_gave_not_the_argv(monkeypatch: pytest.MonkeyPatch) -> None:
-    from gpuc.control.remote import Unreachable, ask
+    from gpuc.control.remote import Unaskable, ask
 
     def down(*_: object, **__: object) -> object:
         raise TransportError(CommandResult("gpubox", ["ssh", "u@h", "printf"], 255, "", SSH_STDERR))
 
     monkeypatch.setattr("gpuc.control.remote.open_session", down)
     asked = ask(host_entry(name="gpubox", kind="ssh", ssh="u@h"), "status")
-    assert isinstance(asked, Unreachable)
+    assert isinstance(asked, Unaskable)
     assert asked.reason == "root@1.2.3.4: Permission denied (publickey)."
 
 

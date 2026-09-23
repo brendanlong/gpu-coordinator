@@ -242,7 +242,7 @@ def test_a_non_rental_host_has_nothing_to_terminate(control_env: Path) -> None:
 def test_a_pod_that_is_already_gone_still_clears_the_registry_entry(
     control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The stale-entry case `gpuc status` calls POD GONE. There is nothing to
+    """The stale-entry case `gpuc status` calls GONE. There is nothing to
     bill for and nothing that could be running, so no `--force` is demanded for
     a pod the provider itself says is dead -- the entry is all that is left."""
     register()
@@ -275,7 +275,7 @@ def test_a_pod_the_provider_has_never_heard_of_is_not_a_terminate(
 def test_an_exited_pod_is_ended_without_force(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """EXITED is `POD GONE` in `gpuc status` but a live rental at the provider.
+    """EXITED is `UNASKABLE` in `gpuc status` but a live rental at the provider.
     Nothing can be running in a container that is not running, so refusing here
     would hold the one command that stops the bill behind a flag for nothing."""
     fake = FakeProvider()

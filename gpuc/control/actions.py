@@ -57,11 +57,10 @@ from gpuc.control.provision import ProvisionError
 from gpuc.control.remote import (
     Answered,
     Asked,
+    Gone,
     HostSession,
-    PodDead,
-    PodGone,
     RemoteError,
-    Unreachable,
+    Unaskable,
     ask,
     reason_of,
 )
@@ -273,8 +272,6 @@ class StatusResult:
     """`--all`: the jobs only the index knows, in id order."""
     lost: set[str] = field(default_factory=set)
     """Which of `unhosted` the mirror records as having lost their outputs."""
-    ended: set[str] = field(default_factory=set)
-    """Which of `unhosted` the mirror records as finished."""
     index_error: str | None = None
     """Why `unhosted` may be short: an S3 index that could not be read."""
 
@@ -308,27 +305,16 @@ class StatusResult:
             job.job_id for view in self.views for job in view.queue + view.running + view.finished
         }
 
-    def host_state(self, entry: IndexEntry) -> str:
-        """What this run found the job's host to be: one of `HostState`, or
-        `NOT_REGISTERED`. Only a host that answered and does not list the job,
-        or is gone, makes the job the index's alone; one that could not be
-        asked may still be running it."""
+    def host_state(self, entry: IndexEntry) -> status_mod.HostState:
+        """What this run found the job's host to be. A host with no registry
+        entry here is gone (a rental that ended was forgotten); one whose
+        entry this build could not read was not asked."""
         view = next((view for view in self.views if view.entry.name == entry.host), None)
         if view is not None:
-            return view.state.value
+            return view.state
         if entry.host in self.read.skipped:
-            return status_mod.UNREADABLE_ENTRY
-        return status_mod.NOT_REGISTERED
-
-    def requeueable(self, entry: IndexEntry) -> bool:
-        """Whether `gpuc requeue` is the way back for this job: its host cannot
-        still be running it. A host not registered here may be another
-        machine's name for a live box, so that case needs the mirror to show
-        the job ended as well."""
-        state = self.host_state(entry)
-        if state not in status_mod.REQUEUEABLE:
-            return False
-        return state != status_mod.NOT_REGISTERED or entry.job_id in self.ended
+            return status_mod.HostState.UNASKABLE
+        return status_mod.HostState.GONE
 
     def document(
         self, *, recent: int = status_mod.RECENT_FINISHED, since_s: float | None = None
@@ -338,10 +324,7 @@ class StatusResult:
             errors=self.errors,
             unhosted=[
                 status_mod.unhosted_json(
-                    entry,
-                    lost=entry.job_id in self.lost,
-                    host_state=self.host_state(entry),
-                    requeue=self.requeueable(entry),
+                    entry, lost=entry.job_id in self.lost, state=self.host_state(entry)
                 )
                 for entry in self.unhosted
             ],
@@ -356,21 +339,18 @@ class StatusResult:
         lines = [f"jobs known only to the index{scope}:"]
         lines += [
             status_mod.unhosted_line(
-                entry,
-                lost=entry.job_id in self.lost,
-                host_state=self.host_state(entry),
-                requeue=self.requeueable(entry),
+                entry, lost=entry.job_id in self.lost, state=self.host_state(entry)
             )
             for entry in self.unhosted
         ]
-        # The hint names a job whose host cannot still be running it: a
-        # requeue offered over a connection error is a run done twice.
-        first = next((e for e in self.unhosted if self.requeueable(e)), None)
+        first = next(
+            (e for e in self.unhosted if status_mod.requeue_offered(self.host_state(e))), None
+        )
         if first is not None:
             # The host is named only when it answered: it is there and empty,
-            # which is the wiped-home case; a gone or unregistered host is not
-            # a place to send anything.
-            answered = self.host_state(first) == status_mod.HostState.ANSWERED.value
+            # which is the wiped-home case; a gone host is not a place to send
+            # anything.
+            answered = self.host_state(first) is status_mod.HostState.ANSWERED
             target = first.host if answered else "<name>"
             lines.append(f"  bring one back with: gpuc requeue {first.job_id} --host {target}")
         return "\n".join(lines)
@@ -416,7 +396,7 @@ def status(
         if on_view is not None:
             on_view(view)
     if all_jobs:
-        result.unhosted, result.lost, result.ended, result.index_error = unhosted_jobs(
+        result.unhosted, result.lost, result.index_error = unhosted_jobs(
             settings, result.seen, host
         )
     return result
@@ -435,7 +415,7 @@ def forget_gone_rentals(
     nobody watching.
     """
     for view in views:
-        if view.pod_gone:
+        if view.gone:
             report(f"forgetting host {view.entry.name}: its pod is gone")
             forget_host(view.entry.name, view.entry.pod_id, report)
 
@@ -609,69 +589,35 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
     }
 
 
-@dataclass
-class Forgotten:
-    """The index names a host this machine has no record of: the ordinary end
-    of a rental, whose entry `status` forgot once the pod was gone. Nothing
-    can be asked, so the mirror is the answer, as for `PodGone`."""
-
-    host: str
-
-    @property
-    def reason(self) -> str:
-        return (
-            f"host {self.host} is not registered on this machine (a rental that ended is "
-            f"forgotten), so it cannot be asked"
-        )
-
-
-@dataclass
-class UnreadableEntry:
-    """The index names a host whose registry entry this build could not read
-    (warned about on the way in). The host is known and may well be running
-    the job; nothing here can open it, and that is not the same as gone."""
-
-    host: str
-    reason: str
-
-
-Trouble = Unreachable | PodDead | PodGone | Forgotten | UnreadableEntry
+Trouble = Unaskable | Gone
 """Why a job's host could not confirm it holds the job."""
 
 
 def mirror_is_the_answer(trouble: Trouble) -> bool:
     """The one rule `logs` and `wait` read the mirror by.
 
-    The spec reads the mirror only when the host is *gone*: a rental whose
-    pod the provider no longer has, or a host the index names that this
-    machine has forgotten. For those the mirror is the answer, now, and
-    nothing failed. A host that is merely unreachable, or a pod that is
-    stopped but still there, may still hold the job: `wait` keeps asking
-    for `TROUBLE_GRACE_S` before it reads the mirror, and `logs` prints what
-    the mirror has -- doing as much as it can -- but as a failure, exit 1
-    with the reason, never as the answer.
+    The spec reads the mirror only when the host is *gone*. For a gone host
+    the mirror is the answer, now, and nothing failed. A host that could not
+    be asked may still hold the job: `wait` keeps asking for
+    `TROUBLE_GRACE_S` before it reads the mirror, and `logs` prints what the
+    mirror has -- doing as much as it can -- but as a failure, exit 1 with
+    the reason, never as the answer.
     """
-    return isinstance(trouble, (PodGone, Forgotten))
+    return isinstance(trouble, Gone)
 
 
 @dataclass
 class Location:
     """Where a job is: its host, its index entry, and what the host said when
     it was asked to find it (None when nothing had to be asked). `entry` is
-    None only for a host this machine cannot open: one it has forgotten
-    (`Forgotten`) or one whose registry entry it could not read
-    (`UnreadableEntry`)."""
+    None for a host the index names that this machine cannot open: one with
+    no registry entry (`Gone`) or one whose entry it could not read
+    (`Unaskable`)."""
 
-    entry: HostEntry | None
+    host: str
+    entry: HostEntry | None = None
     index: IndexEntry | None = None
-    asked: Asked | Forgotten | UnreadableEntry | None = None
-
-    @property
-    def host(self) -> str:
-        if self.entry is not None:
-            return self.entry.name
-        assert isinstance(self.asked, (Forgotten, UnreadableEntry))
-        return self.asked.host
+    asked: Asked | None = None
 
     @property
     def session(self) -> HostSession | None:
@@ -716,35 +662,36 @@ def locate(
     host, which need not be this machine's: it is asked first, not believed.
     A host the index names that cannot be asked is still the answer -- the job
     is there as far as anything knows -- carried as `trouble` for the caller
-    to judge, never hidden. So is a host the index names that this machine
-    has no entry for (`Forgotten`): that is a rental that ended and was
-    forgotten, the ordinary end of one, and `gpuc logs` and `gpuc wait` on
-    its jobs must reach the mirror rather than "no such job". An id no
-    answering host knows is exit 4 only when every host answered: with one
-    unreachable, the job may well be on it, and "no such job" would be a lie
-    told over a connection error.
+    to judge, never hidden. A host the index names that this machine has no
+    entry for is `Gone`: a rental that ended and was forgotten, the ordinary
+    end of one, and `gpuc logs` and `gpuc wait` on its jobs must reach the
+    mirror rather than "no such job". One whose registry entry this build
+    could not read (warned about on the way in) is `Unaskable`: it is known,
+    may well be running the job, and was not asked. An id no answering host
+    knows is exit 4 only when every host answered: with one unaskable, the
+    job may well be on it, and "no such job" would be a lie told over a
+    connection error.
     """
     settings = settings if settings is not None else load_settings()
     if explicit:
         # The local index only: the caller already knows the host, and the
         # entry is a convenience for whoever wants the mirror prefix.
-        return Location(registry.require(explicit), LocalIndex().get(job_id))
+        entry = registry.require(explicit)
+        return Location(entry.name, entry, LocalIndex().get(job_id))
     local = LocalIndex().get(job_id)
     if local is not None and local.host in registry.hosts:
-        return Location(registry.hosts[local.host], local)
+        return Location(local.host, registry.hosts[local.host], local)
     index = local or JobIndex(settings).get(job_id)
     named = registry.hosts.get(index.host) if index is not None else None
     if index is not None and named is None and index.host in skipped:
-        # The host is known and this machine cannot open it: a registry entry
-        # that did not validate is warned about, not a host that is gone, so
-        # the mirror is not the answer and nothing here says "no such job".
         return Location(
+            index.host,
             None,
             index,
-            UnreadableEntry(
-                index.host,
+            Unaskable(
                 f"host {index.host}'s registry entry could not be read (see the warning "
-                f"above), so it was not asked",
+                f"above), so it was not asked; fix the entry, or register the host again "
+                f"with `gpuc host add {index.host} --pod <id>`"
             ),
         )
     rest = [entry for entry in registry.hosts.values() if entry is not named]
@@ -755,16 +702,24 @@ def locate(
         asked = ask(entry, f"status {shlex.quote(job_id)}", settings, provider=provider)
         if isinstance(asked, Answered):
             if (asked.payload or {}).get("jobs"):
-                return Location(entry, index, asked)
+                return Location(entry.name, entry, index, asked)
             continue
         if entry is named:
             named_trouble = asked
-        elif not isinstance(asked, PodGone):
+        elif not isinstance(asked, Gone):
             unasked.append(f"{entry.name}: {asked.reason}")
     if named is not None and named_trouble is not None:
-        return Location(named, index, named_trouble)
+        return Location(named.name, named, index, named_trouble)
     if index is not None and named is None and not unasked:
-        return Location(None, index, Forgotten(index.host))
+        return Location(
+            index.host,
+            None,
+            index,
+            Gone(
+                f"host {index.host} is not registered on this machine (a rental that ended "
+                f"is forgotten), so it cannot be asked"
+            ),
+        )
     if unasked:
         raise CliError(
             f"no host that answered knows job {job_id}, and these could not be asked:\n"
@@ -1046,15 +1001,10 @@ def read_log(
     """
     read = open_registry()
     location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
-    entry = location.entry
-    reached: Asked | Forgotten | UnreadableEntry
-    if entry is None:
-        assert isinstance(location.asked, (Forgotten, UnreadableEntry))
-        reached = location.asked
-    else:
-        reached = location.asked or ask(
-            entry, None, settings, provider=provider_for([entry], settings)
-        )
+    reached = location.asked
+    if reached is None:
+        entry = location.require_entry()
+        reached = ask(entry, None, settings, provider=provider_for([entry], settings))
     remote = None
     purged = False
     failed = False
@@ -1164,7 +1114,7 @@ def mirrored_outcome(
 
 def unhosted_jobs(
     settings: Settings, seen: set[str], host: str | None = None
-) -> tuple[list[IndexEntry], set[str], set[str], str | None]:
+) -> tuple[list[IndexEntry], set[str], str | None]:
     """The index's view of jobs no host admitted to having, and whether that is
     all of it: an S3 index that could not be read leaves this list short.
 
@@ -1176,8 +1126,7 @@ def unhosted_jobs(
     host was found to be (`StatusResult.host_state`) before anyone acts on it.
 
     Returns the entries, the ids among them whose outputs the mirror records as
-    lost, the ids the mirror records as finished, and why the list may be short
-    (None when the index was read in full).
+    lost, and why the list may be short (None when the index was read in full).
     """
     index = JobIndex(settings)
     entries, short = index.all()
@@ -1187,9 +1136,8 @@ def unhosted_jobs(
         if job_id not in seen and (host is None or entry.host == host)
     ]
     if not elsewhere:
-        return [], set(), set(), short
-    lost, ended = _mirror_facts(index, elsewhere[:MIRROR_STATE_LOOKUPS])
-    return elsewhere, lost, ended, short
+        return [], set(), short
+    return elsewhere, _outputs_lost_ids(index, elsewhere[:MIRROR_STATE_LOOKUPS]), short
 
 
 MIRROR_STATE_LOOKUPS = 25
@@ -1198,26 +1146,13 @@ the answer (did this job's outputs make it off the host?) matters most for the
 handful at the top of a recovery list."""
 
 
-def _mirror_facts(index: JobIndex, entries: Sequence[IndexEntry]) -> tuple[set[str], set[str]]:
-    """Which of these jobs the mirror records as having lost their outputs,
-    and which it records as finished.
-
-    Best effort: a job whose state.json is missing or unreadable gets neither
-    flag. The first is a note on a listing; the second withholds a requeue
-    hint, so missing evidence errs towards not offering one.
-    """
+def _outputs_lost_ids(index: JobIndex, entries: Sequence[IndexEntry]) -> set[str]:
+    """Which of these jobs the mirror records as having lost their outputs.
+    Best effort: a job whose state.json is missing or unreadable is not
+    flagged, which is a note missing from a listing and nothing more."""
     lost: set[str] = set()
-    ended: set[str] = set()
     for entry in entries:
         document = index.mirrored_state(entry.job_id, entry.s3_prefix)
-        if not document:
-            continue
-        if document.get("outputs_lost"):
+        if document and document.get("outputs_lost"):
             lost.add(entry.job_id)
-        if document.get("status") in FINISHED_STATUSES:
-            ended.add(entry.job_id)
-    return lost, ended
-
-
-def _outputs_lost_ids(index: JobIndex, entries: Sequence[IndexEntry]) -> set[str]:
-    return _mirror_facts(index, entries)[0]
+    return lost

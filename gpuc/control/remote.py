@@ -7,9 +7,8 @@ that decides something about a host reads `session.config`; the registry's
 cache is for listings.
 
 `ask` is the one answer to "can this host be asked, and what did it say":
-`Answered`, `Unreachable` with the reason, or -- for a rental -- what the
-provider said about its pod instead. Every command that talks to a host goes
-through it, so "could not ask" is spelled once.
+`Answered`, `Unaskable` with the reason, or `Gone`. Every command that talks
+to a host goes through it, so "could not ask" is spelled once.
 """
 
 from __future__ import annotations
@@ -430,63 +429,67 @@ class Answered:
 
 
 @dataclass
-class Unreachable:
+class Unaskable:
+    """The host could not be asked, and may still hold whatever it holds.
+
+    One state for every way that happens -- ssh failed, the provider still
+    has the pod and nothing can run on it, the provider could not be read, a
+    registry entry this build would not validate -- because every consumer
+    does the same thing with all of them: report the reason and infer
+    nothing. The mirror is never the answer for a host in this state. The
+    reason says what to do next; `pod` is what the provider said, for
+    `status` to print.
+    """
+
     reason: str
     pod: Pod | None = None
-    pod_error: str | None = None
 
 
 @dataclass
-class PodDead:
-    """The provider still has the pod and nothing can run on it: a failure,
-    and a registry entry kept for `gpuc host terminate` or `gpuc host remove`."""
+class Gone:
+    """The host does not exist any more: the provider reports its pod
+    terminated or missing, or the index names a host this machine has no
+    entry for. The state every rental reaches, not a failure: the mirror is
+    the answer, and the caller that commands share forgets the entry."""
 
-    pod: Pod
-
-    @property
-    def reason(self) -> str:
-        return f"pod {self.pod.id} is {self.pod.status}"
-
-
-@dataclass
-class PodGone:
-    """The provider says the rental has ended: the state every rental reaches,
-    not a failure. The caller that commands share forgets the entry."""
-
-    pod_id: str
+    reason: str
     pod: Pod | None = None
 
-    @property
-    def reason(self) -> str:
-        status = "no longer exists" if self.pod is None else f"is {self.pod.status}"
-        return f"pod {self.pod_id} {status}; this rental has ended"
 
-
-Asked = Answered | Unreachable | PodDead | PodGone
-"""What asking a host produces. Exactly one of four, decided once."""
+Asked = Answered | Unaskable | Gone
+"""What asking a host produces. Exactly one of three, decided once."""
 
 
 def rental_state(
     entry: HostEntry, provider: Provider | None
-) -> PodDead | PodGone | tuple[Pod | None, str | None]:
+) -> Unaskable | Gone | tuple[Pod | None, str | None]:
     """The provider's word on a rental's pod, before any ssh is tried.
 
     A pod the provider reports gone or dead is never dialled: the ssh would
     hang and then print a stack about a refused connection, which tells nobody
-    anything. Otherwise the pod (or None for a host that is not rented) and
-    why the provider could not be asked, which rides along as a failure
-    rather than stopping the host being asked.
+    anything. A dead pod is `Unaskable` with the provider's status and the
+    two commands that end or forget it, since the provider still bills for
+    it. Otherwise the pod (or None for a host that is not rented) and why the
+    provider could not be asked, which rides along as a failure rather than
+    stopping the host being asked.
     """
     if provider is None or entry.rental is None:
         return None, None
+    pod_id = entry.rental.pod_id
     try:
-        pod = provider.get(entry.rental.pod_id)
+        pod = provider.get(pod_id)
     except ProviderError as exc:
-        return None, f"could not read pod {entry.rental.pod_id}: {exc}"
-    if pod is None or provider.is_gone(pod):
-        return PodGone(entry.rental.pod_id, pod)
+        return None, f"could not read pod {pod_id}: {exc}"
+    if pod is None:
+        return Gone(f"pod {pod_id} no longer exists; this rental has ended")
+    if provider.is_gone(pod):
+        return Gone(f"pod {pod_id} is {pod.status}; this rental has ended", pod)
     if provider.is_dead(pod):
-        return PodDead(pod)
+        return Unaskable(
+            f"pod {pod_id} is {pod.status}; `gpuc host terminate {entry.name}` ends it, "
+            f"`gpuc host remove {entry.name}` forgets it",
+            pod,
+        )
     return pod, None
 
 
@@ -506,20 +509,24 @@ def ask(
     A rental is looked up at its provider first, when one is given
     (`rental_state`). `check=False` for a verb whose refusal *is* the document
     -- a cancel of a finished job -- so the host's reason survives the exit
-    code.
+    code. An ssh that fails is `Unaskable` with what ssh said and, after it,
+    the provider's complaint if it had one: neither is hidden.
     """
     state = rental_state(entry, provider)
-    if isinstance(state, (PodDead, PodGone)):
+    if isinstance(state, (Unaskable, Gone)):
         return state
     pod, pod_error = state
     try:
         session = session or open_session(entry, settings, record=record)
         payload = session.host_json(verb, timeout=timeout, check=check) if verb else None
     except (RemoteError, TransportError, ConfigError, OSError) as exc:
-        return Unreachable(reason_of(exc), pod, pod_error)
+        return Unaskable(_with_pod_error(reason_of(exc), pod_error), pod)
     if verb is not None and not isinstance(payload, dict):
         kind = type(payload).__name__
-        return Unreachable(
-            f"host {entry.name} answered `{verb}` with {kind}, not a JSON object", pod, pod_error
-        )
+        why = f"host {entry.name} answered `{verb}` with {kind}, not a JSON object"
+        return Unaskable(_with_pod_error(why, pod_error), pod)
     return Answered(session, payload, pod, pod_error)
+
+
+def _with_pod_error(why: str, pod_error: str | None) -> str:
+    return f"{why}; {pod_error}" if pod_error else why

@@ -432,9 +432,8 @@ function cardsSummary(host) {
 function hostHeader(host, entry) {
   const target = host.target || (host.kind === "local" ? "this machine" : "");
   let stateBadge;
-  if (host.pod_gone) stateBadge = badge("POD GONE", "bad");
-  else if (host.state === "pod_dead") stateBadge = badge(`POD ${host.pod ? host.pod.status : "DEAD"}`, "bad");
-  else if (!host.reachable) stateBadge = badge("UNREACHABLE", "bad");
+  if (host.state === "gone") stateBadge = badge("GONE", "bad");
+  else if (!host.reachable) stateBadge = badge("UNASKABLE", "bad");
   else if (host.dispatcher.alive) stateBadge = badge(`dispatcher ${Math.round(host.dispatcher.heartbeat_age_s)}s ago`, "good");
   else stateBadge = badge("dispatcher DOWN", "bad", "submit or bootstrap restarts it");
   const meta = el("div", { class: "meta" },
@@ -479,7 +478,7 @@ function hostCard(host, entry) {
   for (const error of host.errors) card.append(el("div", { class: "notice bad" }, error));
   for (const warning of host.warnings || []) card.append(el("div", { class: "notice warn" }, warning));
   if (!host.reachable) {
-    if (host.state === "unreachable") card.append(el("p", { class: "muted" }, `try: gpuc host probe ${host.name}`));
+    if (host.state === "unaskable" && !host.pod) card.append(el("p", { class: "muted" }, `try: gpuc host probe ${host.name}`));
     card.append(podLine(host) || []);
     card.append(el("p", {}, forgetButton(host)));
     return card;

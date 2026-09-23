@@ -168,12 +168,11 @@ def test_a_running_job_the_host_names_no_cards_for_still_renders() -> None:
     assert "gpu=none" in render(busy(running_job(gpus=[])))
 
 
-def test_an_unreachable_host_says_what_to_run_next() -> None:
-    down = HostView(
-        entry=host_entry(name="gpubox", kind="ssh", ssh="me@box"), error="ssh timed out"
-    )
-    text = render(down)
-    assert "UNREACHABLE" in text
+def test_an_unaskable_host_says_what_to_run_next() -> None:
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box")
+    text = render(gather(entry, session=cast(Any, _RefusingSession()), provider=None))
+    assert "UNASKABLE" in text
+    assert "ERROR ssh: connect to 1.2.3.4 port 22: No route to host" in text
     assert "gpuc host probe gpubox" in text
 
 
@@ -246,38 +245,37 @@ def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
         raise AssertionError("status must not ssh to a pod that no longer exists")
 
     view = gather(_runpod_entry(), session=cast(Any, explode), provider=_provider())
-    assert view.pod_gone and not view.reachable
+    assert view.gone and not view.reachable
     assert "no longer exists" in (view.error or "")
     # The rental ended, which is not a host the command could not read.
     assert view.failure is None
     text = render(view)
-    assert "POD GONE" in text
+    assert "GONE" in text and "ERROR" not in text
     assert "this rental has ended" in text
     assert "host probe" not in text
 
 
 def test_a_terminated_pod_reads_as_gone_too() -> None:
     view = gather(_runpod_entry(), provider=_provider(_pod("TERMINATED")))
-    assert view.pod_gone and view.failure is None
+    assert view.gone and view.failure is None
     assert "TERMINATED" in render(view)
 
 
-def test_a_stopped_pod_is_a_failure_and_is_not_forgotten() -> None:
+def test_a_stopped_pod_is_unaskable_and_is_not_forgotten() -> None:
     """An EXITED pod is one the provider still has: nothing runs on it, and only
     a person decides whether to fix it or drop it."""
     view = gather(_runpod_entry(), provider=_provider(_pod("EXITED")))
-    assert view.pod_dead and not view.pod_gone and not view.reachable
+    assert view.state is HostState.UNASKABLE and not view.reachable
     assert view.failure is not None
+    assert "gpuc host terminate gpuc-e2e-1" in (view.error or "")
     assert "gpuc host remove gpuc-e2e-1" in (view.error or "")
     # Still billing, so never printed as gone: the words are the pod's status.
     text = render(view)
-    assert "POD EXITED" in text and "POD GONE" not in text
+    assert "UNASKABLE" in text and "ERROR pod pod-1 is EXITED" in text and "GONE" not in text
+    assert "host probe" not in text
     document = host_json(view)
-    assert (document["state"], document["pod_gone"], document["reachable"]) == (
-        "pod_dead",
-        False,
-        False,
-    )
+    assert (document["state"], document["reachable"]) == ("unaskable", False)
+    assert "pod_gone" not in document
 
 
 def test_a_host_that_answered_still_prints_a_provider_error() -> None:
@@ -960,9 +958,9 @@ def test_the_placement_of_a_job_in_its_hosts_queue() -> None:
     assert queue_note(started) == "  queue: dispatched already; it is running now"
 
 
-def test_an_unreachable_host_places_nothing_rather_than_reporting_an_empty_queue() -> None:
+def test_an_unaskable_host_places_nothing_rather_than_reporting_an_empty_queue() -> None:
     """Null is not `not queued`: the job was enqueued before anything asked."""
-    view = HostView(entry=HostEntry(name="gpubox", ssh="me@box"), state=HostState.UNREACHABLE)
+    view = HostView(entry=HostEntry(name="gpubox", ssh="me@box"), state=HostState.UNASKABLE)
     placement = queue_placement(view, "j-next")
     assert set(placement.values()) == {None}
     assert queue_note(placement) is None

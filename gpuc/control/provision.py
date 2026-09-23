@@ -62,10 +62,9 @@ from gpuc.control.providers.base import (
 )
 from gpuc.control.remote import (
     Answered,
-    PodDead,
-    PodGone,
+    Gone,
     RemoteError,
-    Unreachable,
+    Unaskable,
     ask,
     reason_of,
 )
@@ -601,17 +600,14 @@ def pick_reusable_host(
         if entry.rental is None:
             continue
         asked = ask(entry, "status", settings, provider=provider)
-        if isinstance(asked, PodGone):
+        if isinstance(asked, Gone):
             # The pod is gone for good, so the entry can only mislead `status`,
             # `logs` and the next reuse pass. Drop it here rather than leaving
             # submit to fail on an ssh to an address someone else now owns.
             report(f"reuse: forgetting {entry.name}, its {asked.reason}")
             forget_host(entry.name, entry.rental.pod_id, report)
             continue
-        if isinstance(asked, PodDead):
-            report(f"reuse: skipping {entry.name}, its {asked.reason}")
-            continue
-        if isinstance(asked, Unreachable):
+        if isinstance(asked, Unaskable):
             report(f"reuse: skipping {entry.name}, it could not be asked: {asked.reason}")
             continue
         if not provider.is_running(asked.pod):

@@ -400,7 +400,7 @@ def test_a_host_that_could_not_be_read_is_the_clis_exit_one_on_the_wire(
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
 
     def unreachable(entry: HostEntry, *a: object, **k: object) -> HostView:
-        return HostView(entry=entry, state=HostState.UNREACHABLE, error="ssh timed out")
+        return HostView(entry=entry, state=HostState.UNASKABLE, error="ssh timed out")
 
     monkeypatch.setattr(status_mod, "gather", unreachable)
     status, document = logged_in.get_json("/api/status")

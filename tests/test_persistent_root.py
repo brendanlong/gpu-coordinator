@@ -489,28 +489,18 @@ def index_job(job_id: str, host: str, s3_prefix: str | None = None) -> None:
 
 
 def test_status_all_lists_index_jobs_per_host(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """After a wiped $HOME the host answers but knows nothing, so the index is
-    the only list of what to `gpuc requeue`. A host not registered here is
-    offered for one only once the mirror shows the job ended: that name may
-    be another machine's for a box still running it."""
-    from gpuc.control.config import config_file
-    from tests.fakes3 import FakeS3Client
-
-    index_job("20260101-000000-aaaaaa", "gpubox", s3_prefix="s3://bucket/gpuc/gpubox")
+    the only list of what to `gpuc requeue`; a host not registered here is
+    gone, and its jobs are offered too."""
+    index_job("20260101-000000-aaaaaa", "gpubox")
     index_job("20260101-000001-bbbbbb", "other")
-    ended = "bucket/gpuc/gpubox/jobs/20260101-000000-aaaaaa/state.json"
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client",
-        property(lambda self: FakeS3Client(objects={ended: b'{"status": "failed"}'})),
-    )
-    config_file().write_text('s3_bucket = "bucket"\n')
     capsys.readouterr()
     assert main(["status", "--all"]) == 0
     out = capsys.readouterr().out
     assert "n-20260101-000000-aaaaaa (20260101-000000-aaaaaa) host=gpubox" in out
-    assert "host=other" in out and "does not show it ended" in out
+    assert "host=other" in out and "is gone" in out
     assert "gpuc requeue 20260101-000000-aaaaaa --host" in out
 
 

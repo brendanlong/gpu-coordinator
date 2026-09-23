@@ -33,7 +33,7 @@ from gpuc.control.actions import (
 from gpuc.control.config import HostEntry, Reporter, Settings, load_settings, open_registry
 from gpuc.control.jsonout import note
 from gpuc.control.providers.base import Provider
-from gpuc.control.remote import Answered, HostSession, ask, open_session
+from gpuc.control.remote import Answered, HostSession, Unaskable, ask, open_session
 from gpuc.control.s3index import JobIndex
 from gpuc.control.status import JobView
 from gpuc.host.jobs import FINISHED_STATUSES
@@ -400,7 +400,7 @@ def start(
             unknown[job_id] = str(exc).splitlines()[0]
             continue
         trouble = location.trouble
-        if location.entry is None and trouble is not None and not mirror_is_the_answer(trouble):
+        if location.entry is None and isinstance(trouble, Unaskable):
             unaskable[job_id] = (location.host, trouble.reason)
             continue
         targets.append((job_id, location.host, location.entry))

@@ -40,7 +40,7 @@ from gpuc.control.config import (
 from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.jsonout import warn
 from gpuc.control.probe import ProbeReport, probe_host
-from gpuc.control.remote import PodGone, RemoteError, rental_state
+from gpuc.control.remote import Gone, RemoteError, rental_state
 from gpuc.control.transport import TransportError
 
 
@@ -448,7 +448,7 @@ def bootstrap_every_host(
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
             state = rental_state(entry, provider)
-            if isinstance(state, PodGone):
+            if isinstance(state, Gone):
                 report(f"{state.reason}; forgetting this host")
                 tally.record(entry, "gone")
                 forget_host(entry.name, entry.pod_id, report)
