@@ -61,12 +61,45 @@ one that stopped. An hour is far past any ssh round trip.
 def remove_secrets(job_id: str) -> None:
     """Delete the job's secrets file, if any. The one place that does.
 
-    Called by the runner as its last act -- after the final upload and the
-    mirror, which authenticate with what the file holds -- and by the sweeps
-    for a job whose dir is going or whose submit never finished.
+    Through `settle_secrets` from everything that ends a job, and directly
+    from the sweeps for a job whose dir is going or whose submit never
+    finished.
     """
     with contextlib.suppress(OSError):
         paths.job_env_file(job_id).unlink(missing_ok=True)
+
+
+def settle_secrets(job_id: str, state: JobState) -> str | None:
+    """Delete the job's secrets file now that the job is over, unless the
+    host's drain still needs it; the reason it stays, or None once it is gone.
+
+    Called wherever a job is ended: by the runner after its final upload and
+    mirror, which authenticate with what the file holds; by the dispatcher
+    for a job it failed without a runner or whose runner died; and by a
+    cancel of a queued job. Every one of those used to leave the file for
+    the purge, days later, against the rule that a job's secrets go once it
+    is finished. On an ephemeral host a job whose outputs are still pending
+    keeps it: the drain gets one more go at the upload with the job's own
+    credentials, and the file dies with the pod in minutes either way. A
+    spec that cannot be read declares no outputs anyone could upload.
+    """
+    if _ephemeral():
+        try:
+            spec = jobs.read_spec(job_id)
+        except (RuntimeError, ValueError):
+            spec = None
+        pending = outputs_pending(job_id, spec, state) if spec is not None else None
+        if pending:
+            return pending
+    remove_secrets(job_id)
+    return None
+
+
+def _ephemeral() -> bool:
+    try:
+        return jobs.read_config().ephemeral
+    except (RuntimeError, OSError, ValueError):
+        return False
 
 
 def should_remove(policy: str, status: str) -> bool:

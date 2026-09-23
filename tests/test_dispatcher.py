@@ -285,6 +285,47 @@ def test_a_runner_that_dies_without_final_state_fails_the_job(gpuc_home: Path) -
     assert dispatcher.running == {}
 
 
+def test_a_job_the_dispatcher_ends_loses_its_secrets_with_the_write(gpuc_home: Path) -> None:
+    """The runner would have deleted them as its last act; for a job that
+    never gets one, or whose runner died, the dispatcher's terminal write is
+    that last act."""
+    unreadable = queue.enqueue(make_spec(gpus=1))
+    paths.spec_file(unreadable).write_text("{not json")
+    paths.job_env_file(unreadable).write_text("HF_TOKEN=a\n")
+    died = queue.enqueue(make_spec(gpus=1))
+    paths.job_env_file(died).write_text("HF_TOKEN=b\n")
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(unreadable).reason == "bad-spec"
+    assert not paths.job_env_file(unreadable).exists()
+    assert paths.job_env_file(died).exists(), "a running job's secrets are its runner's"
+
+    spawned[died].returncode = -9
+    dispatcher.run_once()
+    assert jobs.read_state(died).reason == "runner-died"
+    assert not paths.job_env_file(died).exists()
+
+
+def test_a_dead_runner_on_a_pod_keeps_the_secrets_its_drain_will_upload_with(
+    gpuc_home: Path,
+) -> None:
+    """The drain retries this job's outputs with the job's own credentials,
+    and it is the only thing left that could; the file dies with the pod."""
+    configure_pod()
+    job_id = queue.enqueue(make_spec(gpus=1, outputs=[{"path": "out", "s3": "s3://b/{job_id}"}]))
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    jobs.update_state(job_id, ran=True)
+    (paths.workdir(job_id) / "out").mkdir()
+    (paths.workdir(job_id) / "out" / "late.pt").write_text("x")
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).reason == "runner-died"
+    assert paths.job_env_file(job_id).exists()
+    assert "keeping its secrets file for the drain" in paths.dispatcher_log().read_text()
+
+
 def test_a_runner_that_dies_leaves_no_output_confirmed(gpuc_home: Path) -> None:
     """A periodic tick's success says nothing about what the job wrote after
     it, and the final upload never ran: the sweep must not take the workdir."""

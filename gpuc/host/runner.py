@@ -763,26 +763,18 @@ class JobRunner:
         Only now: the final sync and the mirror authenticate with what it
         holds. It stays for the next attempt of a preempted job, since nothing
         delivers secrets a second time (`gpuc preempt` never goes near the
-        machine that holds them), and on an ephemeral host with outputs still
-        pending, where the drain gets one more go at uploading them and the
-        file dies with the pod in minutes either way.
+        machine that holds them); `cleanup.settle_secrets` decides the rest.
         """
         if written == "queued":
             self._log(log, "preempted; keeping this job's secrets file for the next attempt")
             return
-        pending = (
-            cleanup.outputs_pending(self.job_id, self.spec, jobs.read_state(self.job_id))
-            if self.config.ephemeral
-            else None
-        )
-        if pending:
+        kept = cleanup.settle_secrets(self.job_id, jobs.read_state(self.job_id))
+        if kept:
             self._log(
                 log,
-                f"{pending}; keeping this job's secrets file so the host's drain can retry "
+                f"{kept}; keeping this job's secrets file so the host's drain can retry "
                 f"the upload before the pod goes away",
             )
-            return
-        cleanup.remove_secrets(self.job_id)
 
     @staticmethod
     def _blame(outcome: Outcome, sync_reason: str, problems: list[str]) -> Outcome:

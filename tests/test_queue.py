@@ -182,6 +182,15 @@ def test_cancel_of_a_queued_job_is_immediate(gpuc_home: Path) -> None:
     assert state.intent is None
 
 
+def test_cancel_of_a_queued_job_takes_its_secrets_with_it(gpuc_home: Path) -> None:
+    """Nothing will run the job, so nothing will need them; left behind they
+    would sit on the host until the purge, days later."""
+    job_id = queue.enqueue(make_spec())
+    paths.job_env_file(job_id).write_text("HF_TOKEN=hf_abc\n")
+    assert queue.cancel(job_id) == "cancelled"
+    assert not paths.job_env_file(job_id).exists()
+
+
 def test_cancel_of_a_running_job_records_the_intent(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec())
     jobs.update_state(job_id, status="running")

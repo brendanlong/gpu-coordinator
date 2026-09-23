@@ -681,7 +681,8 @@ class Dispatcher:
     def _fail_queued(self, job_id: str, reason: str) -> None:
         """End a queued job without a runner: a spec that cannot be read, a
         request this host can never meet, a runner that could not be spawned.
-        The listing forgets the job with it."""
+        The listing forgets the job with it, and its secrets go: the runner
+        that would have deleted them will never exist."""
         try:
             written = jobs.finish(job_id, Outcome("failed", reason, ran=False), expect="queued")
         except RuntimeError as exc:
@@ -690,8 +691,16 @@ class Dispatcher:
         if written is None:
             return
         self.log(f"job {job_id} failed: {reason}")
+        self._settle_secrets(job_id, written)
         if self._queued is not None:
             self._queued = [entry for entry in self._queued if entry.job_id != job_id]
+
+    def _settle_secrets(self, job_id: str, state: jobs.JobState) -> None:
+        """The runner's last act, done for it: it is the one process that
+        would have deleted the file, and it is gone or never was."""
+        kept = cleanup.settle_secrets(job_id, state)
+        if kept:
+            self.log(f"job {job_id}: {kept}; keeping its secrets file for the drain")
 
     # -- startup ---------------------------------------------------------
     def adopt_orphans(self) -> None:
@@ -754,6 +763,7 @@ class Dispatcher:
             self.log(f"job {job_id}: its runner is gone but its state moved on; nothing written")
             return
         self.log(f"job {job_id} failed: runner died without writing final state")
+        self._settle_secrets(job_id, written)
 
     # -- loop pieces -----------------------------------------------------
     def reap(self) -> None:

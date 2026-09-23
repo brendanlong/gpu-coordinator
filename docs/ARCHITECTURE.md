@@ -414,6 +414,12 @@ The order is the contract; each step is in `runner.py`.
    again, or an ephemeral host still has its outputs pending for the drain.
    The runner exits with the job's code.
 
+The secrets file goes with **every** terminal write, not only the runner's:
+a queued job cancelled, a job the dispatcher failed (`bad-spec`,
+`spawn-failed`, a request the host cannot meet) or marked `runner-died` loses
+it in the same act (`cleanup.settle_secrets`), with the one exception above
+for an ephemeral host's drain.
+
 ## Job length estimates
 
 Nothing infers how long a job will take. Two optional spec fields are purely

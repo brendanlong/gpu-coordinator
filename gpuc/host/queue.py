@@ -12,7 +12,7 @@ import contextlib
 import os
 from dataclasses import dataclass, field
 
-from gpuc.host import jobs, paths
+from gpuc.host import cleanup, jobs, paths
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
 
 PREEMPTED = "preempted"
@@ -103,8 +103,9 @@ def cancel(job_id: str) -> str:
     `cancelling` for a running one, and a finished job's own status.
 
     A queued job is cancelled here and now, so cancel works with no dispatcher
-    running. A running job gets the intent, and its runner (or, as a backstop,
-    the dispatcher) acts on it.
+    running, and its secrets go with it (`cleanup.settle_secrets`): nothing
+    will run the job, so nothing will need them. A running job gets the
+    intent, and its runner (or, as a backstop, the dispatcher) acts on it.
     """
     if not paths.job_dir(job_id).is_dir():
         raise FileNotFoundError(f"no such job: {job_id}")
@@ -115,12 +116,14 @@ def cancel(job_id: str) -> str:
         if state.status == "queued":
             state.status, state.reason, state.ended_at = "cancelled", "cancelled", jobs.utc_now()
             state.intent = None
-            jobs.write_state(job_id, state)
-            return "cancelled"
-        # A cancel overrides a preempt: the job is not coming back.
-        state.intent = CANCEL
+        else:
+            # A cancel overrides a preempt: the job is not coming back.
+            state.intent = CANCEL
         jobs.write_state(job_id, state)
+    if state.status != "cancelled":
         return "cancelling"
+    cleanup.settle_secrets(job_id, state)
+    return "cancelled"
 
 
 def stop_requested(job_id: str) -> str | None:
