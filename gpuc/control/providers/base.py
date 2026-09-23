@@ -99,6 +99,9 @@ class Provider(ABC):
     `providers/` names a status.
     """
 
+    name: str
+    """What a registry entry's `rental.provider` calls this provider, and
+    the key `actions.PROVIDERS` builds it from again."""
     prefix: str
     dead_statuses: tuple[str, ...] = ("EXITED", "ERROR", "TERMINATED")
     """Pod statuses nothing can run on. A pod in one is a failed host."""

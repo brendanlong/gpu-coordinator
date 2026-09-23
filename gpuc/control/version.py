@@ -11,6 +11,7 @@ commit is re-shipped, and a dirty checkout is not the commit it sits on.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from functools import lru_cache
@@ -29,8 +30,8 @@ SHORT = 12
 def short(commit: str | None) -> str:
     if not commit:
         return "unknown"
-    base, dirty = (commit[: -len(DIRTY)], DIRTY) if commit.endswith(DIRTY) else (commit, "")
-    return base[:SHORT] + dirty
+    base, dirty, tag = commit.partition(DIRTY)
+    return base[:SHORT] + dirty + tag
 
 
 def package_root() -> Path:
@@ -77,21 +78,21 @@ def _git(*args: str) -> str | None:
 
 def source_commit() -> str | None:
     """`git rev-parse HEAD` where the package lives, for a checkout or an
-    editable install, with `-dirty` appended when the tree has changes."""
+    editable install, with `dirty_tag()` appended when the tree has changes."""
     commit = (_git("rev-parse", "HEAD") or "").strip()
     if not commit:
         return None
-    return f"{commit}{DIRTY}" if dirty() else commit
+    return f"{commit}{dirty_tag()}"
 
 
 @lru_cache(maxsize=1)
 def local_commit() -> str | None:
     """The build this `gpuc` is running, installed build first.
 
-    A dirty checkout is `<commit>-dirty`: it ships code HEAD does not have, so
-    a host bootstrapped from it must not read as running HEAD, and the next
-    submit from a clean checkout of the same commit must re-ship. Cached:
-    `status` asks once per host, and it cannot change under a process.
+    A dirty checkout is `<commit>-dirty-<hash>`: it ships code HEAD does not
+    have, so a host bootstrapped from it must not read as running HEAD, and
+    the next submit from a clean checkout of the same commit must re-ship.
+    Cached: `status` asks once per host, and it cannot change under a process.
     """
     return installed_commit() or source_commit()
 
@@ -99,6 +100,22 @@ def local_commit() -> str | None:
 def dirty() -> bool:
     """Whether the source checkout has uncommitted changes."""
     return bool((_git("status", "--porcelain") or "").strip())
+
+
+def dirty_tag() -> str:
+    """`-dirty-<8 hex>` for a checkout with uncommitted changes, "" otherwise.
+
+    The hex is a sha1 over `git diff HEAD` and `git status --porcelain`, so a
+    second edit to an already dirty tree is a second build: with a bare
+    `-dirty`, the host already named `<commit>-dirty` and the edit was never
+    re-shipped. The status listing puts an untracked file in by name; its
+    content is not hashed, which is the one edit this still misses.
+    """
+    status = (_git("status", "--porcelain") or "").strip()
+    if not status:
+        return ""
+    digest = hashlib.sha1((_git("diff", "HEAD") or "").encode() + status.encode())
+    return f"{DIRTY}-{digest.hexdigest()[:8]}"
 
 
 def host_build_warning(name: str, host_commit: str | None, local: str | None) -> str | None:

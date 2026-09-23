@@ -33,8 +33,10 @@ def pod_record(address: HostEntry, offer: Offer, created_at: str) -> dict[str, A
     }
 
 
-def address_for(name: str, pod: Pod, provider: str = "runpod") -> HostEntry | None:
-    """How to reach this pod, and nothing about what it is. None: no door yet."""
+def address_for(name: str, pod: Pod, provider: str) -> HostEntry | None:
+    """How to reach this pod, and nothing about what it is. None: no door yet.
+    `provider` is the name of the one the pod came from (`Provider.name`),
+    which is what `actions.PROVIDERS` finds it by again."""
     if pod.ssh_direct is None:
         return None
     return HostEntry(

@@ -461,7 +461,7 @@ def host_document(entry: HostEntry) -> dict[str, Any]:
         "cache_dir": entry.config.env.get("UV_CACHE_DIR"),
         "config_seen_at": entry.seen_at,
         "remote_home": entry.remote_home,
-        "ephemeral": entry.ephemeral,
+        "ephemeral": entry.rental is not None,
         "warnings": [stale] if stale else [],
     }
 

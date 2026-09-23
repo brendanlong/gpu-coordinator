@@ -36,6 +36,7 @@ from gpuc.control.submit import (
     check_gpu_count,
     load_document,
     prepare,
+    refuse_unreadable_config,
     submit_spec,
     validate,
     with_overrides,
@@ -117,6 +118,7 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
     """
     if not bootstrap:
         return
+    refuse_unreadable_config(session)
     if session.config_read.missing or host_build(session) is None:
         raise CliError(
             f"host {session.entry.name} has no gpuc on it yet: its own config records no "
@@ -131,7 +133,8 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
         f"machine has {version_mod.short(local)}: re-syncing the package and restarting the "
         f"dispatcher before enqueueing"
     )
-    ensure_build(session, _quiet)
+    # Decided above; `always` keeps `ensure_build` from asking the same question.
+    ensure_build(session, _quiet, always=True)
 
 
 def _quiet(_: str) -> None:

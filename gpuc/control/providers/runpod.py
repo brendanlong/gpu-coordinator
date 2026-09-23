@@ -62,6 +62,8 @@ class RunPodProvider(Provider):
     behalf -- a `Retry-After`, a rate-limit window -- so a test can run the
     whole flow without waiting them out."""
 
+    name = "runpod"
+
     def __init__(
         self,
         api_key: str | None = None,

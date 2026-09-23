@@ -323,8 +323,8 @@ which is also the read that tells them what the host's cards and mirror are. A
 config that names no commit is a host nothing has bootstrapped, and is refused.
 They re-sync the package and restart the dispatcher first, print one line
 saying so, and `--no-bootstrap` skips it. A checkout with uncommitted changes
-is its own build (`<commit>-dirty`): a host bootstrapped from it never reads as
-running that commit.
+is its own build (`<commit>-dirty-<hash>`): a host bootstrapped from it never
+reads as running that commit, and the next edit to the tree is re-shipped too.
 Re-bootstrapping is safe at any time: **running jobs are not disturbed and do
 not block it.** A dispatcher on another build hands over to the one bootstrap
 starts, which adopts the running jobs from their `state.json`; every new

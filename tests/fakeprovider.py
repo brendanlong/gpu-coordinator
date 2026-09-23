@@ -73,6 +73,8 @@ class _FakePod:
 class FakeProvider(Provider):
     """Speaks the base class's vocabulary, as the real provider does."""
 
+    name = "runpod"
+
     def __init__(
         self,
         offers: list[Offer] | None = None,

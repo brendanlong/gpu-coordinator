@@ -213,8 +213,8 @@ class HostCache(TolerantModel):
 class Rental(TolerantModel):
     """The pod behind an address: which provider is billing for it, and as what.
 
-    The one spelling of "this host is rented": `kind`, `pod_id` and
-    `ephemeral` are all read off it.
+    The one spelling of "this host is rented": `kind` and `pod_id` are read
+    off it, and "is this a rental" is `rental is not None`.
     """
 
     provider: str = "runpod"
@@ -302,10 +302,6 @@ class HostEntry(TolerantModel):
         if self.rental is not None:
             return "rental"
         return "ssh" if self.ssh else "local"
-
-    @property
-    def ephemeral(self) -> bool:
-        return self.rental is not None
 
     @property
     def pod_id(self) -> str | None:
@@ -755,7 +751,6 @@ def forget_host(name: str, pod_id: str | None = None, report: Reporter = warn) -
     seconds. A lock another session is holding is a warning and a False, not
     a failure: the pod is already gone by the time anything calls this.
     """
-    pod_known_hosts_file(name).unlink(missing_ok=True)
     try:
         with state_lock():
             read = read_registry()
@@ -766,6 +761,9 @@ def forget_host(name: str, pod_id: str | None = None, report: Reporter = warn) -
                 return False
             del read.registry.hosts[name]
             save_registry(read.registry, read.skipped)
+            # Only once the entry has gone: the pinned host key belongs to the
+            # pod the entry names, which a request about another pod leaves.
+            pod_known_hosts_file(name).unlink(missing_ok=True)
             return True
     except ConfigError as exc:
         report(f"could not remove host {name} from the registry: {exc}")
@@ -787,7 +785,9 @@ def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transpo
         ssh=entry.ssh,
         port=entry.port,
         key=settings.ssh_key_path,
-        known_hosts=(pod_known_hosts_file(entry.name) if entry.ephemeral else known_hosts_file()),
+        known_hosts=(
+            pod_known_hosts_file(entry.name) if entry.rental is not None else known_hosts_file()
+        ),
     )
 
 

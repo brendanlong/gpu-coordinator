@@ -1113,7 +1113,8 @@ bootstrap and reported back by `python -m gpuc.host status`.
   enqueue and re-ship the package (`ensure_build`) when it does not match this
   build. One comparison, `version.is_other_build`, and it is strict: a host
   that names no commit was never bootstrapped and is refused, and a checkout
-  with uncommitted changes is `<commit>-dirty`, never the commit it sits on.
+  with uncommitted changes is `<commit>-dirty-<hash of the changes>`, never
+  the commit it sits on and never another dirty tree on it.
   That same read is what the rest of the submit works from -- the `gpus` the
   spec is judged against, the `s3_prefix` its outputs are recorded under --
   and it replaces the registry's cache on the way past.

@@ -228,9 +228,9 @@ def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
     return offer.matches_cuda_floor(constraints.cuda_min)
 
 
-def address_for(name: str, pod: Pod) -> HostEntry:
+def address_for(name: str, pod: Pod, provider: Provider) -> HostEntry:
     """How to reach this pod, and nothing about what it is."""
-    address = rented.address_for(name, pod)
+    address = rented.address_for(name, pod, provider.name)
     if address is None:
         raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
     return address
@@ -377,7 +377,7 @@ def _try_offer(
             f"ssh.direct {pod.ssh_direct.username}@{pod.ssh_direct.host}:{pod.ssh_direct.port} "
             f"(cuda {pod.cuda_version or '?'}, ${pod.cost_usd_hr:.3f}/h)"
         )
-        address = address_for(name, pod)
+        address = address_for(name, pod, provider)
         transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
         # The one look at the pod's cards, the same probe `gpuc host add`

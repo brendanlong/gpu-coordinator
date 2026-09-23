@@ -580,6 +580,19 @@ def test_a_job_that_did_not_ask_is_not_given_the_shared_cards_as_capacity(
     assert "use_shared: true" in str(exc.value)
 
 
+def test_a_card_listed_as_both_owned_and_shared_is_counted_once(
+    control_env: Path, repo: Path
+) -> None:
+    """The dispatcher resolves both lists against the live card table and
+    health refuses the overlap; a submit has no table, so the same spelling
+    on both sides is the one overlap it can see, and it must not count it as
+    capacity twice."""
+    entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-a"])
+    with pytest.raises(SubmitError) as exc:
+        submit_to(entry, repo, job_document(gpus=2, use_shared=True))
+    assert "host owns 1 and may borrow 0 shared" in str(exc.value)
+
+
 def test_a_job_bigger_than_owned_and_shared_together_is_still_refused(
     control_env: Path, repo: Path
 ) -> None:

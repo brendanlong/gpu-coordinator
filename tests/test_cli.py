@@ -1449,6 +1449,29 @@ def test_submit_asks_the_host_which_build_it_runs_not_this_machines_record(
     assert resynced == []
 
 
+def test_submit_refuses_a_host_whose_config_cannot_be_read_and_says_why(
+    control_env: Path,
+    fake_host: FakeHost,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A config that is there and does not parse is neither "no gpuc yet" nor a
+    host that owns no cards: the reason it could not be read is the answer."""
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
+    _set_host(python="/py", pkg_commit="b" * 40)
+    monkeypatch.setattr(
+        "gpuc.control.remote.read_config",
+        lambda *a, **k: HostConfigRead(unreadable="config.json is there but holds no JSON object"),
+    )
+    assert main(["submit", str(job), "--host", "gpubox"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "could not be read" in err and "holds no JSON object" in err
+    assert "no gpuc on it yet" not in err and "cannot run this job" not in err
+
+
 def test_submit_records_the_hosts_commit_without_clobbering_the_rest_of_the_entry(
     control_env: Path,
     fake_host: FakeHost,
