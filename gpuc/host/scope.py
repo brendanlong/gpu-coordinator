@@ -17,8 +17,10 @@ CGROUP = "cgroup"
 PGID = "pgid"
 
 ISOLATION_ENV = "GPUC_ISOLATION"
-"""How the dispatcher tells its runners what it already probed, so one answer
-serves every job of that dispatcher's life rather than one exec per phase."""
+"""How the dispatcher tells its runners what it already decided, so one answer
+serves every job of that dispatcher's life rather than one exec per phase --
+and how a test pins the mode on a machine whose systemd it must not depend on.
+`isolation()` is the one reader; nothing else asks the probe."""
 
 STOP_TIMEOUT_S = 15.0
 """`TimeoutStopSec`: SIGTERM, then SIGKILL after this. systemd's own default is
@@ -59,7 +61,12 @@ def probe(*, timeout: float = 20.0, use_cache: bool = True) -> bool:
 
 
 def isolation(*, timeout: float = 20.0) -> str:
-    """`cgroup` or `pgid`, honouring what the dispatcher already worked out."""
+    """`cgroup` or `pgid`: what was announced, else what one probe finds.
+
+    Decided once per process. The dispatcher announces its answer to every
+    child, so the whole tree -- dispatcher, runners, phases -- agrees on what
+    a kill reaches.
+    """
     announced = os.environ.get(ISOLATION_ENV)
     if announced in (CGROUP, PGID):
         return announced

@@ -2,15 +2,15 @@
 
 Nothing is stored about the queue except each job's own `state.json`. Nothing
 here takes the dispatcher lock, so a wedged dispatcher can never lose an
-enqueue; every change of a job's state goes through `jobs.transition`, whose
-per-job lock is what keeps a cancel and a dispatch from both winning.
+enqueue; every change of a job's state goes through a compare-and-set under
+the job's own lock, which is what keeps a cancel and a claim from both winning.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
@@ -19,7 +19,9 @@ PREEMPTED = "preempted"
 """The reason of an attempt stopped so that something else can have its GPUs.
 
 Its own reason: a preempted job is not a failure of the job, and the log of
-the attempt that was stopped should say what ended it.
+the attempt that was stopped should say what ended it. It is a terminal
+reason only on a host that is draining; anywhere else the runner queues the
+job again instead of finishing it.
 """
 
 STOP_REASONS = {CANCEL: "cancelled", PREEMPT: PREEMPTED}
@@ -30,6 +32,9 @@ STOP_REASONS = {CANCEL: "cancelled", PREEMPT: PREEMPTED}
 class QueueEntry:
     priority: int
     job_id: str
+    attempt: int = field(default=1, compare=False)
+    """Which launch of this job the dispatcher would be making, so it can tell
+    a runner that died before claiming the job from one that queued it again."""
 
 
 def enqueue(spec: JobSpec) -> str:
@@ -66,20 +71,16 @@ def list_queued() -> list[QueueEntry]:
         except RuntimeError:
             continue
         if state.status == "queued":
-            entries.append(QueueEntry(state.priority, job_id))
+            entries.append(QueueEntry(state.priority, job_id, state.attempt))
     return sorted(entries)
-
-
-def is_queued(job_id: str) -> bool:
-    return any(entry.job_id == job_id for entry in list_queued())
 
 
 def claim(job_id: str, **state: object) -> bool:
     """Take a job out of the queue, recording what became of it.
 
     False when the job was no longer queued: cancelled, or claimed by another
-    pass. The caller lists the queue and then claims each job it acts on, and
-    the two are not one operation.
+    process. The runner claims the job it was started for this way, as its
+    first act, and the dispatcher claims one it is failing without a runner.
     """
     return jobs.transition(job_id, expect="queued", **state) is not None
 
@@ -116,13 +117,6 @@ def cancel(job_id: str) -> str:
         return "cancelling"
 
 
-def is_cancelled(job_id: str) -> bool:
-    try:
-        return jobs.read_state(job_id).intent == CANCEL
-    except RuntimeError:
-        return False
-
-
 def stop_requested(job_id: str) -> str | None:
     """The reason a running job's runner should stop it now, or None."""
     try:
@@ -135,9 +129,11 @@ def stop_requested(job_id: str) -> str | None:
 def preempt(job_id: str, priority: int | None = None) -> str:
     """Stop a running job and queue it again, from the start.
 
-    The intent says the job is coming back; the runner owns the kill and the
-    final sync, and the dispatcher re-queues the job once its runner has
-    stopped it (`requeue_preempted`, which also counts the next attempt).
+    The intent says the job is coming back; the runner owns the kill, the
+    final sync, and the write that queues the job again (`next_attempt`). A
+    preempt that lands once the runner is past the point of stopping anything
+    -- in its final sync, say -- changes nothing: the attempt ends the way it
+    was already ending, and the intent goes with it.
     """
     if not paths.job_dir(job_id).is_dir():
         raise FileNotFoundError(f"no such job: {job_id}")
@@ -154,14 +150,6 @@ def preempt(job_id: str, priority: int | None = None) -> str:
             raise ValueError(
                 f"job {job_id} is {state.status}, not running, so it is already waiting its "
                 f"turn; `gpuc reorder {job_id} --priority N` moves it"
-            )
-        if state.phase == "sync":
-            # The runner snapshots the intent at the top of its final sync and
-            # then deletes the secrets and, on success, the workdir; a preempt
-            # that arrived after that snapshot would come back with neither.
-            raise ValueError(
-                f"job {job_id} is in its final sync, so there is nothing left to preempt; "
-                f"`gpuc requeue {job_id}` runs it again once it has finished"
             )
         if state.intent == CANCEL:
             raise ValueError(f"job {job_id} is already being cancelled, so it is not coming back")
@@ -229,45 +217,24 @@ def is_preempted(job_id: str) -> bool:
         return False
 
 
-STOPPED_BY_US = (PREEMPTED, "runner-died", "terminated")
-"""Reasons that mean the attempt ended because something stopped it, rather
-than because the job itself was over. Only these come back: a job that failed
-on its own in the seconds before the kill reached it asked for nothing, and
-re-running it would be a retry nobody requested (`gpuc requeue` is that)."""
+def next_attempt(job_id: str) -> int | None:
+    """Queue a preempted job again, as the runner's last act for the attempt
+    it stopped, and say which attempt it is now.
 
+    One write under the job's lock, fresh rather than patched: the job runs
+    from the start, so the exit code, the end time and the GPUs of the attempt
+    that was stopped would all be lies about a queued job. What a queued job is
+    still ordered and described by survives -- the live priority and estimate.
+    The job goes straight from `running` to `queued`: nothing ever sees it
+    finished in between, and no other process has to notice the intent.
 
-def stopped_for_preempt(state: JobState) -> bool:
-    return state.reason in STOPPED_BY_US
-
-
-def requeue_preempted(job_id: str) -> int | None:
-    """Put a preempted job back in the queue, and say which attempt it is now.
-
-    None means it is not going back, and the intent goes with the decision so
-    nothing tries again: the job is already queued, it finished under its own
-    steam before the kill reached it, it was cancelled while it stopped, or it
-    has no workdir left to re-run from.
-
-    The state is written fresh rather than patched. The job runs from the
-    start, so the exit code, the end time and the GPUs of the attempt that was
-    stopped would all be lies about a queued job. One write, under the job's
-    lock: there is no half-done requeue to finish after a crash.
+    None, and nothing written, when the job is no longer `running` under a
+    `preempt` intent: a cancel that landed while it stopped overrides the
+    preempt, and the runner ends the job instead.
     """
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
-        if state.intent != PREEMPT:
-            return None
-        if state.status == "queued":
-            state.intent = None
-            jobs.write_state(job_id, state)
-            return None
-        if (
-            not state.finished
-            or not stopped_for_preempt(state)
-            or not paths.workdir(job_id).is_dir()
-        ):
-            state.intent = None
-            jobs.write_state(job_id, state)
+        if state.status != "running" or state.intent != PREEMPT:
             return None
         attempt = state.attempt + 1
         jobs.write_state(
@@ -277,25 +244,14 @@ def requeue_preempted(job_id: str) -> int | None:
                 attempt=attempt,
                 priority=state.priority,
                 estimated_runtime_min=state.estimated_runtime_min,
-                progress_pct=None,
-                workdir_bytes=None,
             ),
         )
-    _log_requeue(job_id, attempt, state.priority)
-    return attempt
-
-
-def _log_requeue(job_id: str, attempt: int, priority: int) -> None:
-    """Say in the job's own log why it is starting over.
-
-    `gpuc logs` is where somebody looks at a job that has restarted, and
-    without this the log simply runs two attempts together.
-    """
     note(
         job_id,
-        f"preempted; queued again as attempt {attempt} at priority {priority}, "
+        f"preempted; queued again as attempt {attempt} at priority {state.priority}, "
         f"to run from the start in this same workdir",
     )
+    return attempt
 
 
 def note(job_id: str, message: str) -> None:

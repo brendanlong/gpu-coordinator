@@ -38,6 +38,8 @@ __all__ = [
     "TooManyRecentFiles",
     "final_meta_sync",
     "mirror_for",
+    "mirror_meta",
+    "put_state",
     "recently_modified",
     "run_command",
     "sync_job_meta",
@@ -211,26 +213,22 @@ def sync_job_meta(
             mirror.put_file(path, path.name, runner=runner, timeout=timeout, env=env)
 
 
-def final_meta_sync(
+def mirror_meta(
     job_id: str,
     s3_prefix: str | None,
     *,
     runner: CommandRunner = run_command,
     timeout: float | None = 300.0,
     env: Env = None,
-) -> str | None:
-    """Mirror a finished job's log and state, then record that it happened.
+) -> destinations.S3 | None:
+    """Mirror a job's log and state, then record that it happened.
 
     The mirror's upload record is the precondition `purge` checks before
     deleting a job dir, so it is written only once the upload has actually
     succeeded -- a raised SyncError, or no `s3_prefix` at all, leaves no
-    record and the job dir unpurgeable. Writing it changes `state.json`, so
-    state goes up once more afterwards (a few hundred bytes) and the mirror
-    matches the local file.
-
-    Returns a warning when only that trailing PUT failed: the local state is
-    the authority on "was this backed up", and log + state are already in S3,
-    so a stale mirrored copy of `state.json` is not worth undoing the record.
+    record and the job dir unpurgeable. Writing it changes `state.json`, and
+    so does whatever the caller writes next, so the mirror is returned for
+    `put_state` to bring its copy up to date once the caller is done.
     """
     mirror = mirror_for(job_id, s3_prefix)
     if mirror is None:
@@ -241,6 +239,25 @@ def final_meta_sync(
         jobs.record_upload(job_id, mirror.uri, None, error=str(exc))
         raise
     jobs.record_upload(job_id, mirror.uri, None, ok_at=jobs.utc_now())
+    return mirror
+
+
+def put_state(
+    job_id: str,
+    mirror: destinations.S3,
+    *,
+    runner: CommandRunner = run_command,
+    timeout: float | None = 300.0,
+    env: Env = None,
+) -> str | None:
+    """Upload `state.json` once more, so the mirror's copy carries what was
+    written since `mirror_meta`: the record of the mirror itself, and the
+    write that ended the job.
+
+    A failure is a warning, not an error: the local state is the authority on
+    "was this backed up", and log + state are already in S3, so a mirrored
+    `state.json` one revision behind is not worth undoing the record.
+    """
     state = paths.state_file(job_id)
     try:
         if state.exists():
@@ -248,6 +265,22 @@ def final_meta_sync(
     except SyncError as exc:
         return f"the mirrored state.json is one revision behind (re-upload failed): {exc}"
     return None
+
+
+def final_meta_sync(
+    job_id: str,
+    s3_prefix: str | None,
+    *,
+    runner: CommandRunner = run_command,
+    timeout: float | None = 300.0,
+    env: Env = None,
+) -> str | None:
+    """`mirror_meta` then `put_state`, for a job that is already over: the
+    drain's last mirror of every job on a host about to go away."""
+    mirror = mirror_meta(job_id, s3_prefix, runner=runner, timeout=timeout, env=env)
+    if mirror is None:
+        return None
+    return put_state(job_id, mirror, runner=runner, timeout=timeout, env=env)
 
 
 class SyncLoop:
@@ -292,6 +325,7 @@ class SyncLoop:
         timeout: float | None = DEFAULT_TIMEOUT_S,
         *,
         record_missing: bool = True,
+        meta: bool = True,
     ) -> None:
         with self._tick_lock:
             sync_outputs(
@@ -305,13 +339,14 @@ class SyncLoop:
                 baseline_map=baseline.read(self._spec.job_id),
                 record_missing=record_missing,
             )
-            sync_job_meta(
-                self._spec.job_id,
-                self._s3_prefix,
-                runner=self._runner,
-                timeout=timeout,
-                env=self._env,
-            )
+            if meta:
+                sync_job_meta(
+                    self._spec.job_id,
+                    self._s3_prefix,
+                    runner=self._runner,
+                    timeout=timeout,
+                    env=self._env,
+                )
 
     def _loop(self) -> None:
         interval = max(1, self._spec.sync_interval_s)
@@ -349,14 +384,17 @@ class SyncLoop:
             self._thread = None
 
     def final(self) -> None:
-        """Stop the loop and do one complete sync, including files just written.
+        """Stop the loop and upload every output once more, files just
+        written included.
 
         Every output's record is cleared first: an earlier tick having worked
         says nothing about the files the job wrote in its last minute, and
         `purge` reads the records as "everything this job produced is
-        somewhere else".
+        somewhere else". The log and state are not part of it: the runner
+        mirrors those itself, once, after the workdir is settled and measured
+        (`mirror_meta`), so uploading them here would be the same bytes twice.
         """
         self.stop()
         with contextlib.suppress(RuntimeError, OSError):
             jobs.clear_output_uploads(self._spec.job_id)
-        self._tick(min_age_s=0.0, timeout=None)
+        self._tick(min_age_s=0.0, timeout=None, meta=False)

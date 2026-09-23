@@ -200,15 +200,6 @@ def test_hf_put_file_lands_under_the_path(tmp_path: Path, fake_aws: str) -> None
     assert runner.calls == [["/fake/hf", "upload", "org/repo", str(tmp_path / "f"), "runs/jid/f"]]
 
 
-def test_an_upload_of_a_missing_path_is_missing_output_and_runs_nothing(
-    tmp_path: Path, fake_aws: str
-) -> None:
-    runner = RecordingRunner()
-    with pytest.raises(sync.MissingOutput):
-        S3("s3://b/p").upload_dir(tmp_path / "nope", runner=runner)
-    assert runner.calls == []
-
-
 # -- upload records -----------------------------------------------------------
 
 

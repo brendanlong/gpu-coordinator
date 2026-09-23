@@ -72,6 +72,10 @@ def why(result: cleanup.CleanResult, job_id: str) -> str:
     return next(s.why for s in result.purge_skipped if s.job_id == job_id)
 
 
+def pending(job_id: str) -> str | None:
+    return cleanup.outputs_pending(job_id, jobs.read_spec(job_id), jobs.read_state(job_id))
+
+
 # -- the matrix ---------------------------------------------------------------
 
 
@@ -156,7 +160,7 @@ def test_a_job_that_never_wrote_its_outputs_has_nothing_to_lose(gpuc_home: Path)
     preflight or its setup never wrote the path, so calling it unconfirmed both
     misreports it and keeps its dir forever."""
     job_id = make_job(outputs=True, outputs_uploaded=False, produced=False)
-    assert cleanup.outputs_confirmed(job_id, jobs.read_state(job_id)) == (True, None)
+    assert pending(job_id) is None
     result = cleanup.purge(older_than_days=7.0)
     assert [c.job_id for c in result.purged] == [job_id]
     assert not any(c.forced for c in result.purged)
@@ -165,11 +169,10 @@ def test_a_job_that_never_wrote_its_outputs_has_nothing_to_lose(gpuc_home: Path)
 def test_an_output_dir_holding_only_the_checkout_is_not_a_lost_result(gpuc_home: Path) -> None:
     job_id = make_job(outputs=True, outputs_uploaded=False)
     baseline.capture(jobs.read_spec(job_id), paths.workdir(job_id), job_id)
-    assert cleanup.outputs_confirmed(job_id, jobs.read_state(job_id)) == (True, None)
+    assert pending(job_id) is None
 
     (paths.workdir(job_id) / "results" / "new.pt").write_bytes(b"z")
-    confirmed, why_not = cleanup.outputs_confirmed(job_id, jobs.read_state(job_id))
-    assert not confirmed and why_not == "outputs not confirmed uploaded"
+    assert pending(job_id) == "outputs not confirmed uploaded"
 
 
 def test_a_captured_baseline_with_nothing_under_it_is_not_a_lost_result(
@@ -179,7 +182,7 @@ def test_a_captured_baseline_with_nothing_under_it_is_not_a_lost_result(
     nothing. Distinct from never having taken one at all."""
     job_id = make_job(outputs=True, outputs_uploaded=False, produced=False)
     baseline.capture(jobs.read_spec(job_id), paths.workdir(job_id), job_id)
-    assert cleanup.outputs_confirmed(job_id, jobs.read_state(job_id)) == (True, None)
+    assert pending(job_id) is None
 
 
 def test_an_output_path_that_cannot_be_resolved_is_never_purged(gpuc_home: Path) -> None:
@@ -192,7 +195,7 @@ def test_an_output_path_that_cannot_be_resolved_is_never_purged(gpuc_home: Path)
     spec["outputs"] = [{"path": "results/{step}", "s3": "s3://bucket/x"}]
     paths.spec_file(job_id).write_text(json.dumps(spec))
 
-    assert cleanup.produced_outputs(job_id, jobs.read_spec(job_id))
+    assert pending(job_id)
     result = cleanup.purge(older_than_days=7.0)
     assert result.purged == []
     assert why(result, job_id) == "outputs not confirmed uploaded"
@@ -204,7 +207,7 @@ def test_an_unreadable_output_dir_is_never_purged(gpuc_home: Path) -> None:
     results = paths.workdir(job_id) / "results"
     os.chmod(results, 0o000)
     try:
-        assert cleanup.produced_outputs(job_id, jobs.read_spec(job_id))
+        assert pending(job_id)
         result = cleanup.purge(older_than_days=7.0)
         assert result.purged == []
     finally:
@@ -222,7 +225,7 @@ def test_outputs_reached_through_a_symlink_are_never_purged(gpuc_home: Path) -> 
     (workdir / "results").mkdir(exist_ok=True)
     (workdir / "results" / "latest").symlink_to("../checkpoint-9")
 
-    assert cleanup.produced_outputs(job_id, jobs.read_spec(job_id))
+    assert pending(job_id)
     result = cleanup.purge(older_than_days=7.0)
     assert result.purged == []
 
@@ -237,11 +240,10 @@ def test_one_failing_destination_of_two_leaves_the_outputs_unconfirmed(gpuc_home
     both = {**OUTPUT, "hf": "someone/exp", "hf_path": "{job_id}"}
     job_id = make_job(outputs=True, output=both, outputs_uploaded=True)
     _, hf = destinations.of(jobs.read_spec(job_id).outputs[0], job_id)
-    assert cleanup.outputs_confirmed(job_id, jobs.read_state(job_id)) == (True, None)
+    assert pending(job_id) is None
 
     jobs.record_upload(job_id, hf.uri, "results", error="403 Forbidden")
-    confirmed, why_not = cleanup.outputs_confirmed(job_id, jobs.read_state(job_id))
-    assert not confirmed and why_not == "outputs not confirmed uploaded"
+    assert pending(job_id) == "outputs not confirmed uploaded"
     assert [c.job_id for c in cleanup.purge(older_than_days=7.0).purged] == []
 
 
@@ -266,7 +268,7 @@ def test_a_spec_that_declares_no_outputs_needs_no_confirmation(gpuc_home: Path) 
 def test_an_unreadable_spec_fails_closed_on_outputs(gpuc_home: Path) -> None:
     job_id = make_job(outputs=True)
     paths.spec_file(job_id).unlink()
-    assert "spec.json is unreadable" in why(cleanup.purge(older_than_days=7.0), job_id)
+    assert why(cleanup.purge(older_than_days=7.0), job_id) == "no readable spec.json"
     assert paths.job_dir(job_id).is_dir()
 
 
@@ -295,7 +297,7 @@ def test_purge_implies_the_workdir_clean_for_jobs_it_keeps(gpuc_home: Path) -> N
     assert [c.job_id for c in result.removed] == [kept]
     assert not paths.workdir(kept).exists()
     assert paths.state_file(kept).exists()
-    assert jobs.read_state(kept).workdir_removed is True
+    assert jobs.read_state(kept).workdir_bytes == 0
 
 
 def test_the_secrets_file_goes_with_the_purged_job(gpuc_home: Path) -> None:

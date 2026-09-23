@@ -118,10 +118,9 @@ def capacity_failure(gpus: int, owned: int, shared: int, *, borrows: bool) -> st
 
     Everything read here is fixed for the life of a queued job -- the
     configured counts and the spec's `use_shared` -- because the answer
-    deletes the job from the queue.
+    deletes the job from the queue. `gpus` is at least one: `JobSpec` refuses
+    anything less at the reader, so a spec asking for none is `bad-spec`.
     """
-    if gpus < 1:
-        return f"needs at least 1 GPU, asked for {gpus}"
     if gpus <= owned + (shared if borrows else 0):
         return None
     have = f"host owns {owned}"

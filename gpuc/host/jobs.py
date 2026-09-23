@@ -33,9 +33,11 @@ INTENTS = (CANCEL, PREEMPT)
 `status` is the job's own progress; `intent` is the request standing against
 it. A queued job is cancelled outright, so the only intents are ones a running
 job's runner acts on: `cancel` ends it as `cancelled`, `preempt` ends the
-attempt as `failed: preempted` and the dispatcher queues it again. Both live
-in the same file as `status`, written in the same atomic replace, so there is
-no order of writes to get right and nothing to reconcile after a crash.
+attempt and the runner queues the job again itself. Both live in the same file
+as `status`, written in the same atomic replace, so there is no order of
+writes to get right and nothing to reconcile after a crash. The write that
+ends a job clears the intent with it: an intent only ever stands against a
+running job.
 """
 
 DEFAULT_PYTHON = "uv run --no-sync python"
@@ -327,17 +329,27 @@ class JobSpec:
     The default keeps a failed or cancelled workdir so it can be inspected, and
     reclaims the (usually venv-dominated) space of a run that worked.
     """
-    attempt: int = 1
+    requeued_from: str | None = None
+    """The job this one was resubmitted from by `gpuc requeue`, if any.
+
+    Written by the control side and carried through untouched: the host never
+    reads it, and publishes it in `status` so a client can follow the chain.
+    Distinct from the state's `attempt`, which counts the launches of *this*
+    id."""
 
     @staticmethod
     def from_dict(d: Any) -> JobSpec:
         """Unknown keys are ignored and a null means the default -- except for
-        `command`, which has no default that could be right: a spec with
-        nothing to run is a mistake to report, not one to paper over."""
+        `command` and `gpus`, which have no default that could be right: a
+        spec with nothing to run, or nothing to run it on, is a mistake to
+        report, not one to paper over."""
         fields = fields_of(d)
         command = as_str(fields, "command")
         if not command:
             raise ValueError("a job spec needs a `command`")
+        gpus = as_int(fields, "gpus", 1)
+        if gpus < 1:
+            raise ValueError(f"a job spec needs at least one GPU, got `gpus: {gpus}`")
         outputs = fields.get("outputs")
         return JobSpec(
             job_id=as_str(fields, "job_id") or new_job_id(),
@@ -345,7 +357,7 @@ class JobSpec:
             name=as_str(fields, "name"),
             setup=as_opt_str(fields, "setup"),
             python=as_str(fields, "python", DEFAULT_PYTHON) or DEFAULT_PYTHON,
-            gpus=as_int(fields, "gpus", 1),
+            gpus=gpus,
             use_shared=as_bool(fields, "use_shared"),
             env=as_str_dict(fields, "env"),
             secrets=as_str_list(fields, "secrets"),
@@ -361,7 +373,7 @@ class JobSpec:
             if isinstance(fields.get("requires"), dict)
             else {},
             cleanup=normalize_cleanup(fields.get("cleanup")),
-            attempt=as_int(fields, "attempt", 1),
+            requeued_from=as_opt_str(fields, "requeued_from"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -403,6 +415,9 @@ class JobState:
     intent: str | None = None
     """`cancel` | `preempt` | null: see `INTENTS`."""
     attempt: int = 1
+    """How many times this job id has been started: 1 from the first launch,
+    one more each time a preempted attempt is queued again. A resubmission is
+    a new job id and starts at 1 again; see `JobSpec.requeued_from`."""
     priority: int = 50
     """The priority the job is (or was) ordered by. Starts as the spec's and
     is what `gpuc reorder` and `gpuc preempt --priority` change; the queue is
@@ -423,9 +438,13 @@ class JobState:
     started_at: str | None = None
     ended_at: str | None = None
     phase: str | None = None
-    """setup | preflight | main | sync, or null between phases."""
-    pid: int | None = None
+    """setup | preflight | main | sync, or null between phases and once the
+    job is over. `sync` is the runner's final upload and cleanup: the status
+    stays `running` until its very last write, so a job is finished exactly
+    when its runner is gone."""
     pgid: int | None = None
+    """The process group of the phase now running, which the runner publishes
+    when it spawns one. Never the runner's own group."""
     isolation: str | None = None
     """`cgroup` when the phase runs in a transient systemd scope, `pgid` when it
     is only a process group. A `pgid` job's daemonised grandchildren survive a
@@ -434,6 +453,10 @@ class JobState:
     """The scope unit of the phase now running, which `systemctl --user stop`
     reaps whole. Null between phases and on a `pgid` host."""
     runner_pid: int | None = None
+    """The runner's own pid, with the boot id and start time that make it
+    provably the same process later. Written by the runner in the same
+    compare-and-set that takes the job out of the queue, so a `running` state
+    always names a runner that existed."""
     runner_boot_id: str | None = None
     runner_starttime: str | None = None
     util_recent: list[float | None] = field(default_factory=list)
@@ -452,10 +475,6 @@ class JobState:
     """One record per destination this job uploads to; see `Upload`. The
     whole account of whether its outputs, its log and its state are
     somewhere other than this host."""
-    workdir_removed: bool = False
-    """Whether `workdir/` has been deleted, by the job's `cleanup:` policy or by
-    `gpuc clean`. Recorded so `status` and `logs` can say "gone on purpose"
-    rather than leaving an empty job dir to look like data loss."""
     workdir_bytes: int | None = None
     """What deleting `workdir/` would free, measured once when the job ended.
 
@@ -507,7 +526,6 @@ class JobState:
             started_at=as_opt_str(fields, "started_at"),
             ended_at=as_opt_str(fields, "ended_at"),
             phase=as_opt_str(fields, "phase"),
-            pid=as_opt_int(fields, "pid"),
             pgid=as_opt_int(fields, "pgid"),
             isolation=as_opt_str(fields, "isolation"),
             cgroup_unit=as_opt_str(fields, "cgroup_unit"),
@@ -523,7 +541,6 @@ class JobState:
                 for upload in (Upload.from_dict(u) for u in as_list(fields, "uploads"))
                 if upload is not None
             ],
-            workdir_removed=as_bool(fields, "workdir_removed"),
             workdir_bytes=as_opt_int(fields, "workdir_bytes"),
             outputs_lost=as_bool(fields, "outputs_lost"),
         )
@@ -561,16 +578,88 @@ class JobState:
         done = {(u.output, u.to) for u in self.uploads if u.ok_at and not u.error}
         return wanted <= done
 
+    def forget_output_uploads(self) -> None:
+        """Drop every output's success: a periodic tick having worked says
+        nothing about the files written after it, so only an upload that ran
+        after the job stopped writing may vouch for its outputs."""
+        for record in self.output_uploads():
+            record.ok_at = None
+
     @staticmethod
     def initial(spec: JobSpec) -> JobState:
         """The state a job is enqueued with: everything the spec said that can
         change afterwards, copied out of it once."""
         return JobState(
             status="queued",
-            attempt=spec.attempt,
             priority=spec.priority,
             estimated_runtime_min=spec.estimated_runtime_min,
         )
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """How a job ended, in the one shape every terminal write takes.
+
+    `reason` is one of the words usage.md's table lists, and `ran` says whether
+    the job's own phases got as far as running -- a card that is not here, a
+    sync preflight that refused, a spec the dispatcher could not read all end
+    a job that never wrote a byte, so its `outputs:` cannot exist and the
+    final upload and the no-outputs check are skipped rather than reported.
+    """
+
+    status: str
+    reason: str | None = None
+    exit_code: int = 1
+    ran: bool = True
+
+    def __post_init__(self) -> None:
+        if self.status not in FINISHED_STATUSES:
+            raise ValueError(f"an outcome is a finished status, not {self.status!r}")
+
+
+def finish(
+    job_id: str,
+    outcome: Outcome,
+    *,
+    expect: str | tuple[str, ...] = "running",
+    forget_output_uploads: bool = False,
+    **extra: Any,
+) -> JobState | None:
+    """The one write that ends a job, as a compare-and-set on `status`.
+
+    Every terminal status goes through here -- the runner's, and the
+    dispatcher's for a job it failed before or instead of a runner -- so the
+    fields a finished job must not carry are cleared in one place: the
+    `intent` that stood against it, the phase and the processes of the attempt,
+    the `eta` that would read as a promise the job is still going. None means
+    the status was no longer what `expect` says and nothing was written: a
+    runner that lost its job to a cancel, or a dispatcher whose runner finished
+    after all, learns it from that rather than from a job written twice.
+
+    `forget_output_uploads` is for a runner that died: its periodic uploads
+    were recorded, its final one never ran, and the sweep must not read the
+    former as the latter. An unreadable state raises, and the caller leaves the
+    job alone: writing defaults over a file that cannot be read would replace
+    its priority and upload records with guesses.
+    """
+    wanted = (expect,) if isinstance(expect, str) else expect
+    with locked(job_id):
+        state = read_state(job_id)
+        if state.status not in wanted:
+            return None
+        state.status = outcome.status
+        state.reason = outcome.reason
+        state.exit_code = outcome.exit_code
+        state.ended_at = utc_now()
+        state.intent = None
+        state.phase = None
+        state.pgid = None
+        state.cgroup_unit = None
+        state.eta = None
+        if forget_output_uploads:
+            state.forget_output_uploads()
+        write_state(job_id, _apply(state, extra))
+        return state
 
 
 def _destination_uris(output: Output, job_id: str) -> list[str]:
@@ -603,8 +692,7 @@ def clear_output_uploads(job_id: str) -> None:
     proves the files written since the last tick are safe."""
     with locked(job_id):
         state = read_state(job_id)
-        for record in state.output_uploads():
-            record.ok_at = None
+        state.forget_output_uploads()
         write_state(job_id, state)
 
 
@@ -763,11 +851,10 @@ class HostConfig:
     from git -- and leaves the record alone, so it needs no mirror and asks
     nothing of the caller. `retention_days` is the one that deletes `log.txt`.
 
-    Null rather than a default here on purpose: a `config.json` written before
-    this key existed must not start deleting on its own. The default lives on
-    the control side, and arrives whenever it next writes this file -- `gpuc
-    host bootstrap`, or the package re-sync `gpuc submit` runs against a host
-    on an older commit."""
+    Null here, and `cleanup.DEFAULT_WORKDIR_DAYS` only in a host's very first
+    config, written by `connect`: nothing that merely reads a config may turn
+    a sweep on, so a host configured with the key unset stays that way however
+    many packages are shipped to it."""
     env: dict[str, str] = field(default_factory=dict)
     """Host-wide environment, applied to every job before the job's own `env`.
 
@@ -832,10 +919,6 @@ class HostConfig:
         """
         return spec.use_shared and bool(self.shared_gpus)
 
-    def borrowable(self, spec: JobSpec) -> list[str]:
-        """The shared entries this job may reach, for counting capacity."""
-        return self.shared_entries() if self.may_borrow(spec) else []
-
     def bin_dirs(self) -> list[str]:
         """Directories from `env` to put on PATH, in order, without duplicates."""
         out: list[str] = []
@@ -867,31 +950,16 @@ def write_config(config: HostConfig) -> None:
     atomic_write_json(paths.config_file(), config.to_dict())
 
 
-def merge_config(patch: dict[str, Any]) -> dict[str, Any]:
-    """Apply `patch` to this host's config.json and return what it now holds.
-
-    The host owns its config, so every control machine changes it the same way:
-    read what is there, replace the named keys, write the whole file back
-    atomically. A key this build does not know is carried through untouched --
-    it belongs to whichever build wrote it, not to us -- and the keys it does
-    know are normalised, so a hand-written `"idle_minutes": "30"` cannot leave a
-    string where the dispatcher reads a number.
-
-    `env` is replaced wholesale rather than merged: "set it to exactly this" is
-    the only rule that can also express "set it to nothing".
-    """
-    path = paths.config_file()
-    document = merged_config(read_json(path) if path.exists() else {}, patch)
-    atomic_write_json(path, document)
-    return document
-
-
 def merged_config(existing: Any, patch: Mapping[str, Any]) -> dict[str, Any]:
     """`existing` with `patch`'s keys replaced, normalised, unknown keys kept.
 
-    Split out from `merge_config` because the control side applies the same
-    rule by hand on a host that has no gpuc package to run yet, and the two
-    must not be able to disagree about what a patch means.
+    The one rule for changing a host's config, which the control side applies
+    by read-merge-rename over the transport. A key this build does not know is
+    carried through untouched -- it belongs to whichever build wrote it -- and
+    the keys it does know are normalised, so a hand-written
+    `"idle_minutes": "30"` cannot leave a string where the dispatcher reads a
+    number. `env` is replaced wholesale rather than merged: "set it to exactly
+    this" is the only rule that can also express "set it to nothing".
     """
     merged = {**fields_of(existing), **patch}
     return {**merged, **HostConfig.from_dict(merged).to_dict()}
