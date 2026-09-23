@@ -54,6 +54,7 @@ from gpuc.control.actions import (
     status,
     version_document,
 )
+from gpuc.control.bootstrap import HealthOptions
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
@@ -74,7 +75,7 @@ from gpuc.control.gpuinfo import summarize
 from gpuc.control.hosts import add_host, bootstrap_and_record, bootstrap_every_host, set_host
 from gpuc.control.jsonout import note, warn
 from gpuc.control.probe import probe_host
-from gpuc.control.providers.base import Cloud
+from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud
 from gpuc.control.remote import HostSession, RemoteError, open_session, read_config, resolve_home
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import SubmitResult
@@ -300,7 +301,7 @@ def cmd_host_terminate(args: argparse.Namespace) -> Answer:
     else:
         lines = [f"nothing to terminate: {result.target.label}"]
     if result.forgotten:
-        lines.append("  forgotten here; the provider lists it as TERMINATED for a while yet")
+        lines.append("  forgotten here; the provider lists it as ended for a while yet")
     lines += [f"  {text}" for text in result.notes]
     return Answer(result.document(), "\n".join(lines))
 
@@ -355,12 +356,12 @@ def cmd_host_bootstrap(args: argparse.Namespace) -> Answer:
             raise UsageError(
                 f"host bootstrap takes a host name or --all, not both (got {args.name!r})"
             )
-        tally = bootstrap_every_host(settings, args.health_args, report=progress(args))
+        tally = bootstrap_every_host(settings, health_options(args), report=progress(args))
         return tally.answer(NO_HOSTS if not tally.hosts else f"\n{tally.render()}")
     if not args.name:
         raise UsageError("host bootstrap wants a host name, or --all for every registered host")
     entry = open_registry().require(args.name)
-    result = bootstrap_and_record(entry, settings, args.health_args, progress(args))
+    result = bootstrap_and_record(entry, settings, health_options(args), progress(args))
     return Answer(result.document())
 
 
@@ -461,7 +462,7 @@ def rental_options(args: argparse.Namespace) -> RentalOptions | None:
         name_hint=args.name_hint,
         disk_gb=args.disk,
         image=args.image,
-        health_args=args.health_args,
+        health=health_options(args),
     )
     if args.idle_min is not None:
         options.idle_minutes = args.idle_min
@@ -488,6 +489,15 @@ def cmd_config_show(args: argparse.Namespace) -> Answer:
     lines += [f"  {name} = {value!r}" for name, value in settings.model_dump().items()]
     lines += [f"  note: {text}" for text in document["notes"]]
     return Answer(document, "\n".join(lines))
+
+
+def health_options(args: argparse.Namespace) -> HealthOptions:
+    """`--health-args`, judged here so a bad flag is a usage error and not a
+    health check that fails on the host."""
+    try:
+        return HealthOptions.parse(args.health_args)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
 
 
 def progress(args: argparse.Namespace) -> Reporter:
@@ -1496,7 +1506,12 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
         help="which RunPod tier to buy from; community is cheaper and less reliable "
         "(default secure)",
     )
-    parser.add_argument("--cuda-min", default=None, help="host CUDA floor, default 12.8")
+    parser.add_argument(
+        "--cuda-min",
+        default=DEFAULT_CUDA_MIN,
+        help=f"the CUDA floor the catalog is asked for and the pod is created with "
+        f"(default {DEFAULT_CUDA_MIN})",
+    )
     parser.add_argument(
         "--idle-min",
         type=float,

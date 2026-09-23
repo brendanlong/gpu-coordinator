@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime
 from http.client import HTTPResponse
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 from gpuc._version import user_agent
 
 from .base import (
+    DEFAULT_CUDA_MIN,
     DEFAULT_IMAGE,
     DEFAULT_PREFIX,
     Cloud,
@@ -56,11 +58,9 @@ def _rate_limit_pause(header: str | None) -> float:
 
 
 class RunPodProvider(Provider):
-    dead_statuses = ("EXITED", "ERROR", "TERMINATED")
-    gone_statuses = ("TERMINATED",)
-    broken_host = re.compile(
-        r"card[0-9]|device nodes|OCI runtime|runc create|failed to create shim", re.IGNORECASE
-    )
+    """The v2 REST API. `sleep` is every pause the client takes on the API's
+    behalf -- a `Retry-After`, a rate-limit window -- so a test can run the
+    whole flow without waiting them out."""
 
     def __init__(
         self,
@@ -68,6 +68,7 @@ class RunPodProvider(Provider):
         *,
         prefix: str = DEFAULT_PREFIX,
         timeout_s: float = 30.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         key = api_key or os.environ.get("RUNPOD_API_KEY")
         if not key:
@@ -76,6 +77,7 @@ class RunPodProvider(Provider):
         self._base_url = BASE_URL.rstrip("/")
         self.prefix = prefix
         self._timeout_s = timeout_s
+        self._sleep = sleep
 
     def _open(
         self,
@@ -107,7 +109,7 @@ class RunPodProvider(Provider):
                 text = error.read().decode(errors="replace")
                 if error.code == 429 and attempt < 4:
                     retry_after = error.headers.get("Retry-After")
-                    time.sleep(float(retry_after) if retry_after else 2.0 * (attempt + 1))
+                    self._sleep(float(retry_after) if retry_after else 2.0 * (attempt + 1))
                     continue
                 if error.code == 404:
                     raise PodNotFound(method, url, error.code, text) from error
@@ -126,7 +128,7 @@ class RunPodProvider(Provider):
             raw = response.read()
             pause = _rate_limit_pause(response.headers.get("RateLimit"))
             if pause:
-                time.sleep(pause)
+                self._sleep(pause)
         return json.loads(raw) if raw else None
 
     def offers(self, constraints: Constraints) -> list[Offer]:
@@ -138,9 +140,8 @@ class RunPodProvider(Provider):
                 "product": "POD",
                 "cloud": cloud,
                 "count": constraints.gpu_count,
+                "minCudaVersion": constraints.cuda_min,
             }
-            if constraints.cuda_min is not None:
-                params["minCudaVersion"] = constraints.cuda_min
             payload = self._json("GET", "/catalog/gpus", params=params)
             found.extend(self._offers_from_catalog(payload["gpus"], cloud, wanted, constraints))
         found.sort(key=lambda offer: (offer.price_usd_hr, offer.gpu_id, offer.cloud))
@@ -201,14 +202,12 @@ class RunPodProvider(Provider):
         image: str = DEFAULT_IMAGE,
         disk_gb: int = 20,
         env: dict[str, str] | None = None,
-        cuda_min: str | None = None,
+        cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod:
         if not name.startswith(self.prefix):
             raise ProviderError(f"pod name {name!r} must start with {self.prefix!r}")
-        gpu: dict[str, Any] = {"id": offer.gpu_id, "count": gpu_count}
-        if cuda_min is not None:
-            gpu["minCudaVersion"] = cuda_min
+        gpu: dict[str, Any] = {"id": offer.gpu_id, "count": gpu_count, "minCudaVersion": cuda_min}
         body = {
             "name": name,
             "image": image,
@@ -250,7 +249,9 @@ class RunPodProvider(Provider):
             pass  # SSE stays open after the backfill; the read timeout is the end of the tail
         return "\n".join(lines)
 
-    def terminate(self, pod_id: str, *, timeout_s: float = 300.0) -> None:
+    def terminate(self, pod_id: str) -> None:
+        """One POST. A 404 is a pod already gone and a 409 one already ending,
+        and both are what `terminate_confirmed`'s poll then confirms."""
         try:
             self._json("POST", f"/pods/{pod_id}/action", body={"action": "terminate"})
         except PodNotFound:
@@ -258,16 +259,6 @@ class RunPodProvider(Provider):
         except RunPodError as error:
             if error.status != 409:
                 raise
-        deadline = time.monotonic() + timeout_s
-        while True:
-            pod = self.get(pod_id)
-            if pod is None or pod.status == "TERMINATED":
-                return
-            if time.monotonic() >= deadline:
-                raise ProviderError(
-                    f"pod {pod_id} still {pod.status} {timeout_s:.0f}s after terminate"
-                )
-            time.sleep(5.0)
 
     def list(self) -> list[Pod]:
         payload = self._json("GET", "/pods", params={"includeClusterPods": "true"})

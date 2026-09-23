@@ -11,7 +11,9 @@ unconditionally, and `submit` and `requeue` run it when the host's own
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -42,7 +44,7 @@ from gpuc.control.remote import (
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 from gpuc.control.version import is_other_build, local_commit, package_root, short
-from gpuc.host import jobs, paths
+from gpuc.host import health, jobs, paths
 from gpuc.host.jobs import HostConfig, cache_beside
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
@@ -51,10 +53,73 @@ PYTHON_FLOOR_TEXT = ".".join(str(part) for part in PYTHON_FLOOR)
 PYTHON_INSTALL = "3.12"
 INSTALL_TIMEOUT_S = 900.0
 HEALTH_TIMEOUT_S = 300.0
+AWS_KEY_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 
 
 class BootstrapError(RuntimeError):
     pass
+
+
+class _HealthArgsParser(argparse.ArgumentParser):
+    """`--health-args` parsed by the host's own parser, with a bad flag raised
+    rather than printed and exited on: the CLI turns it into a usage error."""
+
+    def error(self, message: str) -> Any:
+        raise ValueError(f"--health-args: {message}")
+
+
+@dataclass(frozen=True)
+class HealthOptions:
+    """What `python -m gpuc.host health` is told beyond its defaults.
+
+    Typed, and rendered to flags in one place (`args`), so a health option
+    reaches the host's command line through `shlex` rather than being spliced
+    in as text by whichever function last held it. None is the host's own
+    default for that check.
+    """
+
+    min_mbps: float | None = None
+    min_free_gb: float | None = None
+    download_url: str | None = None
+    download_timeout_s: float | None = None
+
+    @classmethod
+    def parse(cls, text: str) -> HealthOptions:
+        """`--health-args "--min-mbps 0.1"`, judged by the same parser the host
+        runs (`health.add_arguments`); raises ValueError on a flag it lacks."""
+        parser = _HealthArgsParser(prog="gpuc.host health", add_help=False)
+        health.add_arguments(parser)
+        given = parser.parse_args(shlex.split(text))
+        return cls(
+            min_mbps=None if given.min_mbps == health.DEFAULT_MIN_MBPS else given.min_mbps,
+            min_free_gb=(
+                None if given.min_free_gb == health.DEFAULT_MIN_FREE_GB else given.min_free_gb
+            ),
+            download_url=(
+                None if given.download_url == health.DEFAULT_DOWNLOAD_URL else given.download_url
+            ),
+            download_timeout_s=(
+                None
+                if given.download_timeout == health.DEFAULT_DOWNLOAD_TIMEOUT_S
+                else given.download_timeout
+            ),
+        )
+
+    def args(self) -> list[str]:
+        flags: list[str] = []
+        if self.min_mbps is not None:
+            flags += ["--min-mbps", str(self.min_mbps)]
+        if self.min_free_gb is not None:
+            flags += ["--min-free-gb", str(self.min_free_gb)]
+        if self.download_url is not None:
+            flags += ["--download-url", self.download_url]
+        if self.download_timeout_s is not None:
+            flags += ["--download-timeout", str(self.download_timeout_s)]
+        return flags
+
+
+DEFAULT_HEALTH = HealthOptions()
+"""Every check at the host's own default."""
 
 
 @dataclass
@@ -439,8 +504,8 @@ def ensure_layout(transport: Transport, env: Mapping[str, str], home: str, pytho
     )
 
 
-def run_health(session: HostSession, health_args: str = "") -> dict[str, Any]:
-    args = f"health {health_args}".strip()
+def run_health(session: HostSession, options: HealthOptions) -> dict[str, Any]:
+    args = shlex.join(["health", *options.args()])
     result = session.host_cli(args, timeout=HEALTH_TIMEOUT_S, check=False)
     report = parse_last_json(result.stdout)
     if not isinstance(report, dict):
@@ -465,6 +530,44 @@ def driver_version(health: dict[str, Any]) -> str | None:
     for check in health.get("checks", []):
         if check.get("name") == "driver" and isinstance(check.get("value"), str):
             return str(check["value"])
+    return None
+
+
+def deliver_s3_credentials(
+    transport: Transport,
+    config: HostConfig,
+    report: Reporter,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Give a *rented* host S3 credentials of its own, for the mirror.
+
+    Each job's sync runs with the job's own `secrets:`, but the dispatcher's
+    drain mirrors every job's log.txt and state.json after the jobs -- and
+    their secrets files -- are gone, with only its own environment to do it.
+    So the pod gets a `~/.aws/credentials` from the bootstrapping shell,
+    written from stdin at 0600, never via argv and never in the pod env
+    (`GET /pods` returns the env to any holder of an account key). A rental
+    only: its `$HOME` is ours, and a shared box's user has their own. Part of
+    bootstrap so a pod whose home was wiped gets them back with everything
+    else. Returns a warning when the mirror will go without.
+    """
+    if not config.ephemeral or not config.s3_prefix:
+        return None
+    environ = dict(os.environ) if environ is None else dict(environ)
+    if not (environ.get("AWS_ACCESS_KEY_ID") and environ.get("AWS_SECRET_ACCESS_KEY")):
+        return (
+            f"no AWS credentials in this environment, so the pod cannot mirror logs to "
+            f"{config.s3_prefix}; export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY before "
+            f"bootstrapping if you want the mirror"
+        )
+    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    body = "[default]\n" + f"region = {region}\n"
+    for name in AWS_KEY_VARS:
+        if environ.get(name):
+            body += f"{name.lower()} = {environ[name]}\n"
+    home = transport.run('printf %s "$HOME"', check=True).stdout.strip()
+    transport.put_file(body, f"{home}/.aws/credentials", 0o600)
+    report(f"delivered S3 credentials to {home}/.aws/credentials (0600) for the log mirror")
     return None
 
 
@@ -493,7 +596,7 @@ def bootstrap_host(
     *,
     transport: Transport | None = None,
     report: Reporter = print,
-    health_args: str = "",
+    health_options: HealthOptions = DEFAULT_HEALTH,
 ) -> tuple[HostEntry, BootstrapResult]:
     """Bring a host to a state where `python -m gpuc.host` runs and dispatches.
 
@@ -563,7 +666,11 @@ def bootstrap_host(
             f"Install it by hand into ~/.local/aws-cli, or drop the mirror with "
             f"`gpuc host set {entry.name} --s3-prefix ''`."
         )
-    for warning in (aws_warning, ensure_hf_cli(transport, uv, config.env, report)):
+    for warning in (
+        aws_warning,
+        ensure_hf_cli(transport, uv, config.env, report),
+        deliver_s3_credentials(transport, config, report),
+    ):
         if warning:
             warnings.append(warning)
             report(f"WARNING: {warning}")
@@ -578,7 +685,7 @@ def bootstrap_host(
         report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
     files = ensure_build(session, report, always=True, restart=False) or 0
 
-    health = run_health(session, health_args)
+    health = run_health(session, health_options)
     report("health: " + "; ".join(f"{c['name']} ok" for c in health.get("checks", [])))
     for warning in health.get("warnings", []):
         warnings.append(warning)

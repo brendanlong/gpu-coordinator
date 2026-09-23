@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from gpuc.control import version as version_mod
+from gpuc.control.bootstrap import BootstrapResult, HealthOptions
 from gpuc.control.clean import purge_host
 from gpuc.control.cli import (
     EXIT_ERROR,
@@ -26,6 +27,7 @@ from gpuc.control.config import (
     hosts_file,
     load_settings,
     registry_transaction,
+    utc_now,
 )
 from gpuc.control.providers.base import Constraints, Pod
 from gpuc.control.remote import NO_CONFIG, HostConfigRead, HostSession, RemoteError
@@ -34,7 +36,7 @@ from gpuc.control.submit import JobSpecModel, Prepared, SubmitResult, expand_job
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, load_registry, register_host
 from tests.fakehost import GPU_ROWS, PROBE_SECTIONS, FakeHost
-from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
+from tests.fakeprovider import FakeProvider, running_pod
 from tests.fakes3 import FakeS3Client
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -2319,15 +2321,21 @@ def test_host_list_json_reports_the_host_env_by_name_only(
 def bootstrapping(
     monkeypatch: pytest.MonkeyPatch, *, fail: dict[str, BaseException] | None = None
 ) -> list[tuple[str, object]]:
-    """Record every (host, health_args) bootstrap was asked for; raise for the named hosts."""
+    """Record every (host, health options) bootstrap was asked for; raise for the named hosts."""
     attempted: list[tuple[str, object]] = []
 
     def fake(entry: HostEntry, settings: Settings | None = None, **kwargs: Any):
-        attempted.append((entry.name, kwargs.get("health_args")))
+        attempted.append((entry.name, kwargs.get("health_options")))
         error = (fail or {}).get(entry.name)
         if error is not None:
             raise error
-        return fake_bootstrap(entry, settings, **kwargs)
+        kwargs.get("report", print)(f"fake bootstrap of {entry.name}")
+        updated = entry.with_cache(python="/root/python", uv="/root/uv").model_copy(
+            update={"bootstrapped_at": utc_now()}
+        )
+        return updated, BootstrapResult(
+            host=entry.name, home="/root/.gpuc", files=20, dispatcher_pid=4242
+        )
 
     monkeypatch.setattr("gpuc.control.hosts.bootstrap_host", fake)
     return attempted
@@ -2343,7 +2351,8 @@ def test_host_bootstrap_all_does_every_registered_host(
 
     assert main(["host", "bootstrap", "--all", "--health-args", "--min-mbps 0.1"]) == 0
     # The registry reads back in name order, which is the order `host list` shows.
-    assert attempted == [("gpubox", "--min-mbps 0.1"), ("local", "--min-mbps 0.1")]
+    asked = HealthOptions(min_mbps=0.1)
+    assert attempted == [("gpubox", asked), ("local", asked)]
     out = capsys.readouterr().out
     assert "== gpubox (1/2) ==" in out
     assert "== local (2/2) ==" in out

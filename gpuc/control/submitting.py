@@ -23,9 +23,9 @@ from gpuc.control.actions import (
     make_provider,
     placement_after,
 )
-from gpuc.control.bootstrap import ensure_build, host_build
+from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build, host_build
 from gpuc.control.config import HostEntry, Reporter, Settings, open_registry
-from gpuc.control.providers.base import Cloud, Constraints
+from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
 from gpuc.control.provision import runpod_host
 from gpuc.control.remote import HostSession, open_session
 from gpuc.control.s3index import S3Index, S3ObjectMissing
@@ -54,14 +54,14 @@ class RentalOptions:
     min_vram_gb: int | None = None
     max_price_usd_hr: float | None = None
     clouds: list[Cloud] = field(default_factory=lambda: list[Cloud](["SECURE"]))
-    cuda_min: str | None = None
+    cuda_min: str = DEFAULT_CUDA_MIN
     gpu_count: int = 1
     reuse: bool = True
     name_hint: str = "job"
     idle_minutes: float = DEFAULT_IDLE_MINUTES
     disk_gb: int | None = None
     image: str | None = None
-    health_args: str = ""
+    health: HealthOptions = DEFAULT_HEALTH
 
     def constraints(self) -> Constraints:
         if not self.gpu_names:
@@ -90,7 +90,7 @@ def rent_host(rental: RentalOptions, settings: Settings, report: Reporter) -> Ho
         idle_minutes=rental.idle_minutes,
         disk_gb=rental.disk_gb if rental.disk_gb is not None else settings.disk_gb,
         image=rental.image or settings.image,
-        health_args=rental.health_args,
+        health_options=rental.health,
     )
 
 

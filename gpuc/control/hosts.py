@@ -19,7 +19,12 @@ from gpuc.control.actions import (
     make_provider,
     provider_for,
 )
-from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_host
+from gpuc.control.bootstrap import (
+    BootstrapError,
+    BootstrapResult,
+    HealthOptions,
+    bootstrap_host,
+)
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
@@ -283,10 +288,10 @@ def set_host(
 
 
 def bootstrap_and_record(
-    entry: HostEntry, settings: Settings, health_args: str, report: Reporter = print
+    entry: HostEntry, settings: Settings, health: HealthOptions, report: Reporter = print
 ) -> BootstrapResult:
     """Bootstrap one host, persist what it told us about itself, and say so."""
-    updated, result = bootstrap_host(entry, settings, health_args=health_args, report=report)
+    updated, result = bootstrap_host(entry, settings, health_options=health, report=report)
     update_cache(
         updated.name,
         config=updated.cache.config,
@@ -397,7 +402,7 @@ class BootstrapTally:
 
 
 def bootstrap_every_host(
-    settings: Settings, health_args: str, *, report: Reporter
+    settings: Settings, health: HealthOptions, *, report: Reporter
 ) -> BootstrapTally:
     """`gpuc host bootstrap --all`: the upgrade loop, one command.
 
@@ -427,7 +432,7 @@ def bootstrap_every_host(
         report(f"== {entry.name} ({index}/{len(hosts)}) ==")
         try:
             tally.record(
-                entry, "bootstrapped", bootstrap_and_record(entry, settings, health_args, report)
+                entry, "bootstrapped", bootstrap_and_record(entry, settings, health, report)
             )
         except KeyboardInterrupt:
             tally.record(entry, "interrupted")

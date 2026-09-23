@@ -1,7 +1,7 @@
 """Turn constraints into a bootstrapped RunPod host, or give the money back.
 
 The local side owns an ephemeral host until it has proven healthy, so every
-failure path here ends in `terminate` plus a wait for TERMINATED before the
+failure path here ends in a terminate the provider has confirmed before the
 next offer is tried: a `draining` marker or an unreachable pod is never enough
 to justify a second create (that is how you double-bill).
 
@@ -9,22 +9,34 @@ Nothing outside this process watches a pod it is bringing up: if anything
 goes wrong before the host is registered -- including a Ctrl-C -- the pod is
 terminated on the way out, and a terminate that fails is reported loudly for
 `gpuc pods` to show, because from then on it bills until a person ends it.
+
+One ceiling bounds the whole attempt, every offer included. A failure is one
+of three things (`Verdict`): this offer is bad and the next may not be; the
+attempt cannot succeed however many pods it buys; or nothing is wrong yet and
+the poll should go on. The first buys another pod, the second stops before
+it can, and the third is the only one that costs nothing.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
 from gpuc.control import rented
-from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_host
+from gpuc.control.bootstrap import (
+    DEFAULT_HEALTH,
+    BootstrapError,
+    BootstrapResult,
+    HealthOptions,
+    bootstrap_host,
+)
 from gpuc.control.config import (
     DEFAULT_DISK_GB,
     HostEntry,
@@ -38,7 +50,8 @@ from gpuc.control.config import (
     utc_now,
 )
 from gpuc.control.connect import Connection, connect_host
-from gpuc.control.gpuinfo import GpuInfo, discover, summarize
+from gpuc.control.gpuinfo import summarize
+from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import (
     DEFAULT_IMAGE,
     Constraints,
@@ -47,35 +60,69 @@ from gpuc.control.providers.base import (
     Provider,
     ProviderError,
 )
-from gpuc.control.remote import Answered, RemoteError, ask
+from gpuc.control.remote import Answered, PodDead, PodGone, RemoteError, Unreachable, ask
+from gpuc.control.status import parse_status
 from gpuc.control.transport import SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
-DEFAULT_CUDA_MIN = "12.8"
+"""How long one `submit --runpod` may spend buying, waiting for and proving a
+host, every offer it tries included. Per attempt, not per offer: with N
+offers a per-offer ceiling was N x 15 minutes of somebody's evening."""
 POLL_INTERVAL_S = 5.0
 SSH_MAX_INTERVAL_S = 15.0
 LOG_CHECK_INTERVAL_S = 30.0
 SSH_REPORT_INTERVAL_S = 60.0
-REUSE_HEARTBEAT_MAX_S = 30.0
-"""How stale a pod's heartbeat may be for `submit` to reuse it rather than buy another."""
-AWS_KEY_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 
 SSH_MISCONFIGURED = re.compile(
     r"Bad configuration option|no such identity file|WARNING: UNPROTECTED PRIVATE KEY",
     re.IGNORECASE,
 )
-"""Local ssh problems that no amount of waiting can fix: fail before the ceiling.
-(A ControlMaster socket that cannot bind is `transport.SshUnusable`, raised
-before this is consulted.)"""
-
-BROKEN_HOST = re.compile(
-    r"card[0-9]|device nodes|OCI runtime|runc create|failed to create shim", re.IGNORECASE
-)
-"""Signatures of a host whose GPU device nodes are broken: re-place, never retry."""
+"""Local ssh problems that no amount of waiting -- and no other offer -- can fix.
+(A ControlMaster socket that cannot bind is `transport.SshUnusable`, the same
+verdict from the transport itself.)"""
 
 
 class ProvisionError(RuntimeError):
     pass
+
+
+class Unprovisionable(ProvisionError):
+    """Nothing another offer could fix: the attempt stops at this pod."""
+
+
+class Verdict(Enum):
+    """What a failure while bringing up a pod means for the attempt."""
+
+    KEEP_WAITING = "keep waiting"
+    NEXT_OFFER = "next offer"
+    ABORT = "abort"
+
+
+RECOVERABLE = (ProvisionError, ProviderError, BootstrapError, RemoteError, TransportError)
+"""Failures that are about the pod or the provider, not this program: the
+attempt goes on to the next offer unless `verdict` says otherwise. Anything
+else is a bug, and propagates once the pod has been terminated."""
+
+
+def verdict(exc: BaseException, *, polling: bool = False) -> Verdict:
+    """The one rule for what a failure costs.
+
+    `polling` is the wait for a pod's endpoint or its sshd, where a provider
+    read that failed or an ssh that was refused is the ordinary state of a
+    pod still booting. The same failures at any other point are the offer's.
+    A local ssh misconfiguration is never the offer's: every pod would be
+    bought, waited on and terminated identically, so it ends the attempt at
+    the first one.
+    """
+    if isinstance(exc, (SshUnusable, Unprovisionable)):
+        return Verdict.ABORT
+    if isinstance(exc, TransportError) and SSH_MISCONFIGURED.search(str(exc)):
+        return Verdict.ABORT
+    if polling and isinstance(exc, (ProviderError, TransportError)):
+        return Verdict.KEEP_WAITING
+    if isinstance(exc, RECOVERABLE):
+        return Verdict.NEXT_OFFER
+    return Verdict.ABORT
 
 
 class ConnectFn(Protocol):
@@ -99,7 +146,7 @@ class BootstrapFn(Protocol):
         *,
         transport: Transport | None = ...,
         report: Reporter = ...,
-        health_args: str = ...,
+        health_options: HealthOptions = ...,
     ) -> tuple[HostEntry, BootstrapResult]: ...
 
 
@@ -180,63 +227,8 @@ def address_for(name: str, pod: Pod) -> HostEntry:
     return address
 
 
-def gpu_info_for(transport: Transport, uuids: list[str], offer: Offer) -> dict[str, GpuInfo]:
-    """What the pod's cards are: nvidia-smi if it answers, else the offer.
-
-    A pod whose driver is still coming up would otherwise list its GPUs as
-    unknown forever, and the offer already says exactly what was bought.
-    """
-    discovered = discover(transport)
-    fallback = GpuInfo(name=offer.name, vram_mib=int(offer.vram_gb * 1024))
-    return {uuid: discovered.get(uuid) or fallback for uuid in uuids}
-
-
-def discover_gpu_uuids(transport: Transport) -> list[str]:
-    result = transport.run("nvidia-smi --query-gpu=uuid --format=csv,noheader", check=False)
-    uuids = [line.strip() for line in result.stdout.splitlines() if line.strip().startswith("GPU-")]
-    if not uuids:
-        raise ProvisionError(
-            f"`nvidia-smi --query-gpu=uuid` returned no GPU UUIDs on {transport.host} "
-            f"(exit {result.returncode}): {result.output.strip()[-400:]}"
-        )
-    return uuids
-
-
-def deliver_s3_credentials(
-    transport: Transport,
-    entry: HostEntry,
-    progress: _Progress,
-    environ: dict[str, str] | None = None,
-) -> bool:
-    """Give the *host* S3 credentials, not just each job.
-
-    Still needed even though the runner now hands each job's own ``secrets:``
-    to its sync loop: the dispatcher's drain path mirrors every job's log.txt
-    and state.json to ``s3_prefix`` after the jobs (and their secrets files)
-    are gone, and it has only its own environment to do it with. Written from
-    stdin at 0600, never via argv and never in the pod env (``GET /pods``
-    returns the env to any holder of an account key).
-    """
-    environ = environ if environ is not None else dict(os.environ)
-    if not entry.config.s3_prefix:
-        return False
-    if not (environ.get("AWS_ACCESS_KEY_ID") and environ.get("AWS_SECRET_ACCESS_KEY")):
-        progress(
-            "no AWS credentials in this environment, so the pod cannot mirror logs to "
-            f"{entry.config.s3_prefix}; export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
-            f"before "
-            "submitting if you want the mirror"
-        )
-        return False
-    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-    body = "[default]\n" + f"region = {region}\n"
-    for name in AWS_KEY_VARS:
-        if environ.get(name):
-            body += f"{name.lower()} = {environ[name]}\n"
-    home = transport.run('printf %s "$HOME"', check=True).stdout.strip()
-    transport.put_file(body, f"{home}/.aws/credentials", 0o600)
-    progress(f"delivered S3 credentials to {home}/.aws/credentials (0600) for the log mirror")
-    return True
+def _label(offer: Offer) -> str:
+    return f"{offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h"
 
 
 def provision(
@@ -249,7 +241,7 @@ def provision(
     image: str = DEFAULT_IMAGE,
     provider: Provider,
     report: Reporter = print,
-    health_args: str = "",
+    health_options: HealthOptions = DEFAULT_HEALTH,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
     """Create, wait for, bootstrap and register one pod. Returns its registry entry."""
@@ -260,7 +252,6 @@ def provision(
     added = provider.ensure_ssh_key(key.read_text())
     progress(f"ssh key {key}: {'registered now' if added else 'already registered'} on the account")
 
-    cuda_min = constraints.cuda_min or DEFAULT_CUDA_MIN
     offers = provider.offers(constraints)
     if not offers:
         raise ProvisionError(
@@ -268,15 +259,18 @@ def provision(
             f"Relax --max-price, add another --gpu, or try --cloud any; "
             f"availability moves hour to hour."
         )
+    deadline = deps.now() + deps.ceiling_minutes * 60.0
     progress(
-        f"{len(offers)} offer(s): "
-        + ", ".join(f"{o.name}/{o.cloud.lower()} ${o.price_usd_hr:.3f}/h" for o in offers[:6])
+        f"{len(offers)} offer(s): {', '.join(_label(o) for o in offers[:6])}; "
+        f"ceiling {deps.ceiling_minutes:.0f} min for the whole attempt"
     )
 
     failures: list[str] = []
     billing: list[str] = []
     for offer in offers:
-        label = f"{offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h"
+        if deps.now() >= deadline:
+            failures.append(f"  - {_label(offer)}: not tried, the ceiling had passed")
+            continue
         try:
             return _try_offer(
                 offer,
@@ -287,27 +281,36 @@ def provision(
                 idle_minutes=idle_minutes,
                 disk_gb=disk_gb,
                 image=image,
-                cuda_min=cuda_min,
-                health_args=health_args,
+                health_options=health_options,
                 progress=progress,
                 deps=deps,
+                deadline=deadline,
                 billing=billing,
             )
-        except (ProvisionError, ProviderError, BootstrapError, RemoteError, TransportError) as exc:
-            first = str(exc).splitlines()[0]
-            failures.append(f"  - {label}: {first}")
-            progress(f"offer {label} failed: {first}")
-    cleanup = (
-        f"Pod(s) {', '.join(billing)} could NOT be terminated and are still billing: "
-        f"`gpuc pods` shows them, and `gpuc host terminate <pod-id> --force` (or the "
-        f"provider's console) ends them."
-        if billing
-        else "All pods created here were terminated."
-    )
+        except RECOVERABLE as exc:
+            first = _first_line(exc)
+            failures.append(f"  - {_label(offer)}: {first}")
+            if verdict(exc) is Verdict.ABORT:
+                raise ProvisionError(
+                    f"provisioning stopped, no other offer could fix this: {first}\n"
+                    + "\n".join(failures)
+                    + f"\n{_cleanup(billing)}"
+                ) from exc
+            progress(f"offer {_label(offer)} failed: {first}")
     raise ProvisionError(
         "every offer failed to produce a healthy pod:\n"
         + "\n".join(failures)
-        + f"\n{cleanup} Try again later, widen --gpu, or raise --max-price."
+        + f"\n{_cleanup(billing)} Try again later, widen --gpu, or raise --max-price."
+    )
+
+
+def _cleanup(billing: list[str]) -> str:
+    if not billing:
+        return "All pods created here were terminated."
+    return (
+        f"Pod(s) {', '.join(billing)} could NOT be terminated and are still billing: "
+        f"`gpuc pods` shows them, and `gpuc host terminate <pod-id> --force` (or the "
+        f"provider's console) ends them."
     )
 
 
@@ -318,8 +321,7 @@ def _describe(constraints: Constraints) -> str:
     if constraints.max_price_usd_hr is not None:
         parts.append(f"max-price=${constraints.max_price_usd_hr:.2f}/h")
     parts.append(f"cloud={'+'.join(c.lower() for c in constraints.clouds)}")
-    if constraints.cuda_min:
-        parts.append(f"cuda>={constraints.cuda_min}")
+    parts.append(f"cuda>={constraints.cuda_min}")
     return " ".join(parts)
 
 
@@ -333,33 +335,32 @@ def _try_offer(
     idle_minutes: float,
     disk_gb: int,
     image: str,
-    cuda_min: str,
-    health_args: str,
+    health_options: HealthOptions,
     progress: _Progress,
     deps: ProvisionDeps,
+    deadline: float,
     billing: list[str],
 ) -> HostEntry:
     """One offer, start to finish. A pod this could not terminate on the way
     out is appended to `billing`, so the caller's report can name it."""
     name = pod_name(provider.prefix, name_hint)
     progress(
-        f"creating {name}: {offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
-        f"x{constraints.gpu_count}, disk {disk_gb}GB, cuda>={cuda_min}, image {image}"
+        f"creating {name}: {_label(offer)} x{constraints.gpu_count}, disk {disk_gb}GB, "
+        f"cuda>={constraints.cuda_min}, image {image}"
     )
     pod = provider.create(
         offer,
         name,
         image=image,
         disk_gb=disk_gb,
-        cuda_min=cuda_min,
+        cuda_min=constraints.cuda_min,
         gpu_count=constraints.gpu_count,
     )
     created_at = utc_now()
     progress(
-        f"pod {pod.id} created ({pod.status}); ceiling {deps.ceiling_minutes:.0f} min from now"
+        f"pod {pod.id} created ({pod.status}); {_left(deadline, deps):.0f}s of the ceiling left"
     )
 
-    deadline = deps.now() + deps.ceiling_minutes * 60.0
     try:
         pod = _wait_for_ssh_direct(provider, pod, deadline, progress, deps)
         assert pod.ssh_direct is not None
@@ -370,9 +371,22 @@ def _try_offer(
         address = address_for(name, pod)
         transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
-        uuids = discover_gpu_uuids(transport)
-        address = address.with_cache(gpu_info=gpu_info_for(transport, uuids, offer))
-        progress(f"host GPUs: {summarize(uuids, address.gpu_info)} ({', '.join(uuids)})")
+        # The one look at the pod's cards, the same probe `gpuc host add`
+        # takes; the connect below owns every card it saw.
+        probed = probe_host(address, settings, transport=transport)
+        if not probed.gpu_info:
+            raise ProvisionError(
+                f"nvidia-smi on {transport.host} reported no cards "
+                f"(driver {probed.driver_version or 'missing'}): "
+                f"{probed.sections.get('gpus', '').strip()[-400:] or '(no output)'}"
+            )
+        address = address.with_cache(
+            gpu_info=probed.gpu_info,
+            driver_version=probed.driver_version,
+            python=probed.host_python,
+        )
+        uuids = list(probed.gpu_info)
+        progress(f"host GPUs: {summarize(uuids, probed.gpu_info)} ({', '.join(uuids)})")
         # The same connect path `gpuc host add` takes: a pod nobody has
         # configured yet gets `first_config`, with what only this create knows
         # on top -- the idle timer asked for, and the pod's own record of what
@@ -388,12 +402,11 @@ def _try_offer(
             },
             transport=transport,
         ).entry
-        deliver_s3_credentials(transport, entry, progress)
         with registry_transaction() as registry:
             registry.put(entry)
 
         entry, result = deps.bootstrap(
-            entry, settings, transport=transport, report=progress, health_args=health_args
+            entry, settings, transport=transport, report=progress, health_options=health_options
         )
         with registry_transaction() as registry:
             registry.put(entry)
@@ -411,44 +424,13 @@ def _try_offer(
         raise
 
 
+def _left(deadline: float, deps: ProvisionDeps) -> float:
+    return max(deadline - deps.now(), 0.0)
+
+
 def _first_line(exc: BaseException) -> str:
     lines = str(exc).strip().splitlines()
     return lines[0] if lines else f"{type(exc).__name__} (interrupted)"
-
-
-def _terminate_now(
-    provider: Provider,
-    name: str,
-    pod_id: str,
-    progress: _Progress,
-    deps: ProvisionDeps,
-    reason: str,
-) -> bool:
-    """True only when the provider confirmed the pod is gone.
-
-    Retried a few times: a 5xx or a rate limit on the one call that stops the
-    bill is the worst place to give up after one try, and nothing else will
-    try again once this process has moved on to the next offer.
-    """
-    progress(f"terminating {name} ({pod_id}): {reason}")
-    for attempt in range(1, provider.terminate_attempts + 1):
-        try:
-            provider.terminate(pod_id)
-        except ProviderError as exc:
-            if attempt < provider.terminate_attempts:
-                retry = provider.terminate_retry_s
-                progress(f"terminate {pod_id} failed ({exc}); retrying in {retry:g}s")
-                deps.sleep(retry)
-                continue
-            progress(
-                f"WARNING: could not terminate {name} ({pod_id}) in {attempt} attempts: {exc}\n"
-                f"  It is still billing until you end it: `gpuc pods` shows it, and "
-                f"`gpuc host terminate {pod_id} --force` ends it."
-            )
-            return False
-        progress(f"{name} terminated and confirmed gone")
-        return True
-    return False
 
 
 def _abandon(
@@ -460,13 +442,37 @@ def _abandon(
     reason: str,
 ) -> bool:
     """Terminate and forget a pod this run gave up on; False if it still bills."""
-    if not _terminate_now(provider, name, pod_id, progress, deps, reason):
+    progress(f"terminating {name} ({pod_id}): {reason}")
+    try:
+        provider.terminate_confirmed(pod_id, report=progress, sleep=deps.sleep)
+    except ProviderError as exc:
         # A pod that is still billing must stay visible: its registry entry, if
         # it got one, is what `gpuc status` shows a POD line for.
-        progress(f"keeping the registry entry for {name} until {pod_id} is confirmed gone")
+        progress(
+            f"WARNING: {exc}\n"
+            f"  {name} is still billing until you end it: `gpuc pods` shows it, and "
+            f"`gpuc host terminate {pod_id} --force` ends it; its registry entry is kept "
+            f"until then."
+        )
         return False
+    progress(f"{name} terminated and confirmed gone")
     forget_host(name, pod_id, progress)
     return True
+
+
+def _poll_failure(exc: Exception, what: str, progress: _Progress) -> None:
+    """A failure inside a wait: carry on, or end the attempt -- never the offer."""
+    if verdict(exc, polling=True) is Verdict.ABORT:
+        raise Unprovisionable(f"{what} cannot succeed as configured: {_first_line(exc)}") from exc
+    progress(f"{what} failed, retrying: {_first_line(exc)}")
+
+
+def _ceiling(deadline: float, what: str, deps: ProvisionDeps) -> None:
+    if deps.now() >= deadline:
+        raise Unprovisionable(
+            f"the {deps.ceiling_minutes:.0f} min ceiling passed while {what}; treating the "
+            f"attempt as failed"
+        )
 
 
 def _wait_for_ssh_direct(
@@ -480,14 +486,9 @@ def _wait_for_ssh_direct(
             current = provider.get(pod.id)
         except ProviderError as exc:
             # A 5xx or a rate limit is not a placement failure: terminating a
-            # healthy pod over one bad response costs the create again. Keep
-            # polling; the ceiling is still the backstop.
-            if deps.now() >= deadline:
-                raise ProvisionError(
-                    f"pod {pod.id} could not be read from the provider inside the "
-                    f"{deps.ceiling_minutes:.0f} min ceiling: {_first_line(exc)}"
-                ) from exc
-            progress(f"pod {pod.id}: provider read failed, retrying: {_first_line(exc)}")
+            # healthy pod over one bad response costs the create again.
+            _poll_failure(exc, f"pod {pod.id}: provider read", progress)
+            _ceiling(deadline, f"waiting for the provider to answer about pod {pod.id}", deps)
             deps.sleep(deps.poll_interval_s)
             continue
         if current is None:
@@ -506,18 +507,17 @@ def _wait_for_ssh_direct(
         if deps.now() >= next_log_check:
             next_log_check = deps.now() + deps.log_check_interval_s
             text = _safe_logs(provider, pod.id)
-            match = BROKEN_HOST.search(text)
+            match = provider.broken_host.search(text)
             if match:
                 raise ProvisionError(
                     f"pod {pod.id} is on a broken host (log matched {match.group(0)!r}):\n"
                     f"{_tail(text)}"
                 )
-        if deps.now() >= deadline:
-            raise ProvisionError(
-                f"pod {pod.id} had no direct SSH endpoint {deps.ceiling_minutes:.0f} min after "
-                f"create (last state {state}). Treating it as a placement failure.\n"
-                f"{_log_tail(provider, pod.id)}"
-            )
+        _ceiling(
+            deadline,
+            f"pod {pod.id} had no direct SSH endpoint (last state {state})",
+            deps,
+        )
         deps.sleep(deps.poll_interval_s)
 
 
@@ -526,7 +526,6 @@ def _wait_for_ssh(
 ) -> None:
     interval = 2.0
     attempts = 0
-    last = ""
     next_report = 0.0
     while True:
         attempts += 1
@@ -535,29 +534,23 @@ def _wait_for_ssh(
             if result.returncode == 0:
                 progress(f"ssh answered after {attempts} attempt(s)")
                 return
-            last = result.output.strip().splitlines()[-1] if result.output.strip() else "no output"
-        except SshUnusable as exc:
-            # Never retried: the socket path cannot get shorter while we wait.
-            last, misconfigured = str(exc), True
+            raise TransportError(result)
         except TransportError as exc:
-            last = str(exc).splitlines()[-1]
-            misconfigured = bool(SSH_MISCONFIGURED.search(last))
-        else:
-            misconfigured = bool(SSH_MISCONFIGURED.search(last))
-        if misconfigured:
-            raise ProvisionError(
-                f"ssh to {transport.host} cannot work as configured, so waiting would only "
-                f"burn the pod's clock: {last}"
-            )
+            last = str(exc).strip().splitlines()[-1] if str(exc).strip() else "no output"
+            if verdict(exc, polling=True) is Verdict.ABORT:
+                raise Unprovisionable(
+                    f"ssh to {transport.host} cannot work as configured, so waiting would only "
+                    f"burn the pod's clock: {last}"
+                ) from exc
         # A silent 15-minute wait hides the reason; say it early and then rarely.
         if deps.now() >= next_report:
             next_report = deps.now() + SSH_REPORT_INTERVAL_S
             progress(f"ssh not up yet (attempt {attempts}): {last}")
-        if deps.now() >= deadline:
-            raise ProvisionError(
-                f"ssh to {transport.host} never succeeded within the "
-                f"{deps.ceiling_minutes:.0f} min ceiling ({attempts} attempts); last error: {last}"
-            )
+        _ceiling(
+            deadline,
+            f"waiting for ssh to {transport.host} ({attempts} attempts; last error: {last})",
+            deps,
+        )
         deps.sleep(interval)
         interval = min(interval * 1.5, SSH_MAX_INTERVAL_S)
 
@@ -578,20 +571,6 @@ def _tail(text: str, lines: int = 15) -> str:
     return "\n".join(f"  {line}" for line in text.strip().splitlines()[-lines:])
 
 
-def host_status(
-    entry: HostEntry, settings: Settings | None = None, *, timeout: float = 60.0
-) -> dict[str, Any] | None:
-    """The host's own status document, or None if it cannot be reached."""
-    asked = ask(entry, "status", settings, timeout=timeout)
-    return asked.payload if isinstance(asked, Answered) else None
-
-
-def dispatcher_heartbeat_age(entry: HostEntry, settings: Settings) -> float | None:
-    payload = host_status(entry, settings)
-    age = payload.get("dispatcher_heartbeat_age_s") if payload else None
-    return float(age) if isinstance(age, (int, float)) else None
-
-
 def pick_reusable_host(
     constraints: Constraints,
     settings: Settings,
@@ -599,59 +578,65 @@ def pick_reusable_host(
     provider: Provider,
     report: Reporter = print,
 ) -> HostEntry | None:
-    """An existing gpuc pod that is RUNNING, matches the constraints, and dispatches."""
+    """An existing gpuc pod that is running, matches the constraints, and dispatches.
+
+    Every fact is the host's own: its pod is looked up at the provider and
+    its `status` asked over ssh (`ask`), and the offer it was bought on is
+    read from the config that answer came with. Nothing here is decided on
+    the registry's cache of any of that.
+    """
     for entry in open_registry().registry.listing():
         if entry.rental is None:
             continue
-        offer = rented.offer_of(entry.config.provider)
-        if offer is None:
-            report(
-                f"reuse: skipping {entry.name}, its config records no offer to compare "
-                f"with this request"
-            )
-            continue
-        if not offer_satisfies(offer, constraints):
-            report(
-                f"reuse: skipping {entry.name}, its {offer.name or 'unrecorded'}/"
-                f"{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h offer does not match "
-                f"this request"
-            )
-            continue
-        if len(entry.config.gpus) < constraints.gpu_count:
-            report(
-                f"reuse: skipping {entry.name}, it owns {len(entry.config.gpus)} GPU(s) and this "
-                f"request needs {constraints.gpu_count}"
-            )
-            continue
-        pod = provider.get(entry.rental.pod_id)
-        if pod is None or provider.is_gone(pod):
+        asked = ask(entry, "status", settings, provider=provider)
+        if isinstance(asked, PodGone):
             # The pod is gone for good, so the entry can only mislead `status`,
             # `logs` and the next reuse pass. Drop it here rather than leaving
             # submit to fail on an ssh to an address someone else now owns.
-            report(
-                f"reuse: forgetting {entry.name}, its pod "
-                f"{'is gone' if pod is None else f'is {pod.status}'}"
-            )
+            report(f"reuse: forgetting {entry.name}, its {asked.reason}")
             forget_host(entry.name, entry.rental.pod_id, report)
             continue
-        if pod.status != "RUNNING":
-            report(f"reuse: skipping {entry.name}, its pod is {pod.status}")
+        if isinstance(asked, PodDead):
+            report(f"reuse: skipping {entry.name}, its {asked.reason}")
             continue
-        status = host_status(entry, settings)
-        age = status.get("dispatcher_heartbeat_age_s") if status else None
-        if not isinstance(age, (int, float)) or age >= REUSE_HEARTBEAT_MAX_S:
-            report(
-                f"reuse: skipping {entry.name}, dispatcher heartbeat is "
-                f"{'unreachable' if not isinstance(age, (int, float)) else f'{age:.0f}s old'}"
-            )
+        if isinstance(asked, Unreachable):
+            report(f"reuse: skipping {entry.name}, it could not be asked: {asked.reason}")
             continue
-        assert status is not None
-        if status.get("draining"):
-            # It is terminating itself; a job enqueued now dies with the pod.
-            report(f"reuse: skipping {entry.name}, it is draining (terminating itself)")
+        if not provider.is_running(asked.pod):
+            status = asked.pod.status if asked.pod else "unknown to the provider"
+            report(f"reuse: skipping {entry.name}, its pod is {status}")
             continue
-        report(f"reusing host {entry.name} ({pod.id}, heartbeat {age:.0f}s old)")
+        skip = _unreusable(entry, asked, constraints, provider)
+        if skip:
+            report(f"reuse: skipping {entry.name}, {skip}")
+            continue
+        age = parse_status(entry, asked).heartbeat_age_s or 0.0
+        report(f"reusing host {entry.name} ({entry.rental.pod_id}, heartbeat {age:.0f}s old)")
         return entry
+    return None
+
+
+def _unreusable(
+    entry: HostEntry, asked: Answered, constraints: Constraints, provider: Provider
+) -> str | None:
+    """Why this answering, running pod is not the one to enqueue on, or None."""
+    offer = rented.offer_of(asked.session.config.provider)
+    if offer is None:
+        return "its config records no offer to compare with this request"
+    if not offer_satisfies(offer, constraints):
+        return (
+            f"its {offer.name or 'unrecorded'}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
+            f"offer does not match this request"
+        )
+    view = parse_status(entry, asked)
+    if len(view.owned) < constraints.gpu_count:
+        return f"it owns {len(view.owned)} GPU(s) and this request needs {constraints.gpu_count}"
+    if not view.dispatcher_alive:
+        age = "unknown" if view.heartbeat_age_s is None else f"{view.heartbeat_age_s:.0f}s old"
+        return f"its dispatcher heartbeat is {age}"
+    if view.draining:
+        # It is terminating itself; a job enqueued now dies with the pod.
+        return "it is draining (terminating itself)"
     return None
 
 
@@ -666,7 +651,7 @@ def runpod_host(
     disk_gb: int = DEFAULT_DISK_GB,
     image: str = DEFAULT_IMAGE,
     report: Reporter = print,
-    health_args: str = "",
+    health_options: HealthOptions = DEFAULT_HEALTH,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
     if reuse:
@@ -682,6 +667,6 @@ def runpod_host(
         disk_gb=disk_gb,
         image=image,
         report=report,
-        health_args=health_args,
+        health_options=health_options,
         deps=deps,
     )

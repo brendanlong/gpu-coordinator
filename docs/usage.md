@@ -406,7 +406,7 @@ The same flags work on `gpuc submit` and `gpuc requeue`:
 | `--min-vram GB` | none | skip offers with less VRAM per GPU |
 | `--max-price USD` | none | **whole pod** per hour, so at `--gpu-count 2` it is compared against twice the per-GPU price |
 | `--cloud secure\|community\|any` | `secure` | which tier to buy from; community is cheaper and less reliable; `any` merges both and sorts by price |
-| `--cuda-min X.Y` | `12.8` | the floor sent to `create`; passing it explicitly also filters the catalog query |
+| `--cuda-min X.Y` | `12.8` | the CUDA floor: filters the catalog query and is sent to `create` |
 | `--idle-min N` | `15` | terminate the pod once its queue has been empty this long |
 | `--disk GB` / `--image REF` | `config.toml` | container disk and pod image |
 | `--no-reuse` | reuse is on | always create a new pod |
@@ -414,8 +414,11 @@ The same flags work on `gpuc submit` and `gpuc requeue`:
 | `--health-args "..."` | none | extra flags for the on-host health check, e.g. `--min-mbps 0.1` |
 
 **Offers.** Matching offers are tried cheapest first: create, wait for a direct
-SSH endpoint, bootstrap, health check, enqueue. Any failure terminates that pod
-and moves to the next offer, all inside a **15-minute ceiling**.
+SSH endpoint, bootstrap, health check, enqueue. A failure of that pod
+terminates it and moves to the next offer, all inside **one 15-minute ceiling
+for the whole attempt**; an offer the ceiling leaves no time for is listed as
+untried. A failure no pod could fix -- a local ssh misconfiguration -- ends the
+attempt at the first pod instead of buying another.
 
 **Reuse** is the default: a registered rental whose recorded offer still
 matches the request, that owns at least `--gpu-count` cards, whose pod is

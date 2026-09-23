@@ -796,7 +796,10 @@ that bootstrapped it first matters afterwards.
    and `uv tool install huggingface_hub`, both skipped if present. Their
    failures are warnings -- **except** that a host registered with an
    `s3_prefix` whose `aws` could not be installed fails bootstrap outright,
-   since every job on it would end `failed: sync-preflight`.
+   since every job on it would end `failed: sync-preflight`. A rental with an
+   `s3_prefix` is also given `~/.aws/credentials` (0600, from stdin) out of the
+   bootstrapping shell's `AWS_*`, for the mirror its drain writes after every
+   job's secrets are gone; a shared box's `~/.aws` is never touched.
 3. **Never rewrite `~/.gpuc/config.json`.** The host owns it, so bootstrap reads
    it and merges back only what it derived (`remote.write_config`): the
    commit just shipped, and the managed env keys the host names none of
@@ -897,15 +900,17 @@ The runbook for a host that came back empty is in setup.md.
 
 Everything the control side knows about a provider's vocabulary lives on the
 `Provider` instance: which pod statuses mean nothing can run (`dead_statuses`),
-which mean the rental has ended (`gone_statuses`), the log signature of a
-broken host, and how a terminate is retried. `remote.ask` reads those and
-names no status itself; `actions.PROVIDERS` maps a rental's `provider` name
-to its class. Adding a provider is one class and one table entry.
+which mean the rental has ended (`gone_statuses`), which mean it can be
+dialled (`running_statuses`), the log signature of a broken host, and how a
+terminate is retried and confirmed (`terminate_confirmed`). Nothing outside
+`providers/` names a status; `actions.PROVIDERS` maps a rental's `provider`
+name to its class. Adding a provider is one class and one table entry.
 
 ### RunPod (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
 
 - `offers(constraints)`: `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=<tier>&minCudaVersion=<x>`
-  once per requested tier; filter by name list / min VRAM / max price /
+  once per requested tier, `<x>` being the one CUDA floor the create also gets
+  (`DEFAULT_CUDA_MIN` unless `--cuda-min`); filter by name list / min VRAM / max price /
   availability != NONE and at least one `cudaVersions[].available`; sort by
   price. Pass GPU ids exactly as the catalog returns them.
 - `create(offer)`: `POST /pods` with `name="gpuc-<host>"`, `image`
@@ -936,16 +941,27 @@ to its class. Adding a provider is one class and one table entry.
    pod the provider reports RUNNING, whose dispatcher heartbeat is fresh, and
    which is not draining; enqueue there. A registered pod the provider no longer
    has is forgotten rather than dialled.
-3. Else, for each offer in order: `create`; poll `get` until RUNNING **and**
-   `ssh.direct` present; poll SSH until a trivial command succeeds; write the
-   pod its `first_config`, whose `provider` block carries the offer and `created_at`
-   (`rented.py`: the pod is its own record, and this machine keeps none); run
-   bootstrap; enqueue. The pod terminates itself with the pod-scoped key
-   RunPod leaves in its own `/etc/rp_environment`. On any broken-host signature in `logs`, the
-   15-minute ceiling, a health failure, a Ctrl-C or a bug: `terminate`, wait for
-   TERMINATED, try the next offer. A terminate that failed is reported loudly
-   and leaves the registry entry in place; nothing retries it.
-4. From bootstrap on, the only things that end the pod are the pod itself,
+3. Else, for each offer in order: `create`; poll `get` until the pod is
+   running **and** `ssh.direct` present; poll SSH until a trivial command
+   succeeds; probe the pod once (the same probe `host add` runs, and the one
+   look at its cards); write the pod its `first_config`, whose `provider`
+   block carries the offer and `created_at` (`rented.py`: the pod is its own
+   record, and this machine keeps none); run bootstrap; enqueue. The pod
+   terminates itself with the pod-scoped key RunPod leaves in its own
+   `/etc/rp_environment`.
+4. **One ceiling bounds the whole attempt** (`CEILING_MINUTES`), every offer
+   included, and every failure gets one of three verdicts
+   (`provision.verdict`): *keep waiting* (a provider read or an ssh that
+   failed while the pod is still coming up), *next offer* (the pod is dead,
+   its host is broken by the provider's `broken_host` signature, its health
+   failed, or anything else about that pod or the provider), or *abort* (a
+   local ssh misconfiguration, the ceiling, a Ctrl-C or a bug -- nothing
+   another pod could fix). The pod is terminated on the way out of either of
+   the last two, through the one `Provider.terminate_confirmed`, which retries
+   the call and waits for the provider to confirm; a terminate it could not
+   confirm is reported loudly and leaves the registry entry in place, and
+   nothing retries it.
+5. From bootstrap on, the only things that end the pod are the pod itself,
    through that pod-scoped key, and a client running
    `gpuc host terminate`. `tests/test_runpod_e2e.py` proves the first on every
    opt-in run.
@@ -964,12 +980,13 @@ once it returns there is no host left to own any state.
   confirmed uploaded, each named), on a host that did not answer, or on a
   target with no registry entry to ask. `--force` does not ask at all.
 - A pod the provider reports in `DEAD_STATUSES` is never refused over.
-- The terminate is retried (`TERMINATE_ATTEMPTS`) and the provider must confirm
-  TERMINATED before anything local changes. Only then is the entry dropped,
+- The terminate is `Provider.terminate_confirmed`, the same one provisioning
+  ends a pod with: the provider must confirm the pod gone before anything
+  local changes. Only then is the entry dropped,
   through `forget_host`, which drops it only if it is that pod's and reports
   whether it went -- what `forgotten` in the document means. A terminate that
   could not be confirmed raises, keeping the entry.
-- A pod the provider already reports TERMINATED is not an error: nothing is
+- A pod the provider already reports gone is not an error: nothing is
   called, and the stale entry is dropped.
 
 ## Web dashboard (`gpuc web serve`)

@@ -42,7 +42,7 @@ def test_table_names_the_host_each_pod_is_here_and_counts_the_rest(
     control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _register("gpuc-e2e-aaa", "pod1")
-    monkeypatch.setattr("gpuc.control.pods.dispatcher_heartbeat_age", lambda *a: 4.0)
+    monkeypatch.setattr("gpuc.control.pods.heartbeat_age", lambda *a: 4.0)
 
     text = pods_mod.render(pods_mod.gather(Settings(), provider))
 

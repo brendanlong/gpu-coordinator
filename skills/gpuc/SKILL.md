@@ -321,7 +321,9 @@ Rules, and they are not optional:
 ## RunPod specifics
 
 - Provisioning to job start is about a minute. If it fails before the host
-  proves healthy it re-places automatically onto the next offer, cheapest first.
+  proves healthy it re-places automatically onto the next offer, cheapest first,
+  inside one 15-minute ceiling for the whole attempt; a local ssh problem ends
+  the attempt at the first pod rather than trying every offer.
 - The pod terminates itself 15 minutes after its queue empties (`--idle-min`),
   draining its uploads first.
 - An existing gpuc pod is reused instead of a new one when its recorded offer

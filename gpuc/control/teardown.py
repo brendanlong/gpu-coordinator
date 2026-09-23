@@ -99,8 +99,8 @@ class Termination:
             "host": entry.name if entry else None,
             "pod_id": self.target.pod_id,
             "pod_name": pod.name if pod else None,
-            # What the provider said *before* the terminate: "TERMINATED" here
-            # with `terminated` false is a pod that was already gone.
+            # What the provider said *before* the terminate: a gone status
+            # here with `terminated` false is a pod that had already ended.
             "pod_status": pod.status if pod else None,
             "cost_usd_hr": pod.cost_usd_hr if pod else None,
             "checked": self.checked,
@@ -244,7 +244,12 @@ def terminate(
     frees the rental behind a flag would be protecting nothing.
     """
     resolved = resolve(target, registry, provider)
-    result = Termination(target=resolved) if force else inspect(resolved, settings, provider)
+    if force:
+        result = Termination(target=resolved)
+    else:
+        result = inspect(resolved, settings, provider)
+        if not provider.is_dead(resolved.pod) and (result.busy or not result.checked):
+            raise TerminateRefused(refusal(result))
     if resolved.pod is None:
         # What is being billed, for the result to report -- and whether there
         # is anything to end at all. A provider that will not answer raises
@@ -252,9 +257,6 @@ def terminate(
         # is how a terminated entry and a running bill part company.
         resolved.pod = provider.get(resolved.pod_id)
     pod = resolved.pod
-    alive = not provider.is_dead(pod)
-    if alive and not force and (result.busy or not result.checked):
-        raise TerminateRefused(refusal(result))
     if result.unasked:
         result.notes.append(result.unasked)
         report(f"note: {result.unasked}")
@@ -263,38 +265,24 @@ def terminate(
         gone = "is already terminated" if pod else "does not exist at the provider"
         result.notes.append(f"pod {resolved.pod_id} {gone}; nothing was billing")
     else:
-        if not alive:
+        if provider.is_dead(pod):
             result.notes.append(
                 f"the provider says pod {resolved.pod_id} is {pod.status}, so nothing was "
                 f"running on it; ending it frees the rental"
             )
-        _terminate_with_retries(resolved, provider, report, sleep)
-        result.terminated = True
-    result.forgotten = _forget(resolved, report)
-    return result
-
-
-def _terminate_with_retries(
-    target: Target, provider: Provider, report: Reporter, sleep: Callable[[float], None]
-) -> None:
-    """The same retry the provisioning failure path takes: the one call that
-    stops the bill is the worst place to give up after a single 5xx."""
-    report(f"terminating {target.label}")
-    for attempt in range(1, provider.terminate_attempts + 1):
+        report(f"terminating {resolved.label}")
         try:
-            provider.terminate(target.pod_id)
+            provider.terminate_confirmed(resolved.pod_id, report=report, sleep=sleep)
         except ProviderError as exc:
-            if attempt < provider.terminate_attempts:
-                report(f"terminate failed ({exc}); retrying in {provider.terminate_retry_s:g}s")
-                sleep(provider.terminate_retry_s)
-                continue
             raise TerminateFailed(
-                f"could not terminate {target.label} in {attempt} attempts: {exc}\n"
+                f"{resolved.label}: {exc}\n"
                 f"It is still billing: `gpuc pods` shows it, and the provider's console "
                 f"ends it."
             ) from exc
-        report(f"{target.label} terminated and confirmed gone")
-        return
+        report(f"{resolved.label} terminated and confirmed gone")
+        result.terminated = True
+    result.forgotten = _forget(resolved, report)
+    return result
 
 
 def _forget(target: Target, report: Reporter) -> bool:

@@ -1,23 +1,20 @@
-"""An in-memory provider and transport, so the whole provisioning flow is testable offline.
+"""An in-memory provider, so the whole provisioning flow is testable offline.
 
 Pods follow a script: how many `get` polls before `ssh.direct` appears, what
 the pod log says, whether `create` fails with a capacity error. That is enough
-to reproduce every failure the real flow has to survive.
+to reproduce every failure the real flow has to survive. The host behind a
+pod is `temphost.TempHost`, a real one in a temporary home.
 """
 
 from __future__ import annotations
 
 import itertools
-import re
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
-from gpuc.control.bootstrap import BootstrapResult
-from gpuc.control.config import HostEntry, Settings, utc_now
 from gpuc.control.providers.base import (
+    DEFAULT_CUDA_MIN,
     DEFAULT_IMAGE,
     DEFAULT_PREFIX,
     Cloud,
@@ -30,8 +27,6 @@ from gpuc.control.providers.base import (
     SshEndpoint,
 )
 from gpuc.control.provision import offer_satisfies
-from gpuc.control.remote import NO_CONFIG, PYTHON_PROBE
-from gpuc.control.transport import CommandResult, Transport, TransportError
 
 CAPACITY_ERROR = "no capacity for this gpu type right now"
 BROKEN_LOG = "system: error: failed to create shim task: OCI runtime create failed"
@@ -76,11 +71,7 @@ class _FakePod:
 
 
 class FakeProvider(Provider):
-    dead_statuses = ("EXITED", "ERROR", "TERMINATED")
-    gone_statuses = ("TERMINATED",)
-    broken_host = re.compile(
-        r"card[0-9]|device nodes|OCI runtime|runc create|failed to create shim", re.IGNORECASE
-    )
+    """Speaks the base class's vocabulary, as the real provider does."""
 
     def __init__(
         self,
@@ -127,7 +118,7 @@ class FakeProvider(Provider):
         image: str = DEFAULT_IMAGE,
         disk_gb: int = 20,
         env: dict[str, str] | None = None,
-        cuda_min: str | None = None,
+        cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod:
         if not name.startswith(self.prefix):
@@ -163,7 +154,7 @@ class FakeProvider(Provider):
         entry = self._pods.get(pod_id)
         if entry is None:
             return next((p for p in self.foreign if p.id == pod_id), None)
-        if entry.pod.status == "TERMINATED":
+        if self.is_gone(entry.pod):
             return entry.pod
         entry.polls += 1
         status = entry.script.status_after_polls.get(entry.polls)
@@ -208,7 +199,7 @@ class FakeProvider(Provider):
         return pod
 
     def live_names(self) -> list[str]:
-        return sorted(p.name for p in self.list() if p.status != "TERMINATED")
+        return sorted(p.name for p in self.list() if not self.is_gone(p))
 
 
 def running_pod(name: str, pod_id: str, *, cost: float = 0.49, age_minutes: float = 30.0) -> Pod:
@@ -222,90 +213,4 @@ def running_pod(name: str, pod_id: str, *, cost: float = 0.49, age_minutes: floa
         cuda_version="12.8",
         created_at=datetime.now(UTC) - timedelta(minutes=age_minutes),
         ssh_direct=SshEndpoint(host="1.2.3.4", port=22000, username="root"),
-    )
-
-
-@dataclass
-class FakeTransport:
-    """Answers the handful of commands provisioning runs, and can refuse ssh N times."""
-
-    host: str = "fake"
-    ssh_failures: int = 0
-    gpu_uuids: tuple[str, ...] = ("GPU-1111", "GPU-2222")
-    home: str = "/root"
-    commands: list[str] = field(default_factory=list)
-    files: dict[str, str] = field(default_factory=dict)
-
-    def argv(self, command: str) -> list[str]:
-        return ["bash", "-c", command]
-
-    def interactive_argv(self, command: str) -> list[str]:
-        return ["bash", "-lc", command]
-
-    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
-        """`check` means the same thing here as in Local/SshTransport: raise.
-
-        A fake that quietly returned the failure would let caller code that
-        forgot `check=False` look correct in tests and blow up in production.
-        """
-        self.commands.append(command)
-        result = self._answer(command)
-        if check and result.returncode != 0:
-            raise TransportError(result)
-        return result
-
-    def _answer(self, command: str) -> CommandResult:
-        if command == "true":
-            if self.ssh_failures > 0:
-                self.ssh_failures -= 1
-                return CommandResult(self.host, ["ssh", command], 255, "", "connection refused")
-            return CommandResult(self.host, ["ssh", command], 0, "", "")
-        if command.startswith("nvidia-smi"):
-            return CommandResult(
-                self.host, ["ssh", command], 0, "".join(f"{u}\n" for u in self.gpu_uuids), ""
-            )
-        if command == PYTHON_PROBE:
-            return CommandResult(self.host, ["ssh", command], 0, "/usr/bin/python3 3.12.3\n", "")
-        if "$HOME" in command:
-            return CommandResult(self.host, ["ssh", command], 0, self.home, "")
-        if command.startswith("if [ -f") and "config.json" in command:
-            # A pod nobody has configured yet, which is every pod this creates.
-            body = self.files.get(f"{self.home}/config.json")
-            return CommandResult(self.host, ["ssh", command], 0, body or NO_CONFIG, "")
-        if command.startswith("mv -f") and "config.json" in command:
-            source, target = command.split()[2], command.split()[3]
-            self.files[target] = self.files.pop(source, "")
-            return CommandResult(self.host, ["ssh", command], 0, "", "")
-        return CommandResult(self.host, ["ssh", command], 0, "", "")
-
-    def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
-        self.files[remote_path] = content if isinstance(content, str) else content.decode()
-
-    def rsync(
-        self,
-        local_root: Path,
-        remote_path: str,
-        files: Any = None,
-        excludes: Sequence[str] = (),
-    ) -> CommandResult:
-        return CommandResult(self.host, ["rsync"], 0, "", "")
-
-    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        return CommandResult(self.host, ["tail"], 0, "", "")
-
-
-def fake_bootstrap(
-    entry: HostEntry,
-    settings: Settings | None = None,
-    *,
-    transport: Transport | None = None,
-    report: Any = print,
-    health_args: str = "",
-) -> tuple[HostEntry, BootstrapResult]:
-    report(f"fake bootstrap of {entry.name}")
-    updated = entry.with_cache(
-        python="/root/.venv/bin/python", uv="/root/.local/bin/uv"
-    ).model_copy(update={"bootstrapped_at": utc_now()})
-    return updated, BootstrapResult(
-        host=entry.name, home="/root/.gpuc", files=20, dispatcher_pid=4242
     )
