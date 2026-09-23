@@ -237,9 +237,10 @@ memory and utilization.
 number means hours) choose how much of the finished list to show; `--all` adds
 jobs only the local index and the S3 index know, which is how you find what was
 on a host that lost its state, and is exit 1 if the S3 index could not be read;
-`--json` is [below](#exit-codes-and---json). A rental whose pod the provider
-still has but nothing can run on prints `POD EXITED` (its status) and is exit
-1; one whose pod is gone prints `POD GONE`, is not a failure, and is forgotten
+`--json` is [below](#exit-codes-and---json). A host that could not be asked
+prints `UNASKABLE` with the reason as its `ERROR` line (for a rental whose pod
+the provider still has but nothing can run on, the pod's status) and is exit
+1; a rental whose pod is gone prints `GONE`, is not a failure, and is forgotten
 as it is printed. Card
 UUIDs are in `gpuc host list`, and everything a host can say about itself is in
 `gpuc host probe`.
@@ -593,7 +594,6 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
       "kind": "ssh",
       "state": "answered",
       "reachable": true,
-      "pod_gone": false,
       "pkg_commit": "8f1c2d0a9b34",
       "dispatcher": { "alive": true, "heartbeat_age_s": 2.0, "pkg_commit": "8f1616c..." },
       "provider_util": null,
@@ -661,28 +661,28 @@ Beyond what the example shows:
   `provider_util` is the provider's per-GPU reading for the whole pod, null
   elsewhere. Two measurements that will differ.
 
-Per host: `target`, `draining`, `state` (`answered`, `unreachable`, `pod_dead`
--- the provider still has the pod and nothing can run on it, a failure -- or
-`pod_gone`), `pod_gone` (true only when the rental has ended, so the next `gpuc
-status` forgets the host), `pod` (the provider's view of a rental's pod),
-`pkg_commit`, the host's own answer for the build it runs — `null` means it did
-not say, never "up to date" -- and `warnings[]`, the build mismatch, kept apart
-from `errors[]`, which is what decides the exit code. A card the host cannot
-see appears in `gpus` as `{"owned_as": "3", "available": false}`; `shared_gpus`
-has the same shape plus `unused` (no memory held, no work running) and
-`busy_job` (one of *our* jobs has it), and a missing one is
-`{"shared_as": "5", "available": false}`. `--recent` and `--since` apply to
-`--json`; `--all` fills `unhosted[]` with the jobs only the index knows, each
-`{job_id, name, host, host_state, requeue, requeued_from, submitted_at,
+Per host: `target`, `draining`, `state` -- one of `answered`, `unaskable` (it
+could not be asked, and `errors[]` says why: ssh failed, the provider still has
+the pod and nothing can run on it, the provider could not be read; a failure)
+or `gone` (the pod is terminated or missing: the rental has ended, not a
+failure, and the next `gpuc status` forgets the host) -- `pod` (the provider's
+view of a rental's pod), `pkg_commit`, the host's own answer for the build it
+runs — `null` means it did not say, never "up to date" -- and `warnings[]`,
+the build mismatch, kept apart from `errors[]`, which is what decides the exit
+code. A card the host cannot see appears in `gpus` as `{"owned_as": "3",
+"available": false}`; `shared_gpus` has the same shape plus `unused` (no memory
+held, no work running) and `busy_job` (one of *our* jobs has it), and a missing
+one is `{"shared_as": "5", "available": false}`. `--recent` and `--since` apply
+to `--json`; `--all` fills `unhosted[]` with the jobs only the index knows,
+each `{job_id, name, host, host_state, requeue, requeued_from, submitted_at,
 s3_prefix, outputs_lost}`. `host_state` is what this run found the job's host
-to be -- `answered` (and it does not have the job: the host lost its state, or
-purged it), `unreachable`, `pod_dead`, `pod_gone`, `not_registered` or
-`unreadable_entry` (its registry entry did not validate; see `errors`) -- and
-`requeue` is whether `gpuc requeue` is the way back: true for `answered` and
-`pod_gone`, true for `not_registered` only when the mirror shows the job
-ended (that name may be another machine's for a live box), false for a host
-that could not be asked or a stopped pod, which may still hold the job. The text form says the same after
-each line and offers the hint only for a job it is true of.
+to be, in the same three words: `answered` (and it does not have the job: the
+host lost its state, or purged it), `unaskable` (including a host whose
+registry entry did not validate; see `errors`) or `gone` (including a host
+that is not registered here: a rental that ended and was forgotten). `requeue`
+is whether `gpuc requeue` is the way back: true for `answered` and `gone`,
+false for `unaskable`, which may still hold the job. The text form says the
+same after each line and offers the hint only for a job it is true of.
 
 Rules for anything automated:
 
@@ -885,8 +885,8 @@ nothing until the snapshot expires.
 | a warning names one skipped host entry | that entry did not validate; every other host still works and is written back untouched | fix it by hand, or `gpuc host add <name> --ssh ...` to connect to that host again |
 | `status` warns `host X is running gpuc <sha> and this machine has <sha>` | the host was last bootstrapped from a different build than this one, in either direction | `gpuc host bootstrap X`, or `gpuc host bootstrap --all` for every host at once — safe while jobs run; the new dispatcher adopts them |
 | `status` warns `host X has gpuc <sha> on disk but its running dispatcher was started on <sha>` | the dispatcher outlived the package under it, so nothing shipped since is in effect. A newer dispatcher normally takes over by itself | `gpuc host bootstrap X` — safe while jobs run; the new dispatcher adopts them |
-| `status` says `POD GONE` | the pod is terminated or missing: the end of the rental, and `status` forgets that entry as it prints it | nothing |
-| `status` says `POD EXITED` (or another status) and exits 1 | the provider still has the pod and nothing can run on it; it may still be billing | `gpuc host terminate <name>` ends it; `gpuc host remove <name>` only forgets it |
+| `status` says `GONE` | the pod is terminated or missing: the end of the rental, and `status` forgets that entry as it prints it | nothing |
+| `status` says `UNASKABLE` with `ERROR pod <id> is EXITED` (or another status) and exits 1 | the provider still has the pod and nothing can run on it; it may still be billing | `gpuc host terminate <name>` ends it; `gpuc host remove <name>` only forgets it |
 | `gpuc pods` shows a pod with no heartbeat and nothing running | its dispatcher died, or the machine that was provisioning it was killed before it could clean up; it will never idle out | `gpuc host terminate <pod-id> --force`. A pod that still answers ssh can be re-bootstrapped instead (`gpuc host add <name> --pod <id>`, then `gpuc host bootstrap <name>`) |
 | `host terminate` says the pod could not be confirmed gone | the provider refused or did not answer the terminate, three times | the registry entry is kept and the pod may still be billing: run it again, and check the RunPod console if it keeps failing |
 | everything on a host is suddenly gone | the container restarted and `$HOME` was on the overlay | the runbook in [setup.md](setup.md#hosts-whose-home-is-wiped-on-restart) |

@@ -597,10 +597,17 @@ hold to, whatever the flags:
 - Anything that talks to RunPod (`--runpod`, `pods`, `host add --pod`) checks
   `RUNPOD_API_KEY` first and exits 1 with a single line if it is unset, before
   mirroring a spec or picking a host.
-- **One way to ask a host.** `remote.ask(entry, verb)` answers `Answered`,
-  `Unreachable` (with the one-line reason), `PodDead` or `PodGone` (with what
-  the provider said), and everything that talks to a host -- `status`, the
-  locator, `wait`, `logs`, teardown, `host bootstrap --all` -- consumes that.
+- **One way to ask a host, three answers.** `remote.ask(entry, verb)` answers
+  `Answered` (a payload), `Unaskable` (it could not be asked, with the
+  one-line reason: ssh failed, the provider still has the pod and nothing can
+  run on it, the provider could not be read; the host may still hold its jobs
+  and nothing is inferred) or `Gone` (the host does not
+  exist any more: the provider reports the pod terminated or missing; the
+  mirror is the answer and nothing failed). Each carries what the provider
+  said (`pod`) for `status` to print. Everything that talks to a host --
+  `status`, the locator, `wait`, `logs`, teardown, `host bootstrap --all` --
+  consumes those three and no other spelling of them; the provider's own
+  vocabulary (`is_dead`, `is_gone`) is translated once, in `ask`.
   A rental is looked up at its provider inside `ask`, and nowhere else. A
   session (`remote.open_session`) reads the host's own `config.json` fresh
   and carries it as `session.config`; nothing that decides anything reads the
@@ -614,16 +621,15 @@ hold to, whatever the flags:
   knows is exit 4 only once every host has answered; a host the index names
   that could not be asked still holds the job as far as anything knows, and
   the location carries that trouble for the caller to judge, never hidden.
-  A host the index names that this machine has no entry for is the same
-  trouble in its final form (`Forgotten`: a rental that ended and was
-  forgotten); one whose registry entry this build could not read is not
-  (`UnreadableEntry`): it is a host that was not asked, and never "no such
-  job". One rule, `actions.mirror_is_the_answer`, says what the
-  trouble costs: a host that is *gone* (its pod ended, or forgotten) is read
-  from the mirror now, and that is the answer, exit 0; one that is merely
-  unreachable may still hold the job, so `wait` retries it for
-  `TROUBLE_GRACE_S` before the mirror, `logs` prints the mirror's copy but
-  exits 1 with the reason, and every other verb is exit 1 with the reason.
+  A host the index names that this machine has no entry for is `Gone` (a
+  rental that ended and was forgotten); one whose registry entry this build
+  could not read is `Unaskable` (a host that was not asked, and never "no
+  such job"). One rule, `actions.mirror_is_the_answer`, says what the
+  trouble costs: a host that is `Gone` is read from the mirror now, and that
+  is the answer, exit 0; one that is `Unaskable` may still hold the job, so
+  `wait` retries it for `TROUBLE_GRACE_S` before the mirror, `logs` prints
+  the mirror's copy but exits 1 with the reason, and every other verb is
+  exit 1 with the reason.
   The job index is one facade (`s3index.JobIndex`) over the local index
   and the mirror's, in that order, and the precedence is written once. A host
   name from the mirror's index is the *submitting* client's name for it, so
@@ -703,11 +709,12 @@ answer is *unknown*; 4 is a name that does not exist. Automation keys on
 
 A rental the provider reports missing or TERMINATED is not a failure: `status`
 and `host bootstrap --all` forget that registry entry where they find it
-(`forget_gone_rentals`, on the `PodGone` answer `ask` gave). A pod the provider
-still has and nothing can run on (EXITED, ERROR) is `PodDead`: a failure like
-any other host that could not be read, printed with its status and never as
-gone, and kept for `gpuc host terminate` or `gpuc host remove`. Only a command
-somebody typed forgets: the dashboard's poll never writes to the registry.
+(`forget_gone_rentals`, on the `Gone` answer `ask` gave). A pod the provider
+still has and nothing can run on (EXITED, ERROR) is `Unaskable`: a failure like
+any other host that could not be asked, with the provider's status as the
+reason and never printed as gone, and kept for `gpuc host terminate` or `gpuc
+host remove`. Only a command somebody typed forgets: the dashboard's poll never
+writes to the registry.
 
 `--json` is on every command that has an answer to give, and means the same
 thing on each: stdout is one object carrying `schema_version`, everything else
@@ -733,10 +740,10 @@ that reach outside the module:
 - A host that cannot be asked is *trouble*, not an answer: retried for
   `TROUBLE_GRACE_S`, then read from the **S3 mirror** (the spec's "the mirror is
   read only when the host is gone") through `actions.mirrored_outcome`, the
-  one reader of a mirrored `state.json`. A host `mirror_is_the_answer` calls
-  gone -- a rental whose pod `ask` reports gone, or one the locator found
-  forgotten -- skips the grace and is read from the mirror at once, without
-  a poll. Only if that has no terminal state does the job get an `error`.
+  one reader of a mirrored `state.json`. A host that is `Gone`
+  (`mirror_is_the_answer`) skips the grace and is read from the mirror at
+  once, without a poll. Only if that has no terminal state does the job get
+  an `error`.
 - An id whose host answers and does not list it is exit 4, decided after the
   first poll -- for `logs -f` at once, for `wait` once the other jobs named
   have been waited for and reported. A job that *was* listed and then
@@ -1084,21 +1091,20 @@ after five tries rather than looping for ever.
 
 What `status` prints, and every flag, is usage.md. The invariants:
 
-- A host is in one of four states (`status.HostState`), the four answers of
-  `remote.ask`, read everywhere else: it answered; it could not be reached; its
-  pod is dead (the provider still has it and nothing can run on it: a failure,
-  printed as `POD <status>` and kept for `gpuc host terminate` or `gpuc host
-  remove`); its pod is gone (the rental has ended: not a failure, `POD GONE`,
-  and the entry is forgotten as it is printed). `pod_gone` means gone and
-  nothing else. For either pod state no ssh is attempted, and the line says
-  what the provider said rather than printing a connection error. One
-  `actions.status` builds the text form, `--json` and the dashboard's
-  document, including `--all`'s `unhosted` list -- each job in it labelled
-  with what the same run found its host to be, and `gpuc requeue` offered
-  only where that host cannot still be running it (it answered without the
-  job, its pod is gone, or it is not registered here), never over a
-  connection error; per host, `errors` decide
-  the exit code and `warnings` (the build) do not.
+- A host is in one of three states (`status.HostState`), the three answers of
+  `remote.ask`, read everywhere else: it answered; it is unaskable (a
+  failure, printed as `UNASKABLE` with the reason as its `ERROR` line); it is
+  gone (not a failure, printed as `GONE`, and the entry is forgotten as it is
+  printed). For a pod the provider reports stopped or gone no ssh is
+  attempted, and the reason says what the provider said rather than a
+  connection error. One `actions.status` builds the text form, `--json` and
+  the dashboard's document, including `--all`'s `unhosted` list -- each job
+  in it labelled with what the same run found its host to be, in the same
+  three states (a host not registered here is gone; one whose entry could
+  not be read is unaskable), and `gpuc requeue` offered only where that host
+  cannot still be running it (answered without the job, or gone), never over
+  a connection error; per host, `errors` decide the exit code and `warnings`
+  (the build) do not.
 - A host that answered and still carries an `error` -- the provider could not be
   asked about its pod -- prints it as an `ERROR` line under the header. Nothing
   that decides an exit code may be visible only under `--json`.

@@ -248,24 +248,24 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 ```
 
 The document is `{schema_version, hosts: [...], unhosted: [...], errors: [...]}`.
-Each host has `name, kind, state, reachable, pod_gone, pkg_commit,
+Each host has `name, kind, state, reachable, pkg_commit,
 dispatcher{alive, heartbeat_age_s}, provider_util, gpus, shared_gpus, queued,
 running, finished, errors, warnings`; `state` is one of `answered`,
-`unreachable`, `pod_dead` (the provider still has the pod: a failure) and
-`pod_gone` (the rental ended: not a failure, and the entry is forgotten);
-`warnings` is the build mismatch, apart from the `errors` that decide the exit
-code. Each job in the three lists has `job_id, name, status, reason, problems,
+`unaskable` (it could not be asked and may still hold its jobs: a failure,
+with the reason in `errors`) and `gone` (the rental ended: not a failure, and
+the entry is forgotten); `warnings` is the build mismatch, apart from the
+`errors` that decide the exit code. Each job in the three lists has `job_id, name, status, reason, problems,
 upload_errors, phase, priority, attempt, requeued_from, elapsed_s, util,
 progress_pct, eta, eta_s, estimated_runtime_min, progress_error, gpus,
 gpus_requested, use_shared, starts_in_s, starts_at, starts_unknown, iso,
 ended_at, outputs_pending` (`starts_*` are null unless the job is queued).
 `unhosted` is `--all`'s list of jobs only the index knows, each
 `{job_id, name, host, host_state, requeue, requeued_from, submitted_at,
-s3_prefix, outputs_lost}`, and empty without the flag. **Requeue one only if
-`requeue` is true**: a `host_state` of `unreachable`, `pod_dead` or
-`unreadable_entry` means the host may still be running that job, and so may
-`not_registered` until the mirror shows the job ended; a second copy is not
-recovery. Each entry in
+s3_prefix, outputs_lost}`, and empty without the flag. `host_state` is
+`answered`, `unaskable` or `gone`, as for a host (a host not registered here
+is `gone`; one whose registry entry did not validate is `unaskable`).
+**Requeue one only if `requeue` is true**: an `unaskable` host may still be
+running that job, and a second copy is not recovery. Each entry in
 `shared_gpus` adds `memory_mib`, `utilization_pct` and `unused` — the host's own
 verdict on whether gpuc would borrow that card right now.
 
