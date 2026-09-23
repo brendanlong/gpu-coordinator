@@ -19,7 +19,7 @@ gpuc/
     __main__.py    # the on-host CLI the control side drives over ssh
     paths.py       # the ~/.gpuc layout
     jobs.py        # job ids, HostConfig/JobSpec/JobState, the per-job lock, tolerant readers, atomic writes
-    queue.py       # accept a job, list the queue, cancel, preempt, requeue: every change of a job's status
+    queue.py       # accept a job, list the queue, claim, cancel, preempt, the next attempt of a preempted job
     plan.py        # the dispatch rule, pure: what a pass does with each queued job, and when each will start
     dispatcher.py  # lock+heartbeat, act on the plan, launch runners, escalate stops, idle terminate
     runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, wall-clock limit, sync, exit code
@@ -112,31 +112,35 @@ jobs/<jobid>/
   .lock              # the flock every read-modify-write of state.json takes
   spec.json          # the submitted JobSpec, written once by `enqueue` and never again
   state.json         # {"status": queued|running|succeeded|failed|cancelled,
-                     #  "intent": null | "cancel" | "preempt",   # what somebody asked of a running job
-                     #  "attempt": n, "priority": p,           # the live priority; the queue is
+                     #  "intent": null | "cancel" | "preempt",   # what somebody asked of a running job;
+                     #                                        # cleared by the write that ends it
+                     #  "attempt": n,                          # launches of this id: 1, +1 per preempt
+                     #  "priority": p,                         # the live priority; the queue is
                      #                                        # every `queued` state in (priority, id) order
                      #  "estimated_runtime_min": null | m,     # the live estimate, as `gpuc estimate` left it
                      #  "reason": str|null, "problems": [str, ...],  # what ended it, and what else went wrong
-                     #  "exit_code": int|null, "gpus": [...], "started_at", "ended_at",
-                     #  "phase": setup|preflight|main|sync, "pid": int|null, "pgid": int|null,
+                     #  "exit_code": int|null, "gpus": [...],   # UUIDs, from the runner's claim
+                     #  "started_at", "ended_at",
+                     #  "phase": setup|preflight|main|sync,    # `sync` lasts until the write that
+                     #                                        # ends the attempt
+                     #  "pgid": int|null,                      # the *job's* group, published by the
+                     #                                        # runner when it spawns a phase
                      #  "isolation": "cgroup"|"pgid", "cgroup_unit": str|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
-                     #  "runner_starttime": str|null,
+                     #  "runner_starttime": str|null,          # the runner, from its own claim
                      #  "util_recent": [float|null, ...],
                      #  "progress_pct": float|null, "progress_error": str|null, "eta": str|null,
                      #  "uploads": [{"to": uri, "output": path|null, "ok_at": str|null, "error": str|null}],
                      #                              # one record per destination, `output` null for
                      #                              # the host's mirror of log.txt and state.json;
                      #                              # the whole account of what is safely elsewhere
-                     #  "workdir_removed": bool,
                      #  "workdir_bytes": int|null,  # what removing workdir/ would free;
                      #                              # measured once, as the job ended (or by
                      #                              # the first status to find it missing)
                      #  "outputs_lost": bool}       # a drain retried the outputs and gave up
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and must not be read as 0%. eta is null unless the job is running.
-                     # progress_pct survives the job. pgid is the *job's* group, published by
-                     # the runner when it spawns a phase, and absent during the launch window.
+                     # progress_pct survives the job.
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
@@ -153,10 +157,18 @@ There is no queue file and no marker file: a job's `state.json` is the one
 record of what it is doing and what has been asked of it, every change to it
 is one atomic replace under the job's lock, and the queue is derived from it.
 So there is no order of writes to survive a crash between, and nothing that
-reconciles two files that disagree. A change of ownership -- the dispatcher
-claiming a queued job, a cancel ending one, a requeue putting one back -- is a
-compare-and-set on `status` (`jobs.transition`), so two of them racing on one
-job cannot both win.
+reconciles two files that disagree. A change of ownership is a compare-and-set
+on `status` (`jobs.transition`), so two of them racing on one job cannot both
+win: the runner claiming the job it was started for, a cancel ending a queued
+one, and the write that ends an attempt. **The runner owns every transition of
+its job**: its first act is the claim (`queued` -> `running`, naming itself),
+its last is the write that ends the attempt -- a terminal status through
+`jobs.finish`, or `queued` again at the next attempt for a preempt. So a
+`running` state always names a runner that existed, and a job is finished
+exactly when its runner is gone. Every terminal write goes through
+`jobs.finish(job_id, Outcome)`, the dispatcher's own failures included, and
+it clears the intent, the phase and the processes of the attempt; an
+unreadable state is logged and left alone, never written over with defaults.
 
 All state writes are atomic (write temp in same dir, `os.replace`).
 
@@ -193,7 +205,8 @@ All state writes are atomic (write temp in same dir, `os.replace`).
                                         # important queued one right away
   "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
-  "attempt": 1                          # set by `gpuc requeue` and `gpuc preempt`, not by the submitter
+  "requeued_from": null                 # the job `gpuc requeue` resubmitted this one from;
+                                        # written by the control side, carried by the host
 }
 ```
 
@@ -250,35 +263,46 @@ The rules it holds to:
   and renames the dir into `jobs/`. A job dir under `jobs/` was accepted by
   construction; a dir left under `incoming/` an hour after its last change is
   a submit that died, and is removed.
-- **A queued job is claimed by compare-and-set** (`queue.claim`): only a state
-  still `queued` becomes `running`, so a cancel that landed between listing
-  the queue and launching costs nothing but a skipped launch.
+- **A launch is a spawn; the runner claims the job.** The dispatcher starts
+  `python -m gpuc.host run <id> --gpus <uuids>` and writes nothing: the
+  runner's first act is the compare-and-set that turns `queued` into
+  `running`, recording the assignment and its own pid, boot id and start time
+  in that write. A cancel that lands first costs a runner that exits quietly.
+  Until the claim the job is taken in the dispatcher's memory (`running`
+  holds the spawned process), so a pass never launches it twice; a runner
+  that dies before claiming leaves the job `queued` at the attempt it was
+  launched for, and is failed `runner-died` from there.
 - **Adoption at startup** (`adopt_orphans`): every job whose state says
-  `running` is adopted or failed `runner-died`, and a failed one's leftovers are
-  killed (`cgroup_unit`, then `pgid`) before its cards go back in the pool.
-  Liveness is the recorded `runner_pid` *with* the boot id and start time
-  recorded beside it. A job that names no runner is not failed on that alone --
-  `launch_ready` writes `running` before the spawn -- so /proc is walked for
-  live `gpuc.host run <id>` processes (`runner.live_runner_pids`) and those are
-  adopted. What is found is not written back: the runner records its own pid
-  moments later.
+  `running` is adopted if the runner it names is alive -- the recorded
+  `runner_pid` *with* the boot id and start time recorded beside it -- and
+  failed `runner-died` otherwise, its leftovers killed (`cgroup_unit`, then
+  `pgid`) before its cards go back in the pool. Nothing is inferred from the
+  process table and nothing is written back. A job found `running` under a
+  live runner this dispatcher did not spawn -- the claim it raced for and
+  lost after a takeover -- is adopted the same way.
 - **A stop is an intent** in the job's state: `cancel` or `preempt`. The
-  **runner** owns the kill -- it polls its state and ends the attempt as
-  `cancelled` or `failed: preempted` after a final sync -- and the dispatcher
-  escalates only once the grace period has passed (`escalate_stops`), one
-  rung per grace period: the job's scope and group, then the runner itself,
-  then the runner's group. A runner in its final sync gets
-  `SYNC_STOP_PATIENCE_S` first: the upload has no cap by design and is the
-  runner honouring the request, but one hung there holds its cards for ever. A
-  queued job is cancelled on the spot, with no intent. A cancel overrides a
-  preempt.
+  **runner** owns the kill -- it polls its state, stops the job, runs the
+  final sync and cleanup, and ends the attempt with its last write -- and the
+  dispatcher escalates only once the grace period has passed
+  (`escalate_stops`), one rung per grace period: the job's scope and group,
+  then the runner itself, then the runner's group. A runner in phase `sync`
+  gets `SYNC_STOP_PATIENCE_S` first: the phase lasts until the write that
+  ends the attempt, so it covers the upload, the workdir, the mirror and the
+  secrets, and none of that is ever cut short by the ladder; but a runner
+  hung there holds its cards for ever, so the ladder starts after the
+  patience rather than never. A queued job is cancelled on the spot, with no
+  intent. A cancel overrides a preempt.
 - **Preempt** (`queue.preempt`) is for a running job, and only when something
-  else could run instead. The runner keeps `workdir/` and the secrets file and
-  does not re-take the outputs baseline. `queue.requeue_preempted` is one write
-  under the job's lock: a fresh `queued` state at `attempt+1`, keeping the
-  live priority and estimate. It does not go back if the attempt ended for a
-  reason of its own, was cancelled while stopping, has no workdir, or the host
-  is going away.
+  else could run instead. It is one transition, the runner's: the attempt
+  ends and the runner's last write is a fresh `queued` state at `attempt+1`
+  (`queue.next_attempt`), keeping the live priority and estimate, the
+  workdir, the secrets file and the outputs baseline. The job goes from
+  `running` straight to `queued`; nothing sees it finished in between. It
+  does not go back when the attempt ended for a reason of its own before the
+  kill landed (it ends that way), when a cancel landed while it stopped (the
+  later request wins: `cancelled`), or when the host is going away
+  (`failed: preempted`). A runner that dies while preempting is a dead
+  runner like any other: `failed: runner-died`, intent cleared.
 - **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
   `auto_preempt` jobs that together cover the whole gap -- least important
@@ -303,16 +327,23 @@ The rules it holds to:
 
 The order is the contract; each step is in `runner.py`.
 
-1. Resolve the assignment against `nvidia-smi --query-gpu=index,uuid`, indices
-   and UUIDs both, and fail `gpu-assert` if it is empty or names a card that is
-   not here. Export `CUDA_VISIBLE_DEVICES` as the cards' nvidia-smi **indices**
-   with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the numbers mean the same cards to
-   CUDA (vLLM `int()`s each entry; a UUID there fails inside a subprocess with
-   an error that points at the model); as UUIDs only if the index table could
-   not be read. Then the spec `env` and the secrets file.
+0. Claim the job: one compare-and-set from `queued` to `running` carrying the
+   assignment, `started_at`, the isolation mode and the runner's own pid,
+   boot id and start time. A claim that fails is a job that is no longer
+   ours; the runner exits 0 and writes nothing.
+1. Verify the assignment -- UUIDs, resolved by the dispatcher -- against
+   `nvidia-smi --query-gpu=index,uuid`, and fail `gpu-assert` if it is empty
+   or names a card that is not here. Export `CUDA_VISIBLE_DEVICES` as the
+   cards' nvidia-smi **indices** with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so the
+   numbers mean the same cards to CUDA (vLLM `int()`s each entry; a UUID there
+   fails inside a subprocess with an error that points at the model); as
+   UUIDs only if the index table could not be read. Then the secrets file and
+   the spec `env`; the host's `env` and PATH are the runner's own, applied by
+   the dispatcher to everything it spawns.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json` (path,
    size, mtime), **before `setup`** -- a setup step writing there is this job's
-   doing, a committed file that was already there is not. Every upload excludes
+   doing, a committed file that was already there is not -- and once per job:
+   a later attempt keeps the baseline the first took. Every upload excludes
    files that still match, and a path holding only those is `failed:
    no-outputs`. Above `baseline.MAX_TRACKED` files the exclusion is dropped with
    a loud warning.
@@ -339,26 +370,32 @@ The order is the contract; each step is in `runner.py`.
    running job whose output is not being uploaded shows up in `status` rather
    than in a log line nobody reads. Uploads run with the **job's** environment,
    secrets included, so `secrets: [AWS_ACCESS_KEY_ID, ...]` is enough and no
-   host-level credential is needed. The secrets file is unlinked after the
-   final sync, never before.
+   host-level credential is needed.
 5. `phase=main`: `spec.command`, stdout and stderr appended to `log.txt`, in its
    own scope or process group (see Process isolation). Sample the assigned GPUs
    every 30 s into `util_recent`; nothing acts on it. Enforce
    `max_runtime_min` (SIGTERM the group, SIGKILL at 15 s, `failed: timeout`),
    and run `spec.progress_command` every `progress_interval_s`.
-6. Capture the exit code **before** any cleanup, stop the sync loop, clear
-   every output's success record and run one final sync, so only the upload
-   that includes the last minute's files counts. A failed one makes a succeeded
-   job `failed: sync`, and an output path that was never written makes it
-   `failed: no-outputs`; a job already over for a reason of its own keeps that
-   `reason` and lists the upload failure under `problems`. Write final state.
+6. Capture the exit code **before** any cleanup, set `phase=sync`, stop the
+   sync loop, clear every output's success record and upload every output
+   once more, so only the upload that includes the last minute's files
+   counts. A failed one makes a succeeded job `failed: sync`, and an output
+   path that was never written makes it `failed: no-outputs`; a job already
+   over for a reason of its own keeps that `reason` and lists the upload
+   failure under `problems`. The `Outcome` is now decided.
+7. Apply `spec.cleanup` to `workdir/` through `cleanup.may_delete`, asked with
+   the status about to be written -- `outputs:` paths resolve inside the
+   workdir, so this is after the final sync and never before, and a job on
+   its way back to `queued` keeps it. Record `workdir_bytes`; a removal that
+   fails is logged and nothing more.
+8. Mirror the log and state and record the mirror's own upload (the record
+   with `output: null`).
+9. **The write that ends the attempt, as the last act**: `jobs.finish` with
+   the outcome, or `queue.next_attempt` for a preempt. Then the state once
+   more to the mirror, so its copy says how the job ended; the log is not
+   uploaded twice. Then the secrets file goes -- unless the job is `queued`
+   again, or an ephemeral host still has its outputs pending for the drain.
    The runner exits with the job's code.
-7. Apply `spec.cleanup` to `workdir/` **after** the final sync and state write,
-   never before -- `outputs:` paths resolve inside the workdir. Record
-   `workdir_removed` and `workdir_bytes`; a removal that fails is logged and
-   nothing more. Then upload state and log once more and record the mirror's
-   own upload (the record with `output: null`), so the mirror includes the
-   record of itself.
 
 ## Job length estimates
 
@@ -410,10 +447,13 @@ job's own process group, and the runner -- built from the job's state: the
 runner's kill, the dispatcher's escalation and the adoption of a dead runner's
 leftovers all call it rather than deciding for themselves what to signal. The
 kill path is `systemctl --user stop <unit>`, with the process-group kill kept
-as a fallback, and the job's group is only ever the one the runner published,
-never the runner's own. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are
-in `state.json` and `gpuc status --json`. The probe runs once per dispatcher and
-reaches runners as `GPUC_ISOLATION`. On a host with no user systemd -- every
+as a fallback, and the job's group is only ever the one the runner published
+for the phase now running; the runner's own group is never recorded as the
+job's. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are in `state.json`
+and `gpuc status --json`. The mode is decided once per process
+(`scope.isolation()`: what `GPUC_ISOLATION` announces, else one probe) and the
+dispatcher announces its answer to every child, so dispatcher, runners and
+phases agree on what a kill reaches. On a host with no user systemd -- every
 RunPod pod, most shared boxes -- `pgid` is the mode and a daemonised grandchild
 still escapes: a documented hole, not a fixed one.
 
@@ -424,17 +464,28 @@ usually the largest. `spec.json`, `state.json` and `log.txt` always stay. The
 policy, the two horizons and every refusal are
 [usage.md](usage.md#cleanup-and-retention); the contract behind them:
 
-- No policy touches a job that is not finished, and the runner applies its
-  policy after the final sync and state write. A preempted job keeps its
-  workdir whatever `cleanup:` says: the next attempt re-runs in it.
+- No policy touches a job that is not finished. The runner applies its policy
+  after the final output sync and before the write that ends the attempt,
+  asking with the status it is about to write; a preempted job is about to
+  be `queued`, so it keeps its workdir whatever `cleanup:` says and the next
+  attempt re-runs in it.
 - **One predicate decides every delete**: `cleanup.may_delete(job, what,
   evidence)`, where `what` is the workdir or the whole job dir and `evidence`
   is what the caller can vouch for -- that nobody typed the command
-  (`automatic`), that a person waived the backup preconditions (`force`), or
+  (`automatic`), that the job's own `cleanup:` is being applied by its runner
+  (`policy`), that a person waived the backup preconditions (`force`), or
   which jobs' mirrors the caller checked itself (`verified`). A workdir needs
-  the job finished, and under an automatic sweep also a spec that did not say
-  `cleanup: never` and outputs confirmed elsewhere. A job dir needs the record
-  mirrored and the outputs confirmed, unless forced.
+  the job finished; under the policy also what `cleanup:` says of that
+  status, under an automatic sweep also not `cleanup: never`; and under
+  either, no outputs pending. A job dir needs the record mirrored and no
+  outputs pending, unless forced.
+- **One question about outputs**: `cleanup.outputs_pending(job, spec,
+  state)`, the reason a job's outputs are only on this host or None. It is
+  what the drain retries, what keeps a job's secrets file for that drain,
+  what `purge` and the automatic sweep refuse over, and what `status` flags.
+  Nothing is pending for a job with no `outputs:`, with every destination's
+  last upload recorded, with its workdir gone, or with nothing ever written
+  under the declared paths; anything unreadable counts as content.
 - `python -m gpuc.host clean (--all-finished | --older-than DAYS | --only IDS)
   [--dry-run]` and `purge [--older-than DAYS] [--only IDS] [--verified IDS]
   [--dry-run] [--force]` print JSON and **fail closed**: a running or queued
@@ -450,17 +501,18 @@ policy, the two horizons and every refusal are
   (every periodic tick mirrors the log, so the list alone would vouch for a
   job whose final upload failed). One round trip either way; a list too long
   for an argument goes over as a file.
-- The dispatcher sweeps with `Evidence(automatic=True)` at startup and then at
-  most once an hour, purge first.
-  `workdir_days` defaults to `cleanup.DEFAULT_WORKDIR_DAYS` only for a host
-  being configured for the first time, never on the `HostConfig` field -- a
-  config that predates the key must not start deleting because it was shipped a
-  newer package.
+- The dispatcher reclaims with `Evidence(automatic=True)` at startup and then
+  at most once an hour: job dirs older than `retention_days` first, then one
+  workdir sweep at the shorter of the two horizons that are set.
+  `workdir_days` defaults to `cleanup.DEFAULT_WORKDIR_DAYS` only in the first
+  config `connect` writes, never on the `HostConfig` field: nothing that
+  merely reads a config may turn a sweep on.
 - An ephemeral host's drain retries unconfirmed outputs
   (`OUTPUT_RETRY_ATTEMPTS`, a minute apart), then records `outputs_lost` and
   terminates anyway.
-- `workdir_bytes` is measured **once**, by the runner as the job ends, and read
-  back by `status` rather than walked per call. A job with no figure is walked
+- `workdir_bytes` is measured **once**, by the runner as the job ends and
+  before it mirrors the state, and read back by `status` rather than walked
+  per call. A job with no figure is walked
   by the first `status` that finds its workdir, within
   `cleanup.MEASURING_BUDGET_S` per call, and reports `null` past the budget. A
   workdir that is gone is zero without a walk. `gpuc clean` measures afresh.

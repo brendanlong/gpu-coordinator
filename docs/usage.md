@@ -30,7 +30,6 @@ commented example; `-` as the file name reads the spec from stdin.
 | `auto_preempt` | `false` | let the host stop this job whenever that lets a job queued at a **lower** `priority` number start right away; see [automatic preemption](#automatic-preemption) |
 | `requires` | `{}` | e.g. `cuda_min: "12.8"`. **Informs provisioning only**; the host never checks it |
 | `cleanup` | `on_success` | when the runner deletes `workdir/`: `on_success`, `always`, `never` |
-| `attempt` | `1` | set by `gpuc requeue` and by a preempt, never by you; a submitter's value is ignored |
 
 Unknown keys are refused at submit.
 
@@ -486,13 +485,15 @@ nothing can run on: `POD GONE` in `gpuc status`, exit 1, and it stays until
 
 `gpuc cancel` records the request in the job's state, which the runner checks
 before every phase and on every poll. The runner stops the job's systemd scope,
-SIGTERMs its process group and SIGKILLs it 15 s later, then runs the final sync
-and writes the final state. A queued job is cancelled on the spot. If the
-runner does not act the dispatcher escalates: the scope and a SIGKILL of the
-job's group at 15 s, a SIGTERM of the runner at 30 s, a SIGKILL of its group at
-45 s. A runner already in its final upload is given thirty minutes before
-that ladder starts, since the upload is what the stop is waiting for. `gpuc
-preempt` is the same request with a different ending.
+SIGTERMs its process group and SIGKILLs it 15 s later, then runs the final
+sync, settles the workdir, mirrors the log and state, and writes the final
+state as its last act: the job stays `running` in `phase: sync` until then,
+and is finished exactly when its runner is gone. A queued job is cancelled on
+the spot. If the runner does not act the dispatcher escalates: the scope and
+a SIGKILL of the job's group at 15 s, a SIGTERM of the runner at 30 s, a
+SIGKILL of its group at 45 s. A runner in `phase: sync` is given thirty
+minutes before that ladder starts, since the upload is what the stop is
+waiting for. `gpuc preempt` is the same request with a different ending.
 
 Each phase runs in a transient `systemd --user` scope where the host has one and
 in its own process group where it does not (`isolation: cgroup` or `pgid` in
@@ -500,8 +501,9 @@ in its own process group where it does not (`isolation: cgroup` or `pgid` in
 grandchild that double-forks (`setsid`, `nohup`, a daemonising server) survives
 the kill and holds its GPU. It cannot leave a cgroup.
 
-A preempted job is briefly `failed: preempted` before it is queued again as the
-next attempt. Its workdir and secrets file are kept whatever `cleanup:` says.
+A preempted job goes straight from `running` to `queued` as its next attempt,
+never `failed: preempted` in between; its log records the attempt that was
+stopped. Its workdir and secrets file are kept whatever `cleanup:` says.
 
 Utilization is sampled on the assigned cards every 30 s **during phase `main`
 only**, so downloads and compiles in `setup` never show as idle. A sample
@@ -517,15 +519,14 @@ Every `failed: <reason>`:
 | `gpu-preflight` | a real GPU op inside the job's venv failed, or `device_count()` did not match `gpus:` — usually a CPU-only torch |
 | `sync-preflight` | the uploads the job would do at the end cannot work (no `aws`/`hf`, a missing secret, an unwritable bucket or repo) |
 | `timeout` | `max_runtime_min` elapsed |
-| `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt; the job is queued again as the next one, and this is the record of the attempt that was stopped |
+| `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt while the host was draining, so it was not queued again. Anywhere else a preempted job is `queued` again as its next attempt and never shows this |
 | `terminated` | the runner itself was signalled (and the job was not cancelled) |
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`; a job that was already over for a reason of its own keeps that reason and lists `sync` in its `problems` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. A problem beside the reason, the same way |
-| `bad-spec` | the queued spec could not be read |
+| `bad-spec` | the queued spec could not be read, or asks for no GPU |
 | `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued. On a host with [shared cards](#shared-gpus) it counts the ones this job asked for, and says so when it asked for none |
-| `needs at least 1 GPU, asked for 0` | the spec on the host asks for no card. `gpuc submit` refuses that, so it is a spec an older build queued or one edited by hand |
 | `spawn-failed` | the dispatcher could not start a runner process |
-| `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind before freeing its GPUs |
+| `runner-died` | the runner vanished without writing final state, before or after claiming the job; the dispatcher kills anything it left behind before freeing its GPUs. A job whose runner died while it was being preempted ends this way too, since the runner is what queues it again |
 
 `cancelled` is a status of its own, not a failure.
 
@@ -716,9 +717,10 @@ dir gpuc deletes by default: `spec.json`, `state.json` and `log.txt` stay, so
 | `always` | removed | removed | removed |
 | `never` | kept | kept | kept |
 
-No policy touches a job that is not finished. A workdir the policy keeps is still
-swept once it is `--workdir-days` old (below); `cleanup: never` opts out of that
-too.
+No policy touches a job that is not finished, and none deletes a workdir whose
+`outputs:` have not reached their destination. A workdir the policy keeps is
+still swept once it is `--workdir-days` old (below); `cleanup: never` opts out
+of that too.
 
 **After the fact: `gpuc clean --host H`.**
 

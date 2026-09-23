@@ -180,8 +180,9 @@ gpuc pods                        # RunPod: every pod we own, cost, age, util, ho
 A job's status is its exit code. `failed: <reason>` reasons you will see:
 `gpu-preflight` (no working CUDA in the venv), `sync-preflight` (aws/hf or
 credentials missing), `timeout` (`max_runtime_min`), `preempted`
-(`gpuc preempt` -- or the job's own `auto_preempt` -- stopped that attempt; the job is
-queued again as the next one), `sync`
+(`gpuc preempt` -- or the job's own `auto_preempt` -- stopped that attempt while
+the host was draining; anywhere else a preempted job goes straight back to
+`queued` as its next attempt and never shows this), `sync`
 (final upload failed; results exist only on the host), `no-outputs` (the output
 path was never written), `terminated`, `runner-died`. A job that ended for a
 reason of its own and *also* lost its upload keeps its reason and lists `sync`
