@@ -170,25 +170,8 @@ def test_status_of_a_named_gone_host_lists_its_jobs_from_the_mirror(
 
     assert main(["status", "--host", POD, "--json"]) == EXIT_OK
     host = json.loads(capsys.readouterr().out)["hosts"][0]
-    assert (host["state"], host["source"]) == ("gone", "mirror")
+    assert host["state"] == "gone"
     assert [job["status"] for job in host["finished"]] == ["succeeded"]
-
-
-def test_status_since_shows_a_gone_host_only_for_what_ended_in_the_window(
-    control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    mirror(monkeypatch, {JOB: succeeded(hours=2)})
-
-    assert main(["status", "--json"]) == EXIT_OK
-    assert json.loads(capsys.readouterr().out)["hosts"] == []
-
-    assert main(["status", "--since", "24h", "--json"]) == EXIT_OK
-    hosts = json.loads(capsys.readouterr().out)["hosts"]
-    assert [(h["name"], h["state"]) for h in hosts] == [(POD, "gone")]
-    assert [job["job_id"] for job in hosts[0]["finished"]] == [JOB]
-
-    assert main(["status", "--since", "1h", "--json"]) == EXIT_OK
-    assert json.loads(capsys.readouterr().out)["hosts"] == []
 
 
 def test_status_all_gives_a_gone_hosts_jobs_their_final_status(

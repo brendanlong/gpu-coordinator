@@ -420,7 +420,6 @@ def status(
     *,
     host: str | None = None,
     all_jobs: bool = False,
-    since_s: float | None = None,
     on_view: Callable[[status_mod.HostView], None] | None = None,
     report: Callable[[str], None] = note,
 ) -> StatusResult:
@@ -433,11 +432,9 @@ def status(
     Nothing here writes the registry: forgetting a rental that has ended is
     `forget_gone_rentals`, which only a typed command calls.
 
-    A gone host's jobs are the mirror's (`gone_view`). Which gone hosts are
-    shown: one found gone this run, one named with `--host`, and with
-    `--since` one the index knows that has a job that ended in the window --
-    every rental ever used would bury the hosts that exist, and a job that
-    ended last month is not what anyone polling `status` is waiting for.
+    A gone host's jobs are the mirror's (`fill_from_mirror`). A gone host is
+    shown when it was found gone this run or is named with `--host`: listing
+    every rental ever used would bury the hosts that exist.
     """
     result = StatusResult(read, every_host=host is None)
     index = IndexRead(settings)
@@ -464,11 +461,8 @@ def status(
     provider = provider_for(entries, settings, report) if entries else None
     for view in gather_all(entries, settings, provider):
         if view.gone:
-            fill_from_mirror(view, index.index, jobs_of_registered(view, index))
+            fill_from_mirror(view, index.index, index.on(view.entry.name))
         shown(view)
-    if host is None and since_s is not None and not read.unreadable:
-        for view in gone_since(index, registry, read.skipped, result.seen, since_s, report):
-            shown(view)
     result.index_error = index.error
     if all_jobs:
         result.unhosted, result.mirrored, short = unhosted_jobs(index, result.seen, host)
@@ -486,25 +480,6 @@ def gone_view(name: str, index: JobIndex, entries: Sequence[IndexEntry]) -> stat
     )
     fill_from_mirror(view, index, entries)
     return view
-
-
-def jobs_of_registered(view: status_mod.HostView, index: IndexRead) -> list[IndexEntry]:
-    """A registered gone host's jobs: the ones mirrored under its cached
-    `s3_prefix`, one LIST, rather than a read of the whole index -- the
-    dashboard asks again every poll until a typed command forgets the entry.
-    The index's list when there is no prefix, or it could not be listed."""
-    name, prefix = view.entry.name, view.entry.config.s3_prefix
-    if not prefix or index.index.s3 is None:
-        return index.on(name)
-    try:
-        ids = index.index.s3.mirrored_job_ids(prefix)
-    except S3IndexError:
-        return index.on(name)
-    local = index.index.local
-    return [
-        local.get(job_id) or IndexEntry(job_id=job_id, host=name, s3_prefix=prefix)
-        for job_id in ids[-MIRROR_STATE_LOOKUPS:]
-    ]
 
 
 def fill_from_mirror(
@@ -543,47 +518,6 @@ def fill_from_mirror(
             "`gpuc status --all` lists them for `gpuc requeue`"
         )
     view.finished.sort(key=lambda job: job.ended_at or "", reverse=True)
-
-
-def gone_since(
-    index: IndexRead,
-    registry: Registry,
-    skipped: Collection[str],
-    seen: Collection[str],
-    since_s: float,
-    report: Callable[[str], None],
-) -> list[status_mod.HostView]:
-    """`--since`: every host the index knows and this machine does not, that
-    has a job the mirror says ended in the window.
-
-    The mirror is read for the newest `MIRROR_STATE_LOOKUPS` of their jobs in
-    all, not per host: the index keeps every rental ever used, and a job
-    that ended in the window was, nearly always, submitted recently too. A
-    job a host already answered for is left out: the index's host name is the
-    submitting client's, and may be one a live host here goes by another name.
-    """
-    candidates = sorted(
-        (
-            entry
-            for entry in index.all()[0].values()
-            if entry.host
-            and entry.host not in registry.hosts
-            and entry.host not in skipped
-            and entry.job_id not in seen
-        ),
-        key=lambda entry: entry.job_id,
-        reverse=True,
-    )
-    if len(candidates) > MIRROR_STATE_LOOKUPS:
-        report(
-            f"read the newest {MIRROR_STATE_LOOKUPS} of {len(candidates)} jobs on hosts that "
-            f"are gone from the mirror; `gpuc status --host <name>` reads one host's"
-        )
-    by_host: dict[str, list[IndexEntry]] = {}
-    for entry in candidates[:MIRROR_STATE_LOOKUPS]:
-        by_host.setdefault(entry.host, []).append(entry)
-    views = [gone_view(name, index.index, by_host[name]) for name in sorted(by_host)]
-    return [view for view in views if any(status_mod.within(job, since_s) for job in view.finished)]
 
 
 def forget_gone_rentals(

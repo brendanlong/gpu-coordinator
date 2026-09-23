@@ -1127,9 +1127,6 @@ def host_json(
         "target": entry.ssh,
         "state": view.state.value,
         "reachable": view.reachable,
-        # Where the job lists came from: a gone host's finished jobs are the
-        # mirror's, and nothing else is listed for it.
-        "source": {HostState.ANSWERED: "host", HostState.GONE: "mirror"}.get(view.state),
         "draining": view.draining,
         # The host's own answer, so null means the host did not say, never
         # "current".

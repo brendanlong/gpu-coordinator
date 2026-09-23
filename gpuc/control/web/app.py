@@ -277,11 +277,7 @@ class Dashboard:
         except ValueError as exc:
             raise UsageError(f"since: {exc}") from exc
         result = status(
-            read,
-            settings,
-            host=request.param("host") or None,
-            all_jobs=flag_param(request, "all"),
-            since_s=since_s,
+            read, settings, host=request.param("host") or None, all_jobs=flag_param(request, "all")
         )
         return Response.answer(result.answer(recent=recent, since_s=since_s), gathered_at=utc_now())
 

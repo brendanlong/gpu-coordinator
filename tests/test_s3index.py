@@ -110,19 +110,6 @@ def test_list_index_keeps_the_newest_at_the_limit() -> None:
     assert [e.job_id for e in s3.list_index(limit=3)] == ["j4", "j5", "j6"]
 
 
-def test_mirrored_job_ids_are_the_jobs_with_a_state_under_the_prefix() -> None:
-    client = FakeS3Client(
-        objects={
-            "bkt/gpuc/pod/jobs/a/state.json": b"{}",
-            "bkt/gpuc/pod/jobs/a/log.txt": b"",
-            "bkt/gpuc/pod/jobs/b/log.txt": b"",
-            "other/gpuc/pod/jobs/c/state.json": b"{}",
-        }
-    )
-    assert S3Index("bkt", client).mirrored_job_ids("s3://bkt/gpuc/pod") == ["a"]
-    assert S3Index("bkt", client).mirrored_job_ids("s3://other/gpuc/pod/") == ["c"]
-
-
 def test_a_list_failure_names_the_prefix() -> None:
     class Broken(FakeS3Client):
         def list_objects_v2(self, **_: object) -> dict[str, object]:

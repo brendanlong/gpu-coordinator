@@ -252,20 +252,6 @@ class S3Index:
         except (S3IndexError, ValidationError):
             return None
 
-    def mirrored_job_ids(self, s3_prefix: str) -> list[str]:
-        """The ids of the jobs with a mirrored `state.json` under a host's
-        `s3_prefix`, in id order: which jobs a gone host had, in one LIST
-        rather than a read of the whole index."""
-        bucket, key = split_uri(job_uri(s3_prefix, ""))
-        s3 = self if bucket == self.bucket else S3Index(bucket, self._client)
-        return sorted(
-            {
-                rest.split("/", 1)[0]
-                for full in s3.list_keys(key, KEYS_MAX)
-                if (rest := full[len(key) :]).endswith("/state.json")
-            }
-        )
-
     def get_uri(self, uri: str) -> str:
         bucket, key = split_uri(uri)
         if bucket != self.bucket:

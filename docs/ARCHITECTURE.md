@@ -519,15 +519,12 @@ hold to, whatever the flags:
   `reorder`, `estimate`, `requeue` and `ssh` resolve a job id the same way
   (`actions.locate`): the job index (`s3index.JobIndex`, the local index then
   the mirror's), then asking each host. An id no host knows is exit 4 only
-  once every host has answered. A host name this machine has no entry for,
-  whether the index gave it or `--host` did where the index agrees, is
-  `Gone`; one whose registry entry this build could not read is
-  `Unaskable`. (`requeue --host` and `ssh --host` name a destination, not the
-  job's host, and are exit 4 for an unknown one.) A per-job verb on a `Gone`
-  host answers from the mirror: `cancel` with the job's final status, the
-  rest refused with it. Every per-job verb runs through `actions.job_verb`:
-  locate the job, ask its host over the one session the lookup opened, insist
-  on a verdict, re-mirror a spec field it changed. A host's refusal is its
+  once every host has answered. A host the index names for the job that this
+  machine has no entry for is `Gone`, whether or not `--host` named it; one
+  whose registry entry this build could not read is `Unaskable`. Every
+  per-job verb runs through `actions.job_verb`: locate the job, ask its host
+  over the one session the lookup opened, insist on a verdict, re-mirror a
+  spec field it changed. A host's refusal is its
   `{error}` document; one that also says `missing` is "no such job", exit 4.
 - What a command does lives in `actions` (with `hosts` and `submitting` for the
   host and submit commands), one function per command returning an `Answer`:
@@ -900,10 +897,7 @@ What `status` prints, and every flag, is usage.md. The invariants:
   `remote.ask` under *Control side*, read everywhere else: `UNASKABLE` is
   printed with the reason as its `ERROR` line and is a failure; `GONE` is not,
   its finished jobs are the mirror's, and the entry is forgotten as it is
-  printed. A gone host is shown when it was found gone this run, is named with
-  `--host`, or with `--since` has a job the mirror says ended in the window;
-  each reads at most `actions.MIRROR_STATE_LOOKUPS` `state.json`s, and lists
-  the jobs it has no final state for as lost. For a pod the provider reports
+  printed. For a pod the provider reports
   stopped or gone no ssh is attempted, and the reason is what the provider
   said. One `actions.status` builds the text form, `--json` and the
   dashboard's document, including `--all`'s `unhosted` list, each job in it

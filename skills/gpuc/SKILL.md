@@ -188,13 +188,8 @@ leaves the run alone.
 run on its pod) is exit 1 with the reason from every command, and may still
 hold its jobs; `gpuc wait` keeps asking for five minutes before it reads the
 job's final state from the S3 mirror. **A host that is gone** (its rental
-ended, or its name -- from the job index, or a `--host` the index agrees with
--- is not registered on this machine) is read from the mirror at once by `gpuc
-logs`, `gpuc wait`, `gpuc cancel` and `gpuc status`, and that is the answer,
-exit 0. A job the
-mirror has no final state for (or any job, with no `s3_bucket`) went with its
-host: exit 1, saying so. `gpuc status` shows gone hosts found gone this run,
-named with `--host`, or with a job that ended within `--since`.
+ended, or it is no longer registered on this machine) is answered from the
+mirror at once, exit 0; a job the mirror has no final state for is exit 1.
 
 ## Exit codes and `--json` (read this before scripting anything)
 
@@ -224,8 +219,7 @@ estimated_runtime_min, progress_error, gpus, gpus_requested, use_shared,
 starts_in_s, starts_at, starts_unknown, iso, ended_at, outputs_pending`
 (`starts_*` are null unless the job is queued). `unhosted` is `--all`'s list of
 jobs only the index knows, each `{job_id, name, host, host_state, status,
-requeue, requeued_from, submitted_at, s3_prefix, outputs_lost}` (`status` is
-the mirror's final one when the host is gone). **Requeue one only if
+requeue, requeued_from, submitted_at, s3_prefix, outputs_lost}`. **Requeue one only if
 `requeue` is true**: an `unaskable` host may still be running that job, and a
 second copy is not recovery. Each entry in `shared_gpus` adds `memory_mib`,
 `utilization_pct` and `unused`.
@@ -244,7 +238,7 @@ unchanged by the flag. Prefer it to scraping any of the text output.
 | `submit`, `requeue` | `{job_id, host, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are all null when the host could not be asked again (the job is queued regardless), and `starts_unknown` is why there is no start time |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` uses, plus `host`, `source` (`host` or `mirror`) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say. Exit 1 unless every job succeeded |
-| `cancel` | `{job_id, host, status, source}`; `source` is `mirror` when the host is gone and the job had already ended |
+| `cancel` | `{job_id, host, status, source}`; `source` is `host` or `mirror` |
 | `preempt` | `{job_id, host, status, priority, warnings[]}`; `priority` is what it will be queued again at |
 | `reorder` | `{job_id, host, priority, warnings[]}` plus the same queue fields as `submit`. A `warnings` entry means the mirrored spec kept the old priority, so a `requeue` would not carry the move |
 | `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}` |

@@ -553,9 +553,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
         if args.json
         else lambda v: print(status_mod.render(v, recent=args.recent, since_s=since_s))
     )
-    result = status(
-        read, settings, host=args.host, all_jobs=args.all, since_s=since_s, on_view=show
-    )
+    result = status(read, settings, host=args.host, all_jobs=args.all, on_view=show)
     forget_gone_rentals(result.views)
     lines: list[str] = []
     if read.unreadable:
