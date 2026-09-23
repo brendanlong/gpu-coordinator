@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -18,28 +19,28 @@ import pytest
 
 from snakemake_executor_plugin_gpuc import index_status, job_name, truthy
 from tests.conftest import install_fake_torch
-from tests.test_control_e2e import bootstrapped_home, state_of
+from tests.test_control_e2e import bootstrapped_home, state_of, wait_until
 
 __all__ = ["bootstrapped_home"]
 
 SNAKEFILE = """\
-workdir: config["results"]
+R = config["results"]
 
 rule all:
-    input: "b.txt"
+    input: R + "/b.txt"
 
 rule a:
-    output: "a-{n}.txt"
+    output: R + "/a-{n}.txt"
     shell: 'test "$SMK_TOKEN" = s3cret && echo alpha {wildcards.n} > {output}'
 
 rule b:
-    input: "a-1.txt"
-    output: "b.txt"
+    input: R + "/a-1.txt"
+    output: R + "/b.txt"
     resources: priority=10
     shell: "cat {input} > {output}; echo beta >> {output}"
 
 rule broken:
-    output: "never.txt"
+    output: R + "/never.txt"
     shell: "exit 3"
 """
 
@@ -142,9 +143,17 @@ def test_a_failed_gpuc_job_fails_its_snakemake_job(
 ) -> None:
     results = tmp_path / "results"
     results.mkdir()
-    done = snakemake(project, results, "never.txt")
+    done = snakemake(project, results, str(results / "never.txt"))
     assert done.returncode != 0
     assert "failed: exit" in done.stderr, done.stderr[-4000:]
+
+
+def test_a_directory_other_than_the_one_gpuc_would_copy_is_refused(
+    project: Path, tmp_path: Path
+) -> None:
+    done = snakemake(project, tmp_path, "--directory", str(tmp_path))
+    assert done.returncode != 0
+    assert "--directory is not supported" in done.stderr, done.stderr[-4000:]
 
 
 def test_status_is_indexed_across_hosts_and_lists() -> None:
@@ -176,3 +185,36 @@ def test_a_job_is_named_by_its_rule_and_wildcards() -> None:
         wildcards_dict = {"seed": "1", "k": "4"}  # noqa: RUF012
 
     assert job_name(Job()) == "train[seed=1,k=4]"  # type: ignore[arg-type]
+
+
+def test_ctrl_c_cancels_the_jobs_in_flight(
+    bootstrapped_home: Path, project: Path, tmp_path: Path
+) -> None:
+    results = tmp_path / "results"
+    results.mkdir()
+    with (project / "Snakefile").open("a") as f:
+        f.write(
+            '\nrule slow:\n    output: R + "/slow.txt"\n    shell: "sleep 120; touch {output}"\n'
+        )
+    subprocess.run(["git", "commit", "-qam", "slow"], cwd=project, check=True)
+    controller = subprocess.Popen(
+        snakemake_argv(results, str(results / "slow.txt")),
+        cwd=project,
+        env=snakemake_env(),
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert controller.stderr is not None
+    job_id = ""
+    for line in controller.stderr:
+        if "as gpuc job" in line:
+            job_id = line.split("gpuc job ")[1].split()[0]
+            break
+    wait_until(lambda: state_of(bootstrapped_home, job_id).get("phase") == "main", 60, "phase main")
+    controller.send_signal(signal.SIGINT)
+    controller.communicate(timeout=120)
+    wait_until(
+        lambda: state_of(bootstrapped_home, job_id).get("status") == "cancelled",
+        60,
+        f"job {job_id} to be cancelled",
+    )

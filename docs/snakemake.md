@@ -25,7 +25,8 @@ Snakemake's metadata and logs.
 
 ## Running a workflow
 
-Run Snakemake from the project root:
+Run Snakemake from the project root, without `--directory` (which is
+refused):
 
 ```sh
 uv run snakemake --executor gpuc --gpuc-host spar --jobs 20
@@ -51,7 +52,7 @@ Rule resources become job spec fields:
 | `vram_gb` | `--min-vram`, with `runpod` |
 | `priority` | `priority` |
 | `max_runtime_min` | `max_runtime_min` |
-| `use_shared`, `auto_preempt` | the spec fields; `1`, `true` and `yes` are true |
+| `use_shared`, `auto_preempt` | the spec fields; `1`, `true`, `yes` and `on` are true |
 
 ```python
 rule train:
@@ -90,17 +91,23 @@ seen. Two layouts work.
 ### One machine: a shared directory
 
 Run the controller on the GPU host, with that host registered there as
-`local`, and put every input and output in a directory outside the job
+`local`, and give every input and output an absolute path outside the job
 workdirs:
 
 ```python
-workdir: "/home/me/myproject/results"
+R = "/home/me/myproject-results"
+
+rule train:
+    output: R + "/checkpoints/{seed}/model.pt"
+    shell: "uv run --no-sync python -m train --seed {wildcards.seed} --out {output}"
 ```
 
-A `workdir:` directive (or absolute paths) points the controller and every
-job at the same directory. The code each job runs is still its own copy of the
-tree Snakemake was started from. This needs no storage plugin and nothing
-leaves the machine.
+Rule commands still run in the job's own copy of the project, so
+`uv run` finds the job's environment and code. Don't use a `workdir:`
+directive for this: it would run every rule command in the results directory
+instead. A results directory inside the project has to be in `.gitignore`, or
+every submit copies it. This layout needs no storage plugin and nothing leaves
+the machine.
 
 ### Several hosts: object storage
 
@@ -117,12 +124,12 @@ uv run snakemake --executor gpuc --gpuc-host spar --jobs 20 \
 ```
 
 This works across local, ssh and RunPod hosts in one workflow, at the cost of
-moving every checkpoint through the bucket. Don't use a `workdir:` directive
-in this mode. The directory it names would have to exist on every host.
+moving every checkpoint through the bucket.
 
 ## Limits
 
 - Every Snakemake job is one `gpuc submit`, and each submit copies the working
   tree.
+- Job groups (`group:`) are refused. Each Snakemake job is its own gpuc job.
 - Every job needs a GPU. Mark a rule that doesn't need one `localrule: True`,
   so the controller runs it itself.

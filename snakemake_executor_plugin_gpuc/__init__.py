@@ -21,6 +21,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 from collections.abc import AsyncGenerator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -111,7 +112,14 @@ class Executor(RemoteExecutor):
         self.settings: ExecutorSettings = self.executor_settings
         self.gpuc_argv = shlex.split(self.settings.gpuc)
         # Where Snakemake was started. A `workdir:` directive moves the
-        # controller's cwd, but the tree gpuc must copy is still this one.
+        # controller's cwd, but the tree gpuc must copy is still this one;
+        # `--directory` moves it before this is recorded, hence the refusal.
+        if getattr(self.workflow, "overwrite_workdir", None):
+            raise WorkflowError(
+                "--directory is not supported with --executor gpuc: gpuc copies the directory "
+                "snakemake is run from, so run it from the project root and give outputs an "
+                "absolute path instead"
+            )
         self.project_dir = os.path.abspath(str(self.workflow.workdir_init))
         self.snakefile_in_workdir = os.path.relpath(
             os.path.abspath(str(self.workflow.main_snakefile)), self.project_dir
@@ -123,6 +131,12 @@ class Executor(RemoteExecutor):
                 "from a directory that contains it"
             )
         self.unaskable_warned: set[str] = set()
+        # Every job submitted and not yet over. Snakemake's own `active_jobs`
+        # is emptied for the length of each poll, and a poll here is an ssh
+        # round trip to every host: a Ctrl-C landing in one would cancel
+        # nothing.
+        self.in_flight: dict[str, SubmittedJobInfo] = {}
+        self.in_flight_lock = threading.Lock()
 
     # The interface's own annotations on these two are narrower than what it
     # calls them for: `get_snakefile` is inferred as returning None, and
@@ -135,6 +149,13 @@ class Executor(RemoteExecutor):
 
     def run_job(self, job: JobExecutorInterface) -> None:
         job_info = SubmittedJobInfo(job, aux={})
+        if job.is_group():
+            self.report_job_error(
+                job_info,
+                msg="gpuc runs one Snakemake job per gpuc job; drop the rule's `group:`, since "
+                "a group's summed resources would become its priority and runtime limit\n",
+            )
+            return
         try:
             spec, argv = self.submission(job)
             answer = self.gpuc([*argv, "--json"], stdin=json.dumps(spec), env=self.secret_env())
@@ -143,6 +164,8 @@ class Executor(RemoteExecutor):
             return
         job_info.external_jobid = answer["job_id"]
         job_info.aux = {"host": answer.get("host")}
+        with self.in_flight_lock:
+            self.in_flight[answer["job_id"]] = job_info
         self.report_job_submission(job_info)
         self.logger.info(
             f"Submitted job {job.jobid} as gpuc job {answer['job_id']} on {answer.get('host')}."
@@ -201,7 +224,16 @@ class Executor(RemoteExecutor):
             argv += ["--host", str(next(iter(hosts)))]
         async with self.status_rate_limiter:
             try:
-                document = self.gpuc(argv, ok_codes=(0, 1))
+                try:
+                    document = self.gpuc(argv, ok_codes=(0, 1))
+                except GpucError:
+                    if "--host" not in argv:
+                        raise
+                    # The one host may have been forgotten here since (a
+                    # rental somebody else's `gpuc status` found gone), and
+                    # `--host` of a name this machine does not know is an
+                    # error. Asked without it, its jobs go to `settle_missing`.
+                    document = self.gpuc(argv[: argv.index("--host")], ok_codes=(0, 1))
             except GpucError as exc:
                 self.logger.info(f"gpuc status failed, asking again later: {exc}")
                 for info in active_jobs:
@@ -236,7 +268,10 @@ class Executor(RemoteExecutor):
         """A job no host listed: its host is gone, or no longer has it.
 
         `gpuc wait` is what reads the S3 mirror for a gone host, and it answers
-        at once for a job that has ended, which a job nobody lists has."""
+        at once for a job that has ended, which a job nobody lists has. A host
+        that stops answering between the `status` and this is the one case it
+        does not: `wait` gives it five minutes, and then the job is reported
+        lost although it may still be running."""
         argv = ["wait", job_id, "--json"]
         if host:
             argv += ["--host", host]
@@ -248,6 +283,24 @@ class Executor(RemoteExecutor):
         if final.get("error"):
             return None, str(final["error"])
         return final.get("status"), final.get("reason")
+
+    def report_job_success(self, job_info: SubmittedJobInfo) -> None:
+        self.settled(job_info)
+        super().report_job_success(job_info)
+
+    def report_job_error(self, job_info: SubmittedJobInfo, msg: Any = None, **kwargs: Any) -> None:
+        self.settled(job_info)
+        super().report_job_error(job_info, msg, **kwargs)
+
+    def settled(self, job_info: SubmittedJobInfo) -> None:
+        with self.in_flight_lock:
+            self.in_flight.pop(job_info.external_jobid or "", None)
+
+    def cancel(self) -> None:
+        with self.in_flight_lock:
+            in_flight = list(self.in_flight.values())
+        self.cancel_jobs(in_flight)
+        self.shutdown()
 
     def cancel_jobs(self, active_jobs: list[SubmittedJobInfo]) -> None:
         def cancel(info: SubmittedJobInfo) -> str | None:
