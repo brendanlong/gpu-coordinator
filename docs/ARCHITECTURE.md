@@ -615,7 +615,9 @@ hold to, whatever the flags:
   the location carries that trouble for the caller to judge, never hidden.
   A host the index names that this machine has no entry for is the same
   trouble in its final form (`Forgotten`: a rental that ended and was
-  forgotten). One rule, `actions.mirror_is_the_answer`, says what the
+  forgotten); one whose registry entry this build could not read is not
+  (`UnreadableEntry`): it is a host that was not asked, and never "no such
+  job". One rule, `actions.mirror_is_the_answer`, says what the
   trouble costs: a host that is *gone* (its pod ended, or forgotten) is read
   from the mirror now, and that is the answer, exit 0; one that is merely
   unreachable may still hold the job, so `wait` retries it for

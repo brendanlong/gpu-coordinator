@@ -577,11 +577,12 @@ def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
     are timestamps, so they cannot collide, and looking the name up locally
     keeps `gpuc ssh <host>` from asking every host whether it knows a job.
     """
-    registry = open_registry().named()
+    read = open_registry()
+    registry = read.named()
     entry = registry.hosts.get(args.target)
     if entry is not None:
         return entry, entry.remote_home, None
-    entry = locate(args.target, registry, args.host).require_entry()
+    entry = locate(args.target, registry, args.host, skipped=read.skipped).require_entry()
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
     return entry, f"{job_dir}/workdir", job_dir
 
@@ -712,7 +713,8 @@ def cmd_logs(args: argparse.Namespace) -> Answer:
     check_interval(args, polls=args.follow)
     settings = load_settings()
     if args.follow_forever:
-        location = locate(args.job_id, open_registry().named(), args.host, settings)
+        read = open_registry()
+        location = locate(args.job_id, read.named(), args.host, settings, skipped=read.skipped)
         session = location.session or open_session(location.require_entry(), settings)
         return _follow_forever(session, args.job_id, args.lines)
     if args.follow:

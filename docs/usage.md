@@ -676,10 +676,12 @@ has the same shape plus `unused` (no memory held, no work running) and
 `{job_id, name, host, host_state, requeue, requeued_from, submitted_at,
 s3_prefix, outputs_lost}`. `host_state` is what this run found the job's host
 to be -- `answered` (and it does not have the job: the host lost its state, or
-purged it), `unreachable`, `pod_dead`, `pod_gone` or `not_registered` -- and
-`requeue` is whether `gpuc requeue` is the way back: true for `answered`,
-`pod_gone` and `not_registered`, false for a host that could not be asked or
-a stopped pod, which may still hold the job. The text form says the same after
+purged it), `unreachable`, `pod_dead`, `pod_gone`, `not_registered` or
+`unreadable_entry` (its registry entry did not validate; see `errors`) -- and
+`requeue` is whether `gpuc requeue` is the way back: true for `answered` and
+`pod_gone`, true for `not_registered` only when the mirror shows the job
+ended (that name may be another machine's for a live box), false for a host
+that could not be asked or a stopped pod, which may still hold the job. The text form says the same after
 each line and offers the hint only for a job it is true of.
 
 Rules for anything automated:

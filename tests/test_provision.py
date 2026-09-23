@@ -13,6 +13,7 @@ import re
 import urllib.error
 from collections.abc import Callable
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -501,6 +502,31 @@ def test_a_network_failure_at_the_provider_is_a_provider_error(
     with pytest.raises(ProviderError) as caught:
         RunPodProvider(api_key="k").get("pod1")
     assert "GET" in str(caught.value) and "/pods/pod1" in str(caught.value)
+
+
+def test_a_failure_while_the_body_is_read_is_a_provider_error_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connection opened and then reset mid-body: the same `OSError`, one
+    call later, and the same callers would have let it through."""
+    from gpuc.control.providers.runpod import RunPodProvider
+
+    class Resetting:
+        headers: ClassVar[dict[str, str]] = {}
+
+        def __enter__(self) -> Resetting:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            raise OSError(104, "reset")
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_, **__: Resetting())
+    with pytest.raises(ProviderError) as caught:
+        RunPodProvider(api_key="k").get("pod1")
+    assert "reset" in str(caught.value)
 
 
 def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_path: Path) -> None:

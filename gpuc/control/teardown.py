@@ -167,6 +167,9 @@ def inspect(target: Target, settings: Settings, provider: Provider) -> Terminati
             f"pod {target.pod_id} is not registered on this machine, so nothing here can "
             f"ask what it is running"
         )
+        # Only what the provider actually said: a read that failed leaves
+        # `target.pod` None, and None is not a dead pod.
+        result.pod_dead = target.pod is not None and provider.is_dead(target.pod)
         return result
     view = status_mod.gather(target.entry, settings, provider=provider)
     target.pod = view.pod or target.pod

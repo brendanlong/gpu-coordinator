@@ -245,7 +245,8 @@ def requeue_job(
         # Where the job ran, by the same lookup every other job command uses:
         # the index, then every registered host. A second client with no
         # index of its own still finds it, and an id nobody knows is exit 4.
-        location = locate(job_id, open_registry().named(), host, settings)
+        read = open_registry()
+        location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
         trouble = location.trouble
         if location.entry is None or trouble is not None:
             gone = trouble is not None and mirror_is_the_answer(trouble)

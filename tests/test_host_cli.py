@@ -539,3 +539,15 @@ def test_status_steps_over_a_borrower_short_of_somebody_elses_card(
         "it needs 1 shared card(s) somebody else is using, and when they stop "
         "is not something this host can predict"
     )
+
+
+def test_cancel_of_a_job_whose_state_cannot_be_read_is_a_refusal_not_a_traceback(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No document at all reads as a host that vanished; this host is here
+    and has the job, it just cannot say what state it is in."""
+    job_id = queue.enqueue(make_spec())
+    paths.state_file(job_id).write_text("{not json")
+    code, payload = run(capsys, "cancel", job_id)
+    assert code == 1 and isinstance(payload, dict)
+    assert payload["job_id"] == job_id and "error" in payload and "missing" not in payload

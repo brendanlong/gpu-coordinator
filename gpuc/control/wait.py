@@ -163,10 +163,16 @@ class Watch:
         provider: Provider | None = None,
         sessions: dict[str, HostSession] | None = None,
         gone: dict[str, str] | None = None,
+        unknown: dict[str, str] | None = None,
+        unaskable: dict[str, tuple[str, str]] | None = None,
     ) -> None:
         """`targets` is `(job_id, host name, entry)`, the entry None for a host
         this machine has forgotten; `gone` is the reason each host the locator
-        already found gone is not going to be asked at all."""
+        already found gone is not going to be asked at all; `unknown` is the
+        ids no host knows, settled before the first poll so the others are
+        still waited for and reported; `unaskable` maps an id to the host the
+        index names for it and why that host cannot be opened here, which is
+        a failure to report, not the mirror's moment."""
         # Resolved once here rather than per use: the mirror fallback needs a
         # real `Settings` to find a bucket in, and a watch outlives many reads.
         self.settings = settings if settings is not None else load_settings()
@@ -179,6 +185,18 @@ class Watch:
             job_id: Watched(job_id, host, mirror_prefix=self.index.mirror_prefix(job_id, entry))
             for job_id, host, entry in targets
         }
+        self.jobs.update(
+            {
+                job_id: Watched(job_id, "no host", error=reason, missing=True)
+                for job_id, reason in (unknown or {}).items()
+            }
+        )
+        self.jobs.update(
+            {
+                job_id: Watched(job_id, host, error=reason)
+                for job_id, (host, reason) in (unaskable or {}).items()
+            }
+        )
         self.by_host: dict[str, list[str]] = {}
         for job_id, host, _ in targets:
             self.by_host.setdefault(host, []).append(job_id)
@@ -330,7 +348,7 @@ class Watch:
             if self._from_mirror(watched):
                 continue
             watched.error = (
-                f"host {name} is gone and the mirror has no final state for this job: {why}"
+                f"host {name} cannot be asked and the mirror has no final state for this job: {why}"
                 if gone
                 else f"host {name} could not be asked for {waited}: {why}"
             )
@@ -360,23 +378,46 @@ def start(
 ) -> Watch:
     """Resolve each id to a host. A host asked on the way is kept: its
     session is the one the poll goes on using."""
-    registry = open_registry().named()
+    read = open_registry()
+    registry = read.named()
     settings = settings if settings is not None else load_settings()
     provider = provider_for(list(registry.hosts.values()), settings, report)
     targets: list[tuple[str, str, HostEntry | None]] = []
     sessions: dict[str, HostSession] = {}
     gone: dict[str, str] = {}
+    unknown: dict[str, str] = {}
+    unaskable: dict[str, tuple[str, str]] = {}
     # Deduplicated, so `xargs gpuc wait` on a list with a repeat in it
     # neither polls twice nor prints the outcome twice.
     for job_id in dict.fromkeys(job_ids):
-        location = locate(job_id, registry, host, settings, provider=provider)
+        try:
+            location = locate(
+                job_id, registry, host, settings, provider=provider, skipped=read.skipped
+            )
+        except NotFound as exc:
+            # One typo in a list of twenty must not throw away the nineteen:
+            # it is reported with them, and makes the exit 4.
+            unknown[job_id] = str(exc).splitlines()[0]
+            continue
+        trouble = location.trouble
+        if location.entry is None and trouble is not None and not mirror_is_the_answer(trouble):
+            unaskable[job_id] = (location.host, trouble.reason)
+            continue
         targets.append((job_id, location.host, location.entry))
         if location.session is not None:
             sessions[location.host] = location.session
-        trouble = location.trouble
         if trouble is not None and mirror_is_the_answer(trouble):
             gone[location.host] = trouble.reason
-    return Watch(targets, settings, report=report, provider=provider, sessions=sessions, gone=gone)
+    return Watch(
+        targets,
+        settings,
+        report=report,
+        provider=provider,
+        sessions=sessions,
+        gone=gone,
+        unknown=unknown,
+        unaskable=unaskable,
+    )
 
 
 def document(waited: Sequence[Watched]) -> dict[str, Any]:

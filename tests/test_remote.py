@@ -30,17 +30,24 @@ MOTD = """Welcome to Ubuntu 24.04!
 class ScriptedTransport:
     host = "gpubox"
 
-    def __init__(self, stdout: str, returncode: int = 0, raises: Exception | None = None) -> None:
+    def __init__(
+        self,
+        stdout: str,
+        returncode: int = 0,
+        raises: Exception | None = None,
+        stderr: str = "",
+    ) -> None:
         self.stdout = stdout
         self.returncode = returncode
         self.raises = raises
+        self.stderr = stderr
         self.commands: list[str] = []
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
         self.commands.append(command)
         if self.raises is not None:
             raise self.raises
-        return CommandResult(self.host, ["ssh", command], self.returncode, self.stdout, "")
+        return CommandResult(self.host, ["ssh", command], self.returncode, self.stdout, self.stderr)
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
         raise AssertionError("not used")
@@ -70,9 +77,9 @@ class Recorder(ScriptedTransport):
         self.puts[remote_path] = (text, mode)
 
 
-def session(stdout: str, returncode: int = 0) -> HostSession:
+def session(stdout: str, returncode: int = 0, stderr: str = "") -> HostSession:
     entry = host_entry(name="gpubox", kind="ssh", ssh="u@h")
-    transport: Transport = cast("Transport", ScriptedTransport(stdout, returncode))
+    transport: Transport = cast("Transport", ScriptedTransport(stdout, returncode, stderr=stderr))
     return HostSession(entry, transport, "/home/u/.gpuc", "python3", HostConfigRead({}))
 
 
@@ -272,3 +279,12 @@ def test_usable_python_takes_uvs_answer_or_a_new_enough_python3() -> None:
     assert usable_python("/usr/bin/python3 3.11.4\n") == "/usr/bin/python3"
     assert usable_python("/usr/bin/python3 3.8.10\n") is None
     assert usable_python("") is None
+
+
+def test_a_reused_session_that_fails_still_says_what_ssh_said() -> None:
+    """`wait` polls and the job verbs go on using the session the locator
+    opened, so its failures are the ones most people see; a reason made of
+    the argv and an exit code names nothing."""
+    with pytest.raises(RemoteError) as caught:
+        session("", returncode=255, stderr=SSH_STDERR).host_cli("status")
+    assert reason_of(caught.value) == "root@1.2.3.4: Permission denied (publickey)."

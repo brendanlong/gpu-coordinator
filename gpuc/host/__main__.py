@@ -280,6 +280,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         status = queue.cancel(args.job_id)
     except FileNotFoundError as exc:
         return _no_such_job(args.job_id, str(exc))
+    except (OSError, RuntimeError) as exc:
+        print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
+        return 1
     print(json.dumps({"job_id": args.job_id, "status": status}))
     return 0
 

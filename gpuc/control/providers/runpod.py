@@ -133,7 +133,10 @@ class RunPodProvider(Provider):
         body: Any = None,
     ) -> Any:
         with self._open(method, path, params=params, body=body) as response:
-            raw = response.read()
+            try:
+                raw = response.read()
+            except OSError as error:
+                raise ProviderError(f"{method} {path}: {error}") from error
             pause = _rate_limit_pause(response.headers.get("RateLimit"))
             if pause:
                 self._sleep(pause)

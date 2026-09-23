@@ -256,7 +256,9 @@ def test_status_all_json_carries_the_jobs_only_the_index_knows(
     )
     assert entry["requeued_from"] == "20250101-000000-000000"
     assert entry["outputs_lost"] is False
-    assert (entry["host_state"], entry["requeue"]) == ("not_registered", True)
+    # Not registered here, and no mirror to say the job ended: for all this
+    # machine knows, `gone-box` is another machine's name for a live host.
+    assert (entry["host_state"], entry["requeue"]) == ("not_registered", False)
     assert main(["status", "--json"]) == EXIT_OK
     assert status_json(capsys)["unhosted"] == []
 
@@ -278,31 +280,57 @@ def test_status_all_labels_an_index_only_job_by_what_its_host_is(
         return HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=1.0)
 
     monkeypatch.setattr(status_mod, "gather", gather)
+    prefix = "s3://bucket/gpuc/gone-pod"
     for job_id, host in [
         ("20260101-000000-aaaaaa", "down"),
         ("20260101-000000-bbbbbb", "gpubox"),
         ("20260101-000000-cccccc", "gone-pod"),
+        ("20260101-000000-dddddd", "gone-pod"),
+        ("20260101-000000-eeeeee", "gpuc-old"),
     ]:
-        LocalIndex().record(IndexEntry(job_id=job_id, host=host, name="j"))
+        LocalIndex().record(IndexEntry(job_id=job_id, host=host, name="j", s3_prefix=prefix))
+    # The mirror shows one of the unregistered host's jobs ended and the other
+    # still running: only the first is anyone's to requeue.
+    from tests.fakes3 import FakeS3Client
+
+    states = {
+        "bucket/gpuc/gone-pod/jobs/20260101-000000-cccccc/state.json": b'{"status": "succeeded"}',
+        "bucket/gpuc/gone-pod/jobs/20260101-000000-dddddd/state.json": b'{"status": "running"}',
+    }
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client(objects=states))
+    )
+    config_file().write_text('s3_bucket = "bucket"\n')
+    # A registry entry this build refuses to read is a host that was not asked.
+    write_hosts(
+        {
+            **json.loads(hosts_file().read_text()),
+            "hosts": {**json.loads(hosts_file().read_text())["hosts"], "gpuc-old": LEGACY_RENTAL},
+        }
+    )
     capsys.readouterr()
     assert main(["status", "--all", "--json"]) == EXIT_ERROR
-    by_host = {e["host"]: e for e in status_json(capsys)["unhosted"]}
-    assert (by_host["down"]["host_state"], by_host["down"]["requeue"]) == ("unreachable", False)
-    assert (by_host["gpubox"]["host_state"], by_host["gpubox"]["requeue"]) == ("answered", True)
-    assert (by_host["gone-pod"]["host_state"], by_host["gone-pod"]["requeue"]) == (
-        "not_registered",
-        True,
-    )
+    by_job = {e["job_id"]: e for e in status_json(capsys)["unhosted"]}
+    state_of = {job_id: (e["host_state"], e["requeue"]) for job_id, e in by_job.items()}
+    assert state_of == {
+        "20260101-000000-aaaaaa": ("unreachable", False),
+        "20260101-000000-bbbbbb": ("answered", True),
+        "20260101-000000-cccccc": ("not_registered", True),
+        "20260101-000000-dddddd": ("not_registered", False),
+        "20260101-000000-eeeeee": ("unreadable_entry", False),
+    }
 
     assert main(["status", "--all"]) == EXIT_ERROR
     out = capsys.readouterr().out
     assert "host=down" in out and "may still be running there" in out
     assert "host=gpubox" in out and "does not have it" in out
+    assert "20260101-000000-dddddd" in out and "does not show it ended" in out
+    assert "host=gpuc-old" in out and "registry entry could not be read" in out
     assert "bring one back with: gpuc requeue 20260101-000000-bbbbbb" in out
 
     # Only the unreachable host's job left: nothing to offer a requeue for.
-    (LocalIndex().directory / "20260101-000000-bbbbbb.json").unlink()
-    (LocalIndex().directory / "20260101-000000-cccccc.json").unlink()
+    for job_id in ("bbbbbb", "cccccc", "dddddd", "eeeeee"):
+        (LocalIndex().directory / f"20260101-000000-{job_id}.json").unlink()
     assert main(["status", "--all"]) == EXIT_ERROR
     assert "bring one back" not in capsys.readouterr().out
 
@@ -1417,3 +1445,20 @@ def test_status_json_says_what_order_the_queue_runs_in(
     text = capsys.readouterr().out
     assert "queued  urgent (20260915-140100-cccccc) prio=10 needs 2 gpus est 30m" in text
     assert "starts in ~1h00m" in text
+
+
+def test_a_job_on_a_host_this_build_cannot_read_is_not_a_missing_job(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The index names a host whose registry entry did not validate. That host
+    may be running the job: not exit 4, and not the mirror as the answer."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "gpuc-old": LEGACY_RENTAL}})
+    monkeypatch.setattr(status_mod, "gather", _answered_with_no_jobs)
+    LocalIndex().record(IndexEntry(job_id="20260101-000000-aaaaaa", host="gpuc-old", name="j"))
+    capsys.readouterr()
+    assert main(["cancel", "20260101-000000-aaaaaa"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "registry entry could not be read" in err
+    assert "no registered host knows" not in err

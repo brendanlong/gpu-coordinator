@@ -255,7 +255,7 @@ class HostSession:
                 f"`python -m gpuc.host {args}` exited {result.returncode}\n"
                 f"{_tail(result.output)}\n"
                 f"If the package is missing, run: gpuc host bootstrap {self.entry.name}",
-            )
+            ) from TransportError(result)
         return result
 
     def host_json(

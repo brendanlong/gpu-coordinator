@@ -402,3 +402,19 @@ def test_forgotten_is_what_happened_not_what_was_asked(
 
     assert (result.terminated, result.forgotten) == (True, False)
     assert result.document()["forgotten"] is False
+
+
+def test_an_unregistered_pod_the_provider_reports_stopped_is_ended_without_force(
+    control_env: Path,
+) -> None:
+    """Nothing here can ask it, but the provider's own word that its container
+    is not running is the same answer it is for a registered one: nothing
+    can be running there, and the bill is the only thing left to stop."""
+    fake = FakeProvider()
+    stopped = running_pod("gpuc-leak-bbb", "podL").model_copy(update={"status": "EXITED"})
+    fake.adopt(stopped, PodScript(ssh_after_polls=0))
+
+    result = terminate(fake, "podL")
+
+    assert fake.terminated == ["podL"]
+    assert (result.terminated, result.checked) == (True, False)

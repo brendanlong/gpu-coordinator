@@ -679,3 +679,44 @@ def test_a_follow_retries_a_log_that_is_not_written_yet_and_a_read_does_not() ->
     assert tail_command("/j/log.txt", 10, follow=True, retry=True).startswith("tail -F ")
     assert tail_command("/j/log.txt", 10, follow=True).startswith("tail -f ")
     assert tail_command("/j/log.txt", 10).startswith("tail -n ")
+
+
+def test_wait_without_a_host_still_reports_the_jobs_it_found_beside_the_one_nobody_has(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without `--host` the locator asks every host for each id, and the id
+    nobody has used to be exit 4 before anything was waited for."""
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    unknown = "20260101-000000-aaaaaa"
+    assert main(["wait", JOB, unknown, "--json"]) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    by_id = {job["job_id"]: job for job in document["jobs"]}
+    assert by_id[JOB]["status"] == "succeeded" and by_id[JOB]["error"] is None
+    assert "no registered host knows" in by_id[unknown]["error"]
+    assert document["errors"] == [by_id[unknown]["error"]]
+
+
+def test_wait_reports_a_job_whose_hosts_registry_entry_it_cannot_read(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Not gone, so not the mirror's moment; not askable, so not five minutes
+    of polling either: one line saying which entry to fix, and exit 1."""
+    from gpuc.control.config import hosts_file
+
+    document = json.loads(hosts_file().read_text())
+    document["hosts"]["gpuc-old"] = {
+        "name": "gpuc-old",
+        "kind": "runpod",
+        "ssh": "root@1.2.3.4",
+        "pod_id": "podOLD",
+    }
+    hosts_file().write_text(json.dumps(document))
+    other = "20260101-000000-aaaaaa"
+    LocalIndex().record(IndexEntry(job_id=other, host="gpuc-old", name="j"))
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    assert main(["wait", JOB, other, "--json"]) == EXIT_ERROR
+    document = json.loads(capsys.readouterr().out)
+    by_id = {job["job_id"]: job for job in document["jobs"]}
+    assert by_id[JOB]["status"] == "succeeded"
+    assert by_id[other]["host"] == "gpuc-old"
+    assert "registry entry could not be read" in by_id[other]["error"]
