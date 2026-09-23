@@ -63,6 +63,7 @@ from gpuc.control.remote import (
     RemoteError,
     Unreachable,
     ask,
+    reason_of,
 )
 from gpuc.control.remote import config_file as remote_config_file
 from gpuc.control.s3index import (
@@ -906,7 +907,7 @@ def read_log(
             purged = job_dir_gone(session, job_id)
             why = (result.output.strip().splitlines() or ["no log file on the host"])[-1]
         except (RemoteError, TransportError) as exc:
-            why = str(exc).splitlines()[0]
+            why = reason_of(exc)
     else:
         why = reached.reason
     # A job dir that is gone entirely is what `gpuc clean --purge` does on
