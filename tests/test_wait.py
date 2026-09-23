@@ -496,6 +496,47 @@ def test_wait_json_carries_the_error_and_where_the_answer_came_from(
     assert document["errors"] == [job["error"]]
 
 
+def test_wait_reports_the_jobs_it_found_and_exits_four_for_the_one_nobody_has(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One typo in a list of twenty must not throw away nineteen outcomes."""
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    unknown = "20260101-000000-aaaaaa"
+    assert main(["wait", JOB, unknown, "--host", "local", "--json"]) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    by_id = {job["job_id"]: job for job in document["jobs"]}
+    assert by_id[JOB]["status"] == "succeeded" and by_id[JOB]["error"] is None
+    assert "has no job" in by_id[unknown]["error"]
+    assert document["errors"] == [by_id[unknown]["error"]]
+
+
+def test_wait_reads_the_mirror_at_once_for_a_host_this_machine_has_forgotten(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ordinary end of a rental: the pod idled out, `status` forgot the
+    entry, and the index still names it. Nothing can be asked, so the mirror
+    is the answer -- not exit 4, and not five minutes of asking nobody."""
+    from tests.fakes3 import FakeS3Client
+
+    prefix = "s3://bucket/gpuc/gpuc-pod"
+    key = f"bucket/gpuc/gpuc-pod/jobs/{JOB}/state.json"
+    state = json.dumps({"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0})
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client",
+        property(lambda self: FakeS3Client(objects={key: state.encode()})),
+    )
+    config_file().write_text('s3_bucket = "bucket"\n')
+    LocalIndex().record(IndexEntry(job_id=JOB, host="gpuc-pod", name="lego-s4", s3_prefix=prefix))
+    sleeps = [0]
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: sleeps.__setitem__(0, sleeps[0] + 1))
+
+    assert main(["wait", JOB]) == EXIT_OK
+    captured = capsys.readouterr()
+    assert "succeeded" in captured.out and "from the S3 mirror" in captured.out
+    assert "not registered on this machine" in captured.err
+    assert sleeps[0] == 0
+
+
 # -- `gpuc logs -f` ------------------------------------------------------------
 
 
@@ -525,6 +566,35 @@ def test_follow_a_failed_job_exits_with_it(
     write_log(host_home, JOB, "no CUDA device\n")
     assert main(["logs", JOB, "-f"]) == EXIT_ERROR
     assert "failed (gpu-preflight)" in capfd.readouterr().out
+
+
+def test_follow_rides_out_a_blip_on_the_first_poll_like_wait_does(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A host that does not answer the first poll is the wait's trouble, not
+    exit 1 from opening the stream: the stream starts once the host answers,
+    and here the job has ended by then, so the tail is the ordinary read."""
+    from gpuc.control import remote
+
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    write_log(host_home, JOB, "epoch 1\nepoch 2\n")
+    real = remote.open_session
+    calls = [0]
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise TransportError(message="ssh: connect to host local port 22: Connection refused")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(remote, "open_session", flaky)
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: None)
+
+    assert main(["logs", JOB, "-f", "--host", "local"]) == EXIT_OK
+    captured = capfd.readouterr()
+    assert "epoch 2" in captured.out
+    assert captured.out.strip().endswith("on local: succeeded")
+    assert "Connection refused; still waiting" in captured.err
 
 
 def test_follow_streams_a_running_job_and_stops_when_it_ends(

@@ -301,8 +301,8 @@ class Dashboard:
     def api_logs(self, request: Request) -> Response:
         job_id = job_id_of(request)
         lines = min(int_param(request, "lines", 200), MAX_LOG_LINES)
-        entry, log = read_log(job_id, request.param("host") or None, lines, self.load_settings())
-        return Response.json(log.document(job_id, entry.name))
+        host, log = read_log(job_id, request.param("host") or None, lines, self.load_settings())
+        return Response.answer(log.answer(job_id, host))
 
     def api_cancel(self, request: Request) -> Response:
         job_id = job_id_of(request)

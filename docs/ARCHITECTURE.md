@@ -588,9 +588,16 @@ hold to, whatever the flags:
   (`actions.locate`): the job index, then asking each host. An id no host
   knows is exit 4 only once every host has answered; a host the index names
   that could not be asked still holds the job as far as anything knows, and
-  the location carries that trouble for the caller to judge -- `logs` and
-  `wait` read the mirror, a verb is exit 1 with the reason -- and never hides
-  it. The job index is one facade (`s3index.JobIndex`) over the local index
+  the location carries that trouble for the caller to judge, never hidden.
+  A host the index names that this machine has no entry for is the same
+  trouble in its final form (`Forgotten`: a rental that ended and was
+  forgotten). One rule, `actions.mirror_is_the_answer`, says what the
+  trouble costs: a host that is *gone* (its pod ended, or forgotten) is read
+  from the mirror now, and that is the answer, exit 0; one that is merely
+  unreachable may still hold the job, so `wait` retries it for
+  `TROUBLE_GRACE_S` before the mirror, `logs` prints the mirror's copy but
+  exits 1 with the reason, and every other verb is exit 1 with the reason.
+  The job index is one facade (`s3index.JobIndex`) over the local index
   and the mirror's, in that order, and the precedence is written once. A host
   name from the mirror's index is the *submitting* client's name for it, so
   it is asked first rather than believed; the local index's name is this
@@ -699,14 +706,18 @@ that reach outside the module:
 - A host that cannot be asked is *trouble*, not an answer: retried for
   `TROUBLE_GRACE_S`, then read from the **S3 mirror** (the spec's "the mirror is
   read only when the host is gone") through `actions.mirrored_outcome`, the
-  one reader of a mirrored `state.json`. A rental whose pod `ask` reports gone
-  skips the grace and is read from the mirror at once. Only if that has no
-  terminal state does the job get an `error`.
-- An id whose host answers and does not list it is exit 4, checked after the
-  first poll. A job that *was* listed and then vanishes is trouble, not a
-  missing id.
+  one reader of a mirrored `state.json`. A host `mirror_is_the_answer` calls
+  gone -- a rental whose pod `ask` reports gone, or one the locator found
+  forgotten -- skips the grace and is read from the mirror at once, without
+  a poll. Only if that has no terminal state does the job get an `error`.
+- An id whose host answers and does not list it is exit 4, decided after the
+  first poll -- for `logs -f` at once, for `wait` once the other jobs named
+  have been waited for and reported. A job that *was* listed and then
+  vanishes is trouble, not a missing id.
 - `logs -f` runs `tail -F` as a child writing straight to stdout while the loop
-  polls, and gives the stream `FLUSH_GRACE_S` to catch up before stopping it:
+  polls, started on the first poll the host answers (a host in trouble is the
+  loop's to retry, as for `wait`), and gives the stream `FLUSH_GRACE_S` to
+  catch up before stopping it:
   the runner's last log lines come after its terminal write, so the poll
   can be slightly ahead of the log. `-F` rather than `-f` follows a log that
   does not exist yet, and only from this path -- `Transport.tail()` keeps `-f`,

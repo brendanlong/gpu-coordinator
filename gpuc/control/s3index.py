@@ -279,16 +279,18 @@ class JobIndex:
             return entries, f"could not read the S3 index: {exc}"
         return entries, None
 
-    def mirror_prefix(self, job_id: str, entry: HostEntry) -> str | None:
+    def mirror_prefix(self, job_id: str, entry: HostEntry | None) -> str | None:
         """Where this job's own mirror is: the index's answer, else the host's.
 
         The job's is the one that counts -- a host whose `s3_prefix` changed
         after the job ran still has the old jobs under the old prefix. The
         host's is the cached one, and that is right here: this is the last
         resort for a host that is gone, which is the one host nothing can ask.
+        A host this machine has forgotten has no cache to fall back on.
         """
         indexed = self.get(job_id)
-        return (indexed.s3_prefix if indexed else None) or entry.config.s3_prefix
+        cached = entry.config.s3_prefix if entry is not None else None
+        return (indexed.s3_prefix if indexed else None) or cached
 
     def mirrored_state(self, job_id: str, prefix: str | None) -> dict[str, Any] | None:
         """The job's mirrored `state.json`, or None for anything but a document."""

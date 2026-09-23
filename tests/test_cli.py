@@ -898,7 +898,7 @@ def test_a_second_client_asks_the_host_the_mirror_names_first(
     asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
 
     location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
-    assert location.entry.name == "gpubox"
+    assert location.host == "gpubox"
     assert location.index is not None and location.index.s3_prefix == "s3://bkt/gpuc/gpubox"
     assert asked == ["gpubox"]
     # The session that found it is the one the caller goes on using.
@@ -919,7 +919,7 @@ def test_a_mirror_index_naming_a_host_that_does_not_know_the_job_is_not_believed
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     asked = _probes(monkeypatch, {"lab": {"jobs": [{"job_id": "j1"}]}})
 
-    assert locate("j1", load_registry(), None, Settings(s3_bucket="bkt")).entry.name == "lab"
+    assert locate("j1", load_registry(), None, Settings(s3_bucket="bkt")).host == "lab"
     assert asked == ["gpu1", "lab"]
 
 
@@ -936,7 +936,7 @@ def test_a_job_the_mirror_has_no_entry_for_is_found_by_asking_the_hosts(
     asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
 
     location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
-    assert location.entry.name == "gpubox"
+    assert location.host == "gpubox"
     assert location.index is None
     assert "gpubox" in asked
 
@@ -986,7 +986,7 @@ def test_a_job_the_index_puts_on_an_unreachable_host_stays_on_it(
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     _probes(monkeypatch, {"gpubox": RemoteError("gpubox", "printf %s", "no route to host")})
     location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
-    assert location.entry.name == "gpubox"
+    assert location.host == "gpubox"
     assert location.trouble is not None and "no route to host" in location.trouble_reason
 
 
@@ -1000,6 +1000,92 @@ def test_a_verb_on_a_job_whose_host_is_down_is_exit_one_with_the_reason(
     document = one_document(capsys)
     assert document["exit_code"] == EXIT_ERROR
     assert "no route to host" in str(document["error"])
+
+
+def _mirrored_log(monkeypatch: pytest.MonkeyPatch, host: str, job_id: str) -> FakeS3Client:
+    """A bucket holding `job_id`'s log and state under `host`'s prefix, plus the
+    S3 index entry the submitting machine wrote for it."""
+    from gpuc.control.s3index import IndexEntry, S3Index
+
+    prefix = f"s3://bkt/gpuc/{host}"
+    client = FakeS3Client(
+        objects={
+            f"bkt/gpuc/{host}/jobs/{job_id}/log.txt": b"epoch 1\nepoch 2\n",
+            f"bkt/gpuc/{host}/jobs/{job_id}/state.json": b'{"status": "succeeded"}',
+        }
+    )
+    S3Index("bkt", client).put_index(IndexEntry(job_id=job_id, host=host, s3_prefix=prefix))
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    config_file().write_text('s3_bucket = "bkt"\n')
+    return client
+
+
+def test_logs_of_a_job_on_a_host_this_machine_has_forgotten_are_the_mirrors(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rental ended and `status` forgot it; the index still names it. That
+    host is gone, so the mirror is the answer and nothing failed: exit 0."""
+    job_id = "20260101-000000-aaaaaa"
+    register_host(name="gpubox", ssh="me@gpubox")
+    _mirrored_log(monkeypatch, "gpuc-pod", job_id)
+    _probes(monkeypatch, {})
+    capsys.readouterr()
+    assert main(["logs", job_id, "--json"]) == 0
+    document = one_document(capsys)
+    assert (document["source"], document["host"]) == ("s3", "gpuc-pod")
+    assert document["lines"] == ["epoch 1", "epoch 2"]
+    assert any("not registered on this machine" in note for note in cast("list[str]", document["notes"]))
+
+
+def test_logs_of_a_job_on_an_unreachable_host_print_the_mirror_and_still_fail(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that is only unreachable may hold a newer log than its mirror:
+    what the mirror has is printed (as much as can be done) and the command
+    exits 1 with the reason, never 0 as if that were the answer."""
+    job_id = "20260101-000000-aaaaaa"
+    register_host(name="gpubox", ssh="me@gpubox")
+    _mirrored_log(monkeypatch, "gpubox", job_id)
+    _probes(monkeypatch, {"gpubox": RemoteError("gpubox", "printf %s", "no route to host")})
+    capsys.readouterr()
+    assert main(["logs", job_id]) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "epoch 2" in captured.out
+    assert "could not read the host log: no route to host" in captured.err
+    assert "falling back to the S3 mirror" in captured.err
+
+
+def test_logs_of_a_job_whose_rental_has_ended_are_the_mirrors_and_exit_zero(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "20260101-000000-aaaaaa"
+    register_host(name="gpuc-pod", kind="rental", pod_id="pod-1", ssh="root@1.2.3.4")
+    _mirrored_log(monkeypatch, "gpuc-pod", job_id)
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: FakeProvider())
+    _probes(monkeypatch, {"gpuc-pod": RemoteError("gpuc-pod", "printf %s", "must not be asked")})
+    capsys.readouterr()
+    assert main(["logs", job_id]) == 0
+    captured = capsys.readouterr()
+    assert "epoch 2" in captured.out
+    assert "this rental has ended" in captured.err
+
+
+def test_requeue_of_a_job_whose_host_was_forgotten_needs_another_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 1 naming the gone host and the way on, not exit 4: the spec is in
+    the mirror and the job is real, it just has nowhere to go back to."""
+    from gpuc.control.s3index import S3Index
+
+    job_id = "20260101-000000-aaaaaa"
+    register_host(name="gpubox", ssh="me@gpubox")
+    client = _mirrored_log(monkeypatch, "gpuc-pod", job_id)
+    S3Index("bkt", client).put_spec_document(job_id, {"command": "train", "gpus": 1})
+    _probes(monkeypatch, {})
+    capsys.readouterr()
+    assert main(["requeue", job_id]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "gpuc-pod, which is gone" in err and "--host" in err
 
 
 def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path) -> None:

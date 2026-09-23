@@ -571,20 +571,63 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
 
 
 @dataclass
+class Forgotten:
+    """The index names a host this machine has no record of: the ordinary end
+    of a rental, whose entry `status` forgot once the pod was gone. Nothing
+    can be asked, so the mirror is the answer, as for `PodGone`."""
+
+    host: str
+
+    @property
+    def reason(self) -> str:
+        return (
+            f"host {self.host} is not registered on this machine (a rental that ended is "
+            f"forgotten), so it cannot be asked"
+        )
+
+
+Trouble = Unreachable | PodDead | PodGone | Forgotten
+"""Why a job's host could not confirm it holds the job."""
+
+
+def mirror_is_the_answer(trouble: Trouble) -> bool:
+    """The one rule `logs` and `wait` read the mirror by.
+
+    The spec reads the mirror only when the host is *gone*: a rental whose
+    pod the provider no longer has, or a host the index names that this
+    machine has forgotten. For those the mirror is the answer, now, and
+    nothing failed. A host that is merely unreachable, or a pod that is
+    stopped but still there, may still hold the job: `wait` keeps asking
+    for `TROUBLE_GRACE_S` before it reads the mirror, and `logs` prints what
+    the mirror has -- doing as much as it can -- but as a failure, exit 1
+    with the reason, never as the answer.
+    """
+    return isinstance(trouble, (PodGone, Forgotten))
+
+
+@dataclass
 class Location:
     """Where a job is: its host, its index entry, and what the host said when
-    it was asked to find it (None when nothing had to be asked)."""
+    it was asked to find it (None when nothing had to be asked). `entry` is
+    None only for a host this machine has forgotten (`Forgotten`)."""
 
-    entry: HostEntry
+    entry: HostEntry | None
     index: IndexEntry | None = None
-    asked: Asked | None = None
+    asked: Asked | Forgotten | None = None
+
+    @property
+    def host(self) -> str:
+        if self.entry is not None:
+            return self.entry.name
+        assert isinstance(self.asked, Forgotten)
+        return self.asked.host
 
     @property
     def session(self) -> HostSession | None:
         return self.asked.session if isinstance(self.asked, Answered) else None
 
     @property
-    def trouble(self) -> Unreachable | PodDead | PodGone | None:
+    def trouble(self) -> Trouble | None:
         """The index says the job is on this host, and the host could not be
         asked to confirm it: the caller decides whether that is the mirror's
         moment or a failure."""
@@ -594,6 +637,16 @@ class Location:
     def trouble_reason(self) -> str:
         trouble = self.trouble
         return trouble.reason if trouble is not None else ""
+
+    def require_entry(self) -> HostEntry:
+        """The host, for a caller that needs to open it -- which a forgotten
+        host cannot be: the job's remains are in the mirror, if anywhere."""
+        if self.entry is None:
+            raise CliError(
+                f"job's host {self.host} is gone: {self.trouble_reason}\n"
+                f"`gpuc logs` reads its mirror; `gpuc requeue <id> --host <name>` re-runs it."
+            )
+        return self.entry
 
 
 def locate(
@@ -611,9 +664,13 @@ def locate(
     host, which need not be this machine's: it is asked first, not believed.
     A host the index names that cannot be asked is still the answer -- the job
     is there as far as anything knows -- carried as `trouble` for the caller
-    to judge, never hidden. An id no answering host knows is exit 4 only when
-    every host answered: with one unreachable, the job may well be on it, and
-    "no such job" would be a lie told over a connection error.
+    to judge, never hidden. So is a host the index names that this machine
+    has no entry for (`Forgotten`): that is a rental that ended and was
+    forgotten, the ordinary end of one, and `gpuc logs` and `gpuc wait` on
+    its jobs must reach the mirror rather than "no such job". An id no
+    answering host knows is exit 4 only when every host answered: with one
+    unreachable, the job may well be on it, and "no such job" would be a lie
+    told over a connection error.
     """
     settings = settings if settings is not None else load_settings()
     if explicit:
@@ -641,6 +698,8 @@ def locate(
             unasked.append(f"{entry.name}: {asked.reason}")
     if named is not None and named_trouble is not None:
         return Location(named, index, named_trouble)
+    if index is not None and named is None and not unasked:
+        return Location(None, index, Forgotten(index.host))
     if unasked:
         raise CliError(
             f"no host that answered knows job {job_id}, and these could not be asked:\n"
@@ -685,13 +744,19 @@ def job_verb(
     """
     registry = open_registry().named()
     location = locate(job_id, registry, host, settings)
+    trouble = location.trouble
+    if location.entry is None or trouble is not None:
+        gone = trouble is not None and mirror_is_the_answer(trouble)
+        raise CliError(
+            f"job {job_id} is on host {location.host}, which "
+            f"{'is gone' if gone else 'could not be asked'}: {location.trouble_reason}"
+        )
     entry = location.entry
-    provider = provider_for([entry], settings)
-    asked = location.trouble or ask(
+    asked = ask(
         entry,
         f"{verb} {shlex.quote(job_id)}{args}",
         settings,
-        provider=provider,
+        provider=provider_for([entry], settings),
         session=location.session,
         check=False,
     )
@@ -723,7 +788,7 @@ def cancel_job(job_id: str, host: str | None, settings: Settings) -> dict[str, A
     location, _, document, _ = job_verb("cancel", job_id, host, settings)
     # The host's own word for what it did: `cancelled` for a queued job it
     # dequeued, `cancelling` for a running one whose runner has been marked.
-    return {"job_id": job_id, "host": location.entry.name, "status": document["status"]}
+    return {"job_id": job_id, "host": location.host, "status": document["status"]}
 
 
 def check_priority(priority: int) -> None:
@@ -738,7 +803,7 @@ def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings
     )
     return {
         "job_id": job_id,
-        "host": location.entry.name,
+        "host": location.host,
         "priority": priority,
         "warnings": warnings,
         **placement_after(session, job_id, settings),
@@ -768,7 +833,7 @@ def preempt_job(
     )
     return {
         "job_id": job_id,
-        "host": location.entry.name,
+        "host": location.host,
         "status": document["status"],
         "priority": document.get("priority"),
         "warnings": warnings,
@@ -850,14 +915,14 @@ def estimate_job(
         # Otherwise a host whose answer lacks the key reports a successful
         # *clear* of a job it never touched.
         raise CliError(
-            f"host {location.entry.name} did not say what estimate it recorded for {job_id}: "
+            f"host {location.host} did not say what estimate it recorded for {job_id}: "
             f"{json.dumps(document)[:200]}"
         )
     if document.get("warning"):
         warnings.insert(0, str(document["warning"]))
     return {
         "job_id": job_id,
-        "host": location.entry.name,
+        "host": location.host,
         "estimated_runtime_min": recorded,
         "status": document["status"],
         "warnings": warnings,
@@ -873,6 +938,11 @@ class LogText:
     location: str | None
     text: str = ""
     notes: list[str] = field(default_factory=list)
+    failure: str | None = None
+    """Why this is not the answer: the host may still hold the log and could
+    not be asked. The mirror was read anyway (doing as much as it can), but
+    the command exits 1 with this. None when the host produced the log, or
+    is gone and the mirror is the answer."""
 
     def document(self, job_id: str, host: str) -> dict[str, Any]:
         return {
@@ -884,6 +954,13 @@ class LogText:
             "notes": self.notes,
         }
 
+    def answer(self, job_id: str, host: str) -> Answer:
+        return Answer(
+            self.document(job_id, host),
+            self.text,
+            failures=[self.failure] if self.failure else [],
+        )
+
 
 def read_log(
     job_id: str,
@@ -892,43 +969,56 @@ def read_log(
     settings: Settings,
     *,
     report: Callable[[str], None] = note,
-) -> tuple[HostEntry, LogText]:
+) -> tuple[str, LogText]:
     """The tail of a job's log from its host, else from the S3 mirror.
 
     Host first, always: the mirror is a copy of what the host uploaded last,
-    and is read only when the host cannot produce the log -- it could not be
-    asked, its rental has ended, or the job dir was purged.
+    and is read only when the host cannot produce the log. When that is
+    because the host is gone (`mirror_is_the_answer`) or the job dir was
+    purged, the mirror is the answer; when the host merely could not be
+    asked, the mirror is printed and the command still fails, because the
+    host may hold a newer log than the copy.
     """
     location = locate(job_id, open_registry().named(), host, settings)
     entry = location.entry
-    reached = location.asked or ask(entry, None, settings, provider=provider_for([entry], settings))
+    reached: Asked | Forgotten
+    if entry is None:
+        assert isinstance(location.asked, Forgotten)
+        reached = location.asked
+    else:
+        reached = location.asked or ask(
+            entry, None, settings, provider=provider_for([entry], settings)
+        )
     remote = None
     purged = False
+    failed = False
     if isinstance(reached, Answered):
         session = reached.session
         remote = f"{session.job_dir(job_id)}/log.txt"
         try:
             result = session.transport.tail(remote, lines=lines)
             if result.returncode == 0:
-                return entry, LogText("host", remote, result.stdout)
+                return location.host, LogText("host", remote, result.stdout)
             purged = job_dir_gone(session, job_id)
             why = (result.output.strip().splitlines() or ["no log file on the host"])[-1]
         except (RemoteError, TransportError) as exc:
-            why = reason_of(exc)
+            why, failed = reason_of(exc), True
     else:
-        why = reached.reason
+        why, failed = reached.reason, not mirror_is_the_answer(reached)
     # A job dir that is gone entirely is what `gpuc clean --purge` does on
     # purpose. Saying "purged" beats printing a `tail: No such file`.
     missing = (
-        f"job {job_id} was purged from host {entry.name} "
+        f"job {job_id} was purged from host {location.host} "
         f"(gpuc clean --purge removes the whole job dir once it is mirrored)"
         if purged
         else f"could not read {remote or 'the host log'}: {why}"
     )
     report(missing)
-    log = logs_from_s3(job_id, entry, settings, purged=purged, report=report)
+    log = logs_from_s3(job_id, location, settings, purged=purged, report=report)
     log.notes.insert(0, missing)
-    return entry, log
+    if failed:
+        log.failure = missing
+    return location.host, log
 
 
 def job_dir_gone(session: HostSession, job_id: str) -> bool:
@@ -942,17 +1032,17 @@ def job_dir_gone(session: HostSession, job_id: str) -> bool:
 
 def logs_from_s3(
     job_id: str,
-    entry: HostEntry,
+    location: Location,
     settings: Settings,
     *,
     purged: bool = False,
     report: Callable[[str], None] = note,
 ) -> LogText:
     s3 = S3Index.from_settings(settings)
-    prefix = JobIndex(settings).mirror_prefix(job_id, entry)
+    prefix = JobIndex(settings).mirror_prefix(job_id, location.entry)
     if s3 is None or not prefix:
         gone = (
-            f"Its job dir was purged from host {entry.name}, so this log no longer exists "
+            f"Its job dir was purged from host {location.host}, so this log no longer exists "
             f"anywhere.\n"
             if purged
             else ""
