@@ -8,10 +8,11 @@ from typing import Any
 import pytest
 
 from gpuc.control import teardown
-from gpuc.control.config import HostNotFound, Settings, load_registry, registry_transaction
+from gpuc.control.config import HostNotFound, Settings, registry_transaction
 from gpuc.control.providers.base import ProviderError
 from gpuc.control.remote import RemoteError
-from tests.conftest import host_entry
+from gpuc.host.jobs import HostConfig
+from tests.conftest import host_entry, load_registry
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
 FOREIGN = "other-someone-else"
@@ -30,7 +31,7 @@ def register(name: str = "gpuc-e2e-aaa", pod_id: str = "pod1") -> None:
         registry.put(
             host_entry(
                 name=name,
-                kind="runpod",
+                kind="rental",
                 pod_id=pod_id,
                 ssh="root@1.2.3.4",
                 python="/root/python",
@@ -56,6 +57,8 @@ def answering(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any] | None) -
     """Point `status.gather`'s ssh half at a payload, or at a host that is gone."""
 
     class Session:
+        config = HostConfig()
+
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
             if payload is None:
                 raise TimeoutError("ssh timed out")
@@ -66,7 +69,7 @@ def answering(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any] | None) -
             raise RemoteError("gpuc-e2e-aaa", "status", "ssh: connect: no route to host")
         return Session()
 
-    monkeypatch.setattr("gpuc.control.status.open_session", open_session)
+    monkeypatch.setattr("gpuc.control.remote.open_session", open_session)
 
 
 def terminate(provider: FakeProvider, target: str, **kwargs: Any) -> teardown.Termination:
@@ -138,7 +141,7 @@ def test_force_terminates_a_busy_host_without_asking_it_anything(
     def refuse(*args: object, **kwargs: object) -> None:
         raise AssertionError("--force must not ask the host anything")
 
-    monkeypatch.setattr("gpuc.control.status.open_session", refuse)
+    monkeypatch.setattr("gpuc.control.remote.open_session", refuse)
 
     result = terminate(provider, "gpuc-e2e-aaa", force=True)
 
@@ -361,9 +364,7 @@ def test_forgotten_is_what_happened_not_what_was_asked(
     `forgotten` anyway would have `gpuc status` contradict this command's own
     JSON, and a caller keying on it would never re-run the removal."""
     register()
-    monkeypatch.setattr(
-        "gpuc.control.teardown.forget_host_locked", lambda name, pod_id, report: False
-    )
+    monkeypatch.setattr("gpuc.control.teardown.forget_host", lambda name, pod_id, report: False)
 
     result = terminate(provider, "gpuc-e2e-aaa", force=True)
 

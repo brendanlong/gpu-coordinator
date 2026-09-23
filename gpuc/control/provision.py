@@ -27,13 +27,12 @@ from gpuc.control import rented
 from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_host
 from gpuc.control.config import (
     DEFAULT_DISK_GB,
-    ConfigError,
     HostEntry,
     Reporter,
     Settings,
     config_file,
-    forget_host_locked,
-    load_registry,
+    forget_host,
+    open_registry,
     registry_transaction,
     transport_for,
     utc_now,
@@ -48,8 +47,7 @@ from gpuc.control.providers.base import (
     Provider,
     ProviderError,
 )
-from gpuc.control.remote import RemoteError, open_session
-from gpuc.control.s3index import default_s3_prefix
+from gpuc.control.remote import Answered, RemoteError, ask
 from gpuc.control.transport import SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
@@ -182,33 +180,6 @@ def address_for(name: str, pod: Pod) -> HostEntry:
     return address
 
 
-def initial_config(
-    name: str,
-    settings: Settings,
-    *,
-    idle_minutes: float,
-    created_at: str,
-    provider: dict[str, Any],
-) -> dict[str, Any]:
-    """What a pod we just bought is: the config `connect_host` gives it.
-
-    A fresh pod has no `config.json`, so this is the one case where the machine
-    that created a host also decides what it is. Everything after this reads
-    the host's copy, including the next machine to connect to it -- which is
-    why the `provider` block (`rented.pod_record`) is written here rather than
-    kept on this machine: it is the pod's own record of what it was bought as,
-    and it is what any other machine reads it from. The cards are not here:
-    the pod owns every one it has, which is what `connect_host` gives a host
-    with no config, from the `gpu_info` the address carries.
-    """
-    return {
-        "idle_minutes": idle_minutes,
-        "s3_prefix": default_s3_prefix(settings, name),
-        "created_at": created_at,
-        "provider": provider,
-    }
-
-
 def gpu_info_for(transport: Transport, uuids: list[str], offer: Offer) -> dict[str, GpuInfo]:
     """What the pod's cards are: nvidia-smi if it answers, else the offer.
 
@@ -247,12 +218,13 @@ def deliver_s3_credentials(
     returns the env to any holder of an account key).
     """
     environ = environ if environ is not None else dict(os.environ)
-    if not entry.s3_prefix:
+    if not entry.config.s3_prefix:
         return False
     if not (environ.get("AWS_ACCESS_KEY_ID") and environ.get("AWS_SECRET_ACCESS_KEY")):
         progress(
             "no AWS credentials in this environment, so the pod cannot mirror logs to "
-            f"{entry.s3_prefix}; export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY before "
+            f"{entry.config.s3_prefix}; export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
+            f"before "
             "submitting if you want the mirror"
         )
         return False
@@ -401,19 +373,19 @@ def _try_offer(
         uuids = discover_gpu_uuids(transport)
         address = address.with_cache(gpu_info=gpu_info_for(transport, uuids, offer))
         progress(f"host GPUs: {summarize(uuids, address.gpu_info)} ({', '.join(uuids)})")
-        # The same connect path `gpuc host add` takes, with the config a pod
-        # nobody has configured yet needs: written to the pod, which owns it
-        # from here on, and read back into the registry.
+        # The same connect path `gpuc host add` takes: a pod nobody has
+        # configured yet gets `first_config`, with what only this create knows
+        # on top -- the idle timer asked for, and the pod's own record of what
+        # it was bought as (`rented.pod_record`), written to the pod so any
+        # other machine reads it from there.
         entry = deps.connect(
             address,
             settings,
-            fields=initial_config(
-                name,
-                settings,
-                idle_minutes=idle_minutes,
-                created_at=created_at,
-                provider=rented.pod_record(address, offer, created_at),
-            ),
+            fields={
+                "idle_minutes": idle_minutes,
+                "created_at": created_at,
+                "provider": rented.pod_record(address, offer, created_at),
+            },
             transport=transport,
         ).entry
         deliver_s3_credentials(transport, entry, progress)
@@ -493,7 +465,7 @@ def _abandon(
         # it got one, is what `gpuc status` shows a POD line for.
         progress(f"keeping the registry entry for {name} until {pod_id} is confirmed gone")
         return False
-    forget_host_locked(name, pod_id, progress)
+    forget_host(name, pod_id, progress)
     return True
 
 
@@ -610,11 +582,8 @@ def host_status(
     entry: HostEntry, settings: Settings | None = None, *, timeout: float = 60.0
 ) -> dict[str, Any] | None:
     """The host's own status document, or None if it cannot be reached."""
-    try:
-        payload = open_session(entry, settings).host_json("status", timeout=timeout)
-    except (RemoteError, TransportError, ConfigError):
-        return None
-    return payload if isinstance(payload, dict) else None
+    asked = ask(entry, "status", settings, timeout=timeout)
+    return asked.payload if isinstance(asked, Answered) else None
 
 
 def dispatcher_heartbeat_age(entry: HostEntry, settings: Settings) -> float | None:
@@ -631,8 +600,8 @@ def pick_reusable_host(
     report: Reporter = print,
 ) -> HostEntry | None:
     """An existing gpuc pod that is RUNNING, matches the constraints, and dispatches."""
-    for entry in list(load_registry().hosts.values()):
-        if not entry.pod_id:
+    for entry in open_registry().registry.listing():
+        if entry.rental is None:
             continue
         offer = rented.offer_of(entry.config.provider)
         if offer is None:
@@ -648,13 +617,13 @@ def pick_reusable_host(
                 f"this request"
             )
             continue
-        if len(entry.gpus) < constraints.gpu_count:
+        if len(entry.config.gpus) < constraints.gpu_count:
             report(
-                f"reuse: skipping {entry.name}, it owns {len(entry.gpus)} GPU(s) and this "
+                f"reuse: skipping {entry.name}, it owns {len(entry.config.gpus)} GPU(s) and this "
                 f"request needs {constraints.gpu_count}"
             )
             continue
-        pod = provider.get(entry.pod_id)
+        pod = provider.get(entry.rental.pod_id)
         if pod is None or provider.is_gone(pod):
             # The pod is gone for good, so the entry can only mislead `status`,
             # `logs` and the next reuse pass. Drop it here rather than leaving
@@ -663,7 +632,7 @@ def pick_reusable_host(
                 f"reuse: forgetting {entry.name}, its pod "
                 f"{'is gone' if pod is None else f'is {pod.status}'}"
             )
-            forget_host_locked(entry.name, entry.pod_id, report)
+            forget_host(entry.name, entry.rental.pod_id, report)
             continue
         if pod.status != "RUNNING":
             report(f"reuse: skipping {entry.name}, its pod is {pod.status}")

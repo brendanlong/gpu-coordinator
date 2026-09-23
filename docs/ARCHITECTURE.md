@@ -34,8 +34,9 @@ gpuc/
     health.py      # host preflight: driver, owned GPUs, disk, network download timing
     terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
   control/       # runs on the local machine; may use third-party deps
-    cli.py         # argparse and the text output of every `gpuc` command
-    actions.py     # one function per command returning its --json document; the CLI and the web call these
+    cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
+    actions.py     # one function per command returning its Answer (document + text + what failed); the CLI and the web call these
+    exits.py       # the exit codes, and the one table that maps them onto HTTP statuses
     hosts.py       # the actions of `host add`, `host set` and `host bootstrap`
     submitting.py  # the actions of `submit` and `requeue`: rent or look up the host, re-ship, enqueue
     status.py      # gather a host's status, render it, project queue start times
@@ -48,9 +49,9 @@ gpuc/
     config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
     tolerant.py    # the pydantic base every shared-state model reads through
     connect.py     # `host add` / `host set`: read or write the host's own config.json
-    bootstrap.py   # install uv + this package on a host, run host health, start the dispatcher
+    bootstrap.py   # install uv + this package on a host, run host health, start the dispatcher; `ensure_build` ships
     probe.py       # `host probe`: what a host has, before bootstrap
-    remote.py      # HostSession: run the on-host package with its environment pinned
+    remote.py      # HostSession (opened on a fresh read of config.json) and `ask`: the one way to ask a host
     transport.py   # LocalTransport / SshTransport: run, rsync, put_file(0600), tail
     ssh.py         # `gpuc ssh`: the interactive form of the transport
     clean.py       # `gpuc clean` / `gpuc host clean --uv-cache` over the transport
@@ -566,20 +567,39 @@ hold to, whatever the flags:
 - Anything that talks to RunPod (`--runpod`, `pods`, `host add --pod`) checks
   `RUNPOD_API_KEY` first and exits 1 with a single line if it is unset, before
   mirroring a spec or picking a host.
+- **One way to ask a host.** `remote.ask(entry, verb)` answers `Answered`,
+  `Unreachable` (with the one-line reason), `PodDead` or `PodGone` (with what
+  the provider said), and everything that talks to a host -- `status`, the
+  locator, `wait`, `logs`, teardown, `host bootstrap --all` -- consumes that.
+  A rental is looked up at its provider inside `ask`, and nowhere else. A
+  session (`remote.open_session`) reads the host's own `config.json` fresh
+  and carries it as `session.config`; nothing that decides anything reads the
+  registry's cache. A host with no cached interpreter is asked for one on the
+  spot (the same question `host probe` asks), and what a session reads is
+  recorded in the cache on the way past -- except by a poll, which never
+  writes the registry.
 - A host name is looked up locally; `logs`, `wait`, `cancel`, `preempt`,
   `reorder`, `estimate`, `requeue` and `ssh` resolve a job id the same way
-  (`find_job_host`): the job index, then asking each host, and an id nothing
-  knows is exit 4, never a guess. The job index is one facade
-  (`s3index.JobIndex`) over the local index and the mirror's, in that order,
-  and the precedence is written once. A host name from the mirror's index is
-  the *submitting* client's name for it, so it is asked first rather than
-  believed; the local index's name is this machine's and is trusted. Every per-job verb runs through
-  `actions.job_verb`: find the host, ask it, insist on a verdict, re-mirror a
-  spec field it changed. The CLI and the dashboard call the same functions.
+  (`actions.locate`): the job index, then asking each host. An id no host
+  knows is exit 4 only once every host has answered; a host the index names
+  that could not be asked still holds the job as far as anything knows, and
+  the location carries that trouble for the caller to judge -- `logs` and
+  `wait` read the mirror, a verb is exit 1 with the reason -- and never hides
+  it. The job index is one facade (`s3index.JobIndex`) over the local index
+  and the mirror's, in that order, and the precedence is written once. A host
+  name from the mirror's index is the *submitting* client's name for it, so
+  it is asked first rather than believed; the local index's name is this
+  machine's and is trusted. Every per-job verb runs through
+  `actions.job_verb`: locate the job, ask its host over the one session the
+  lookup opened, insist on a verdict, re-mirror a spec field it changed. The
+  CLI and the dashboard call the same functions.
 - What a command does lives in `actions` (with `hosts` and `submitting` for
-  the host and submit commands), one function per command returning the
-  document its `--json` form prints; `cli.py` holds only argparse, the
-  parsing of flags into plain arguments, and the text rendering.
+  the host and submit commands), one function per command returning an
+  `Answer`: the document its `--json` form prints, the text form, and what
+  failed. `cli.py` holds only argparse, the parsing of flags into plain
+  arguments, and the text rendering; `main` emits every answer once -- the
+  document or the text -- and exits with what it says. Progress goes to
+  stderr through one reporter under `--json`.
 - Nothing runs in the background on this side except, if installed, the web
   dashboard's service.
 
@@ -612,8 +632,9 @@ no pydantic, the same rules are spelled out in `jobs.from_dict` for
 `float(None)`, never a `KeyError`, an unusable value means the default.
 
 `hosts.json` and `config.json` both carry `schema_version` (1); readers accept
-it missing. `tests/fixtures/schema/` holds today's shape of each file plus
-older and newer variants, and every one of them must parse.
+it missing. `tests/fixtures/schema/` holds today's shape of each file plus a
+newer variant, and every one of them must parse; the shapes earlier builds of
+this repository wrote are not kept, pre-release.
 
 A host entry that still does not validate is **skipped, not fatal**: `gpuc`
 warns, works with the rest, and writes that entry back untouched on the next
@@ -623,19 +644,25 @@ anything (exit 3, a `.bak` kept).
 ## Exit codes
 
 The table is in usage.md. The contract behind it: **a command reports
-everything it found out and exits non-zero if any part of it failed.** `gpuc
-status` prints every host that answered *and* exits 1 for one it could not read,
-or -- when it was asked about every host rather than one -- for a registry entry
-this build could not parse. 3 means local state could not be read at all, so the
+everything it found out and exits non-zero if any part of it failed.** Every
+action returns an `Answer` carrying its document and its failures, and one
+function (`actions.exit_code_of`) turns that into a code: unknown local state
+is 3, a relayed outcome (a job's, a remote command's) is itself, any failure
+is 1, else 0; `exits.http_status` is the one table from those codes to HTTP
+statuses (0 → 200, 1 → 500, 2 → 400, 3 → 503, 4 → 404). `gpuc status` prints
+every host that answered *and* exits 1 for one it could not read, or -- when
+it was asked about every host rather than one -- for a registry entry this
+build could not parse. 3 means local state could not be read at all, so the
 answer is *unknown*; 4 is a name that does not exist. Automation keys on
 `hosts[].running` and treats exit 3 as unknown, never as "nothing running".
 
 A rental the provider reports missing or TERMINATED is not a failure: `status`
 and `host bootstrap --all` forget that registry entry where they find it
-(`forget_gone_rentals`, `rental_gone`). A pod the provider still has and nothing
-can run on (EXITED, ERROR) is a failure like any other host that could not be
-read, and is kept for `gpuc host remove`. Only a command somebody typed
-forgets: the dashboard's poll never writes to the registry.
+(`forget_gone_rentals`, on the `PodGone` answer `ask` gave). A pod the provider
+still has and nothing can run on (EXITED, ERROR) is `PodDead`: a failure like
+any other host that could not be read, printed with its status and never as
+gone, and kept for `gpuc host terminate` or `gpuc host remove`. Only a command
+somebody typed forgets: the dashboard's poll never writes to the registry.
 
 `--json` is on every command that has an answer to give, and means the same
 thing on each: stdout is one object carrying `schema_version`, everything else
@@ -648,7 +675,8 @@ stream.
 own, as `gpuc ssh <host> -- cmd` does with the remote command's code. **130** is
 a Ctrl-C, raised in one place: `main` turns any `KeyboardInterrupt` into that
 exit and the matching `--json` error document, and a command with something to
-say about what was in flight raises `Interrupted` to add it.
+say about what was in flight raises `Interrupted` to add it -- `host bootstrap
+--all` adds the tally so far to the error document.
 
 ## Waiting for a job to end (`control/wait.py`)
 
@@ -659,9 +687,10 @@ that reach outside the module:
 
 - A host that cannot be asked is *trouble*, not an answer: retried for
   `TROUBLE_GRACE_S`, then read from the **S3 mirror** (the spec's "the mirror is
-  read only when the host is gone"). A rental whose pod the provider already
-  reports gone skips the grace and is read from the mirror at once. Only if
-  that has no terminal state does the job get an `error`.
+  read only when the host is gone") through `actions.mirrored_outcome`, the
+  one reader of a mirrored `state.json`. A rental whose pod `ask` reports gone
+  skips the grace and is read from the mirror at once. Only if that has no
+  terminal state does the job get an `error`.
 - An id whose host answers and does not list it is exit 4, checked after the
   first poll. A job that *was* listed and then vanishes is trouble, not a
   missing id.
@@ -706,15 +735,19 @@ touch argv.
 
 `hosts.json` holds two kinds of thing about a host and only two:
 
-- the **address** -- `name`, `kind`, `ssh`, `port`, `gpuc_home` /
-  `persistent_root`, `pod_id` -- which is hand-entered, local to this machine,
-  and is everything needed to open a session and find `config.json`. Nothing in
-  it is a fact about how the host behaves. A host is a rental exactly when it
-  has a `pod_id`; `kind` only says which provider.
+- the **address** -- `name`, `ssh`, `port`, `gpuc_home` / `persistent_root`,
+  `rental` -- which is hand-entered, local to this machine, and is everything
+  needed to open a session and find `config.json`. Nothing in it is a fact
+  about how the host behaves. A host is a rental exactly when it has a
+  `rental: {provider, pod_id}`, the one spelling of it; `kind` (`local`,
+  `ssh`, `rental`) is derived from the address and never stored, and
+  `actions.PROVIDERS` is keyed by `rental.provider`.
 - a **cache** of what the host last said: `python`, `uv`, `gpu_info`,
   `driver_version` and a copy of its `config.json`, stamped with `read_at`.
   Offline commands (`host list`, `version`) print it labelled "as of <age>";
-  anything that decides something reads the host.
+  anything that decides something reads the host. Every write of the cache is
+  `config.update_cache`: re-read under the lock, merge the fields learned,
+  write, so a concurrent probe's answer about the same host is never undone.
 
 What the host **is** -- `gpus`, `s3_prefix`, `env`, `idle_minutes`,
 `retention_days`, `provider`, `pkg_commit` -- lives in
@@ -730,21 +763,28 @@ that bootstrapped it first matters afterwards.
   without matching it is refused, because that one difference hands one card
   to two jobs.
 - `gpuc host set <name> --gpus ... --env ...` **writes through** to
-  `config.json` via `python -m gpuc.host config --merge` (one atomic
-  read-modify-write on the host, by the code that reads the file; a host with
-  no package yet gets the same merge done here and the file replaced by
-  rename). It does not work offline, which is correct: there is no local copy
-  to set. `--persistent-root` and `--gpuc-home` are addresses and stay here.
+  `config.json`. The client is the one writer of that file
+  (`remote.write_config`): read, merge with the host's own rule
+  (`jobs.merged_config`), replace by rename -- never truncated in place,
+  because a dispatcher may be reading it. A config that is there and cannot
+  be read is never written over. It does not work offline, which is correct:
+  there is no local copy to set. `--persistent-root` and `--gpuc-home` are
+  addresses and stay here. A host with no config gets `config.first_config`,
+  the one constructor -- for a box `host add` meets, a pod just bought, or a
+  wiped home bootstrap restores -- with the same defaults whatever the kind of
+  host: every card seen, `workdir_days`, and the mirror `s3_bucket` implies.
 - `gpuc host probe` refreshes the cache and nothing else -- including an
   interpreter to run the on-host package with, so a host somebody else
   bootstrapped answers `status` and `host set` before this machine has
   bootstrapped it.
 - "the host has no config" is a marker the host echoes, never the absence of
   parseable output: a `config.json` that is there and does not parse is a file
-  the host is running on, so `read_remote_config` returns `None` for it, and
-  nothing -- connect, `host set` or bootstrap -- writes over a `None`.
-- `gpuc submit`'s pre-enqueue read of `config.json` is the only source for the
-  `gpus` a spec is judged against, and it refreshes the cache on the way past.
+  the host is running on, so `remote.read_config` reports it *unreadable*
+  rather than missing, and nothing -- connect, `host set` or bootstrap --
+  writes over one.
+- The config a session read is the only source for the `gpus` a spec is judged
+  against on `submit`, for the `s3_prefix` its outputs are recorded under, and
+  for the build the host runs; the read refreshes the cache on the way past.
 - Provision is create pod -> wait for ssh -> the same connect, with the initial
   config a pod nobody has configured yet needs.
 
@@ -758,15 +798,18 @@ that bootstrapped it first matters afterwards.
    `s3_prefix` whose `aws` could not be installed fails bootstrap outright,
    since every job on it would end `failed: sync-preflight`.
 3. **Never rewrite `~/.gpuc/config.json`.** The host owns it, so bootstrap reads
-   it and merges back only what it derived, through the host's own `config
-   --merge`: the commit just shipped, and the managed env keys the host names
-   none of (`UV_CACHE_DIR` by filesystem comparison, `HF_HOME` beside gpuc
-   home under a persistent root). The one exception is a host with **no** config at all, where the last
-   config this machine read off it is restored.
+   it and merges back only what it derived (`remote.write_config`): the
+   commit just shipped, and the managed env keys the host names none of
+   (`UV_CACHE_DIR` by filesystem comparison, `HF_HOME` beside gpuc home under
+   a persistent root). The one exception is a host with **no** config at all,
+   which gets `first_config` with the last config this machine read off it on
+   top.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
 5. Start the dispatcher with `$HOME/.local/bin` and `$HOME/.cargo/bin` on PATH,
    and record the commit this build came from in the host's `config.json` --
-   the authoritative copy, which `status` reports and `submit` judges. Bootstrap
+   the authoritative copy, which `status` reports and `submit` judges. The
+   shipping is `bootstrap.ensure_build`, the one ship path, which `submit` and
+   `requeue` also run when the host's config names another build. Bootstrap
    is never blocked by running jobs: the package is replaced, and whichever
    dispatcher takes over adopts them from their `state.json`.
 6. Record the host's cards and driver version into the registry's cache, best
@@ -855,10 +898,9 @@ The runbook for a host that came back empty is in setup.md.
 Everything the control side knows about a provider's vocabulary lives on the
 `Provider` instance: which pod statuses mean nothing can run (`dead_statuses`),
 which mean the rental has ended (`gone_statuses`), the log signature of a
-broken host, and how a terminate is retried. Provisioning, `status`, `wait`
-and `host terminate` read those and name no status themselves;
-`actions.PROVIDERS` maps a `provider.kind` to its class. Adding a provider is
-one class and one table entry.
+broken host, and how a terminate is retried. `remote.ask` reads those and
+names no status itself; `actions.PROVIDERS` maps a rental's `provider` name
+to its class. Adding a provider is one class and one table entry.
 
 ### RunPod (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
 
@@ -884,7 +926,11 @@ one class and one table entry.
 
 ## Provisioning flow (`gpuc submit --runpod`)
 
-1. Write the spec to S3 (`s3://bucket/gpuc/specs/<jobid>.json`) first.
+1. Parse, validate and prepare the spec -- secrets present, `{job_id}`
+   expanded -- before anything is bought: the same pipeline as `--host`, which
+   then rents or looks up the host, opens one session, ships this build if the
+   host runs another, judges the fit against the host's own config, stages,
+   enqueues and records the job (local index, then the mirror, once).
 2. Unless `--no-reuse`: pick an existing registered pod whose own config records
    an offer that still satisfies the constraints, which owns enough cards, whose
    pod the provider reports RUNNING, whose dispatcher heartbeat is fresh, and
@@ -892,7 +938,7 @@ one class and one table entry.
    has is forgotten rather than dialled.
 3. Else, for each offer in order: `create`; poll `get` until RUNNING **and**
    `ssh.direct` present; poll SSH until a trivial command succeeds; write the
-   pod its config, whose `provider` block carries the offer and `created_at`
+   pod its `first_config`, whose `provider` block carries the offer and `created_at`
    (`rented.py`: the pod is its own record, and this machine keeps none); run
    bootstrap; enqueue. The pod terminates itself with the pod-scoped key
    RunPod leaves in its own `/etc/rp_environment`. On any broken-host signature in `logs`, the
@@ -929,11 +975,13 @@ once it returns there is no host left to own any state.
 ## Web dashboard (`gpuc web serve`)
 
 A thin view, by construction: `gpuc.control.actions` holds one function per
-command returning the document its `--json` form prints, and both `cli.py` and
+command returning the `Answer` its `--json` form prints, and both `cli.py` and
 `web/app.py` call those. **Nothing the dashboard shows or does exists only in
-the dashboard**, and anything it gains lands in `actions` first. `exit_code_for`
-is the one table mapping an error to an exit code (CLI) or an HTTP status (2 ->
-400, 3 -> 503, 4 -> 404, 1 -> 500), and the API's failure document is `--json`'s.
+the dashboard**, and anything it gains lands in `actions` first. An answer
+goes on the wire under the HTTP status its exit code maps to
+(`exits.http_status`), so a `status` with a host it could not read is a 500
+carrying every host that answered, as the CLI exits 1 having printed them;
+the API's failure document is `--json`'s.
 
 The server is stdlib `ThreadingHTTPServer` with `bcrypt` the one added
 dependency. One password, hashed into `config_dir()/web-password` (0600) and
@@ -961,13 +1009,17 @@ after five tries rather than looping for ever.
 
 What `status` prints, and every flag, is usage.md. The invariants:
 
-- A host is in one of four states (`status.HostState`), decided once in
-  `gather` and read everywhere else: it answered; it could not be reached; its
+- A host is in one of four states (`status.HostState`), the four answers of
+  `remote.ask`, read everywhere else: it answered; it could not be reached; its
   pod is dead (the provider still has it and nothing can run on it: a failure,
-  kept for `gpuc host terminate` or `gpuc host remove`); its pod is gone (the
-  rental has ended: not a failure, and the entry is forgotten as it is
-  printed). For either pod state no ssh is attempted, and the line says what
-  the provider said rather than printing a connection error.
+  printed as `POD <status>` and kept for `gpuc host terminate` or `gpuc host
+  remove`); its pod is gone (the rental has ended: not a failure, `POD GONE`,
+  and the entry is forgotten as it is printed). `pod_gone` means gone and
+  nothing else. For either pod state no ssh is attempted, and the line says
+  what the provider said rather than printing a connection error. One
+  `actions.status` builds the text form, `--json` and the dashboard's
+  document, including `--all`'s `unhosted` list; per host, `errors` decide
+  the exit code and `warnings` (the build) do not.
 - A host that answered and still carries an `error` -- the provider could not be
   asked about its pod -- prints it as an `ERROR` line under the header. Nothing
   that decides an exit code may be visible only under `--json`.
@@ -1006,10 +1058,13 @@ bootstrap and reported back by `python -m gpuc.host status`.
   commit is warned about rather than passed as current. `status --json`'s
   `pkg_commit` is the host's answer, so `null` means "the host did not say".
 - `gpuc submit` and `gpuc requeue` read the host's `config.json` before they
-  enqueue and re-ship the package when it does not match this build. That same
-  read is what the rest of the submit works from -- the `gpus` the spec is
-  judged against, the `s3_prefix` its outputs are recorded under -- and it
-  replaces the registry's cache on the way past.
+  enqueue and re-ship the package (`ensure_build`) when it does not match this
+  build. One comparison, `version.is_other_build`, and it is strict: a host
+  that names no commit was never bootstrapped and is refused, and a checkout
+  with uncommitted changes is `<commit>-dirty`, never the commit it sits on.
+  That same read is what the rest of the submit works from -- the `gpus` the
+  spec is judged against, the `s3_prefix` its outputs are recorded under --
+  and it replaces the registry's cache on the way past.
 - `gpuc host list` and `gpuc version` never ssh: they report the commit the
   host was running when this machine last read it, labelled with its age.
 

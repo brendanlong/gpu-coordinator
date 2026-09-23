@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from gpuc.control.cli import main
-from gpuc.control.config import HostEntry, load_registry, registry_transaction
+from gpuc.control.config import HostEntry, registry_transaction
 from gpuc.control.gpuinfo import GpuInfo, parse_smi, rows, summarize, vram_text
 from gpuc.control.status import HostState, HostView, JobView, render
-from tests.conftest import host_entry
+from tests.conftest import host_entry, load_registry
 
 SMI_OUTPUT = """\
 0, GPU-80646905-50a9-afc1-4375-43ca475b15e4, NVIDIA A40, 46068

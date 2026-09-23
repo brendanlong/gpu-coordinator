@@ -14,10 +14,10 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuc.control.config import HostEntry, Settings, load_settings, transport_for
+from gpuc.control.config import HostEntry, Settings, load_settings
+from gpuc.control.exits import EXIT_USAGE
 from gpuc.control.remote import HostSession, env_prefix, open_session
 from gpuc.control.s3index import S3Index, job_uri, make_s3_client, split_uri
-from gpuc.control.transport import Transport
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS, human_bytes
 
 
@@ -32,7 +32,7 @@ class CleanUsageError(CleanError):
     impossible" from "the clean ran and something failed".
     """
 
-    exit_code = 2
+    exit_code = EXIT_USAGE
 
 
 @dataclass
@@ -335,7 +335,9 @@ def purge_host(
         if all_finished or only is not None
         else (DEFAULT_RETENTION_DAYS if older_than_days is None else older_than_days)
     )
-    verified = verified_mirrors(entry, settings, client=s3_client) if verify else None
+    verified = (
+        verified_mirrors(session.config.s3_prefix, settings, client=s3_client) if verify else None
+    )
     args = _purge_args(days, dry_run=dry_run, force=force, only=only)
     if verified is not None:
         args += f" {_verified_arg(session, verified)}"
@@ -355,19 +357,20 @@ def _s3_client(settings: Settings) -> Any:
 
 
 def verified_mirrors(
-    entry: HostEntry, settings: Settings | None = None, *, client: Any | None = None
+    s3_prefix: str | None, settings: Settings | None = None, *, client: Any | None = None
 ) -> list[str]:
-    """The job ids whose mirrored `log.txt` exists under this host's prefix.
+    """The job ids whose mirrored `log.txt` exists under the host's prefix.
 
     One listing rather than one HEAD per candidate, and before the host is
-    asked anything, so the purge is a single round trip. A host with no
-    `s3_prefix` has nothing mirrored, and a listing that fails is an error:
-    "could not check" must not read as "nothing is backed up".
+    asked anything, so the purge is a single round trip. `s3_prefix` is the
+    host's own, from the session's read of its config; a host with none has
+    nothing mirrored, and a listing that fails is an error: "could not check"
+    must not read as "nothing is backed up".
     """
-    if not entry.s3_prefix:
+    if not s3_prefix:
         return []
     s3 = client if client is not None else _s3_client(settings or load_settings())
-    bucket, key = split_uri(job_uri(entry.s3_prefix, ""))
+    bucket, key = split_uri(job_uri(s3_prefix, ""))
     prefix = key.rstrip("/") + "/"
     ids: list[str] = []
     token: str | None = None
@@ -445,18 +448,19 @@ def _kib_to_bytes(raw: str | None) -> int | None:
 
 
 def prune_uv_cache(
-    entry: HostEntry, settings: Settings | None = None, *, transport: Transport | None = None
+    entry: HostEntry, settings: Settings | None = None, *, session: HostSession | None = None
 ) -> PruneReport:
     """`uv cache prune` on the host: drop cache entries no venv can link to.
 
     Deliberately `prune` and not `clean`: pruning removes unused and
     unreachable entries, while `uv cache clean` would throw away exactly the
-    wheels the next job wants to link out of.
+    wheels the next job wants to link out of. Run with the host's own env, so
+    it prunes the cache the host's jobs actually use.
     """
-    transport = transport or transport_for(entry, settings)
+    session = session or open_session(entry, settings)
     uv = entry.uv or "uv"
-    result = transport.run(
-        UV_CACHE_PRUNE.format(env=env_prefix(entry.env), uv=shlex.quote(uv)),
+    result = session.transport.run(
+        UV_CACHE_PRUNE.format(env=env_prefix(session.env), uv=shlex.quote(uv)),
         timeout=900.0,
         check=False,
     )

@@ -12,7 +12,15 @@ from typing import Any
 
 import pytest
 
-from gpuc.control.config import HostCache, HostEntry, HostKind, registry_transaction
+from gpuc.control.config import (
+    HostCache,
+    HostEntry,
+    HostKind,
+    Registry,
+    Rental,
+    open_registry,
+    registry_transaction,
+)
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.host import jobs, paths, scope
 from gpuc.host.jobs import HostConfig, JobSpec
@@ -81,9 +89,11 @@ def host_entry(
     if cache_dir:
         config["env"] = {**(config.get("env") or {}), "UV_CACHE_DIR": cache_dir}
     document: dict[str, Any] = {"host": name, **config}
-    if kind == "runpod":
+    rental: Rental | None = None
+    if kind == "rental" or pod_id is not None:
         # A rental is an address with a pod behind it; `kind` alone is not one.
         pod_id = pod_id or f"pod-{name}"
+        rental = Rental(provider="runpod", pod_id=pod_id)
         document.setdefault("provider", {"kind": "runpod", "pod_id": pod_id})
     return HostEntry(
         name=name,
@@ -91,7 +101,7 @@ def host_entry(
         port=port,
         gpuc_home=gpuc_home,
         persistent_root=persistent_root,
-        pod_id=pod_id,
+        rental=rental,
         bootstrapped_at=bootstrapped_at,
         cache=HostCache(
             read_at=read_at,
@@ -102,6 +112,11 @@ def host_entry(
             config=HostConfig.from_dict(document).to_dict(),
         ),
     )
+
+
+def load_registry() -> Registry:
+    """The registry as a command would read it, for a test's assertions."""
+    return open_registry().registry
 
 
 def register_host(*, gpus: str | list[str] | None = None, **fields: Any) -> HostEntry:

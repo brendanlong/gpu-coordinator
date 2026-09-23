@@ -373,7 +373,7 @@ def test_wait_reads_a_terminated_rental_from_the_mirror_without_waiting_out_the_
     with registry_transaction() as registry:
         registry.put(
             host_entry(
-                name="gpuc-pod", kind="runpod", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=prefix
+                name="gpuc-pod", kind="rental", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=prefix
             )
         )
     ended = Pod(id="pod-1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)

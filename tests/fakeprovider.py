@@ -30,7 +30,7 @@ from gpuc.control.providers.base import (
     SshEndpoint,
 )
 from gpuc.control.provision import offer_satisfies
-from gpuc.control.remote import NO_CONFIG
+from gpuc.control.remote import NO_CONFIG, PYTHON_PROBE
 from gpuc.control.transport import CommandResult, Transport, TransportError
 
 CAPACITY_ERROR = "no capacity for this gpu type right now"
@@ -264,6 +264,8 @@ class FakeTransport:
             return CommandResult(
                 self.host, ["ssh", command], 0, "".join(f"{u}\n" for u in self.gpu_uuids), ""
             )
+        if command == PYTHON_PROBE:
+            return CommandResult(self.host, ["ssh", command], 0, "/usr/bin/python3 3.12.3\n", "")
         if "$HOME" in command:
             return CommandResult(self.host, ["ssh", command], 0, self.home, "")
         if command.startswith("if [ -f") and "config.json" in command:

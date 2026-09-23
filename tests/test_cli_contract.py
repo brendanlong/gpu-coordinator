@@ -20,6 +20,7 @@ import pytest
 from gpuc.control import status as status_mod
 from gpuc.control.cli import (
     EXIT_ERROR,
+    EXIT_INTERRUPTED,
     EXIT_LOCAL_STATE,
     EXIT_NOT_FOUND,
     EXIT_OK,
@@ -31,13 +32,12 @@ from gpuc.control.config import (
     backup_path,
     config_file,
     hosts_file,
-    load_registry,
     pod_known_hosts_file,
     read_registry,
 )
 from gpuc.control.s3index import S3IndexError
 from gpuc.control.status import HostState, HostView
-from tests.conftest import host_entry, register_host
+from tests.conftest import host_entry, load_registry, register_host
 from tests.fakehost import FakeHost
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -118,7 +118,7 @@ def test_a_mutation_refuses_to_overwrite_a_registry_it_could_not_read(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{ this is not json")
     assert main(["host", "set", "local", "--idle-min", "9"]) == EXIT_LOCAL_STATE
-    assert "Nothing was written" in capsys.readouterr().err
+    assert "not a readable host registry" in capsys.readouterr().err
     assert path.read_text() == "{ this is not json"
 
 
@@ -188,6 +188,43 @@ def test_a_bad_entry_does_not_fail_a_status_asked_about_another_host(
     )
     assert main(["status", "--host", "good"]) == EXIT_OK
     assert main(["status", "--host", "good", "--json"]) == EXIT_OK
+
+
+def test_status_all_json_carries_the_jobs_only_the_index_knows(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one list of what was on a host that lost its state, in the form a
+    script reads: `--json` used to drop it while the text form printed it."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    monkeypatch.setattr(status_mod, "gather", _answered_with_no_jobs)
+    LocalIndex().record(
+        IndexEntry(
+            job_id="20260101-000000-aaaaaa",
+            host="gone-box",
+            name="lost",
+            requeued_from="20250101-000000-000000",
+            submitted_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    capsys.readouterr()
+    assert main(["status", "--all", "--json"]) == EXIT_OK
+    document = status_json(capsys)
+    (entry,) = document["unhosted"]
+    assert (entry["job_id"], entry["host"], entry["name"]) == (
+        "20260101-000000-aaaaaa",
+        "gone-box",
+        "lost",
+    )
+    assert entry["requeued_from"] == "20250101-000000-000000"
+    assert entry["outputs_lost"] is False
+    assert main(["status", "--json"]) == EXIT_OK
+    assert status_json(capsys)["unhosted"] == []
+
+
+def _answered_with_no_jobs(entry: HostEntry, *a: object, **k: object) -> HostView:
+    return HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=1.0)
 
 
 def test_status_all_is_one_when_the_index_it_needs_cannot_be_read(
@@ -361,6 +398,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "outputs_lost",
         "priority",
         "attempt",
+        "requeued_from",
         "started_at",
         "workdir_bytes",
         "outputs",
@@ -540,7 +578,9 @@ def test_the_commit_status_judges_is_the_hosts_own_not_the_registrys(
     assert "gpuc host bootstrap gpubox" in warnings[0]
     assert status_mod.render(view).count("WARNING") == 1
     assert status_mod.host_json(view)["pkg_commit"] == "b" * 40
-    assert warnings[0] in status_mod.host_json(view)["errors"]
+    # A warning, apart from the errors that decide the exit code.
+    assert status_mod.host_json(view)["warnings"] == warnings
+    assert status_mod.host_json(view)["errors"] == []
 
 
 def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
@@ -604,7 +644,7 @@ def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
     (warning,) = status_mod.host_warnings(HostView(entry=entry, state=HostState.ANSWERED))
-    assert "a build too old to say which" in warning
+    assert "a build that named no commit" in warning
     assert "gpuc host bootstrap gpubox" in warning
     # With nothing to compare against: a gpuc that cannot name its own
     # commit has no business telling a host it is behind.
@@ -768,7 +808,7 @@ def test_a_ctrl_c_is_exit_130_and_a_document_whoever_was_running(
     def interrupted(*_args: Any, **_kwargs: Any) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli, "read_registry_warned", interrupted)
+    monkeypatch.setattr(cli, "open_registry", interrupted)
     assert main(["status"]) == 130
     assert "interrupted" in capsys.readouterr().err
     assert main(["status", "--json"]) == 130
@@ -896,7 +936,7 @@ def test_host_set_json_with_nothing_to_set_is_usage_in_both_forms(
 def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    register_host(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1")
+    register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
     register_host(name="local", gpus=GPU)
     pinned = pod_known_hosts_file("pod")
     pinned.parent.mkdir(parents=True, exist_ok=True)
@@ -904,7 +944,7 @@ def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
     capsys.readouterr()
     assert main(["host", "remove", "pod", "--json"]) == EXIT_OK
     document = document_of(capsys)
-    assert (document["host"], document["kind"], document["pod_id"]) == ("pod", "runpod", "p1")
+    assert (document["host"], document["kind"], document["pod_id"]) == ("pod", "rental", "p1")
     assert any("p1" in text and "not terminated" in text for text in document["notes"])
     # RunPod recycles host:port, so the next pod under this name must not be
     # checked against this one's key.
@@ -928,8 +968,8 @@ def test_host_terminate_json_is_what_was_ended_and_what_it_was_doing(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"), PodScript(ssh_after_polls=0))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
-    register_host(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", pod_id="pod1")
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    register_host(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4", pod_id="pod1")
     capsys.readouterr()
 
     assert main(["host", "terminate", "gpuc-e2e-aaa", "--force", "--json"]) == EXIT_OK
@@ -980,7 +1020,7 @@ def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
     from tests.test_cli import bootstrapping
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
-    register_host(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1")
+    register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
     document = json.loads(hosts_file().read_text())
     document["hosts"]["bad"] = BAD_ENTRY
     hosts_file().write_text(json.dumps(document))
@@ -1006,7 +1046,7 @@ def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
     assert by_name["pod"]["ephemeral"] is True
     assert by_name["pod"]["dispatcher_pid"] is None
     assert "== gpubox (1/2) ==" in captured.err
-    assert "error: host pod: ssh to pod failed" in captured.err
+    assert "warning: host pod: ssh to pod failed" in captured.err
 
 
 def test_host_bootstrap_all_json_interrupted_names_the_hosts_never_reached(
@@ -1019,9 +1059,12 @@ def test_host_bootstrap_all_json_interrupted_names_the_hosts_never_reached(
     register_host(name="cbox", kind="ssh", ssh="me@c")
     bootstrapping(monkeypatch, fail={"bbox": KeyboardInterrupt()})
     capsys.readouterr()
-    assert main(["host", "bootstrap", "--all", "--json"]) == 1
+    # A Ctrl-C is 130 like everywhere else, and the error document still
+    # carries the tally: what got through is true, and what did not is named.
+    assert main(["host", "bootstrap", "--all", "--json"]) == EXIT_INTERRUPTED
     tally = document_of(capsys)
     assert tally["interrupted"] is True
+    assert "interrupted during bbox" in tally["error"]
     assert [(h["name"], h["outcome"]) for h in tally["hosts"]] == [
         ("abox", "bootstrapped"),
         ("bbox", "interrupted"),
@@ -1070,9 +1113,9 @@ class PruningTransport:
 def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register_host(name="local", gpus=GPU)
+    register_host(name="local", gpus=GPU, python="/py")
     host = PruningTransport("before_kib=18874368\nafter_kib=11534336\ndir=/home/u/.cache/uv\n")
-    monkeypatch.setattr("gpuc.control.clean.transport_for", lambda entry, settings=None: host)
+    monkeypatch.setattr("gpuc.control.remote.transport_for", lambda entry, settings=None: host)
     assert main(["host", "clean", "local", "--uv-cache"]) == EXIT_OK
     assert "pruned 18.0 GiB -> 11.0 GiB" in capsys.readouterr().out
     assert main(["host", "clean", "local", "--uv-cache", "--json"]) == EXIT_OK

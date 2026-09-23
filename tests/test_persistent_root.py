@@ -22,7 +22,7 @@ import pytest
 
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, remote_path
 from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_USAGE, main
-from gpuc.control.config import HostEntry, load_registry
+from gpuc.control.config import HostEntry
 from gpuc.control.remote import env_prefix, host_command
 from gpuc.host import dispatcher, health, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig, JobState
@@ -32,6 +32,7 @@ from tests.conftest import (
     host_entry,
     install_fake_nvidia_smi,
     install_fake_torch,
+    load_registry,
     make_spec,
     register_host,
 )
@@ -56,9 +57,9 @@ def test_no_persistent_root_changes_nothing() -> None:
     entry = host_entry(name="plain")
     assert entry.root is None
     assert entry.remote_home == "$HOME/.gpuc"
-    assert entry.env == {}
-    assert remote_path(entry) == 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
-    assert env_prefix(entry.env) == ""
+    assert entry.config.env == {}
+    assert remote_path(entry.config) == 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
+    assert env_prefix(entry.config.env) == ""
 
 
 def test_a_persistent_root_moves_only_gpuc_home() -> None:
@@ -66,8 +67,8 @@ def test_a_persistent_root_moves_only_gpuc_home() -> None:
     assert entry.remote_home == f"{ROOT}/gpuc"
     # Not uv, not the aws bundle: a root is for the state that cannot be
     # reinstalled, and /mnt is the slow disk. (The caches are bootstrap's call.)
-    assert entry.env == {}
-    assert env_prefix(entry.env) == ""
+    assert entry.config.env == {}
+    assert env_prefix(entry.config.env) == ""
 
 
 def test_a_trailing_slash_does_not_double_up() -> None:
@@ -257,7 +258,9 @@ def test_the_package_and_config_land_under_the_root(control_env: Path) -> None:
         ["GPU-a"],
         {"HF_HOME": f"{ROOT}/.cache/huggingface"},
     )
-    assert all(f"{ROOT}/gpuc/config.json" not in put for put in host.puts)
+    # Written by rename, never put in place: a dispatcher may be reading it.
+    assert f"put_file {ROOT}/gpuc/config.json" not in host.events
+    assert any(event.startswith("mv -f") and "config.json" in event for event in host.events)
 
 
 def test_uv_and_the_aws_bundle_stay_in_home(control_env: Path) -> None:
@@ -348,7 +351,7 @@ def test_host_add_records_a_persistent_root(
 
 def test_host_add_records_env_pairs(control_env: Path, fake_host: FakeHost) -> None:
     add("--env", "HF_HOME=/scratch/hf", "--env", "A=b")
-    assert load_registry().require("gpubox").env == {"HF_HOME": "/scratch/hf", "A": "b"}
+    assert load_registry().require("gpubox").config.env == {"HF_HOME": "/scratch/hf", "A": "b"}
     assert fake_host.config is not None
     assert fake_host.config["env"] == {"HF_HOME": "/scratch/hf", "A": "b"}
 
@@ -369,8 +372,8 @@ def test_host_set_edits_one_field_and_leaves_the_rest(
     assert main(["host", "set", "gpubox", "--persistent-root", ROOT]) == 0
     entry = load_registry().require("gpubox")
     assert entry.persistent_root == ROOT
-    assert entry.gpus == ["GPU-a", "GPU-b"]
-    assert entry.idle_minutes == 7.0
+    assert entry.config.gpus == ["GPU-a", "GPU-b"]
+    assert entry.config.idle_minutes == 7.0
     assert entry.ssh == "gpubox"
 
 
@@ -380,13 +383,13 @@ def test_host_set_writes_the_gpu_list_through_to_the_host(
     add()
     assert main(["host", "set", "gpubox", "--gpus", "GPU-b,GPU-c"]) == 0
     assert fake_host.config is not None and fake_host.config["gpus"] == ["GPU-b", "GPU-c"]
-    assert load_registry().require("gpubox").gpus == ["GPU-b", "GPU-c"]
+    assert load_registry().require("gpubox").config.gpus == ["GPU-b", "GPU-c"]
 
 
 def test_host_set_can_hand_every_gpu_back(control_env: Path, fake_host: FakeHost) -> None:
     add()
     assert main(["host", "set", "gpubox", "--gpus", ""]) == 0
-    assert load_registry().require("gpubox").gpus == []
+    assert load_registry().require("gpubox").config.gpus == []
     assert fake_host.config is not None and fake_host.config["gpus"] == []
 
 
@@ -401,9 +404,9 @@ def test_host_set_can_clear_the_root(control_env: Path, fake_host: FakeHost) -> 
 def test_host_set_replaces_the_whole_env(control_env: Path, fake_host: FakeHost) -> None:
     add("--env", "A=1", "--env", "B=2")
     main(["host", "set", "gpubox", "--env", "B=3"])
-    assert load_registry().require("gpubox").env == {"B": "3"}
+    assert load_registry().require("gpubox").config.env == {"B": "3"}
     main(["host", "set", "gpubox", "--env", ""])
-    assert load_registry().require("gpubox").env == {}
+    assert load_registry().require("gpubox").config.env == {}
     assert fake_host.config is not None and fake_host.config["env"] == {}
 
 
@@ -429,7 +432,7 @@ def test_host_set_keeps_the_hf_home_a_new_env_did_not_mention(
 def test_host_set_changes_the_idle_timer(control_env: Path, fake_host: FakeHost) -> None:
     add()
     main(["host", "set", "gpubox", "--idle-min", "3"])
-    assert load_registry().require("gpubox").idle_minutes == 3.0
+    assert load_registry().require("gpubox").config.idle_minutes == 3.0
 
 
 def test_host_set_with_no_flags_says_so(

@@ -21,9 +21,9 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.cli import main
-from gpuc.control.config import load_registry
+from gpuc.control.s3index import LocalIndex
 from gpuc.host import scope
-from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch
+from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch, load_registry
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
 
@@ -400,7 +400,7 @@ def s3_bucket_configured() -> Iterator[None]:
             path.write_text(before)
 
 
-def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
+def test_requeue_resubmits_from_the_s3_spec_as_a_new_job_that_names_its_origin(
     bootstrapped_home: Path,
     workdir: Path,
     s3_bucket_configured: None,
@@ -424,8 +424,15 @@ def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
         assert main(["requeue", first, "--host", "local"]) == 0
     finally:
         os.chdir(cwd)
-    assert "attempt 2" in capsys.readouterr().out
+    assert f"requeued from {first}" in capsys.readouterr().out
     second = (_indexed_job_ids() - before).pop()
+    assert second != first
+    # The new job records where it came from, in the index and in the mirror
+    # the next requeue would read.
+    indexed = LocalIndex().get(second)
+    assert indexed is not None and indexed.requeued_from == first
+    mirrored = json.loads(fake.objects[f"bkt/gpuc/specs/{second}.json"])
+    assert (mirrored["job_id"], mirrored["requeued_from"]) == (second, first)
 
     wait_until(lambda: finished(home, second), 120, f"job {second} to finish")
     state = state_of(home, second)
@@ -654,10 +661,10 @@ def test_retention_days_reaches_the_host_config(
     # `config.json` is the only copy of this setting.
     assert main(["host", "set", "local", "--retention-days", "14"]) == 0
     assert json.loads((home / "config.json").read_text())["retention_days"] == 14.0
-    assert load_registry().require("local").retention_days == 14.0
+    assert load_registry().require("local").config.retention_days == 14.0
     assert main(["host", "set", "local", "--retention-days", ""]) == 0
     assert json.loads((home / "config.json").read_text())["retention_days"] is None
-    assert load_registry().require("local").retention_days is None
+    assert load_registry().require("local").config.retention_days is None
 
 
 def test_workdir_days_reaches_the_host_config(
@@ -671,4 +678,4 @@ def test_workdir_days_reaches_the_host_config(
     assert json.loads((home / "config.json").read_text())["workdir_days"] == 3.0
     assert main(["host", "set", "local", "--workdir-days", ""]) == 0
     assert json.loads((home / "config.json").read_text())["workdir_days"] is None
-    assert load_registry().require("local").workdir_days is None
+    assert load_registry().require("local").config.workdir_days is None

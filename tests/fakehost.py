@@ -3,7 +3,8 @@
 `gpuc host add` reads the host's `config.json` (and writes its first one), and
 `gpuc host set` writes through to it, so a CLI test that registers a host needs
 something on the other end of the transport. This is that: a dict of files,
-plus the handful of commands those two paths send.
+plus the handful of commands those paths send -- and the interpreter probe a
+session runs on a host with no cached interpreter, so a test entry needs none.
 """
 
 from __future__ import annotations
@@ -16,9 +17,8 @@ from typing import Any
 
 import pytest
 
-from gpuc.control.remote import NO_CONFIG
+from gpuc.control.remote import NO_CONFIG, PYTHON_PROBE
 from gpuc.control.transport import CommandResult
-from gpuc.host import jobs
 
 HOME = "/home/u"
 GPU_ROWS = ["0, GPU-a, NVIDIA A40, 46068 MiB", "1, GPU-b, NVIDIA A40, 46068 MiB"]
@@ -73,11 +73,8 @@ class FakeHost:
             return 0, body if body is not None else NO_CONFIG
         if "say()" in command:
             return 0, "".join(f"==={name}===\n{body}\n" for name, body in PROBE_SECTIONS.items())
-        if "-m gpuc.host config --merge" in command:
-            patch = json.loads(self.files[command.rsplit(" ", 1)[1]])
-            merged = jobs.merged_config(self.config or {}, patch)
-            self.files[f"{self.home}/config.json"] = json.dumps(merged)
-            return 0, json.dumps(merged)
+        if command == PYTHON_PROBE:
+            return 0, PROBE_SECTIONS["python3"] + "\n"
         if command.startswith("mv -f "):
             source, target = shlex.split(command)[2:4]
             self.files[target] = self.files.pop(source, "")
@@ -112,6 +109,6 @@ def fake_host(monkeypatch: pytest.MonkeyPatch) -> FakeHost:
         host.home = entry.remote_home.replace("$HOME", HOME)
         return host
 
-    for module in ("connect", "probe", "cli"):
+    for module in ("connect", "probe", "cli", "remote", "bootstrap"):
         monkeypatch.setattr(f"gpuc.control.{module}.transport_for", factory, raising=False)
     return host

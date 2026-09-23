@@ -10,19 +10,22 @@ from gpuc.control.config import (
     ConfigError,
     HostEntry,
     Registry,
+    Rental,
+    Settings,
     config_changes,
     config_drift,
+    first_config,
     forget_host,
-    load_registry,
     load_settings,
     registry_transaction,
     save_registry,
-    state_lock,
     transport_for,
 )
+from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.transport import LocalTransport, SshTransport
+from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import HostConfig
-from tests.conftest import SEEN_AT, host_entry
+from tests.conftest import SEEN_AT, host_entry, load_registry
 
 
 def test_settings_default_when_no_file(control_env: Path) -> None:
@@ -79,7 +82,7 @@ def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:
     the last connect left behind, not from anything the registry decides."""
     entry = host_entry(
         name="pod1",
-        kind="runpod",
+        kind="rental",
         pod_id="abc",
         gpus=["GPU-a"],
         retention_days=1.0,
@@ -87,36 +90,53 @@ def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:
         env={"HF_HOME": "/big"},
         cache_dir="/vol/uv",
     )
-    assert (entry.gpus, entry.retention_days, entry.s3_prefix) == (
+    assert (entry.config.gpus, entry.config.retention_days, entry.config.s3_prefix) == (
         ["GPU-a"],
         1.0,
         "s3://bucket/gpuc/pod1",
     )
-    assert entry.env == {"HF_HOME": "/big", "UV_CACHE_DIR": "/vol/uv"}
+    assert entry.config.env == {"HF_HOME": "/big", "UV_CACHE_DIR": "/vol/uv"}
     assert entry.config.ephemeral
     assert entry.seen_at == SEEN_AT
     # Nothing is known about a host nobody has read yet, and it says so.
     blank = HostEntry(name="gpubox", ssh="me@box")
-    assert (blank.gpus, blank.s3_prefix, blank.seen_at) == ([], None, None)
+    assert (blank.config.gpus, blank.config.s3_prefix, blank.seen_at) == ([], None, None)
 
 
-def test_the_provider_block_comes_from_the_address_for_a_config_we_initialise() -> None:
-    address = HostEntry(name="pod1", pod_id="abc")
-    assert address.provider() == {"kind": "runpod", "pod_id": "abc"}
-    assert HostEntry(name="local").provider() is None
-    initial = address.initial_config()
-    assert (initial.host, initial.provider) == ("pod1", {"kind": "runpod", "pod_id": "abc"})
-    assert initial.created_at
+def test_the_provider_block_comes_from_the_rental_for_a_config_we_initialise() -> None:
+    address = HostEntry(name="pod1", rental=Rental(pod_id="abc"))
+    assert address.provider_block() == {"kind": "runpod", "pod_id": "abc"}
+    assert HostEntry(name="local").provider_block() is None
+    initial = first_config(address, Settings(s3_bucket="b"))
+    assert (initial["host"], initial["provider"]) == ("pod1", {"kind": "runpod", "pod_id": "abc"})
+    assert initial["created_at"]
+    assert initial["s3_prefix"] == "s3://b/gpuc/pod1"
+
+
+def test_first_config_owns_every_card_seen_less_the_shared_ones() -> None:
+    """The one constructor for a host that has none: the same defaults for a
+    box, a pod and a wiped home, and overrides on top."""
+    address = HostEntry(name="box", ssh="me@box").with_cache(
+        gpu_info={"GPU-a": GpuInfo(index=0), "GPU-b": GpuInfo(index=1)}
+    )
+    document = first_config(address, Settings(), {"shared_gpus": ["1"], "idle_minutes": 5.0})
+    assert document["gpus"] == ["GPU-a"]
+    assert document["shared_gpus"] == ["1"]
+    assert (document["idle_minutes"], document["workdir_days"], document["s3_prefix"]) == (
+        5.0,
+        DEFAULT_WORKDIR_DAYS,
+        None,
+    )
+    assert first_config(address, Settings(), {"gpus": ["GPU-b"]})["gpus"] == ["GPU-b"]
 
 
 def test_a_rental_is_an_address_with_a_pod_behind_it() -> None:
-    """Only a pod id makes an entry a rental, and only a rental implies a
-    provider block."""
-    assert HostEntry(name="pod1", pod_id="abc").ephemeral
-    assert HostEntry(name="box", ssh="me@box", pod_id="abc").ephemeral
+    """Only `rental` makes an entry a rental; `ssh` says nothing about it."""
+    assert HostEntry(name="pod1", rental=Rental(pod_id="abc")).ephemeral
+    assert HostEntry(name="box", ssh="me@box", rental=Rental(pod_id="abc")).pod_id == "abc"
     podless = HostEntry(name="pod1", ssh="root@1.2.3.4")
-    assert not podless.ephemeral
-    assert podless.provider() is None
+    assert not podless.ephemeral and podless.pod_id is None
+    assert podless.provider_block() is None
     assert not HostEntry(name="local").ephemeral
 
 
@@ -125,29 +145,21 @@ def test_a_rental_is_an_address_with_a_pod_behind_it() -> None:
     [
         ({}, "local"),
         ({"ssh": "me@box"}, "ssh"),
-        ({"ssh": "root@1.2.3.4", "pod_id": "abc"}, "runpod"),
-        ({"pod_id": "abc"}, "runpod"),
-        # A stored `kind` is a key this build no longer reads: the address decides.
+        ({"ssh": "root@1.2.3.4", "rental": {"provider": "runpod", "pod_id": "abc"}}, "rental"),
+        ({"rental": {"pod_id": "abc"}}, "rental"),
+        # A stored `kind` is a key this build does not read: the address decides.
         ({"kind": "ssh"}, "local"),
-        ({"kind": "runpod", "ssh": "me@box"}, "ssh"),
-        ({"kind": "local", "pod_id": "abc"}, "runpod"),
+        ({"kind": "rental", "ssh": "me@box"}, "ssh"),
     ],
 )
 def test_kind_is_what_the_address_says(address: dict[str, str], kind: str) -> None:
     entry = HostEntry.model_validate({"name": "h", **address})
     assert entry.kind == kind
-    assert entry.model_copy(update={"kind": "ssh"}).kind == kind
 
 
-def test_kind_is_written_for_older_builds_and_ignored_on_the_way_back() -> None:
-    """Derived, so nothing stored can disagree with it -- but still written,
-    because the build before this one reads it and defaults a missing one to
-    `local`, which sends every command for an ssh host to this machine."""
+def test_kind_is_derived_and_never_written() -> None:
     entry = HostEntry(name="box", ssh="me@box")
-    assert json.loads(entry.model_dump_json())["kind"] == "ssh"
-    stored = json.loads(entry.model_dump_json())
-    stored["kind"] = "runpod"
-    assert HostEntry.model_validate(stored).kind == "ssh"
+    assert "kind" not in json.loads(entry.model_dump_json())
 
 
 def test_a_pre_split_registry_entry_parses_as_an_address_with_an_empty_cache() -> None:
@@ -168,21 +180,21 @@ def test_a_pre_split_registry_entry_parses_as_an_address_with_an_empty_cache() -
         }
     )
     assert (entry.name, entry.kind, entry.ssh) == ("gpubox", "ssh", "me@box")
-    assert entry.gpus == []
+    assert entry.config.gpus == []
     assert entry.python is None
-    assert entry.env == {}
-    assert entry.pkg_commit is None
+    assert entry.config.env == {}
+    assert entry.config.pkg_commit is None
     assert entry.seen_at is None
 
 
 def test_with_config_and_with_cache_stamp_when_the_host_was_read() -> None:
     entry = HostEntry(name="gpubox", ssh="me@box")
     read = entry.with_config({"host": "gpubox", "gpus": ["0"]}, read_at="2026-01-01T00:00:00+00:00")
-    assert read.gpus == ["0"]
+    assert read.config.gpus == ["0"]
     assert read.seen_at == "2026-01-01T00:00:00+00:00"
     # A later probe keeps the cards it already had names for.
     probed = read.with_cache(python="/usr/bin/python3", read_at="2026-01-02T00:00:00+00:00")
-    assert probed.gpus == ["0"]
+    assert probed.config.gpus == ["0"]
     assert probed.python == "/usr/bin/python3"
     assert probed.seen_at == "2026-01-02T00:00:00+00:00"
 
@@ -260,10 +272,12 @@ def test_config_changes_names_every_key_a_flag_would_change_on_the_host() -> Non
 
 
 def test_config_drift_is_quiet_about_a_config_just_written() -> None:
-    entry = host_entry(name="gpuc-1", kind="runpod", pod_id="pod-1", gpus=["GPU-a"])
+    entry = host_entry(name="gpuc-1", kind="rental", pod_id="pod-1", gpus=["GPU-a"])
     assert config_drift(entry.config.to_dict(), entry.config) == []
     # A difference in the provider block reads as a sentence, not as punctuation.
-    fresh = HostEntry(name="gpuc-1", pod_id="pod-2").initial_config()
+    fresh = HostConfig.from_dict(
+        first_config(HostEntry(name="gpuc-1", rental=Rental(pod_id="pod-2")), Settings())
+    )
     assert config_drift({"provider": {"kind": "runpod", "pod_id": "pod-1"}}, fresh) == [
         "provider kind=runpod pod_id=pod-1 -> kind=runpod pod_id=pod-2"
     ]
@@ -282,11 +296,8 @@ def test_forgetting_a_pod_leaves_a_different_host_of_the_same_name_alone(
     with registry_transaction() as registry:
         registry.put(mine)
 
-    with state_lock():
-        forget_host("shared", "podX")
-
+    assert not forget_host("shared", "podX")
     assert load_registry().hosts["shared"].ssh == "me@box"  # not this pod's entry
 
-    with state_lock():
-        forget_host("shared", None)  # no pod named: forget the host too
+    assert forget_host("shared", None)  # no pod named: forget the host too
     assert load_registry().hosts == {}

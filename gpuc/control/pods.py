@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuc.control.config import Settings, load_registry
+from gpuc.control.config import Settings, open_registry
 from gpuc.control.providers.base import Pod, Provider, owned_pods
 from gpuc.control.provision import CEILING_MINUTES, dispatcher_heartbeat_age
 from gpuc.control.status import format_duration
@@ -107,15 +107,15 @@ def gather(
     ours = owned_pods(pods, provider.prefix)
     ours_ids = {pod.id for pod in ours}
     others = [pod for pod in pods if pod.id not in ours_ids]
-    registry = load_registry()
-    by_pod_id = {e.pod_id: e for e in registry.hosts.values() if e.pod_id}
+    registry = open_registry().registry
+    by_pod_id = {e.rental.pod_id: e for e in registry.hosts.values() if e.rental is not None}
 
     for pod in sorted(ours, key=lambda p: p.name):
         entry = by_pod_id.get(pod.id)
         # Only bootstrapped, running hosts can answer; anything else costs an ssh timeout.
         age = (
             dispatcher_heartbeat_age(entry, settings)
-            if heartbeats and entry is not None and entry.python and pod.status == "RUNNING"
+            if heartbeats and entry is not None and pod.status == "RUNNING"
             else None
         )
         view.rows.append(
