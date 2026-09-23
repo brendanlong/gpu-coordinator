@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import json
 import re
+import urllib.error
 from collections.abc import Callable
 from pathlib import Path
 
@@ -333,6 +334,47 @@ def test_a_local_ssh_misconfiguration_ends_the_attempt_at_the_first_pod(
     assert load_registry().hosts == {}
 
 
+def test_a_tool_missing_on_this_machine_ends_the_attempt_at_the_first_pod(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    """A missing local `rsync` is rc 127 from the transport, which read as
+    "next offer" bought and terminated one pod per offer; a missing `ssh`
+    read as "keep waiting" and billed the first pod to the ceiling. Neither
+    is the offer's, so the first pod is terminated and the attempt stops."""
+    from gpuc.control.transport import CommandResult, LocalToolMissing
+
+    provider = FakeProvider(
+        [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")]
+    )
+
+    def no_rsync(*args: object, **kwargs: object) -> CommandResult:
+        raise LocalToolMissing(
+            CommandResult("fake", ["rsync"], 127, "", "rsync not found on this machine")
+        )
+
+    host.rsync = no_rsync  # type: ignore[method-assign]
+    with pytest.raises(ProvisionError) as error:
+        run(provider, host, offline_health, now=ticking())
+    message = str(error.value)
+    assert "no other offer could fix this" in message
+    assert "rsync not found on this machine" in message
+    assert len(provider.created) == 1
+    assert provider.terminated == ["pod1"]
+    assert load_registry().hosts == {}
+
+
+def test_an_unreadable_identity_file_ends_the_attempt_too(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    provider = FakeProvider([make_offer(price=0.20, gpu_id="first"), make_offer(gpu_id="second")])
+    host.refuse = 99
+    host.refusal = "Warning: Identity file /home/me/.ssh/id_ed25519 not accessible: No such file"
+    with pytest.raises(ProvisionError) as error:
+        run(provider, host, offline_health, now=ticking())
+    assert "no other offer could fix this" in str(error.value)
+    assert len(provider.created) == 1 and provider.terminated == ["pod1"]
+
+
 def test_health_failure_terminates_and_forgets(
     control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
@@ -414,6 +456,51 @@ def test_a_terminate_the_provider_will_not_confirm_is_a_failure(
         run(provider, host, impossible, reports=reports)
     assert "still RUNNING" in "\n".join(reports)
     assert "could NOT be terminated" in str(error.value)
+
+
+def test_a_read_that_fails_inside_the_confirm_loop_is_asked_again() -> None:
+    """The POST went through; one 5xx on the poll after it must not report
+    the pod as still billing when the next poll would have confirmed it."""
+    provider = FakeProvider()
+    provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
+    real = provider.get
+    reads = [0]
+
+    def flaky(pod_id: str) -> Pod | None:
+        reads[0] += 1
+        if reads[0] == 1:
+            raise ProviderError("HTTP 502 from runpod")
+        return real(pod_id)
+
+    provider.get = flaky  # type: ignore[method-assign]
+    reports: list[str] = []
+    provider.terminate_confirmed("pod1", report=reports.append, sleep=lambda _: None)
+    assert provider.terminated == ["pod1"]
+    assert any("asking again" in line for line in reports)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.URLError("name resolution failed"),
+        TimeoutError("timed out"),
+        OSError(104, "reset"),
+    ],
+)
+def test_a_network_failure_at_the_provider_is_a_provider_error(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Everything on the terminate path catches `ProviderError` to say "still
+    billing"; a `URLError` or a reset escaping as `OSError` said nothing."""
+    from gpuc.control.providers.runpod import RunPodProvider
+
+    def down(*_: object, **__: object) -> object:
+        raise error
+
+    monkeypatch.setattr("urllib.request.urlopen", down)
+    with pytest.raises(ProviderError) as caught:
+        RunPodProvider(api_key="k").get("pod1")
+    assert "GET" in str(caught.value) and "/pods/pod1" in str(caught.value)
 
 
 def test_a_public_key_path_is_the_private_one_plus_pub(control_env: Path, tmp_path: Path) -> None:

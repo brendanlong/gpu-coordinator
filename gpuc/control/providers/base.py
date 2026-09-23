@@ -157,9 +157,16 @@ class Provider(ABC):
                     f"terminate {pod_id} failed ({exc}); retrying in {self.terminate_retry_s:g}s"
                 )
                 sleep(self.terminate_retry_s)
-        status = ""
+        status = "unread"
         for _ in range(self.confirm_polls):
-            pod = self.get(pod_id)
+            try:
+                pod = self.get(pod_id)
+            except ProviderError as exc:
+                # The terminate went through; one 5xx on the read must not
+                # turn that into "could not confirm, still billing".
+                report(f"could not read pod {pod_id} after the terminate ({exc}); asking again")
+                sleep(self.confirm_poll_s)
+                continue
             if self.is_gone(pod):
                 return
             assert pod is not None

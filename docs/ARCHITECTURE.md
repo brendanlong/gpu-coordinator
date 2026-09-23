@@ -985,8 +985,9 @@ name to its class. Adding a provider is one class and one table entry.
    failed while the pod is still coming up), *next offer* (the pod is dead,
    its host is broken by the provider's `broken_host` signature, its health
    failed, or anything else about that pod or the provider), or *abort* (a
-   local ssh misconfiguration, the ceiling, a Ctrl-C or a bug -- nothing
-   another pod could fix). The pod is terminated on the way out of either of
+   local ssh misconfiguration, an `ssh` or `rsync` this machine does not
+   have (`transport.LocalToolMissing`), the ceiling, a Ctrl-C or a bug --
+   nothing another pod could fix). The pod is terminated on the way out of either of
    the last two, through the one `Provider.terminate_confirmed`, which retries
    the call and waits for the provider to confirm; a terminate it could not
    confirm is reported loudly and leaves the registry entry in place, and

@@ -114,6 +114,12 @@ class RunPodProvider(Provider):
                 if error.code == 404:
                     raise PodNotFound(method, url, error.code, text) from error
                 raise RunPodError(method, url, error.code, text) from error
+            except OSError as error:
+                # A `URLError` (DNS, refused), a socket timeout or a reset:
+                # every caller that catches `ProviderError` -- the terminate
+                # that must say "still billing", the confirm loop -- would
+                # otherwise let it through as a traceback and say nothing.
+                raise ProviderError(f"{method} {url}: {error}") from error
         raise AssertionError("unreachable: the last attempt raises")
 
     def _json(

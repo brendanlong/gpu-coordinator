@@ -46,17 +46,20 @@ def reason_of(exc: BaseException) -> str:
     """One line saying why a host could not be asked.
 
     The last non-empty line of the stderr the failed command carried, when
-    the error (or the one it wraps) carries a `CommandResult`: that is where
-    ssh puts `Connection refused`, `Permission denied (publickey)` and `Host
-    key verification failed`, while the first line of a `TransportError` is
-    the argv, which names nothing. Otherwise the first line of the message.
+    the error carries a `CommandResult` -- or is a `RemoteError` wrapping one,
+    whose own first line repeats the argv: that is where ssh puts `Connection
+    refused`, `Permission denied (publickey)` and `Host key verification
+    failed`, while the first line of a `TransportError` is the argv, which
+    names nothing. Otherwise the first line of the message: an error with
+    words of its own keeps them.
     """
-    for error in (exc, exc.__cause__):
-        result = getattr(error, "result", None)
-        if isinstance(result, CommandResult):
-            lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
-            if lines:
-                return lines[-1]
+    result = getattr(exc, "result", None)
+    if result is None and isinstance(exc, RemoteError):
+        result = getattr(exc.__cause__, "result", None)
+    if isinstance(result, CommandResult):
+        lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
     lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
     return lines[0] if lines else type(exc).__name__
 

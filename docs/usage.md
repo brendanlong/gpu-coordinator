@@ -428,8 +428,9 @@ The same flags work on `gpuc submit` and `gpuc requeue`:
 SSH endpoint, bootstrap, health check, enqueue. A failure of that pod
 terminates it and moves to the next offer, all inside **one 15-minute ceiling
 for the whole attempt**; an offer the ceiling leaves no time for is listed as
-untried. A failure no pod could fix -- a local ssh misconfiguration -- ends the
-attempt at the first pod instead of buying another.
+untried. A failure no pod could fix -- a local ssh misconfiguration, an unreadable
+key file, or an `ssh`/`rsync` this machine does not have -- ends the attempt at
+the first pod instead of buying another.
 
 **Reuse** is the default: a registered rental whose recorded offer still
 matches the request, that owns at least `--gpu-count` cards, whose pod is
