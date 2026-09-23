@@ -450,6 +450,10 @@ def _spawn_host_process(*args: str, label: str) -> subprocess.Popen[bytes]:
     all -- which the runner reads as a stop and ends the job `terminated`,
     forty minutes into a run nobody asked to stop. `systemd-run --scope`
     execs the command in place, so the pid returned is still the process.
+
+    The scope lives under the user's systemd instance, so a host whose user
+    manager stops at logout needs `loginctl enable-linger` -- the same thing
+    the dashboard's unit needs on the control side.
     """
     package_root = Path(__file__).resolve().parents[2]
     paths.ensure_layout()

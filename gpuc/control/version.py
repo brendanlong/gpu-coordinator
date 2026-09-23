@@ -7,6 +7,13 @@ registry is exactly the failure this exists to make visible.
 
 One comparison, `is_other_build`, and it is strict: a host that names no
 commit is re-shipped, and a dirty checkout is not the commit it sits on.
+
+The package is the one thing a host cannot own, because it is shipped to it:
+two machines on different commits bootstrapping the same box leave it running
+whichever shipped last, and neither registry can see the other's. So the
+authoritative copy of what a host runs is its own `config.json` `pkg_commit`,
+written by every bootstrap and reported back by `python -m gpuc.host status`;
+the registry's copy is a cache, labelled with its age.
 """
 
 from __future__ import annotations

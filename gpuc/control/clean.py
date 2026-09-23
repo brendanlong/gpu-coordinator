@@ -399,6 +399,9 @@ echo "before_kib=$(du -sk "$cache" 2>/dev/null | cut -f1)"
 echo "after_kib=$(du -sk "$cache" 2>/dev/null | cut -f1)"
 echo "dir=$cache"
 """
+"""`uv cache prune`, never `uv cache clean`: prune drops only what no
+installed venv links to, while clean would throw away the wheels the next
+job's `uv sync` wants to link out of the cache and re-download every one."""
 
 
 @dataclass

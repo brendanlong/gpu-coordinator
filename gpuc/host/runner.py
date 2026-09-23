@@ -512,6 +512,8 @@ class JobRunner:
             stopped = self._stopped_before("preflight", sync_loop, log)
             if stopped is not None:
                 return stopped
+            # A phase of its own, not the tail of `setup`: `gpuc status` can
+            # then tell "still installing torch" from "proving the card works".
             code = self._run_phase(
                 "preflight", self.deps.preflight_command(self.spec), env, log, job_start
             )

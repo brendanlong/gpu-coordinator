@@ -840,6 +840,15 @@ class HostConfig:
     schema_version: int = SCHEMA_VERSION
     host: str = "local"
     gpus: list[str] = field(default_factory=list)
+    """The cards this host owns, stored exactly as they were given: nvidia-smi
+    indices, UUIDs, or a mix.
+
+    An index is how a share of a shared box is agreed ("you get 2 and 3"), and
+    resolving it to a UUID at registration would freeze one boot's numbering
+    into a file nobody looks at again. So the entry stays as typed and every
+    reader resolves it against the live table (`gpus.resolve`); everything
+    downstream of that is UUIDs.
+    """
     shared_gpus: list[str] = field(default_factory=list)
     """Cards on this box that gpuc may *borrow*, spelled like `gpus`.
 
@@ -848,6 +857,11 @@ class HostConfig:
     (`use_shared`), only after the owned cards are full, and only while
     nvidia-smi says the card holds no memory and is doing no work. Nothing
     here is counted as capacity for a job that did not ask.
+
+    There is deliberately no per-host floor on which jobs may borrow (a
+    minimum priority, say): borrowing is not a reservation, so a floor would
+    never protect an important job from a trivial one, only keep the card
+    idle.
     """
     provider: dict[str, Any] | None = None
     idle_minutes: float = 15.0
