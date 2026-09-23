@@ -72,9 +72,9 @@ and delivered to the host in a 0600 file. It never appears in the job's
 command. A storage plugin's credentials are passed the same way.
 
 **Status.** Every poll is one `gpuc status --json` covering every job in
-flight, restricted with `--host` when they are all on one host. A job whose
-host could not be asked is waited for. A job no host lists any more is looked
-up with `gpuc wait`, which reads the S3 mirror for a rental that has ended.
+flight. A job whose host could not be asked stays in flight, and the host's
+reason is printed. A job its host no longer has, or whose host is gone, has
+failed.
 
 **A killed controller.** Ctrl-C cancels the workflow's gpuc jobs, but a
 controller that is killed outright leaves them queued and running. Started

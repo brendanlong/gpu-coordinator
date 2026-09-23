@@ -167,12 +167,19 @@ def test_status_is_indexed_across_hosts_and_lists() -> None:
                     "running": [{"job_id": "r", "status": "running"}],
                     "finished": [{"job_id": "f", "status": "failed", "reason": "exit 3"}],
                 },
-                {"name": "b", "state": "unaskable", "queued": [], "running": [], "finished": []},
+                {
+                    "name": "b",
+                    "state": "unaskable",
+                    "errors": ["ssh: timed out"],
+                    "queued": [],
+                    "running": [],
+                    "finished": [],
+                },
             ]
         }
     )
     assert jobs == {"q": ("queued", None), "r": ("running", None), "f": ("failed", "exit 3")}
-    assert states == {"a": "answered", "b": "unaskable"}
+    assert states == {"a": ("answered", None), "b": ("unaskable", "ssh: timed out")}
 
 
 def test_resources_given_as_strings_still_read_as_flags() -> None:

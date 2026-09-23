@@ -130,7 +130,7 @@ class Executor(RemoteExecutor):
                 "so it would not be in the job's copy of that directory; run snakemake "
                 "from a directory that contains it"
             )
-        self.unaskable_warned: set[str] = set()
+        self.unaskable_shown: dict[str, str | None] = {}
         # Every job submitted and not yet over. Snakemake's own `active_jobs`
         # is emptied for the length of each poll, and a poll here is an ssh
         # round trip to every host: a Ctrl-C landing in one would cancel
@@ -215,74 +215,46 @@ class Executor(RemoteExecutor):
         self, active_jobs: list[SubmittedJobInfo]
     ) -> AsyncGenerator[SubmittedJobInfo, None]:
         """One `gpuc status` for every active job, not one per job: each asks
-        every host over ssh, and a sweep has hundreds of jobs in flight."""
+        every host over ssh, and a sweep has hundreds of jobs in flight.
+
+        A job its host lists has the host's status. A job whose host could not
+        be asked is neither: it stays active, and the host's reason is shown.
+        Any other job no longer exists -- its host answered without it, is
+        gone, or is not registered here -- and has failed."""
         if not active_jobs:
             return
-        hosts = {(info.aux or {}).get("host") for info in active_jobs}
-        argv = ["status", "--json", "--recent", str(RECENT_ALL)]
-        if len(hosts) == 1 and None not in hosts:
-            argv += ["--host", str(next(iter(hosts)))]
         async with self.status_rate_limiter:
             try:
-                try:
-                    document = self.gpuc(argv, ok_codes=(0, 1))
-                except GpucError:
-                    if "--host" not in argv:
-                        raise
-                    # The one host may have been forgotten here since (a
-                    # rental somebody else's `gpuc status` found gone), and
-                    # `--host` of a name this machine does not know is an
-                    # error. Asked without it, its jobs go to `settle_missing`.
-                    document = self.gpuc(argv[: argv.index("--host")], ok_codes=(0, 1))
+                document = self.gpuc(
+                    ["status", "--json", "--recent", str(RECENT_ALL)], ok_codes=(0, 1)
+                )
             except GpucError as exc:
                 self.logger.info(f"gpuc status failed, asking again later: {exc}")
                 for info in active_jobs:
                     yield info
                 return
 
-        jobs, host_states = index_status(document)
+        jobs, hosts = index_status(document)
+        for host, (state, reason) in hosts.items():
+            shown = self.unaskable_shown.get(host)
+            if state == "unaskable" and shown != reason:
+                self.logger.info(f"gpuc host {host} could not be asked: {reason}")
+            self.unaskable_shown[host] = reason if state == "unaskable" else None
         for info in active_jobs:
             job_id = info.external_jobid or ""
-            host = (info.aux or {}).get("host")
-            seen = jobs.get(job_id)
-            if seen is None:
-                asked = host_states.values() if host is None else [host_states.get(host)]
-                if "unaskable" in asked:
-                    if job_id not in self.unaskable_warned:
-                        self.unaskable_warned.add(job_id)
-                        self.logger.info(f"gpuc job {job_id}: its host could not be asked")
-                    yield info
-                    continue
-                seen = self.settle_missing(job_id, host)
-            status, reason = seen
+            host = (info.aux or {}).get("host") or ""
+            state, _ = hosts.get(host, ("not registered here", None))
+            status, reason = jobs.get(job_id, (None, None))
             if status == "succeeded":
                 self.report_job_success(info)
-            elif status in FAILED or status is None:
-                label = status or "lost"
-                why = f"{label}: {reason}" if reason else label
+            elif status in FAILED:
+                why = f"{status}: {reason}" if reason else status
                 self.report_job_error(info, msg=f"gpuc job {job_id} {why}; `gpuc logs {job_id}`.\n")
-            else:
+            elif status is not None or state == "unaskable":
                 yield info
-
-    def settle_missing(self, job_id: str, host: str | None) -> tuple[str | None, str | None]:
-        """A job no host listed: its host is gone, or no longer has it.
-
-        `gpuc wait` is what reads the S3 mirror for a gone host, and it answers
-        at once for a job that has ended, which a job nobody lists has. A host
-        that stops answering between the `status` and this is the one case it
-        does not: `wait` gives it five minutes, and then the job is reported
-        lost although it may still be running."""
-        argv = ["wait", job_id, "--json"]
-        if host:
-            argv += ["--host", host]
-        try:
-            document = self.gpuc(argv, ok_codes=(0, 1, 4))
-        except GpucError as exc:
-            return None, str(exc)
-        final = next(iter(document.get("jobs") or []), {})
-        if final.get("error"):
-            return None, str(final["error"])
-        return final.get("status"), final.get("reason")
+            else:
+                lost = "has no such job" if state == "answered" else f"is {state}"
+                self.report_job_error(info, msg=f"gpuc job {job_id}: host {host} {lost}.\n")
 
     def report_job_success(self, job_info: SubmittedJobInfo) -> None:
         self.settled(job_info)
@@ -358,12 +330,14 @@ class Executor(RemoteExecutor):
 
 def index_status(
     document: Mapping[str, Any],
-) -> tuple[dict[str, tuple[str, str | None]], dict[str, str]]:
-    """`gpuc status --json` as `{job_id: (status, reason)}` and `{host: state}`."""
+) -> tuple[dict[str, tuple[str, str | None]], dict[str, tuple[str, str | None]]]:
+    """`gpuc status --json` as `{job_id: (status, reason)}` and
+    `{host: (state, first error)}`."""
     jobs: dict[str, tuple[str, str | None]] = {}
-    states: dict[str, str] = {}
+    states: dict[str, tuple[str, str | None]] = {}
     for host in document.get("hosts") or []:
-        states[host.get("name")] = host.get("state")
+        errors = host.get("errors") or []
+        states[host.get("name")] = (host.get("state"), errors[0] if errors else None)
         for key in ("queued", "running", "finished"):
             for job in host.get(key) or []:
                 jobs[job["job_id"]] = (job.get("status"), job.get("reason"))
