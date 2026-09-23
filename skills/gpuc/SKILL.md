@@ -199,9 +199,11 @@ mirror at once, exit 0; a job the mirror has no final state for is exit 1.
 
 **A graph of jobs** (train, then evaluate, for every seed) is a Snakefile, not
 a script around `gpuc wait`: `snakemake --executor gpuc --gpuc-host <host>`
-submits each Snakemake job as a gpuc job. Outputs must be in a directory the
-controller can see, or in object storage; `docs/snakemake.md` in the repo has
-both layouts.
+submits each Snakemake job as a gpuc job. Run that controller inside tmux, not
+as a background shell job: it has no persistence of its own, and one that dies
+leaves its gpuc jobs running and submits them again when restarted. Outputs
+must be in a directory the controller can see, or in object storage;
+`docs/snakemake.md` in the repo has both layouts.
 
 ## Exit codes and `--json` (read this before scripting anything)
 

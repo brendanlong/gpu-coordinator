@@ -32,6 +32,11 @@ refused):
 uv run snakemake --executor gpuc --gpuc-host spar --jobs 20
 ```
 
+**Run it in tmux** (or another session that outlives your terminal). The
+controller is an ordinary foreground process: nothing in gpuc keeps it alive,
+and a controller that dies leaves its jobs behind (see [a killed
+controller](#a-killed-controller) below).
+
 `--jobs` is how many gpuc jobs are queued or running at once. The host's
 queue decides how many of those actually run.
 
@@ -76,6 +81,7 @@ flight. A job whose host could not be asked stays in flight, and the host's
 reason is printed. A job its host no longer has, or whose host is gone, has
 failed.
 
+<a name="a-killed-controller"></a>
 **A killed controller.** Ctrl-C cancels the workflow's gpuc jobs, but a
 controller that is killed outright leaves them queued and running. Started
 again, it submits them again. Cancel the old ones first; `gpuc status` lists
