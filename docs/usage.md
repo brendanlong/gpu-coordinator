@@ -323,7 +323,8 @@ this build does not know are dropped rather than refused.
 `--host` is optional on `logs`, `wait`, `cancel`, `preempt`, `reorder`,
 `estimate` and `requeue`: the local job index is tried first, then every
 registered host is asked whether it knows the id. An unknown host is exit 4, and
-so is a job no host knows -- once every host has answered. A host the index
+so is a job no host knows -- once every host has answered -- and a job the host
+you named answers it does not have. A host the index
 names that cannot be reached still holds the job as far as anything knows:
 `logs` and `wait` read the mirror, and every other verb is exit 1 with the
 reason, never "no such job".

@@ -596,8 +596,10 @@ hold to, whatever the flags:
   it is asked first rather than believed; the local index's name is this
   machine's and is trusted. Every per-job verb runs through
   `actions.job_verb`: locate the job, ask its host over the one session the
-  lookup opened, insist on a verdict, re-mirror a spec field it changed. The
-  CLI and the dashboard call the same functions.
+  lookup opened, insist on a verdict, re-mirror a spec field it changed. A
+  host's refusal is its `{error}` document; one that also says `missing`
+  is the host answering "no such job", and is exit 4 like any other unknown
+  name. The CLI and the dashboard call the same functions.
 - What a command does lives in `actions` (with `hosts` and `submitting` for
   the host and submit commands), one function per command returning an
   `Answer`: the document its `--json` form prints, the text form, and what

@@ -391,6 +391,32 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
     return home
 
 
+def test_a_verb_on_an_id_the_host_does_not_have_is_exit_four_with_its_reason(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host's own `no such job` answer, through `cancel` and `reorder`
+    for real: exit 4, not "the host could not be asked" or a refusal."""
+    assert main(["cancel", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    assert document["exit_code"] == EXIT_NOT_FOUND
+    assert "no such job" in document["error"] and "host local has no job" in document["error"]
+    assert (
+        main(["reorder", "20260101-000000-aaaaaa", "--priority", "1", "--host", "local"])
+        == EXIT_NOT_FOUND
+    )
+    assert "no job 20260101-000000-aaaaaa on this host" in capsys.readouterr().err
+
+
+def test_a_verb_the_host_refuses_for_a_job_it_has_is_exit_one(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The job is there and the host will not: that is a refusal, never 4."""
+    assert main(["reorder", RUNNING_JOB, "--priority", "1", "--host", "local"]) == EXIT_ERROR
+    assert "not queued (status running)" in capsys.readouterr().err
+    assert main(["estimate", FINISHED_JOB, "--minutes", "5", "--host", "local"]) == EXIT_ERROR
+    assert "already failed" in capsys.readouterr().err
+
+
 def test_status_json_is_one_document_with_the_promised_shape(
     real_local_host: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

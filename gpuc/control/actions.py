@@ -671,9 +671,11 @@ def job_verb(
 
     `check=False` on the host call: a refusal (a finished job, an id this host
     does not know) *is* the host's document, and raising on the exit code
-    would throw away the reason it gave. An answer with no `status` is an
-    error too: reporting success for a job the host never touched is worse
-    than any exception.
+    would throw away the reason it gave. A refusal that says `missing` is
+    the host answering "no such job", exit 4 like every other unknown name,
+    and told apart from a refusal of a job that is there by that key rather
+    than by the words. An answer with no `status` is an error too: reporting
+    success for a job the host never touched is worse than any exception.
 
     `mirror` is `(spec field, value)`: `requeue` submits what S3 holds, so a
     priority or estimate changed on the host and not in the mirror would hand
@@ -698,6 +700,11 @@ def job_verb(
             f"job {job_id} is on host {entry.name}, which could not be asked: {asked.reason}"
         )
     document = asked.payload or {}
+    if document.get("missing"):
+        raise NotFound(
+            f"host {entry.name} has no job {job_id}: {document.get('error')}\n"
+            f"Check the id with `gpuc status --all`."
+        )
     if document.get("error"):
         raise CliError(f"host {entry.name} did not {verb} {job_id}: {document['error']}")
     if not document.get("status"):
