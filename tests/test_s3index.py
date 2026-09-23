@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.config import Settings
+from gpuc.control.config import Settings, default_s3_prefix
 from gpuc.control.s3index import (
     IndexEntry,
     JobIndex,
@@ -13,7 +13,6 @@ from gpuc.control.s3index import (
     S3Index,
     S3IndexError,
     S3ObjectMissing,
-    default_s3_prefix,
     job_log_uri,
     split_uri,
 )
@@ -27,7 +26,7 @@ def spec(job_id: str = "20260101-000000-abc123") -> JobSpec:
 
 def test_local_index_round_trips(control_env: Path) -> None:
     index = LocalIndex()
-    entry = IndexEntry(job_id="j1", host="gpubox", name="t", attempt=3)
+    entry = IndexEntry(job_id="j1", host="gpubox", name="t", requeued_from="j0")
     index.record(entry)
     assert index.get("j1") == entry
     assert index.get("missing") is None

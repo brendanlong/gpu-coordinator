@@ -61,7 +61,8 @@ class IndexEntry(TolerantModel):
     job_id: str = ""
     host: str = ""
     name: str = ""
-    attempt: int = 1
+    requeued_from: str | None = None
+    """The job this one was requeued from, for a listing to say so."""
     submitted_at: str = ""
     s3_prefix: str | None = None
     spec_uri: str | None = None
@@ -86,12 +87,6 @@ def make_s3_client() -> S3Client:
     from botocore.config import Config
 
     return boto3.client("s3", config=Config(user_agent_extra=user_agent()))
-
-
-def default_s3_prefix(settings: Settings, host: str) -> str | None:
-    if not settings.s3_bucket:
-        return None
-    return f"s3://{settings.s3_bucket}/gpuc/{host}"
 
 
 def job_uri(s3_prefix: str, job_id: str, name: str = "") -> str:
@@ -292,10 +287,12 @@ class JobIndex:
         """Where this job's own mirror is: the index's answer, else the host's.
 
         The job's is the one that counts -- a host whose `s3_prefix` changed
-        after the job ran still has the old jobs under the old prefix.
+        after the job ran still has the old jobs under the old prefix. The
+        host's is the cached one, and that is right here: this is the last
+        resort for a host that is gone, which is the one host nothing can ask.
         """
         indexed = self.get(job_id)
-        return (indexed.s3_prefix if indexed else None) or entry.s3_prefix
+        return (indexed.s3_prefix if indexed else None) or entry.config.s3_prefix
 
     def mirrored_state(self, job_id: str, prefix: str | None) -> dict[str, Any] | None:
         """The job's mirrored `state.json`, or None for anything but a document."""
