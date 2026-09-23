@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from gpuc._version import user_agent
-from gpuc.control.config import Settings, index_dir
+from gpuc.control.config import HostEntry, Settings, index_dir
 from gpuc.control.tolerant import TolerantModel
 from gpuc.host.jobs import JobSpec
 
@@ -202,6 +202,13 @@ class S3Index:
     def put_index(self, entry: IndexEntry) -> str:
         return self._put(index_key(entry.job_id), entry.model_dump_json(indent=2) + "\n")
 
+    def get_index(self, job_id: str) -> IndexEntry | None:
+        """This job's index entry, or None if the mirror has none (or it is unreadable)."""
+        try:
+            return IndexEntry.model_validate_json(self._get(index_key(job_id)))
+        except (S3IndexError, ValidationError):
+            return None
+
     def list_keys(self, prefix: str, limit: int) -> list[str]:
         """Every key under `prefix`, following continuation tokens.
 
@@ -244,3 +251,58 @@ class S3Index:
         if bucket != self.bucket:
             return S3Index(bucket, self._client)._get(key)
         return self._get(key)
+
+
+class JobIndex:
+    """Every record this machine has of which jobs exist and where, as one
+    answer. The local index is what this machine submitted; the S3 index is
+    what any machine submitted; a host is the authority on what it holds. The
+    precedence is here and nowhere else: the local copy first, because it is
+    free, then the mirror.
+    """
+
+    def __init__(self, settings: Settings, *, local: LocalIndex | None = None) -> None:
+        self.local = local or LocalIndex()
+        self.s3 = S3Index.from_settings(settings)
+
+    def get(self, job_id: str) -> IndexEntry | None:
+        """Where this job was submitted, from the local index, else the mirror.
+
+        The mirror is what lets a second machine find a job it never
+        submitted without asking every host.
+        """
+        entry = self.local.get(job_id)
+        if entry is None and self.s3 is not None:
+            entry = self.s3.get_index(job_id)
+        return entry
+
+    def all(self) -> tuple[dict[str, IndexEntry], str | None]:
+        """Every job either index knows, by id, and why that may not be the
+        whole list: the error a mirror that could not be read gave, or None."""
+        entries = {entry.job_id: entry for entry in self.local.list()}
+        if self.s3 is None:
+            return entries, None
+        try:
+            entries.update({e.job_id: e for e in self.s3.list_index()})
+        except S3IndexError as exc:
+            return entries, f"could not read the S3 index: {exc}"
+        return entries, None
+
+    def mirror_prefix(self, job_id: str, entry: HostEntry) -> str | None:
+        """Where this job's own mirror is: the index's answer, else the host's.
+
+        The job's is the one that counts -- a host whose `s3_prefix` changed
+        after the job ran still has the old jobs under the old prefix.
+        """
+        indexed = self.get(job_id)
+        return (indexed.s3_prefix if indexed else None) or entry.s3_prefix
+
+    def mirrored_state(self, job_id: str, prefix: str | None) -> dict[str, Any] | None:
+        """The job's mirrored `state.json`, or None for anything but a document."""
+        if self.s3 is None or not prefix:
+            return None
+        try:
+            document = json.loads(self.s3.get_uri(job_uri(prefix, job_id, "state.json")))
+        except (S3IndexError, json.JSONDecodeError, OSError):
+            return None
+        return document if isinstance(document, dict) else None

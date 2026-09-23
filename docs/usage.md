@@ -490,7 +490,9 @@ SIGTERMs its process group and SIGKILLs it 15 s later, then runs the final sync
 and writes the final state. A queued job is cancelled on the spot. If the
 runner does not act the dispatcher escalates: the scope and a SIGKILL of the
 job's group at 15 s, a SIGTERM of the runner at 30 s, a SIGKILL of its group at
-45 s. `gpuc preempt` is the same request with a different ending.
+45 s. A runner already in its final upload is given thirty minutes before
+that ladder starts, since the upload is what the stop is waiting for. `gpuc
+preempt` is the same request with a different ending.
 
 Each phase runs in a transient `systemd --user` scope where the host has one and
 in its own process group where it does not (`isolation: cgroup` or `pgid` in
@@ -755,9 +757,10 @@ selection (exit 1, nothing removed); an empty `--only` is exit 2.
   paths. Otherwise `outputs not confirmed uploaded`. Anything unreadable counts
   as content.
 
-`--force` overrides those two and nothing else, per job. `--verify` HEADs each
-candidate's mirrored `log.txt` with your own credentials and purges only what
-answered; without it the host's own record is trusted. `--purge
+`--force` overrides those two and nothing else, per job. `--verify` lists the
+mirrored logs under the host's prefix with your own credentials, and a job is
+then purged only if it has one *and* the host's own record says its final
+upload succeeded; without it the record alone is trusted. `--purge
 --all-finished` is an age horizon of zero, so it needs `--yes` (or `--dry-run`).
 
 **Automatic, by the host: two horizons.** The dispatcher reclaims disk at

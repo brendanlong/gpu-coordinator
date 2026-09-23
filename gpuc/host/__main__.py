@@ -155,13 +155,20 @@ def projected_starts(
             cards.append(plan.Card(row["uuid"], True, release(row["uuid"])))
         else:
             theirs += 1
+    # The queue from the same snapshot as everything else in this document:
+    # listed separately, a job the dispatcher claimed in between would be
+    # reported queued with no start time and no reason.
+    queued = sorted(
+        queue.QueueEntry(state.priority, job_id)
+        for job_id, state in states.items()
+        if state.status == "queued"
+    )
     requests: list[plan.Request] = []
-    for entry in queue.list_queued():
+    for entry in queued:
         spec = _spec(entry.job_id)
-        state = states.get(entry.job_id)
-        if spec is None or state is None:
-            # Accepted since `states` was read, or a spec the dispatcher is
-            # about to fail: the next call will say.
+        state = states[entry.job_id]
+        if spec is None:
+            # A spec the dispatcher is about to fail: the next call will say.
             continue
         estimate = state.estimated_runtime_min
         requests.append(
@@ -259,7 +266,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "draining": paths.draining_file().exists(),
                 "dispatcher_heartbeat_age_s": None if heartbeat is None else round(heartbeat, 1),
                 "queue": [
-                    {"priority": e.priority, "job_id": e.job_id} for e in queue.list_queued()
+                    {"priority": state.priority, "job_id": job_id}
+                    for job_id, state in sorted(
+                        states.items(), key=lambda item: (item[1].priority, item[0])
+                    )
+                    if state.status == "queued"
                 ],
                 "jobs": entries,
             },
@@ -446,17 +457,22 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 def cmd_purge(args: argparse.Namespace) -> int:
     only = _selection(args.only)
-    sweep_only = _selection(args.sweep_only)
-    refused = _refusal(args.dry_run, only, sweep_only)
+    refused = _refusal(args.dry_run, only)
     if refused:
         return _emit(refused)
+    verified = _selection(args.verified)
+    if args.verified_file:
+        listed = Path(args.verified_file)
+        verified = _selection(listed.read_text().strip())
+        listed.unlink(missing_ok=True)
     return _emit(
         cleanup.purge(
             older_than_days=args.older_than,
             dry_run=args.dry_run,
-            force=args.force,
             only=only,
-            sweep_only=sweep_only,
+            evidence=cleanup.Evidence(
+                force=args.force, verified=None if verified is None else frozenset(verified)
+            ),
         )
     )
 
@@ -539,14 +555,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     purge.add_argument(
         "--only",
-        help="comma-separated job ids that may be purged, and no others, whatever their "
-        "age; the implied workdir sweep is unaffected. Empty means purge nothing.",
+        help="comma-separated job ids that may be purged (and swept), and no others, "
+        "whatever their age. Empty means purge nothing.",
     )
     purge.add_argument(
-        "--sweep-only",
-        help="comma-separated job ids the implied workdir sweep may touch, and no "
-        "others, whatever their age; by default it covers every finished job past "
-        "the horizon",
+        "--verified",
+        help="comma-separated job ids whose mirrored log the caller listed itself; given, "
+        "a job must be in it as well as recorded here to count as backed up. Empty "
+        "means none of them are.",
+    )
+    purge.add_argument(
+        "--verified-file",
+        metavar="PATH",
+        help="the same list read from PATH (and PATH removed), for a list too long for argv",
     )
     purge.set_defaults(func=cmd_purge)
 

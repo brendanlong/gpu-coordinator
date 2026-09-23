@@ -35,12 +35,15 @@ def env_prefix(env: Mapping[str, str] | None) -> str:
     return "".join(f'{key}="{value}" ' for key, value in sorted((env or {}).items()))
 
 
+def host_python(python: str, home: str, env: Mapping[str, str] | None = None) -> str:
+    """The interpreter, with the on-host package importable and gpuc home
+    pinned: the prefix of every command that runs the host's own code."""
+    return f'{env_prefix(env)}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" "{python}"'
+
+
 def host_command(python: str, home: str, args: str, env: Mapping[str, str] | None = None) -> str:
     """One invocation of the on-host package, with its environment pinned."""
-    return (
-        f'{env_prefix(env)}GPUC_HOME="{home}" PYTHONPATH="{home}/pkg" "{python}" '
-        f"-m gpuc.host {args}"
-    )
+    return f"{host_python(python, home, env)} -m gpuc.host {args}"
 
 
 @dataclass

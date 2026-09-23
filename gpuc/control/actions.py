@@ -32,6 +32,7 @@ from gpuc.control.config import (
     config_file,
     forget_host_locked,
     hosts_file,
+    load_settings,
     pod_known_hosts_file,
     read_registry,
     registry_transaction,
@@ -46,6 +47,7 @@ from gpuc.control.remote import HostSession, RemoteError, open_session
 from gpuc.control.remote import config_file as remote_config_file
 from gpuc.control.s3index import (
     IndexEntry,
+    JobIndex,
     LocalIndex,
     S3Index,
     S3IndexError,
@@ -343,6 +345,9 @@ def host_document(entry: HostEntry) -> dict[str, Any]:
     because that is the shape every consumer of this document already reads.
     """
     document: dict[str, Any] = json.loads(entry.model_dump_json())
+    # Derived from the address, so not in the dump, and the one word a reader
+    # scans the list by.
+    document["kind"] = entry.kind
     config = entry.config.to_dict()
     # The host file's own version says nothing about this document's shape, and
     # beside the address it reads as if it did.
@@ -484,14 +489,24 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
 
 
 def find_job_host(
-    job_id: str, registry: Registry, explicit: str | None
+    job_id: str, registry: Registry, explicit: str | None, settings: Settings | None = None
 ) -> tuple[HostEntry, IndexEntry | None]:
-    index = LocalIndex().get(job_id)
+    """The host a job is on, and its index entry: `--host` if given, else the
+    index (local, then the mirror), else whichever registered host admits to
+    it. An id nothing knows is exit 4, never a guess."""
     if explicit:
-        return registry.require(explicit), index
-    if index is not None and index.host in registry.hosts:
-        return registry.hosts[index.host], index
-    for entry in registry.hosts.values():
+        # The local index only: the caller already knows the host, and the
+        # entry is a convenience for whoever wants the mirror prefix.
+        return registry.require(explicit), LocalIndex().get(job_id)
+    local = LocalIndex().get(job_id)
+    if local is not None and local.host in registry.hosts:
+        return registry.hosts[local.host], local
+    index = local or JobIndex(settings or load_settings()).get(job_id)
+    # A name in the mirror's index is the *submitting* client's name for the
+    # host, which need not be this machine's: it is asked first, not believed.
+    first = [registry.hosts[index.host]] if index and index.host in registry.hosts else []
+    rest = [entry for entry in registry.hosts.values() if entry not in first]
+    for entry in [*first, *rest]:
         try:
             payload = open_session(entry).host_json(f"status {shlex.quote(job_id)}", timeout=60.0)
         except (RemoteError, TransportError):
@@ -779,7 +794,7 @@ def logs_from_s3(
     report: Callable[[str], None] = note,
 ) -> LogText:
     s3 = S3Index.from_settings(settings)
-    prefix = (index.s3_prefix if index else None) or entry.s3_prefix
+    prefix = JobIndex(settings).mirror_prefix(job_id, entry)
     if s3 is None or not prefix:
         gone = (
             f"Its job dir was purged from host {entry.name}, so this log no longer exists "
@@ -797,3 +812,49 @@ def logs_from_s3(
     fallback = f"falling back to the S3 mirror at {uri}"
     report(fallback)
     return LogText("s3", uri, s3.get_uri(uri), [fallback])
+
+
+def unhosted_jobs(
+    settings: Settings, seen: set[str], host: str | None = None
+) -> tuple[list[IndexEntry], set[str], str | None]:
+    """The index's view of jobs no host admitted to having, and whether that is
+    all of it: an S3 index that could not be read leaves this list short.
+
+    After a host loses its state -- a container whose $HOME was wiped, a pod
+    that is gone -- this is the only list of what was on it, and `gpuc requeue
+    <id> --host <name>` is how each one comes back, so `--host H --all` narrows
+    it to the host being recovered.
+
+    Returns the entries, the ids among them whose outputs the mirror records as
+    lost, and why the list may be short (None when the index was read in full).
+    """
+    index = JobIndex(settings)
+    entries, short = index.all()
+    elsewhere = [
+        entry
+        for job_id, entry in sorted(entries.items())
+        if job_id not in seen and (host is None or entry.host == host)
+    ]
+    if not elsewhere:
+        return [], set(), short
+    return elsewhere, _outputs_lost_ids(index, elsewhere[:MIRROR_STATE_LOOKUPS]), short
+
+
+MIRROR_STATE_LOOKUPS = 25
+"""How many index-only jobs `--all` reads `state.json` for. One GET each, and
+the answer (did this job's outputs make it off the host?) matters most for the
+handful at the top of a recovery list."""
+
+
+def _outputs_lost_ids(index: JobIndex, entries: Sequence[IndexEntry]) -> set[str]:
+    """Which of these jobs the mirror records as having lost their outputs.
+
+    Best effort: a job whose state.json is missing or unreadable simply does not
+    get the flag, because this is a note on a listing, not a decision.
+    """
+    return {
+        entry.job_id
+        for entry in entries
+        if (document := index.mirrored_state(entry.job_id, entry.s3_prefix))
+        and document.get("outputs_lost")
+    }

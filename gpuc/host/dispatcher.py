@@ -25,14 +25,14 @@ from pathlib import Path
 from gpuc._version import is_other_build
 from gpuc.host import baseline, cleanup, gpus, jobs, paths, plan, queue, scope, sync, terminate
 from gpuc.host.gpus import SmiRunner
-from gpuc.host.runner import (
+from gpuc.host.procs import (
     KILL_GRACE_S,
+    JobProcesses,
     boot_id,
     cmdline,
     is_gpuc_process,
     live_runner_pids,
     pid_alive,
-    process_group_alive,
     recorded_process_alive,
     starttime,
 )
@@ -41,6 +41,11 @@ from gpuc.host.terminate import TerminateCall
 HEARTBEAT_INTERVAL_S = 5.0
 HEARTBEAT_STALE_S = 30.0
 LOOP_INTERVAL_S = 2.0
+SYNC_STOP_PATIENCE_S = 1800.0
+"""How long a stop request waits on a runner in its final sync before the
+escalation ladder starts. A checkpoint upload can legitimately take this long;
+an upload that is still going half an hour after somebody asked for the job
+to stop is hung, and the cards it holds are wanted."""
 TERMINATE_RETRY_S = 600.0
 MAX_CONSECUTIVE_FAILURES = 20
 RETENTION_INTERVAL_S = 3600.0
@@ -438,12 +443,35 @@ def _child_env(package_root: Path) -> dict[str, str]:
 
 
 def _spawn_host_process(*args: str) -> subprocess.Popen[bytes]:
-    """`python -m gpuc.host <args>` in its own session, logging to the dispatcher log."""
+    """`python -m gpuc.host <args>` in its own session -- and, where the host
+    has user systemd, its own transient scope.
+
+    A new session detaches from the terminal but not from the cgroup: a
+    dispatcher started by `gpuc submit` from inside a systemd scope (an agent
+    session, a `systemd-run --scope` wrapper, a CI job) stays in that scope,
+    every runner it starts inherits it, and stopping the scope SIGTERMs them
+    all -- which the runner reads as a stop and ends the job `terminated`,
+    forty minutes into a run nobody asked to stop. `systemd-run --scope`
+    execs the command in place, so the pid returned is still the process.
+    """
     package_root = Path(__file__).resolve().parents[2]
     paths.ensure_layout()
+    argv = [sys.executable, "-m", "gpuc.host", *args]
+    if scope.probe():
+        unit = f"gpuc-{'-'.join(args)}-{os.getpid()}-{int(time.time())}.scope"
+        argv = [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            f"--unit={unit}",
+            "--",
+            *argv,
+        ]
     with paths.dispatcher_log().open("ab", buffering=0) as log:
         return subprocess.Popen(
-            [sys.executable, "-m", "gpuc.host", *args],
+            argv,
             cwd=str(package_root),
             env=_child_env(package_root),
             stdout=log,
@@ -563,6 +591,9 @@ class Dispatcher:
     _borrowable: tuple[list[str], int] | None = None
     """This pass's one reading of the shared cards: the ones nobody else was
     on, and how many they were on. Reset every pass; see `borrowable_gpus`."""
+    _queued: list[queue.QueueEntry] | None = None
+    """This pass's one listing of the queue. Every state file is parsed to
+    list it, and a pass asks three times."""
     _shared_in_use: tuple[str, ...] | None = None
     """The shared cards somebody else was on, last time this was asked.
 
@@ -589,6 +620,18 @@ class Dispatcher:
 
     def log(self, message: str) -> None:
         log_line(message, self.deps.utcnow())
+
+    def queued(self) -> list[queue.QueueEntry]:
+        if self._queued is None:
+            self._queued = queue.list_queued()
+        return self._queued
+
+    def _claim(self, job_id: str, **state: object) -> bool:
+        """`queue.claim`, and the cached listing forgets the job with it."""
+        taken = queue.claim(job_id, **state)
+        if taken and self._queued is not None:
+            self._queued = [entry for entry in self._queued if entry.job_id != job_id]
+        return taken
 
     # -- startup ---------------------------------------------------------
     def adopt_orphans(self) -> None:
@@ -688,7 +731,10 @@ class Dispatcher:
         except RuntimeError as exc:
             self.log(f"job {job_id} has an unreadable state.json ({exc}); treating as runner-died")
             state = None
-        self._kill_orphaned_group(job_id, state.pgid if state else None, state)
+        if state is not None:
+            JobProcesses.of(state).kill(
+                lambda m: self.log(f"job {job_id}: {m} before freeing its GPUs")
+            )
         with jobs.locked(job_id):
             # Re-read under the lock: a cancel or preempt that landed since
             # the read above must not be written over.
@@ -713,21 +759,6 @@ class Dispatcher:
                 record.ok_at = None
             jobs.write_state(job_id, final)
         self.log(f"job {job_id} failed: runner died without writing final state")
-
-    def _kill_orphaned_group(
-        self, job_id: str, pgid: int | None, state: jobs.JobState | None = None
-    ) -> None:
-        unit = state.cgroup_unit if state else None
-        if unit:
-            self.log(f"job {job_id}: stopping leftover scope {unit} before freeing its GPUs")
-            scope.stop_unit(unit)
-        if not pgid or pgid <= 1 or pgid == os.getpgid(0):
-            return
-        if not process_group_alive(pgid):
-            return
-        self.log(f"job {job_id}: SIGKILLing orphaned process group {pgid} before freeing its GPUs")
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pgid, signal.SIGKILL)
 
     # -- loop pieces -----------------------------------------------------
     def reap(self) -> None:
@@ -800,17 +831,14 @@ class Dispatcher:
     def escalate_stops(self) -> None:
         """Make a stop request stick when the runner never acts on it.
 
-        The runner owns the kill: it polls its state, stops the job's scope or
-        group, syncs and writes the final state. That is right when the runner
-        is healthy and nothing at all when it is wedged, so a request it has
-        not honoured within the grace period gets the ladder: the job's scope
-        and group first, then the runner itself (which handles SIGTERM with a
-        final sync), then the runner's group. Never inside the grace period,
-        and the job's group is only ever the one the state names -- during the
-        launch window the runner is the only member of its own group, and
-        killing that would kill the one process that can finish the job
-        cleanly. By three grace periods the runner is wedged and its group
-        goes regardless.
+        The runner owns the kill: it polls its state, stops the job's
+        processes, syncs and writes the final state. That is right when the
+        runner is healthy and nothing at all when it is wedged, so a request
+        it has not honoured within the grace period gets `JobProcesses.escalate`.
+        A runner in its final sync is honouring it: the upload has no
+        wall-clock cap by design, and a ladder that reached the runner there
+        would kill the one upload that matters most, so nothing is escalated
+        while the phase is `sync`.
         """
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
@@ -822,24 +850,25 @@ class Dispatcher:
             # dispatcher we took over from -- needs a clock of its own, or a
             # runner that never acts on it is never escalated either.
             elapsed = now - self._stop_sent.setdefault(job_id, now)
-            if elapsed <= grace:
+            # A runner in its final sync is honouring the request, and the
+            # upload has no cap by design; but one that is *hung* there holds
+            # the cards for ever, so the ladder starts after a long patience
+            # rather than never.
+            patience = SYNC_STOP_PATIENCE_S if state.phase == "sync" else grace
+            if elapsed <= patience:
                 continue
-            if job_id not in self._stop_escalated:
+            first = job_id not in self._stop_escalated
+            if first:
                 self._stop_escalated.add(job_id)
                 self.log(
                     f"job {job_id}: its runner has not stopped it {elapsed:.0f}s after the "
                     f"{state.intent} request; escalating"
                 )
-            job_pgid = self._job_pgid(state, entry)
-            if state.cgroup_unit:
-                scope.stop_unit(state.cgroup_unit)
-            if job_pgid:
-                self._signal_group(job_pgid, signal.SIGKILL)
-            if elapsed > 2 * grace:
-                self._signal_pid(entry.pid, signal.SIGTERM)
-            if elapsed > 3 * grace and process_group_alive(entry.pid):
-                self.log(f"job {job_id}: runner pid {entry.pid} is wedged; SIGKILLing its group")
-                self._signal_group(entry.pid, signal.SIGKILL)
+            JobProcesses.of(state, entry.pid).escalate(
+                elapsed - patience + grace,
+                grace,
+                (lambda m, job_id=job_id: self.log(f"job {job_id}: {m}")) if first else None,
+            )
 
     @staticmethod
     def _state_or_empty(job_id: str) -> jobs.JobState:
@@ -847,23 +876,6 @@ class Dispatcher:
             return jobs.read_state(job_id)
         except RuntimeError:
             return jobs.JobState()
-
-    @staticmethod
-    def _job_pgid(state: jobs.JobState, entry: _Running) -> int | None:
-        """The *job's* process group, never the runner's own."""
-        return state.pgid if state.pgid and state.pgid != entry.pid else None
-
-    def _signal_pid(self, pid: int, sig: int) -> None:
-        if pid <= 1 or not pid_alive(pid):
-            return
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, sig)
-
-    def _signal_group(self, pgid: int | None, sig: int) -> None:
-        if not pgid or pgid <= 1 or not process_group_alive(pgid):
-            return
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pgid, sig)
 
     def owned_gpus(self) -> list[str]:
         """The UUIDs of the cards this host owns *and* can see, this pass.
@@ -957,12 +969,12 @@ class Dispatcher:
         failed here: it is the one thing about a queued job that only the
         dispatcher can decide."""
         requests: list[tuple[queue.QueueEntry, plan.Request]] = []
-        for entry in queue.list_queued():
+        for entry in self.queued():
             try:
                 spec = jobs.read_spec(entry.job_id)
             except (RuntimeError, ValueError) as exc:
                 self.log(f"job {entry.job_id} has an unreadable spec ({exc}); dropping from queue")
-                queue.claim(
+                self._claim(
                     entry.job_id, status="failed", reason="bad-spec", ended_at=jobs.utc_now()
                 )
                 continue
@@ -1000,7 +1012,7 @@ class Dispatcher:
         for decision in decisions:
             job_id = decision.job_id
             if isinstance(decision, plan.Fails):
-                queue.claim(
+                self._claim(
                     job_id,
                     status="failed",
                     reason=decision.reason,
@@ -1013,7 +1025,7 @@ class Dispatcher:
             self._launch(job_id, decision.gpus)
 
     def _launch(self, job_id: str, assigned: list[str]) -> None:
-        if not queue.claim(
+        if not self._claim(
             job_id, status="running", gpus=assigned, phase="setup", started_at=jobs.utc_now()
         ):
             # Cancelled between listing the queue and here; its cards stay free.
@@ -1214,7 +1226,7 @@ class Dispatcher:
         if self.running:
             self._queue_empty_since = None
             return
-        if queue.list_queued():
+        if self.queued():
             self._queue_empty_since = None
             return
         if self._queue_empty_since is None:
@@ -1397,7 +1409,9 @@ class Dispatcher:
             self._sweep_workdirs(workdir_days)
 
     def _purge(self, days: float) -> None:
-        result = cleanup.purge(older_than_days=days, now=self.deps.utcnow(), automatic=True)
+        result = cleanup.purge(
+            older_than_days=days, now=self.deps.utcnow(), evidence=cleanup.Evidence(automatic=True)
+        )
         if result.purged or result.removed:
             purged = ", ".join(c.job_id for c in result.purged) or "none"
             self.log(
@@ -1409,7 +1423,9 @@ class Dispatcher:
             self.log(f"retention: {error}")
 
     def _sweep_workdirs(self, days: float) -> None:
-        result = cleanup.clean(older_than_days=days, now=self.deps.utcnow(), automatic=True)
+        result = cleanup.clean(
+            older_than_days=days, now=self.deps.utcnow(), evidence=cleanup.Evidence(automatic=True)
+        )
         if result.removed:
             self.log(
                 f"workdirs ({days:g} days): removed {len(result.removed)} workdir(s), freeing "
@@ -1425,16 +1441,21 @@ class Dispatcher:
         self._owned = None
         self._shared = None
         self._borrowable = None
+        self._queued = None
         self.reap()
         self.escalate_stops()
         self.launch_ready()
         self.preempt_for_waiting()
+        # The listing is shared by the two walks above and by nothing after
+        # them: a reclaim can take seconds, and a job accepted during it must
+        # be seen by the idle clock.
+        self._queued = None
         self.maybe_reclaim()
         self.sweep_stale_incoming()
         self.maybe_terminate()
 
     def idle_and_not_ephemeral(self) -> bool:
-        return not self.running and not queue.list_queued() and not self.config.ephemeral
+        return not self.running and not self.queued() and not self.config.ephemeral
 
     def run(self, lock: DispatcherLock) -> int:
         lock.start_heartbeat()

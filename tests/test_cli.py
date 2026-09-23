@@ -359,9 +359,13 @@ def test_use_shared_is_an_override_of_the_spec_and_only_when_it_is_passed(
         seen.append(dict(overrides or {}))
         return SubmitResult(job_id="j", host="gpubox", attempt=1)
 
-    monkeypatch.setattr("gpuc.control.cli.submit_file", capture)
-    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
-    monkeypatch.setattr("gpuc.control.cli.placement_after", lambda *a, **k: placement_unknown())
+    monkeypatch.setattr("gpuc.control.submitting.submit_file", capture)
+    monkeypatch.setattr(
+        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
+    )
+    monkeypatch.setattr(
+        "gpuc.control.submitting.placement_after", lambda *a, **k: placement_unknown()
+    )
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
@@ -429,8 +433,8 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
         seen["job_id"] = kwargs["job_id"]
         return SubmitResult(job_id=str(kwargs["job_id"]), host=entry.name, attempt=1)
 
-    monkeypatch.setattr("gpuc.control.cli.runpod_host", fake_runpod_host)
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit_spec)
+    monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit_spec)
 
     assert (
         main(
@@ -503,8 +507,8 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
         seen["attempt"] = kwargs["attempt"]
         return SubmitResult(job_id="new", host=entry.name, attempt=2)
 
-    monkeypatch.setattr("gpuc.control.cli.runpod_host", fake_runpod_host)
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit_spec)
+    monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit_spec)
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 0
     assert seen == {"gpu_names": ["A40"], "attempt": 2}
@@ -607,7 +611,7 @@ def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     created: list[object] = []
     monkeypatch.setattr(
-        "gpuc.control.cli.runpod_host",
+        "gpuc.control.submitting.runpod_host",
         lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
     )
 
@@ -628,7 +632,7 @@ def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
     created: list[object] = []
     monkeypatch.delenv("GPUC_DEFINITELY_UNSET", raising=False)
     monkeypatch.setattr(
-        "gpuc.control.cli.runpod_host",
+        "gpuc.control.submitting.runpod_host",
         lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
     )
 
@@ -666,17 +670,71 @@ def purged_entry(job_id: str, prefix: str | None = "s3://bucket/gpuc/gpubox") ->
     }
 
 
+def test_a_verified_list_too_long_for_an_argument_travels_as_a_file(
+    control_env: Path,
+) -> None:
+    from gpuc.control import clean as clean_mod
+
+    ids = [f"20260101-000000-{i:06x}" for i in range(3000)]
+    client = FakeS3Client(
+        objects={f"bucket/gpuc/gpubox/jobs/{job_id}/log.txt": b"x" for job_id in ids}
+    )
+    puts: dict[str, str] = {}
+
+    class FileSession(StubSession):
+        home = "/home/u/.gpuc"
+        transport = SimpleNamespace(
+            put_file=lambda content, path, mode=0o600: puts.__setitem__(path, content)
+        )
+
+    session = FileSession([{"purged": [], "purge_skipped": [], "removed": []}])
+    clean_mod.purge_host(
+        mirrored_host(), Settings(), session=as_session(session), verify=True, s3_client=client
+    )
+    (call,) = session.calls
+    assert "--verified-file " in call and "--verified " not in call
+    ((path, content),) = puts.items()
+    assert path in call and content.strip().split(",") == ids
+
+
+def mirrored_host() -> HostEntry:
+    return host_entry(
+        name="gpubox",
+        ssh="me@gpubox",
+        python="/usr/bin/python3",
+        s3_prefix="s3://bucket/gpuc/gpubox",
+    )
+
+
 def as_session(session: StubSession) -> HostSession:
     return cast("HostSession", session)
 
 
-def test_verify_purges_only_the_jobs_whose_mirror_answers(control_env: Path) -> None:
-    client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+NO_MIRRORED_LOG = "not backed up: the mirror has no log for it"
+
+
+def test_verify_is_one_host_call_carrying_the_ids_the_mirror_has_a_log_for(
+    control_env: Path,
+) -> None:
+    """The listing happens first, here; the host is asked once, with the answer."""
+    client = FakeS3Client(
+        objects={
+            "bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n",
+            "bucket/gpuc/gpubox/jobs/kept/state.json": b"{}",
+            # Another host's prefix, and a job with a state but no log: neither counts.
+            "bucket/gpuc/other/jobs/elsewhere/log.txt": b"hello\n",
+            "bucket/gpuc/gpubox/jobs/nolog/state.json": b"{}",
+        }
+    )
+    entry = mirrored_host()
     session = StubSession(
         [
-            {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
-            {"dry_run": False, "purged": [purged_entry("kept")], "freed_bytes": 1024},
+            {
+                "dry_run": False,
+                "purged": [purged_entry("kept")],
+                "purge_skipped": [{"job_id": "gone", "why": NO_MIRRORED_LOG}],
+                "freed_bytes": 1024,
+            }
         ]
     )
     report = purge_host(
@@ -687,10 +745,189 @@ def test_verify_purges_only_the_jobs_whose_mirror_answers(control_env: Path) -> 
         verify=True,
         s3_client=client,
     )
+    assert session.calls == ["purge --older-than 7.0 --verified kept"]
+    assert session.checked == [False]
     assert report.verified == ["kept"]
     assert [job["job_id"] for job in report.purged] == ["kept"]
-    assert any("no mirrored log" in str(job["why"]) for job in report.purge_skipped)
-    assert "--only kept" in session.calls[1]
+    assert any(job["why"] == NO_MIRRORED_LOG for job in report.purge_skipped)
+    assert "SKIPPED gone  " + NO_MIRRORED_LOG in report.render()
+
+
+def test_verify_with_nothing_mirrored_still_passes_an_empty_verified_list(
+    control_env: Path,
+) -> None:
+    """`--verified ''` is "none of them are backed up", which must not collapse
+    into leaving the flag off and letting the host trust its own records."""
+    entry = mirrored_host()
+    session = StubSession([{"dry_run": True, "purged": []}])
+    report = purge_host(
+        entry,
+        Settings(),
+        session=as_session(session),
+        only=["gone"],
+        verify=True,
+        dry_run=True,
+        s3_client=FakeS3Client(),
+    )
+    assert session.calls == ["purge --older-than 0.0 --dry-run --only gone --verified ''"]
+    assert report.purged == []
+    assert report.verified == []
+
+
+def test_verify_asks_the_host_nothing_when_the_mirror_cannot_be_listed(
+    control_env: Path,
+) -> None:
+    """ "Could not check" must not read as "nothing is backed up", and it must
+    not reach the host as a purge either."""
+    from gpuc.control.clean import CleanError
+
+    class Refusing(FakeS3Client):
+        def list_objects_v2(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("AccessDenied")
+
+    entry = mirrored_host()
+    session = StubSession([])
+    with pytest.raises(CleanError, match="AccessDenied"):
+        purge_host(
+            entry,
+            Settings(),
+            session=as_session(session),
+            older_than_days=7.0,
+            verify=True,
+            s3_client=Refusing(),
+        )
+    assert session.calls == []
+
+
+def test_verified_mirrors_are_the_ids_with_a_log_under_the_hosts_prefix(
+    control_env: Path,
+) -> None:
+    from gpuc.control.clean import verified_mirrors
+
+    client = FakeS3Client(
+        objects={
+            "bucket/gpuc/gpubox/jobs/b/log.txt": b"",
+            "bucket/gpuc/gpubox/jobs/a/log.txt": b"",
+            "bucket/gpuc/gpubox/jobs/a/state.json": b"{}",
+            "bucket/gpuc/gpubox/jobs/nolog/state.json": b"{}",
+            "bucket/gpuc/gpubox/jobs/deep/outputs/log.txt": b"",
+            "bucket/gpuc/gpubox-2/jobs/sibling/log.txt": b"",
+            "bucket/gpuc/other/jobs/elsewhere/log.txt": b"",
+        },
+        page_size=2,
+    )
+    assert verified_mirrors(mirrored_host(), Settings(), client=client) == ["a", "b"]
+    assert {call["Prefix"] for call in client.list_calls} == {"gpuc/gpubox/jobs/"}
+    assert len(client.list_calls) > 1  # followed the continuation tokens
+
+
+def test_verified_mirrors_of_a_host_with_no_prefix_is_nothing(control_env: Path) -> None:
+    from gpuc.control.clean import verified_mirrors
+
+    client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/a/log.txt": b""})
+    entry = host_entry(name="gpubox", ssh="me@gpubox")
+    assert verified_mirrors(entry, Settings(), client=client) == []
+    assert client.list_calls == []
+
+
+def test_verified_mirrors_raises_when_the_listing_fails(control_env: Path) -> None:
+    from gpuc.control.clean import CleanError, verified_mirrors
+
+    class Refusing(FakeS3Client):
+        def list_objects_v2(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("AccessDenied")
+
+    with pytest.raises(CleanError, match=r"s3://bucket/gpuc/gpubox/jobs/.*AccessDenied"):
+        verified_mirrors(mirrored_host(), Settings(), client=Refusing())
+
+
+# -- find_job_host --------------------------------------------------------------
+
+
+def _probes(monkeypatch: pytest.MonkeyPatch, answers: dict[str, object]) -> list[str]:
+    """Stand in for `open_session` in `find_job_host`: each host answers its
+    `status <id>` with `answers[name]`. Returns the hosts that were asked."""
+    asked: list[str] = []
+
+    def session(entry: HostEntry, *_: object, **__: object) -> object:
+        asked.append(entry.name)
+        return SimpleNamespace(host_json=lambda *a, **k: answers.get(entry.name, {"jobs": []}))
+
+    monkeypatch.setattr("gpuc.control.actions.open_session", session)
+    return asked
+
+
+def test_a_second_client_asks_the_host_the_mirror_names_first(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This machine never submitted the job, so its local index is empty; the
+    S3 index entry the submitting machine wrote names the host -- by *that*
+    machine's name for it, so it is asked first rather than believed."""
+    from gpuc.control.actions import find_job_host
+    from gpuc.control.s3index import IndexEntry, S3Index
+
+    register_host(name="first", ssh="me@first")
+    register_host(name="gpubox", ssh="me@gpubox")
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(
+        IndexEntry(job_id="j1", host="gpubox", s3_prefix="s3://bkt/gpuc/gpubox")
+    )
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
+
+    entry, index = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert entry.name == "gpubox"
+    assert index is not None and index.s3_prefix == "s3://bkt/gpuc/gpubox"
+    assert asked == ["gpubox"]
+
+
+def test_a_mirror_index_naming_a_host_that_does_not_know_the_job_is_not_believed(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another client's `gpu1` may be this client's `lab`."""
+    from gpuc.control.actions import find_job_host
+    from gpuc.control.s3index import IndexEntry, S3Index
+
+    register_host(name="gpu1", ssh="me@mine")
+    register_host(name="lab", ssh="me@theirs")
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(IndexEntry(job_id="j1", host="gpu1"))
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    asked = _probes(monkeypatch, {"lab": {"jobs": [{"job_id": "j1"}]}})
+
+    entry, _ = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert entry.name == "lab"
+    assert asked == ["gpu1", "lab"]
+
+
+def test_a_job_the_mirror_has_no_entry_for_is_found_by_asking_the_hosts(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing index object is "not indexed", not an error: the probe goes on."""
+    from gpuc.control.actions import find_job_host
+
+    register_host(name="first", ssh="me@first")
+    register_host(name="gpubox", ssh="me@gpubox")
+    client = FakeS3Client()
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
+
+    entry, index = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert entry.name == "gpubox"
+    assert index is None
+    assert "gpubox" in asked
+
+
+def test_a_job_no_index_and_no_host_knows_is_not_found(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.control.actions import NotFound, find_job_host
+
+    register_host(name="gpubox", ssh="me@gpubox")
+    asked = _probes(monkeypatch, {})
+    with pytest.raises(NotFound, match="no registered host knows job j1"):
+        find_job_host("j1", load_registry(), None, Settings())
+    assert asked == ["gpubox"]
 
 
 def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path) -> None:
@@ -711,15 +948,11 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
     assert "purging every finished job (horizon 0)" in report.render()
 
 
-def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> None:
+def test_verify_with_force_passes_both_and_reports_the_forced_purge(control_env: Path) -> None:
     client = FakeS3Client()
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
-    session = StubSession(
-        [
-            {"dry_run": True, "purged": [purged_entry("gone")]},
-            {"dry_run": False, "purged": [purged_entry("gone")], "freed_bytes": 1024},
-        ]
-    )
+    entry = mirrored_host()
+    forced = {**purged_entry("gone"), "forced": True}
+    session = StubSession([{"dry_run": False, "purged": [forced], "freed_bytes": 1024}])
     report = purge_host(
         entry,
         Settings(),
@@ -729,8 +962,10 @@ def test_verify_with_force_purges_even_an_unmirrored_job(control_env: Path) -> N
         verify=True,
         s3_client=client,
     )
+    assert session.calls == ["purge --older-than 7.0 --force --verified ''"]
     assert [job["job_id"] for job in report.purged] == ["gone"]
-    assert any("purged anyway because --force" in note for note in report.notes)
+    assert report.verified == []
+    assert "FORCED" in report.render()
 
 
 def test_verify_without_purge_is_refused(
@@ -767,7 +1002,7 @@ def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
         purge=True,
         only=["a", "b"],
     )
-    assert session.calls == ["purge --older-than 0.0 --only a,b --sweep-only a,b"]
+    assert session.calls == ["purge --older-than 0.0 --only a,b"]
     assert "--only a,b" in report.render()
     # A host that exits 1 has still said what it deleted; the report is the
     # point of the call, so `clean` must not let the exit code discard it.
@@ -783,15 +1018,21 @@ def test_only_without_purge_cleans_just_those_workdirs(control_env: Path) -> Non
     assert session.calls == ["clean --only a"]
 
 
-def test_only_with_verify_purges_what_answered_and_sweeps_what_was_asked(
+def test_only_with_verify_names_the_jobs_and_what_the_mirror_vouches_for(
     control_env: Path,
 ) -> None:
+    """The host scopes purge and sweep to `--only`, and judges the backup by
+    `--verified`: one call, both lists."""
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    entry = mirrored_host()
     session = StubSession(
         [
-            {"dry_run": True, "purged": [purged_entry("kept"), purged_entry("gone")]},
-            {"dry_run": False, "purged": [purged_entry("kept")], "freed_bytes": 1024},
+            {
+                "dry_run": False,
+                "purged": [purged_entry("kept")],
+                "purge_skipped": [{"job_id": "gone", "why": NO_MIRRORED_LOG}],
+                "freed_bytes": 1024,
+            }
         ]
     )
     report = purge_host(
@@ -802,31 +1043,8 @@ def test_only_with_verify_purges_what_answered_and_sweeps_what_was_asked(
         verify=True,
         s3_client=client,
     )
+    assert session.calls == ["purge --older-than 0.0 --only kept,gone --verified kept"]
     assert report.verified == ["kept"]
-    assert "--only kept,gone --sweep-only kept,gone" in session.calls[0]
-    # The job whose mirror never answered keeps its dir and still loses its venv.
-    assert session.calls[1].endswith("--only kept --sweep-only kept,gone")
-
-
-def test_a_dry_run_says_the_workdirs_verification_dropped_will_still_go(
-    control_env: Path,
-) -> None:
-    """The host sized its sweep over the dirs it expected to purge, so the
-    workdirs of the jobs we then drop are in neither total."""
-    client = FakeS3Client()
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
-    session = StubSession([{"dry_run": True, "purged": [purged_entry("gone")]}])
-    report = purge_host(
-        entry,
-        Settings(),
-        session=as_session(session),
-        only=["gone"],
-        verify=True,
-        dry_run=True,
-        s3_client=client,
-    )
-    assert report.purged == []
-    assert any("still reclaims their workdirs" in note for note in report.notes)
 
 
 def test_purge_only_needs_no_yes(control_env: Path) -> None:
@@ -926,8 +1144,8 @@ def test_a_bad_workdir_days_value_is_rejected(
 
 
 def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:
-    from gpuc.control.cli import _outputs_lost_ids
-    from gpuc.control.s3index import IndexEntry, S3Index
+    from gpuc.control.actions import _outputs_lost_ids
+    from gpuc.control.s3index import IndexEntry, JobIndex, S3Index
 
     client = FakeS3Client(
         objects={
@@ -939,7 +1157,11 @@ def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path)
         IndexEntry(job_id=job_id, host="pod", s3_prefix="s3://bucket/gpuc/pod")
         for job_id in ("lost", "fine", "missing")
     ]
-    assert _outputs_lost_ids(S3Index("bucket", client), entries) == {"lost"}
+    index = JobIndex(Settings(s3_bucket="bucket"))
+    index.s3 = S3Index("bucket", client)
+    assert _outputs_lost_ids(index, entries) == {"lost"}
+    # No bucket configured: no mirror to read, so nothing is flagged.
+    assert _outputs_lost_ids(JobIndex(Settings()), entries) == set()
 
 
 def test_submit_and_requeue_both_take_no_git() -> None:
@@ -972,16 +1194,16 @@ def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | N
         restored = config or entry.initial_config().to_dict()
         return entry.with_config({**restored, "pkg_commit": "b" * 40})
 
-    monkeypatch.setattr("gpuc.control.cli.resync_package", fake_resync)
+    monkeypatch.setattr("gpuc.control.submitting.resync_package", fake_resync)
 
     def open_or_fail(*_: object, **__: object) -> Any:
         if config is None:
             raise RemoteError("gpubox", "printf %s", "could not reach host gpubox")
         return fake_session
 
-    monkeypatch.setattr("gpuc.control.cli.open_session", open_or_fail)
+    monkeypatch.setattr("gpuc.control.submitting.open_session", open_or_fail)
     monkeypatch.setattr(
-        "gpuc.control.cli.submit_file",
+        "gpuc.control.submitting.submit_file",
         lambda *a, **k: SubmitResult(job_id="j", host="gpubox", attempt=1),
     )
     return resynced
@@ -1079,7 +1301,7 @@ def test_submit_records_the_hosts_commit_without_clobbering_the_rest_of_the_entr
         return {"pkg_commit": "c" * 40}
 
     monkeypatch.setattr(
-        "gpuc.control.cli.open_session",
+        "gpuc.control.submitting.open_session",
         lambda *a, **k: SimpleNamespace(
             transport=SimpleNamespace(host="gpubox"), read_config=concurrent_probe
         ),
@@ -1304,7 +1526,7 @@ def test_submit_json_is_the_queued_job_and_its_notes(
             job_id="20260915-120000-abc123", host=entry.name, attempt=1, notes=["s3_bucket unset"]
         )
 
-    monkeypatch.setattr("gpuc.control.cli.submit_file", fake_submit_file)
+    monkeypatch.setattr("gpuc.control.submitting.submit_file", fake_submit_file)
     capsys.readouterr()
     assert main(["submit", str(job), "--host", "local", "--json"]) == 0
     captured = capsys.readouterr()
@@ -1339,7 +1561,7 @@ def test_requeue_json_names_the_job_it_came_from(
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
-        "gpuc.control.cli.submit_spec",
+        "gpuc.control.submitting.submit_spec",
         lambda entry, *a, **k: SubmitResult(job_id="new", host=entry.name, attempt=2),
     )
     register_host(name="local", gpus=GPU)
@@ -1380,14 +1602,18 @@ def _requeue_setup(
         "gpuc.control.actions.open_session",
         lambda entry, *a, **k: _KnowsJobs(entry.name, known.get(entry.name, set()), asked),
     )
-    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
-    monkeypatch.setattr("gpuc.control.cli.placement_after", lambda *a, **k: placement_unknown())
+    monkeypatch.setattr(
+        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
+    )
+    monkeypatch.setattr(
+        "gpuc.control.submitting.placement_after", lambda *a, **k: placement_unknown()
+    )
 
     def fake_submit(entry: Any, *a: Any, **k: Any) -> SubmitResult:
         submitted.append(entry.name)
         return SubmitResult(job_id="new", host=entry.name, attempt=k["attempt"])
 
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
     for name in known:
         register_host(name=name, kind="ssh", ssh=f"me@{name}", gpus=GPU)
     return asked, submitted
@@ -1450,7 +1676,7 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
         submitted.append(model)
         return SubmitResult(job_id="new", host=entry.name, attempt=2)
 
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
@@ -1470,7 +1696,7 @@ def test_requeue_refuses_a_mirrored_spec_that_asks_for_no_gpu(
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
-        "gpuc.control.cli.submit_spec",
+        "gpuc.control.submitting.submit_spec",
         lambda *a, **k: pytest.fail("a spec asking for no GPU must not be submitted"),
     )
     register_host(name="local", gpus=GPU)
@@ -1502,7 +1728,9 @@ def test_requeue_refuses_a_mirror_an_older_build_expanded(
         }
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
-    monkeypatch.setattr("gpuc.control.cli.ensure_package_current", lambda entry, *a, **k: entry)
+    monkeypatch.setattr(
+        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
+    )
     monkeypatch.setattr(
         "gpuc.control.submit.open_session",
         lambda *a, **k: pytest.fail("a spec pointed at an earlier run's outputs must not ship"),
@@ -1531,7 +1759,7 @@ def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
-        "gpuc.control.cli.runpod_host",
+        "gpuc.control.submitting.runpod_host",
         lambda *a, **k: pytest.fail("no pod may be bought for a spec that is refused"),
     )
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 1
@@ -1558,7 +1786,7 @@ def test_requeue_expands_the_mirrored_template_with_the_new_id(
         submitted.append(model)
         return SubmitResult(job_id="new", host=entry.name, attempt=2)
 
-    monkeypatch.setattr("gpuc.control.cli.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
@@ -2053,7 +2281,7 @@ def bootstrapping(
             raise error
         return fake_bootstrap(entry, settings, **kwargs)
 
-    monkeypatch.setattr("gpuc.control.cli.bootstrap_host", fake)
+    monkeypatch.setattr("gpuc.control.hosts.bootstrap_host", fake)
     return attempted
 
 
@@ -2262,7 +2490,7 @@ def adoptable(monkeypatch: pytest.MonkeyPatch, fake_host: FakeHost) -> FakeProvi
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda settings: provider)
     fake_host.put_file(
         json.dumps(
             {
@@ -2331,7 +2559,7 @@ def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda settings: provider)
 
     assert main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111"]) == 0
 
@@ -2427,3 +2655,45 @@ def test_reorder_refuses_to_report_a_move_the_host_did_not_say_it_made(
     assert document["exit_code"] == EXIT_ERROR
     assert "did not say what it did with 20260101-000000-aaaaaa" in str(document["error"])
     assert "priority" not in document
+
+
+def test_the_commands_the_dashboard_could_want_live_outside_the_cli() -> None:
+    """cli.py is argparse and text; what a command *does* is somewhere the web can call.
+
+    A structural pin, not a behavioural one: the logic that used to live in
+    these `cmd_*` bodies must stay importable without the CLI.
+    """
+    import inspect
+
+    from gpuc.control import actions, cli, hosts, submitting
+
+    moved = {
+        submitting: ["submit_job", "requeue_job", "ensure_package_current", "mirror_spec_first"],
+        hosts: ["add_host", "set_host", "bootstrap_and_record", "bootstrap_every_host"],
+        actions: ["unhosted_jobs"],
+    }
+    for module, names in moved.items():
+        for name in names:
+            assert hasattr(module, name), f"{module.__name__} lost {name}"
+    for name in [
+        "ensure_package_current",
+        "mirror_spec_first",
+        "check_runpod_args",
+        "runpod_target",
+        "BootstrapTally",
+        "_print_unhosted",
+        "_outputs_lost_ids",
+        "_pod_address",
+        "_refuse_a_taken_name",
+    ]:
+        assert not hasattr(cli, name), f"cli.py defines {name} again"
+    calls = {
+        cli.cmd_submit: "submit_job",
+        cli.cmd_requeue: "requeue_job",
+        cli.cmd_host_add: "add_host",
+        cli.cmd_host_set: "set_host",
+        cli.cmd_host_bootstrap: "bootstrap_every_host",
+        cli.cmd_status: "status_views",
+    }
+    for command, callee in calls.items():
+        assert f"{callee}(" in inspect.getsource(command), f"{command.__name__} skips {callee}"

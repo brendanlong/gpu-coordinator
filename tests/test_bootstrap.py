@@ -348,6 +348,33 @@ def test_the_dispatcher_is_started_with_the_home_tool_dirs_on_path(control_env: 
     assert command.startswith('PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"')
 
 
+def test_bootstrap_retires_the_reconcile_units_before_starting_the_dispatcher(
+    control_env: Path,
+) -> None:
+    """An earlier build installed them; no build serves them, so left alone
+    they fail every minute for ever."""
+    host = ScriptedHost()
+    bootstrap_host(entry(), transport=host, report=lambda _: None)
+    retire = host.index_of("systemctl --user disable --now gpuc-reconcile.timer")
+    assert "gpuc-reconcile.service" in host.events[retire]
+    assert "rm -f $HOME/.config/systemd/user/gpuc-reconcile.timer" in host.events[retire]
+    assert retire < host.index_of("spawn_detached_dispatcher")
+
+
+def test_a_host_without_user_systemd_still_bootstraps(control_env: Path) -> None:
+    @dataclass
+    class NoSystemd(ScriptedHost):
+        def _answer(self, command: str) -> tuple[int, str]:
+            if command.startswith("systemctl"):
+                return 1, "Failed to connect to bus"
+            return super()._answer(command)
+
+    host = NoSystemd()
+    _, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    assert result.dispatcher_pid == 4242
+    assert result.warnings == []
+
+
 def test_a_mirroring_host_fails_bootstrap_when_the_aws_cli_will_not_install(
     control_env: Path,
 ) -> None:

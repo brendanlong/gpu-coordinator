@@ -8,6 +8,7 @@ import pytest
 from gpuc.control.config import Settings
 from gpuc.control.s3index import (
     IndexEntry,
+    JobIndex,
     LocalIndex,
     S3Index,
     S3IndexError,
@@ -116,3 +117,108 @@ def test_a_list_failure_names_the_prefix() -> None:
 
     with pytest.raises(S3IndexError, match="gpuc/index"):
         S3Index("bkt", Broken()).list_index()
+
+
+# -- JobIndex: the local index, then the mirror --------------------------------
+
+
+def job_index(tmp_path: Path, client: FakeS3Client | None) -> JobIndex:
+    """A `JobIndex` over a local index under `tmp_path` and, given a client,
+    a mirror in bucket `bkt`."""
+    index = JobIndex(
+        Settings(s3_bucket="bkt" if client else None), local=LocalIndex(tmp_path / "index")
+    )
+    if client is not None:
+        index.s3 = S3Index("bkt", client)
+    return index
+
+
+def test_job_index_get_falls_back_to_the_mirror(tmp_path: Path) -> None:
+    """A second machine never submitted the job, so its local index is empty;
+    the mirror is what tells it where the job went."""
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(
+        IndexEntry(job_id="j1", host="gpubox", s3_prefix="s3://bkt/gpuc/gpubox")
+    )
+    index = job_index(tmp_path, client)
+    found = index.get("j1")
+    assert found is not None and found.host == "gpubox"
+    assert index.get("missing") is None
+
+
+def test_job_index_get_prefers_the_local_copy(tmp_path: Path) -> None:
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(IndexEntry(job_id="j1", host="from-mirror"))
+    index = job_index(tmp_path, client)
+    index.local.record(IndexEntry(job_id="j1", host="from-local"))
+    client.objects.clear()  # would the mirror be read, it would now say nothing
+    found = index.get("j1")
+    assert found is not None and found.host == "from-local"
+
+
+def test_job_index_get_without_a_bucket_is_the_local_index_alone(tmp_path: Path) -> None:
+    index = job_index(tmp_path, None)
+    assert index.s3 is None
+    assert index.get("j1") is None
+    index.local.record(IndexEntry(job_id="j1", host="gpubox"))
+    found = index.get("j1")
+    assert found is not None and found.host == "gpubox"
+
+
+def test_job_index_get_treats_an_unreadable_mirror_as_no_entry(tmp_path: Path) -> None:
+    class Refusing(FakeS3Client):
+        def get_object(self, **_: object) -> dict[str, object]:
+            raise RuntimeError("AccessDenied")
+
+    assert job_index(tmp_path, Refusing()).get("j1") is None
+
+
+def test_job_index_all_merges_both_indexes(tmp_path: Path) -> None:
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(IndexEntry(job_id="remote", host="pod"))
+    index = job_index(tmp_path, client)
+    index.local.record(IndexEntry(job_id="local", host="gpubox"))
+    entries, short = index.all()
+    assert sorted(entries) == ["local", "remote"]
+    assert short is None
+
+
+def test_job_index_all_is_incomplete_when_the_mirror_cannot_be_listed(tmp_path: Path) -> None:
+    """ "Could not read the mirror" must not read as "these are all the jobs"."""
+
+    class Broken(FakeS3Client):
+        def list_objects_v2(self, **_: object) -> dict[str, object]:
+            raise RuntimeError("AccessDenied")
+
+    index = job_index(tmp_path, Broken())
+    index.local.record(IndexEntry(job_id="local", host="gpubox"))
+    entries, short = index.all()
+    assert list(entries) == ["local"]
+    assert short is not None and "AccessDenied" in short
+
+
+def test_job_index_mirror_prefix_is_the_jobs_own_before_the_hosts(tmp_path: Path) -> None:
+    from tests.conftest import host_entry
+
+    index = job_index(tmp_path, None)
+    host = host_entry(name="gpubox", ssh="me@box", s3_prefix="s3://bkt/gpuc/new")
+    index.local.record(IndexEntry(job_id="old", host="gpubox", s3_prefix="s3://bkt/gpuc/old"))
+    assert index.mirror_prefix("old", host) == "s3://bkt/gpuc/old"
+    assert index.mirror_prefix("unindexed", host) == "s3://bkt/gpuc/new"
+
+
+def test_job_index_mirrored_state_is_a_document_or_nothing(tmp_path: Path) -> None:
+    client = FakeS3Client(
+        objects={
+            "bkt/gpuc/h/jobs/good/state.json": b'{"status": "succeeded"}',
+            "bkt/gpuc/h/jobs/list/state.json": b"[1, 2]",
+            "bkt/gpuc/h/jobs/torn/state.json": b"{not json",
+        }
+    )
+    index = job_index(tmp_path, client)
+    prefix = "s3://bkt/gpuc/h"
+    assert index.mirrored_state("good", prefix) == {"status": "succeeded"}
+    for job_id in ("list", "torn", "missing"):
+        assert index.mirrored_state(job_id, prefix) is None
+    assert index.mirrored_state("good", None) is None
+    assert job_index(tmp_path, None).mirrored_state("good", prefix) is None

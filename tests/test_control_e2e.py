@@ -10,6 +10,7 @@ registry are never touched.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -556,12 +557,18 @@ def test_clean_removes_a_leftover_incoming_dir(
 
 def mark_mirrored(home: Path, job_id: str, prefix: str = "s3://bucket/gpuc/local") -> None:
     """Stand in for a successful final meta sync on a host with a prefix."""
-    path = home / "jobs" / job_id / "state.json"
-    document = json.loads(path.read_text())
-    document["uploads"] = [
-        {"to": f"{prefix}/jobs/{job_id}", "output": None, "ok_at": document.get("ended_at")}
-    ]
-    path.write_text(json.dumps(document, indent=2) + "\n")
+    # Under the job's own lock: the runner is still writing its last fields
+    # (workdir size, the meta sync) when `finished()` first says so, and an
+    # unlocked write here would be lost to its next read-modify-write.
+    lock = home / "jobs" / job_id / ".lock"
+    with lock.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        path = home / "jobs" / job_id / "state.json"
+        document = json.loads(path.read_text())
+        document["uploads"] = [
+            {"to": f"{prefix}/jobs/{job_id}", "output": None, "ok_at": document.get("ended_at")}
+        ]
+        path.write_text(json.dumps(document, indent=2) + "\n")
 
 
 def test_purge_removes_a_mirrored_job_whole(

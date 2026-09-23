@@ -36,6 +36,8 @@ gpuc/
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command
     actions.py     # one function per command returning its --json document; the CLI and the web call these
+    hosts.py       # the actions of `host add`, `host set` and `host bootstrap`
+    submitting.py  # the actions of `submit` and `requeue`: rent or look up the host, re-ship, enqueue
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
@@ -210,7 +212,13 @@ queue's lexical order, not submission order below one second.
 ## Dispatcher (`python -m gpuc.host dispatch`)
 
 Started by every `enqueue`, and by bootstrap, in its own session so it outlives
-the ssh that started it. The rules it holds to:
+the ssh that started it -- and, where the host has user systemd, in a transient
+scope of its own, so it outlives the *cgroup* that started it too: a
+dispatcher started from inside somebody's session scope would otherwise be
+stopped with that session, and so would every runner it spawned. The scope
+lives under the user's systemd instance, so a host whose user manager stops at
+logout needs `loginctl enable-linger`, as the dashboard's unit already does.
+The rules it holds to:
 
 - **One dispatcher per host**, by `flock` on `dispatcher.lock` plus a heartbeat.
   A holder whose heartbeat is stale (30 s) is killed by the pgid in the lock
@@ -257,8 +265,11 @@ the ssh that started it. The rules it holds to:
 - **A stop is an intent** in the job's state: `cancel` or `preempt`. The
   **runner** owns the kill -- it polls its state and ends the attempt as
   `cancelled` or `failed: preempted` after a final sync -- and the dispatcher
-  escalates only once the grace period has passed (`escalate_stops`): the
-  job's scope and group, then the runner itself, then the runner's group. A
+  escalates only once the grace period has passed (`escalate_stops`), one
+  rung per grace period: the job's scope and group, then the runner itself,
+  then the runner's group. A runner in its final sync gets
+  `SYNC_STOP_PATIENCE_S` first: the upload has no cap by design and is the
+  runner honouring the request, but one hung there holds its cards for ever. A
   queued job is cancelled on the spot, with no intent. A cancel overrides a
   preempt.
 - **Preempt** (`queue.preempt`) is for a running job, and only when something
@@ -394,9 +405,13 @@ systemd-run --user --scope --collect --quiet -p TimeoutStopSec=15 \
 The script is base64-encoded because the words after `--` become a systemd
 `ExecStart`, whose own substitution would corrupt inline shell.
 
-The kill path is then `systemctl --user stop <unit>`, with the process-group
-kill kept as a fallback, and the dispatcher's backstop uses the unit when
-`state.json` records one. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are
+Every stop goes through one object, `procs.JobProcesses` -- the scope, the
+job's own process group, and the runner -- built from the job's state: the
+runner's kill, the dispatcher's escalation and the adoption of a dead runner's
+leftovers all call it rather than deciding for themselves what to signal. The
+kill path is `systemctl --user stop <unit>`, with the process-group kill kept
+as a fallback, and the job's group is only ever the one the runner published,
+never the runner's own. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are
 in `state.json` and `gpuc status --json`. The probe runs once per dispatcher and
 reaches runners as `GPUC_ISOLATION`. On a host with no user systemd -- every
 RunPod pod, most shared boxes -- `pgid` is the mode and a daemonised grandchild
@@ -412,25 +427,31 @@ policy, the two horizons and every refusal are
 - No policy touches a job that is not finished, and the runner applies its
   policy after the final sync and state write. A preempted job keeps its
   workdir whatever `cleanup:` says: the next attempt re-runs in it.
+- **One predicate decides every delete**: `cleanup.may_delete(job, what,
+  evidence)`, where `what` is the workdir or the whole job dir and `evidence`
+  is what the caller can vouch for -- that nobody typed the command
+  (`automatic`), that a person waived the backup preconditions (`force`), or
+  which jobs' mirrors the caller checked itself (`verified`). A workdir needs
+  the job finished, and under an automatic sweep also a spec that did not say
+  `cleanup: never` and outputs confirmed elsewhere. A job dir needs the record
+  mirrored and the outputs confirmed, unless forced.
 - `python -m gpuc.host clean (--all-finished | --older-than DAYS | --only IDS)
-  [--sweep-only IDS] [--dry-run]` and `purge [--older-than DAYS] [--only IDS]
-  [--sweep-only IDS] [--dry-run] [--force]` print JSON and **fail closed**: a
-  running or queued job, an unreadable `state.json`, and (under an age gate) a
-  job with no parseable `ended_at` are skipped. `--only` replaces the age gate,
-  and a named id no job dir matches removes nothing and exits 1 -- so the
-  control side reads these two with `host_json(check=False)`, since the
-  document is the report of the failure. `--purge` also runs the workdir sweep,
-  and `gpuc clean --only` sends the ids as both `--only` and `--sweep-only`; the
-  two stay separate because `--verify` purges what the mirror confirmed and
-  sweeps what was named.
+  [--dry-run]` and `purge [--older-than DAYS] [--only IDS] [--verified IDS]
+  [--dry-run] [--force]` print JSON and **fail closed**: a running or queued
+  job, an unreadable `state.json`, and (under an age gate) a job with no
+  parseable `ended_at` are skipped. `--only` replaces the age gate and scopes
+  the workdir sweep `--purge` implies, and a named id no job dir matches
+  removes nothing and exits 1 -- so the control side reads these two with
+  `host_json(check=False)`, since the document is the report of the failure.
 - The host cannot consult the mirror, so the mirror's upload record in the
-  job's own `state.json` is the purge's authority, and confirmed outputs are
-  every output destination's record saying the last upload succeeded.
-  `--verify` on the control side is the exception: it HEADs the mirrored
-  `log.txt` under the recorded mirror uri first.
-- The dispatcher runs `cleanup.clean(automatic=True)` at startup and then at
-  most once an hour, purge first. The automatic form adds two refusals a delete
-  nobody typed needs: `cleanup: never`, and outputs not confirmed elsewhere.
+  job's own `state.json` is the purge's authority. `--verify` on the control
+  side lists the mirrored logs under the host's prefix first and passes the
+  ids as `--verified`; a job must then be in the list *and* have the record
+  (every periodic tick mirrors the log, so the list alone would vouch for a
+  job whose final upload failed). One round trip either way; a list too long
+  for an argument goes over as a file.
+- The dispatcher sweeps with `Evidence(automatic=True)` at startup and then at
+  most once an hour, purge first.
   `workdir_days` defaults to `cleanup.DEFAULT_WORKDIR_DAYS` only for a host
   being configured for the first time, never on the `HostConfig` field -- a
   config that predates the key must not start deleting because it was shipped a
@@ -496,9 +517,17 @@ hold to, whatever the flags:
 - A host name is looked up locally; `logs`, `wait`, `cancel`, `preempt`,
   `reorder`, `estimate`, `requeue` and `ssh` resolve a job id the same way
   (`find_job_host`): the job index, then asking each host, and an id nothing
-  knows is exit 4, never a guess. Every per-job verb runs through
+  knows is exit 4, never a guess. The job index is one facade
+  (`s3index.JobIndex`) over the local index and the mirror's, in that order,
+  and the precedence is written once. A host name from the mirror's index is
+  the *submitting* client's name for it, so it is asked first rather than
+  believed; the local index's name is this machine's and is trusted. Every per-job verb runs through
   `actions.job_verb`: find the host, ask it, insist on a verdict, re-mirror a
   spec field it changed. The CLI and the dashboard call the same functions.
+- What a command does lives in `actions` (with `hosts` and `submitting` for
+  the host and submit commands), one function per command returning the
+  document its `--json` form prints; `cli.py` holds only argparse, the
+  parsing of flags into plain arguments, and the text rendering.
 - Nothing runs in the background on this side except, if installed, the web
   dashboard's service.
 

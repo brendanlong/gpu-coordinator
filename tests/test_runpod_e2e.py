@@ -186,6 +186,7 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
         pytest.skip("RUNPOD_API_KEY is not set")
     provider = RecordingProvider(live_settings.runpod_pod_prefix)
     monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.submitting.make_provider", lambda settings: provider)
     monkeypatch.chdir(workdir)
     started = time.monotonic()
 

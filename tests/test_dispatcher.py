@@ -13,7 +13,7 @@ import pytest
 
 from gpuc.host import cleanup, destinations, jobs, paths, queue, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
-from gpuc.host import runner as procinfo
+from gpuc.host import procs as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig
 from tests.conftest import FAKE_GPUS, fake_smi, make_spec
@@ -76,6 +76,21 @@ def make_dispatcher(
         kill_grace_s=1.0,
     )
     return Dispatcher(deps=deps), spawned
+
+
+def record_signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """Every real signal sent to a pid or a group, as `(target, signal)`, with
+    every target reading alive. Liveness probes (signal 0) are not recorded."""
+    signals: list[tuple[int, int]] = []
+
+    def send(target: int, sig: int) -> None:
+        if sig != 0:
+            signals.append((target, sig))
+
+    monkeypatch.setattr(os, "kill", send)
+    monkeypatch.setattr(os, "killpg", send)
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 1)
+    return signals
 
 
 def test_queued_job_is_launched_with_assigned_uuids(gpuc_home: Path) -> None:
@@ -210,10 +225,7 @@ def test_a_stop_the_runner_never_acts_on_is_escalated_after_the_grace_period(
     dispatcher.run_once()
     jobs.update_state(job_id, pgid=123456)
 
-    signals: list[tuple[int | None, int]] = []
-    monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
-    monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
+    signals = record_signals(monkeypatch)
     assert queue.cancel(job_id) == "cancelling"
     dispatcher.escalate_stops()
     assert signals == [], "inside the grace period the runner is left to do it"
@@ -501,7 +513,31 @@ def test_a_dead_runner_never_leaves_a_job_holding_a_card(gpuc_home: Path) -> Non
             orphan.kill()
     assert jobs.read_state(job_id).reason == "runner-died"
     assert dispatcher.free_gpus() == FAKE_GPUS
-    assert f"orphaned process group {orphan.pid}" in paths.dispatcher_log().read_text()
+    assert (
+        f"job {job_id}: SIGKILLing process group {orphan.pid} before freeing its GPUs"
+        in paths.dispatcher_log().read_text()
+    )
+
+
+def test_a_dead_runners_leftover_scope_is_stopped_before_its_cards_are_freed(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        host_dispatcher.scope, "stop_unit", lambda unit: stopped.append(unit) or True
+    )
+    jobs.update_state(job_id, cgroup_unit="gpuc-job-x.scope")
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    assert stopped == ["gpuc-job-x.scope"]
+    assert jobs.read_state(job_id).reason == "runner-died"
+    assert (
+        f"job {job_id}: stopping leftover scope gpuc-job-x.scope before freeing its GPUs"
+        in paths.dispatcher_log().read_text()
+    )
 
 
 def test_an_unreadable_state_for_a_running_job_is_runner_died_not_a_crash(
@@ -724,9 +760,47 @@ def test_the_runner_the_dispatcher_spawns_is_one_the_scan_recognises(
             captured.append(argv)
 
     monkeypatch.setattr(host_dispatcher.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(host_dispatcher.scope, "probe", lambda: False)
+    host_dispatcher.default_spawn_runner(job_id)
+    monkeypatch.setattr(host_dispatcher.scope, "probe", lambda: True)
     host_dispatcher.default_spawn_runner(job_id)
 
-    assert procinfo.runner_job_id(captured[0]) == job_id
+    plain, scoped = captured
+    assert plain[1:] == ["-m", "gpuc.host", "run", job_id]
+    assert scoped[:3] == ["systemd-run", "--user", "--scope"]
+    assert scoped[scoped.index("--") + 1 :] == plain
+    assert procinfo.runner_job_id(plain) == job_id
+    assert procinfo.runner_job_id(scoped) == job_id
+
+
+def test_a_runner_in_its_final_sync_is_given_a_long_patience_before_the_ladder(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final upload has no wall-clock cap, and a runner in it is honouring
+    the stop: a ladder that reached it after the ordinary grace would kill the
+    upload that matters most. One hung there for half an hour holds cards
+    somebody wants, so the ladder does start, from the first rung."""
+    clock = FakeClock()
+    dispatcher, spawned = make_dispatcher(clock=clock)
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    jobs.update_state(job_id, pgid=123456, phase="sync")
+    signals = record_signals(monkeypatch)
+
+    assert queue.cancel(job_id) == "cancelling"
+    for _ in range(10):
+        dispatcher.escalate_stops()
+        clock.advance(10.0)  # kill_grace_s is 1.0 in these tests
+    assert signals == []
+    assert "escalating" not in paths.dispatcher_log().read_text()
+
+    # The rungs count from the end of the patience, one grace period apart.
+    clock.advance(host_dispatcher.SYNC_STOP_PATIENCE_S - 100.0 + 0.5)
+    dispatcher.escalate_stops()
+    assert signals == [(123456, signal.SIGKILL)]
+    clock.advance(1.5)
+    dispatcher.escalate_stops()
+    assert (spawned[job_id].pid, signal.SIGTERM) in signals
 
 
 def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path) -> None:
@@ -751,9 +825,7 @@ def test_a_stop_in_the_launch_window_never_signals_the_runners_own_group(
     dispatcher.run_once()
     assert jobs.read_state(job_id).pgid is None
 
-    signals: list[tuple[int | None, int]] = []
-    monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
-    monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
+    signals = record_signals(monkeypatch)
     queue.cancel(job_id)
     dispatcher.escalate_stops()
     clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
@@ -1155,10 +1227,7 @@ def test_a_preempt_the_runner_ignores_is_escalated_and_the_job_still_comes_back(
     jobs.update_state(job_id, pgid=123456)
     waiting = queue.enqueue(make_spec(gpus=2, priority=10))
 
-    signals: list[tuple[int | None, int]] = []
-    monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
-    monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
+    signals = record_signals(monkeypatch)
 
     queue.preempt(job_id)
     dispatcher.run_once()
@@ -1424,10 +1493,7 @@ def test_a_stop_another_process_asked_for_gets_an_escalation_clock_of_its_own(
     dispatcher.run_once()
     jobs.update_state(job_id, pgid=123456)
 
-    signals: list[tuple[int | None, int]] = []
-    monkeypatch.setattr(dispatcher, "_signal_group", lambda pgid, sig: signals.append((pgid, sig)))
-    monkeypatch.setattr(dispatcher, "_signal_pid", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(host_dispatcher, "process_group_alive", lambda _pgid: True)
+    signals = record_signals(monkeypatch)
 
     queue.enqueue(make_spec(gpus=1, priority=1))
     queue.preempt(job_id)

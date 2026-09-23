@@ -112,8 +112,8 @@ says so. Disabling it again is under [teardown](#teardown) below.
 environment variables, `~/.aws/credentials`, an instance role — gpuc never reads
 a key out of its own config. On the bucket it needs `s3:PutObject` and
 `s3:GetObject` under `gpuc/*`, `s3:ListBucket` (for `gpuc status --all`, which
-lists `gpuc/index/`), and, for `gpuc clean --purge --verify`, permission to HEAD
-each mirrored `log.txt`.
+lists `gpuc/index/`, and `gpuc clean --purge --verify`, which lists each host's
+mirrored logs).
 
 **The hosts.** A host uploads with whatever the *job* carries: list the names in
 the spec's `secrets:` and they are read from your shell at submit time and

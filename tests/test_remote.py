@@ -11,6 +11,7 @@ from gpuc.control.remote import (
     HostSession,
     RemoteError,
     host_command,
+    host_python,
     parse_last_json,
     read_remote_config,
     write_remote_config,
@@ -116,6 +117,18 @@ def test_host_command_pins_gpuc_home_and_pythonpath() -> None:
     command = host_command("/py", "/home/u/.gpuc", "status")
     assert 'GPUC_HOME="/home/u/.gpuc"' in command
     assert 'PYTHONPATH="/home/u/.gpuc/pkg"' in command
+
+
+def test_every_host_invocation_starts_with_the_one_python_prefix() -> None:
+    """`-m gpuc.host` and bootstrap's `-c` snippets share the prefix, so the
+    host env and the pinned home cannot drift apart between them."""
+    env = {"UV_CACHE_DIR": "/vol/uv", "HF_HOME": "/big"}
+    prefix = host_python("/py", "/home/u/.gpuc", env)
+    assert prefix == (
+        'HF_HOME="/big" UV_CACHE_DIR="/vol/uv" '
+        'GPUC_HOME="/home/u/.gpuc" PYTHONPATH="/home/u/.gpuc/pkg" "/py"'
+    )
+    assert host_command("/py", "/home/u/.gpuc", "status", env) == f"{prefix} -m gpuc.host status"
 
 
 def test_a_pretty_printed_report_is_not_mistaken_for_its_last_nested_object() -> None:

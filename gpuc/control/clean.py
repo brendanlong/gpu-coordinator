@@ -3,19 +3,20 @@
 Both are thin: the host package decides what is safe to delete (it is the only
 thing that can read a job's `state.json` without a race), and this module asks
 it and formats the answer. `--purge` adds the one thing the control side can
-do and the host cannot: `--verify` HEADs the mirrored log in S3 with our own
-credentials before the job dir that holds the original goes away.
+do and the host cannot: `--verify` lists the mirrored logs in S3 with our own
+credentials before a job dir that holds the original goes away.
 """
 
 from __future__ import annotations
 
+import os
 import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, load_settings, transport_for
 from gpuc.control.remote import HostSession, env_prefix, open_session
-from gpuc.control.s3index import S3Index, job_log_uri, make_s3_client, split_uri
+from gpuc.control.s3index import S3Index, job_uri, make_s3_client, split_uri
 from gpuc.control.transport import Transport
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS, human_bytes
 
@@ -275,12 +276,7 @@ def _report(host: str, payload: Any, **extra: Any) -> CleanReport:
 
 
 def _purge_args(
-    older_than_days: float,
-    *,
-    dry_run: bool,
-    force: bool,
-    only: list[str] | None,
-    sweep_only: list[str] | None = None,
+    older_than_days: float, *, dry_run: bool, force: bool, only: list[str] | None
 ) -> str:
     args = ["purge", "--older-than", str(older_than_days)]
     if dry_run:
@@ -289,9 +285,22 @@ def _purge_args(
         args.append("--force")
     if only is not None:
         args += ["--only", shlex.quote(",".join(only))]
-    if sweep_only is not None:
-        args += ["--sweep-only", shlex.quote(",".join(sweep_only))]
     return " ".join(args)
+
+
+VERIFIED_INLINE_MAX = 32 * 1024
+"""Longer than this and the id list travels as a file: every id ever mirrored
+under a busy host's prefix, in one argument, would pass the kernel's
+per-argument limit long before the host stopped being worth purging."""
+
+
+def _verified_arg(session: HostSession, verified: list[str]) -> str:
+    joined = ",".join(verified)
+    if len(joined) <= VERIFIED_INLINE_MAX:
+        return f"--verified {shlex.quote(joined)}"
+    path = f"{session.home}/incoming/.verified-{os.getpid()}"
+    session.transport.put_file(joined + "\n", path, 0o600)
+    return f"--verified-file {shlex.quote(path)}"
 
 
 def purge_host(
@@ -309,11 +318,12 @@ def purge_host(
 ) -> CleanReport:
     """Remove whole job dirs on a host, optionally checking the mirror first.
 
-    Without `--verify` this trusts the host's mirror record, which it wrote only
-    after its own upload returned 0 -- the cheap answer, and the only one
-    available to a host with no credentials of ours. With it we HEAD the
-    mirrored `log.txt` ourselves: a dry run then *labels* each candidate, and a
-    real purge only deletes the ones that answered.
+    Without `--verify` the host trusts its own mirror record, which it wrote
+    only after its upload returned 0 -- the cheap answer, and the only one
+    available to a host with no credentials of ours. With it we list the
+    mirrored logs ourselves and hand the host the ids that have one: the host
+    then counts only those as backed up, whatever its records say. One round
+    trip either way.
 
     `only` is the user naming job ids: an age horizon of 0 for exactly those
     jobs, with the implied workdir sweep scoped to them as well, so purging one
@@ -325,94 +335,58 @@ def purge_host(
         if all_finished or only is not None
         else (DEFAULT_RETENTION_DAYS if older_than_days is None else older_than_days)
     )
-    if not verify:
-        payload = session.host_json(
-            _purge_args(days, dry_run=dry_run, force=force, only=only, sweep_only=only),
-            timeout=900.0,
-            check=False,
-        )
-        return _report(entry.name, payload, purge=True)
-
-    preview = session.host_json(
-        _purge_args(days, dry_run=True, force=force, only=only, sweep_only=only),
-        timeout=900.0,
-        check=False,
-    )
-    report = _report(entry.name, preview, purge=True)
-    verified, unverified = verify_mirror(entry, report, settings, client=s3_client)
-    report.verified = verified
-    for job_id, why in unverified:
-        if force:
-            report.notes.append(f"{job_id}: {why} -- purged anyway because --force was given")
-        else:
-            report.purge_skipped.append({"job_id": job_id, "why": why})
-    keep = set(verified) | ({job_id for job_id, _ in unverified} if force else set())
-    report.purged = [job for job in report.purged if job["job_id"] in keep]
-    report.freed_bytes = sum(int(job.get("bytes") or 0) for job in report.purged) + sum(
-        int(job.get("bytes") or 0) for job in report.removed
-    )
-    if dry_run:
-        if report.purge_skipped:
-            # The host sized its dry-run sweep over the dirs it expected to
-            # purge, so the workdirs of the jobs we are about to drop from that
-            # list are in neither total. The real run does reclaim them.
-            report.notes.append(
-                "the job dirs above stay, but the real run still reclaims their workdirs, "
-                "which this dry run has not sized"
-            )
-        return report
-    # `--only` with the verified ids -- possibly none of them, which the host
-    # reads as "purge nothing", while the workdir sweep `--purge` implies still
-    # runs over whatever the user asked about.
-    payload = session.host_json(
-        _purge_args(days, dry_run=False, force=force, only=sorted(keep), sweep_only=only),
-        timeout=900.0,
-        check=False,
-    )
-    final = _report(entry.name, payload, purge=True)
-    final.verified = verified
-    final.notes = report.notes
-    final.purge_skipped += report.purge_skipped
-    return final
+    verified = verified_mirrors(entry, settings, client=s3_client) if verify else None
+    args = _purge_args(days, dry_run=dry_run, force=force, only=only)
+    if verified is not None:
+        args += f" {_verified_arg(session, verified)}"
+    payload = session.host_json(args, timeout=900.0, check=False)
+    report = _report(entry.name, payload, purge=True)
+    if verified is not None:
+        report.verified = [job["job_id"] for job in report.purged if job["job_id"] in verified]
+    return report
 
 
 def _s3_client(settings: Settings) -> Any:
-    """A client for the HEADs. The bucket comes from each job's own recorded
-    prefix, so this works even for a host mirroring outside `s3_bucket`."""
+    """A client for the listing, from `s3_bucket` when there is one."""
     index = S3Index.from_settings(settings)
     if index is not None:
         return index.client
     return make_s3_client()
 
 
-def verify_mirror(
-    entry: HostEntry,
-    report: CleanReport,
-    settings: Settings | None = None,
-    *,
-    client: Any | None = None,
-) -> tuple[list[str], list[tuple[str, str]]]:
-    """HEAD each candidate's mirrored `log.txt`. Returns (verified, (id, why))."""
+def verified_mirrors(
+    entry: HostEntry, settings: Settings | None = None, *, client: Any | None = None
+) -> list[str]:
+    """The job ids whose mirrored `log.txt` exists under this host's prefix.
+
+    One listing rather than one HEAD per candidate, and before the host is
+    asked anything, so the purge is a single round trip. A host with no
+    `s3_prefix` has nothing mirrored, and a listing that fails is an error:
+    "could not check" must not read as "nothing is backed up".
+    """
+    if not entry.s3_prefix:
+        return []
     s3 = client if client is not None else _s3_client(settings or load_settings())
-    verified: list[str] = []
-    unverified: list[tuple[str, str]] = []
-    for job in report.purged:
-        job_id = str(job["job_id"])
-        mirror = job.get("mirror")
-        if not mirror and entry.s3_prefix:
-            mirror = job_log_uri(entry.s3_prefix, job_id).removesuffix("/log.txt")
-        if not mirror:
-            unverified.append((job_id, "no mirror prefix to verify against"))
-            continue
-        uri = f"{mirror}/log.txt"
-        bucket, key = split_uri(uri)
+    bucket, key = split_uri(job_uri(entry.s3_prefix, ""))
+    prefix = key.rstrip("/") + "/"
+    ids: list[str] = []
+    token: str | None = None
+    while True:
+        request: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            request["ContinuationToken"] = token
         try:
-            s3.head_object(Bucket=bucket, Key=key)
+            response = s3.list_objects_v2(**request)
         except Exception as exc:  # botocore raises its own per-operation classes
-            unverified.append((job_id, f"no mirrored log at {uri} ({type(exc).__name__})"))
-            continue
-        verified.append(job_id)
-    return verified, unverified
+            raise CleanError(f"could not list the mirror at s3://{bucket}/{prefix}: {exc}") from exc
+        for item in response.get("Contents", []):
+            rest = str(item.get("Key", ""))[len(prefix) :]
+            job_id, _, name = rest.partition("/")
+            if name == "log.txt":
+                ids.append(job_id)
+        token = response.get("NextContinuationToken")
+        if not response.get("IsTruncated") or not token:
+            return sorted(ids)
 
 
 UV_CACHE_PRUNE = """\

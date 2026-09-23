@@ -203,7 +203,9 @@ def test_status_all_is_one_when_the_index_it_needs_cannot_be_read(
         def list_index(self) -> list[object]:
             raise S3IndexError("no credentials")
 
-    monkeypatch.setattr("gpuc.control.cli.S3Index.from_settings", lambda settings: _Unreadable())
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.from_settings", lambda settings: _Unreadable()
+    )
     assert main(["status", "--all"]) == EXIT_ERROR
     assert "could not read the S3 index" in capsys.readouterr().err
 
