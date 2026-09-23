@@ -9,19 +9,19 @@ from typing import Any
 
 import pytest
 
-from gpuc.control.config import Settings
-from gpuc.control.remote import HostSession
+from gpuc.control.config import HostEntry, Settings
+from gpuc.control.remote import HostConfigRead, HostSession
 from gpuc.control.s3index import LocalIndex, S3Index, spec_key
 from gpuc.control.submit import (
+    JobSpecModel,
     SubmitError,
     check_gpu_count,
     gather_secrets,
     load_document,
     prepare,
-    submit_file,
-    submit_spec,
     validate,
 )
+from gpuc.control.submit import submit_spec as submit_prepared
 from gpuc.control.transport import CommandResult
 from gpuc.host import jobs
 from tests.conftest import host_entry
@@ -74,7 +74,30 @@ def session(host: FakeHost) -> HostSession:
     entry = host_entry(
         name="gpubox", kind="ssh", ssh="me@box", gpus=["GPU-a"], python="/usr/bin/py"
     )
-    return HostSession(entry, host, REMOTE_HOME, "/usr/bin/py")
+    return HostSession(entry, host, REMOTE_HOME, "/usr/bin/py", HostConfigRead(entry.cache.config))
+
+
+def submit_spec(
+    entry: HostEntry,
+    model: JobSpecModel,
+    settings: Settings | None = None,
+    *,
+    workdir: Path,
+    session: HostSession,
+    environ: dict[str, str] | None = None,
+    s3: S3Index | None = None,
+    use_git: bool = True,
+    job_id: str | None = None,
+    report: Any = print,
+) -> Any:
+    """The old one-call shape, over the pipeline: prepare, then a session whose
+    fresh config is what the test entry says the host holds."""
+    prepared = prepare(model, workdir, job_id=job_id, environ=environ, use_git=use_git)
+    session.entry = entry
+    session.config_read = HostConfigRead(entry.cache.config)
+    return submit_prepared(
+        session, prepared, settings, workdir=workdir, report=report, use_git=use_git, s3=s3
+    )
 
 
 @pytest.fixture
@@ -210,7 +233,7 @@ def test_the_mirror_keeps_the_job_id_unexpanded_so_a_requeue_gets_its_own_namesp
     )
     mirrored = json.loads(client.objects[f"bkt/{spec_key(result.job_id)}"])
     assert mirrored["outputs"][0]["s3"] == "s3://b/exp/{job_id}/results"
-    assert (mirrored["job_id"], mirrored["attempt"]) == (result.job_id, 1)
+    assert (mirrored["job_id"], mirrored["requeued_from"]) == (result.job_id, None)
     shipped = json.loads(host.puts[f"{REMOTE_HOME}/incoming/{result.job_id}/spec.json"][0])
     assert shipped["outputs"][0]["s3"] == f"s3://b/exp/{result.job_id}/results"
 
@@ -453,7 +476,7 @@ def test_submit_enqueues_over_stdin_and_records_the_index(control_env: Path, rep
     assert f'PYTHONPATH="{REMOTE_HOME}/pkg"' in enqueue
     index = LocalIndex().get(result.job_id)
     assert index is not None
-    assert (index.host, index.name, index.attempt) == ("gpubox", "lego", 1)
+    assert (index.host, index.name, index.requeued_from) == ("gpubox", "lego", None)
     assert "s3_bucket is unset" in " ".join(result.notes)
 
 
@@ -479,24 +502,30 @@ def test_submit_mirrors_the_spec_to_s3_when_a_bucket_is_configured(
     assert index is not None and index.spec_uri == f"s3://bkt/{spec_key(result.job_id)}"
 
 
-def test_a_spec_already_mirrored_is_not_put_again(control_env: Path, repo: Path) -> None:
-    """`submit --runpod` mirrors the spec before it buys a pod and passes the
-    uri back in; the second PUT was the same object over the wire twice."""
-    client = FakeS3Client()
-    result = submit_spec(
-        host_entry(name="gpubox", gpus=["GPU-a"]),
-        validate(job_document()),
-        Settings(s3_bucket="bkt"),
-        workdir=repo,
-        session=session(FakeHost()),
-        environ={},
-        s3=S3Index("bkt", client),
-        spec_uri="s3://bkt/mirrored-earlier.json",
-        report=lambda _: None,
-    )
-    assert f"bkt/{spec_key(result.job_id)}" not in client.objects
-    index = LocalIndex().get(result.job_id)
-    assert index is not None and index.spec_uri == "s3://bkt/mirrored-earlier.json"
+def test_the_fit_is_judged_against_the_sessions_fresh_config_not_the_cache(
+    control_env: Path, repo: Path
+) -> None:
+    """The registry may remember four cards; the host's own config is what the
+    spec is judged against, and it is the one the session read."""
+    host = FakeHost()
+    live = session(host)
+    live.config_read = HostConfigRead({"host": "gpubox", "gpus": ["GPU-a"]})
+    prepared = prepare(validate(job_document(gpus=2)), repo, environ={})
+    with pytest.raises(SubmitError, match="host owns 1"):
+        submit_prepared(live, prepared, Settings(), workdir=repo, report=lambda _: None)
+    assert host.rsyncs == []
+
+
+def test_a_host_with_no_config_is_refused_before_anything_is_shipped(
+    control_env: Path, repo: Path
+) -> None:
+    host = FakeHost()
+    live = session(host)
+    live.config_read = HostConfigRead()
+    prepared = prepare(validate(job_document()), repo, environ={})
+    with pytest.raises(SubmitError, match=r"no config\.json"):
+        submit_prepared(live, prepared, Settings(), workdir=repo, report=lambda _: None)
+    assert host.rsyncs == []
 
 
 def test_a_job_bigger_than_the_host_is_refused_early(control_env: Path, repo: Path) -> None:
@@ -584,19 +613,21 @@ def test_submitting_from_a_non_repository_says_what_to_do(
         )
 
 
-def test_submit_file_reads_yaml(control_env: Path, repo: Path) -> None:
-    (repo / "job.yaml").write_text("name: t\ncommand: echo hi\ngpus: 1\n")
-    result = submit_file(
-        host_entry(name="gpubox", gpus=["GPU-a"]),
-        repo / "job.yaml",
-        Settings(),
-        workdir=repo,
-        session=session(FakeHost()),
-        environ={},
-        report=lambda _: None,
+def test_a_mirrored_spec_is_validated_like_a_job_file_with_unknown_keys_dropped() -> None:
+    """A mirrored spec was written by some build: a key this one does not know
+    is ignored, at the top and on an output, and everything else is judged."""
+    document = job_document(
+        job_id="20260101-000000-aaaaaa",
+        requeued_from=None,
+        future_key=1,
+        outputs=[{"path": "r", "s3": "s3://b/{job_id}", "future_output_key": True}],
     )
-    assert result.host == "gpubox"
-    assert result.attempt == 1
+    model = validate(document, tolerant=True)
+    assert model.outputs[0].s3 == "s3://b/{job_id}"
+    with pytest.raises(SubmitError, match="future_key"):
+        validate(document)
+    with pytest.raises(SubmitError, match="gpus"):
+        validate(job_document(gpus=0), tolerant=True)
 
 
 def test_the_gpu_count_of_a_pod_to_be_is_checked_before_it_is_bought() -> None:
@@ -626,11 +657,12 @@ def test_prepare_expands_the_job_id_and_gathers_the_secrets_in_one_call(repo: Pa
         ),
         repo,
         job_id="j-fixed",
-        attempt=3,
+        requeued_from="j-old",
         environ={"HF_TOKEN": "hf_secret"},
     )
     assert prepared.spec.job_id == "j-fixed"
-    assert prepared.spec.attempt == 3
+    assert prepared.requeued_from == "j-old"
+    assert prepared.mirrored()["requeued_from"] == "j-old"
     assert prepared.spec.outputs[0].s3 == "s3://b/j-fixed"
     assert prepared.secrets_body == "HF_TOKEN=hf_secret\n"
 

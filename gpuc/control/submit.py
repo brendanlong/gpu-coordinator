@@ -1,9 +1,11 @@
 """`gpuc submit`: validate a spec, ship the code and secrets, enqueue on a host.
 
 Order matters. Everything that can fail cheaply (spec validation, missing
-secrets in the submitter's environment) fails before we touch the host, and
-the job is built under `incoming/` and accepted by one rename, so it is only
-dispatchable once its workdir, secrets and spec are all in place.
+secrets in the submitter's environment, `{job_id}` expansion) fails in
+`prepare`, before any host is touched; `submit_spec` then judges the prepared
+job against the host's own config, builds it under `incoming/`, and has the
+host accept it by one rename, so it is only dispatchable once its workdir,
+secrets and spec are all in place.
 """
 
 from __future__ import annotations
@@ -20,26 +22,19 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from gpuc.control.config import HostEntry, Reporter, Settings, utc_now
-from gpuc.control.remote import HostSession, open_session
-from gpuc.control.s3index import (
-    IndexEntry,
-    LocalIndex,
-    S3Index,
-    S3IndexError,
-    default_s3_prefix,
-)
+from gpuc.control.config import Reporter, Settings, default_s3_prefix, utc_now
+from gpuc.control.remote import HostSession
+from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
 from gpuc.control.status import placement_unknown
 from gpuc.control.transport import (
     NO_GIT_EXCLUDES,
-    Transport,
     TransportError,
     git_summary,
     git_tracked_files,
     uncommitted_patch,
 )
 from gpuc.host import jobs, plan, progress
-from gpuc.host.jobs import JobSpec
+from gpuc.host.jobs import HostConfig, JobSpec
 
 
 class SubmitError(RuntimeError):
@@ -58,6 +53,15 @@ class OutputModel(BaseModel):
 
 
 class JobSpecModel(BaseModel):
+    """The job spec as the submitter writes it: every key checked, none extra.
+
+    `extra="forbid"` because a job file is typed by a person and an unknown key
+    is a typo (`max_runtime_mins`) that would otherwise silently do nothing.
+    A mirrored spec is read through the same model with unknown keys dropped
+    first (`validate(tolerant=True)`): it was written by some build, and a key
+    this build does not know is not a mistake.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     command: str
@@ -97,10 +101,9 @@ class JobSpecModel(BaseModel):
             raise ValueError("command must not be empty")
         return value
 
-    def to_spec(self, job_id: str, attempt: int = 1) -> JobSpec:
+    def to_spec(self, job_id: str) -> JobSpec:
         document = self.model_dump()
         document["job_id"] = job_id
-        document["attempt"] = attempt
         return JobSpec.from_dict(document)
 
 
@@ -125,7 +128,13 @@ def load_document(source: str | Path) -> dict[str, Any]:
     return document
 
 
-def validate(document: Mapping[str, Any], origin: str = "job spec") -> JobSpecModel:
+def validate(
+    document: Mapping[str, Any], origin: str = "job spec", *, tolerant: bool = False
+) -> JobSpecModel:
+    """The one validation of a spec. `tolerant` drops the keys this build does
+    not know before judging the rest, for a document another build wrote."""
+    if tolerant:
+        document = _known_keys(document)
     try:
         return JobSpecModel.model_validate(dict(document))
     except ValidationError as exc:
@@ -140,17 +149,29 @@ def validate(document: Mapping[str, Any], origin: str = "job spec") -> JobSpecMo
         raise SubmitError(f"{origin} is not a valid job:\n{problems}") from exc
 
 
+def _known_keys(document: Mapping[str, Any]) -> dict[str, Any]:
+    known = {k: v for k, v in document.items() if k in JobSpecModel.model_fields}
+    outputs = known.get("outputs")
+    if isinstance(outputs, list):
+        known["outputs"] = [
+            {k: v for k, v in o.items() if k in OutputModel.model_fields}
+            if isinstance(o, dict)
+            else o
+            for o in outputs
+        ]
+    return known
+
+
 def expand_job_id(spec: JobSpec) -> JobSpec:
     """Fill `{job_id}` into the output destinations, and refuse any that would
     not carry the id.
 
     Every output location includes the job id, so runs never overwrite each
     other. The expanded string is what is judged, not the template: a
-    destination with a literal id pasted in passes when it is this job's, and
-    a mirrored spec an older build wrote with the *previous* run's id in it is
-    refused at requeue rather than pointed at that run's outputs. A Hugging
-    Face location is the repo plus the path in it, so the id may sit in either;
-    an `hf` output with no `hf_path` uploads under the id itself.
+    destination with a literal id pasted in passes when it is this job's and
+    is refused when it is another run's. A Hugging Face location is the repo
+    plus the path in it, so the id may sit in either; an `hf` output with no
+    `hf_path` uploads under the id itself.
     """
     for output in spec.outputs:
         output.s3 = _expand(output, "s3", output.s3, spec.job_id)
@@ -190,28 +211,6 @@ def _no_job_id(output: jobs.Output, key: str, destination: str, job_id: str) -> 
     )
 
 
-def from_mirror(document: dict[str, Any]) -> dict[str, Any]:
-    """A mirrored spec as `requeue` submits it: the keys this build knows.
-
-    The mirror holds what some build wrote. The id and attempt are this run's
-    to assign, and a key this build does not know, at the top or on an output,
-    is not a typo. What is *not* forgiven is a destination carrying an earlier
-    run's literal id (builds before the mirror held the template wrote those):
-    `expand_job_id` refuses it, because the alternative is a new job writing
-    over an old one's outputs.
-    """
-    known = {k: v for k, v in document.items() if k in JobSpecModel.model_fields}
-    outputs = known.get("outputs")
-    if isinstance(outputs, list):
-        known["outputs"] = [
-            {k: v for k, v in o.items() if k in OutputModel.model_fields}
-            if isinstance(o, dict)
-            else o
-            for o in outputs
-        ]
-    return known
-
-
 def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -> str:
     environ = environ if environ is not None else os.environ
     missing = [name for name in names if not environ.get(name)]
@@ -236,9 +235,20 @@ def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -
 class Prepared:
     """A spec checked for everything a submit can fail on without a host."""
 
+    model: JobSpecModel
     spec: JobSpec
+    """The job as the host will run it: `{job_id}` expanded."""
     secrets_body: str
+    requeued_from: str | None = None
     warnings: list[str] = field(default_factory=list)
+
+    def mirrored(self) -> dict[str, Any]:
+        """The spec as the mirror holds it: `{job_id}` unexpanded, so a requeue
+        lands in its own namespace rather than the one this run wrote into."""
+        return {
+            **self.model.to_spec(self.spec.job_id).to_dict(),
+            "requeued_from": self.requeued_from,
+        }
 
 
 def prepare(
@@ -246,7 +256,7 @@ def prepare(
     workdir: Path,
     *,
     job_id: str | None = None,
-    attempt: int = 1,
+    requeued_from: str | None = None,
     environ: Mapping[str, str] | None = None,
     use_git: bool = True,
 ) -> Prepared:
@@ -256,7 +266,7 @@ def prepare(
     secret or a non-git workdir found here costs nothing, where the same
     failure discovered by a pod that is already billing costs a pod.
     """
-    spec = expand_job_id(model.to_spec(job_id or jobs.new_job_id(), attempt))
+    spec = expand_job_id(model.to_spec(job_id or jobs.new_job_id()))
     secrets_body = gather_secrets(spec.secrets, environ)
     if use_git:
         try:
@@ -264,7 +274,7 @@ def prepare(
         except TransportError as exc:
             raise _not_a_repo(workdir, exc) from exc
     warnings = [*preexisting_output_warnings(spec, workdir), *timeout_warnings(spec)]
-    return Prepared(spec, secrets_body, warnings)
+    return Prepared(model, spec, secrets_body, requeued_from, warnings)
 
 
 def check_gpu_count(model: JobSpecModel, gpu_count: int | None) -> None:
@@ -304,7 +314,7 @@ def git_source(workdir: Path) -> dict[str, str]:
 class SubmitResult:
     job_id: str
     host: str
-    attempt: int
+    requeued_from: str | None = None
     notes: list[str] = field(default_factory=list)
     session: HostSession | None = field(default=None, repr=False)
     """The connection the enqueue was made over, kept so that looking up where
@@ -315,15 +325,20 @@ class SubmitResult:
     so a caller that never looks still emits the document's promised keys as
     nulls rather than leaving them out."""
 
-    def render(self, queue_note: str | None = None) -> str:
-        lines = [f"job {self.job_id} queued on host {self.host} (attempt {self.attempt})"]
+    def render(self, queue_note: str | None = None, workdir: Path | None = None) -> str:
+        lines = [f"job {self.job_id} queued on host {self.host}"]
         lines += [f"  note: {note}" for note in self.notes]
         if queue_note:
             lines.append(queue_note)
+        if self.requeued_from is not None:
+            lines.append(
+                f"  requeued from {self.requeued_from}; workdir re-synced from "
+                f"{workdir or Path.cwd()}"
+            )
         lines.append(f"  logs: gpuc logs {self.job_id} -f")
         return "\n".join(lines)
 
-    def document(self, *, requeued_from: str | None = None) -> dict[str, Any]:
+    def document(self) -> dict[str, Any]:
         """`gpuc submit --json` and `gpuc requeue --json`.
 
         `notes` are the things the text output prints as `note:` -- a spec that
@@ -335,8 +350,7 @@ class SubmitResult:
         return {
             "job_id": self.job_id,
             "host": self.host,
-            "attempt": self.attempt,
-            "requeued_from": requeued_from,
+            "requeued_from": self.requeued_from,
             "notes": list(self.notes),
             **self.placement,
         }
@@ -439,21 +453,23 @@ def _push_without_git(
     )
 
 
-def enqueue_spec(session: HostSession, spec: JobSpec) -> dict[str, Any]:
+def enqueue_spec(session: HostSession, prepared: Prepared) -> dict[str, Any]:
     """Put the spec in the staged job dir and ask the host to accept it.
 
     `enqueue` rewrites the spec normalised, writes the initial state beside
     it, and renames the whole dir into `jobs/`; it also starts the dispatcher.
     """
+    spec = prepared.spec
     staged = f"{session.staging_dir(spec.job_id)}/spec.json"
-    session.transport.put_file(json.dumps(spec.to_dict(), indent=2) + "\n", staged, 0o644)
+    document = {**spec.to_dict(), "requeued_from": prepared.requeued_from}
+    session.transport.put_file(json.dumps(document, indent=2) + "\n", staged, 0o644)
     response = session.host_json(f"enqueue {shlex.quote(staged)}")
     if not isinstance(response, dict):
         raise SubmitError(f"unexpected enqueue response from {session.entry.name}: {response!r}")
     return response
 
 
-def wont_fit(spec: JobSpec, entry: HostEntry) -> str | None:
+def wont_fit(spec: JobSpec, config: HostConfig, host: str) -> str | None:
     """Why this host could never run this job, or None if it could.
 
     The dispatcher's own rule (`plan.capacity_failure`), run here against the
@@ -461,7 +477,6 @@ def wont_fit(spec: JobSpec, entry: HostEntry) -> str | None:
     before the code is shipped rather than as a failed job -- with the way
     out added, since this is the moment somebody is looking.
     """
-    config = entry.config
     failure = plan.capacity_failure(
         spec.gpus,
         len(config.gpus),
@@ -476,36 +491,39 @@ def wont_fit(spec: JobSpec, entry: HostEntry) -> str | None:
             "Add `use_shared: true` to the spec to let it wait for the shared cards, "
             "or lower `gpus:`."
         )
-    return f"host {entry.name} cannot run this job: it {failure}.\n{fix}"
+    return f"host {host} cannot run this job: it {failure}.\n{fix}"
 
 
 def submit_spec(
-    entry: HostEntry,
-    spec_model: JobSpecModel,
+    session: HostSession,
+    prepared: Prepared,
     settings: Settings | None = None,
     *,
     workdir: Path | None = None,
-    transport: Transport | None = None,
-    session: HostSession | None = None,
-    environ: Mapping[str, str] | None = None,
-    attempt: int = 1,
-    job_id: str | None = None,
-    s3: S3Index | None = None,
-    spec_uri: str | None = None,
-    use_git: bool = True,
     report: Reporter = print,
-    prepared: Prepared | None = None,
+    use_git: bool = True,
+    s3: S3Index | None = None,
 ) -> SubmitResult:
+    """Judge the prepared job against the host, stage it, enqueue it, record it.
+
+    The fit check reads the config the session opened with -- the host's own
+    answer, a moment old -- so a host whose cards were reassigned since the
+    registry last saw it refuses here rather than failing the job at dispatch.
+    The spec is mirrored once, after the host has accepted it, and the index
+    entry (local, then mirrored) is what every later command finds the job by.
+    """
     settings = settings or Settings()
     workdir = workdir or Path.cwd()
+    entry = session.entry
+    spec = prepared.spec
     notes: list[str] = []
 
-    if prepared is None:
-        prepared = prepare(
-            spec_model, workdir, job_id=job_id, attempt=attempt, environ=environ, use_git=use_git
+    if session.config_read.missing:
+        raise SubmitError(
+            f"host {entry.name} has no config.json, so nothing says which cards it owns.\n"
+            f"Run: gpuc host bootstrap {entry.name}"
         )
-    spec, secrets_body = prepared.spec, prepared.secrets_body
-    too_big = wont_fit(spec, entry)
+    too_big = wont_fit(spec, session.config, entry.name)
     if too_big:
         raise SubmitError(too_big)
 
@@ -513,38 +531,36 @@ def submit_spec(
         report(f"WARNING: {warning}")
         notes.append(warning)
 
-    session = session or open_session(entry, settings, transport)
     push_workdir(session, spec.job_id, workdir, use_git=use_git, report=report)
     report(f"synced to {session.staging_dir(spec.job_id)}/workdir")
 
-    if secrets_body:
-        session.transport.put_file(secrets_body, f"{session.home}/secrets/{spec.job_id}.env", 0o600)
+    if prepared.secrets_body:
+        session.transport.put_file(
+            prepared.secrets_body, f"{session.home}/secrets/{spec.job_id}.env", 0o600
+        )
         report(f"delivered {len(spec.secrets)} secret(s) as {spec.job_id}.env (0600)")
 
+    response = enqueue_spec(session, prepared)
+
     s3 = s3 if s3 is not None else S3Index.from_settings(settings)
+    spec_uri: str | None = None
     if s3 is None:
         notes.append(
             "s3_bucket is unset, so the spec was not mirrored and `gpuc requeue` "
             "will need --host with the workdir present locally"
         )
-    elif spec_uri is None:
-        # `submit --runpod` mirrors the spec *before* it buys a pod, and passes
-        # the uri back in; the same object twice is a wasted round trip. The
-        # mirror holds `{job_id}` unexpanded, so a requeue gets its own
-        # namespace rather than the one this run wrote into.
+    else:
         try:
-            spec_uri = s3.put_spec(spec_model.to_spec(spec.job_id, attempt))
+            spec_uri = s3.put_spec_document(spec.job_id, prepared.mirrored())
         except S3IndexError as exc:
             notes.append(f"could not mirror the spec to S3: {exc}")
-
-    response = enqueue_spec(session, spec)
     index_entry = IndexEntry(
         job_id=spec.job_id,
         host=entry.name,
         name=spec.name,
-        attempt=attempt,
+        requeued_from=prepared.requeued_from,
         submitted_at=utc_now(),
-        s3_prefix=entry.s3_prefix or default_s3_prefix(settings, entry.name),
+        s3_prefix=session.config.s3_prefix or default_s3_prefix(settings, entry.name),
         spec_uri=spec_uri,
     )
     LocalIndex().record(index_entry)
@@ -559,7 +575,11 @@ def submit_spec(
         )
 
     return SubmitResult(
-        job_id=spec.job_id, host=entry.name, attempt=attempt, notes=notes, session=session
+        job_id=spec.job_id,
+        host=entry.name,
+        requeued_from=prepared.requeued_from,
+        notes=notes,
+        session=session,
     )
 
 
@@ -571,14 +591,3 @@ def with_overrides(document: Mapping[str, Any], **overrides: Any) -> dict[str, A
     would have been.
     """
     return {**document, **{key: value for key, value in overrides.items() if value is not None}}
-
-
-def submit_file(
-    entry: HostEntry,
-    job_file: str | Path,
-    settings: Settings | None = None,
-    overrides: Mapping[str, Any] | None = None,
-    **kwargs: Any,
-) -> SubmitResult:
-    document = with_overrides(load_document(job_file), **dict(overrides or {}))
-    return submit_spec(entry, validate(document, str(job_file)), settings, **kwargs)
