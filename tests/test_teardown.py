@@ -306,6 +306,38 @@ def test_a_provider_that_will_not_answer_does_not_read_as_gone(
     assert "gpuc-e2e-aaa" in load_registry().hosts
 
 
+def test_a_provider_read_that_fails_does_not_read_as_a_dead_pod(
+    control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host says it is busy and the provider's first answer is a 503:
+    that is a live pod nobody could describe, not a dead one, and without
+    `--force` it is refused like any other busy host."""
+    register()
+    answering(
+        monkeypatch,
+        host_payload(
+            jobs=[{"job_id": "j-running", "name": "train", "status": "running", "phase": "main"}]
+        ),
+    )
+    real = provider.get
+    reads: list[str] = []
+
+    def flaky(pod_id: str) -> Any:
+        reads.append(pod_id)
+        if len(reads) == 1:
+            raise ProviderError("HTTP 503 from runpod")
+        return real(pod_id)
+
+    monkeypatch.setattr(provider, "get", flaky)
+
+    with pytest.raises(teardown.TerminateRefused) as error:
+        terminate(provider, "gpuc-e2e-aaa")
+
+    assert "train (j-running)" in str(error.value)
+    assert provider.terminated == []
+    assert "gpuc-e2e-aaa" in load_registry().hosts
+
+
 def test_a_terminate_the_provider_will_not_confirm_keeps_the_host_visible(
     control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:

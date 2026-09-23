@@ -81,6 +81,9 @@ class Termination:
     unasked: str | None = None
     """Why it did not answer, when it was asked and did not. None under
     `--force`, which does not ask."""
+    pod_dead: bool = False
+    """The provider itself said the pod is dead or gone, so nothing on it can
+    be running. Not the same as a pod it could not describe."""
     running: list[str] = field(default_factory=list)
     queued: list[str] = field(default_factory=list)
     outputs_pending: list[str] = field(default_factory=list)
@@ -170,6 +173,7 @@ def inspect(target: Target, settings: Settings, provider: Provider) -> Terminati
     if view.pod_gone or view.pod_dead:
         # No ssh was attempted and none would have answered. What became of the
         # pod is the whole answer, and the caller has it in `target.pod`.
+        result.pod_dead = True
         return result
     if not view.reachable:
         result.unasked = (
@@ -241,14 +245,17 @@ def terminate(
 
     A pod the provider already calls dead is never refused over. There is no
     live container to be running anything, and holding the one command that
-    frees the rental behind a flag would be protecting nothing.
+    frees the rental behind a flag would be protecting nothing. That takes
+    the provider *saying* so: a provider read that failed leaves no pod to
+    look at, which `is_dead` would also call dead, and a busy host would be
+    ended over a 503.
     """
     resolved = resolve(target, registry, provider)
     if force:
         result = Termination(target=resolved)
     else:
         result = inspect(resolved, settings, provider)
-        if not provider.is_dead(resolved.pod) and (result.busy or not result.checked):
+        if not result.pod_dead and (result.busy or not result.checked):
             raise TerminateRefused(refusal(result))
     if resolved.pod is None:
         # What is being billed, for the result to report -- and whether there
