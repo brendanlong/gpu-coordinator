@@ -228,6 +228,26 @@ def test_status_resolves_the_owned_gpus(
     assert status["gpus_unavailable"] == ["9"]
 
 
+def test_status_does_not_flag_a_queued_job_as_holding_outputs(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The checkout may well have files where the outputs go; until the job
+    has run there is nothing of its own to lose, and once an attempt has run
+    there may be."""
+    job_id = queue.enqueue(make_spec(outputs=[{"path": "results", "s3": "s3://b/{job_id}"}]))
+    (paths.workdir(job_id) / "results").mkdir(parents=True)
+    (paths.workdir(job_id) / "results" / "from-the-checkout.md").write_text("old\n")
+
+    _, status = run(capsys, "status", job_id)
+    assert isinstance(status, dict)
+    assert status["jobs"][0]["outputs_pending"] is False
+
+    jobs.update_state(job_id, ran=True)
+    _, status = run(capsys, "status", job_id)
+    assert isinstance(status, dict)
+    assert status["jobs"][0]["outputs_pending"] is True
+
+
 def test_status_reports_a_queued_jobs_estimate(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

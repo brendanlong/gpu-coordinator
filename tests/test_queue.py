@@ -254,7 +254,7 @@ def test_preempt_can_lower_the_priority_it_comes_back_at(gpuc_home: Path) -> Non
     job_id = running_job(priority=50)
     queue.preempt(job_id, priority=80)
     assert jobs.read_state(job_id).priority == 80
-    assert queue.next_attempt(job_id) == 2
+    assert queue.next_attempt(job_id, ran=True) == 2
     assert queue.QueueEntry(80, job_id) in queue.list_queued()
 
 
@@ -357,7 +357,7 @@ def test_next_attempt_starts_the_job_over_from_running(gpuc_home: Path) -> None:
     waiting_job()
     job_id = running_job(priority=20, estimated_runtime_min=45.0)
     queue.preempt(job_id)
-    assert queue.next_attempt(job_id) == 2
+    assert queue.next_attempt(job_id, ran=True) == 2
 
     state = jobs.read_state(job_id)
     assert (state.status, state.attempt) == ("queued", 2)
@@ -372,16 +372,33 @@ def test_next_attempt_starts_the_job_over_from_running(gpuc_home: Path) -> None:
     assert "queued again as attempt 2" in paths.log_file(job_id).read_text()
 
 
+def test_a_queued_again_job_remembers_that_an_earlier_attempt_ran(gpuc_home: Path) -> None:
+    """`ran` is the one fact about the stopped attempts a queued job keeps:
+    their outputs are still in the workdir, and a later attempt stopped
+    before `main` must not make them read as never produced."""
+    waiting_job()
+    job_id = running_job()
+    assert jobs.read_state(job_id).ran is False
+    queue.preempt(job_id)
+    assert queue.next_attempt(job_id, ran=True) == 2
+    assert jobs.read_state(job_id).ran is True
+
+    jobs.update_state(job_id, status="running")
+    queue.preempt(job_id)
+    assert queue.next_attempt(job_id, ran=False) == 3
+    assert jobs.read_state(job_id).ran is True
+
+
 def test_a_job_that_is_already_back_in_the_queue_is_not_queued_twice(gpuc_home: Path) -> None:
     """A stale intent on a queued job must not bump the attempt again and
     rewrite a job that is already waiting its turn."""
     waiting_job()
     job_id = running_job()
     queue.preempt(job_id)
-    assert queue.next_attempt(job_id) == 2
+    assert queue.next_attempt(job_id, ran=True) == 2
 
     jobs.update_state(job_id, intent=jobs.PREEMPT)
-    assert queue.next_attempt(job_id) is None
+    assert queue.next_attempt(job_id, ran=True) is None
     assert jobs.read_state(job_id).attempt == 2
 
 
@@ -394,7 +411,7 @@ def test_a_job_cancelled_while_it_was_stopping_does_not_come_back(gpuc_home: Pat
     queue.preempt(job_id)
     assert queue.cancel(job_id) == "cancelling"
     assert queue.stop_requested(job_id) == "cancelled"
-    assert queue.next_attempt(job_id) is None
+    assert queue.next_attempt(job_id, ran=True) is None
     assert jobs.read_state(job_id).status == "running"
     assert [e.job_id for e in queue.list_queued()] == [waiting]
 
@@ -407,5 +424,5 @@ def test_only_a_running_job_under_a_preempt_intent_gets_a_next_attempt(
     as it is."""
     job_id = running_job()
     jobs.update_state(job_id, status=status)
-    assert queue.next_attempt(job_id) is None
+    assert queue.next_attempt(job_id, ran=True) is None
     assert (jobs.read_state(job_id).status, jobs.read_state(job_id).attempt) == (status, 1)

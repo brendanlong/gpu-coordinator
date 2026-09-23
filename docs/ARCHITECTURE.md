@@ -126,7 +126,8 @@ jobs/<jobid>/
                      #  "phase": setup|preflight|main|sync,    # `sync` lasts until the write that
                      #                                        # ends the attempt
                      #  "pgid": int|null,                      # the *job's* group, published by the
-                     #                                        # runner when it spawns a phase
+                     #                                        # runner when it spawns a phase and
+                     #                                        # cleared when the phase ends
                      #  "isolation": "cgroup"|"pgid", "cgroup_unit": str|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null,          # the runner, from its own claim
@@ -139,7 +140,10 @@ jobs/<jobid>/
                      #  "workdir_bytes": int|null,  # what removing workdir/ would free;
                      #                              # measured once, as the job ended (or by
                      #                              # the first status to find it missing)
-                     #  "outputs_lost": bool}       # a drain retried the outputs and gave up
+                     #  "outputs_lost": bool,       # a drain retried the outputs and gave up
+                     #  "ran": bool}                # has `main` started, in any attempt; false
+                     #                              # from enqueue, set as `main` begins, never
+                     #                              # cleared
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and must not be read as 0%. eta is null unless the job is running.
                      # progress_pct survives the job.
@@ -391,7 +395,10 @@ The order is the contract; each step is in `runner.py`.
    counts. A failed one makes a succeeded job `failed: sync`, and an output
    path that was never written makes it `failed: no-outputs`; a job already
    over for a reason of its own keeps that `reason` and lists the upload
-   failure under `problems`. The `Outcome` is now decided.
+   failure under `problems`. All of this only for a job whose `main`
+   started (`Outcome.ran`, recorded as the state's `ran`): one that failed
+   or was stopped before it has no result to upload, skips the final upload
+   and is never `no-outputs`. The `Outcome` is now decided.
 7. Apply `spec.cleanup` to `workdir/` through `cleanup.may_delete`, asked with
    the status about to be written -- `outputs:` paths resolve inside the
    workdir, so this is after the final sync and never before, and a job on
@@ -457,8 +464,9 @@ runner's kill, the dispatcher's escalation and the adoption of a dead runner's
 leftovers all call it rather than deciding for themselves what to signal. The
 kill path is `systemctl --user stop <unit>`, with the process-group kill kept
 as a fallback, and the job's group is only ever the one the runner published
-for the phase now running; the runner's own group is never recorded as the
-job's. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are in `state.json`
+for the phase now running -- cleared, with the unit, the moment the phase
+ends, so nothing is ever signalled at a number the kernel may have reissued;
+the runner's own group is never recorded as the job's. `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are in `state.json`
 and `gpuc status --json`. The mode is decided once per process
 (`scope.isolation()`: what `GPUC_ISOLATION` announces, else one probe) and the
 dispatcher announces its answer to every child, so dispatcher, runners and
@@ -492,9 +500,10 @@ policy, the two horizons and every refusal are
   state)`, the reason a job's outputs are only on this host or None. It is
   what the drain retries, what keeps a job's secrets file for that drain,
   what `purge` and the automatic sweep refuse over, and what `status` flags.
-  Nothing is pending for a job with no `outputs:`, with every destination's
-  last upload recorded, with its workdir gone, or with nothing ever written
-  under the declared paths; anything unreadable counts as content.
+  Nothing is pending for a job with no `outputs:`, whose `main` never
+  started in any attempt (`ran`), with every destination's last upload
+  recorded, with its workdir gone, or with nothing ever written under the
+  declared paths; anything else unreadable counts as content.
 - `python -m gpuc.host clean (--all-finished | --older-than DAYS | --only IDS)
   [--dry-run]` and `purge [--older-than DAYS] [--only IDS] [--verified IDS]
   [--dry-run] [--force]` print JSON and **fail closed**: a running or queued

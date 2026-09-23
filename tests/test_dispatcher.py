@@ -61,7 +61,7 @@ class FakeRunnerProcess:
     def requeue(self) -> None:
         """A preempted runner's last write: `queued` at the next attempt."""
         self.returncode = runner.TERMINATED_EXIT_CODE
-        assert queue.next_attempt(self.job_id) is not None
+        assert queue.next_attempt(self.job_id, ran=True) is not None
 
 
 class FakeClock:
@@ -1072,7 +1072,7 @@ def test_the_workdir_horizon_leaves_outputs_that_never_reached_the_mirror(
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
     job_id = queue.enqueue(spec)
     ended = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-    jobs.update_state(job_id, status="failed", ended_at=ended)
+    jobs.update_state(job_id, status="failed", ended_at=ended, ran=True)
     results = paths.workdir(job_id) / "results"
     results.mkdir(parents=True, exist_ok=True)
     (results / "checkpoint.pt").write_bytes(b"w" * 4096)
@@ -1167,7 +1167,7 @@ def test_retention_never_touches_a_running_job(gpuc_home: Path) -> None:
 def job_with_pending_outputs() -> str:
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
     job_id = queue.enqueue(spec)
-    jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now())
+    jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now(), ran=True)
     (paths.workdir(job_id) / "results").mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "results" / "a.txt").write_text("hi\n")
     return job_id
@@ -1564,7 +1564,7 @@ def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     queue.enqueue(make_spec(priority=1))  # what the preempt is making room for
     jobs.update_state(job_id, status="running", ended_at=None)
     queue.preempt(job_id)
-    assert queue.next_attempt(job_id) == 2
+    assert queue.next_attempt(job_id, ran=True) == 2
 
     dispatcher, _ = make_dispatcher()
     assert dispatcher.unconfirmed_output_jobs() == [job_id]

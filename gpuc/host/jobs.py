@@ -499,6 +499,15 @@ class JobState:
     failed, so an ephemeral host is about to take the only copy with it. The
     record's `error` holds the last failure. Surfaced by `status` because
     nothing fixes it afterwards except re-running the job."""
+    ran: bool = True
+    """Whether `main` has started, in this attempt or an earlier one: false
+    from enqueue, recorded by the runner as `main` begins, kept by the write
+    that ends an attempt and by the one that queues it again. Only a job
+    that got that far can have written anything under `outputs:`, so nothing
+    of a job that never did is pending, and its secrets are not kept for a
+    drain that would upload nothing. True when a state file does not say
+    (`from_dict`), and on a bare `JobState`: the point of asking is to keep
+    the only copy of a result, so not knowing counts as having run."""
 
     @staticmethod
     def from_dict(d: Any) -> JobState:
@@ -543,6 +552,7 @@ class JobState:
             ],
             workdir_bytes=as_opt_int(fields, "workdir_bytes"),
             outputs_lost=as_bool(fields, "outputs_lost"),
+            ran=as_bool(fields, "ran", True),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -593,6 +603,7 @@ class JobState:
             status="queued",
             priority=spec.priority,
             estimated_runtime_min=spec.estimated_runtime_min,
+            ran=False,
         )
 
 
@@ -601,10 +612,12 @@ class Outcome:
     """How a job ended, in the one shape every terminal write takes.
 
     `reason` is one of the words usage.md's table lists, and `ran` says whether
-    the job's own phases got as far as running -- a card that is not here, a
-    sync preflight that refused, a spec the dispatcher could not read all end
-    a job that never wrote a byte, so its `outputs:` cannot exist and the
-    final upload and the no-outputs check are skipped rather than reported.
+    `main` started. Outputs are what `main` produces: a job that never got
+    there -- a card that is not here, a setup that failed, a sync preflight
+    that refused, a cancel before the first phase, a spec the dispatcher could
+    not read -- has no result to upload, so the final upload and the
+    no-outputs check are skipped rather than reported as a problem beside the
+    reason the job actually ended for.
     """
 
     status: str
@@ -641,6 +654,12 @@ def finish(
     former as the latter. An unreadable state raises, and the caller leaves the
     job alone: writing defaults over a file that cannot be read would replace
     its priority and upload records with guesses.
+
+    `ran` is never cleared, only set: the runner records it as `main`
+    begins, and an attempt that never reached `main` may be the second of a
+    job whose first did, with that attempt's outputs still in the workdir. A
+    dispatcher failing a job whose runner died after claiming it reports
+    `ran` rather than knowing, which is the fail-closed answer.
     """
     wanted = (expect,) if isinstance(expect, str) else expect
     with locked(job_id):
@@ -656,6 +675,7 @@ def finish(
         state.pgid = None
         state.cgroup_unit = None
         state.eta = None
+        state.ran = state.ran or outcome.ran
         if forget_output_uploads:
             state.forget_output_uploads()
         write_state(job_id, _apply(state, extra))

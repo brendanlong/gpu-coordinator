@@ -221,14 +221,16 @@ def is_preempted(job_id: str) -> bool:
         return False
 
 
-def next_attempt(job_id: str) -> int | None:
+def next_attempt(job_id: str, *, ran: bool) -> int | None:
     """Queue a preempted job again, as the runner's last act for the attempt
     it stopped, and say which attempt it is now.
 
     One write under the job's lock, fresh rather than patched: the job runs
     from the start, so the exit code, the end time and the GPUs of the attempt
     that was stopped would all be lies about a queued job. What a queued job is
-    still ordered and described by survives -- the live priority and estimate.
+    still ordered and described by survives -- the live priority and estimate,
+    and whether any attempt has reached `main` (`ran`, which the stopped
+    attempt reports), since the outputs it produced are still in the workdir.
     The job goes straight from `running` to `queued`: nothing ever sees it
     finished in between, and no other process has to notice the intent.
 
@@ -248,6 +250,7 @@ def next_attempt(job_id: str) -> int | None:
                 attempt=attempt,
                 priority=state.priority,
                 estimated_runtime_min=state.estimated_runtime_min,
+                ran=state.ran or ran,
             ),
         )
     note(

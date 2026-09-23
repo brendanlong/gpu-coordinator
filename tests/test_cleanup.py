@@ -245,7 +245,7 @@ def job_with_outputs_still_only_here() -> str:
     results = paths.workdir(job_id) / "results"
     results.mkdir(parents=True, exist_ok=True)
     (results / "checkpoint.pt").write_bytes(b"w" * 8192)
-    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now())
+    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now(), ran=True)
     return job_id
 
 

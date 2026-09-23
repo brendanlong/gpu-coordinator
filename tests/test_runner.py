@@ -197,7 +197,7 @@ def test_a_runner_started_for_an_earlier_attempt_claims_nothing(gpuc_home: Path)
     queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
     jobs.update_state(job_id, status="running")
     queue.preempt(job_id)
-    assert queue.next_attempt(job_id) == 2
+    assert queue.next_attempt(job_id, ran=False) == 2
 
     assert run(job_id, attempt=1) == 0
     state = jobs.read_state(job_id)
@@ -412,6 +412,25 @@ def test_state_records_the_phase_and_pgid_while_running(gpuc_home: Path) -> None
     assert observed and observed[0][0] == "main"
 
 
+def test_the_pgid_goes_with_the_phase_that_owned_it(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pgid` names the phase now running and nothing else. Left set during
+    the final sync it named a finished group, and the dispatcher's ladder,
+    once its patience ran out, would SIGKILL whatever the kernel had reissued
+    that number to."""
+    during_sync: list[tuple[str | None, int | None, str | None]] = []
+
+    def observe(_self: sync.SyncLoop) -> None:
+        state = jobs.read_state(job_id)
+        during_sync.append((state.phase, state.pgid, state.cgroup_unit))
+
+    monkeypatch.setattr(sync.SyncLoop, "final", observe)
+    job_id = prepare(command="true")
+    assert run(job_id) == 0
+    assert during_sync == [("sync", None, None)]
+
+
 def test_runner_uses_the_s3_prefix_for_log_and_state(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -519,6 +538,39 @@ def test_a_job_cancelled_before_its_first_phase_never_runs_its_command(
     assert (state.status, state.reason, state.intent) == ("cancelled", "cancelled", None)
     assert not (paths.workdir(job_id) / "RAN").exists()
     assert "cancelled before phase=setup; not starting it" in log_of(job_id)
+
+
+def test_a_job_stopped_before_main_skips_the_final_sync_and_is_never_no_outputs(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel that lands before the first phase ends a job that produced
+    nothing: an `outputs:` path it never had the chance to write is not a
+    problem of the job's, and the state says its main never started."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+    uploads: list[list[str]] = []
+
+    def recording(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        uploads.append(argv)
+        return sync.CommandResult(argv, 0, "")
+
+    job_id = prepare(
+        command="touch RAN", outputs=[{"path": "never-written", "s3": "s3://bucket/{job_id}"}]
+    )
+    deps_ = deps(
+        smi=stopping_after_claim(job_id, queue.cancel),
+        command_runner=recording,
+        sync_preflight=False,
+    )
+    assert run(job_id, deps_) == runner.TERMINATED_EXIT_CODE
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.problems, state.ran) == (
+        "cancelled",
+        "cancelled",
+        [],
+        False,
+    )
+    assert uploads == []
+    assert "skipping the final output sync" in log_of(job_id)
 
 
 def test_a_job_preempted_before_its_first_phase_goes_back_without_running_it(
@@ -954,6 +1006,17 @@ def test_the_status_stays_running_until_the_mirror_has_been_written(
     assert (len(state_puts), len(log_puts)) == (2, 1)
 
 
+def preempt_in_main(job_id: str) -> None:
+    """Preempt the job once its `main` phase is running, from a thread, so
+    the attempt has something to stop and a final sync to run afterwards."""
+
+    def once_in_main() -> None:
+        _wait_until(lambda: jobs.read_state(job_id).phase == "main")
+        queue.preempt(job_id)
+
+    threading.Thread(target=once_in_main, daemon=True).start()
+
+
 def test_a_cancel_that_lands_while_a_preempt_is_stopping_wins(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -966,7 +1029,7 @@ def test_a_cancel_that_lands_while_a_preempt_is_stopping_wins(
         assert queue.cancel(job_id) == "cancelling"
 
     monkeypatch.setattr(sync.SyncLoop, "final", cancel_during_final_sync)
-    assert run(job_id, deps(smi=stopping_after_claim(job_id, queue.preempt))) != 0
+    assert run(job_id, deps(smi=stopping_after_claim(job_id, preempt_in_main))) != 0
     state = jobs.read_state(job_id)
     assert (state.status, state.reason, state.attempt, state.intent) == (
         "cancelled",
@@ -990,7 +1053,7 @@ def test_a_preempt_on_a_host_that_is_draining_ends_the_attempt_instead(
         paths.draining_file().write_text("idle\n")
 
     monkeypatch.setattr(sync.SyncLoop, "final", drain_during_final_sync)
-    assert run(job_id, deps(smi=stopping_after_claim(job_id, queue.preempt))) != 0
+    assert run(job_id, deps(smi=stopping_after_claim(job_id, preempt_in_main))) != 0
     state = jobs.read_state(job_id)
     assert (state.status, state.reason, state.attempt, state.intent) == (
         "failed",

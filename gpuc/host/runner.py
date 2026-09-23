@@ -182,6 +182,10 @@ class JobRunner:
         state when the estimate actually changed: `state.json` is a
         read-modify-write with the sync loop as a second writer, and an eta
         recomputed from the same estimate is the same instant anyway."""
+        self._main_started = False
+        """Whether `main` has begun, which is what `Outcome.ran` reports: the
+        final upload and the no-outputs check are for a job that produced
+        something, and only `main` does."""
         self._ending = False
         """Set once the attempt is on its way out: by the signal handler as it
         raises `_Terminated`, and by `_finalize` as it starts. A signal after
@@ -356,7 +360,10 @@ class JobRunner:
         self._current = proc
         code = self._monitor(proc, phase, log, job_start)
         self._current = None
-        jobs.update_state(self.job_id, cgroup_unit=None)
+        # Both, together: a group number outlives its processes, and a
+        # `pgid` left naming a finished phase is what the dispatcher's ladder
+        # would SIGKILL during the final sync, once somebody else had it.
+        jobs.update_state(self.job_id, pgid=None, cgroup_unit=None)
         self._current_unit = None
         self._log(log, f"phase={phase} exited {code}")
         return code
@@ -518,6 +525,8 @@ class JobRunner:
         if stopped is not None:
             return stopped
 
+        self._main_started = True
+        jobs.update_state(self.job_id, ran=True)
         sync_loop.start()
         code = self._run_phase("main", self.spec.command, env, log, job_start)
         return self._finalize(self._classify(code, None), sync_loop, log)
@@ -596,22 +605,26 @@ class JobRunner:
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
         requested = queue.stop_requested(self.job_id)
+        ran = self._main_started
         if requested == "cancelled":
-            outcome = Outcome("cancelled", "cancelled", TERMINATED_EXIT_CODE)
+            outcome = Outcome("cancelled", "cancelled", TERMINATED_EXIT_CODE, ran)
         elif requested == queue.PREEMPTED:
-            outcome = Outcome("failed", queue.PREEMPTED, TERMINATED_EXIT_CODE)
+            outcome = Outcome("failed", queue.PREEMPTED, TERMINATED_EXIT_CODE, ran)
         else:
-            outcome = Outcome("failed", "terminated", TERMINATED_EXIT_CODE)
+            outcome = Outcome("failed", "terminated", TERMINATED_EXIT_CODE, ran)
         return self._finalize(outcome, sync_loop, log)
 
     def _classify(self, code: int, failure_reason: str | None) -> Outcome:
+        """The outcome of the phase that just ended, or that a stop landed
+        before. `ran` is whether `main` started, whatever the phase."""
+        ran = self._main_started
         if self.kill_reason == "cancelled":
-            return Outcome("cancelled", "cancelled", code)
+            return Outcome("cancelled", "cancelled", code, ran)
         if self.kill_reason:
-            return Outcome("failed", self.kill_reason, code)
+            return Outcome("failed", self.kill_reason, code, ran)
         if code == 0:
-            return Outcome("succeeded", None, 0)
-        return Outcome("failed", failure_reason or f"exit {code}", code)
+            return Outcome("succeeded", None, 0, ran)
+        return Outcome("failed", failure_reason or f"exit {code}", code, ran)
 
     def _finalize(self, outcome: Outcome, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int:
         """End the attempt: final sync, workdir, mirror, the one write, secrets.
@@ -631,7 +644,7 @@ class JobRunner:
         jobs.update_state(self.job_id, phase="sync")
         problems: list[str] = []
         if not outcome.ran:
-            self._log(log, "skipping the final output sync: the job never ran")
+            self._log(log, "skipping the final output sync: the job's main phase never started")
         else:
             try:
                 sync_loop.final()
@@ -738,7 +751,7 @@ class JobRunner:
         the state was no longer `running` at all, which is nothing this
         process can repair and is logged rather than written over.
         """
-        if coming_back and queue.next_attempt(self.job_id) is not None:
+        if coming_back and queue.next_attempt(self.job_id, ran=outcome.ran) is not None:
             return "queued"
         if outcome.reason == queue.PREEMPTED and queue.stop_requested(self.job_id) == "cancelled":
             outcome = Outcome("cancelled", "cancelled", outcome.exit_code)

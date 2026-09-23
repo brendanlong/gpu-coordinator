@@ -728,16 +728,20 @@ def outputs_pending(job_id: str, spec: JobSpec, state: JobState) -> str | None:
     flag `status` shows. `outputs:` paths resolve *inside* `workdir/`, and a
     failed or cancelled job keeps its workdir by default, so a job that ended
     `failed: sync` can be holding the only copy of a checkpoint. Nothing is
-    pending when the spec declares no outputs, the upload records say every
-    destination has the last upload, the workdir is already gone (whatever it
-    held went with `cleanup:`, not with us), or nothing was ever written under
-    the declared paths -- declaring an output is not producing one, and a job
-    that died in its preflight, or whose output dir holds only files that came
-    with the checkout, produced nothing. Every way of not knowing counts as
-    content, an `outputs.path` that cannot even be resolved included, because
-    the point of asking is to avoid throwing away the only copy of a result.
+    pending when the spec declares no outputs, no attempt of the job ever
+    reached `main` (`state.ran`: outputs are what `main` produces, and a job
+    failed by the dispatcher, stopped before its first phase or refused by a
+    preflight has no result -- only a checkout, which may well have files
+    where the outputs go), the upload records say every destination has the
+    last upload, the workdir is already gone (whatever it held went with
+    `cleanup:`, not with us), or nothing was ever written under the declared
+    paths -- declaring an output is not producing one, and an output dir that
+    holds only files that came with the checkout is nothing produced. Every
+    other way of not knowing counts as content, an `outputs.path` that cannot
+    even be resolved included, because the point of asking is to avoid
+    throwing away the only copy of a result.
     """
-    if not spec.outputs or state.outputs_uploaded(spec):
+    if not spec.outputs or not state.ran or state.outputs_uploaded(spec):
         return None
     if not paths.workdir(job_id).is_dir():
         return None

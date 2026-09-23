@@ -33,11 +33,12 @@ def make_job(
     outputs_uploaded: bool = False,
     produced: bool = True,
     workdir: bool = True,
+    ran: bool = True,
 ) -> str:
     spec = make_spec(outputs=[output] if outputs else [])
     job_id = queue.enqueue(spec)
     ended = datetime.now(UTC) - timedelta(days=days_old)
-    fields: dict[str, Any] = {"status": status}
+    fields: dict[str, Any] = {"status": status, "ran": ran}
     if status in jobs.FINISHED_STATUSES:
         fields["ended_at"] = ended.isoformat()
     uploads: list[jobs.Upload] = []
@@ -164,6 +165,18 @@ def test_a_job_that_never_wrote_its_outputs_has_nothing_to_lose(gpuc_home: Path)
     result = cleanup.purge(older_than_days=7.0)
     assert [c.job_id for c in result.purged] == [job_id]
     assert not any(c.forced for c in result.purged)
+
+
+def test_a_job_whose_main_never_started_has_nothing_to_lose(gpuc_home: Path) -> None:
+    """The gpu-assert shape: failed before the outputs baseline was taken, in
+    a checkout that already has files where the outputs go. Without `ran`
+    every one of them reads as new content, the drain uploads the checkout as
+    results, and the job dir is kept for ever."""
+    job_id = make_job(status="failed", outputs=True, outputs_uploaded=False, ran=False)
+    assert not paths.outputs_baseline_file(job_id).exists()
+    assert pending(job_id) is None
+    result = cleanup.purge(older_than_days=7.0)
+    assert [c.job_id for c in result.purged] == [job_id]
 
 
 def test_an_output_dir_holding_only_the_checkout_is_not_a_lost_result(gpuc_home: Path) -> None:

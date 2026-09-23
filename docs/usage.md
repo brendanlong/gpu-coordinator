@@ -538,7 +538,7 @@ Every `failed: <reason>`:
 | `preempted` | `gpuc preempt`, or the job's own `auto_preempt`, stopped this attempt while the host was draining, so it was not queued again. Anywhere else a preempted job is `queued` again as its next attempt and never shows this |
 | `terminated` | the runner itself was signalled (and the job was not cancelled) |
 | `sync` | the final upload failed; the run itself may have been fine. A succeeded job becomes `failed: sync`; a job that was already over for a reason of its own keeps that reason and lists `sync` in its `problems` |
-| `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. A problem beside the reason, the same way |
+| `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout. A problem beside the reason, the same way. Never reported for a job whose `main` never started: it has no result, and its final upload is skipped |
 | `bad-spec` | the queued spec could not be read, or asks for no GPU |
 | `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued. On a host with [shared cards](#shared-gpus) it counts the ones this job asked for, and says so when it asked for none |
 | `spawn-failed` | the dispatcher could not start a runner process |
