@@ -15,34 +15,35 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from gpuc.control.config import HostEntry
+from gpuc.control.config import HostEntry, Rental
 from gpuc.control.providers.base import Offer, Pod
 
 
 def pod_record(address: HostEntry, offer: Offer, created_at: str) -> dict[str, Any]:
     """The `provider` block a pod is given: its own record of what it was bought as.
 
-    `kind` and `pod_id` were always here. What follows is what a machine that
+    `kind` and `pod_id` name the rental. What follows is what a machine that
     did not create this pod needs in order to judge it: the offer
     `pick_reusable_host` compares against, and when the pod was bought.
-    `bootstrapped_at` is added by bootstrap, once there is one.
     """
     return {
-        **(address.provider() or {}),
+        **(address.provider_block() or {}),
         "offer": offer.model_dump(mode="json"),
         "created_at": created_at,
     }
 
 
-def address_for(name: str, pod: Pod) -> HostEntry | None:
-    """How to reach this pod, and nothing about what it is. None: no door yet."""
+def address_for(name: str, pod: Pod, provider: str) -> HostEntry | None:
+    """How to reach this pod, and nothing about what it is. None: no door yet.
+    `provider` is the name of the one the pod came from (`Provider.name`),
+    which is what `actions.PROVIDERS` finds it by again."""
     if pod.ssh_direct is None:
         return None
     return HostEntry(
         name=name,
         ssh=f"{pod.ssh_direct.username}@{pod.ssh_direct.host}",
         port=pod.ssh_direct.port,
-        pod_id=pod.id,
+        rental=Rental(provider=provider, pod_id=pod.id),
     )
 
 

@@ -1,7 +1,11 @@
 """`gpuc submit` and `gpuc requeue`: what they do, for the CLI and the dashboard.
 
-Both return the `SubmitResult` with its placement filled in; rendering it as
-text or as the `--json` document stays with the caller.
+One pipeline for both, whichever way the host arrives: parse and prepare
+(everything that needs no host), rent or look up the host, open one session,
+ship this build if the host runs another, judge the fit against the host's
+own config, stage, enqueue, record. Both return the `SubmitResult` with its
+placement filled in; rendering it as text or as the `--json` document stays
+with the caller.
 """
 
 from __future__ import annotations
@@ -15,37 +19,33 @@ from gpuc.control.actions import (
     CliError,
     NotFound,
     UsageError,
-    find_job_host,
+    locate,
     make_provider,
-    named_registry,
+    mirror_is_the_answer,
     placement_after,
 )
-from gpuc.control.bootstrap import resync_package
-from gpuc.control.config import (
-    ConfigError,
-    HostEntry,
-    Reporter,
-    Settings,
-    registry_transaction,
-)
-from gpuc.control.providers.base import Cloud, Constraints
+from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build, host_build
+from gpuc.control.config import HostEntry, Reporter, Settings, open_registry
+from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
 from gpuc.control.provision import runpod_host
-from gpuc.control.remote import HostSession, RemoteError, open_session
-from gpuc.control.s3index import JobIndex, S3Index, S3IndexError, S3ObjectMissing
+from gpuc.control.remote import HostSession, open_session
+from gpuc.control.s3index import S3Index, S3ObjectMissing
 from gpuc.control.submit import (
-    JobSpecModel,
+    Prepared,
     SubmitResult,
     check_gpu_count,
-    from_mirror,
     load_document,
     prepare,
-    submit_file,
+    refuse_unreadable_config,
     submit_spec,
     validate,
     with_overrides,
 )
-from gpuc.control.transport import TransportError
 from gpuc.host import jobs
+
+DEFAULT_IDLE_MINUTES = 15.0
+"""How long a rental sits with an empty queue before it ends itself, unless
+`--idle-min` says otherwise."""
 
 
 @dataclass
@@ -56,14 +56,14 @@ class RentalOptions:
     min_vram_gb: int | None = None
     max_price_usd_hr: float | None = None
     clouds: list[Cloud] = field(default_factory=lambda: list[Cloud](["SECURE"]))
-    cuda_min: str | None = None
+    cuda_min: str = DEFAULT_CUDA_MIN
     gpu_count: int = 1
     reuse: bool = True
     name_hint: str = "job"
-    idle_minutes: float = 15.0
+    idle_minutes: float = DEFAULT_IDLE_MINUTES
     disk_gb: int | None = None
     image: str | None = None
-    health_args: str = ""
+    health: HealthOptions = DEFAULT_HEALTH
 
     def constraints(self) -> Constraints:
         if not self.gpu_names:
@@ -92,29 +92,8 @@ def rent_host(rental: RentalOptions, settings: Settings, report: Reporter) -> Ho
         idle_minutes=rental.idle_minutes,
         disk_gb=rental.disk_gb if rental.disk_gb is not None else settings.disk_gb,
         image=rental.image or settings.image,
-        health_args=rental.health_args,
+        health_options=rental.health,
     )
-
-
-def mirror_spec_first(
-    model: JobSpecModel, job_id: str, settings: Settings
-) -> tuple[str | None, list[str]]:
-    """Put the spec in S3 before spending any money, so a lost pod is still requeueable.
-
-    Returns the uri it landed at, so the submit that follows does not PUT the
-    same object a second time. `{job_id}` goes up unexpanded: the mirror is
-    what `requeue` submits, and that run must land in its own namespace.
-    """
-    s3 = S3Index.from_settings(settings)
-    if s3 is None:
-        return None, [
-            "s3_bucket is unset, so the spec was not mirrored before provisioning; "
-            "`gpuc requeue` will need the job file again"
-        ]
-    try:
-        return s3.put_spec(model.to_spec(job_id)), []
-    except S3IndexError as exc:
-        return None, [f"could not mirror the spec to S3 before provisioning: {exc}"]
 
 
 def check_placement(*, runpod: bool, host: str | None) -> None:
@@ -126,98 +105,67 @@ def check_placement(*, runpod: bool, host: str | None) -> None:
         )
 
 
-def ensure_package_current(
-    entry: HostEntry, settings: Settings, *, bootstrap: bool = True, report: Reporter = print
-) -> HostEntry:
-    """Read the host's config, and re-ship the package if it is not this build.
+def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Reporter) -> None:
+    """Re-ship the package when the host's own config names another build.
 
-    The host's `config.json` is the only copy of what the host is, so this read
-    is also what makes the rest of the submit true: the `gpus` the spec is
-    judged against and the `s3_prefix` the job's outputs are recorded under are
-    the host's own answer, from a moment ago, not whatever this machine last
-    wrote down.
-
-    The commit comes from the same file rather than from this registry, which
-    only ever recorded what this machine shipped: two control machines against
-    one box -- a laptop and a desktop -- each leave that record describing a
-    host the other has since re-bootstrapped, and every submit would then skip
-    the check it exists for. An *unrecorded* commit counts as older, because
-    the hosts with nothing recorded were bootstrapped by the oldest builds of all.
-
-    Only the package and the dispatcher are re-shipped: uv, the interpreter and
-    health cannot have gone stale, and the job is waiting.
+    The host's `config.json` is the only copy of what the host is, and the
+    session already holds it: the `pkg_commit` judged here is the same read
+    the `gpus` the spec is judged against comes from. A host that has never
+    been bootstrapped -- no config, or no commit in it -- is refused rather
+    than half-installed on the way past: re-shipping the package alone would
+    start a dispatcher on a host with no uv and no interpreter of its own, and
+    the first anyone would hear of it is the job failing there.
     """
     if not bootstrap:
-        return entry
-    if not (entry.bootstrapped_at or entry.pkg_commit):
-        # Nothing has ever installed gpuc on this host -- not this machine, and
-        # not whoever else would have left a commit in its config. Re-shipping
-        # the package alone would start a dispatcher on a host with no uv and
-        # no interpreter of its own, and the first anyone would hear of it is
-        # the job failing there.
+        return
+    refuse_unreadable_config(session)
+    if session.config_read.missing or host_build(session) is None:
         raise CliError(
-            f"host {entry.name} has no gpuc on it yet: nothing recorded here or in its own "
-            f"config says it was ever bootstrapped.\nRun: gpuc host bootstrap {entry.name}"
+            f"host {session.entry.name} has no gpuc on it yet: its own config records no "
+            f"bootstrap.\nRun: gpuc host bootstrap {session.entry.name}"
         )
-    if not entry.python:
-        return entry
+    host_commit = host_build(session)
     local = version_mod.local_commit()
-    session = _try_session(entry, settings)
-    config = session.read_config() if session else None
-    # A host that could not be asked keeps the cache it had; the submit right
-    # behind this produces the transport error in full.
-    if config is None:
-        return entry
-    if config:
-        entry = _record_config(entry, config)
-        host_commit = entry.pkg_commit
-    else:
-        # The host answered and has no config at all: its gpuc home was wiped,
-        # taking the package with it. The cache here is the only copy of what
-        # that host was, so it is kept rather than overwritten with nothing --
-        # and an unrecorded commit re-ships below, which restores both.
-        host_commit = None
-    if not version_mod.needs_package_sync(local, host_commit):
-        return entry
+    if not version_mod.is_other_build(host_commit, local):
+        return
     report(
-        f"host {entry.name} is running gpuc {version_mod.short(host_commit)} and this machine "
-        f"has {version_mod.short(local)}: re-syncing the package and restarting the "
+        f"host {session.entry.name} is running gpuc {version_mod.short(host_commit)} and this "
+        f"machine has {version_mod.short(local)}: re-syncing the package and restarting the "
         f"dispatcher before enqueueing"
     )
-    transport = session.transport if session else None
-    updated = resync_package(entry, settings, transport=transport, report=_quiet)
-    with registry_transaction() as registry:
-        registry.put(updated)
-    return updated
-
-
-def _try_session(entry: HostEntry, settings: Settings) -> HostSession | None:
-    try:
-        return open_session(entry, settings)
-    except (ConfigError, RemoteError, TransportError):
-        return None
-
-
-def _record_config(entry: HostEntry, config: dict[str, Any]) -> HostEntry:
-    """Cache what the host just said about itself, for the offline commands.
-
-    `gpuc host list` and `gpuc version` never ask a host anything, so this is
-    what keeps them from repeating a bootstrap somebody else replaced. Written
-    even when the config has not changed, because *when* it was read is half of
-    what those commands report. Re-read under the lock and written as one
-    field, because this runs on every submit and writing back the whole entry
-    read at startup would undo whatever a concurrent `gpuc host probe` learned
-    about the same host.
-    """
-    updated = entry.with_config(config)
-    with registry_transaction() as registry:
-        current = registry.hosts.get(entry.name)
-        registry.put(current.with_config(config) if current else updated)
-    return updated
+    # Decided above; `always` keeps `ensure_build` from asking the same question.
+    ensure_build(session, _quiet, always=True)
 
 
 def _quiet(_: str) -> None:
     """Swallow a step's progress: the caller has already said what it is doing."""
+
+
+def enqueue(
+    entry: HostEntry,
+    prepared: Prepared,
+    settings: Settings,
+    *,
+    workdir: Path,
+    use_git: bool,
+    bootstrap: bool,
+    report: Reporter,
+    session: HostSession | None = None,
+) -> SubmitResult:
+    """The half of a submit that needs a host: one session, then everything
+    over it -- the build check, the fit check, the enqueue, and where the job
+    landed in the queue. `session` is one a lookup already opened."""
+    session = session or open_session(entry, settings)
+    ensure_package_current(session, bootstrap=bootstrap, report=report)
+    result = submit_spec(
+        session, prepared, settings, workdir=workdir, report=report, use_git=use_git
+    )
+    # The queue is looked up again here rather than inferred from the enqueue:
+    # the dispatcher the enqueue started may well have taken the job already,
+    # and "position 3 of 5, starts in ~2h" is the thing the submitter actually
+    # wants to know and cannot work out from a job id.
+    result.placement = placement_after(session, result.job_id, settings)
+    return result
 
 
 def submit_job(
@@ -232,56 +180,27 @@ def submit_job(
     bootstrap: bool = True,
     report: Reporter = print,
 ) -> SubmitResult:
+    """`gpuc submit`: everything that needs no host first, then the host."""
     check_placement(runpod=rental is not None, host=host)
-    overrides = overrides or {}
-    if rental is not None:
-        document = with_overrides(load_document(job_file), **overrides)
-        model = validate(document, str(job_file))
-        check_gpu_count(model, rental.gpu_count)
-        job_id = jobs.new_job_id()
-        prepared = prepare(model, workdir, job_id=job_id, use_git=use_git)
-        spec_uri, notes = mirror_spec_first(model, job_id, settings)
-        entry = rent_host(rental, settings, report)
-        entry = ensure_package_current(entry, settings, bootstrap=bootstrap, report=report)
-        result = submit_spec(
-            entry,
-            model,
-            settings,
-            workdir=workdir,
-            job_id=job_id,
-            spec_uri=spec_uri,
-            use_git=use_git,
-            report=report,
-            prepared=prepared,
-        )
-        result.notes.extend(notes)
-        return _placed(result, entry, settings)
-    if not host:
+    if rental is None and not host:
         raise UsageError("submit needs --host <name> (see `gpuc host list`)")
-    entry = named_registry().require(host)
-    entry = ensure_package_current(entry, settings, bootstrap=bootstrap, report=report)
-    result = submit_file(
+    document = with_overrides(load_document(job_file), **(overrides or {}))
+    model = validate(document, str(job_file))
+    prepared = prepare(model, workdir, job_id=jobs.new_job_id(), use_git=use_git)
+    if rental is not None:
+        check_gpu_count(model, rental.gpu_count)
+        entry = rent_host(rental, settings, report)
+    else:
+        entry = open_registry().require(host or "")
+    return enqueue(
         entry,
-        job_file,
+        prepared,
         settings,
-        overrides,
         workdir=workdir,
         use_git=use_git,
+        bootstrap=bootstrap,
         report=report,
     )
-    return _placed(result, entry, settings)
-
-
-def _placed(result: SubmitResult, entry: HostEntry, settings: Settings) -> SubmitResult:
-    """The result, with where the job now sits in the host's queue.
-
-    The queue is looked up again here rather than inferred from the enqueue:
-    the dispatcher the enqueue started may well have taken the job already, and
-    "position 3 of 5, starts in ~2h" is the thing the submitter actually wants
-    to know and cannot work out from a job id.
-    """
-    result.placement = placement_after(entry, result.job_id, settings, session=result.session)
-    return result
 
 
 def requeue_job(
@@ -295,9 +214,9 @@ def requeue_job(
     bootstrap: bool = True,
     report: Reporter = print,
 ) -> SubmitResult:
+    """`gpuc requeue`: the mirrored spec as a new job, on the host named or
+    the one the job ran on."""
     check_placement(runpod=rental is not None, host=host)
-    registry = named_registry()
-    index = JobIndex(settings).get(job_id)
     s3 = S3Index.from_settings(settings)
     if s3 is None:
         raise CliError(
@@ -314,27 +233,36 @@ def requeue_job(
             f"Check the id with `gpuc status --all`; only jobs submitted with s3_bucket "
             f"set can be requeued."
         ) from exc
-    document = from_mirror(document)
-    attempt = (index.attempt if index else 1) + 1
-    model = validate(document, f"spec for {job_id}")
-    prepared = prepare(model, workdir, attempt=attempt, use_git=use_git)
+    model = validate(document, f"spec for {job_id}", tolerant=True)
+    prepared = prepare(
+        model, workdir, job_id=jobs.new_job_id(), requeued_from=job_id, use_git=use_git
+    )
+    session: HostSession | None = None
     if rental is not None:
         check_gpu_count(model, rental.gpu_count)
         entry = rent_host(rental, settings, report)
     else:
         # Where the job ran, by the same lookup every other job command uses:
-        # the local index, then every registered host. A second client with
-        # no index of its own still finds it, and an id nobody knows is exit 4.
-        entry, _ = find_job_host(job_id, registry, host)
-    entry = ensure_package_current(entry, settings, bootstrap=bootstrap, report=report)
-    result = submit_spec(
+        # the index, then every registered host. A second client with no
+        # index of its own still finds it, and an id nobody knows is exit 4.
+        read = open_registry()
+        location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
+        trouble = location.trouble
+        if location.entry is None or trouble is not None:
+            gone = trouble is not None and mirror_is_the_answer(trouble)
+            raise CliError(
+                f"job {job_id} ran on host {location.host}, which "
+                f"{'is gone' if gone else 'could not be asked'}: {location.trouble_reason}\n"
+                f"Name another host with --host, or --runpod."
+            )
+        entry, session = location.entry, location.session
+    return enqueue(
         entry,
-        model,
+        prepared,
         settings,
         workdir=workdir,
-        attempt=attempt,
         use_git=use_git,
+        bootstrap=bootstrap,
         report=report,
-        prepared=prepared,
+        session=session,
     )
-    return _placed(result, entry, settings)

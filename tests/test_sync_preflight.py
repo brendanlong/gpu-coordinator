@@ -169,11 +169,12 @@ def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
     jobs.write_config(HostConfig(host="test-host", s3_prefix="s3://bucket/gpuc/h"))
     spec = make_spec(command="echo SHOULD-NOT-RUN")
     job_id = queue.enqueue(spec)
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
     fake = FakeRunner(fail_on="s3 cp", output="An error occurred (NoSuchBucket)")
 
     code = runner.run_job(
         job_id,
+        [FAKE_GPUS[0]],
+        1,
         RunnerDeps(smi=fake_smi(), command_runner=fake, preflight=False, poll_interval_s=0.02),
     )
 
@@ -188,10 +189,11 @@ def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, tools: None) -> N
     jobs.write_config(HostConfig(host="test-host", s3_prefix="s3://bucket/gpuc/h"))
     spec = make_spec(command="echo RAN")
     job_id = queue.enqueue(spec)
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
 
     code = runner.run_job(
         job_id,
+        [FAKE_GPUS[0]],
+        1,
         RunnerDeps(
             smi=fake_smi(), command_runner=FakeRunner(), preflight=False, poll_interval_s=0.02
         ),

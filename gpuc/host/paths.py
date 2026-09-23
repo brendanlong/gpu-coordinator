@@ -35,7 +35,7 @@ def path_with_user_bins(environ: Mapping[str, str] | None = None, extra: Sequenc
     """``PATH`` with ``extra`` then the $HOME tool dirs in front, no duplicates.
 
     ``extra`` is for a host whose tools live off ``$HOME`` (see
-    ``jobs.HOST_ENV_BIN_KEYS``); those come first, because a host that names a
+    ``jobs.MANAGED_ENV``); those come first, because a host that names a
     tool directory explicitly means it.
 
     Unlike the $HOME entries, an ``extra`` directory is prepended even when it

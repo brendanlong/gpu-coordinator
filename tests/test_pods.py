@@ -9,9 +9,9 @@ import pytest
 
 from gpuc.control import pods as pods_mod
 from gpuc.control.cli import EXIT_OK, main
-from gpuc.control.config import Settings, load_registry, registry_transaction
+from gpuc.control.config import Settings, registry_transaction
 from gpuc.control.status import HostState, HostView, render
-from tests.conftest import host_entry
+from tests.conftest import host_entry, load_registry
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
 FOREIGN = "other-someone-else"
@@ -22,7 +22,7 @@ def _register(pod_name: str, pod_id: str) -> None:
         registry.put(
             host_entry(
                 name=pod_name,
-                kind="runpod",
+                kind="rental",
                 pod_id=pod_id,
                 ssh="root@1.2.3.4",
                 python="/root/python",
@@ -42,7 +42,7 @@ def test_table_names_the_host_each_pod_is_here_and_counts_the_rest(
     control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _register("gpuc-e2e-aaa", "pod1")
-    monkeypatch.setattr("gpuc.control.pods.dispatcher_heartbeat_age", lambda *a: 4.0)
+    monkeypatch.setattr("gpuc.control.pods.heartbeat_age", lambda *a: 4.0)
 
     text = pods_mod.render(pods_mod.gather(Settings(), provider))
 
@@ -96,7 +96,7 @@ def test_empty_account_renders_a_hint(control_env: Path) -> None:
 
 
 def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
-    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
+    entry = host_entry(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4")
     view = HostView(
         entry=entry,
         state=HostState.ANSWERED,
@@ -108,13 +108,13 @@ def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
     assert "pod     pod1 RUNNING NVIDIA A40 $0.490/h cuda 12.8 age 20m" in text
 
 
-def test_status_shows_the_pod_even_when_the_host_is_unreachable() -> None:
-    entry = host_entry(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4")
+def test_status_shows_the_pod_even_when_the_host_is_unaskable() -> None:
+    entry = host_entry(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4")
     view = HostView(
-        entry=entry, state=HostState.UNREACHABLE, error="ssh timed out", pod=running_pod("n", "p")
+        entry=entry, state=HostState.UNASKABLE, error="ssh timed out", pod=running_pod("n", "p")
     )
     text = render(view)
-    assert "UNREACHABLE" in text and "pod     p RUNNING" in text
+    assert "UNASKABLE" in text and "pod     p RUNNING" in text
 
 
 def test_status_forgets_a_rental_the_provider_no_longer_has(
@@ -122,12 +122,12 @@ def test_status_forgets_a_rental_the_provider_no_longer_has(
 ) -> None:
     """A rental that ended itself is a state, not a host nobody can reach."""
     _register("gpuc-e2e-aaa", "pod1")
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: FakeProvider())
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: FakeProvider())
     capsys.readouterr()
 
     assert main(["status"]) == EXIT_OK
     captured = capsys.readouterr()
-    assert "POD GONE" in captured.out
+    assert "GONE" in captured.out
     assert "this rental has ended" in captured.out
     assert "forgetting host gpuc-e2e-aaa" in captured.err
     assert load_registry().hosts == {}
@@ -138,11 +138,11 @@ def test_status_json_forgets_the_rental_it_just_reported(
 ) -> None:
     """The document still lists the host; the entry is gone once it is printed."""
     _register("gpuc-e2e-aaa", "pod1")
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: FakeProvider())
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: FakeProvider())
     capsys.readouterr()
 
     assert main(["status", "--json"]) == EXIT_OK
     document = json.loads(capsys.readouterr().out)
     (host,) = document["hosts"]
-    assert host["pod_gone"] is True and host["pod_terminated"] is True
+    assert host["state"] == "gone" and "pod_gone" not in host
     assert load_registry().hosts == {}

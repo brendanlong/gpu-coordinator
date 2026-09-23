@@ -1,13 +1,12 @@
 """`gpuc status`: one compact block per host.
 
-Reads the host over the transport (the host is authoritative); the S3 index
-only fills in jobs whose host is gone. Never kills anything.
+Asks the host (the host is authoritative) and renders what it said; the jobs
+only the index knows are `actions.unhosted_jobs`. Never kills anything.
 """
 
 from __future__ import annotations
 
-import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -18,10 +17,9 @@ from gpuc.control import version
 from gpuc.control.config import HostEntry, Settings, parse_timestamp
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.gpuinfo import rows as gpu_rows
-from gpuc.control.providers.base import Pod, Provider, ProviderError
-from gpuc.control.remote import HostSession, RemoteError, open_session
-from gpuc.control.s3index import job_uri
-from gpuc.control.transport import TransportError
+from gpuc.control.providers.base import Pod, Provider
+from gpuc.control.remote import Asked, Gone, HostSession, Unaskable, ask
+from gpuc.control.s3index import IndexEntry, job_uri
 from gpuc.host.cleanup import human_bytes
 from gpuc.host.jobs import SCHEMA_VERSION
 
@@ -30,10 +28,6 @@ RECENT_FINISHED = 5
 LEFTOVER_FLOOR_BYTES = 1 << 30
 """Only mention finished jobs' workdirs once they add up to something worth a
 command. A job dir under a gigabyte is noise next to a 6.5 GB torch venv."""
-
-
-def _note(message: str) -> None:
-    print(message, file=sys.stderr)
 
 
 @dataclass
@@ -98,6 +92,9 @@ class JobView:
     which is the thing to notice before it runs for four hours."""
     exit_code: int | None = None
     attempt: int = 1
+    """How many times the host has launched this id: a preempt adds one."""
+    requeued_from: str | None = None
+    """The job this one was requeued from, when the host reports it."""
     started_at: str | None = None
     ended_at: str | None = None
     util_recent: list[float] = field(default_factory=list)
@@ -260,57 +257,22 @@ def _str_dict(value: Any) -> dict[str, str]:
 
 
 class HostState(Enum):
-    """Whether a host could be asked, and if not, which of the ways it
-    could not. One value, decided once in `gather`; everything that prints,
-    exits or forgets reads it rather than re-deriving it."""
+    """The three answers of `remote.ask`, as the view carries them; everything
+    that prints, exits or forgets reads this rather than re-deriving it."""
 
     ANSWERED = "answered"
-    UNREACHABLE = "unreachable"
-    """No answer over ssh (or not a JSON one)."""
-    POD_DEAD = "pod_dead"
-    """The provider still has the pod and nothing can run on it: a failure,
-    and an entry kept for `gpuc host terminate` or `gpuc host remove`."""
-    POD_GONE = "pod_gone"
-    """The provider says the rental has ended. The state every rental
-    reaches, not a failure; whoever gathered this view forgets the entry."""
-
-
-def pod_state(entry: HostEntry, provider: Provider | None) -> tuple[Pod | None, HostState | None]:
-    """The provider's word on a rental's pod. `(pod, None)` means it is up,
-    or this is not a rental; a provider that cannot be asked raises."""
-    if provider is None or not entry.pod_id:
-        return None, None
-    pod = provider.get(entry.pod_id)
-    if pod is None or provider.is_gone(pod):
-        return pod, HostState.POD_GONE
-    if provider.is_dead(pod):
-        return pod, HostState.POD_DEAD
-    return pod, None
-
-
-def rental_gone(
-    entry: HostEntry, provider: Provider | None, report: Callable[[str], None] = _note
-) -> str | None:
-    """Why this host's pod no longer exists, or None if it does.
-
-    Asked once a host has failed to answer: a rental that ended itself when
-    its queue went idle is how one is meant to die, not a failure. A provider
-    that cannot be asked leaves the failure as it was.
-    """
-    try:
-        pod, state = pod_state(entry, provider)
-    except ProviderError as exc:
-        report(f"could not ask the provider about pod {entry.pod_id}: {exc}")
-        return None
-    if state is not HostState.POD_GONE:
-        return None
-    return f"pod {entry.pod_id} {'no longer exists' if pod is None else f'is {pod.status}'}"
+    UNASKABLE = "unaskable"
+    """Could not be asked and may still hold its jobs: a failure, with the
+    reason in `error`."""
+    GONE = "gone"
+    """Does not exist any more. Not a failure; `actions.forget_gone_rentals`
+    forgets the entry."""
 
 
 @dataclass
 class HostView:
     entry: HostEntry
-    state: HostState = HostState.UNREACHABLE
+    state: HostState = HostState.UNASKABLE
     error: str | None = None
     heartbeat_age_s: float | None = None
     draining: bool = False
@@ -327,10 +289,15 @@ class HostView:
     shared_unavailable: list[str] = field(default_factory=list)
     """Shared entries the host could not resolve to a card it can see."""
     pod: Pod | None = None
+    session: HostSession | None = None
+    """The session the answer came over, for a caller with a follow-up
+    question (`submit` and `reorder` ask where the job landed)."""
+    mirror_prefix: str | None = None
+    """The host's own `s3_prefix`, from the config the session read."""
     pkg_commit: str | None = None
     """The commit the *host* says its package came from, not the one this
     machine's registry remembers shipping. Null when the host was not asked or
-    was bootstrapped by a build too old to record it."""
+    did not say."""
     dispatcher_pkg_commit: str | None = None
     """The commit recorded by whoever last took the host's dispatcher lock.
 
@@ -339,8 +306,8 @@ class HostView:
     package replaces it, and this is how a host where that did not happen says
     so. Read from a lock file that outlives its writer, so it is only a fact
     about what is *running* next to a live heartbeat -- which is what
-    `host_warnings` checks before saying anything. Null when the host is on a
-    build too old to answer."""
+    `host_warnings` checks before saying anything. Null when the host did not
+    say."""
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
@@ -350,19 +317,14 @@ class HostView:
         return self.state is HostState.ANSWERED
 
     @property
-    def pod_gone(self) -> bool:
-        """No ssh was attempted: the provider said the pod cannot answer."""
-        return self.state in (HostState.POD_DEAD, HostState.POD_GONE)
-
-    @property
-    def pod_terminated(self) -> bool:
-        return self.state is HostState.POD_GONE
+    def gone(self) -> bool:
+        return self.state is HostState.GONE
 
     @property
     def failure(self) -> str | None:
-        """Why this host could not be read, if that is what happened. A rental
-        that has ended is not that."""
-        return None if self.state is HostState.POD_GONE else self.error
+        """Why this host could not be read, if that is what happened. A host
+        that is gone is not that."""
+        return None if self.gone else self.error
 
     @property
     def dispatcher_alive(self) -> bool:
@@ -409,8 +371,8 @@ class HostView:
 
         The host answers for all but the finished job it ran out of measuring
         budget for, and that one is measured by the next call. A null that
-        never resolves means a host too old to answer, which is what the build
-        warning in `host_warnings` is for.
+        never resolves is a host that does not answer the question, which is
+        what the build warning in `host_warnings` is for.
         """
         return sum(job.workdir_bytes or 0 for job in self.finished)
 
@@ -444,7 +406,8 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
                 if isinstance(u, dict) and isinstance(u.get("error"), str)
             ],
             exit_code=entry.get("exit_code"),
-            attempt=entry.get("attempt", 1),
+            attempt=_as_int(entry.get("attempt")) or 1,
+            requeued_from=_as_str(entry.get("requeued_from")),
             started_at=entry.get("started_at"),
             ended_at=entry.get("ended_at"),
             # A sample is null when nvidia-smi failed; drop it rather than
@@ -484,39 +447,31 @@ def gather(
     session: HostSession | None = None,
     provider: Provider | None = None,
 ) -> HostView:
-    view = HostView(entry=entry, owned=list(entry.gpus))
-    dead: HostState | None = None
-    try:
-        view.pod, dead = pod_state(entry, provider)
-    except ProviderError as exc:
-        view.error = f"could not read pod {entry.pod_id}: {exc}"
-    if dead is not None:
-        # An ssh here would hang and then print a stack about a refused
-        # connection, which tells nobody anything.
-        view.state = dead
-        status = "missing" if view.pod is None else view.pod.status
-        view.error = (
-            f"pod {entry.pod_id} is {status}; this rental has ended"
-            if dead is HostState.POD_GONE
-            # The provider still has this one, so it may still be billing:
-            # ending it is a different act from forgetting it.
-            else f"pod {entry.pod_id} is {status}; `gpuc host terminate {entry.name}` ends "
-            f"it, `gpuc host remove {entry.name}` forgets it"
-        )
+    """One host's status: `ask` it, and read the answer."""
+    return parse_status(entry, ask(entry, "status", settings, provider=provider, session=session))
+
+
+def parse_status(entry: HostEntry, asked: Asked) -> HostView:
+    """A host's `status` answer as a view, every field read as untrusted:
+    this is another build's JSON. A host nobody could ask produces no claim
+    about its cards, its build or its jobs -- only the reason."""
+    view = HostView(entry=entry, pod=asked.pod)
+    if isinstance(asked, Gone):
+        view.state, view.error = HostState.GONE, asked.reason
         return view
-    try:
-        session = session or open_session(entry, settings)
-        payload = session.host_json("status", timeout=60.0)
-    except (RemoteError, TransportError) as exc:
-        view.error = str(exc).splitlines()[0]
-        return view
-    if not isinstance(payload, dict):
-        view.error = f"host {entry.name} answered `status` with {type(payload).__name__}, not JSON"
+    if isinstance(asked, Unaskable):
+        view.error = asked.reason
         return view
     view.state = HostState.ANSWERED
+    view.session = asked.session
+    view.mirror_prefix = asked.session.config.s3_prefix
+    # The provider could not be asked about the pod: the host answered, and
+    # this is still the command's exit code.
+    view.error = asked.pod_error
+    payload = asked.payload or {}
     view.pkg_commit = _as_str(payload.get("pkg_commit"))
     view.dispatcher_pkg_commit = _as_str(payload.get("dispatcher_pkg_commit"))
-    view.owned, view.indices = owned_gpus(payload, entry)
+    view.owned, view.indices = owned_gpus(payload)
     view.unavailable = [g for g in payload.get("gpus_unavailable") or [] if isinstance(g, str)]
     view.shared = [
         card
@@ -598,10 +553,10 @@ def _fmt_eta(job: JobView) -> str:
 
     A running job whose host published no `eta` falls back to the estimate the
     same host reports, rendered as a total rather than a remaining time. The
-    one thing that may not happen is `--json` carrying an estimate the text
-    does not show, and there are two ways to reach that: the window after
-    `gpuc estimate` before the runner next re-reads the spec, and a host on a
-    build old enough not to re-read it at all."""
+    runner re-reads the estimate every `ESTIMATE_REFRESH_S`, which bounds the
+    window after `gpuc estimate` but does not close it, and inside it `--json`
+    carries an estimate the text would otherwise not show -- a scripted caller
+    seeing what the operator cannot, which `tests/test_control_e2e.py` pins."""
     remaining = job.eta_seconds
     if remaining is None:
         return _fmt_estimate(job, total=True)
@@ -751,12 +706,8 @@ def next_free_line(view: HostView) -> str | None:
     return f"  free    next card {when} ({job.job_id}){note}"
 
 
-def owned_gpus(payload: dict[str, Any], entry: HostEntry) -> tuple[list[str], dict[str, int]]:
-    """The host's resolved cards, falling back to what it was configured with.
-
-    A host running a build from before the resolution existed reports only
-    `gpus`, which on that build could only ever have been UUIDs.
-    """
+def owned_gpus(payload: dict[str, Any]) -> tuple[list[str], dict[str, int]]:
+    """The host's owned cards as it resolved them this pass, and their indices."""
     owned: list[str] = []
     indices: dict[str, int] = {}
     for row in payload.get("gpus_resolved") or []:
@@ -767,9 +718,7 @@ def owned_gpus(payload: dict[str, Any], entry: HostEntry) -> tuple[list[str], di
         index = _as_int(row.get("index"))
         if index is not None:
             indices[uuid] = index
-    if owned or payload.get("gpus_resolved") is not None:
-        return owned, indices
-    return [g for g in (payload.get("gpus") or entry.gpus) if isinstance(g, str)], indices
+    return owned, indices
 
 
 def _gpu_lines(view: HostView) -> list[str]:
@@ -837,15 +786,19 @@ def render(
     entry = view.entry
     target = entry.ssh or "this machine"
     if not view.reachable:
-        state = "POD GONE" if view.pod_gone else "UNREACHABLE"
+        # A gone host's reason is not a failure, so it is not an ERROR line.
+        state, prefix = ("GONE", "") if view.gone else ("UNASKABLE", "ERROR ")
         lines = [
             f"host {entry.name} [{entry.kind}] {target}: {state}",
-            f"  {view.error}",
+            f"  {prefix}{view.error}",
         ]
         pod = pod_line(view.pod)
         if pod:
             lines.append(pod)
-        if not view.pod_gone:
+        elif not view.gone:
+            # No provider's word to read next, so the probe is the next step;
+            # a pod line is what to read when there is one, and a stopped
+            # pod's reason already names the commands that end or forget it.
             lines.append(f"  try: gpuc host probe {entry.name}")
         return "\n".join(lines)
     flags = []
@@ -1010,6 +963,7 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "phase": job.phase,
         "priority": job.priority,
         "attempt": job.attempt,
+        "requeued_from": job.requeued_from,
         "started_at": job.started_at,
         "elapsed_s": None if job.minutes is None else round(job.minutes * 60.0, 1),
         "util": job.last_util,
@@ -1146,16 +1100,13 @@ def host_json(
     pod (null for every other host); each job's `util` is the host's own
     sampler. They are two different measurements and are named as such."""
     entry = view.entry
-    errors = [view.error] if view.error else []
-    errors += host_warnings(view)
     finished = [job for job in view.finished if within(job, since_s)][:recent]
     return {
         "name": entry.name,
         "kind": entry.kind,
         "target": entry.ssh,
+        "state": view.state.value,
         "reachable": view.reachable,
-        "pod_gone": view.pod_gone,
-        "pod_terminated": view.pod_terminated,
         "draining": view.draining,
         # The host's own answer, so null means the host did not say, never
         # "current".
@@ -1169,10 +1120,11 @@ def host_json(
         "pod": pod_json(view),
         "gpus": gpu_json(view),
         "shared_gpus": shared_gpu_json(view),
-        "queued": [job_json(job, entry.s3_prefix) for job in view.queue],
-        "running": [job_json(job, entry.s3_prefix) for job in view.running],
-        "finished": [job_json(job, entry.s3_prefix) for job in finished],
-        "errors": errors,
+        "queued": [job_json(job, view.mirror_prefix) for job in view.queue],
+        "running": [job_json(job, view.mirror_prefix) for job in view.running],
+        "finished": [job_json(job, view.mirror_prefix) for job in finished],
+        "errors": [view.error] if view.error else [],
+        "warnings": host_warnings(view),
     }
 
 
@@ -1192,21 +1144,67 @@ def pod_json(view: HostView) -> dict[str, Any] | None:
     }
 
 
+UNHOSTED_LABELS: dict[HostState, str] = {
+    HostState.ANSWERED: "its host answered and does not have it (lost its state, or purged)",
+    HostState.UNASKABLE: "its host could not be asked, so it may still be running there",
+    HostState.GONE: "its host is gone",
+}
+"""What each `host_state` means for a job only the index knows."""
+
+
+def requeue_offered(state: HostState) -> bool:
+    """Whether `gpuc requeue` is the way back for a job only the index knows:
+    its host cannot still be running it. A host that could not be asked may
+    hold the job -- running, or finished with its outputs -- and a requeue
+    offered on the strength of a connection error is how a run ends up done
+    twice."""
+    return state in (HostState.ANSWERED, HostState.GONE)
+
+
+def unhosted_json(entry: IndexEntry, *, lost: bool, state: HostState) -> dict[str, Any]:
+    """One job only the index knows, as `status --all --json` lists it."""
+    return {
+        "job_id": entry.job_id,
+        "name": entry.name,
+        "host": entry.host,
+        "host_state": state.value,
+        "requeue": requeue_offered(state),
+        "requeued_from": entry.requeued_from,
+        "submitted_at": entry.submitted_at,
+        "s3_prefix": entry.s3_prefix,
+        "outputs_lost": lost,
+    }
+
+
+def unhosted_line(entry: IndexEntry, *, lost: bool, state: HostState) -> str:
+    flag = " OUTPUTS LOST (the host went away before they uploaded)" if lost else ""
+    label = f"{entry.name} ({entry.job_id})" if entry.name else entry.job_id
+    origin = f" requeued from {entry.requeued_from}" if entry.requeued_from else ""
+    return (
+        f"  {label} host={entry.host}{origin} submitted {format_age(entry.submitted_at)}: "
+        f"{UNHOSTED_LABELS[state]}{flag}"
+    )
+
+
 def document(
     views: Sequence[HostView],
     *,
     errors: Sequence[str] = (),
+    unhosted: Sequence[dict[str, Any]] = (),
     recent: int = RECENT_FINISHED,
     since_s: float | None = None,
 ) -> dict[str, Any]:
     """The whole of `gpuc status --json`: one object, always this shape.
 
     Top-level `errors` are the ones that belong to no host -- an unreadable
-    registry, a skipped entry -- and they are the reason exit 3 exists: a
-    consumer that sees them must not read `hosts` as the whole truth.
+    registry (exit 3), a skipped entry or an index that could not be read
+    (exit 1) -- and a consumer that sees any of them must not read `hosts` as
+    the whole truth. `unhosted` is `--all`'s list of jobs only the index
+    knows, empty without the flag.
     """
     return {
         "schema_version": SCHEMA_VERSION,
         "hosts": [host_json(view, recent=recent, since_s=since_s) for view in views],
+        "unhosted": list(unhosted),
         "errors": list(errors),
     }

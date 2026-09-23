@@ -138,11 +138,13 @@ def test_poll_kills_the_whole_session_not_just_the_shell(tmp_path: Path) -> None
 
 
 def prepare(**overrides: object) -> str:
-    spec = make_spec(**overrides)
-    job_id = queue.enqueue(spec)
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
+    job_id = queue.enqueue(make_spec(**overrides))
     paths.ensure_job_layout(job_id)
     return job_id
+
+
+def run(job_id: str, deps_: runner.RunnerDeps | None = None) -> int:
+    return runner.run_job(job_id, [FAKE_GPUS[0]], 1, deps_ or deps())
 
 
 def deps(**overrides: object) -> runner.RunnerDeps:
@@ -154,7 +156,7 @@ def deps(**overrides: object) -> runner.RunnerDeps:
 @contextlib.contextmanager
 def live_runner(job_id: str) -> Iterator[tuple[runner.JobRunner, IO[bytes]]]:
     """A runner set up as far as `_record_progress` needs, without a job."""
-    started = runner.JobRunner(job_id, deps())
+    started = runner.JobRunner(job_id, [FAKE_GPUS[0]], 1, deps())
     started.env = {"PATH": os.environ["PATH"]}
     with paths.log_file(job_id).open("ab", buffering=0) as log:
         yield started, log
@@ -166,7 +168,7 @@ def seconds_from_now(stamp: str) -> float:
 
 def test_progress_command_records_a_percentage(gpuc_home: Path) -> None:
     job_id = prepare(command="sleep 0.5", progress_command="echo 25%", progress_interval_s=0.05)
-    assert runner.run_job(job_id, deps()) == 0
+    assert run(job_id) == 0
     state = jobs.read_state(job_id)
     assert state.progress_pct == 25.0
     assert state.progress_error is None
@@ -187,7 +189,7 @@ def test_the_eta_is_extrapolated_from_the_time_main_has_taken(gpuc_home: Path) -
 
 def test_a_broken_progress_command_is_recorded_and_never_fails_the_job(gpuc_home: Path) -> None:
     job_id = prepare(command="sleep 0.4", progress_command="exit 9", progress_interval_s=0.05)
-    assert runner.run_job(job_id, deps()) == 0
+    assert run(job_id) == 0
     state = jobs.read_state(job_id)
     assert (state.status, state.progress_pct) == ("succeeded", None)
     assert state.progress_error and "exited 9" in state.progress_error
@@ -197,7 +199,7 @@ def test_one_broken_poll_is_logged_once_however_often_it_repeats(gpuc_home: Path
     job_id = prepare(
         command="sleep 0.5", progress_command="echo not-a-number", progress_interval_s=0.02
     )
-    assert runner.run_job(job_id, deps()) == 0
+    assert run(job_id) == 0
     assert paths.log_file(job_id).read_text().count("progress command") == 1
 
 
@@ -230,7 +232,7 @@ def test_estimated_runtime_min_publishes_an_eta_from_the_first_phase(gpuc_home: 
         seen.append(jobs.read_state(job_id).eta)
         time.sleep(seconds)
 
-    assert runner.run_job(job_id, deps(sleep=watching_sleep)) == 0
+    assert run(job_id, deps(sleep=watching_sleep)) == 0
     published = [eta for eta in seen if eta]
     assert published, "no eta was published while the job was running"
     # Published during `setup` -- the phase somebody most wants an end time for,
@@ -252,7 +254,7 @@ def test_an_estimate_added_while_the_job_runs_becomes_an_eta(gpuc_home: Path) ->
         seen.append(jobs.read_state(job_id).eta)
         time.sleep(seconds)
 
-    assert runner.run_job(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
+    assert run(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
     published = [eta for eta in seen if eta]
     assert published, "the estimate never became an eta"
     assert 5000.0 < seconds_from_now(published[-1]) < 5500.0
@@ -295,7 +297,7 @@ def test_a_measured_eta_is_not_overwritten_by_an_estimate(gpuc_home: Path) -> No
             etas.append(eta)
         time.sleep(seconds)
 
-    assert runner.run_job(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
+    assert run(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
     assert etas, "no progress eta was published"
     # Half done after a fraction of a second: the measured eta is seconds away,
     # nowhere near the ten hours the submitter's estimate guesses at.
@@ -317,7 +319,7 @@ def test_an_estimate_added_in_setup_survives_the_phase_that_follows(gpuc_home: P
             etas.append(jobs.read_state(job_id).eta)
         time.sleep(seconds)
 
-    assert runner.run_job(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
+    assert run(job_id, deps(sleep=watching_sleep, estimate_refresh_s=0.0)) == 0
     assert etas, "the job never reached main"
     assert all(eta for eta in etas), "the eta was withdrawn when the phase changed"
 
@@ -333,7 +335,7 @@ def test_a_state_that_cannot_be_read_leaves_the_estimate_where_it_was(gpuc_home:
 
 def test_no_estimate_and_no_progress_command_means_no_eta(gpuc_home: Path) -> None:
     job_id = prepare(command="true")
-    assert runner.run_job(job_id, deps()) == 0
+    assert run(job_id) == 0
     state = jobs.read_state(job_id)
     assert (state.eta, state.progress_pct, state.progress_error) == (None, None, None)
 
@@ -351,7 +353,7 @@ def test_progress_is_only_polled_during_main(gpuc_home: Path) -> None:
         phases.append(jobs.read_state(job_id).phase)
         return 50.0
 
-    assert runner.run_job(job_id, deps(progress_poller=poller)) == 0
+    assert run(job_id, deps(progress_poller=poller)) == 0
     # During `setup` the command would be reading a file the job has not
     # started writing, and 0% of nothing is not information.
     assert phases and set(phases) == {"main"}
@@ -365,7 +367,7 @@ def test_an_unrepresentable_estimate_is_no_estimate_rather_than_a_dead_job(
     `runner-died` -- an estimate deciding an outcome it may never touch."""
     for absurd in (float("inf"), 1e15, 5e9):
         job_id = prepare(command="true", estimated_runtime_min=absurd)
-        assert runner.run_job(job_id, deps()) == 0
+        assert run(job_id) == 0
         state = jobs.read_state(job_id)
         assert (state.status, state.eta) == ("succeeded", None)
 
@@ -388,7 +390,7 @@ def test_a_job_whose_runner_died_does_not_keep_an_eta(gpuc_home: Path) -> None:
     from gpuc.host import dispatcher
 
     job_id = prepare(command="true", estimated_runtime_min=360.0)
-    jobs.update_state(job_id, eta=jobs.utc_in(3600.0), runner_pid=None)
-    dispatcher.Dispatcher()._mark_runner_died(job_id)  # pyright: ignore[reportPrivateUsage]
+    jobs.update_state(job_id, status="running", eta=jobs.utc_in(3600.0), runner_pid=None)
+    dispatcher.Dispatcher()._mark_runner_died(job_id, expect="running")  # pyright: ignore[reportPrivateUsage]
     state = jobs.read_state(job_id)
     assert (state.status, state.reason, state.eta) == ("failed", "runner-died", None)

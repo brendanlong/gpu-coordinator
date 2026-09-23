@@ -1,4 +1,12 @@
-"""Runs exactly one job: environment, preflight, wall-clock limit, sync, exit code.
+"""Runs exactly one job: claim, environment, preflight, wall-clock limit, sync,
+cleanup, and the one write that ends it.
+
+The runner owns every transition of its job. Its first act is the
+compare-and-set that takes the job out of the queue, so a `running` state
+always names a runner that existed; its last act is the write that ends the
+attempt -- a terminal status, or `queued` again for a preempted job -- so a
+job is finished exactly when its runner is gone, and nothing has to guess
+whether the process behind a finished state is still cleaning up.
 
 Exit-code discipline (measured in the shell implementation this replaces):
 the job's exit code is captured before *any* cleanup, and a failed final sync
@@ -9,13 +17,14 @@ silent.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import shlex
 import signal
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO
 
@@ -23,6 +32,7 @@ from gpuc._version import user_agent
 from gpuc.host import (
     baseline,
     cleanup,
+    destinations,
     gpus,
     jobs,
     paths,
@@ -33,7 +43,7 @@ from gpuc.host import (
     sync,
 )
 from gpuc.host.gpus import SmiRunner
-from gpuc.host.jobs import JobSpec
+from gpuc.host.jobs import JobSpec, Outcome
 from gpuc.host.procs import KILL_GRACE_S, JobProcesses, boot_id, starttime
 
 SAMPLE_INTERVAL_S = 30.0
@@ -94,8 +104,6 @@ class RunnerDeps:
     preflight: bool = True
     preflight_command: Callable[[JobSpec], str] = preflight_command
     sync_preflight: bool = True
-    isolation: str | None = None
-    """`cgroup`, `pgid`, or None to ask `scope.isolation()` at job start."""
 
     def util_sampler(self) -> UtilSampler:
         if self.sampler is not None:
@@ -104,13 +112,12 @@ class RunnerDeps:
 
 
 def build_env(
-    spec: JobSpec,
-    assigned: Sequence[str],
-    config: jobs.HostConfig | None = None,
-    indices: Mapping[str, int] | None = None,
+    spec: JobSpec, assigned: Sequence[str], indices: Mapping[str, int] | None = None
 ) -> dict[str, str]:
-    """The job's environment: the host's, the secrets file, the spec's, then
-    the cards -- last, so a spec `env` typo cannot hand the job the wrong ones.
+    """The job's environment: the runner's own, the secrets file, the spec's,
+    then the cards -- last, so a spec `env` typo cannot hand the job the wrong
+    ones. The host's `env` and PATH are already the runner's: the dispatcher
+    applied them to everything it spawns.
 
     `CUDA_VISIBLE_DEVICES` names the cards by nvidia-smi index when the runner
     has just resolved every one (vLLM and others `int()` each entry, and a
@@ -120,11 +127,6 @@ def build_env(
     UUIDs go through as they are, which every torch accepts.
     """
     env = dict(os.environ)
-    # The host's own env and PATH go first, so a job may still pin either
-    # explicitly. The dispatcher normally passes these down already; doing it
-    # here too means a runner started by hand, or by a dispatcher from before a
-    # `gpuc host set`, still gets them.
-    (config or jobs.read_config()).apply_env(env)
     env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
     env.update(spec.env)
     if indices is not None and assigned and all(uuid in indices for uuid in assigned):
@@ -143,16 +145,24 @@ def build_env(
 
 
 class JobRunner:
-    def __init__(self, job_id: str, deps: RunnerDeps | None = None) -> None:
+    def __init__(
+        self, job_id: str, assigned: Sequence[str], attempt: int, deps: RunnerDeps | None = None
+    ) -> None:
         self.job_id = job_id
+        self.assigned: list[str] = list(assigned)
+        self.attempt = attempt
+        """The attempt the dispatcher launched this runner for; the claim is
+        for exactly that one."""
         self.deps = deps or RunnerDeps()
         self.spec = jobs.read_spec(job_id)
         self.state = jobs.read_state(job_id)
-        self.assigned: list[str] = list(self.state.gpus)
         self.config = jobs.read_config()
         self.kill_reason: str | None = None
         self.env: dict[str, str] = {}
-        self.isolation: str = self.deps.isolation or scope.isolation()
+        self.isolation: str = scope.isolation()
+        self._indices: dict[str, int] | None = None
+        """uuid -> nvidia-smi index, from the one reading that verified the
+        assignment; None if it could not be read."""
         self._current: subprocess.Popen[bytes] | None = None
         self._current_unit: str | None = None
         self._progress_error: str | None = None
@@ -172,20 +182,18 @@ class JobRunner:
         state when the estimate actually changed: `state.json` is a
         read-modify-write with the sync loop as a second writer, and an eta
         recomputed from the same estimate is the same instant anyway."""
-        self._terminating = False
-        self._preempting = False
-        """Whether this job is going back in the queue rather than ending here.
-
-        Snapshotted at the top of `_finalize`; see the note there."""
-        self._finalizing = False
-        """Set for the whole of `_finalize`, which must run exactly once.
-
-        The dispatcher escalates a cancel to a SIGTERM at the runner itself
-        after 30 s, and that lands squarely in the final sync of a long upload.
-        Without this, the signal unwound `_finalize`, `run()` caught it, and
-        finalize ran again -- rewriting a job that had already been recorded as
-        `succeeded` into `failed: terminated` and uploading every output a
-        second time."""
+        self._main_started = False
+        """Whether `main` has begun, which is what `Outcome.ran` reports: the
+        final upload and the no-outputs check are for a job that produced
+        something, and only `main` does."""
+        self._ending = False
+        """Set once the attempt is on its way out: by the signal handler as it
+        raises `_Terminated`, and by `_finalize` as it starts. A signal after
+        that is ignored. The dispatcher escalates a stop to a SIGTERM at the
+        runner itself, and that lands squarely in the final sync of a long
+        upload; without this it unwound `_finalize`, `run()` caught it, and
+        finalize ran again -- rewriting a job already recorded as `succeeded`
+        into `failed: terminated` and uploading every output a second time."""
 
     # -- logging ---------------------------------------------------------
     def _log(self, log: IO[bytes], message: str) -> None:
@@ -212,15 +220,7 @@ class JobRunner:
         self, proc: subprocess.Popen[bytes], phase: str, log: IO[bytes], job_start: float
     ) -> int:
         deps = self.deps
-        pgid = proc.pid
-        jobs.update_state(
-            self.job_id,
-            phase=phase,
-            pid=proc.pid,
-            pgid=pgid,
-            isolation=self.isolation,
-            cgroup_unit=self._current_unit,
-        )
+        jobs.update_state(self.job_id, phase=phase, pgid=proc.pid, cgroup_unit=self._current_unit)
         sampler = deps.util_sampler()
         # Utilization is sampled for `gpuc status` only, and only in `main`:
         # setup is downloads and compiles, and a 0% there says nothing.
@@ -360,7 +360,10 @@ class JobRunner:
         self._current = proc
         code = self._monitor(proc, phase, log, job_start)
         self._current = None
-        jobs.update_state(self.job_id, cgroup_unit=None)
+        # Both, together: a group number outlives its processes, and a
+        # `pgid` left naming a finished phase is what the dispatcher's ladder
+        # would SIGKILL during the final sync, once somebody else had it.
+        jobs.update_state(self.job_id, pgid=None, cgroup_unit=None)
         self._current_unit = None
         self._log(log, f"phase={phase} exited {code}")
         return code
@@ -376,9 +379,9 @@ class JobRunner:
         """
 
         def handle(signum: int, _frame: object) -> None:
-            if self._finalizing or self._terminating:
+            if self._ending:
                 return
-            self._terminating = True
+            self._ending = True
             raise _Terminated(signum)
 
         try:
@@ -396,10 +399,17 @@ class JobRunner:
 
     # -- entry point -----------------------------------------------------
     def run(self) -> int:
+        """Claim the job, run it, end it. Zero, quietly, if the claim failed:
+        the job was cancelled between the dispatcher's decision and this
+        process starting, another runner got here first, or the attempt this
+        runner was started for is over, and either way it is not ours to
+        touch."""
+        if not self._claim():
+            return 0
         paths.ensure_job_layout(self.job_id)
         job_start = self.deps.now()
-        gpu_error = self._resolve_assigned()
-        env = build_env(self.spec, self.assigned, self.config, self._indices())
+        gpu_error = self._verify_assigned()
+        env = build_env(self.spec, self.assigned, self._indices)
         # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
         # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
         # credential file anywhere on the host.
@@ -411,43 +421,63 @@ class JobRunner:
             runner=self.deps.command_runner,
             env=env,
         )
-        with paths.log_file(self.job_id).open("ab", buffering=0) as log, self._term_handlers():
+        with paths.log_file(self.job_id).open("ab") as log, self._term_handlers():
             try:
                 return self._run_phases(env, sync_loop, log, job_start, gpu_error)
             except _Terminated as exc:
                 return self._finalize_terminated(exc, sync_loop, log)
 
-    def _resolve_assigned(self) -> str | None:
-        """Turn the assignment into UUIDs, or say why it cannot be.
+    def _claim(self) -> bool:
+        """Take the job out of the queue, naming this process as its runner.
 
-        A job may have been assigned cards by nvidia-smi index -- that is how
-        ownership of a shared box is written, and a dispatcher from before the
-        assignment was resolved host-side hands the index straight through. An
-        index is only meaningful against the host's numbering right now, so it
-        is resolved here and everything after this -- `CUDA_VISIBLE_DEVICES`,
-        the utilization samples -- sees UUIDs.
+        One compare-and-set on the attempt this runner was started for,
+        carrying the assignment the dispatcher decided and the identity a
+        later dispatcher needs to tell this process from a reused pid. So a
+        state that says `running` always names a runner that existed, and a
+        cancel that landed first simply wins.
+        """
+        pid = os.getpid()
+        return queue.claim(
+            self.job_id,
+            self.attempt,
+            status="running",
+            gpus=self.assigned,
+            phase="setup",
+            started_at=jobs.utc_now(),
+            isolation=self.isolation,
+            runner_pid=pid,
+            runner_boot_id=boot_id(),
+            runner_starttime=starttime(pid),
+        )
+
+    def _verify_assigned(self) -> str | None:
+        """Check every assigned UUID against the driver, or say why not.
+
+        The assignment is UUIDs, resolved by the dispatcher; what can still go
+        wrong is a card that the driver no longer reports. The same reading
+        gives the nvidia-smi index of each card for `CUDA_VISIBLE_DEVICES`.
         """
         if not self.assigned:
             return "no GPUs assigned; every job runs on at least one"
-        before = list(self.assigned)
         try:
-            self.assigned = gpus.resolve_present(self.assigned, "assigned GPUs", smi=self.deps.smi)
+            table = gpus.list_gpus(self.deps.smi)
         except gpus.GpuError as exc:
             return str(exc)
-        if self.assigned != before:
-            # So everything reading the state afterwards -- `gpuc status`, the
-            # control side's free/busy view -- names the same cards the job is
-            # actually on. The dispatcher resolves what it adopts either way.
-            jobs.update_state(self.job_id, gpus=self.assigned)
+        cards = gpus.resolve(self.assigned, table)
+        if cards.missing:
+            return (
+                f"assigned GPUs not present on this host: {', '.join(cards.missing)}; "
+                f"nvidia-smi reports: {gpus.describe_table(table)}"
+            )
+        if cards.duplicates:
+            # A promise of *n* cards that names one twice would run a two-GPU
+            # job on one.
+            return (
+                f"assigned GPUs name one card twice: {', '.join(cards.duplicates)}; "
+                f"nvidia-smi reports: {gpus.describe_table(table)}"
+            )
+        self._indices = {gpu.uuid: gpu.index for gpu in table if gpu.index is not None}
         return None
-
-    def _indices(self) -> dict[str, int] | None:
-        """uuid -> nvidia-smi index, read now, just after the assignment was
-        resolved against the same driver; None if it cannot be read."""
-        try:
-            return {gpu.uuid: gpu.index for gpu in gpus.list_gpus(self.deps.smi)}
-        except gpus.GpuError:
-            return None
 
     def _run_phases(
         self,
@@ -457,21 +487,9 @@ class JobRunner:
         job_start: float,
         gpu_error: str | None,
     ) -> int:
-        jobs.update_state(
-            self.job_id,
-            status="running",
-            phase="setup",
-            started_at=self.state.started_at or jobs.utc_now(),
-            isolation=self.isolation,
-            runner_pid=os.getpid(),
-            runner_boot_id=boot_id(),
-            runner_starttime=starttime(os.getpid()),
-        )
         if gpu_error:
             self._log(log, f"GPU assertion failed: {gpu_error}")
-            # The job never ran, so its `outputs:` cannot exist and there is
-            # nothing to upload.
-            return self._finalize(1, "failed", "gpu-assert", sync_loop, log, skip_output_sync=True)
+            return self._finalize(Outcome("failed", "gpu-assert", 1, ran=False), sync_loop, log)
 
         self._log(
             log,
@@ -481,55 +499,54 @@ class JobRunner:
 
         self._capture_output_baseline(log)
 
-        cancelled = self._cancelled_before("setup", sync_loop, log)
-        if cancelled is not None:
-            return cancelled
+        stopped = self._stopped_before("setup", sync_loop, log)
+        if stopped is not None:
+            return stopped
 
         if self.spec.setup:
             code = self._run_phase("setup", self.spec.setup, env, log, job_start)
             if code != 0 or self.kill_reason:
-                return self._finalize(code, *self._classify(code, "setup"), sync_loop, log)
+                return self._finalize(self._classify(code, "setup"), sync_loop, log)
 
         if self.deps.preflight:
-            cancelled = self._cancelled_before("preflight", sync_loop, log)
-            if cancelled is not None:
-                return cancelled
+            stopped = self._stopped_before("preflight", sync_loop, log)
+            if stopped is not None:
+                return stopped
+            # A phase of its own, not the tail of `setup`: `gpuc status` can
+            # then tell "still installing torch" from "proving the card works".
             code = self._run_phase(
                 "preflight", self.deps.preflight_command(self.spec), env, log, job_start
             )
             if code != 0 or self.kill_reason:
-                return self._finalize(code, *self._classify(code, "gpu-preflight"), sync_loop, log)
+                return self._finalize(self._classify(code, "gpu-preflight"), sync_loop, log)
 
         if self._sync_preflight(log) is not None:
-            return self._finalize(
-                1, "failed", "sync-preflight", sync_loop, log, skip_output_sync=True
-            )
+            return self._finalize(Outcome("failed", "sync-preflight", 1, ran=False), sync_loop, log)
 
-        cancelled = self._cancelled_before("main", sync_loop, log)
-        if cancelled is not None:
-            return cancelled
+        stopped = self._stopped_before("main", sync_loop, log)
+        if stopped is not None:
+            return stopped
 
+        self._main_started = True
+        jobs.update_state(self.job_id, ran=True)
         sync_loop.start()
         code = self._run_phase("main", self.spec.command, env, log, job_start)
-        status, reason = self._classify(code, None)
-        return self._finalize(code, status, reason, sync_loop, log)
+        return self._finalize(self._classify(code, None), sync_loop, log)
 
     def _capture_output_baseline(self, log: IO[bytes]) -> None:
         """Record what the checkout already had where the outputs go.
 
         Before `setup`, because a setup step may legitimately write into an
-        output path and that *is* this job's doing.
+        output path and that *is* this job's doing. Once per job, not per
+        attempt: a preempted job re-runs in the workdir the stopped attempt
+        left, and re-scanning would record that attempt's own results as
+        files "the checkout arrived with" -- never uploaded, never counted.
+        The baseline is a fact about the checkout, and the checkout has not
+        changed.
         """
         if not self.spec.outputs:
             return
-        if self.state.attempt > 1 and paths.outputs_baseline_file(self.job_id).exists():
-            # A preempted job re-runs in the workdir the stopped attempt left,
-            # so re-scanning now would record that attempt's own results as
-            # files "the checkout arrived with" -- and this attempt would then
-            # never upload them, nor count them towards `outputs:`. The
-            # baseline is a fact about the checkout, and the checkout has not
-            # changed. (`gpuc requeue` cannot reach this: it is a new job id,
-            # with a new job dir and no baseline in it.)
+        if paths.outputs_baseline_file(self.job_id).exists():
             self._log(log, "outputs baseline: keeping the one taken before the first attempt")
             return
         found = baseline.capture(self.spec, paths.workdir(self.job_id), self.job_id)
@@ -566,26 +583,22 @@ class JobRunner:
         self._log(log, preflight.describe(destinations))
         return None
 
-    def _cancelled_before(self, phase: str, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int | None:
+    def _stopped_before(self, phase: str, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int | None:
         """A job asked to stop between phases never starts the next one."""
         requested = queue.stop_requested(self.job_id)
         if requested is None:
             return None
         self.kill_reason = requested
         self._log(log, f"{requested} before phase={phase}; not starting it")
-        return self._finalize(TERMINATED_EXIT_CODE, *self._classify(1, None), sync_loop, log)
+        return self._finalize(self._classify(TERMINATED_EXIT_CODE, None), sync_loop, log)
 
     def _finalize_terminated(
         self, exc: _Terminated, sync_loop: sync.SyncLoop, log: IO[bytes]
     ) -> int:
-        if self._finalizing:
-            # Belt and braces with the signal handler: whatever `_finalize`
-            # decided is this job's outcome, so report that rather than
-            # finalizing a second time.
-            try:
-                return jobs.read_state(self.job_id).exit_code or 0
-            except RuntimeError:
-                return TERMINATED_EXIT_CODE
+        """The runner itself was signalled: stop the job, then end the attempt
+        as whatever was asked of it -- the dispatcher's ladder reaches the
+        runner while it is cancelling or preempting, and that must not turn a
+        preempt into a failure or a cancel into a `terminated`."""
         name = signal.Signals(exc.signum).name
         self._log(log, f"runner received {name}; stopping the job")
         proc = self._current
@@ -593,168 +606,192 @@ class JobRunner:
             self._kill(proc, "terminated", log)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
-        cancelled = queue.stop_requested(self.job_id) == "cancelled"
-        status, reason = ("cancelled", "cancelled") if cancelled else ("failed", "terminated")
-        return self._finalize(TERMINATED_EXIT_CODE, status, reason, sync_loop, log)
+        requested = queue.stop_requested(self.job_id)
+        ran = self._main_started
+        if requested == "cancelled":
+            outcome = Outcome("cancelled", "cancelled", TERMINATED_EXIT_CODE, ran)
+        elif requested == queue.PREEMPTED:
+            outcome = Outcome("failed", queue.PREEMPTED, TERMINATED_EXIT_CODE, ran)
+        else:
+            outcome = Outcome("failed", "terminated", TERMINATED_EXIT_CODE, ran)
+        return self._finalize(outcome, sync_loop, log)
 
-    def _classify(self, code: int, failure_reason: str | None) -> tuple[str, str | None]:
+    def _classify(self, code: int, failure_reason: str | None) -> Outcome:
+        """The outcome of the phase that just ended, or that a stop landed
+        before. `ran` is whether `main` started, whatever the phase."""
+        ran = self._main_started
         if self.kill_reason == "cancelled":
-            return "cancelled", "cancelled"
+            return Outcome("cancelled", "cancelled", code, ran)
         if self.kill_reason:
-            return "failed", self.kill_reason
+            return Outcome("failed", self.kill_reason, code, ran)
         if code == 0:
-            return "succeeded", None
-        return "failed", failure_reason or f"exit {code}"
+            return Outcome("succeeded", None, 0, ran)
+        return Outcome("failed", failure_reason or f"exit {code}", code, ran)
 
-    def _finalize(
-        self,
-        exit_code: int,
-        status: str,
-        reason: str | None,
-        sync_loop: sync.SyncLoop,
-        log: IO[bytes],
-        skip_output_sync: bool = False,
-    ) -> int:
-        self._finalizing = True
-        # The intent survives every write this runner makes, and the
-        # dispatcher only consumes it once this process has exited, so the
-        # workdir and secrets decisions below can trust this reading.
-        self._preempting = queue.is_preempted(self.job_id)
+    def _finalize(self, outcome: Outcome, sync_loop: sync.SyncLoop, log: IO[bytes]) -> int:
+        """End the attempt: final sync, workdir, mirror, the one write, secrets.
+
+        The order is the contract. The outputs are uploaded first, from inside
+        the workdir; the workdir goes (or stays) and is measured; the log and
+        state are mirrored and the mirror recorded; then the write that ends
+        the attempt -- and only then, so the status stays `running` with
+        `phase=sync` until this process has nothing left to do, and the
+        dispatcher's patience for a runner in its final sync covers all of it.
+        The mirror's `state.json` is put once more after that write, so the
+        copy that survives this host says how the job ended; the log is not
+        uploaded twice, since nothing below writes to it that a reader of the
+        mirror needs.
+        """
+        self._ending = True
         jobs.update_state(self.job_id, phase="sync")
         problems: list[str] = []
-        if skip_output_sync:
-            # The job never ran (a failed preflight, a card that is not here),
-            # so its outputs cannot exist and there is nothing to upload.
-            self._log(log, "skipping the final output sync: the job never ran")
+        if not outcome.ran:
+            self._log(log, "skipping the final output sync: the job's main phase never started")
         else:
             try:
                 sync_loop.final()
             except sync.MissingOutput as exc:
                 self._log(log, f"final sync found no outputs: {exc}")
-                status, reason, exit_code = self._blame(
-                    status, reason, exit_code, "no-outputs", problems
-                )
+                outcome = self._blame(outcome, "no-outputs", problems)
             except sync.SyncError as exc:
                 self._log(log, f"final sync FAILED: {exc}")
-                status, reason, exit_code = self._blame(status, reason, exit_code, "sync", problems)
-            if sync_loop.last_error and status == "succeeded":
+                outcome = self._blame(outcome, "sync", problems)
+            if sync_loop.last_error and outcome.status == "succeeded":
                 self._log(log, f"periodic sync had errors: {sync_loop.last_error}")
+        why = f" ({outcome.reason})" if outcome.reason else ""
+        self._log(log, f"job {self.job_id} {outcome.status}{why}")
+        coming_back = self._coming_back(outcome)
+        # After the final sync, and only then: the outputs it just uploaded
+        # live *inside* the workdir. Measured while still standing in it, so
+        # `status` never has to walk a 67k-file venv to find out.
+        jobs.update_state(
+            self.job_id,
+            workdir_bytes=self._cleanup_workdir("queued" if coming_back else outcome.status, log),
+        )
+        mirror = self._mirror(log)
+        written = self._end(outcome, coming_back, problems, log)
+        if mirror is not None and written is not None:
+            warning = sync.put_state(
+                self.job_id, mirror, runner=self.deps.command_runner, env=self.env or None
+            )
+            if warning:
+                self._log(log, f"WARNING: {warning}")
+        self._settle_secrets(written, log)
+        return outcome.exit_code
 
-        jobs.update_state(
-            self.job_id,
-            status=status,
-            reason=reason,
-            problems=problems,
-            exit_code=exit_code,
-            ended_at=jobs.utc_now(),
-            phase=None,
-            pid=None,
-            pgid=None,
-            cgroup_unit=None,
-            # The job is over, so there is nothing left to estimate; the last
-            # `progress_pct` stays, because how far it had got when it died is
-            # the useful part. A surviving `eta` would read as a promise the
-            # job is still going.
-            eta=None,
-        )
-        self._log(log, f"job {self.job_id} {status}{f' ({reason})' if reason else ''}")
-        # After the final state write, and only then: the outputs the sync just
-        # uploaded live *inside* the workdir, so anything earlier would delete
-        # the run's results on the way past.
-        removed = self._cleanup_workdir(status, log)
-        # Measure what is left while we are still standing in it: this job is
-        # over, so the figure will not change, and `status` should not have to
-        # walk a 67k-file venv to find it out again. Exact, because once is
-        # cheap -- see `cleanup.reclaimable_bytes`.
-        jobs.update_state(
-            self.job_id,
-            workdir_removed=removed,
-            workdir_bytes=0 if removed else (cleanup.workdir_size(self.job_id) or 0),
-        )
+    def _coming_back(self, outcome: Outcome) -> bool:
+        """Is this attempt going back in the queue rather than ending?
+
+        Only an attempt the preempt itself stopped: a job that ended for a
+        reason of its own before the kill landed asked for nothing, and
+        re-running it would be a retry nobody requested (`gpuc requeue` is
+        that). This reading decides what the workdir is kept for; the write
+        is `queue.next_attempt`'s own compare-and-set, which refuses if a
+        cancel has landed since, and `_end` then ends the job `cancelled`.
+        Nothing here asks whether the host is draining: a drain starts only
+        when nothing is running, and a preempt is refused once it has.
+        """
+        return outcome.reason == queue.PREEMPTED and queue.is_preempted(self.job_id)
+
+    def _cleanup_workdir(self, status: str, log: IO[bytes]) -> int:
+        """Apply the spec's `cleanup:` to `workdir/`, through the one delete
+        predicate, and return what the workdir holds afterwards.
+
+        Asked with the status this attempt is about to write, since the write
+        comes last and the outputs the workdir holds would go with it. A
+        failure to delete is logged and nothing more: the job's own outcome has
+        already been decided and uploaded, and turning a green run red over
+        leftover disk would be the wrong trade.
+        """
+        state = dataclasses.replace(jobs.read_state(self.job_id), status=status)
+        why = cleanup.may_delete(self.job_id, state, cleanup.WORKDIR, cleanup.Evidence(policy=True))
+        if why is None:
+            try:
+                freed = cleanup.remove_workdir(self.job_id)
+            except OSError as exc:
+                self._log(log, f"could not remove workdir (cleanup={self.spec.cleanup}): {exc}")
+                return cleanup.workdir_size(self.job_id) or 0
+            self._log(
+                log,
+                f"removed workdir (cleanup={self.spec.cleanup}), freeing "
+                f"{cleanup.human_bytes(freed)}; spec.json, state.json and log.txt are kept",
+            )
+            return 0
+        if status == "queued":
+            self._log(log, f"keeping workdir for the next attempt (cleanup={self.spec.cleanup})")
+        else:
+            self._log(log, f"keeping workdir: {why}")
+        return cleanup.workdir_size(self.job_id) or 0
+
+    def _mirror(self, log: IO[bytes]) -> destinations.S3 | None:
+        """Mirror the log and state and record it. None when there is no
+        mirror to put the final state to afterwards -- the host has none, or
+        the upload failed, in which case `purge` will refuse this job dir: the
+        only copy of the log lives here."""
         try:
-            warning = sync.final_meta_sync(
+            return sync.mirror_meta(
                 self.job_id,
                 self.config.s3_prefix,
                 runner=self.deps.command_runner,
                 env=self.env or None,
             )
-            if warning:
-                self._log(log, f"WARNING: {warning}")
         except sync.SyncError as exc:
-            # No mirror record, so `purge` will refuse to delete this job dir:
-            # the only copy of the log lives here.
             self._log(log, f"final state upload failed: {exc}")
-        # Only now: the final sync and the state upload authenticate with the
-        # secrets this file holds, so removing it earlier would break exactly
-        # the upload that matters most. On an ephemeral host with outputs still
-        # unconfirmed it stays: the drain gets one more go at uploading them,
-        # and the file dies with the pod in minutes either way.
-        if self._keep_secrets_for_drain():
+            return None
+
+    def _end(
+        self, outcome: Outcome, coming_back: bool, problems: list[str], log: IO[bytes]
+    ) -> str | None:
+        """The write that ends the attempt, and the status it wrote.
+
+        `queued` again for a preempted job, else the outcome; each a
+        compare-and-set from `running`. A preempt a cancel overrode in the
+        meantime ends the job `cancelled` -- the later request wins. None when
+        the state was no longer `running` at all, which is nothing this
+        process can repair and is logged rather than written over.
+        """
+        if coming_back and queue.next_attempt(self.job_id, ran=outcome.ran) is not None:
+            return "queued"
+        if outcome.reason == queue.PREEMPTED and queue.stop_requested(self.job_id) == "cancelled":
+            outcome = replace(outcome, status="cancelled", reason="cancelled")
+        if jobs.finish(self.job_id, outcome, problems=problems) is None:
+            self._log(log, "state was no longer `running` at the end; nothing written")
+            return None
+        return outcome.status
+
+    def _settle_secrets(self, written: str | None, log: IO[bytes]) -> None:
+        """Delete the job's secrets file, unless something still needs it.
+
+        Only now: the final sync and the mirror authenticate with what it
+        holds. It stays for the next attempt of a preempted job, since nothing
+        delivers secrets a second time (`gpuc preempt` never goes near the
+        machine that holds them); `cleanup.settle_secrets` decides the rest.
+        """
+        if written == "queued":
+            self._log(log, "preempted; keeping this job's secrets file for the next attempt")
+            return
+        kept = cleanup.settle_secrets(self.job_id, jobs.read_state(self.job_id))
+        if kept:
             self._log(
                 log,
-                "outputs are not confirmed uploaded; keeping this job's secrets file so the "
-                "host's drain can retry the upload before the pod goes away",
+                f"{kept}; keeping this job's secrets file so the host's drain can retry "
+                f"the upload before the pod goes away",
             )
-        elif self._preempting:
-            # The next attempt is this same job id, and nothing will deliver
-            # its secrets a second time: `gpuc preempt` never goes near the
-            # control machine that holds them.
-            self._log(log, "preempted; keeping this job's secrets file for the next attempt")
-        else:
-            paths.job_env_file(self.job_id).unlink(missing_ok=True)
-        return exit_code
-
-    def _keep_secrets_for_drain(self) -> bool:
-        if not (self.config.ephemeral and self.spec.outputs):
-            return False
-        if jobs.read_state(self.job_id).outputs_uploaded(self.spec):
-            return False
-        # The same question the drain asks before it retries anything: a job
-        # that wrote no outputs is skipped there, so keeping its credentials on
-        # disk buys a retry that will never happen.
-        return cleanup.produced_outputs(self.job_id, self.spec)
-
-    def _cleanup_workdir(self, status: str, log: IO[bytes]) -> bool:
-        """Apply the spec's `cleanup:` policy to `workdir/`, and nothing else.
-
-        A failure to delete is logged and nothing more: the job's own outcome
-        has already been decided and uploaded, and turning a green run red over
-        leftover disk would be the wrong trade.
-        """
-        if not cleanup.should_remove(self.spec.cleanup, status):
-            return False
-        if self._preempting:
-            # `cleanup: always` would take the code with it, and the workdir is
-            # the only copy on this host: the control side rsynced it once, at
-            # submit, and the next attempt re-runs from what is there.
-            self._log(log, f"preempted; keeping workdir (cleanup={self.spec.cleanup})")
-            return False
-        try:
-            freed = cleanup.remove_workdir(self.job_id)
-        except OSError as exc:
-            self._log(log, f"could not remove workdir (cleanup={self.spec.cleanup}): {exc}")
-            return False
-        self._log(
-            log,
-            f"removed workdir (cleanup={self.spec.cleanup}), freeing "
-            f"{cleanup.human_bytes(freed)}; spec.json, state.json and log.txt are kept",
-        )
-        return True
 
     @staticmethod
-    def _blame(
-        status: str, reason: str | None, exit_code: int, sync_reason: str, problems: list[str]
-    ) -> tuple[str, str | None, int]:
+    def _blame(outcome: Outcome, sync_reason: str, problems: list[str]) -> Outcome:
         """A job that succeeded and then lost its outputs failed, for that
         reason. One that was already over for a reason of its own keeps it,
         and the upload failure is a problem noted beside it."""
-        if status == "succeeded":
-            return "failed", sync_reason, 1
-        if reason is None:
-            return status, sync_reason, exit_code
+        if outcome.status == "succeeded":
+            return Outcome("failed", sync_reason, 1)
+        if outcome.reason is None:
+            return dataclasses.replace(outcome, reason=sync_reason)
         problems.append(sync_reason)
-        return status, reason, exit_code
+        return outcome
 
 
-def run_job(job_id: str, deps: RunnerDeps | None = None) -> int:
-    return JobRunner(job_id, deps).run()
+def run_job(
+    job_id: str, assigned: Sequence[str], attempt: int, deps: RunnerDeps | None = None
+) -> int:
+    return JobRunner(job_id, assigned, attempt, deps).run()

@@ -69,7 +69,6 @@ def minutes(projection: Projection) -> dict[str, float]:
         (1, 2, 0, False, None),
         (2, 2, 0, False, None),
         (3, 2, 1, True, None),
-        (0, 2, 0, False, "needs at least 1 GPU, asked for 0"),
         (3, 2, 0, False, "needs 3 GPUs, host owns 2"),
         (4, 2, 1, True, "needs 4 GPUs, host owns 2 and may borrow 1 shared"),
         (
@@ -193,7 +192,6 @@ def test_a_job_short_of_a_missing_owned_card_holds() -> None:
     ("request_", "reason"),
     [
         (req("j", 3), "needs 3 GPUs, host owns 2"),
-        (req("j", 0), "needs at least 1 GPU, asked for 0"),
         (req("j", 4, borrows=True), "needs 4 GPUs, host owns 2 and may borrow 1 shared"),
     ],
 )

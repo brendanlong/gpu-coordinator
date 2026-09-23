@@ -23,7 +23,7 @@ def test_enqueue_from_a_file(
     gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     spec_path = tmp_path / "job.json"
-    spec_path.write_text(json.dumps({"name": "demo", "command": "true", "gpus": 0}))
+    spec_path.write_text(json.dumps({"name": "demo", "command": "true", "gpus": 1}))
     code, payload = run(capsys, "enqueue", str(spec_path))
     assert code == 0
     assert isinstance(payload, dict)
@@ -41,7 +41,7 @@ def test_enqueue_starts_a_dispatcher(
     started: list[int] = []
     monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: started.append(1) or 4242)
     spec_path = tmp_path / "job.json"
-    spec_path.write_text(json.dumps({"command": "true", "gpus": 0}))
+    spec_path.write_text(json.dumps({"command": "true", "gpus": 1}))
     _, payload = run(capsys, "enqueue", str(spec_path))
     assert isinstance(payload, dict)
     assert payload["dispatcher_pid"] == 4242
@@ -52,71 +52,12 @@ def test_enqueue_from_stdin(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "sys.stdin", __import__("io").StringIO(json.dumps({"command": "true", "gpus": 0}))
+        "sys.stdin", __import__("io").StringIO(json.dumps({"command": "true", "gpus": 1}))
     )
     code, payload = run(capsys, "enqueue", "-")
     assert code == 0
     assert isinstance(payload, dict)
     assert jobs.read_state(payload["job_id"]).status == "queued"
-
-
-def test_config_merge_replaces_the_keys_it_is_given_and_no_others(
-    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """`gpuc host set` is this: the host applies the patch, atomically, with
-    the same code the dispatcher reads the file with."""
-    patch = tmp_path / "patch.json"
-    patch.write_text(json.dumps({"gpus": ["0"], "retention_days": 7.0, "env": {"HF_HOME": "/big"}}))
-    code, payload = run(capsys, "config", "--merge", str(patch))
-    assert code == 0
-    assert isinstance(payload, dict)
-    assert (payload["gpus"], payload["retention_days"]) == (["0"], 7.0)
-    # Untouched: the host's name, and every key the patch did not name.
-    assert payload["host"] == "test-host"
-    on_disk = jobs.read_config()
-    assert (on_disk.gpus, on_disk.retention_days, on_disk.env) == (["0"], 7.0, {"HF_HOME": "/big"})
-
-
-def test_config_merge_keeps_the_keys_this_build_does_not_know(
-    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A control machine on a newer build may have written fields this host has
-    never heard of; a `host set` from an older one must not drop them."""
-    document = json.loads(paths.config_file().read_text())
-    document["power_cap_watts"] = 220
-    paths.config_file().write_text(json.dumps(document))
-    patch = tmp_path / "patch.json"
-    patch.write_text(json.dumps({"idle_minutes": 5.0}))
-    _, payload = run(capsys, "config", "--merge", str(patch))
-    assert isinstance(payload, dict)
-    assert payload["power_cap_watts"] == 220
-    assert payload["idle_minutes"] == 5.0
-
-
-def test_config_merge_can_clear_a_nullable_field(
-    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    jobs.write_config(HostConfig(host="test-host", retention_days=14.0, s3_prefix="s3://b/p"))
-    patch = tmp_path / "patch.json"
-    patch.write_text(json.dumps({"retention_days": None, "s3_prefix": None}))
-    _, payload = run(capsys, "config", "--merge", str(patch))
-    assert isinstance(payload, dict)
-    assert payload["retention_days"] is None and payload["s3_prefix"] is None
-    assert jobs.read_config().retention_days is None
-
-
-def test_config_merge_on_a_host_with_no_config_writes_one(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("GPUC_HOME", str(tmp_path / "gpuc-home"))
-    patch = tmp_path / "patch.json"
-    patch.write_text(json.dumps({"host": "fresh", "gpus": ["GPU-a"]}))
-    code, payload = run(capsys, "config", "--merge", str(patch))
-    assert code == 0
-    assert isinstance(payload, dict)
-    assert (payload["host"], payload["gpus"]) == ("fresh", ["GPU-a"])
-    assert payload["schema_version"] == 1
-    assert jobs.read_config().host == "fresh"
 
 
 def test_status(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -278,7 +219,6 @@ def test_status_resolves_the_owned_gpus(
     """The control side cannot: `gpus` may name cards by index, and only the
     host knows today's numbering."""
     monkeypatch.setattr(cli.gpus, "list_gpus", lambda *_: [cli.gpus.Gpu(3, FAKE_GPUS[0])])
-    monkeypatch.setattr(cli.gpus, "resolve_owned", lambda owned, *_: ([FAKE_GPUS[0]], ["9"]))
     jobs.write_config(HostConfig(host="test-host", gpus=["3", "9"]))
 
     _, status = run(capsys, "status")
@@ -286,6 +226,26 @@ def test_status_resolves_the_owned_gpus(
     assert status["gpus"] == ["3", "9"]
     assert status["gpus_resolved"] == [{"index": 3, "uuid": FAKE_GPUS[0]}]
     assert status["gpus_unavailable"] == ["9"]
+
+
+def test_status_does_not_flag_a_queued_job_as_holding_outputs(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The checkout may well have files where the outputs go; until the job
+    has run there is nothing of its own to lose, and once an attempt has run
+    there may be."""
+    job_id = queue.enqueue(make_spec(outputs=[{"path": "results", "s3": "s3://b/{job_id}"}]))
+    (paths.workdir(job_id) / "results").mkdir(parents=True)
+    (paths.workdir(job_id) / "results" / "from-the-checkout.md").write_text("old\n")
+
+    _, status = run(capsys, "status", job_id)
+    assert isinstance(status, dict)
+    assert status["jobs"][0]["outputs_pending"] is False
+
+    jobs.update_state(job_id, ran=True)
+    _, status = run(capsys, "status", job_id)
+    assert isinstance(status, dict)
+    assert status["jobs"][0]["outputs_pending"] is True
 
 
 def test_status_reports_a_queued_jobs_estimate(
@@ -371,8 +331,8 @@ def test_reorder_records_the_new_priority_in_the_state(
 def test_preempt_records_the_intent_and_starts_a_dispatcher(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dispatcher is what puts the job back: on a host whose dispatcher had
-    died, the kill would land and nothing would ever queue the job again."""
+    """The runner queues the job again; the dispatcher launches the next
+    attempt, so a host whose dispatcher had died gets one."""
     monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: 4242)
     job_id = queue.enqueue(make_spec(priority=50))
     jobs.update_state(job_id, status="running")
@@ -579,3 +539,15 @@ def test_status_steps_over_a_borrower_short_of_somebody_elses_card(
         "it needs 1 shared card(s) somebody else is using, and when they stop "
         "is not something this host can predict"
     )
+
+
+def test_cancel_of_a_job_whose_state_cannot_be_read_is_a_refusal_not_a_traceback(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No document at all reads as a host that vanished; this host is here
+    and has the job, it just cannot say what state it is in."""
+    job_id = queue.enqueue(make_spec())
+    paths.state_file(job_id).write_text("{not json")
+    code, payload = run(capsys, "cancel", job_id)
+    assert code == 1 and isinstance(payload, dict)
+    assert payload["job_id"] == job_id and "error" in payload and "missing" not in payload

@@ -1,47 +1,68 @@
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import signal
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from gpuc.host import cleanup, destinations, jobs, paths, queue, sync, terminate
+from gpuc.host import cleanup, destinations, jobs, paths, queue, runner, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import procs as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
-from gpuc.host.jobs import HostConfig
+from gpuc.host.jobs import HostConfig, Outcome
 from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.test_runner import deps as runner_deps
 
 
 class FakeRunnerProcess:
-    """Stands in for a spawned runner: alive until the test finishes it."""
+    """Stands in for a spawned runner: claims its job as the real one does,
+    then stays alive until the test ends it the way a runner would."""
 
     _next_pid = 500000
 
-    def __init__(self, job_id: str) -> None:
+    def __init__(
+        self, job_id: str, gpus: Sequence[str], attempt: int = 1, *, claim: bool = True
+    ) -> None:
         FakeRunnerProcess._next_pid += 1
         self.pid = FakeRunnerProcess._next_pid
         self.job_id = job_id
+        self.gpus = list(gpus)
+        self.attempt = attempt
         self.returncode: int | None = None
+        self.claimed = claim and self.claim()
+
+    def claim(self) -> bool:
+        return queue.claim(
+            self.job_id,
+            self.attempt,
+            status="running",
+            gpus=self.gpus,
+            phase="setup",
+            started_at=jobs.utc_now(),
+            runner_pid=self.pid,
+            runner_boot_id=procinfo.boot_id(),
+        )
 
     def poll(self) -> int | None:
         return self.returncode
 
     def finish(self, status: str = "succeeded", reason: str | None = None) -> None:
+        """The runner's last write: the terminal status, then it exits."""
         self.returncode = 0
-        jobs.update_state(
-            self.job_id,
-            status=status,
-            reason=reason,
-            exit_code=0 if status == "succeeded" else 1,
-            ended_at=jobs.utc_now(),
-        )
+        jobs.finish(self.job_id, Outcome(status, reason, 0 if status == "succeeded" else 1))
+
+    def requeue(self) -> None:
+        """A preempted runner's last write: `queued` at the next attempt."""
+        self.returncode = runner.TERMINATED_EXIT_CODE
+        assert queue.next_attempt(self.job_id, ran=True) is not None
 
 
 class FakeClock:
@@ -59,15 +80,20 @@ def make_dispatcher(
     clock: FakeClock | None = None,
     terminate_call: terminate.TerminateCall | None = None,
     utcnow: Callable[[], datetime] | None = None,
+    *,
+    claim: bool = True,
 ) -> tuple[Dispatcher, dict[str, FakeRunnerProcess]]:
+    """A dispatcher whose runners are fakes. `claim=False` spawns runners that
+    have not claimed their job yet, for the window between spawn and claim."""
     spawned: dict[str, FakeRunnerProcess] = {}
 
-    def spawn(job_id: str) -> subprocess.Popen[bytes]:
-        proc = FakeRunnerProcess(job_id)
+    def spawn(job_id: str, gpus: Sequence[str], attempt: int) -> subprocess.Popen[bytes]:
+        proc = FakeRunnerProcess(job_id, gpus, attempt, claim=claim)
         spawned[job_id] = proc
         return cast("subprocess.Popen[bytes]", proc)
 
     deps = DispatcherDeps(
+        smi=fake_smi(),
         spawn_runner=spawn,
         monotonic=clock or FakeClock(),
         terminate_call=terminate_call or (lambda pod, key: "{}"),
@@ -154,15 +180,18 @@ def test_a_wide_job_is_not_starved_by_a_stream_of_narrow_ones(gpuc_home: Path) -
 
 
 def test_a_job_asking_for_no_gpus_fails_at_dispatch(gpuc_home: Path) -> None:
-    """`gpuc submit` refuses `gpus: 0`, so a spec that has it was queued by an
-    older build or written by hand. It is failed, with the reason, rather than
-    run on no card -- and it holds nothing up on its way out."""
-    none = queue.enqueue(make_spec(gpus=0, priority=10))
+    """`gpuc submit` refuses `gpus: 0`, so a spec that has it was written by
+    hand. The reader refuses it too, which makes it `bad-spec` like any other
+    spec that cannot be read -- and it holds nothing up on its way out."""
+    none = queue.enqueue(make_spec(gpus=1, priority=10))
+    document = json.loads(paths.spec_file(none).read_text())
+    document["gpus"] = 0
+    paths.spec_file(none).write_text(json.dumps(document))
     runnable = queue.enqueue(make_spec(gpus=1, priority=20))
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
     state = jobs.read_state(none)
-    assert (state.status, state.reason) == ("failed", "needs at least 1 GPU, asked for 0")
+    assert (state.status, state.reason, state.exit_code) == ("failed", "bad-spec", 1)
     assert none not in spawned
     assert jobs.read_state(runnable).status == "running"
 
@@ -187,12 +216,13 @@ def test_a_job_cancelled_while_queued_is_never_launched(gpuc_home: Path) -> None
     assert jobs.read_state(job_id).status == "cancelled"
 
 
-def test_a_job_cancelled_between_listing_and_claiming_is_not_launched(
+def test_a_job_cancelled_between_listing_and_launching_is_never_run(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Listing the queue and claiming a job out of it are not one operation, so
-    a cancel landing in between has to win: `queue.claim` is the compare-and-set
-    that decides it, and the card the job would have taken stays free."""
+    """Listing the queue and launching a job out of it are not one operation,
+    so a cancel landing in between has to win: the runner's claim is the
+    compare-and-set that decides it, the runner exits, and the card the job
+    would have taken is free again once it has."""
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, spawned = make_dispatcher()
     read_spec = jobs.read_spec
@@ -207,8 +237,10 @@ def test_a_job_cancelled_between_listing_and_claiming_is_not_launched(
     dispatcher.launch_ready()
 
     assert listed == [job_id], "the job was queued when the pass listed it"
-    assert spawned == {}
+    assert not spawned[job_id].claimed
     assert jobs.read_state(job_id).status == "cancelled"
+    spawned[job_id].returncode = 0
+    dispatcher.reap()
     assert dispatcher.free_gpus() == FAKE_GPUS
 
 
@@ -254,6 +286,47 @@ def test_a_runner_that_dies_without_final_state_fails_the_job(gpuc_home: Path) -
     assert dispatcher.running == {}
 
 
+def test_a_job_the_dispatcher_ends_loses_its_secrets_with_the_write(gpuc_home: Path) -> None:
+    """The runner would have deleted them as its last act; for a job that
+    never gets one, or whose runner died, the dispatcher's terminal write is
+    that last act."""
+    unreadable = queue.enqueue(make_spec(gpus=1))
+    paths.spec_file(unreadable).write_text("{not json")
+    paths.job_env_file(unreadable).write_text("HF_TOKEN=a\n")
+    died = queue.enqueue(make_spec(gpus=1))
+    paths.job_env_file(died).write_text("HF_TOKEN=b\n")
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    assert jobs.read_state(unreadable).reason == "bad-spec"
+    assert not paths.job_env_file(unreadable).exists()
+    assert paths.job_env_file(died).exists(), "a running job's secrets are its runner's"
+
+    spawned[died].returncode = -9
+    dispatcher.run_once()
+    assert jobs.read_state(died).reason == "runner-died"
+    assert not paths.job_env_file(died).exists()
+
+
+def test_a_dead_runner_on_a_pod_keeps_the_secrets_its_drain_will_upload_with(
+    gpuc_home: Path,
+) -> None:
+    """The drain retries this job's outputs with the job's own credentials,
+    and it is the only thing left that could; the file dies with the pod."""
+    configure_pod()
+    job_id = queue.enqueue(make_spec(gpus=1, outputs=[{"path": "out", "s3": "s3://b/{job_id}"}]))
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    jobs.update_state(job_id, ran=True)
+    (paths.workdir(job_id) / "out").mkdir()
+    (paths.workdir(job_id) / "out" / "late.pt").write_text("x")
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).reason == "runner-died"
+    assert paths.job_env_file(job_id).exists()
+    assert "keeping its secrets file for the drain" in paths.dispatcher_log().read_text()
+
+
 def test_a_runner_that_dies_leaves_no_output_confirmed(gpuc_home: Path) -> None:
     """A periodic tick's success says nothing about what the job wrote after
     it, and the final upload never ran: the sweep must not take the workdir."""
@@ -261,6 +334,7 @@ def test_a_runner_that_dies_leaves_no_output_confirmed(gpuc_home: Path) -> None:
     job_id = queue.enqueue(spec)
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
+    jobs.update_state(job_id, ran=True)  # as the runner writes it when main begins
     jobs.record_upload(job_id, f"s3://b/{job_id}", "out", ok_at=jobs.utc_now())
     (paths.workdir(job_id) / "out").mkdir()
     (paths.workdir(job_id) / "out" / "late.pt").write_text("x")
@@ -269,10 +343,17 @@ def test_a_runner_that_dies_leaves_no_output_confirmed(gpuc_home: Path) -> None:
     state = jobs.read_state(job_id)
     assert state.reason == "runner-died"
     assert not state.outputs_uploaded(jobs.read_spec(job_id))
-    assert cleanup.outputs_confirmed(job_id, state) == (False, "outputs not confirmed uploaded")
+    assert (
+        cleanup.outputs_pending(job_id, jobs.read_spec(job_id), state)
+        == "outputs not confirmed uploaded"
+    )
 
 
-def test_a_stop_asked_for_as_the_runner_dies_is_not_written_over(gpuc_home: Path) -> None:
+def test_a_runner_that_dies_while_preempting_leaves_a_failed_job(gpuc_home: Path) -> None:
+    """The runner is what queues a preempted job again, and a dead one queued
+    nothing: `runner-died` is the one verdict for a dead runner, whatever was
+    asked of the job, and the intent goes with it. `gpuc requeue` is the way
+    back."""
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
@@ -280,11 +361,13 @@ def test_a_stop_asked_for_as_the_runner_dies_is_not_written_over(gpuc_home: Path
     queue.preempt(job_id)
     spawned[job_id].returncode = -9
     dispatcher.run_once()
-    # The intent was seen: runner-died is a stop of ours, so the job comes back
-    # as its next attempt (and may already be running again on the freed card).
     state = jobs.read_state(job_id)
-    assert (state.attempt, state.intent) == (2, None)
-    assert state.status in ("queued", "running")
+    assert (state.status, state.reason, state.attempt, state.intent) == (
+        "failed",
+        "runner-died",
+        1,
+        None,
+    )
 
 
 def test_orphans_from_a_dead_dispatcher_are_reconciled(gpuc_home: Path) -> None:
@@ -305,16 +388,6 @@ def test_a_live_orphan_is_adopted_not_failed(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).status == "running"
     assert job_id in dispatcher.running
     assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
-
-
-def test_a_paused_marker_from_an_older_build_does_not_stop_dispatching(gpuc_home: Path) -> None:
-    """Builds before the host pause was removed left `paused` under the home;
-    a stale one is a file this build does not know, not a reason to sit idle."""
-    (paths.home() / "paused").write_text("two consecutive jobs failed with reason low-util\n")
-    job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert jobs.read_state(job_id).status == "running"
 
 
 def test_a_non_provider_host_never_self_terminates(gpuc_home: Path) -> None:
@@ -540,18 +613,21 @@ def test_a_dead_runners_leftover_scope_is_stopped_before_its_cards_are_freed(
     )
 
 
-def test_an_unreadable_state_for_a_running_job_is_runner_died_not_a_crash(
+def test_an_unreadable_state_for_a_running_job_is_logged_and_left_alone(
     gpuc_home: Path,
 ) -> None:
+    """Writing defaults over a file that cannot be read would replace its
+    priority and upload records with guesses; the job is dropped from the
+    running set (its runner is gone) and the file is somebody's to look at."""
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
     spawned[job_id].returncode = 0
     paths.state_file(job_id).write_text("{ truncated")
     dispatcher.run_once()
-    state = jobs.read_state(job_id)
-    assert (state.status, state.reason) == ("failed", "runner-died")
+    assert paths.state_file(job_id).read_text() == "{ truncated"
     assert dispatcher.running == {}
+    assert "state.json is unreadable" in paths.dispatcher_log().read_text()
 
 
 def test_run_once_failures_are_logged_and_eventually_give_up(
@@ -593,7 +669,11 @@ def test_an_occasional_failure_does_not_stop_the_loop(gpuc_home: Path) -> None:
     assert dispatcher.consecutive_failures == 0
 
 
-def test_an_orphan_from_a_previous_boot_is_not_adopted(gpuc_home: Path) -> None:
+def test_an_orphan_from_a_previous_boot_is_not_adopted_and_nothing_of_it_is_killed(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failed `runner-died`, and its recorded group left alone: after a
+    reboot that number belongs to whatever the kernel gave it to next."""
     job_id = queue.enqueue(make_spec(gpus=1))
     jobs.update_state(
         job_id,
@@ -601,10 +681,14 @@ def test_an_orphan_from_a_previous_boot_is_not_adopted(gpuc_home: Path) -> None:
         gpus=[FAKE_GPUS[0]],
         runner_pid=os.getpid(),
         runner_boot_id="0000-a-previous-boot",
+        pgid=os.getpid(),
     )
+    signals = record_signals(monkeypatch)
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
     assert jobs.read_state(job_id).reason == "runner-died"
+    assert signals == []
+    assert dispatcher.free_gpus() == FAKE_GPUS
 
 
 def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
@@ -689,53 +773,11 @@ def test_an_accepted_job_is_never_swept_however_long_it_waits(gpuc_home: Path) -
     assert paths.job_dir(job_id).is_dir()
 
 
-def test_a_runner_left_unrecorded_by_a_dead_dispatcher_is_adopted(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`launch_ready` writes `running` before it has a process to name. A
-    dispatcher killed between that write and the runner pid leaves a job that
-    reads as abandoned while its runner is training: failing it would lose the
-    job and hand the card it is on to whatever starts next."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], started_at=jobs.utc_now())
-    monkeypatch.setattr(host_dispatcher, "live_runner_pids", lambda: {job_id: os.getpid()})
-
-    dispatcher, _ = make_dispatcher()
-    dispatcher.adopt_orphans()
-
-    assert jobs.read_state(job_id).status == "running"
-    assert dispatcher.running[job_id].pid == os.getpid()
-    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
-
-
-def test_a_preempted_job_syncing_under_an_unrecorded_runner_is_not_queued_again(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The same window on the way out: a runner signalled before it recorded
-    itself still writes its final state and then spends the whole output sync
-    alive. Queued on that evidence, attempt 2 would start in the workdir
-    attempt 1 is still uploading from."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    queue.enqueue(make_spec(gpus=2, priority=1))
-    jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
-    queue.preempt(job_id)
-    jobs.update_state(job_id, status="failed", reason="preempted", ended_at=jobs.utc_now())
-    monkeypatch.setattr(host_dispatcher, "live_runner_pids", lambda: {job_id: os.getpid()})
-
-    dispatcher, _ = make_dispatcher()
-    dispatcher.adopt_orphans()
-
-    assert jobs.read_state(job_id).status == "failed"
-    assert queue.is_preempted(job_id)
-    assert job_id in dispatcher.running
-
-
-def test_a_running_job_with_no_runner_anywhere_still_fails(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_running_state_naming_no_runner_is_runner_died(gpuc_home: Path) -> None:
+    """A `running` state is written by the runner that claimed it, naming
+    itself; one that names nobody has no process behind it to adopt."""
     job_id = queue.enqueue(make_spec(gpus=1))
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]])
-    monkeypatch.setattr(host_dispatcher, "live_runner_pids", dict)
 
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
@@ -744,12 +786,12 @@ def test_a_running_job_with_no_runner_anywhere_still_fails(
     assert dispatcher.free_gpus() == [FAKE_GPUS[0], FAKE_GPUS[1]]
 
 
-def test_the_runner_the_dispatcher_spawns_is_one_the_scan_recognises(
+def test_the_runner_is_started_with_its_assignment(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The command is built here and read back in `runner`: two modules, one
-    fact. A runner the spawner starts and the scan cannot name is adopted by
-    nobody, and nothing else would notice the two had drifted apart."""
+    """The cards travel on the command line, and the runner claims the job
+    with them; where the host has user systemd the runner gets a scope of its
+    own, named without the assignment in it."""
     job_id = "20250101-000000-abcdef"
     captured: list[list[str]] = []
 
@@ -760,17 +802,26 @@ def test_the_runner_the_dispatcher_spawns_is_one_the_scan_recognises(
             captured.append(argv)
 
     monkeypatch.setattr(host_dispatcher.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(host_dispatcher.scope, "probe", lambda: False)
-    host_dispatcher.default_spawn_runner(job_id)
-    monkeypatch.setattr(host_dispatcher.scope, "probe", lambda: True)
-    host_dispatcher.default_spawn_runner(job_id)
+    monkeypatch.setenv(host_dispatcher.scope.ISOLATION_ENV, host_dispatcher.scope.PGID)
+    host_dispatcher.default_spawn_runner(job_id, FAKE_GPUS, 2)
+    monkeypatch.setenv(host_dispatcher.scope.ISOLATION_ENV, host_dispatcher.scope.CGROUP)
+    host_dispatcher.default_spawn_runner(job_id, FAKE_GPUS, 2)
 
     plain, scoped = captured
-    assert plain[1:] == ["-m", "gpuc.host", "run", job_id]
+    assert plain[1:] == [
+        "-m",
+        "gpuc.host",
+        "run",
+        job_id,
+        "--gpus",
+        ",".join(FAKE_GPUS),
+        "--attempt",
+        "2",
+    ]
     assert scoped[:3] == ["systemd-run", "--user", "--scope"]
     assert scoped[scoped.index("--") + 1 :] == plain
-    assert procinfo.runner_job_id(plain) == job_id
-    assert procinfo.runner_job_id(scoped) == job_id
+    unit = next(arg for arg in scoped if arg.startswith("--unit="))
+    assert unit.startswith(f"--unit=gpuc-run-{job_id}-") and "," not in unit
 
 
 def test_a_runner_in_its_final_sync_is_given_a_long_patience_before_the_ladder(
@@ -803,39 +854,161 @@ def test_a_runner_in_its_final_sync_is_given_a_long_patience_before_the_ladder(
     assert (spawned[job_id].pid, signal.SIGTERM) in signals
 
 
-def test_launch_records_the_runner_identity_but_no_job_pgid_yet(gpuc_home: Path) -> None:
+def test_launch_writes_nothing_until_the_runner_claims(gpuc_home: Path) -> None:
+    """The runner claims the job itself, so a `running` state always names a
+    live runner. Until then the job is still `queued` on disk, and the entry
+    in `running` is what keeps the next pass from launching it twice."""
     job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher, spawned = make_dispatcher()
+    dispatcher, spawned = make_dispatcher(claim=False)
     dispatcher.run_once()
     state = jobs.read_state(job_id)
+    assert (state.status, state.runner_pid, state.gpus) == ("queued", None, [])
+    assert job_id in dispatcher.running
+    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
+
+    dispatcher.run_once()
+    assert list(spawned) == [job_id], "launched twice"
+
+    assert spawned[job_id].claim()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.runner_pid, state.gpus) == (
+        "running",
+        spawned[job_id].pid,
+        [FAKE_GPUS[0]],
+    )
     assert state.pgid is None
-    assert state.runner_pid == spawned[job_id].pid
-    assert state.runner_boot_id == procinfo.boot_id()
 
 
-def test_a_stop_in_the_launch_window_never_signals_the_runners_own_group(
+def test_a_cancel_before_the_claim_wins_and_the_runner_exits(gpuc_home: Path) -> None:
+    """A queued job is cancelled on the spot, claim or no claim: the runner's
+    compare-and-set fails, it exits quietly, and the card is free again."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher(claim=False)
+    dispatcher.run_once()
+    assert queue.cancel(job_id) == "cancelled"
+    assert not spawned[job_id].claim()
+    spawned[job_id].returncode = 0
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "cancelled"
+    assert dispatcher.running == {}
+    assert dispatcher.free_gpus() == FAKE_GPUS
+
+
+def test_a_runner_that_dies_before_claiming_fails_the_job(gpuc_home: Path) -> None:
+    """Still `queued` at the attempt this dispatcher launched, with the runner
+    gone: without this the job would be launched again every pass, for ever."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher(claim=False)
+    dispatcher.run_once()
+    spawned[job_id].returncode = 1
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "runner-died")
+    assert list(spawned) == [job_id]
+    assert dispatcher.free_gpus() == FAKE_GPUS
+
+
+def test_a_claim_lost_to_another_runner_is_adopted_not_failed(gpuc_home: Path) -> None:
+    """A dispatcher killed mid-spawn leaves a runner its successor knows
+    nothing about; the successor spawns its own, the two race for the one
+    claim, and exactly one wins. When the winner is not ours, the job is
+    running under a runner we did not start, and it is adopted."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher(claim=False)
+    dispatcher.run_once()
+    other = FakeRunnerProcess(job_id, [FAKE_GPUS[0]], claim=False)
+    other.pid = os.getpid()
+    assert other.claim()
+    assert not spawned[job_id].claim()
+    spawned[job_id].returncode = 0
+    dispatcher.run_once()
+    assert jobs.read_state(job_id).status == "running"
+    assert dispatcher.running[job_id].runner_pid == os.getpid()
+    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
+    assert "adopted" in paths.dispatcher_log().read_text()
+
+
+def test_a_claim_lost_on_other_cards_keeps_both_sets_busy_until_it_is_adopted(
+    gpuc_home: Path,
+) -> None:
+    """The runner we lost the claim to was given its cards by the dispatcher
+    we took over from, and they need not be the ones we chose. From its claim
+    until our runner is reaped and the job adopted, the cards on disk are in
+    use and the cards in `running` are what stops a second launch; a job may
+    be handed neither."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher(claim=False)
+    dispatcher.run_once()
+    assert dispatcher.running[job_id].gpus == [FAKE_GPUS[0]]
+
+    theirs = FakeRunnerProcess(job_id, [FAKE_GPUS[1]], claim=False)
+    theirs.pid = os.getpid()
+    assert theirs.claim()
+    waiting = queue.enqueue(make_spec(gpus=1))
+    dispatcher.run_once()
+    assert dispatcher.free_gpus() == []
+    assert jobs.read_state(waiting).status == "queued"
+
+    assert not spawned[job_id].claim()
+    spawned[job_id].returncode = 0
+    dispatcher.run_once()
+    assert dispatcher.running[job_id].gpus == [FAKE_GPUS[1]]
+    assert spawned[waiting].gpus == [FAKE_GPUS[0]]
+
+
+def test_a_long_final_sync_after_a_cancel_is_never_sigkilled(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Until the state names the job's group, the runner is the only member of
-    its own -- and killing it there kills the one process that can stop the job
-    cleanly and write down what happened to it."""
+    """The bug this design exists for. The runner's terminal write is its last
+    act, so a cancelled job stays `running` with `phase=sync` for the whole of
+    its final upload and cleanup, and the dispatcher's patience for a runner
+    in its final sync covers all of it. The old order wrote the terminal
+    status first, cleared no intent, and the ladder then SIGKILLed the runner
+    mid-cleanup once a cancel had taken over three grace periods: no mirror
+    record, secrets left behind."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+    jobs.write_config(HostConfig(host="h", gpus=list(FAKE_GPUS), s3_prefix="s3://b/gpuc/h"))
     clock = FakeClock()
-    dispatcher, _ = make_dispatcher(clock=clock)
-    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher(clock=clock)
+    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 300"))
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
     dispatcher.run_once()
-    assert jobs.read_state(job_id).pgid is None
-
     signals = record_signals(monkeypatch)
-    queue.cancel(job_id)
-    dispatcher.escalate_stops()
-    clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
-    dispatcher.escalate_stops()
-    assert signals == []
+    assert queue.cancel(job_id) == "cancelling"
 
-    # The runner publishes the job's group, and only then is it signalled.
-    jobs.update_state(job_id, pgid=123456)
-    dispatcher.escalate_stops()
-    assert signals == [(123456, signal.SIGKILL)]
+    def slow_final(_self: sync.SyncLoop) -> None:
+        # Four grace periods pass while the upload runs, with a dispatcher
+        # pass at each: every rung of the ladder would have fired by now.
+        for _ in range(4):
+            clock.advance(dispatcher.deps.kill_grace_s + 0.5)
+            dispatcher.escalate_stops()
+
+    monkeypatch.setattr(sync.SyncLoop, "final", slow_final)
+    # The real runner, in this process, on the job the fake was spawned for:
+    # the fake pid's claim is rewritten with our own.
+    jobs.update_state(job_id, status="queued", runner_pid=None)
+    code = runner.run_job(
+        job_id,
+        [FAKE_GPUS[0]],
+        1,
+        runner_deps(
+            command_runner=lambda argv, timeout=None, env=None: sync.CommandResult(argv, 0, "")
+        ),
+    )
+    assert code == runner.TERMINATED_EXIT_CODE
+    assert not any(target == os.getpid() for target, _ in signals), signals
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.intent, state.phase) == (
+        "cancelled",
+        "cancelled",
+        None,
+        None,
+    )
+    assert state.mirrored
+    assert not paths.job_env_file(job_id).exists()
+    spawned[job_id].returncode = code
+    dispatcher.run_once()
+    assert dispatcher.running == {}
 
 
 def test_spawned_children_get_the_home_tool_dirs_on_path(
@@ -904,7 +1077,7 @@ def test_the_workdir_horizon_sweeps_without_a_purge_horizon(gpuc_home: Path) -> 
     assert paths.workdir(young).is_dir()
     # Only the workdir: the record of the run is what `retention_days` takes.
     assert paths.state_file(old).exists()
-    assert jobs.read_state(old).workdir_removed is True
+    assert jobs.read_state(old).workdir_bytes == 0
     assert "workdirs (1 days): removed 1 workdir(s)" in paths.dispatcher_log().read_text()
 
 
@@ -950,7 +1123,7 @@ def test_the_workdir_horizon_leaves_outputs_that_never_reached_the_mirror(
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
     job_id = queue.enqueue(spec)
     ended = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-    jobs.update_state(job_id, status="failed", ended_at=ended)
+    jobs.update_state(job_id, status="failed", ended_at=ended, ran=True)
     results = paths.workdir(job_id) / "results"
     results.mkdir(parents=True, exist_ok=True)
     (results / "checkpoint.pt").write_bytes(b"w" * 4096)
@@ -1045,7 +1218,7 @@ def test_retention_never_touches_a_running_job(gpuc_home: Path) -> None:
 def job_with_pending_outputs() -> str:
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
     job_id = queue.enqueue(spec)
-    jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now())
+    jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now(), ran=True)
     (paths.workdir(job_id) / "results").mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "results" / "a.txt").write_text("hi\n")
     return job_id
@@ -1194,13 +1367,12 @@ def test_an_auto_preempt_stop_is_only_asked_for_once(
 def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_running(
     gpuc_home: Path,
 ) -> None:
-    """State says `running` a line before the spawn, so a spawn that raises
-    used to leave a job nothing was running: no runner pid to miss, no ended_at,
-    and its GPUs handed back while `gpuc status` still showed it live."""
+    """A job nothing is running must not sit in the queue being launched
+    again every pass, nor hold cards; it is failed, with the reason."""
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, _ = make_dispatcher()
 
-    def refuse(_job_id: str) -> subprocess.Popen[bytes]:
+    def refuse(_job_id: str, _gpus: Sequence[str], _attempt: int) -> subprocess.Popen[bytes]:
         raise OSError("fork: Resource temporarily unavailable")
 
     dispatcher.deps.spawn_runner = refuse
@@ -1247,23 +1419,24 @@ def test_a_preempt_the_runner_ignores_is_escalated_and_the_job_still_comes_back(
     assert signals[-1] == (spawned[job_id].pid, signal.SIGKILL)
     assert "escalating" in paths.dispatcher_log().read_text()
 
-    spawned[job_id].finish(status="failed", reason="preempted")
+    spawned[job_id].requeue()
     dispatcher.run_once()
     assert jobs.read_state(job_id).status == "queued"
     assert jobs.read_state(waiting).status == "running"
 
 
-def test_the_drain_bounds_each_upload_and_skips_sync_preflight_failures(
+def test_the_drain_bounds_each_upload_and_skips_jobs_that_produced_nothing(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unbounded upload can hang a billing pod for hours, and a job that
-    failed its sync preflight proved before it ran that these uploads cannot
-    work -- retrying it three times only burns the budget."""
+    declared outputs and never wrote them -- one that failed its sync
+    preflight, say -- has nothing to retry; three tries would only burn the
+    budget the jobs with real outputs need."""
     monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     pending = job_with_pending_outputs()
-    hopeless = job_with_pending_outputs()
+    hopeless = queue.enqueue(make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}]))
     jobs.update_state(hopeless, status="failed", reason="sync-preflight", exit_code=1)
 
     calls: list[tuple[list[str], float | None]] = []
@@ -1307,23 +1480,6 @@ def test_gpus_owned_by_index_are_dispatched_as_uuids(gpuc_home: Path) -> None:
     assert jobs.read_state(job_id).gpus == [FAKE_GPUS[1]]
     assert dispatcher.owned_gpus() == [FAKE_GPUS[1]]
     assert dispatcher.free_gpus() == []
-
-
-def test_an_orphan_holding_an_index_is_adopted_as_the_uuid_that_index_names(
-    gpuc_home: Path,
-) -> None:
-    """A job launched before assignments were resolved host-side has an index in
-    its state. Adopted as-is it would match nothing owned, so its card would
-    read free and be handed to a second job while the first is still on it."""
-    configure_indices(["0", "1"])
-    dispatcher, _ = make_dispatcher()
-    dispatcher.deps.smi = fake_smi()
-    job_id = queue.enqueue(make_spec(gpus=1))
-    jobs.update_state(job_id, status="running", gpus=["1"], runner_pid=os.getpid())
-    dispatcher.adopt_orphans()
-
-    assert job_id in dispatcher.running
-    assert dispatcher.free_gpus() == [FAKE_GPUS[0]]
 
 
 def test_an_owned_index_the_host_cannot_see_is_not_handed_out(gpuc_home: Path) -> None:
@@ -1378,7 +1534,7 @@ def test_a_preempted_job_goes_back_in_the_queue_when_its_runner_stops(gpuc_home:
     # Still holding its cards: the runner has not stopped it yet.
     assert jobs.read_state(urgent).status == "queued"
 
-    spawned[running].finish(status="failed", reason="preempted")
+    spawned[running].requeue()
     dispatcher.run_once()
     assert jobs.read_state(urgent).status == "running"
     state = jobs.read_state(running)
@@ -1391,94 +1547,32 @@ def test_a_preempted_job_goes_back_in_the_queue_when_its_runner_stops(gpuc_home:
     assert jobs.read_state(running).attempt == 2
 
 
-def test_a_preempted_job_whose_runner_died_still_comes_back(gpuc_home: Path) -> None:
-    """`failed: runner-died` is the dispatcher's own verdict on the attempt that
-    was stopping, and it must not be the last word on a job somebody asked to
-    keep."""
-    job_id = queue.enqueue(make_spec(gpus=2))
-    dispatcher, spawned = make_dispatcher()
-    dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=1))
-    queue.preempt(job_id)
-    spawned[job_id].returncode = -9
-    dispatcher.run_once()
-    state = jobs.read_state(job_id)
-    assert (state.status, state.attempt) == ("queued", 2)
-
-
-def test_a_job_preempted_while_no_dispatcher_was_alive_is_picked_up_at_startup(
+def test_a_preempted_job_still_finalizing_is_adopted_and_nothing_is_launched_into_it(
     gpuc_home: Path,
 ) -> None:
-    """Nothing else would ever look at the intent: the dispatcher that would
-    have reaped this job is the one that died."""
-    job_id = queue.enqueue(make_spec(gpus=1))
-    jobs.update_state(job_id, status="running")
-    waiting = queue.enqueue(make_spec(gpus=1, priority=1))
-    queue.preempt(job_id)
-    jobs.update_state(
-        job_id, status="failed", reason="preempted", exit_code=143, ended_at=jobs.utc_now()
-    )
-
-    dispatcher, _ = make_dispatcher()
-    dispatcher.adopt_orphans()
-    assert jobs.read_state(job_id).status == "queued"
-    assert [e.job_id for e in queue.list_queued()] == [waiting, job_id]
-
-
-def test_a_preempted_job_still_finalizing_is_not_queued_under_its_own_runner(
-    gpuc_home: Path,
-) -> None:
-    """The runner that is still uploading owns that workdir. Queueing the job
-    now would launch the next attempt straight into it -- two processes, one
-    directory -- so the runner is adopted and `reap` does it afterwards."""
+    """A preempted job whose runner is still there is a running job like any
+    other: its status says so until the runner's last write. The runner is
+    adopted, and the next attempt waits for the write that queues it."""
     job_id = queue.enqueue(make_spec(gpus=1))
     # Two cards, so it cannot start while the finalizing runner holds one.
     queue.enqueue(make_spec(gpus=2, priority=1))
     jobs.update_state(
         job_id,
         status="running",
+        phase="sync",
         gpus=[FAKE_GPUS[0]],
         runner_pid=os.getpid(),
         runner_boot_id=procinfo.boot_id(),
         runner_starttime=procinfo.starttime(os.getpid()),
     )
     queue.preempt(job_id)
-    # ...and now it writes its final state, while still syncing.
-    jobs.update_state(job_id, status="failed", reason="preempted", ended_at=jobs.utc_now())
 
     dispatcher, spawned = make_dispatcher()
     dispatcher.adopt_orphans()
-    assert jobs.read_state(job_id).status == "failed"
-    assert queue.is_preempted(job_id)
     assert job_id in dispatcher.running
-    # Nothing is launched: not the preempted job into the workdir its own
-    # runner is still writing, and nothing onto the cards it still holds.
+    assert dispatcher.free_gpus() == [FAKE_GPUS[1]]
     dispatcher.run_once()
     assert spawned == {}
-
-
-def test_a_preempted_job_is_not_queued_again_on_a_host_that_is_going_away(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Queued onto a pod that is terminating, the job would be lost outright --
-    and the drain would stop counting its outputs as unconfirmed, because that
-    list is finished jobs. Left finished, it keeps both."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "key")
-    configure_pod(idle_minutes=600.0)
-    dispatcher, spawned = make_dispatcher()
-    job_id = queue.enqueue(make_spec(gpus=1, command="sleep 600"))
-    dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=1, priority=1))
-    queue.preempt(job_id)
-    spawned[job_id].finish(status="failed", reason="preempted")
-    paths.draining_file().write_text("idle\n")
-    dispatcher.run_once()
-
-    state = jobs.read_state(job_id)
-    assert (state.status, state.reason) == ("failed", "preempted")
-    assert not queue.is_queued(job_id)
-    assert not queue.is_preempted(job_id)
-    assert "this host is draining" in paths.dispatcher_log().read_text()
 
 
 def test_a_stop_another_process_asked_for_gets_an_escalation_clock_of_its_own(
@@ -1521,8 +1615,7 @@ def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     queue.enqueue(make_spec(priority=1))  # what the preempt is making room for
     jobs.update_state(job_id, status="running", ended_at=None)
     queue.preempt(job_id)
-    jobs.update_state(job_id, status="failed", reason="preempted", ended_at=jobs.utc_now())
-    assert queue.requeue_preempted(job_id) == 2
+    assert queue.next_attempt(job_id, ran=True) == 2
 
     dispatcher, _ = make_dispatcher()
     assert dispatcher.unconfirmed_output_jobs() == [job_id]
@@ -1537,13 +1630,12 @@ def test_a_running_jobs_outputs_are_left_to_its_own_runner(gpuc_home: Path) -> N
     assert dispatcher.unconfirmed_output_jobs() == []
 
 
-def test_a_preempted_job_whose_runner_died_before_the_dispatcher_did_comes_back(
+def test_a_preempted_job_whose_runner_died_before_the_dispatcher_did_is_failed(
     gpuc_home: Path,
 ) -> None:
-    """Startup finds it still marked `running` with nobody running it. Without
-    the re-queue here nothing would look at the intent again until some later
-    dispatcher started -- and then it would resurrect a job reported failed
-    hours before."""
+    """Startup finds it still marked `running` with nobody running it: the
+    same verdict as at any other time, since the runner that would have
+    queued it again is gone."""
     job_id = queue.enqueue(make_spec(gpus=1))
     jobs.update_state(job_id, status="running", gpus=[FAKE_GPUS[0]], runner_pid=2**30)
     queue.enqueue(make_spec(gpus=1, priority=1))
@@ -1552,8 +1644,12 @@ def test_a_preempted_job_whose_runner_died_before_the_dispatcher_did_comes_back(
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
     state = jobs.read_state(job_id)
-    assert (state.status, state.attempt) == ("queued", 2)
-    assert not queue.is_preempted(job_id)
+    assert (state.status, state.reason, state.attempt, state.intent) == (
+        "failed",
+        "runner-died",
+        1,
+        None,
+    )
 
 
 # -- shared GPUs: cards we borrow rather than own ------------------------------
@@ -1809,7 +1905,7 @@ def test_an_auto_preempt_job_gives_its_cards_to_a_more_important_one(gpuc_home: 
     assert queue.stop_requested(cheap) == "preempted"
     assert f"auto_preempt: stopping so job {urgent}" in paths.log_file(cheap).read_text()
 
-    spawned[cheap].finish(status="failed", reason="preempted")
+    spawned[cheap].requeue()
     dispatcher.run_once()
     assert jobs.read_state(urgent).status == "running"
     state = jobs.read_state(cheap)
@@ -1959,14 +2055,14 @@ def test_the_cards_freed_for_a_waiting_job_are_not_handed_back_to_the_stopped_on
     dispatcher.run_once()
     assert queue.is_preempted(first) and queue.is_preempted(second)
 
-    spawned[first].finish(status="failed", reason="preempted")
+    spawned[first].requeue()
     dispatcher.run_once()
     # Queued again, and *not* running on the card it just gave up: that card is
     # being held for the job it was freed for.
     assert jobs.read_state(first).status == "queued"
     assert jobs.read_state(waiting).status == "queued"
 
-    spawned[second].finish(status="failed", reason="preempted")
+    spawned[second].requeue()
     dispatcher.run_once()
     assert jobs.read_state(waiting).status == "running"
     assert jobs.read_state(waiting).gpus == FAKE_GPUS
@@ -1989,11 +2085,11 @@ def test_a_manual_preempt_in_flight_does_not_donate_its_cards_twice(gpuc_home: P
 
     dispatcher.run_once()
     assert queue.is_preempted(cheap)  # the other card, so the big job can start
-    spawned[manual].finish(status="failed", reason="preempted")
+    spawned[manual].requeue()
     dispatcher.run_once()
     assert jobs.read_state(manual).status == "queued"  # and not running again
 
-    spawned[cheap].finish(status="failed", reason="preempted")
+    spawned[cheap].requeue()
     dispatcher.run_once()
     assert jobs.read_state(waiting).status == "running"
 
@@ -2035,7 +2131,7 @@ def test_cards_held_for_a_job_that_is_cancelled_are_handed_out_again(gpuc_home: 
     assert queue.is_preempted(cheap)
 
     queue.cancel(waiting)
-    spawned[cheap].finish(status="failed", reason="preempted")
+    spawned[cheap].requeue()
     dispatcher.run_once()
     assert jobs.read_state(cheap).status == "running"
     assert jobs.read_state(cheap).attempt == 2
@@ -2163,7 +2259,7 @@ def test_nothing_is_stopped_for_a_job_the_queue_ahead_would_take_the_cards_from(
     queue.cancel(wide)
     dispatcher.run_once()
     assert queue.is_preempted(cheap)
-    spawned[cheap].finish(status="failed", reason="preempted")
+    spawned[cheap].requeue()
     dispatcher.run_once()
     assert jobs.read_state(narrow).status == "running"
     assert jobs.read_state(stuck).status == "running"
@@ -2192,7 +2288,7 @@ def test_a_job_the_queue_steps_over_does_not_hold_up_a_preempt_behind_it(
     dispatcher.run_once()
     assert queue.is_preempted(cheap)
 
-    spawned[cheap].finish(status="failed", reason="preempted")
+    spawned[cheap].requeue()
     dispatcher.run_once()
     assert jobs.read_state(narrow).status == "running"
     assert jobs.read_state(stuck).status == "running"
@@ -2216,7 +2312,7 @@ def test_a_free_shared_card_counts_towards_the_gap_a_stop_has_to_cover(
     assert queue.is_preempted(first)  # the least important of the two, and only it
     assert not queue.is_preempted(second)
 
-    spawned[first].finish(status="failed", reason="preempted")
+    spawned[first].requeue()
     dispatcher.run_once()
     assert jobs.read_state(waiting).status == "running"
     assert jobs.read_state(waiting).gpus == [FAKE_GPUS[1], SHARED_GPUS[0]]
@@ -2293,3 +2389,59 @@ def test_the_job_the_queue_is_stuck_on_is_the_last_one_asked(gpuc_home: Path) ->
     assert not queue.is_preempted(borrower)
     assert jobs.read_state(stuck).status == "queued"
     assert jobs.read_state(waiting).status == "queued"
+
+
+def test_a_runner_that_dies_before_main_leaves_nothing_pending_and_no_secrets(
+    gpuc_home: Path,
+) -> None:
+    """The runner writes `ran` as main begins, and a dead runner's terminal
+    write keeps that answer rather than guessing from its claim: a job that
+    died in setup on a pod has no result, so the checkout's own files under
+    `outputs:` are not held for the drain to upload, and the secrets go."""
+    configure_pod()
+    job_id = queue.enqueue(make_spec(gpus=1, outputs=[{"path": "out", "s3": "s3://b/{job_id}"}]))
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    (paths.workdir(job_id) / "out").mkdir(parents=True)
+    (paths.workdir(job_id) / "out" / "committed.pt").write_text("came with the checkout")
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    spawned[job_id].returncode = -9
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.ran) == ("failed", "runner-died", False)
+    assert cleanup.outputs_pending(job_id, jobs.read_spec(job_id), state) is None
+    assert not paths.job_env_file(job_id).exists()
+
+
+def test_a_card_claimed_between_the_plan_and_the_launch_is_not_handed_out(
+    gpuc_home: Path,
+) -> None:
+    """The last window of the handover race: a runner the previous dispatcher
+    started claims a card after this pass planned around it being free. The
+    launch re-reads the claims and leaves that job for the next pass."""
+    both = {queue.enqueue(make_spec(gpus=1)), queue.enqueue(make_spec(gpus=1))}
+    dispatcher, spawned = make_dispatcher(claim=False)
+    real_spawn = dispatcher.deps.spawn_runner
+    foreign: list[FakeRunnerProcess] = []
+
+    def spawn_then_lose_the_other_card(
+        job_id: str, gpus: Sequence[str], attempt: int
+    ) -> subprocess.Popen[bytes]:
+        proc = real_spawn(job_id, gpus, attempt)
+        if not foreign:
+            # While the first launch of the pass is under way, a runner the
+            # old dispatcher started claims the other job on the other card.
+            (other,) = both - {job_id}
+            (card,) = set(FAKE_GPUS) - set(gpus)
+            theirs = FakeRunnerProcess(other, [card], claim=True)
+            theirs.pid = os.getpid()
+            foreign.append(theirs)
+        return proc
+
+    dispatcher.deps = replace(dispatcher.deps, spawn_runner=spawn_then_lose_the_other_card)
+    dispatcher.run_once()
+    (launched,) = spawned
+    (other,) = both - {launched}
+    assert other not in dispatcher.running
+    assert jobs.read_state(other).gpus == foreign[0].gpus
+    assert "claimed by a runner since this pass began" in paths.dispatcher_log().read_text()

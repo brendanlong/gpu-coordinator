@@ -38,7 +38,8 @@ class SyncError(RuntimeError):
 
 class MissingOutput(SyncError):
     """The output path the spec names is not there. Not the same failure as a
-    broken upload: nothing was produced, so `sync` would be a misleading reason."""
+    broken upload: nothing was produced, so `sync` would be a misleading
+    reason. Raised by `sync.sync_output`, the one place that looks."""
 
 
 class PreflightFailed(RuntimeError):
@@ -136,11 +137,7 @@ def _excludes(names: Sequence[str]) -> list[str]:
     return args
 
 
-def _run(
-    argv: list[str], local: Path, runner: CommandRunner, timeout: float | None, env: Env
-) -> None:
-    if not local.exists():
-        raise MissingOutput(f"output path does not exist: {local}")
+def _run(argv: list[str], runner: CommandRunner, timeout: float | None, env: Env) -> None:
     result = runner(argv, timeout, env)
     if result.returncode != 0:
         _fail(result)
@@ -216,7 +213,7 @@ class S3(Destination):
     ) -> None:
         aws = _binary("aws", env, f"{local} to {self.uri}")
         argv = [aws, "s3", "sync", str(local), self.uri, "--only-show-errors", *_excludes(exclude)]
-        _run(argv, local, runner, timeout, env)
+        _run(argv, runner, timeout, env)
 
     def put_file(
         self,
@@ -230,7 +227,6 @@ class S3(Destination):
         aws = _binary("aws", env, f"{local} to {self.uri}")
         _run(
             [aws, "s3", "cp", str(local), f"{self.uri}/{name}", "--only-show-errors"],
-            local,
             runner,
             timeout,
             env,
@@ -306,7 +302,7 @@ class HuggingFace(Destination):
     ) -> None:
         hf = _binary("hf", env, f"{local} to {self.uri}")
         argv = [hf, "upload", self.repo, str(local), self.path, *_excludes(exclude)]
-        _run(argv, local, runner, timeout, env)
+        _run(argv, runner, timeout, env)
 
     def put_file(
         self,
@@ -318,7 +314,7 @@ class HuggingFace(Destination):
         env: Env = None,
     ) -> None:
         hf = _binary("hf", env, f"{local} to {self.uri}")
-        _run([hf, "upload", self.repo, str(local), self._target(name)], local, runner, timeout, env)
+        _run([hf, "upload", self.repo, str(local), self._target(name)], runner, timeout, env)
 
     def preflight(
         self, probe: Path, *, runner: CommandRunner = run_command, env: Env = None

@@ -17,7 +17,7 @@ from gpuc.host import __main__ as host_cli
 from gpuc.host import cleanup, destinations, jobs, paths, queue, runner
 from gpuc.host.jobs import JobSpec
 from tests.conftest import make_spec
-from tests.test_runner import deps, log_of, prepare
+from tests.test_runner import deps, log_of, prepare, run, stopping_after_claim
 
 # -- the policy matrix --------------------------------------------------------
 
@@ -66,7 +66,7 @@ def run_with_policy(policy: str, command: str) -> str:
     job_id = prepare(command=command, cleanup=policy)
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "big.bin").write_bytes(b"x" * 4096)
-    runner.run_job(job_id, deps())
+    run(job_id)
     return job_id
 
 
@@ -78,14 +78,12 @@ def test_the_runner_applies_the_policy(
     job_id = prepare(command=command, cleanup=policy)
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "big.bin").write_bytes(b"x" * 4096)
-    if status == "cancelled":
-        queue.cancel(job_id)
-    runner.run_job(job_id, deps())
+    smi = stopping_after_claim(job_id, queue.cancel) if status == "cancelled" else None
+    run(job_id, deps(smi=smi) if smi else None)
 
     state = jobs.read_state(job_id)
     assert state.status == status
     assert paths.workdir(job_id).exists() is not expected
-    assert state.workdir_removed is expected
     # The runner is the primary writer of the figure `status` reads, and it
     # must agree with what it just did either way.
     if expected:
@@ -100,18 +98,18 @@ def test_the_runner_applies_the_policy(
 def test_the_runner_records_the_size_before_it_mirrors_state(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Written after the final meta sync, the mirror would never carry it."""
+    """Written after the mirror upload, the mirror would never carry it."""
     mirrored: list[int | None] = []
 
-    def capture(job_id: str, prefix: str, **kwargs: object) -> str | None:
+    def capture(job_id: str, prefix: str | None, **kwargs: object) -> None:
         mirrored.append(jobs.read_state(job_id).workdir_bytes)
         return None
 
-    monkeypatch.setattr(runner.sync, "final_meta_sync", capture)
+    monkeypatch.setattr(runner.sync, "mirror_meta", capture)
     job_id = prepare(command="true", cleanup="never")
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
     (paths.workdir(job_id) / "big.bin").write_bytes(b"x" * 4096)
-    runner.run_job(job_id, deps())
+    run(job_id)
     assert mirrored and mirrored[0] is not None and mirrored[0] > 0
 
 
@@ -133,7 +131,7 @@ def test_the_log_says_the_workdir_went_and_why(gpuc_home: Path) -> None:
 def test_a_failed_job_keeps_its_workdir_for_inspection(gpuc_home: Path) -> None:
     job_id = run_with_policy("on_success", "echo oops >&2; exit 5")
     assert (paths.workdir(job_id) / "big.bin").exists()
-    assert jobs.read_state(job_id).workdir_removed is False
+    assert (jobs.read_state(job_id).workdir_bytes or 0) > 0
 
 
 def test_outputs_are_synced_before_the_workdir_goes(gpuc_home: Path) -> None:
@@ -153,7 +151,7 @@ def test_outputs_are_synced_before_the_workdir_goes(gpuc_home: Path) -> None:
         outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
     )
     paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
-    runner.run_job(job_id, deps(command_runner=record))
+    run(job_id, deps(command_runner=record))
 
     assert uploaded, "the final sync never ran"
     assert all(entry.endswith(":True") for entry in uploaded), uploaded
@@ -182,7 +180,7 @@ def test_clean_removes_every_finished_workdir(gpuc_home: Path) -> None:
     assert result.freed_bytes > 0
     for job_id in ids:
         assert not paths.workdir(job_id).exists()
-        assert jobs.read_state(job_id).workdir_removed is True
+        assert jobs.read_state(job_id).workdir_bytes == 0
 
 
 def test_dry_run_deletes_nothing_but_reports_the_same_jobs(gpuc_home: Path) -> None:
@@ -191,7 +189,7 @@ def test_dry_run_deletes_nothing_but_reports_the_same_jobs(gpuc_home: Path) -> N
     assert [c.job_id for c in result.removed] == [job_id]
     assert result.freed_bytes > 0
     assert (paths.workdir(job_id) / "blob.bin").exists()
-    assert jobs.read_state(job_id).workdir_removed is False
+    assert jobs.read_state(job_id).workdir_bytes is None
 
 
 def test_clean_never_touches_a_running_job(gpuc_home: Path) -> None:
@@ -247,7 +245,7 @@ def job_with_outputs_still_only_here() -> str:
     results = paths.workdir(job_id) / "results"
     results.mkdir(parents=True, exist_ok=True)
     (results / "checkpoint.pt").write_bytes(b"w" * 8192)
-    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now())
+    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now(), ran=True)
     return job_id
 
 
@@ -709,7 +707,6 @@ def test_the_sweep_records_that_it_freed_everything(gpuc_home: Path) -> None:
     jobs.update_state(done, workdir_bytes=999999)
     cleanup.clean(all_finished=True)
     state = jobs.read_state(done)
-    assert state.workdir_removed is True
     assert state.workdir_bytes == 0, "status would still be quoting a workdir that is gone"
 
 
@@ -967,11 +964,33 @@ def test_a_preempted_job_keeps_its_workdir_whatever_its_policy_says(gpuc_home: P
     job_id = prepare(command="sleep 30", cleanup="always")
     (paths.workdir(job_id) / "train.py").write_text("print('hi')\n")
     queue.enqueue(make_spec(priority=1))  # something waiting, or preempt refuses
-    queue.preempt(job_id)
 
-    assert runner.run_job(job_id, deps()) != 0
+    assert run(job_id, deps(smi=stopping_after_claim(job_id, queue.preempt))) != 0
     state = jobs.read_state(job_id)
-    assert (state.status, state.reason) == ("failed", "preempted")
+    assert (state.status, state.attempt) == ("queued", 2)
     assert (paths.workdir(job_id) / "train.py").exists()
-    assert state.workdir_removed is False
-    assert "preempted; keeping workdir (cleanup=always)" in log_of(job_id)
+    assert "keeping workdir for the next attempt (cleanup=always)" in log_of(job_id)
+
+
+def test_the_runner_keeps_a_workdir_holding_outputs_that_never_reached_anywhere(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`cleanup: always` is not a licence to delete the only copy of a result:
+    the runner's delete goes through the same predicate as every other, and a
+    workdir whose `outputs:` are still pending stays whatever the policy says."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+    from gpuc.host.sync import CommandResult
+
+    def failing(argv: list[str], _timeout: float | None, _env: object) -> CommandResult:
+        return CommandResult(argv, 1, "AccessDenied")
+
+    job_id = prepare(
+        command="mkdir -p results && echo hi > results/a.txt",
+        cleanup="always",
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+    )
+    run(job_id, deps(command_runner=failing, sync_preflight=False))
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "sync")
+    assert (paths.workdir(job_id) / "results" / "a.txt").exists()
+    assert "keeping workdir: outputs not confirmed uploaded" in log_of(job_id)

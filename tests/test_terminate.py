@@ -67,12 +67,14 @@ def test_rp_environment_missing_file_is_empty(no_pod_env: Path) -> None:
 def test_pod_id_resolution_order(
     gpuc_home: Path, no_pod_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider = {"kind": "runpod", "pod_id": "from-config"}
-    assert terminate.read_pod_id(provider) == "from-config"
+    """The config's pod id is the rental the client made, so it wins; the
+    pod's own environment only fills in for a config written without one."""
+    provider = {"kind": "runpod"}
     no_pod_env.write_text("export RUNPOD_POD_ID=from-rp-env\n")
     assert terminate.read_pod_id(provider) == "from-rp-env"
     monkeypatch.setenv("RUNPOD_POD_ID", "from-env")
     assert terminate.read_pod_id(provider) == "from-env"
+    assert terminate.read_pod_id({**provider, "pod_id": "from-config"}) == "from-config"
 
 
 def test_missing_api_key_is_a_clear_error(gpuc_home: Path, no_pod_env: Path) -> None:
@@ -103,14 +105,19 @@ def test_self_terminate_uses_the_injected_call(
     assert seen == [("abc123", "k")]
 
 
-def test_self_terminate_prefers_the_pods_own_id(
+def test_self_terminate_ends_the_pod_the_config_names(
     gpuc_home: Path, no_pod_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    no_pod_env.write_text("export RUNPOD_POD_ID=real-pod\n")
+    no_pod_env.write_text("export RUNPOD_POD_ID=some-other-pod\n")
     seen: list[tuple[str, str]] = []
     terminate.self_terminate(POD_CONFIG, terminate_call=lambda p, k: seen.append((p, k)) or "")
-    assert seen == [("real-pod", "k")]
+    assert seen == [("abc123", "k")]
+
+
+def test_an_unknown_provider_kind_is_refused_before_anything_is_read(gpuc_home: Path) -> None:
+    with pytest.raises(terminate.TerminateError, match="unsupported provider kind"):
+        terminate.self_terminate(HostConfig(host="x", provider={"kind": "lambda", "pod_id": "p"}))
 
 
 def test_self_terminate_refuses_a_non_provider_host() -> None:

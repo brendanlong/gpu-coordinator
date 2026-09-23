@@ -6,37 +6,41 @@ rendering stays in the CLI.
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc.control import rented
-from gpuc.control import status as status_mod
 from gpuc.control.actions import (
-    EXIT_ERROR,
-    EXIT_OK,
+    Answer,
     CliError,
+    Interrupted,
     UsageError,
     connection_document,
     make_provider,
-    provider_for_status,
-    read_registry_warned,
+    provider_for,
 )
-from gpuc.control.bootstrap import BootstrapError, BootstrapResult, bootstrap_host
+from gpuc.control.bootstrap import (
+    BootstrapError,
+    BootstrapResult,
+    HealthOptions,
+    bootstrap_host,
+)
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
     LocalStateUnreadable,
     Reporter,
     Settings,
-    forget_host_locked,
-    load_registry,
+    forget_host,
     load_settings,
+    open_registry,
     registry_transaction,
+    update_cache,
 )
 from gpuc.control.connect import Connection, connect_host, push_config
+from gpuc.control.jsonout import warn
 from gpuc.control.probe import ProbeReport, probe_host
-from gpuc.control.remote import RemoteError
+from gpuc.control.remote import Gone, RemoteError, rental_state
 from gpuc.control.transport import TransportError
 
 
@@ -70,13 +74,15 @@ def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEnt
             f"pod {pod_id} is {'gone' if pod is None else pod.status} on this account, so "
             f"there is nothing to add. `gpuc pods` lists the pods it can see."
         )
-    reached = rented.address_for(address.name, pod)
+    reached = rented.address_for(address.name, pod, provider.name)
     if reached is None:
         raise CliError(
             f"pod {pod_id} ({pod.name}) is {pod.status} and has no direct SSH endpoint yet, so "
             f"it cannot be asked what it is. Try again once `gpuc pods` shows it RUNNING."
         )
-    return address.model_copy(update={"ssh": reached.ssh, "port": reached.port, "pod_id": pod.id})
+    return address.model_copy(
+        update={"ssh": reached.ssh, "port": reached.port, "rental": reached.rental}
+    )
 
 
 def add_host(
@@ -126,7 +132,7 @@ def add_host(
         env_updates=env_updates,
         force=force,
         before_write=lambda adopted: _refuse_a_taken_name(
-            load_registry().hosts.get(adopted.name), adopted, name
+            open_registry().registry.hosts.get(adopted.name), adopted, name
         ),
     )
     entry = connection.entry
@@ -142,7 +148,7 @@ def add_host(
             )
         registry.put(entry)
     warnings: list[str] = []
-    if not connection.adopted and not entry.gpus:
+    if not connection.adopted and not entry.config.gpus:
         warnings.append(_owns_nothing_warning(entry, fields, report))
     if pod_id and not connection.adopted:
         # A pod nobody has set up has no dispatcher, so nothing will ever idle
@@ -204,7 +210,7 @@ def _refuse_a_taken_name(current: HostEntry | None, entry: HostEntry, asked_for:
 def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str:
     lines = [
         f"added host {entry.name} [{entry.kind}] "
-        f"{entry.ssh or 'this machine'} with {len(entry.gpus)} GPU(s)"
+        f"{entry.ssh or 'this machine'} with {len(entry.config.gpus)} GPU(s)"
     ]
     if connection.adopted:
         lines.append(f"adopted the config on the host ({connection.home}/config.json)")
@@ -247,11 +253,7 @@ def set_host(
     the only copy of it. It therefore needs the host to answer -- there is
     nothing to set offline -- and what it changed is reported field by field.
     """
-    # The lookup goes through a transaction so that a registry this build
-    # cannot read refuses the whole command, in the words that say nothing was
-    # written, rather than failing halfway through with the host already changed.
-    with registry_transaction() as registry:
-        entry = registry.require(name)
+    entry = open_registry().require(name)
     lines = [f"host {entry.name}:"]
     # The config first, and through the address the host still has: a
     # `--persistent-root` in the same command moves gpuc home, and writing the
@@ -270,9 +272,6 @@ def set_host(
     entry = entry.model_copy(update=address)
     lines += [f"  here <- {key}={value!r}" for key, value in sorted(address.items())]
     warnings: list[str] = []
-    # Re-read under the lock: the entry above was read before an ssh round
-    # trip, and writing it back whole would undo whatever a concurrent `gpuc
-    # host probe` or submit learned about the same host in between.
     with registry_transaction() as registry:
         current = registry.hosts.get(entry.name)
         if current is None:
@@ -289,12 +288,19 @@ def set_host(
 
 
 def bootstrap_and_record(
-    entry: HostEntry, settings: Settings, health_args: str, report: Reporter = print
+    entry: HostEntry, settings: Settings, health: HealthOptions, report: Reporter = print
 ) -> BootstrapResult:
     """Bootstrap one host, persist what it told us about itself, and say so."""
-    updated, result = bootstrap_host(entry, settings, health_args=health_args, report=report)
-    with registry_transaction() as registry:
-        registry.put(updated)
+    updated, result = bootstrap_host(entry, settings, health_options=health, report=report)
+    update_cache(
+        updated.name,
+        config=updated.cache.config,
+        python=updated.python,
+        uv=updated.uv,
+        gpu_info=updated.gpu_info,
+        driver_version=updated.driver_version,
+        bootstrapped_at=updated.bootstrapped_at,
+    )
     report(result.render())
     return result
 
@@ -333,7 +339,7 @@ class BootstrapTally:
                 "name": entry.name,
                 "outcome": outcome,
                 "error": error,
-                "ephemeral": entry.ephemeral,
+                "ephemeral": entry.rental is not None,
                 **detail,
             }
         )
@@ -361,8 +367,7 @@ class BootstrapTally:
                 # Not one of the forgotten: the provider still has this pod, so
                 # somebody has to decide whether to fix it or drop it.
                 lines.append(
-                    "an ephemeral host the provider still has is forgotten by "
-                    "`gpuc host remove <name>`"
+                    "a rental the provider still has is forgotten by `gpuc host remove <name>`"
                 )
         if self.unreadable:
             lines.append(
@@ -387,45 +392,54 @@ class BootstrapTally:
             "errors": list(self.errors),
         }
 
+    def answer(self, text: str | None) -> Answer:
+        """Exit 1 if any host failed, or was never attempted because this build
+        could not read its entry: nobody may read a wall of output as "all
+        upgraded" over the top of one that did not get done, whichever way."""
+        failures = [o["error"] or o["name"] for o in self.failed]
+        failures += [f"registry entry {name} could not be read" for name in self.unreadable]
+        return Answer(self.document(), text, failures=failures)
+
 
 def bootstrap_every_host(
-    settings: Settings, health_args: str, *, report: Reporter
-) -> tuple[BootstrapTally, int]:
+    settings: Settings, health: HealthOptions, *, report: Reporter
+) -> BootstrapTally:
     """`gpuc host bootstrap --all`: the upgrade loop, one command.
 
     A host that fails does not stop the others -- the hosts that are still
     there are the reason the flag exists. Each failure is named again in the
-    tally and the command exits 1, so nobody reads a wall of output as "all
-    upgraded". A rental the provider no longer has is not one of those
-    failures: it ended itself, so the entry is forgotten and the run carries on.
+    tally, so nobody reads a wall of output as "all upgraded". A rental the
+    provider no longer has is not one of those failures: it ended itself, so
+    the entry is forgotten and the run carries on.
+
+    A Ctrl-C ends the run with the tally so far: health alone allows five
+    minutes a host, so this is a command somebody does give up on, and what
+    it got through is still true.
     """
-    read = read_registry_warned()
+    read = open_registry()
     if read.unreadable:
         raise LocalStateUnreadable("\n".join(read.errors))
     hosts = list(read.registry.hosts.values())
     tally = BootstrapTally(hosts, sorted(read.skipped), list(read.errors))
     if not hosts:
-        return tally, EXIT_OK
-    code = EXIT_OK
+        return tally
     # Built once, and only when a rental is registered: a host that fails to
     # answer may simply have ended, and only the provider knows which.
-    provider = provider_for_status(hosts, settings, report)
+    provider = provider_for(hosts, settings, report)
     for index, entry in enumerate(hosts, start=1):
         if index > 1:
             report("")
         report(f"== {entry.name} ({index}/{len(hosts)}) ==")
         try:
             tally.record(
-                entry, "bootstrapped", bootstrap_and_record(entry, settings, health_args, report)
+                entry, "bootstrapped", bootstrap_and_record(entry, settings, health, report)
             )
         except KeyboardInterrupt:
-            # Health alone allows five minutes a host, so this is a command
-            # somebody does give up on; what it got through is still true.
-            report(f"\ninterrupted during {entry.name}")
             tally.record(entry, "interrupted")
             tally.interrupted = True
-            code = EXIT_ERROR
-            break
+            raise Interrupted(
+                f"interrupted during {entry.name}\n{tally.render()}", tally.document()
+            ) from None
         except LocalStateUnreadable:
             # The registry stopped being readable mid-run, so the next host's
             # write would be a guess: say how far this got, and exit 3. Under
@@ -433,13 +447,12 @@ def bootstrap_every_host(
             report(f"\n{tally.render()}")
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
-            gone = status_mod.rental_gone(entry, provider, report)
-            if gone is not None:
-                report(f"{gone}; forgetting this host")
+            state = rental_state(entry, provider)
+            if isinstance(state, Gone):
+                report(f"{state.reason}; forgetting this host")
                 tally.record(entry, "gone")
-                forget_host_locked(entry.name, entry.pod_id, report)
+                forget_host(entry.name, entry.pod_id, report)
                 continue
-            print(f"error: host {entry.name}: {exc}", file=sys.stderr)
+            warn(f"host {entry.name}: {exc}")
             tally.record(entry, "failed", error=str(exc))
-            code = EXIT_ERROR
-    return tally, code
+    return tally

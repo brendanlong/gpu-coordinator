@@ -13,10 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuc.control.config import Settings, load_registry
+from gpuc.control.config import HostEntry, Settings, open_registry
 from gpuc.control.providers.base import Pod, Provider, owned_pods
-from gpuc.control.provision import CEILING_MINUTES, dispatcher_heartbeat_age
-from gpuc.control.status import format_duration
+from gpuc.control.provision import CEILING_MINUTES
+from gpuc.control.remote import ask
+from gpuc.control.status import format_duration, parse_status
 
 COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "HOST", "HEARTBEAT")
 
@@ -68,13 +69,15 @@ class PodRow:
 
 @dataclass
 class PodsView:
+    provider: Provider
+    """Whose vocabulary says which of these pods still bill."""
     rows: list[PodRow] = field(default_factory=list)
     others: list[Pod] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
     def hourly(self) -> float:
-        return sum(row.pod.cost_usd_hr for row in self.rows if row.pod.status != "TERMINATED")
+        return sum(row.pod.cost_usd_hr for row in self.rows if not self.provider.is_gone(row.pod))
 
     def document(self) -> dict[str, Any]:
         """`gpuc pods --json`: the provider's answer, ours and everyone else's.
@@ -102,20 +105,20 @@ def gather(
     *,
     heartbeats: bool = True,
 ) -> PodsView:
-    view = PodsView()
+    view = PodsView(provider)
     pods = provider.list()
     ours = owned_pods(pods, provider.prefix)
     ours_ids = {pod.id for pod in ours}
     others = [pod for pod in pods if pod.id not in ours_ids]
-    registry = load_registry()
-    by_pod_id = {e.pod_id: e for e in registry.hosts.values() if e.pod_id}
+    registry = open_registry().registry
+    by_pod_id = {e.rental.pod_id: e for e in registry.hosts.values() if e.rental is not None}
 
     for pod in sorted(ours, key=lambda p: p.name):
         entry = by_pod_id.get(pod.id)
         # Only bootstrapped, running hosts can answer; anything else costs an ssh timeout.
         age = (
-            dispatcher_heartbeat_age(entry, settings)
-            if heartbeats and entry is not None and entry.python and pod.status == "RUNNING"
+            heartbeat_age(entry, settings)
+            if heartbeats and entry is not None and provider.is_running(pod)
             else None
         )
         view.rows.append(
@@ -123,6 +126,12 @@ def gather(
         )
     view.others = sorted(others, key=lambda p: p.name)
     return view
+
+
+def heartbeat_age(entry: HostEntry, settings: Settings) -> float | None:
+    """How long ago the pod's dispatcher last beat, by the host's own `status`;
+    the pod was just listed, so the provider is not asked about it again."""
+    return parse_status(entry, ask(entry, "status", settings)).heartbeat_age_s
 
 
 def _may_be_provisioning(pod: Pod) -> bool:
@@ -141,7 +150,7 @@ def render(view: PodsView) -> str:
     else:
         lines.append(f"{len(view.rows)} pod(s) with our prefix, ${view.hourly:.2f}/h total")
     unregistered = [
-        row.pod for row in view.rows if row.host is None and row.pod.status != "TERMINATED"
+        row.pod for row in view.rows if row.host is None and not view.provider.is_gone(row.pod)
     ]
     if unregistered:
         names = ", ".join(f"{pod.name} ({pod.id})" for pod in unregistered)

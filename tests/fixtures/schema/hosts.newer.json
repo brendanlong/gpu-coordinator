@@ -4,9 +4,9 @@
   "hosts": {
     "local": {
       "name": "local",
-      "kind": "local",
       "ssh": null,
       "port": null,
+      "rental": null,
       "bootstrapped_at": "2026-09-15T20:43:46+00:00",
       "labels": ["desktop", "shared"],
       "cache": {
@@ -39,10 +39,9 @@
     },
     "pod-a40": {
       "name": "pod-a40",
-      "kind": "runpod",
       "ssh": "root@1.2.3.4",
       "port": 22,
-      "pod_id": "abc123",
+      "rental": {"provider": "runpod", "pod_id": "abc123", "region": "EU-RO-1"},
       "spot": false,
       "cache": {
         "read_at": null,

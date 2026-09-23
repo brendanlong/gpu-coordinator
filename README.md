@@ -4,7 +4,7 @@ One submit path (`gpuc submit`) for three kinds of GPU host:
 
 - **local** — this machine and the cards you hand it,
 - **ssh** — a shared box you have no sudo on, using a subset of its GPUs,
-- **runpod** — an ephemeral pod, provisioned for the job and torn down after it.
+- **rental** — a RunPod pod, provisioned for the job and torn down after it.
 
 ![A terminal session: cat job.yaml shows a five-line spec; gpuc submit sends it
 to the host workstation, which starts it at once; a second submit queues

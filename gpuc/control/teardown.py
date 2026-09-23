@@ -33,7 +33,7 @@ from gpuc.control.config import (
     Registry,
     Reporter,
     Settings,
-    forget_host_locked,
+    forget_host,
 )
 from gpuc.control.providers.base import Pod, Provider, ProviderError
 
@@ -81,6 +81,10 @@ class Termination:
     unasked: str | None = None
     """Why it did not answer, when it was asked and did not. None under
     `--force`, which does not ask."""
+    nothing_can_run: bool = False
+    """The provider itself said the pod is stopped, terminated or missing, so
+    nothing on it can be running and the host is owed no question. Not the
+    same as a pod the provider could not describe."""
     running: list[str] = field(default_factory=list)
     queued: list[str] = field(default_factory=list)
     outputs_pending: list[str] = field(default_factory=list)
@@ -99,8 +103,8 @@ class Termination:
             "host": entry.name if entry else None,
             "pod_id": self.target.pod_id,
             "pod_name": pod.name if pod else None,
-            # What the provider said *before* the terminate: "TERMINATED" here
-            # with `terminated` false is a pod that was already gone.
+            # What the provider said *before* the terminate: a gone status
+            # here with `terminated` false is a pod that had already ended.
             "pod_status": pod.status if pod else None,
             "cost_usd_hr": pod.cost_usd_hr if pod else None,
             "checked": self.checked,
@@ -124,18 +128,12 @@ def resolve(target: str, registry: Registry, provider: Provider) -> Target:
     """
     entry = registry.hosts.get(target)
     if entry is not None:
-        if not entry.ephemeral:
+        if entry.rental is None:
             raise TerminateRefused(
                 f"host {entry.name} is a {entry.kind!r} host: there is no rental to end.\n"
                 f"`gpuc host remove {entry.name}` forgets it here, and nothing on it changes."
             )
-        if not entry.pod_id:
-            raise TerminateRefused(
-                f"host {entry.name} is a runpod host with no pod id recorded, so there is "
-                f"nothing to terminate.\nName the pod instead: `gpuc pods` lists them, and "
-                f"`gpuc host terminate <pod-id>` ends one."
-            )
-        return Target(pod_id=entry.pod_id, entry=entry)
+        return Target(pod_id=entry.rental.pod_id, entry=entry)
     pod = _find_pod(target, provider)
     return Target(pod_id=pod.id, pod=pod, entry=_entry_for_pod(pod.id, registry))
 
@@ -170,17 +168,24 @@ def inspect(target: Target, settings: Settings, provider: Provider) -> Terminati
             f"pod {target.pod_id} is not registered on this machine, so nothing here can "
             f"ask what it is running"
         )
+        # Only what the provider actually said: a read that failed leaves
+        # `target.pod` None, and None is not a dead pod.
+        result.nothing_can_run = target.pod is not None and provider.is_dead(target.pod)
         return result
     view = status_mod.gather(target.entry, settings, provider=provider)
     target.pod = view.pod or target.pod
-    if view.pod_gone:
-        # No ssh was attempted and none would have answered. What became of the
-        # pod is the whole answer, and the caller has it in `target.pod`.
-        return result
     if not view.reachable:
-        result.unasked = (
-            f"could not ask {target.entry.name} what it is doing: {view.error or 'no answer'}"
+        # Gone, or unaskable with a pod the provider itself calls dead: what
+        # became of the pod is the whole answer, and the caller has it in
+        # `target.pod`. Unaskable otherwise -- an ssh that blipped, a provider
+        # that could not be read -- may be hiding six hours of training.
+        result.nothing_can_run = view.gone or (
+            target.pod is not None and provider.is_dead(target.pod)
         )
+        if not result.nothing_can_run:
+            result.unasked = (
+                f"could not ask {target.entry.name} what it is doing: {view.error or 'no answer'}"
+            )
         return result
     result.checked = True
     result.running = [status_mod.job_label(job) for job in view.running]
@@ -247,10 +252,18 @@ def terminate(
 
     A pod the provider already calls dead is never refused over. There is no
     live container to be running anything, and holding the one command that
-    frees the rental behind a flag would be protecting nothing.
+    frees the rental behind a flag would be protecting nothing. That takes
+    the provider *saying* so: a provider read that failed leaves no pod to
+    look at, which `is_dead` would also call dead, and a busy host would be
+    ended over a 503.
     """
     resolved = resolve(target, registry, provider)
-    result = Termination(target=resolved) if force else inspect(resolved, settings, provider)
+    if force:
+        result = Termination(target=resolved)
+    else:
+        result = inspect(resolved, settings, provider)
+        if not result.nothing_can_run and (result.busy or not result.checked):
+            raise TerminateRefused(refusal(result))
     if resolved.pod is None:
         # What is being billed, for the result to report -- and whether there
         # is anything to end at all. A provider that will not answer raises
@@ -258,49 +271,32 @@ def terminate(
         # is how a terminated entry and a running bill part company.
         resolved.pod = provider.get(resolved.pod_id)
     pod = resolved.pod
-    alive = not provider.is_dead(pod)
-    if alive and not force and (result.busy or not result.checked):
-        raise TerminateRefused(refusal(result))
     if result.unasked:
         result.notes.append(result.unasked)
         report(f"note: {result.unasked}")
 
-    if pod is None or pod.status == "TERMINATED":
+    if pod is None or provider.is_gone(pod):
         gone = "is already terminated" if pod else "does not exist at the provider"
         result.notes.append(f"pod {resolved.pod_id} {gone}; nothing was billing")
     else:
-        if not alive:
+        if provider.is_dead(pod):
             result.notes.append(
                 f"the provider says pod {resolved.pod_id} is {pod.status}, so nothing was "
                 f"running on it; ending it frees the rental"
             )
-        _terminate_with_retries(resolved, provider, report, sleep)
-        result.terminated = True
-    result.forgotten = _forget(resolved, report)
-    return result
-
-
-def _terminate_with_retries(
-    target: Target, provider: Provider, report: Reporter, sleep: Callable[[float], None]
-) -> None:
-    """The same retry the provisioning failure path takes: the one call that
-    stops the bill is the worst place to give up after a single 5xx."""
-    report(f"terminating {target.label}")
-    for attempt in range(1, provider.terminate_attempts + 1):
+        report(f"terminating {resolved.label}")
         try:
-            provider.terminate(target.pod_id)
+            provider.terminate_confirmed(resolved.pod_id, report=report, sleep=sleep)
         except ProviderError as exc:
-            if attempt < provider.terminate_attempts:
-                report(f"terminate failed ({exc}); retrying in {provider.terminate_retry_s:g}s")
-                sleep(provider.terminate_retry_s)
-                continue
             raise TerminateFailed(
-                f"could not terminate {target.label} in {attempt} attempts: {exc}\n"
+                f"{resolved.label}: {exc}\n"
                 f"It is still billing: `gpuc pods` shows it, and the provider's console "
                 f"ends it."
             ) from exc
-        report(f"{target.label} terminated and confirmed gone")
-        return
+        report(f"{resolved.label} terminated and confirmed gone")
+        result.terminated = True
+    result.forgotten = _forget(resolved, report)
+    return result
 
 
 def _forget(target: Target, report: Reporter) -> bool:
@@ -308,11 +304,11 @@ def _forget(target: Target, report: Reporter) -> bool:
 
     Only ever the entry that names *this* pod (`forget_host`'s own rule), and
     only after the provider has confirmed the terminate: a pod still billing
-    must stay visible in `gpuc status`. The answer is what `forget_host_locked`
+    must stay visible in `gpuc status`. The answer is what `forget_host`
     reports rather than what it was asked to do -- a lock another session is
     holding leaves the entry there, and saying otherwise is how a caller ends
-    up believing a POD GONE line is a bug.
+    up believing a `GONE` line in `gpuc status` is a bug.
     """
     if target.entry is None:
         return False
-    return forget_host_locked(target.entry.name, target.pod_id, report)
+    return forget_host(target.entry.name, target.pod_id, report)

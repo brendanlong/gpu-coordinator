@@ -11,6 +11,11 @@ way:
   exits with that code, so `error` is the one key a consumer has to check.
   `errors` (plural) is different: it is per-host or per-job trouble the command
   survived, and it never implies a non-zero exit on its own.
+
+`note` and `warn` are the two things a command says on stderr: progress and
+context, and a problem it carried on past. They live here because stderr is
+where they go under both output forms, and one spelling of each is what lets a
+transcript be read.
 """
 
 from __future__ import annotations
@@ -26,10 +31,15 @@ def emit(payload: dict[str, Any]) -> None:
     print(json.dumps({"schema_version": SCHEMA_VERSION, **payload}, indent=2))
 
 
-def emit_error(message: str, exit_code: int) -> None:
-    emit({"error": message, "exit_code": exit_code})
+def emit_error(message: str, exit_code: int, **extra: Any) -> None:
+    emit({"error": message, "exit_code": exit_code, **extra})
 
 
 def note(message: str) -> None:
-    """Progress from a step that would otherwise print onto the document."""
+    """A line of progress or context, on stderr under either output form."""
     print(message, file=sys.stderr)
+
+
+def warn(message: str) -> None:
+    """A problem the command carried on past, on stderr under either form."""
+    print(f"warning: {message}", file=sys.stderr)

@@ -31,16 +31,14 @@ from pathlib import Path
 from typing import Any
 
 from gpuc.host import baseline, jobs, paths
-from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS, JobState
+from gpuc.host.jobs import ALWAYS, FINISHED_STATUSES, ON_SUCCESS, JobSpec, JobState
 
 DEFAULT_WORKDIR_DAYS = 1.0
-"""What a host with no config of its own is given for `workdir_days`.
+"""What `connect` writes for `workdir_days` into a host's very first config.
 
-Here rather than on `HostConfig`, whose default stays null, because those are
-different questions: a host being configured for the first time should reclaim
-its venvs, and a host whose `config.json` predates the key should not start
-deleting because somebody shipped it a newer package. `connect_host` applies
-this one; nothing applies the other.
+Here rather than on `HostConfig`, whose default stays null: a host being
+configured for the first time should reclaim its venvs, and nothing that
+merely reads a config may turn a sweep on. See `HostConfig.workdir_days`.
 """
 
 DEFAULT_RETENTION_DAYS = 7.0
@@ -58,6 +56,50 @@ dir into `jobs/`; a dir still there is a submit that died. Measured from the
 dir's last change, so a large rsync still in progress is never mistaken for
 one that stopped. An hour is far past any ssh round trip.
 """
+
+
+def remove_secrets(job_id: str) -> None:
+    """Delete the job's secrets file, if any. The one place that does.
+
+    Through `settle_secrets` from everything that ends a job, and directly
+    from the sweeps for a job whose dir is going or whose submit never
+    finished.
+    """
+    with contextlib.suppress(OSError):
+        paths.job_env_file(job_id).unlink(missing_ok=True)
+
+
+def settle_secrets(job_id: str, state: JobState) -> str | None:
+    """Delete the job's secrets file now that the job is over, unless the
+    host's drain still needs it; the reason it stays, or None once it is gone.
+
+    Called wherever a job is ended: by the runner after its final upload and
+    mirror, which authenticate with what the file holds; by the dispatcher
+    for a job it failed without a runner or whose runner died; and by a
+    cancel of a queued job. Every one of those used to leave the file for
+    the purge, days later, against the rule that a job's secrets go once it
+    is finished. On an ephemeral host a job whose outputs are still pending
+    keeps it: the drain gets one more go at the upload with the job's own
+    credentials, and the file dies with the pod in minutes either way. A
+    spec that cannot be read declares no outputs anyone could upload.
+    """
+    if _ephemeral():
+        try:
+            spec = jobs.read_spec(job_id)
+        except (RuntimeError, ValueError):
+            spec = None
+        pending = outputs_pending(job_id, spec, state) if spec is not None else None
+        if pending:
+            return pending
+    remove_secrets(job_id)
+    return None
+
+
+def _ephemeral() -> bool:
+    try:
+        return jobs.read_config().ephemeral
+    except (RuntimeError, OSError, ValueError):
+        return False
 
 
 def should_remove(policy: str, status: str) -> bool:
@@ -478,6 +520,11 @@ class Evidence:
 
     automatic: bool = False
     """Nobody typed this: the dispatcher sweeping on its own horizon."""
+    policy: bool = False
+    """The job's own `cleanup:` policy, applied by its runner as it ends. The
+    only evidence under which `on_success` and `always` are read at all: a
+    sweep honours `never` and nothing else about the policy, since the horizon
+    is the operator's decision and the policy was the submitter's."""
     force: bool = False
     """A person waives the backup preconditions, and is told so per job."""
     verified: frozenset[str] | None = None
@@ -499,38 +546,40 @@ def may_delete(job_id: str, state: JobState, what: str, evidence: Evidence) -> s
     """Why this job's `what` may not be deleted, or None if it may.
 
     Fails closed at every step. `workdir/` is recreatable and only ever
-    deleted because the job's own state says it is over; a sweep nobody typed
-    adds two refusals -- a spec that said `cleanup: never`, and outputs not
-    confirmed elsewhere, since those paths live *inside* the workdir. The
-    whole `jobs/<id>/` is the record of a run, so it needs that record
-    mirrored (or vouched for) and the outputs confirmed, unless a person
-    forces it. A person naming a job with `gpuc clean --only <id>` gets its
-    workdir with no further questions: that is a delete typed with the id in
-    front of them.
+    deleted because the job's state says it is over -- the runner asks with
+    the status it is about to write, since the workdir goes before that write
+    and the outputs it holds go with it. A delete nobody typed adds two
+    refusals: the spec's `cleanup:` (in full for the runner applying it, and
+    `never` alone for a sweep), and outputs still pending, since those paths
+    live *inside* the workdir. The whole `jobs/<id>/` is the record of a run,
+    so it needs that record mirrored (or vouched for) and the outputs
+    confirmed, unless a person forces it. A person naming a job with `gpuc
+    clean --only <id>` gets its workdir with no further questions: that is a
+    delete typed with the id in front of them. An unreadable spec cannot say
+    what it wanted kept, so it keeps everything.
     """
     if not state.finished:
         return f"status {state.status}"
+    if what == WORKDIR and not (evidence.automatic or evidence.policy):
+        return None
+    try:
+        spec = jobs.read_spec(job_id)
+    except (RuntimeError, ValueError):
+        return "no readable spec.json"
     if what == WORKDIR:
-        if not evidence.automatic:
-            return None
-        try:
-            policy = jobs.read_spec(job_id).cleanup
-        except (RuntimeError, ValueError):
-            # An unreadable spec cannot say it wanted this kept, but it cannot
-            # say it did not either.
-            return "no readable spec.json"
-        if policy == jobs.NEVER:
+        if evidence.policy and not should_remove(spec.cleanup, state.status):
+            return f"cleanup: {spec.cleanup}"
+        if evidence.automatic and spec.cleanup == jobs.NEVER:
             return "cleanup: never"
-        _, why = outputs_confirmed(job_id, state)
-        return why
+        return outputs_pending(job_id, spec, state)
     reasons: list[str] = []
     if not state.mirrored:
         reasons.append(_not_backed_up(host_s3_prefix()))
     elif evidence.verified is not None and job_id not in evidence.verified:
         reasons.append("not backed up: the mirror has no log for it")
-    _, why = outputs_confirmed(job_id, state)
-    if why:
-        reasons.append(why)
+    pending = outputs_pending(job_id, spec, state)
+    if pending:
+        reasons.append(pending)
     if reasons and not evidence.force:
         return "; ".join(reasons)
     return None
@@ -634,17 +683,21 @@ def stale_incoming(now: float | None = None) -> list[Path]:
     return stale
 
 
-def remove_stale_incoming(now: float | None = None) -> list[str]:
-    """Delete what `stale_incoming` found; the names of what went."""
+def remove_stale_incoming(now: float | None = None) -> tuple[list[str], list[str]]:
+    """Delete what `stale_incoming` found: the names of what went, and what
+    could not be removed. The secrets file goes with the dir: it was delivered
+    before the enqueue that never came, and nothing else would unlink it."""
     removed: list[str] = []
+    errors: list[str] = []
     for path in stale_incoming(now):
-        with contextlib.suppress(OSError):
+        try:
             shutil.rmtree(path)
-            # The secrets file was delivered before the enqueue that never
-            # came, and nothing else will ever unlink it.
-            paths.job_env_file(path.name).unlink(missing_ok=True)
-            removed.append(path.name)
-    return removed
+        except OSError as exc:
+            errors.append(f"could not remove {path}: {exc}")
+            continue
+        remove_secrets(path.name)
+        removed.append(path.name)
+    return removed, errors
 
 
 def clean(
@@ -675,20 +728,16 @@ def clean(
             continue
         result.removed.append(candidate)
         try:
-            jobs.update_state(candidate.job_id, workdir_removed=True, workdir_bytes=0)
+            jobs.update_state(candidate.job_id, workdir_bytes=0)
         except (RuntimeError, OSError, KeyError) as exc:
             result.errors.append(
                 f"{candidate.job_id}: workdir removed but state not updated: {exc}"
             )
-    for path in stale_incoming():
-        if not dry_run:
-            try:
-                shutil.rmtree(path)
-                paths.job_env_file(path.name).unlink(missing_ok=True)
-            except OSError as exc:
-                result.errors.append(f"could not remove {path}: {exc}")
-                continue
-        result.incoming_removed.append(path.name)
+    if dry_run:
+        result.incoming_removed = [path.name for path in stale_incoming()]
+    else:
+        result.incoming_removed, errors = remove_stale_incoming()
+        result.errors += errors
     return result
 
 
@@ -703,16 +752,39 @@ def host_s3_prefix() -> str | None:
         return None
 
 
-def produced_outputs(job_id: str, spec: jobs.JobSpec) -> bool:
-    """Did any declared `outputs:` path actually gain content?
+def outputs_pending(job_id: str, spec: JobSpec, state: JobState) -> str | None:
+    """Why this job's outputs are only on this host, or None if nothing here
+    needs saving.
 
-    Declaring an output is not producing one: a job that died before it wrote
-    the path produced nothing, and neither did one whose output dir holds only
-    files that came with the checkout. Fails closed in every direction --
-    including an `outputs.path` this cannot even resolve, which nothing
-    validates at submit -- because the point of asking is to avoid throwing
-    away the only copy of a result.
+    The one question behind a rental's drain, the runner's decision to keep a
+    job's secrets for that drain, `purge`, the automatic workdir sweep and the
+    flag `status` shows. `outputs:` paths resolve *inside* `workdir/`, and a
+    failed or cancelled job keeps its workdir by default, so a job that ended
+    `failed: sync` can be holding the only copy of a checkpoint. Nothing is
+    pending when the spec declares no outputs, no attempt of the job ever
+    reached `main` (`state.ran`: outputs are what `main` produces, and a job
+    failed by the dispatcher, stopped before its first phase or refused by a
+    preflight has no result -- only a checkout, which may well have files
+    where the outputs go), the upload records say every destination has the
+    last upload, the workdir is already gone (whatever it held went with
+    `cleanup:`, not with us), or nothing was ever written under the declared
+    paths -- declaring an output is not producing one, and an output dir that
+    holds only files that came with the checkout is nothing produced. Every
+    other way of not knowing counts as content, an `outputs.path` that cannot
+    even be resolved included, because the point of asking is to avoid
+    throwing away the only copy of a result.
     """
+    if not spec.outputs or not state.ran or state.outputs_uploaded(spec):
+        return None
+    if not paths.workdir(job_id).is_dir():
+        return None
+    if not _produced_outputs(job_id, spec):
+        return None
+    detail = " (the drain gave up: outputs_lost)" if state.outputs_lost else ""
+    return f"outputs not confirmed uploaded{detail}"
+
+
+def _produced_outputs(job_id: str, spec: JobSpec) -> bool:
     workdir = paths.workdir(job_id)
     entries = baseline.read(job_id)
     for output in spec.outputs:
@@ -723,31 +795,6 @@ def produced_outputs(job_id: str, spec: jobs.JobSpec) -> bool:
         if baseline.has_new_content(workdir / key, entries.get(key, {})):
             return True
     return False
-
-
-def outputs_confirmed(job_id: str, state: jobs.JobState) -> tuple[bool, str | None]:
-    """Is everything this job produced known to be somewhere other than here?
-
-    `outputs:` paths resolve *inside* `workdir/`, and a failed or cancelled job
-    keeps its workdir by default, so a job that ended `failed: sync` can be
-    holding the only copy of a checkpoint. Satisfied when the upload records
-    say every destination has the last upload, or when there is nothing here
-    to lose: no outputs declared, the workdir already gone (whatever it held
-    went with `cleanup:`, not with us), or nothing ever written to the output
-    paths. An unreadable spec cannot answer the question, so it fails closed.
-    """
-    try:
-        spec = jobs.read_spec(job_id)
-    except RuntimeError:
-        return False, "spec.json is unreadable, so its outputs cannot be checked"
-    if not spec.outputs or state.outputs_uploaded(spec):
-        return True, None
-    if not paths.workdir(job_id).is_dir():
-        return True, None
-    if not produced_outputs(job_id, spec):
-        return True, None
-    detail = " (the drain gave up: outputs_lost)" if state.outputs_lost else ""
-    return False, f"outputs not confirmed uploaded{detail}"
 
 
 def _not_backed_up(prefix: str | None) -> str:
@@ -814,9 +861,35 @@ def remove_job_dir(job_id: str) -> int:
     size = reclaimable_bytes(directory) if directory.is_dir() else 0
     if directory.is_dir():
         shutil.rmtree(directory)
-    with contextlib.suppress(OSError):
-        paths.job_env_file(job_id).unlink(missing_ok=True)
+    remove_secrets(job_id)
     return size
+
+
+def purge_job_dirs(
+    *,
+    older_than_days: float = DEFAULT_RETENTION_DAYS,
+    dry_run: bool = False,
+    now: datetime | None = None,
+    only: Iterable[str] | None = None,
+    evidence: Evidence = ASKED,
+) -> CleanResult:
+    """Remove whole job dirs, and nothing else. `purge` is this plus the sweep;
+    the dispatcher, which sweeps on its own horizon anyway, calls this."""
+    picked, skipped = purge_candidates(
+        older_than_days=older_than_days, now=now, only=only, evidence=evidence
+    )
+    result = CleanResult(dry_run=dry_run, purge_skipped=skipped, s3_prefix=host_s3_prefix())
+    for candidate in picked:
+        if dry_run:
+            result.purged.append(candidate)
+            continue
+        try:
+            remove_job_dir(candidate.job_id)
+        except OSError as exc:
+            result.errors.append(f"{candidate.job_id}: could not remove the job dir: {exc}")
+            continue
+        result.purged.append(candidate)
+    return result
 
 
 def purge(
@@ -834,20 +907,9 @@ def purge(
     workdirs are still worth reclaiming. `only` scopes both: purging two jobs
     should not also reclaim every other finished job's venv.
     """
-    picked, skipped = purge_candidates(
-        older_than_days=older_than_days, now=now, only=only, evidence=evidence
+    result = purge_job_dirs(
+        older_than_days=older_than_days, dry_run=dry_run, now=now, only=only, evidence=evidence
     )
-    result = CleanResult(dry_run=dry_run, purge_skipped=skipped, s3_prefix=host_s3_prefix())
-    for candidate in picked:
-        if dry_run:
-            result.purged.append(candidate)
-            continue
-        try:
-            remove_job_dir(candidate.job_id)
-        except OSError as exc:
-            result.errors.append(f"{candidate.job_id}: could not remove the job dir: {exc}")
-            continue
-        result.purged.append(candidate)
     purged_ids = {candidate.job_id for candidate in result.purged}
     # Named ids replace the age gate here too, or `--purge --only X` would
     # reclaim less than a bare `clean --only X` does for a job whose state

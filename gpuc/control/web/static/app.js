@@ -200,6 +200,20 @@ function logsButton(host, job) {
   return el("button", { type: "button", onclick: () => openLog(job.job_id, host.name) }, "Logs");
 }
 
+// `gpuc host remove`: forget a host here, and nothing else. Offered only on
+// a card nothing answers from, which is where the CLI's own hint points.
+function forgetButton(host) {
+  const button = el("button", {
+    type: "button", class: "danger",
+    onclick: () => {
+      if (!window.confirm(`Forget host ${host.name} here? Nothing on it changes.`)) return;
+      act(button, `/api/hosts/${encodeURIComponent(host.name)}/remove`, {},
+        (r) => [`removed host ${r.host}`, ...r.notes].join("; "));
+    },
+  }, "Forget host");
+  return button;
+}
+
 function cancelButton(host, job) {
   const button = el("button", {
     type: "button", class: "danger",
@@ -418,8 +432,8 @@ function cardsSummary(host) {
 function hostHeader(host, entry) {
   const target = host.target || (host.kind === "local" ? "this machine" : "");
   let stateBadge;
-  if (host.pod_gone) stateBadge = badge("POD GONE", "bad");
-  else if (!host.reachable) stateBadge = badge("UNREACHABLE", "bad");
+  if (host.state === "gone") stateBadge = badge("GONE", "bad");
+  else if (!host.reachable) stateBadge = badge("UNASKABLE", "bad");
   else if (host.dispatcher.alive) stateBadge = badge(`dispatcher ${Math.round(host.dispatcher.heartbeat_age_s)}s ago`, "good");
   else stateBadge = badge("dispatcher DOWN", "bad", "submit or bootstrap restarts it");
   const meta = el("div", { class: "meta" },
@@ -427,7 +441,7 @@ function hostHeader(host, entry) {
     entry && entry.s3_prefix ? el("span", { class: "mono" }, `mirror ${entry.s3_prefix}`) : null,
     entry && entry.retention_days !== null && entry.retention_days !== undefined ? el("span", {}, `retention ${entry.retention_days}d`) : null,
     entry && entry.workdir_days !== null && entry.workdir_days !== undefined ? el("span", {}, `workdirs ${entry.workdir_days}d`) : null,
-    host.kind === "runpod" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`) : null,
+    host.kind === "rental" && entry ? el("span", {}, `idle ${entry.idle_minutes}m`) : null,
   );
   const flags = el("div", { class: "flags" },
     host.draining ? badge("DRAINING", "warn") : null,
@@ -462,9 +476,11 @@ function podLine(host) {
 function hostCard(host, entry) {
   const card = el("article", { class: "host" }, hostHeader(host, entry));
   for (const error of host.errors) card.append(el("div", { class: "notice bad" }, error));
+  for (const warning of host.warnings || []) card.append(el("div", { class: "notice warn" }, warning));
   if (!host.reachable) {
-    if (!host.pod_gone) card.append(el("p", { class: "muted" }, `try: gpuc host probe ${host.name}`));
+    if (host.state === "unaskable" && !host.pod) card.append(el("p", { class: "muted" }, `try: gpuc host probe ${host.name}`));
     card.append(podLine(host) || []);
+    card.append(el("p", {}, forgetButton(host)));
     return card;
   }
   card.append(gpuTable(host), podLine(host) || []);

@@ -1,4 +1,6 @@
-"""The `gpuc` command line. Thin: parse, call a module, print, map errors to 1."""
+"""The `gpuc` command line. Thin: parse, call a module, render, and let `main`
+emit the answer once -- as text, or as the `--json` document -- and exit with
+what the answer says."""
 
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from gpuc.control.actions import (
     EXIT_NOT_FOUND,
     EXIT_OK,
     EXIT_USAGE,
+    Answer,
     CliError,
     Interrupted,
     NotFound,
@@ -37,31 +40,21 @@ from gpuc.control.actions import (
     estimate_job,
     exit_code_for,
     failure_message,
-    find_job_host,
     forget_gone_rentals,
-    gather_all,
     hosts_document,
-    hosts_for,
     init_config,
-    job_log_path,
+    locate,
     make_provider,
-    named_registry,
-    note,
     preempt_job,
-    provider_for_status,
     read_log,
-    read_registry_warned,
-    registry_exit,
+    registry_answer,
     remove_host,
     reorder_job,
     shipped_note,
-    status_errors,
-    status_exit,
-    status_views,
-    unhosted_jobs,
+    status,
     version_document,
-    warn,
 )
+from gpuc.control.bootstrap import HealthOptions
 from gpuc.control.clean import check_flags as check_clean_flags
 from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
@@ -72,19 +65,26 @@ from gpuc.control.config import (
     config_file,
     hosts_file,
     load_settings,
-    registry_transaction,
+    open_registry,
     state_dir,
     transport_for,
+    update_cache,
 )
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.gpuinfo import summarize
 from gpuc.control.hosts import add_host, bootstrap_and_record, bootstrap_every_host, set_host
+from gpuc.control.jsonout import note, warn
 from gpuc.control.probe import probe_host
-from gpuc.control.providers.base import Cloud
-from gpuc.control.remote import RemoteError, read_remote_config, resolve_home
+from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud
+from gpuc.control.remote import HostSession, RemoteError, open_session, read_config, resolve_home
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import SubmitResult
-from gpuc.control.submitting import RentalOptions, requeue_job, submit_job
+from gpuc.control.submitting import (
+    DEFAULT_IDLE_MINUTES,
+    RentalOptions,
+    requeue_job,
+    submit_job,
+)
 from gpuc.control.transport import (
     NO_GIT_EXCLUDES,
     Transport,
@@ -193,7 +193,7 @@ def _env_updates(args: argparse.Namespace) -> dict[str, str | None]:
     return {"UV_CACHE_DIR": args.cache_dir or None}
 
 
-def cmd_host_add(args: argparse.Namespace) -> int:
+def cmd_host_add(args: argparse.Namespace) -> Answer:
     # The flags are judged before the host is touched: a typo in `--gpus` is
     # the caller's mistake and should not cost a probe to find out.
     fields, env_updates = _config_fields(args), _env_updates(args)
@@ -208,11 +208,7 @@ def cmd_host_add(args: argparse.Namespace) -> int:
         env_updates=env_updates,
         force=args.force,
     )
-    if args.json:
-        jsonout.emit(change.document)
-        return EXIT_OK
-    print(change.render())
-    return EXIT_OK
+    return Answer(change.document, change.render())
 
 
 def _days(raw: str | None, flag: str) -> float | None:
@@ -256,7 +252,7 @@ _SET_FIELDS = (
 )
 
 
-def cmd_host_set(args: argparse.Namespace) -> int:
+def cmd_host_set(args: argparse.Namespace) -> Answer:
     address: dict[str, object] = {}
     for flag in _ADDRESS_FIELDS:
         value = getattr(args, flag)
@@ -272,25 +268,16 @@ def cmd_host_set(args: argparse.Namespace) -> int:
     change = set_host(args.name, address=address, fields=fields, env_updates=env_updates)
     for warning in change.warnings:
         warn(warning)
-    if args.json:
-        jsonout.emit(change.document)
-        return EXIT_OK
-    print(change.render())
-    return EXIT_OK
+    return Answer(change.document, change.render())
 
 
-def cmd_host_remove(args: argparse.Namespace) -> int:
+def cmd_host_remove(args: argparse.Namespace) -> Answer:
     document = remove_host(args.name)
-    if args.json:
-        jsonout.emit(document)
-        return EXIT_OK
-    print(f"removed host {args.name}")
-    for text in document["notes"]:
-        print(f"  {text}")
-    return EXIT_OK
+    lines = [f"removed host {args.name}", *[f"  {text}" for text in document["notes"]]]
+    return Answer(document, "\n".join(lines))
 
 
-def cmd_host_terminate(args: argparse.Namespace) -> int:
+def cmd_host_terminate(args: argparse.Namespace) -> Answer:
     """End a rental now: the provider call, then forget the host here.
 
     Progress goes to stderr so that `--json` keeps its single document on
@@ -302,56 +289,48 @@ def cmd_host_terminate(args: argparse.Namespace) -> int:
     result = teardown.terminate(
         args.name,
         settings,
-        registry=named_registry(),
+        registry=open_registry().named(),
         provider=make_provider(settings),
         force=args.force,
-        report=lambda line: print(line, file=sys.stderr),
+        report=note,
     )
-    if args.json:
-        jsonout.emit(result.document())
-        return EXIT_OK
     pod = result.target.pod
     if result.terminated:
         cost = f" (was ${pod.cost_usd_hr:.3f}/h)" if pod and pod.cost_usd_hr else ""
-        print(f"terminated {result.target.label}{cost}")
+        lines = [f"terminated {result.target.label}{cost}"]
     else:
-        print(f"nothing to terminate: {result.target.label}")
+        lines = [f"nothing to terminate: {result.target.label}"]
     if result.forgotten:
-        print("  forgotten here; the provider lists it as TERMINATED for a while yet")
-    for text in result.notes:
-        print(f"  {text}")
-    return EXIT_OK
+        lines.append("  forgotten here; the provider lists it as ended for a while yet")
+    lines += [f"  {text}" for text in result.notes]
+    return Answer(result.document(), "\n".join(lines))
 
 
-def cmd_host_list(args: argparse.Namespace) -> int:
-    read = read_registry_warned()
+def cmd_host_list(args: argparse.Namespace) -> Answer:
+    read = open_registry()
     registry = read.registry
-    if args.json:
-        jsonout.emit(hosts_document(read))
-        return registry_exit(read)
-    if not registry.hosts:
-        if read.unreadable:
-            return EXIT_LOCAL_STATE
-        print(NO_HOSTS)
-        return registry_exit(read)
+    lines: list[str] = []
+    if not registry.hosts and not read.unreadable:
+        lines.append(NO_HOSTS)
     for entry in registry.hosts.values():
-        summary = summarize(entry.gpus, entry.gpu_info) if entry.gpus else "no GPUs"
+        config = entry.config
+        summary = summarize(config.gpus, entry.gpu_info) if config.gpus else "no GPUs"
         driver = f", driver {entry.driver_version}" if entry.driver_version else ""
         # One block per host, shaped like `gpuc status`: what the host is, then
-        # its cards, then the bootstrap facts. The interpreter path used to sit
-        # in the header and was longer than everything else on the line put
-        # together; `gpuc host list --json` and `gpuc host probe` still have it.
-        print(
+        # its cards, then the bootstrap facts. The interpreter path is in
+        # `gpuc host list --json` and `gpuc host probe`, not here: it is longer
+        # than everything else on the line put together.
+        lines.append(
             f"host {entry.name} [{entry.kind}] {entry.ssh or 'this machine'}  "
-            f"gpus {len(entry.gpus)} ({summary}{driver})"
+            f"gpus {len(config.gpus)} ({summary}{driver})"
         )
         stale = shipped_note(entry)
         if stale:
-            print(f"  NOTE {stale}")
-        for index, name, vram, uuid in gpu_rows(entry.gpus, entry.gpu_info):
-            print(f"  gpu     [{index}] {name:<28} {vram:<7} {uuid}")
-        for index, name, vram, uuid in gpu_rows(entry.config.shared_gpus, entry.gpu_info):
-            print(f"  shared  [{index}] {name:<28} {vram:<7} {uuid}")
+            lines.append(f"  NOTE {stale}")
+        for index, name, vram, uuid in gpu_rows(config.gpus, entry.gpu_info):
+            lines.append(f"  gpu     [{index}] {name:<28} {vram:<7} {uuid}")
+        for index, name, vram, uuid in gpu_rows(config.shared_gpus, entry.gpu_info):
+            lines.append(f"  shared  [{index}] {name:<28} {vram:<7} {uuid}")
         # Everything above and here is the cache: what the host said the last
         # time anything on this machine asked it. The host owns all of it, so
         # it is labelled with its age rather than printed as current.
@@ -360,42 +339,33 @@ def cmd_host_list(args: argparse.Namespace) -> int:
             if entry.seen_at
             else f"never read; run gpuc host probe {entry.name}"
         )
-        print(f"  pkg     {version_mod.short(entry.pkg_commit)} on the host, {seen}")
+        lines.append(f"  pkg     {version_mod.short(config.pkg_commit)} on the host, {seen}")
         if entry.bootstrapped_at:
-            print(
+            lines.append(
                 f"  boot    bootstrapped from here {status_mod.format_age(entry.bootstrapped_at)}"
             )
         if entry.root:
-            print(f"  root    {entry.root} (gpuc home {entry.remote_home})")
-    return registry_exit(read)
+            lines.append(f"  root    {entry.root} (gpuc home {entry.remote_home})")
+    return registry_answer(read, hosts_document(read), "\n".join(lines) or None)
 
 
-def cmd_host_bootstrap(args: argparse.Namespace) -> int:
+def cmd_host_bootstrap(args: argparse.Namespace) -> Answer:
     settings = load_settings()
     if args.all:
         if args.name:
             raise UsageError(
                 f"host bootstrap takes a host name or --all, not both (got {args.name!r})"
             )
-        tally, code = bootstrap_every_host(settings, args.health_args, report=reporter(args))
-        if args.json:
-            jsonout.emit(tally.document())
-        elif not tally.hosts:
-            print(NO_HOSTS)
-        else:
-            print()
-            print(tally.render())
-        return code
+        tally = bootstrap_every_host(settings, health_options(args), report=progress(args))
+        return tally.answer(NO_HOSTS if not tally.hosts else f"\n{tally.render()}")
     if not args.name:
         raise UsageError("host bootstrap wants a host name, or --all for every registered host")
-    entry = named_registry().require(args.name)
-    result = bootstrap_and_record(entry, settings, args.health_args, reporter(args))
-    if args.json:
-        jsonout.emit(result.document())
-    return EXIT_OK
+    entry = open_registry().require(args.name)
+    result = bootstrap_and_record(entry, settings, health_options(args), progress(args))
+    return Answer(result.document())
 
 
-def cmd_clean(args: argparse.Namespace) -> int:
+def cmd_clean(args: argparse.Namespace) -> Answer:
     settings = load_settings()
     # Checked before the host lookup so a wrong command line answers in the
     # same way whether or not the host exists. `clean` owns the rule; keeping a
@@ -411,7 +381,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         yes=args.yes,
         only=only,
     )
-    entry = named_registry().require(args.host)
+    entry = open_registry().require(args.host)
     report = clean_host(
         entry,
         settings,
@@ -424,26 +394,18 @@ def cmd_clean(args: argparse.Namespace) -> int:
         yes=args.yes,
         only=only,
     )
-    if args.json:
-        jsonout.emit(report.document())
-    else:
-        print(report.render())
-    return EXIT_ERROR if report.errors else EXIT_OK
+    return Answer(report.document(), report.render(), failures=list(report.errors))
 
 
-def cmd_host_clean(args: argparse.Namespace) -> int:
+def cmd_host_clean(args: argparse.Namespace) -> Answer:
     if not args.uv_cache:
         raise UsageError("host clean needs --uv-cache (job workdirs are `gpuc clean --host H`)")
-    entry = named_registry().require(args.name)
+    entry = open_registry().require(args.name)
     report = prune_uv_cache(entry, load_settings())
-    if args.json:
-        jsonout.emit(report.document())
-    else:
-        print(report.render())
-    return EXIT_OK
+    return Answer(report.document(), report.render())
 
 
-def cmd_host_probe(args: argparse.Namespace) -> int:
+def cmd_host_probe(args: argparse.Namespace) -> Answer:
     """Refresh what this machine knows about a host, and print it. Nothing else.
 
     A probe is the one command that runs before bootstrap, so it is also the
@@ -453,38 +415,27 @@ def cmd_host_probe(args: argparse.Namespace) -> int:
     stale, but it never writes one: a probe changes nothing about the host.
     """
     settings = load_settings()
-    entry = named_registry().require(args.name)
+    entry = open_registry().require(args.name)
     report = probe_host(entry, settings)
-    if not args.json:
-        print(report.render(all_gpus=args.all_gpus))
-    config = _probe_config(entry, settings)
     # Written even when the host had nothing new to say: *when* it was last
     # read is half of what the offline listings report.
-    with registry_transaction() as registry:
-        current = registry.hosts.get(args.name)
-        if current is not None:
-            current = current.with_cache(
-                gpu_info=report.gpu_info or None,
-                driver_version=report.driver_version,
-                # Only until a bootstrap of our own records the interpreter uv
-                # picked: a host somebody else set up is worth being able to
-                # read before then.
-                python=current.python or report.host_python,
-            )
-            registry.put(current if config is None else current.with_config(config))
-    # After the registry write, not before: that write can fail (a held lock, a
-    # registry that changed under us) and print an error document of its own,
-    # and stdout may hold only one.
-    if args.json:
-        jsonout.emit(report.document())
-    return EXIT_OK
+    update_cache(
+        args.name,
+        gpu_info=report.gpu_info or None,
+        driver_version=report.driver_version,
+        # Only until a bootstrap of our own records the interpreter uv picked:
+        # a host somebody else set up is worth being able to read before then.
+        python=None if entry.python else report.host_python,
+        config=_probe_config(entry, settings),
+    )
+    return Answer(report.document(), report.render(all_gpus=args.all_gpus))
 
 
 def _probe_config(entry: HostEntry, settings: Settings) -> dict[str, Any] | None:
     """The host's `config.json`, or None if it has none or could not be read."""
     try:
         transport = transport_for(entry, settings)
-        return read_remote_config(transport, resolve_home(transport, entry)) or None
+        return read_config(transport, resolve_home(transport, entry)).document
     except (ConfigError, RemoteError, TransportError):
         return None
 
@@ -500,7 +451,7 @@ def rental_options(args: argparse.Namespace) -> RentalOptions | None:
     """`--runpod` and its flags, or None when the job names a host instead."""
     if not args.runpod:
         return None
-    return RentalOptions(
+    options = RentalOptions(
         gpu_names=_comma_list(args.gpu),
         min_vram_gb=args.min_vram,
         max_price_usd_hr=args.max_price,
@@ -509,47 +460,52 @@ def rental_options(args: argparse.Namespace) -> RentalOptions | None:
         gpu_count=args.gpu_count,
         reuse=not args.no_reuse,
         name_hint=args.name_hint,
-        idle_minutes=args.idle_min,
         disk_gb=args.disk,
         image=args.image,
-        health_args=args.health_args,
+        health=health_options(args),
     )
+    if args.idle_min is not None:
+        options.idle_minutes = args.idle_min
+    return options
 
 
-def cmd_config_init(args: argparse.Namespace) -> int:
+def cmd_config_init(args: argparse.Namespace) -> Answer:
     document = init_config(force=args.force)
-    if args.json:
-        jsonout.emit(document)
-        return EXIT_OK
-    print(
-        f"wrote {document['config_file']}\n"
-        f"Every key is commented with its default; edit what you need."
+    return Answer(
+        document,
+        f"wrote {document['config_file']}\nEvery key is commented with its default; edit what "
+        f"you need.",
     )
-    return EXIT_OK
 
 
-def cmd_config_show(args: argparse.Namespace) -> int:
+def cmd_config_show(args: argparse.Namespace) -> Answer:
     settings = load_settings()
     document = config_document(settings)
-    if args.json:
-        jsonout.emit(document)
-        return EXIT_OK
     path = config_file()
-    print(f"config file: {path}{'' if path.exists() else ' (does not exist; using defaults)'}")
-    print(f"state dir:   {state_dir()}")
-    for name, value in settings.model_dump().items():
-        print(f"  {name} = {value!r}")
-    for text in document["notes"]:
-        print(f"  note: {text}")
-    return EXIT_OK
+    lines = [
+        f"config file: {path}{'' if path.exists() else ' (does not exist; using defaults)'}",
+        f"state dir:   {state_dir()}",
+    ]
+    lines += [f"  {name} = {value!r}" for name, value in settings.model_dump().items()]
+    lines += [f"  note: {text}" for text in document["notes"]]
+    return Answer(document, "\n".join(lines))
 
 
-def reporter(args: argparse.Namespace) -> Reporter:
+def health_options(args: argparse.Namespace) -> HealthOptions:
+    """`--health-args`, judged here so a bad flag is a usage error and not a
+    health check that fails on the host."""
+    try:
+        return HealthOptions.parse(args.health_args)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+
+
+def progress(args: argparse.Namespace) -> Reporter:
     """Where a step's progress goes: stdout, or stderr when stdout is a document."""
-    return jsonout.note if args.json else print
+    return jsonout.note if getattr(args, "json", False) else print
 
 
-def cmd_submit(args: argparse.Namespace) -> int:
+def cmd_submit(args: argparse.Namespace) -> Answer:
     settings = load_settings()
     # None, not False, for a flag that was not passed: a spec that says
     # `use_shared: true` keeps saying it when nobody typed --use-shared.
@@ -563,28 +519,20 @@ def cmd_submit(args: argparse.Namespace) -> int:
         workdir=Path.cwd(),
         use_git=not args.no_git,
         bootstrap=not args.no_bootstrap,
-        report=reporter(args),
+        report=progress(args),
     )
-    return _queued(result, args)
+    return _queued(result)
 
 
-def _queued(
-    result: SubmitResult, args: argparse.Namespace, *, requeued_from: str | None = None
-) -> int:
+def _queued(result: SubmitResult) -> Answer:
     """The last word of `submit` and `requeue`, in whichever form was asked for."""
-    if args.json:
-        jsonout.emit(result.document(requeued_from=requeued_from))
-        return EXIT_OK
-    print(result.render(status_mod.queue_note(result.placement)))
-    if requeued_from is not None:
-        print(
-            f"  requeued from {requeued_from} (attempt {result.attempt}); "
-            f"workdir re-synced from {Path.cwd()}"
-        )
-    return EXIT_OK
+    return Answer(
+        result.document(),
+        result.render(status_mod.queue_note(result.placement), workdir=Path.cwd()),
+    )
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace) -> Answer:
     """Report on every host, and exit non-zero if any of them could not be read.
 
     Every host that answered is printed either way: a box that is down is the
@@ -593,70 +541,33 @@ def cmd_status(args: argparse.Namespace) -> int:
     guess, and automation must never take it for idle.
     """
     settings = load_settings()
-    read = read_registry_warned()
+    read = open_registry()
     try:
         since_s = status_mod.parse_duration(args.since) if args.since else None
     except ValueError as exc:
         raise UsageError(f"--since: {exc}") from exc
-    if args.json:
-        views = status_views(read, settings, host=args.host)
-        jsonout.emit(
-            status_mod.document(
-                views, errors=status_errors(read), recent=args.recent, since_s=since_s
-            )
+    # Each host as it answers, so a slow one does not hold the others' blocks.
+    show = (
+        None
+        if args.json
+        else lambda v: print(status_mod.render(v, recent=args.recent, since_s=since_s))
+    )
+    result = status(read, settings, host=args.host, all_jobs=args.all, on_view=show)
+    forget_gone_rentals(result.views)
+    lines: list[str] = []
+    if read.unreadable:
+        note(
+            f"cannot read {hosts_file()}, so no host status is known "
+            f"(this is not `no jobs running`)"
         )
-        forget_gone_rentals(views)
-        return status_exit(read, views, every_host=args.host is None)
-    entries = hosts_for(read.registry, args.host) if not read.unreadable else []
-    if not entries:
-        if read.unreadable:
-            print(
-                f"cannot read {hosts_file()}, so no host status is known "
-                f"(this is not `no jobs running`)",
-                file=sys.stderr,
-            )
-            return EXIT_LOCAL_STATE
-        print(NO_HOSTS)
-        # ...but `--all` still has something to say: the index remembers jobs
-        # whose host has since been removed.
-        if args.all and not _show_unhosted(settings, set(), args.host):
-            return EXIT_ERROR
-        return registry_exit(read)
-    provider = provider_for_status(entries, settings)
-    seen: set[str] = set()
-    views: list[status_mod.HostView] = []
-    for view in gather_all(entries, settings, provider):
-        views.append(view)
-        seen.update(job.job_id for job in view.queue + view.running + view.finished)
-        print(status_mod.render(view, recent=args.recent, since_s=since_s))
-    forget_gone_rentals(views)
-    if args.all and not _show_unhosted(settings, seen, args.host):
-        return EXIT_ERROR
-    return status_exit(read, views, every_host=args.host is None)
-
-
-def _show_unhosted(settings: Settings, seen: set[str], host: str | None = None) -> bool:
-    """`unhosted_jobs` as text, and whether the index was read in full."""
-    elsewhere, lost, short = unhosted_jobs(settings, seen, host)
-    if short:
-        note(f"{short}; this list may be short")
-    if not elsewhere:
-        return short is None
-    scope = f" for host {host}" if host else ""
-    print(f"jobs known only to the index{scope} (their host is gone, or lost its state):")
-    for entry in elsewhere:
-        flag = (
-            " OUTPUTS LOST (the host went away before they uploaded)"
-            if entry.job_id in lost
-            else ""
-        )
-        label = f"{entry.name} ({entry.job_id})" if entry.name else entry.job_id
-        print(
-            f"  {label} host={entry.host} attempt={entry.attempt} "
-            f"submitted {status_mod.format_age(entry.submitted_at)}{flag}"
-        )
-    print(f"  bring one back with: gpuc requeue {elsewhere[0].job_id} --host {elsewhere[0].host}")
-    return short is None
+    elif not result.views:
+        lines.append(NO_HOSTS)
+    if result.index_error:
+        note(f"{result.index_error}; the list of index-only jobs may be short")
+    unhosted = result.unhosted_text(args.host)
+    if unhosted:
+        lines.append(unhosted)
+    return result.answer(recent=args.recent, since_s=since_s, text="\n".join(lines) or None)
 
 
 def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
@@ -666,16 +577,17 @@ def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
     are timestamps, so they cannot collide, and looking the name up locally
     keeps `gpuc ssh <host>` from asking every host whether it knows a job.
     """
-    registry = named_registry()
+    read = open_registry()
+    registry = read.named()
     entry = registry.hosts.get(args.target)
     if entry is not None:
         return entry, entry.remote_home, None
-    entry, _ = find_job_host(args.target, registry, args.host)
+    entry = locate(args.target, registry, args.host, skipped=read.skipped).require_entry()
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
     return entry, f"{job_dir}/workdir", job_dir
 
 
-def cmd_ssh(args: argparse.Namespace) -> int:
+def cmd_ssh(args: argparse.Namespace) -> Answer:
     """A shell on a host (or in a job's workdir), with gpuc's own ssh options."""
     command = list(args.command or [])
     # argparse.REMAINDER swallows flags that follow the target, and typing
@@ -692,49 +604,45 @@ def cmd_ssh(args: argparse.Namespace) -> int:
         # shlex.join would quote the pipe back into a filename.
         joined = " ".join(command)
         if args.print_only:
-            print(ssh_mod.print_line(ssh_mod.command_argv(transport, directory, joined, fallback)))
-            return EXIT_OK
+            argv = ssh_mod.command_argv(transport, directory, joined, fallback)
+            return Answer({}, ssh_mod.print_line(argv))
         result = ssh_mod.run_command(transport, directory, joined, fallback)
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
-        return result.returncode
+        return Answer({}, outcome=result.returncode)
     if args.print_only:
-        print(ssh_mod.print_line(ssh_mod.interactive_argv(transport, directory, fallback)))
-        return EXIT_OK
+        return Answer(
+            {}, ssh_mod.print_line(ssh_mod.interactive_argv(transport, directory, fallback))
+        )
     print(f"# {entry.name}:{directory}", file=sys.stderr)
     argv = ssh_mod.interactive_argv(transport, directory, fallback)
     os.execvp(argv[0], argv)
 
 
-def _answer(args: argparse.Namespace, document: dict[str, Any], *text: str | None) -> int:
+def _job_answer(document: dict[str, Any], *text: str | None) -> Answer:
     """A job command's last word: its warnings on stderr, then the document or the text."""
     for warning in document.get("warnings", []):
         warn(warning)
-    if args.json:
-        jsonout.emit(document)
-    else:
-        print("\n".join(line for line in text if line))
-    return EXIT_OK
+    return Answer(document, "\n".join(line for line in text if line))
 
 
-def cmd_cancel(args: argparse.Namespace) -> int:
+def cmd_cancel(args: argparse.Namespace) -> Answer:
     document = cancel_job(args.job_id, args.host, load_settings())
-    return _answer(
-        args, document, f"job {args.job_id} on host {document['host']}: {document['status']}"
+    return _job_answer(
+        document, f"job {args.job_id} on host {document['host']}: {document['status']}"
     )
 
 
-def cmd_reorder(args: argparse.Namespace) -> int:
+def cmd_reorder(args: argparse.Namespace) -> Answer:
     document = reorder_job(args.job_id, args.priority, args.host, load_settings())
-    return _answer(
-        args,
+    return _job_answer(
         document,
         f"job {args.job_id} on host {document['host']} moved to priority {args.priority}",
         status_mod.queue_note(document),
     )
 
 
-def cmd_preempt(args: argparse.Namespace) -> int:
+def cmd_preempt(args: argparse.Namespace) -> Answer:
     """Stop a running job and put it back in its host's queue.
 
     The text output says which priority it comes back at, because that is what
@@ -748,12 +656,12 @@ def cmd_preempt(args: argparse.Namespace) -> int:
     document = preempt_job(args.job_id, args.priority, args.host, load_settings())
     priority = document["priority"]
     at = f"; it will be queued again at priority {priority}" if priority is not None else ""
-    return _answer(
-        args, document, f"job {args.job_id} on host {document['host']}: {document['status']}{at}"
+    return _job_answer(
+        document, f"job {args.job_id} on host {document['host']}: {document['status']}{at}"
     )
 
 
-def cmd_estimate(args: argparse.Namespace) -> int:
+def cmd_estimate(args: argparse.Namespace) -> Answer:
     """Add, change or clear a job's `estimated_runtime_min` after submitting it.
 
     It is the one spec field somebody else needs and only the submitter knows,
@@ -764,8 +672,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     document = estimate_job(args.job_id, wanted, args.host, load_settings())
     recorded = document["estimated_runtime_min"]
     job = f"job {args.job_id} on host {document['host']}"
-    return _answer(
-        args,
+    return _job_answer(
         document,
         f"{job} no longer estimates a runtime"
         if recorded is None
@@ -792,7 +699,7 @@ def check_interval(args: argparse.Namespace, *, polls: bool) -> None:
         raise UsageError(f"--interval must be a positive number of seconds, got {args.interval:g}")
 
 
-def cmd_logs(args: argparse.Namespace) -> int:
+def cmd_logs(args: argparse.Namespace) -> Answer:
     if args.follow and args.follow_forever:
         raise UsageError(
             "-f and --follow-forever are the two different things you can mean by "
@@ -806,26 +713,24 @@ def cmd_logs(args: argparse.Namespace) -> int:
     check_interval(args, polls=args.follow)
     settings = load_settings()
     if args.follow_forever:
-        entry, _ = find_job_host(args.job_id, named_registry(), args.host)
-        session, remote = job_log_path(entry, args.job_id, settings)
-        return _follow_forever(session.transport, remote, args.lines)
+        read = open_registry()
+        location = locate(args.job_id, read.named(), args.host, settings, skipped=read.skipped)
+        session = location.session or open_session(location.require_entry(), settings)
+        return _follow_forever(session, args.job_id, args.lines)
     if args.follow:
         return _follow_until_done(args, settings)
-    entry, log = read_log(args.job_id, args.host, args.lines, settings)
+    host, log = read_log(args.job_id, args.host, args.lines, settings)
     # Bytes for a human; lines plus where they came from for a script.
-    if args.json:
-        jsonout.emit(log.document(args.job_id, entry.name))
-    else:
-        sys.stdout.write(log.text)
-    return EXIT_OK
+    return log.answer(args.job_id, host)
 
 
-def _follow_forever(transport: Transport, remote: str, lines: int) -> int:
+def _follow_forever(session: HostSession, job_id: str, lines: int) -> Answer:
     """`--follow-forever`: the stream with no end, and no claim about the job."""
-    return subprocess.call(_follow_argv(transport, remote, lines))
+    remote = f"{session.job_dir(job_id)}/log.txt"
+    return Answer({}, outcome=subprocess.call(_follow_argv(session.transport, remote, lines)))
 
 
-def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
+def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
     """`logs -f`: the log while the job runs, its outcome, and exit with it.
 
     The stream and the polling are two things at once because there is nothing
@@ -833,9 +738,16 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
     thing that does. So `tail` runs as a child writing straight to our stdout
     while this thread asks the host, and the job's own outcome becomes the exit
     code, which is what makes `gpuc logs -f "$id"` a foreground wait on its own.
+
+    The stream is started on the first poll the host answers, not before: a
+    host in trouble is the wait's business (`Watch` retries it and reads the
+    mirror once it is gone), and opening a session to it here would turn an
+    ssh blip into exit 1 before the wait had its say.
     """
     watched: wait_mod.Watched | None = None
     ended = False
+    tail: subprocess.Popen[bytes] | None = None
+    reported_stream_end = False
     # Everything is inside, not just the polling: finding the job's host can
     # ask every registered host in turn, 60s each, which is exactly where
     # somebody who mistyped an id reaches for Ctrl-C.
@@ -849,43 +761,53 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
             # The ordinary read, so a purged job falls back to the S3 mirror.
             _, log = read_log(args.job_id, watched.host, args.lines, settings)
             sys.stdout.write(log.text)
-            print(watched.line())
-            return wait_mod.exit_code([watched])
-        if watched.status == "queued":
-            # Said before tail is started, because tail then says `cannot open
-            # ... No such file or directory` about a log the host has not
-            # opened yet, and alone that reads like a failure not a queue.
-            note(f"job {args.job_id} is queued; following the log from when it starts")
-        # The watch's own session, rather than a second one: opening another
-        # costs a round trip to resolve the same home on the same host.
-        session = watch.session(watched.host)
-        argv = _follow_argv(
-            session.transport, f"{session.job_dir(args.job_id)}/log.txt", args.lines
-        )
-        reported_stream_end = False
+            return wait_mod.answer([watched], watched.line())
 
-        def check_tail(tail: subprocess.Popen[bytes]) -> None:
-            """Say so once if the stream died, rather than freeze the log in silence.
+        def each_round() -> None:
+            """Start the stream once the host answers; after that, say so once
+            if it died, rather than freeze the log in silence.
 
             An ssh whose keepalives ran out takes the tail with it. The wait
             itself is fine -- it polls over its own connection -- so this is a
             note and not an ending.
             """
-            nonlocal reported_stream_end
+            nonlocal tail, reported_stream_end
+            assert watched is not None
+            if tail is None:
+                if watched.settled or watch.troubled(watched.host):
+                    return
+                if watched.status == "queued":
+                    # Said before tail is started, because tail then says
+                    # `cannot open ... No such file or directory` about a log
+                    # the host has not opened yet, and alone that reads like a
+                    # failure not a queue.
+                    note(f"job {args.job_id} is queued; following the log from when it starts")
+                # The watch's own session, rather than a second one: opening
+                # another costs a round trip to resolve the same home.
+                session = watch.session(watched.host)
+                remote = f"{session.job_dir(args.job_id)}/log.txt"
+                tail = subprocess.Popen(_follow_argv(session.transport, remote, args.lines))
+                return
             if reported_stream_end or tail.poll() is None:
                 return
             reported_stream_end = True
             note("the log stream ended before the job did; still waiting for the job")
 
-        # Nothing between the spawn and the `try` that owns its cleanup.
-        tail = subprocess.Popen(argv)
         try:
-            wait_mod.block(watch, interval=args.interval, each_round=lambda: check_tail(tail))
+            each_round()
+            wait_mod.block(watch, interval=args.interval, each_round=each_round)
             ended = True
         finally:
             # Only a job that ended has last lines worth waiting for; an
             # interrupt wants the stream gone now.
-            _end_tail(tail, flush=ended)
+            if tail is not None:
+                _end_tail(tail, flush=ended)
+        if tail is None and watched.error is None:
+            # The host never answered and the job settled from the mirror:
+            # its log is there too. (A job that settled with an error has
+            # the wait's line to say so, and nothing to read.)
+            _, log = read_log(args.job_id, watched.host, args.lines, settings)
+            sys.stdout.write(log.text)
     except KeyboardInterrupt:
         # Ctrl-C reached the tail too: it shares this process group. The job
         # does not care either way -- its host owns it, not us. A second one,
@@ -896,8 +818,7 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> int:
             raise Interrupted(f"interrupted; job {args.job_id} {where}") from None
     if watched is None:
         raise CliError(f"job {args.job_id} was never looked up")
-    print(watched.line())
-    return wait_mod.exit_code([watched])
+    return wait_mod.answer([watched], watched.line())
 
 
 def _end_tail(tail: subprocess.Popen[bytes], *, flush: bool) -> None:
@@ -918,7 +839,7 @@ def _end_tail(tail: subprocess.Popen[bytes], *, flush: bool) -> None:
             tail.wait()
 
 
-def cmd_wait(args: argparse.Namespace) -> int:
+def cmd_wait(args: argparse.Namespace) -> Answer:
     """Block until every named job has ended, then exit with their outcome.
 
     No log: this is the half of `logs -f` a sweep wants, where twenty jobs'
@@ -928,7 +849,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     watch: wait_mod.Watch | None = None
     # Under --json stdout belongs to the document, so the outcomes go to stderr
     # as they happen and are in the document at the end.
-    announce = jsonout.note if args.json else print
+    announce = progress(args)
     try:
         # `start` is inside too: with no --host and nothing in the index it asks
         # every registered host in turn, 60s each, and that is the wait a user
@@ -943,12 +864,10 @@ def cmd_wait(args: argparse.Namespace) -> int:
         # value of saying anything at all.
         pending = [job.job_id for job in watch.pending] if watch else list(args.job_ids)
         raise Interrupted(f"interrupted; still on their hosts: {', '.join(pending)}") from None
-    if args.json:
-        jsonout.emit(wait_mod.document(waited))
-    return wait_mod.exit_code(waited)
+    return wait_mod.answer(waited)
 
 
-def cmd_requeue(args: argparse.Namespace) -> int:
+def cmd_requeue(args: argparse.Namespace) -> Answer:
     result = requeue_job(
         args.job_id,
         load_settings(),
@@ -957,22 +876,18 @@ def cmd_requeue(args: argparse.Namespace) -> int:
         workdir=Path.cwd(),
         use_git=not args.no_git,
         bootstrap=not args.no_bootstrap,
-        report=reporter(args),
+        report=progress(args),
     )
-    return _queued(result, args, requeued_from=args.job_id)
+    return _queued(result)
 
 
-def cmd_pods(args: argparse.Namespace) -> int:
+def cmd_pods(args: argparse.Namespace) -> Answer:
     settings = load_settings()
     view = pods_mod.gather(settings, make_provider(settings), heartbeats=not args.no_heartbeat)
-    if args.json:
-        jsonout.emit(view.document())
-    else:
-        print(pods_mod.render(view))
-    return EXIT_OK
+    return Answer(view.document(), pods_mod.render(view))
 
 
-def cmd_version(args: argparse.Namespace) -> int:
+def cmd_version(args: argparse.Namespace) -> Answer:
     """What is installed here, and what each host was running when last read.
 
     The host commits come from the registry's cache -- no ssh, so this stays a
@@ -980,33 +895,34 @@ def cmd_version(args: argparse.Namespace) -> int:
     host somebody else has bootstrapped since it was read: `gpuc status` asks
     each host what it is running.
     """
-    read = read_registry_warned()
+    read = open_registry()
     document = version_document(read)
-    if args.json:
-        jsonout.emit(document)
-        return registry_exit(read)
     dirty = " (+uncommitted changes)" if document["dirty"] else ""
-    print(f"gpuc {document['version']}")
-    print(f"commit {version_mod.short(document['commit'])} [{document['source']}]{dirty}")
-    print(f"python {document['python']} at {document['executable']}")
+    lines = [
+        f"gpuc {document['version']}",
+        f"commit {version_mod.short(document['commit'])} [{document['source']}]{dirty}",
+        f"python {document['python']} at {document['executable']}",
+    ]
     hosts = document["hosts"]
     if not hosts:
-        print("hosts: none read yet")
-        return registry_exit(read)
-    print("hosts (as last read from here):")
-    for host in hosts:
-        note = "" if host["current"] else "  DIFFERS: re-bootstrap"
-        seen = f"  {status_mod.format_age(host['seen_at'])}" if host["seen_at"] else ""
-        print(f"  {host['name']:<16} pkg {version_mod.short(host['pkg_commit'])}{seen}{note}")
-    if not all(host["current"] for host in hosts):
-        print(
-            "upgrade a host with: gpuc host bootstrap <host> (or --all for every host; "
-            "running jobs are not disturbed)"
-        )
-    return registry_exit(read)
+        lines.append("hosts: none read yet")
+    else:
+        lines.append("hosts (as last read from here):")
+        for host in hosts:
+            differs = "" if host["current"] else "  DIFFERS: re-bootstrap"
+            seen = f"  {status_mod.format_age(host['seen_at'])}" if host["seen_at"] else ""
+            lines.append(
+                f"  {host['name']:<16} pkg {version_mod.short(host['pkg_commit'])}{seen}{differs}"
+            )
+        if not all(host["current"] for host in hosts):
+            lines.append(
+                "upgrade a host with: gpuc host bootstrap <host> (or --all for every host; "
+                "running jobs are not disturbed)"
+            )
+    return registry_answer(read, document, "\n".join(lines))
 
 
-def cmd_web_set_password(args: argparse.Namespace) -> int:
+def cmd_web_set_password(args: argparse.Namespace) -> Answer:
     if args.stdin:
         password = sys.stdin.readline().rstrip("\r\n")
     else:
@@ -1014,39 +930,33 @@ def cmd_web_set_password(args: argparse.Namespace) -> int:
         if password != getpass.getpass("again: "):
             raise UsageError("the two passwords differ; nothing was written")
     path = web_mod.write_password(password)
-    print(f"wrote {path} (0600)\nserve the dashboard with: gpuc web serve")
-    return EXIT_OK
+    return Answer({}, f"wrote {path} (0600)\nserve the dashboard with: gpuc web serve")
 
 
-def cmd_web_serve(args: argparse.Namespace) -> int:
+def cmd_web_serve(args: argparse.Namespace) -> Answer:
     if args.install:
         web_mod.install_service(args.bind, args.port)
-        return EXIT_OK
+        return Answer({})
     server = web_mod.make_server(args.bind, args.port)
-    print(
-        f"gpuc dashboard on http://{args.bind}:{server.server_port}/ (Ctrl-C to stop)",
-        file=sys.stderr,
-    )
+    note(f"gpuc dashboard on http://{args.bind}:{server.server_port}/ (Ctrl-C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("stopped", file=sys.stderr)
+        note("stopped")
     finally:
         server.server_close()
-    return EXIT_OK
+    return Answer({})
 
 
-def cmd_skill(args: argparse.Namespace) -> int:
+def cmd_skill(args: argparse.Namespace) -> Answer:
     """Print the agent guide, or drop a copy into a project.
 
     Printing is the point: an agent can pipe `gpuc skill` into its own context
     without being told where the file lives, or which checkout it is in.
     """
     if args.install is None:
-        sys.stdout.write(read_skill())
-        return EXIT_OK
-    print(f"wrote {install_skill(Path(args.install), force=args.force)}")
-    return EXIT_OK
+        return Answer({}, read_skill())
+    return Answer({}, f"wrote {install_skill(Path(args.install), force=args.force)}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1111,8 +1021,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         metavar="MINUTES",
-        help="how long an ephemeral host may sit with an empty queue before it terminates "
-        "itself (default 15); ignored for hosts that are not ephemeral",
+        help="how long a rental may sit with an empty queue before it terminates itself "
+        "(the host's own default is 15); ignored for hosts that are not rented",
     )
     add.add_argument(
         "--force",
@@ -1159,7 +1069,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--idle-min",
         type=float,
         metavar="MINUTES",
-        help="idle minutes before an ephemeral host terminates itself",
+        help="idle minutes before a rental terminates itself",
     )
     add_json_flag(edit, "the host as `host list --json` reports it, plus what this changed")
     edit.set_defaults(func=cmd_host_set)
@@ -1216,7 +1126,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     terminate.add_argument(
         "name",
-        help="a registered runpod host, or a pod id or pod name from `gpuc pods`",
+        help="a registered rental, or a pod id or pod name from `gpuc pods`",
     )
     terminate.add_argument(
         "--force",
@@ -1353,7 +1263,7 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument(
         "--follow-forever",
         action="store_true",
-        help="stream the log and never stop, as -f used to: for watching a host's own "
+        help="stream the log and never stop: for watching a host's own "
         "writing past the end of a run. Ctrl-C is the only way out",
     )
     logs.add_argument(
@@ -1518,8 +1428,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Every page and API call is behind the password `gpuc web set-password` "
         "records. The dashboard is a thin view over the same code the CLI runs: what it "
         "shows is `gpuc status --json`, `gpuc host list --json` and `gpuc config show "
-        "--json`, and what it can do is `gpuc cancel`, `gpuc preempt`, `gpuc reorder` and "
-        "`gpuc estimate`.",
+        "--json`, and what it can do is `gpuc cancel`, `gpuc preempt`, `gpuc reorder`, "
+        "`gpuc estimate` and `gpuc host remove`.",
     )
     serve.add_argument(
         "--bind",
@@ -1616,13 +1526,19 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
         help="which RunPod tier to buy from; community is cheaper and less reliable "
         "(default secure)",
     )
-    parser.add_argument("--cuda-min", default=None, help="host CUDA floor, default 12.8")
+    parser.add_argument(
+        "--cuda-min",
+        default=DEFAULT_CUDA_MIN,
+        help=f"the CUDA floor the catalog is asked for and the pod is created with "
+        f"(default {DEFAULT_CUDA_MIN})",
+    )
     parser.add_argument(
         "--idle-min",
         type=float,
-        default=15.0,
+        default=None,
         metavar="MINUTES",
-        help="terminate the pod once its queue has been empty this long (default 15)",
+        help=f"terminate the pod once its queue has been empty this long "
+        f"(default {DEFAULT_IDLE_MINUTES:g})",
     )
     parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
     parser.add_argument("--image", help="pod image; default from config")
@@ -1649,14 +1565,27 @@ def first_run_note() -> None:
         )
 
 
-def failed(args: argparse.Namespace, message: str, exit_code: int) -> int:
+def failed(
+    args: argparse.Namespace, message: str, exit_code: int, document: dict[str, Any] | None = None
+) -> int:
     """One exit for every failure: the message on stderr, and under `--json` a
     document on stdout saying the same thing, so a caller parsing stdout is
-    never handed half an answer or nothing at all."""
+    never handed half an answer or nothing at all. `document` is what a
+    command interrupted midway still has to show, beside the error."""
     print(f"error: {message}", file=sys.stderr)
     if getattr(args, "json", False):
-        jsonout.emit_error(message, exit_code)
+        jsonout.emit_error(message, exit_code, **(document or {}))
     return exit_code
+
+
+def emit(args: argparse.Namespace, answer: Answer) -> int:
+    """The one place a command's answer reaches stdout: the document under
+    `--json`, the text otherwise, and the exit code the answer says."""
+    if getattr(args, "json", False):
+        jsonout.emit(answer.document)
+    elif answer.text:
+        sys.stdout.write(answer.text if answer.text.endswith("\n") else answer.text + "\n")
+    return answer.exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1684,7 +1613,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command not in ("config", "skill"):
         first_run_note()
     try:
-        return int(args.func(args))
+        answer = args.func(args)
     except KeyboardInterrupt:
         # Every Ctrl-C out of a blocking command lands here, so none of them can
         # return 0 by accident or leave `--json` with an empty stdout -- the two
@@ -1693,11 +1622,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # what was in flight raises `Interrupted` instead, which is the line
         # below.
         return failed(args, "interrupted", EXIT_INTERRUPTED)
+    except Interrupted as exc:
+        return failed(args, str(exc), EXIT_INTERRUPTED, exc.document)
     except Exception as exc:
         code = exit_code_for(exc)
         if code is None:
             raise
         return failed(args, failure_message(exc), code)
+    return emit(args, answer)
 
 
 if __name__ == "__main__":

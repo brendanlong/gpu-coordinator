@@ -3,44 +3,123 @@
 Re-running is always safe and is the supported fix for "the host looks wrong".
 Anything optional (the `aws` and `hf` upload helpers) degrades to a warning:
 a missing uploader must fail a job's sync step, never the queue.
+
+`ensure_build` is the one path that ships the package: bootstrap runs it
+unconditionally, and `submit` and `requeue` run it when the host's own
+`config.json` names another build.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from gpuc._version import user_agent
-from gpuc.control import probe as probe_mod
-from gpuc.control.config import HostEntry, Reporter, Settings, transport_for, utc_now
-from gpuc.control.gpuinfo import discover, summarize
+from gpuc.control.config import (
+    HostEntry,
+    Reporter,
+    Settings,
+    first_config,
+    load_settings,
+    transport_for,
+    utc_now,
+)
+from gpuc.control.connect import refuse_unreadable
+from gpuc.control.gpuinfo import summarize
 from gpuc.control.remote import (
+    PYTHON_FLOOR,
+    HostConfigRead,
     HostSession,
     env_prefix,
     host_python,
     parse_last_json,
-    read_remote_config,
+    read_config,
     resolve_home,
-    write_remote_config,
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
-from gpuc.control.version import local_commit, package_root, short
-from gpuc.host import jobs, paths
-from gpuc.host.jobs import cache_beside
+from gpuc.control.version import is_other_build, local_commit, package_root, short
+from gpuc.host import health, jobs, paths
+from gpuc.host.jobs import HostConfig, cache_beside
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
-PYTHON_FLOOR = ".".join(str(part) for part in probe_mod.PYTHON_FLOOR)
+PYTHON_FLOOR_TEXT = ".".join(str(part) for part in PYTHON_FLOOR)
 PYTHON_INSTALL = "3.12"
 INSTALL_TIMEOUT_S = 900.0
 HEALTH_TIMEOUT_S = 300.0
+AWS_KEY_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 
 
 class BootstrapError(RuntimeError):
     pass
+
+
+class _HealthArgsParser(argparse.ArgumentParser):
+    """`--health-args` parsed by the host's own parser, with a bad flag raised
+    rather than printed and exited on: the CLI turns it into a usage error."""
+
+    def error(self, message: str) -> Any:
+        raise ValueError(f"--health-args: {message}")
+
+
+@dataclass(frozen=True)
+class HealthOptions:
+    """What `python -m gpuc.host health` is told beyond its defaults.
+
+    Typed, and rendered to flags in one place (`args`), so a health option
+    reaches the host's command line through `shlex` rather than being spliced
+    in as text by whichever function last held it. None is the host's own
+    default for that check.
+    """
+
+    min_mbps: float | None = None
+    min_free_gb: float | None = None
+    download_url: str | None = None
+    download_timeout_s: float | None = None
+
+    @classmethod
+    def parse(cls, text: str) -> HealthOptions:
+        """`--health-args "--min-mbps 0.1"`, judged by the same parser the host
+        runs (`health.add_arguments`); raises ValueError on a flag it lacks."""
+        parser = _HealthArgsParser(prog="gpuc.host health", add_help=False)
+        health.add_arguments(parser)
+        given = parser.parse_args(shlex.split(text))
+        return cls(
+            min_mbps=None if given.min_mbps == health.DEFAULT_MIN_MBPS else given.min_mbps,
+            min_free_gb=(
+                None if given.min_free_gb == health.DEFAULT_MIN_FREE_GB else given.min_free_gb
+            ),
+            download_url=(
+                None if given.download_url == health.DEFAULT_DOWNLOAD_URL else given.download_url
+            ),
+            download_timeout_s=(
+                None
+                if given.download_timeout == health.DEFAULT_DOWNLOAD_TIMEOUT_S
+                else given.download_timeout
+            ),
+        )
+
+    def args(self) -> list[str]:
+        flags: list[str] = []
+        if self.min_mbps is not None:
+            flags += ["--min-mbps", str(self.min_mbps)]
+        if self.min_free_gb is not None:
+            flags += ["--min-free-gb", str(self.min_free_gb)]
+        if self.download_url is not None:
+            flags += ["--download-url", self.download_url]
+        if self.download_timeout_s is not None:
+            flags += ["--download-timeout", str(self.download_timeout_s)]
+        return flags
+
+
+DEFAULT_HEALTH = HealthOptions()
+"""Every check at the host's own default."""
 
 
 @dataclass
@@ -112,14 +191,14 @@ def _first_line(text: str) -> str:
     return text.strip().splitlines()[0].strip() if text.strip() else ""
 
 
-def remote_path(entry: HostEntry) -> str:
+def remote_path(config: HostConfig) -> str:
     """The ``PATH=`` assignment for anything we start on the host.
 
     A pod's sshd hands out a PATH with none of these, and the dispatcher's
     environment is what every runner and every job command inherits. A host
     whose `env` names its own tool directories gets those in front.
     """
-    head = "".join(f"{d}:" for d in entry.config.bin_dirs())
+    head = "".join(f"{d}:" for d in config.bin_dirs())
     user = "".join(f"$HOME/{d}:" for d in paths.USER_BIN_DIRS)
     return f'PATH="{head}{user}$PATH"'
 
@@ -178,31 +257,33 @@ def install_uv(transport: Transport) -> str:
     return uv
 
 
-def find_python(transport: Transport, uv: str, entry: HostEntry) -> str | None:
+def find_python(transport: Transport, uv: str, env: Mapping[str, str]) -> str | None:
     # From $HOME, without the project and without an inherited VIRTUAL_ENV:
     # otherwise `uv python find` returns the venv of whatever directory the
     # control side was invoked from (`uv run gpuc ...` exports VIRTUAL_ENV),
     # and the host would be pinned to an interpreter that can disappear.
     result = transport.run(
-        f'cd "$HOME" && {env_prefix(entry.env)}env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT '
-        f"{shlex.quote(uv)} python find --no-project '>={PYTHON_FLOOR}' 2>/dev/null",
+        f'cd "$HOME" && {env_prefix(env)}env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT '
+        f"{shlex.quote(uv)} python find --no-project '>={PYTHON_FLOOR_TEXT}' 2>/dev/null",
         check=False,
     )
     path = _first_line(result.stdout)
     return path or None
 
 
-def ensure_python(transport: Transport, uv: str, entry: HostEntry, report: Reporter) -> str:
-    python = find_python(transport, uv, entry)
+def ensure_python(transport: Transport, uv: str, env: Mapping[str, str], report: Reporter) -> str:
+    python = find_python(transport, uv, env)
     if python:
         return python
-    report(f"installing Python {PYTHON_INSTALL} with uv (no interpreter >= {PYTHON_FLOOR} found)")
+    report(
+        f"installing Python {PYTHON_INSTALL} with uv (no interpreter >= {PYTHON_FLOOR_TEXT} found)"
+    )
     result = transport.run(
-        f"{env_prefix(entry.env)}{shlex.quote(uv)} python install {PYTHON_INSTALL}",
+        f"{env_prefix(env)}{shlex.quote(uv)} python install {PYTHON_INSTALL}",
         timeout=INSTALL_TIMEOUT_S,
         check=False,
     )
-    python = find_python(transport, uv, entry)
+    python = find_python(transport, uv, env)
     if python is None:
         raise BootstrapError(
             f"`uv python install {PYTHON_INSTALL}` on host {transport.host} left no usable "
@@ -230,6 +311,39 @@ def sync_package(transport: Transport, home: str, report: Reporter) -> int:
         f'find "{home}/pkg" -name __pycache__ -type d -prune -exec rm -rf {{}} +', check=False
     )
     return len(files)
+
+
+def host_build(session: HostSession) -> str | None:
+    """The build a host is running, by its own account: `pkg_commit` in the
+    config the session read. None is a host that never said."""
+    return session.config.pkg_commit
+
+
+def ensure_build(
+    session: HostSession, report: Reporter, *, always: bool = False, restart: bool = True
+) -> int | None:
+    """Ship this build's package to a host whose config names another one.
+
+    The one ship path. The commit comes from the host's own `config.json`
+    rather than from this registry, which only ever recorded what this
+    machine shipped: two control machines against one box -- a laptop and a
+    desktop -- each leave that record describing a host the other has since
+    re-bootstrapped. An unrecorded commit counts as another build, and so does
+    a dirty checkout on either side.
+
+    Only the package and, with `restart`, the dispatcher: uv, the interpreter
+    and health cannot have gone stale, and a job may be waiting. The commit
+    just shipped is written to the host's config as the only key touched.
+    Returns how many files went, or None when nothing had to.
+    """
+    local = local_commit()
+    if not always and not is_other_build(host_build(session), local):
+        return None
+    files = sync_package(session.transport, session.home, report)
+    session.write_config({"pkg_commit": local})
+    if restart:
+        start_dispatcher(session)
+    return files
 
 
 def find_aws_cli(transport: Transport) -> str | None:
@@ -270,7 +384,9 @@ def ensure_aws_cli(transport: Transport, report: Reporter) -> str | None:
     return None
 
 
-def ensure_hf_cli(transport: Transport, uv: str, entry: HostEntry, report: Reporter) -> str | None:
+def ensure_hf_cli(
+    transport: Transport, uv: str, env: Mapping[str, str], report: Reporter
+) -> str | None:
     bin_dir = "$HOME/.local/bin"
     present = transport.run(
         f'if [ -x "{bin_dir}/hf" ]; then echo "{bin_dir}/hf"; else command -v hf 2>/dev/null; fi',
@@ -280,7 +396,7 @@ def ensure_hf_cli(transport: Transport, uv: str, entry: HostEntry, report: Repor
         return None
     report("installing huggingface_hub as a uv tool")
     result = transport.run(
-        f"{env_prefix(entry.env)}{shlex.quote(uv)} tool install huggingface_hub",
+        f"{env_prefix(env)}{shlex.quote(uv)} tool install huggingface_hub",
         timeout=INSTALL_TIMEOUT_S,
         check=False,
     )
@@ -292,25 +408,28 @@ def ensure_hf_cli(transport: Transport, uv: str, entry: HostEntry, report: Repor
     return None
 
 
-UV_CACHE_PROBE = """\
-set -e
-home={home}
-mkdir -p "$home" 2>/dev/null || true
-cache=$({env}{uv} cache dir 2>/dev/null || true)
-[ -n "$cache" ] || cache="$HOME/.cache/uv"
-mkdir -p "$cache" 2>/dev/null || true
-echo "cache=$cache"
-echo "cache_dev=$(stat -c %d "$cache" 2>/dev/null || echo unknown)"
-echo "home_dev=$(stat -c %d "$home" 2>/dev/null || echo unknown)"
-"""
+def uv_cache_placement(session: HostSession) -> dict[str, Any] | None:
+    """The host's own answer to where uv's cache is and whether it shares gpuc
+    home's filesystem (`health.uv_cache_placement`), or None when the host
+    could not say. The same code the health check reports with, run under
+    the host's env, so bootstrap decides on exactly what health will show."""
+    command = (
+        f"{host_python(session.python, session.home, session.env)} -c "
+        f'"import json; from gpuc.host import health; '
+        f'print(json.dumps(health.uv_cache_placement()))"'
+    )
+    result = session.run(command)
+    document = parse_last_json(result.stdout) if result.returncode == 0 else _NO_JSON
+    return document if isinstance(document, dict) else None
 
 
-def resolve_cache_dir(
-    transport: Transport, entry: HostEntry, uv: str, home: str, report: Reporter
-) -> str | None:
+_NO_JSON = object()
+
+
+def resolve_cache_dir(session: HostSession, report: Reporter) -> str | None:
     """Decide this host's `UV_CACHE_DIR`. `None` means uv's default is right.
 
-    uv builds a venv by reflinking or hardlinking wheels out of `~/.cache/uv`,
+    uv builds a venv by reflinking or hardlinking wheels out of its cache,
     and both only work inside a single filesystem; across one it silently falls
     back to copying. On a host whose gpuc home is on a network volume and whose
     `$HOME` is a container's overlay (a RunPod pod with `--persistent-root
@@ -323,27 +442,23 @@ def resolve_cache_dir(
     there (`--cache-dir`, `--env UV_CACHE_DIR=...`, or an earlier bootstrap):
     this is the one key bootstrap fills in itself, and only when it is empty.
     """
-    pinned = entry.env.get("UV_CACHE_DIR")
+    pinned = session.env.get("UV_CACHE_DIR")
     if pinned:
         report(f"uv cache: {pinned} (set for this host; left alone)")
         return None
-    script = UV_CACHE_PROBE.format(
-        home=shlex.quote(home), env=env_prefix(entry.env), uv=shlex.quote(uv)
-    )
-    result = transport.run(script, check=False)
-    if result.returncode != 0:
-        report(f"WARNING: could not read the uv cache location on {entry.name}; leaving it default")
+    placement = uv_cache_placement(session)
+    if placement is None:
+        report(
+            f"WARNING: could not read the uv cache location on {session.entry.name}; "
+            f"leaving it default"
+        )
         return None
-    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if line.count("=") >= 1)
-    cache, cache_dev, home_dev = (
-        values.get("cache", ""),
-        values.get("cache_dev", "unknown"),
-        values.get("home_dev", "unknown"),
-    )
-    if "unknown" in (cache_dev, home_dev) or not cache:
+    cache, shared = placement.get("dir"), placement.get("shares_gpuc_home_fs")
+    home = session.home
+    if not cache or shared is None:
         report(f"uv cache: {cache or 'unknown'} (could not compare filesystems; left alone)")
         return None
-    if cache_dev == home_dev:
+    if shared:
         report(f"uv cache: {cache}, same filesystem as {home}; uv will link wheels into venvs")
         return None
     target = cache_beside(home, "uv")
@@ -354,9 +469,7 @@ def resolve_cache_dir(
     return target
 
 
-def derive_env(
-    transport: Transport, entry: HostEntry, uv: str, home: str, report: Reporter
-) -> dict[str, str]:
+def derive_env(session: HostSession, report: Reporter) -> dict[str, str]:
     """The managed env keys this host names nothing for, filled in.
 
     `UV_CACHE_DIR` is the one with a real decision behind it
@@ -366,33 +479,32 @@ def derive_env(
     never touched.
     """
     derived: dict[str, str] = {}
-    cache_dir = resolve_cache_dir(transport, entry, uv, home, report)
+    cache_dir = resolve_cache_dir(session, report)
     if cache_dir:
         derived["UV_CACHE_DIR"] = cache_dir
-    if entry.root is None:
+    if session.entry.root is None:
         # Only a persistent root moves a cache: on an ordinary host the
         # default location is the user's own, holding their models and their
         # `hf auth login` token, and pointing jobs elsewhere would lose both.
         return derived
     for key, managed in jobs.MANAGED_ENV.items():
-        if key == "UV_CACHE_DIR" or not managed.beside_home or entry.env.get(key):
+        if key == "UV_CACHE_DIR" or not managed.beside_home or session.env.get(key):
             continue
-        derived[key] = cache_beside(home, managed.beside_home)
+        derived[key] = cache_beside(session.home, managed.beside_home)
         report(f"{key}: {derived[key]} (beside gpuc home, on the persistent root)")
     return derived
 
 
-def ensure_layout(transport: Transport, entry: HostEntry, home: str, python: str) -> None:
+def ensure_layout(transport: Transport, env: Mapping[str, str], home: str, python: str) -> None:
     """Create gpuc home and its subdirectories 0700, using the host's own code."""
     transport.run(
-        f'{host_python(python, home, entry.env)} -c "from gpuc.host import paths; '
-        f'paths.ensure_layout()"',
+        f'{host_python(python, home, env)} -c "from gpuc.host import paths; paths.ensure_layout()"',
         check=True,
     )
 
 
-def run_health(session: HostSession, health_args: str = "") -> dict[str, Any]:
-    args = f"health {health_args}".strip()
+def run_health(session: HostSession, options: HealthOptions) -> dict[str, Any]:
+    args = shlex.join(["health", *options.args()])
     result = session.host_cli(args, timeout=HEALTH_TIMEOUT_S, check=False)
     report = parse_last_json(result.stdout)
     if not isinstance(report, dict):
@@ -420,18 +532,42 @@ def driver_version(health: dict[str, Any]) -> str | None:
     return None
 
 
-STALE_UNITS = ("gpuc-reconcile.timer", "gpuc-reconcile.service")
-"""Units an earlier build installed and no build serves any more; left in
-place they fail every minute for ever. Removed best-effort on every bootstrap."""
+def deliver_s3_credentials(
+    transport: Transport,
+    config: HostConfig,
+    report: Reporter,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Give a *rented* host S3 credentials of its own, for the mirror.
 
-
-def remove_stale_units(transport: Transport) -> None:
-    units = " ".join(STALE_UNITS)
-    files = " ".join(f"$HOME/.config/systemd/user/{unit}" for unit in STALE_UNITS)
-    transport.run(
-        f"systemctl --user disable --now {units} >/dev/null 2>&1; rm -f {files}; true",
-        check=False,
-    )
+    Each job's sync runs with the job's own `secrets:`, but the dispatcher's
+    drain mirrors every job's log.txt and state.json after the jobs -- and
+    their secrets files -- are gone, with only its own environment to do it.
+    So the pod gets a `~/.aws/credentials` from the bootstrapping shell,
+    written from stdin at 0600, never via argv and never in the pod env
+    (`GET /pods` returns the env to any holder of an account key). A rental
+    only: its `$HOME` is ours, and a shared box's user has their own. Part of
+    bootstrap so a pod whose home was wiped gets them back with everything
+    else. Returns a warning when the mirror will go without.
+    """
+    if not config.ephemeral or not config.s3_prefix:
+        return None
+    environ = dict(os.environ) if environ is None else dict(environ)
+    if not (environ.get("AWS_ACCESS_KEY_ID") and environ.get("AWS_SECRET_ACCESS_KEY")):
+        return (
+            f"no AWS credentials in this environment, so the pod cannot mirror logs to "
+            f"{config.s3_prefix}; export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY before "
+            f"bootstrapping if you want the mirror"
+        )
+    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    body = "[default]\n" + f"region = {region}\n"
+    for name in AWS_KEY_VARS:
+        if environ.get(name):
+            body += f"{name.lower()} = {environ[name]}\n"
+    home = transport.run('printf %s "$HOME"', check=True).stdout.strip()
+    transport.put_file(body, f"{home}/.aws/credentials", 0o600)
+    report(f"delivered S3 credentials to {home}/.aws/credentials (0600) for the log mirror")
+    return None
 
 
 def start_dispatcher(session: HostSession) -> int:
@@ -439,8 +575,8 @@ def start_dispatcher(session: HostSession) -> int:
     # setting them here means the very first process in the chain already has
     # them, before it has read anything.
     command = (
-        f"{remote_path(session.entry)} "
-        f"{host_python(session.python, session.home, session.entry.env)} "
+        f"{remote_path(session.config)} "
+        f"{host_python(session.python, session.home, session.env)} "
         f'-c "from gpuc.host import dispatcher; print(dispatcher.spawn_detached_dispatcher())"'
     )
     result = session.transport.run(command, check=False)
@@ -453,93 +589,27 @@ def start_dispatcher(session: HostSession) -> int:
     return int(pid)
 
 
-def bootstrapped_provider(entry: HostEntry) -> dict[str, Any]:
-    """`{"provider": ...}` with this moment stamped on it, for a rented host.
-
-    A pod carries its own record of what it was bought as (`rented`), and this
-    is the stamp that says it was set up, written by whichever machine did so.
-    Empty for a host nobody is renting: inventing a provider block for one
-    would make it read as a pod.
-
-    The question is whether this host is *rented*, not whether its config
-    already says so: a pod set up before the block existed has none, and it is
-    the address that knows it is a pod.
-    """
-    provider = entry.config.provider or entry.provider()
-    if provider is None:
-        return {}
-    return {"provider": {**provider, "bootstrapped_at": utc_now()}}
-
-
-def read_host_config(transport: Transport, entry: HostEntry, home: str) -> dict[str, Any]:
-    """The host's own config, or a refusal: `{}` means it has none, never that
-    we could not tell. Bootstrap replaces a config that is not there; a config
-    that is there and unreadable is a file the host is running on."""
-    document = read_remote_config(transport, home)
-    if document is None:
-        raise BootstrapError(
-            f"{home}/config.json on host {entry.name} could not be read, and bootstrap will not "
-            f"replace a config it cannot see.\nFix the file (it should be JSON), or delete it "
-            f"and run this again to write a fresh one."
-        )
-    return document
-
-
-def resync_package(
-    entry: HostEntry,
-    settings: Settings | None = None,
-    *,
-    transport: Transport | None = None,
-    report: Reporter = print,
-) -> HostEntry:
-    """Ship this build's package to a host and start the dispatcher again.
-
-    The half of bootstrap that goes stale. uv, the interpreter and the upload
-    CLIs cannot have changed since the host was bootstrapped, and health takes
-    minutes, so `gpuc submit` re-runs only this before it enqueues: a host
-    still running last week's package would otherwise dispatch the job with
-    code that no longer matches the spec this machine just wrote.
-
-    The only thing it writes to the host's config is the commit it just
-    shipped. Returns the entry with the host's answer cached; the caller
-    persists it.
-    """
-    transport = transport or transport_for(entry, settings)
-    home = resolve_home(transport, entry)
-    sync_package(transport, home, report)
-    patch: dict[str, Any] = {"pkg_commit": local_commit()}
-    if not read_host_config(transport, entry, home):
-        # The host has lost its config (a wiped $HOME, most often a pod that
-        # restarted). Restoring the last one seen is better than dispatching
-        # this job to a host that now believes it owns no cards at all.
-        patch = {**entry.initial_config().to_dict(), **patch}
-        report(f"{home}/config.json was missing; restoring the last one seen")
-    document = write_remote_config(transport, home, patch, python=entry.python, env=entry.env)
-    updated = entry.with_config(document)
-    start_dispatcher(HostSession(updated, transport, home, updated.python or ""))
-    return updated
-
-
 def bootstrap_host(
     entry: HostEntry,
     settings: Settings | None = None,
     *,
     transport: Transport | None = None,
     report: Reporter = print,
-    health_args: str = "",
+    health_options: HealthOptions = DEFAULT_HEALTH,
 ) -> tuple[HostEntry, BootstrapResult]:
     """Bring a host to a state where `python -m gpuc.host` runs and dispatches.
 
     Installs, ships and starts things; it does **not** configure the host.
     What the host is -- its cards, its mirror, its env, its timers -- is
     `config.json`'s and stays the host's, so the only keys bootstrap writes are
-    the commit it just shipped and, on a host that has never had one,
-    `UV_CACHE_DIR`. The exception is a host with no config at all (one
-    registered before this split, or one whose gpuc home was wiped): there is
-    nothing to preserve, so the last config this machine saw is restored.
+    the commit it just shipped and the managed env keys it derives from the
+    host's own filesystem. The exception is a host with no config at all (one
+    whose gpuc home was wiped): there is nothing to preserve, so it gets
+    `first_config` with the last config this machine read off it on top.
 
     Returns the entry with what the host said cached; the caller persists it.
     """
+    settings = settings if settings is not None else load_settings()
     transport = transport or transport_for(entry, settings)
     warnings: list[str] = []
 
@@ -549,23 +619,23 @@ def bootstrap_host(
     # The host's own config decides every environment below -- which uv cache
     # the installs populate, which tool directories go on PATH -- so it is read
     # before anything else runs.
-    existing = read_host_config(transport, entry, home)
-    entry = entry.with_config(existing) if existing else entry
+    read = refuse_unreadable(read_config(transport, home), entry.name, home, BootstrapError)
     patch: dict[str, Any] = {}
-    if not existing:
-        patch.update(entry.initial_config().to_dict())
-        entry = entry.with_config(patch)
+    if read.missing:
+        patch = first_config(entry, settings, entry.cache.config)
+        read = HostConfigRead(patch)
         report(
             f"{home}/config.json does not exist on {entry.name}: initialising it with "
-            f"{len(entry.gpus)} GPU(s)"
+            f"{len(read.config.gpus)} GPU(s)"
         )
-        if not entry.gpus:
+        if not read.config.gpus:
             warnings.append(
-                f"host {entry.name} has no config of its own and this machine has none cached "
-                f"for it, so it will run nothing until "
+                f"host {entry.name} has no config of its own and this machine has no cards "
+                f"recorded for it, so it will run nothing until "
                 f"`gpuc host set {entry.name} --gpus <list>`"
             )
             report(f"WARNING: {warnings[-1]}")
+    config = read.config
 
     uv = find_uv(transport)
     if uv is None:
@@ -573,72 +643,74 @@ def bootstrap_host(
         uv = install_uv(transport)
     report(f"uv: {uv}")
 
-    python = ensure_python(transport, uv, entry, report)
+    python = ensure_python(transport, uv, config.env, report)
     report(f"python: {python}")
 
-    files = sync_package(transport, home, report)
+    # The host's first config, if it has none, goes down before anything runs
+    # against the host (and creates gpuc home 0700 on the way); the package
+    # next, so `pkg_commit` says which commit this is while `gpuc status` is
+    # still watching; and only then anything that imports the host's own code,
+    # `ensure_layout` included -- on a fresh box it is the package just shipped
+    # that provides it.
+    session = HostSession(entry, transport, home, python, read)
+    if patch:
+        session.write_config(patch)
+        report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
+    files = ensure_build(session, report, always=True, restart=False) or 0
+    ensure_layout(transport, config.env, home, python)
 
     # Before `uv tool install`, so that call already populates the cache this
     # host will actually use.
-    derived = derive_env(transport, entry, uv, home, report)
+    derived = derive_env(session, report)
     if derived:
-        patch["env"] = {**entry.env, **derived}
-        entry = entry.with_config({**entry.cache.config, **patch})
+        session.write_config({"env": {**session.env, **derived}})
+        report(f"{home}/config.json: env <- {', '.join(sorted(derived))}")
+    config = session.config
 
     aws_warning = ensure_aws_cli(transport, report)
-    if aws_warning and entry.s3_prefix:
+    if aws_warning and config.s3_prefix:
         # This host is registered to mirror every job's log and state to S3. With
         # no `aws` there, each job's final sync fails, every job ends
         # `failed: sync`, and nothing is ever purgeable -- a broken host that
         # looks bootstrapped is worse than a bootstrap that says no.
         raise BootstrapError(
-            f"host {entry.name} has s3_prefix {entry.s3_prefix} but the aws CLI could not be "
+            f"host {entry.name} has s3_prefix {config.s3_prefix} but the aws CLI could not be "
             f"installed:\n{aws_warning}\n"
             f"Install it by hand into ~/.local/aws-cli, or drop the mirror with "
             f"`gpuc host set {entry.name} --s3-prefix ''`."
         )
-    for warning in (aws_warning, ensure_hf_cli(transport, uv, entry, report)):
+    for warning in (
+        aws_warning,
+        ensure_hf_cli(transport, uv, config.env, report),
+        deliver_s3_credentials(transport, config, report),
+    ):
         if warning:
             warnings.append(warning)
             report(f"WARNING: {warning}")
 
-    # Written before health runs, so the checks judge the config the host is
-    # about to dispatch with, and so its `pkg_commit` says which commit this
-    # package came from while `gpuc status` is still watching.
-    ensure_layout(transport, entry, home, python)
-    commit = local_commit()
-    patch["pkg_commit"] = commit
-    patch.update(bootstrapped_provider(entry))
-    entry = entry.with_config(
-        write_remote_config(transport, home, patch, python=python, env=entry.env)
-    )
-    report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
-
-    session = HostSession(entry, transport, home, python)
-    health = run_health(session, health_args)
+    health = run_health(session, health_options)
     report("health: " + "; ".join(f"{c['name']} ok" for c in health.get("checks", [])))
     for warning in health.get("warnings", []):
         warnings.append(warning)
         report(f"WARNING: {warning}")
 
-    remove_stale_units(transport)
     pid = start_dispatcher(session)
     report(f"dispatcher running (pid {pid})")
 
-    gpu_info = discover(transport)
-    if entry.gpus:
-        report(f"gpus: {summarize(entry.gpus, gpu_info or entry.gpu_info)}")
-    updated = entry.with_cache(
-        uv=uv,
-        python=python,
-        gpu_info=gpu_info or None,
-        driver_version=driver_version(health),
-    ).model_copy(update={"bootstrapped_at": utc_now()})
+    # The cards are the probe's to record (`host add`, `host probe`); this
+    # keeps what the entry has and adds the driver health just reported.
+    if session.config.gpus:
+        report(f"gpus: {summarize(session.config.gpus, entry.gpu_info)}")
+    updated = (
+        entry.with_cache(uv=uv, python=python, driver_version=driver_version(health))
+        .with_config(session.config_read.document or {})
+        .model_copy(update={"bootstrapped_at": utc_now()})
+    )
     return updated, BootstrapResult(
         host=entry.name,
         home=home,
         files=files,
-        pkg_commit=commit,
+        pkg_commit=local_commit(),
         dispatcher_pid=pid,
         warnings=warnings,
     )

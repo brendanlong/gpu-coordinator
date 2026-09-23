@@ -27,12 +27,12 @@ from gpuc.control.cli import main
 from gpuc.control.config import (
     HostEntry,
     Settings,
-    load_registry,
     load_settings,
 )
 from gpuc.control.providers.base import Offer, Pod
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.s3index import LocalIndex
+from tests.conftest import load_registry
 
 pytestmark = pytest.mark.runpod
 
@@ -185,8 +185,8 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
     if not os.environ.get("RUNPOD_API_KEY"):
         pytest.skip("RUNPOD_API_KEY is not set")
     provider = RecordingProvider(live_settings.runpod_pod_prefix)
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
-    monkeypatch.setattr("gpuc.control.submitting.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    monkeypatch.setattr("gpuc.control.submitting.make_provider", lambda *a, **k: provider)
     monkeypatch.chdir(workdir)
     started = time.monotonic()
 
@@ -218,7 +218,7 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
             )
             log(f"submit returned after {time.monotonic() - started:.0f}s")
 
-            entries = [e for e in load_registry().hosts.values() if e.kind == "runpod"]
+            entries = [e for e in load_registry().hosts.values() if e.kind == "rental"]
             assert len(entries) == 1, entries
             entry = entries[0]
             assert entry.pod_id in provider.created_ids
@@ -230,7 +230,7 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
             assert pod is not None
             log(
                 f"pod {pod.id} {pod.name}: {pod.gpu_name} cuda {pod.cuda_version} "
-                f"${pod.cost_usd_hr:.3f}/h, {len(entry.gpus)} GPU(s) {entry.gpus}"
+                f"${pod.cost_usd_hr:.3f}/h, {len(entry.config.gpus)} GPU(s) {entry.config.gpus}"
             )
             assert main(["status"]) == 0
             assert main(["pods"]) == 0

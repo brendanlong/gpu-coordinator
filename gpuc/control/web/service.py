@@ -20,6 +20,10 @@ BIND = re.compile(r"^[A-Za-z0-9.:\[\]_-]+$")
 unit file verbatim: a newline in it is a second `ExecStart=`."""
 START_LIMIT_INTERVAL_S = 300
 START_LIMIT_BURST = 5
+"""`Restart=on-failure` under a start limit: a service with no password set
+starts, logs the `gpuc web set-password` line and exits, and without the
+limit systemd would loop it for ever. Five tries over five minutes leaves it
+`failed`, where `systemctl --user status` shows the line."""
 """`Restart=on-failure` alone retries every `RestartSec` for ever, and a
 server with no password exits 1 at once: without a limit that is a loop only
 the journal can see. Five tries in five minutes, then `failed`."""

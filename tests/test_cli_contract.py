@@ -9,6 +9,7 @@ running". Both halves of that have to be impossible now.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,7 @@ import pytest
 from gpuc.control import status as status_mod
 from gpuc.control.cli import (
     EXIT_ERROR,
+    EXIT_INTERRUPTED,
     EXIT_LOCAL_STATE,
     EXIT_NOT_FOUND,
     EXIT_OK,
@@ -31,16 +33,22 @@ from gpuc.control.config import (
     backup_path,
     config_file,
     hosts_file,
-    load_registry,
     pod_known_hosts_file,
     read_registry,
 )
 from gpuc.control.s3index import S3IndexError
 from gpuc.control.status import HostState, HostView
-from tests.conftest import host_entry, register_host
+from tests.conftest import (
+    FAKE_GPUS,
+    accept_job,
+    host_entry,
+    install_fake_nvidia_smi,
+    load_registry,
+    register_host,
+)
 from tests.fakehost import FakeHost
 
-GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
+GPU = FAKE_GPUS[0]
 
 GOOD_ENTRY = {
     "name": "good",
@@ -75,6 +83,35 @@ def test_one_bad_host_entry_is_skipped_and_the_rest_still_work(
     captured = capsys.readouterr()
     assert "good" in captured.out
     assert "skipping host 'bad'" in captured.err
+
+
+LEGACY_RENTAL = {"name": "gpuc-old", "kind": "runpod", "ssh": "root@1.2.3.4", "pod_id": "podOLD"}
+"""A rental as a build before `rental: {provider, pod_id}` wrote one."""
+
+
+def test_a_rental_an_earlier_build_registered_is_refused_not_read_as_ssh(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Read tolerantly it parses as an ssh host, and then nothing about it being
+    a rental works: no terminate, no reuse, never forgotten when its pod ends.
+    So it is one more entry this build cannot read -- skipped with the reason
+    and the way back, written back untouched, exit 1 -- not a quiet ssh host."""
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "gpuc-old": LEGACY_RENTAL}})
+    read = read_registry()
+    assert set(read.registry.hosts) == {"good"}
+    assert read.skipped["gpuc-old"] == LEGACY_RENTAL
+    assert "earlier build" in read.errors[0]
+    assert "gpuc host add <name> --pod podOLD" in read.errors[0]
+
+    assert main(["host", "list"]) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "good" in captured.out
+    assert "gpuc host add <name> --pod podOLD" in captured.err
+    # A rental spelled the one way this build spells it is still a rental.
+    spelled = HostEntry.model_validate(
+        {"name": "n", "rental": {"provider": "runpod", "pod_id": "p"}}
+    )
+    assert spelled.kind == "rental"
 
 
 def test_a_write_puts_back_the_entry_this_build_could_not_read(
@@ -118,7 +155,7 @@ def test_a_mutation_refuses_to_overwrite_a_registry_it_could_not_read(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{ this is not json")
     assert main(["host", "set", "local", "--idle-min", "9"]) == EXIT_LOCAL_STATE
-    assert "Nothing was written" in capsys.readouterr().err
+    assert "not a readable host registry" in capsys.readouterr().err
     assert path.read_text() == "{ this is not json"
 
 
@@ -144,7 +181,7 @@ def test_a_missing_registry_is_simply_no_hosts(control_env: Path) -> None:
 # -- exit codes ---------------------------------------------------------------
 
 
-def test_status_reports_an_unreachable_host_and_exits_one(
+def test_status_reports_an_unaskable_host_and_exits_one(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The host it could not read is the failure; the ones it could are the answer."""
@@ -155,13 +192,13 @@ def test_status_reports_an_unreachable_host_and_exits_one(
         if entry.name == "local":
             return HostView(entry=entry, state=HostState.ANSWERED)
         return HostView(
-            entry=entry, state=HostState.UNREACHABLE, error="ssh: could not resolve hostname"
+            entry=entry, state=HostState.UNASKABLE, error="ssh: could not resolve hostname"
         )
 
     monkeypatch.setattr(status_mod, "gather", only_local)
     assert main(["status"]) == EXIT_ERROR
     out = capsys.readouterr().out
-    assert "UNREACHABLE" in out
+    assert "UNASKABLE" in out and "ERROR ssh: could not resolve hostname" in out
     assert "host local" in out
 
 
@@ -188,6 +225,103 @@ def test_a_bad_entry_does_not_fail_a_status_asked_about_another_host(
     )
     assert main(["status", "--host", "good"]) == EXIT_OK
     assert main(["status", "--host", "good", "--json"]) == EXIT_OK
+
+
+def test_status_all_json_carries_the_jobs_only_the_index_knows(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one list of what was on a host that lost its state, in the form a
+    script reads: `--json` used to drop it while the text form printed it."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    monkeypatch.setattr(status_mod, "gather", _answered_with_no_jobs)
+    LocalIndex().record(
+        IndexEntry(
+            job_id="20260101-000000-aaaaaa",
+            host="gone-box",
+            name="lost",
+            requeued_from="20250101-000000-000000",
+            submitted_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    capsys.readouterr()
+    assert main(["status", "--all", "--json"]) == EXIT_OK
+    document = status_json(capsys)
+    (entry,) = document["unhosted"]
+    assert (entry["job_id"], entry["host"], entry["name"]) == (
+        "20260101-000000-aaaaaa",
+        "gone-box",
+        "lost",
+    )
+    assert entry["requeued_from"] == "20250101-000000-000000"
+    assert entry["outputs_lost"] is False
+    # Not registered here: a rental that ended and was forgotten.
+    assert (entry["host_state"], entry["requeue"]) == ("gone", True)
+    assert main(["status", "--json"]) == EXIT_OK
+    assert status_json(capsys)["unhosted"] == []
+
+
+def test_status_all_labels_an_index_only_job_by_what_its_host_is(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job whose host could not be asked may still be running there, so it
+    is listed with that said and no requeue offered for it; one whose host
+    answered without it, or is gone, is the recovery case the hint is for.
+    A host with no registry entry here is gone; one whose entry this build
+    refuses to read was not asked."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box")
+    register_host(name="down", kind="ssh", ssh="me@down")
+
+    def gather(entry: HostEntry, *a: object, **k: object) -> HostView:
+        if entry.name == "down":
+            return HostView(entry=entry, state=HostState.UNASKABLE, error="ssh timed out")
+        return HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=1.0)
+
+    monkeypatch.setattr(status_mod, "gather", gather)
+    for job_id, host in [
+        ("20260101-000000-aaaaaa", "down"),
+        ("20260101-000000-bbbbbb", "gpubox"),
+        ("20260101-000000-cccccc", "gone-pod"),
+        ("20260101-000000-eeeeee", "gpuc-old"),
+    ]:
+        LocalIndex().record(IndexEntry(job_id=job_id, host=host, name="j"))
+    write_hosts(
+        {
+            **json.loads(hosts_file().read_text()),
+            "hosts": {**json.loads(hosts_file().read_text())["hosts"], "gpuc-old": LEGACY_RENTAL},
+        }
+    )
+    capsys.readouterr()
+    assert main(["status", "--all", "--json"]) == EXIT_ERROR
+    by_job = {e["job_id"]: e for e in status_json(capsys)["unhosted"]}
+    state_of = {job_id: (e["host_state"], e["requeue"]) for job_id, e in by_job.items()}
+    assert state_of == {
+        "20260101-000000-aaaaaa": ("unaskable", False),
+        "20260101-000000-bbbbbb": ("answered", True),
+        "20260101-000000-cccccc": ("gone", True),
+        "20260101-000000-eeeeee": ("unaskable", False),
+    }
+
+    assert main(["status", "--all"]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "host=down" in out and "may still be running there" in out
+    assert "host=gpubox" in out and "does not have it" in out
+    assert "host=gone-pod" in out and "is gone" in out
+    assert "host=gpuc-old" in out and "could not be asked" in out
+    assert "bring one back with: gpuc requeue 20260101-000000-bbbbbb" in out
+
+    # Only the unaskable hosts' jobs left: nothing to offer a requeue for.
+    for job_id in ("bbbbbb", "cccccc"):
+        (LocalIndex().directory / f"20260101-000000-{job_id}.json").unlink()
+    assert main(["status", "--all"]) == EXIT_ERROR
+    assert "bring one back" not in capsys.readouterr().out
+
+
+def _answered_with_no_jobs(entry: HostEntry, *a: object, **k: object) -> HostView:
+    return HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=1.0)
 
 
 def test_status_all_is_one_when_the_index_it_needs_cannot_be_read(
@@ -267,27 +401,28 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
 
     home = tmp_path / "host-home"
     monkeypatch.setenv("GPUC_HOME", str(home))
+    # The host's own card, answered by the fake driver whatever this machine
+    # has: the projection below holds only for a card nvidia-smi reports.
+    install_fake_nvidia_smi(tmp_path / "bin", [GPU])
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
     paths.ensure_layout()
     jobs.write_config(HostConfig(host="local", gpus=[GPU]))
     paths.heartbeat_file().touch()
 
     started = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
     ended = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
-    jobs.write_spec(
-        JobSpec.from_dict({"job_id": RUNNING_JOB, "name": "lego-s4", "command": "train", "gpus": 1})
-    )
-    jobs.write_state(
-        RUNNING_JOB,
-        JobState(
-            status="running",
-            phase="main",
-            gpus=[GPU],
-            started_at=started,
-            util_recent=[90.0, 95.0],
-            isolation="cgroup",
+    accept_job(
+        JobSpec.from_dict(
+            {"job_id": RUNNING_JOB, "name": "lego-s4", "command": "train", "gpus": 1}
         ),
+        status="running",
+        phase="main",
+        gpus=[GPU],
+        started_at=started,
+        util_recent=[90.0, 95.0],
+        isolation="cgroup",
     )
-    jobs.write_spec(
+    accept_job(
         JobSpec.from_dict(
             {
                 "job_id": FINISHED_JOB,
@@ -314,6 +449,32 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
     )
     write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
     return home
+
+
+def test_a_verb_on_an_id_the_host_does_not_have_is_exit_four_with_its_reason(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host's own `no such job` answer, through `cancel` and `reorder`
+    for real: exit 4, not "the host could not be asked" or a refusal."""
+    assert main(["cancel", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    assert document["exit_code"] == EXIT_NOT_FOUND
+    assert "no such job" in document["error"] and "host local has no job" in document["error"]
+    assert (
+        main(["reorder", "20260101-000000-aaaaaa", "--priority", "1", "--host", "local"])
+        == EXIT_NOT_FOUND
+    )
+    assert "no job 20260101-000000-aaaaaa on this host" in capsys.readouterr().err
+
+
+def test_a_verb_the_host_refuses_for_a_job_it_has_is_exit_one(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The job is there and the host will not: that is a refusal, never 4."""
+    assert main(["reorder", RUNNING_JOB, "--priority", "1", "--host", "local"]) == EXIT_ERROR
+    assert "not queued (status running)" in capsys.readouterr().err
+    assert main(["estimate", FINISHED_JOB, "--minutes", "5", "--host", "local"]) == EXIT_ERROR
+    assert "already failed" in capsys.readouterr().err
 
 
 def test_status_json_is_one_document_with_the_promised_shape(
@@ -361,6 +522,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "outputs_lost",
         "priority",
         "attempt",
+        "requeued_from",
         "started_at",
         "workdir_bytes",
         "outputs",
@@ -391,7 +553,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
     assert (link["kind"], link["path"], link["target"]) == ("s3", "results", "s3://bucket/{job_id}")
     assert link["url"].startswith("https://s3.console.aws.amazon.com/s3/buckets/bucket?prefix=")
     assert host["pod"] is None
-    assert (host["draining"], host["pod_gone"]) == (False, False)
+    assert host["draining"] is False and "pod_gone" not in host
 
     # One row for the owned card. Which shape it takes says whether nvidia-smi
     # on *this* machine could resolve it, which is not what this test is about.
@@ -418,7 +580,7 @@ def test_config_show_json_is_the_effective_settings(
     assert document["notes"] == []
 
 
-def test_status_json_says_unreachable_rather_than_empty(
+def test_status_json_says_unaskable_rather_than_empty(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
@@ -427,7 +589,7 @@ def test_status_json_says_unreachable_rather_than_empty(
         status_mod,
         "gather",
         lambda entry, *a, **k: HostView(
-            entry=entry, state=HostState.UNREACHABLE, error="ssh timed out"
+            entry=entry, state=HostState.UNASKABLE, error="ssh timed out"
         ),
     )
     assert main(["status", "--json"]) == EXIT_ERROR
@@ -540,7 +702,9 @@ def test_the_commit_status_judges_is_the_hosts_own_not_the_registrys(
     assert "gpuc host bootstrap gpubox" in warnings[0]
     assert status_mod.render(view).count("WARNING") == 1
     assert status_mod.host_json(view)["pkg_commit"] == "b" * 40
-    assert warnings[0] in status_mod.host_json(view)["errors"]
+    # A warning, apart from the errors that decide the exit code.
+    assert status_mod.host_json(view)["warnings"] == warnings
+    assert status_mod.host_json(view)["errors"] == []
 
 
 def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
@@ -552,7 +716,7 @@ def test_a_host_running_this_build_or_one_we_could_not_ask_says_nothing(
     entry = host_entry(name="s", pkg_commit="b" * 40)
     current = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="a" * 40)
     assert status_mod.host_warnings(current) == []
-    # Unreachable: "we could not ask" is not evidence of anything.
+    # Unaskable: "we could not ask" is not evidence of anything.
     assert status_mod.host_warnings(HostView(entry=entry, pkg_commit="b" * 40)) == []
 
 
@@ -604,7 +768,7 @@ def test_a_host_too_old_to_say_which_build_it_runs_is_still_warned_about(
     monkeypatch.setattr(version_mod, "local_commit", lambda: "a" * 40)
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", pkg_commit="a" * 40)
     (warning,) = status_mod.host_warnings(HostView(entry=entry, state=HostState.ANSWERED))
-    assert "a build too old to say which" in warning
+    assert "a build that named no commit" in warning
     assert "gpuc host bootstrap gpubox" in warning
     # With nothing to compare against: a gpuc that cannot name its own
     # commit has no business telling a host it is behind.
@@ -768,7 +932,7 @@ def test_a_ctrl_c_is_exit_130_and_a_document_whoever_was_running(
     def interrupted(*_args: Any, **_kwargs: Any) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli, "read_registry_warned", interrupted)
+    monkeypatch.setattr(cli, "open_registry", interrupted)
     assert main(["status"]) == 130
     assert "interrupted" in capsys.readouterr().err
     assert main(["status", "--json"]) == 130
@@ -828,7 +992,7 @@ def test_host_add_json_is_the_host_as_list_reports_it_plus_what_add_did(
     assert (document["name"], document["kind"], document["ssh"]) == ("gpubox", "ssh", "me@box")
     assert document["gpus"] == ["GPU-a", "GPU-b"]
     assert document["adopted"] is False
-    assert document["config_path"] == "/home/u/.gpuc/config.json"
+    assert document["config_path"] == fake_host.config_path
     assert document["warnings"] == []
     assert isinstance(document["changes"], list)
     assert fake_host.config is not None
@@ -896,7 +1060,7 @@ def test_host_set_json_with_nothing_to_set_is_usage_in_both_forms(
 def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    register_host(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1")
+    register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
     register_host(name="local", gpus=GPU)
     pinned = pod_known_hosts_file("pod")
     pinned.parent.mkdir(parents=True, exist_ok=True)
@@ -904,7 +1068,7 @@ def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
     capsys.readouterr()
     assert main(["host", "remove", "pod", "--json"]) == EXIT_OK
     document = document_of(capsys)
-    assert (document["host"], document["kind"], document["pod_id"]) == ("pod", "runpod", "p1")
+    assert (document["host"], document["kind"], document["pod_id"]) == ("pod", "rental", "p1")
     assert any("p1" in text and "not terminated" in text for text in document["notes"])
     # RunPod recycles host:port, so the next pod under this name must not be
     # checked against this one's key.
@@ -928,8 +1092,8 @@ def test_host_terminate_json_is_what_was_ended_and_what_it_was_doing(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"), PodScript(ssh_after_polls=0))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
-    register_host(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", pod_id="pod1")
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    register_host(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4", pod_id="pod1")
     capsys.readouterr()
 
     assert main(["host", "terminate", "gpuc-e2e-aaa", "--force", "--json"]) == EXIT_OK
@@ -980,7 +1144,7 @@ def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
     from tests.test_cli import bootstrapping
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
-    register_host(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1")
+    register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
     document = json.loads(hosts_file().read_text())
     document["hosts"]["bad"] = BAD_ENTRY
     hosts_file().write_text(json.dumps(document))
@@ -1006,7 +1170,7 @@ def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
     assert by_name["pod"]["ephemeral"] is True
     assert by_name["pod"]["dispatcher_pid"] is None
     assert "== gpubox (1/2) ==" in captured.err
-    assert "error: host pod: ssh to pod failed" in captured.err
+    assert "warning: host pod: ssh to pod failed" in captured.err
 
 
 def test_host_bootstrap_all_json_interrupted_names_the_hosts_never_reached(
@@ -1019,9 +1183,12 @@ def test_host_bootstrap_all_json_interrupted_names_the_hosts_never_reached(
     register_host(name="cbox", kind="ssh", ssh="me@c")
     bootstrapping(monkeypatch, fail={"bbox": KeyboardInterrupt()})
     capsys.readouterr()
-    assert main(["host", "bootstrap", "--all", "--json"]) == 1
+    # A Ctrl-C is 130 like everywhere else, and the error document still
+    # carries the tally: what got through is true, and what did not is named.
+    assert main(["host", "bootstrap", "--all", "--json"]) == EXIT_INTERRUPTED
     tally = document_of(capsys)
     assert tally["interrupted"] is True
+    assert "interrupted during bbox" in tally["error"]
     assert [(h["name"], h["outcome"]) for h in tally["hosts"]] == [
         ("abox", "bootstrapped"),
         ("bbox", "interrupted"),
@@ -1070,9 +1237,9 @@ class PruningTransport:
 def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    register_host(name="local", gpus=GPU)
+    register_host(name="local", gpus=GPU, python="/py")
     host = PruningTransport("before_kib=18874368\nafter_kib=11534336\ndir=/home/u/.cache/uv\n")
-    monkeypatch.setattr("gpuc.control.clean.transport_for", lambda entry, settings=None: host)
+    monkeypatch.setattr("gpuc.control.remote.transport_for", lambda entry, settings=None: host)
     assert main(["host", "clean", "local", "--uv-cache"]) == EXIT_OK
     assert "pruned 18.0 GiB -> 11.0 GiB" in capsys.readouterr().out
     assert main(["host", "clean", "local", "--uv-cache", "--json"]) == EXIT_OK
@@ -1198,6 +1365,8 @@ def test_logs_json_says_when_it_fell_back_to_the_mirror(
     entry = load_registry().require("local")
     entry = entry.with_config({**entry.cache.config, "s3_prefix": "s3://bucket/gpuc/local"})
     write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})
+    # The host lost the log; the mirror still has it.
+    (real_local_host / "jobs" / RUNNING_JOB / "log.txt").unlink()
 
     assert main(["logs", RUNNING_JOB, "--json"]) == EXIT_OK
     document = document_of(capsys)
@@ -1261,3 +1430,20 @@ def test_status_json_says_what_order_the_queue_runs_in(
     text = capsys.readouterr().out
     assert "queued  urgent (20260915-140100-cccccc) prio=10 needs 2 gpus est 30m" in text
     assert "starts in ~1h00m" in text
+
+
+def test_a_job_on_a_host_this_build_cannot_read_is_not_a_missing_job(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The index names a host whose registry entry did not validate. That host
+    may be running the job: not exit 4, and not the mirror as the answer."""
+    from gpuc.control.s3index import IndexEntry, LocalIndex
+
+    write_hosts({"hosts": {"good": GOOD_ENTRY, "gpuc-old": LEGACY_RENTAL}})
+    monkeypatch.setattr(status_mod, "gather", _answered_with_no_jobs)
+    LocalIndex().record(IndexEntry(job_id="20260101-000000-aaaaaa", host="gpuc-old", name="j"))
+    capsys.readouterr()
+    assert main(["cancel", "20260101-000000-aaaaaa"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "registry entry could not be read" in err
+    assert "no registered host knows" not in err

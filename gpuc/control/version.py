@@ -1,13 +1,24 @@
-"""Which build of gpuc is this, and which one is on each host.
+"""Which build of gpuc is this, and is a host running it.
 
 `__version__` has not moved in the life of the project, so it cannot answer
 "is the thing in my PATH the thing the docs describe?". The commit can, and
 two sessions of the same user running different commits against one shared
 registry is exactly the failure this exists to make visible.
+
+One comparison, `is_other_build`, and it is strict: a host that names no
+commit is re-shipped, and a dirty checkout is not the commit it sits on.
+
+The package is the one thing a host cannot own, because it is shipped to it:
+two machines on different commits bootstrapping the same box leave it running
+whichever shipped last, and neither registry can see the other's. So the
+authoritative copy of what a host runs is its own `config.json` `pkg_commit`,
+written by every bootstrap and reported back by `python -m gpuc.host status`;
+the registry's copy is a cache, labelled with its age.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from functools import lru_cache
@@ -15,16 +26,19 @@ from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
 
 import gpuc
+from gpuc._version import DIRTY
 from gpuc._version import __version__ as __version__
-from gpuc._version import is_other_build
-from gpuc._version import same_commit as same_commit
+from gpuc._version import is_other_build as is_other_build
 
 DIST_NAME = "gpu-coordinator"
 SHORT = 12
 
 
 def short(commit: str | None) -> str:
-    return commit[:SHORT] if commit else "unknown"
+    if not commit:
+        return "unknown"
+    base, dirty, tag = commit.partition(DIRTY)
+    return base[:SHORT] + dirty + tag
 
 
 def package_root() -> Path:
@@ -54,12 +68,11 @@ def installed_commit() -> str | None:
     return str(commit) if commit else None
 
 
-def source_commit() -> str | None:
-    """`git rev-parse HEAD` where the package lives, for a checkout or an
-    editable install. Never raises: git may not be there at all."""
+def _git(*args: str) -> str | None:
+    """`git` in the package's checkout, or None: git may not be there at all."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(package_root()), "rev-parse", "HEAD"],
+            ["git", "-C", str(package_root()), *args],
             capture_output=True,
             text=True,
             check=False,
@@ -67,63 +80,62 @@ def source_commit() -> str | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    commit = result.stdout.strip()
-    return commit if result.returncode == 0 and commit else None
+    return result.stdout if result.returncode == 0 else None
+
+
+def source_commit() -> str | None:
+    """`git rev-parse HEAD` where the package lives, for a checkout or an
+    editable install, with `dirty_tag()` appended when the tree has changes."""
+    commit = (_git("rev-parse", "HEAD") or "").strip()
+    if not commit:
+        return None
+    return f"{commit}{dirty_tag()}"
 
 
 @lru_cache(maxsize=1)
 def local_commit() -> str | None:
-    """The commit this `gpuc` is running, installed build first.
+    """The build this `gpuc` is running, installed build first.
 
+    A dirty checkout is `<commit>-dirty-<hash>`: it ships code HEAD does not
+    have, so a host bootstrapped from it must not read as running HEAD, and
+    the next submit from a clean checkout of the same commit must re-ship.
     Cached: `status` asks once per host, and it cannot change under a process.
     """
     return installed_commit() or source_commit()
 
 
 def dirty() -> bool:
-    """Whether the source checkout has uncommitted changes, so `version` can
-    say that the commit it printed is not the whole truth."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(package_root()), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+    """Whether the source checkout has uncommitted changes."""
+    return bool((_git("status", "--porcelain") or "").strip())
 
 
-def needs_package_sync(local: str | None, host: str | None) -> bool:
-    """Should this host be shipped the package again before it runs anything?
+def dirty_tag() -> str:
+    """`-dirty-<8 hex>` for a checkout with uncommitted changes, "" otherwise.
 
-    `is_other_build`, which is stricter than `same_commit` in the one place
-    that matters: a host with no recorded commit was bootstrapped by a build
-    from before the field existed, so it cannot be running this one.
+    The hex is a sha1 over `git diff HEAD` and `git status --porcelain`, so a
+    second edit to an already dirty tree is a second build: with a bare
+    `-dirty`, the host already named `<commit>-dirty` and the edit was never
+    re-shipped. The status listing puts an untracked file in by name; its
+    content is not hashed, which is the one edit this still misses.
     """
-    return is_other_build(host, local)
+    status = (_git("status", "--porcelain") or "").strip()
+    if not status:
+        return ""
+    digest = hashlib.sha1((_git("diff", "HEAD") or "").encode() + status.encode())
+    return f"{DIRTY}-{digest.hexdigest()[:8]}"
 
 
 def host_build_warning(name: str, host_commit: str | None, local: str | None) -> str | None:
     """`host_commit` is the host's own answer, from its `config.json`.
 
-    Judged by exactly the rule `submit` re-ships on, which is stricter than
-    `same_commit` in the case that matters here: a host that *answered* and
-    named no commit is a host on a build old enough not to report one, so
-    saying nothing about it would leave `status` quiet about the very hosts
-    `submit` re-ships on every single run. A host nobody could ask is the
-    caller's to skip -- that one really is "we do not know".
-
-    Not "older": whichever machine bootstrapped the host last is the one it
-    runs, and that can as easily be a laptop on a newer build as this machine
-    on an older one. Both directions are the same problem -- the host is not
-    running the code that wrote the spec -- and the same fix.
+    Judged by exactly the rule `submit` re-ships on. A host that *answered*
+    and named no commit is warned about rather than passed as current; a host
+    nobody could ask is the caller's to skip -- that one really is "we do not
+    know".
     """
-    if not needs_package_sync(local, host_commit):
+    if not is_other_build(host_commit, local):
         return None
-    running = f"gpuc {short(host_commit)}" if host_commit else "a build too old to say which"
+    running = f"gpuc {short(host_commit)}" if host_commit else "a build that named no commit"
     return (
         f"host {name} is running {running} and this machine has "
         f"{short(local)}; run gpuc host bootstrap {name}"
@@ -136,9 +148,11 @@ def shipped_commit_note(name: str, recorded: str | None, local: str | None) -> s
     `gpuc host list` and `gpuc version` never touch the host, so all they have
     is the `pkg_commit` cached from the last time something here did ask. Any
     machine may have re-bootstrapped the host since, so it is reported as what
-    it is -- last seen -- and `gpuc status` is where the live answer lives.
+    it is -- last seen -- and `gpuc status` is where the live answer lives. A
+    host that never named a commit gets no note: the listing already prints
+    `pkg unknown`, and `gpuc host add` already says to bootstrap next.
     """
-    if same_commit(local, recorded):
+    if recorded is None or not is_other_build(recorded, local):
         return None
     return (
         f"host {name} was last seen running gpuc {short(recorded)} and this machine has "
@@ -159,7 +173,7 @@ def dispatcher_build_warning(name: str, running: str | None, shipped: str | None
     """
     if not is_other_build(running, shipped):
         return None
-    was = f"gpuc {short(running)}" if running else "a build too old to say which"
+    was = f"gpuc {short(running)}" if running else "a build that named no commit"
     return (
         f"host {name} has gpuc {short(shipped)} on disk but its running dispatcher was "
         f"started on {was}; nothing shipped since is in effect. Restart it with "

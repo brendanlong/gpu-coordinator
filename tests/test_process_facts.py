@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -51,63 +50,27 @@ def test_cmdline_identifies_a_gpuc_process() -> None:
     assert not procinfo.pid_alive(2**30)
 
 
-def _wait_for_cmdline(pid: int) -> str:
-    deadline = time.time() + 10
-    while not procinfo.cmdline(pid) and time.time() < deadline:
-        time.sleep(0.02)
-    return procinfo.cmdline(pid)
-
-
-def test_a_live_runner_is_found_by_the_job_it_was_started_for() -> None:
-    """How a job whose state names no runner is told from one that has none."""
-    job_id = "20250101-000000-abcdef"
-    proc = subprocess.Popen(
-        [sys.executable, "-c", "import time;time.sleep(30)", "gpuc.host", "run", job_id]
-    )
-    try:
-        _wait_for_cmdline(proc.pid)
-        assert procinfo.live_runner_pids().get(job_id) == proc.pid
-    finally:
-        proc.kill()
-        proc.wait(timeout=10)
-    assert job_id not in procinfo.live_runner_pids()
-
-
-def test_a_runner_is_named_from_argv_not_from_a_string_of_words() -> None:
-    """A job's own command reaches /proc as one argument however many words it
-    holds, and `bash -c <script>` is how every phase is run."""
-    assert procinfo.runner_job_id([sys.executable, "-m", "gpuc.host", "run", "J"]) == "J"
-    assert procinfo.runner_job_id([sys.executable, "-m", "gpuc.host", "dispatch"]) is None
-    assert procinfo.runner_job_id(["bash", "-c", "python train.py gpuc.host run J"]) is None
-
-
-def test_cmdline_argv_keeps_an_argument_that_contains_spaces() -> None:
-    proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)", "a b c"])
-    try:
-        _wait_for_cmdline(proc.pid)
-        assert procinfo.cmdline_argv(proc.pid)[-1] == "a b c"
-    finally:
-        proc.kill()
-        proc.wait(timeout=10)
-    assert procinfo.cmdline_argv(2**30) == []
-
-
 # -- JobProcesses ---------------------------------------------------------------
 
 
-def test_the_job_group_is_never_the_runners_own() -> None:
-    """In the launch window the runner is alone in its group: killing that as
-    "the job" would kill the one process that can finish the job cleanly."""
-    assert JobProcesses.of(JobState(runner_pid=500, pgid=500)).job_pgid is None
-    assert JobProcesses.of(JobState(pgid=500), runner_pid=500).job_pgid is None
-    assert JobProcesses.of(JobState(runner_pid=400, pgid=500), runner_pid=500).job_pgid is None
+def test_job_processes_are_exactly_what_the_state_recorded() -> None:
+    """The job's group is the one the runner published for the phase, and the
+    runner is the one that claimed the job; neither is ever inferred."""
     processes = JobProcesses.of(JobState(runner_pid=500, pgid=600, cgroup_unit="u.scope"))
     assert processes == JobProcesses("u.scope", 600, 500)
+    assert JobProcesses.of(JobState(runner_pid=500)) == JobProcesses(None, None, 500)
+    assert JobProcesses.of(JobState(pgid=0)).job_pgid is None
 
 
-def test_the_runner_the_caller_holds_wins_over_the_recorded_one() -> None:
-    assert JobProcesses.of(JobState(runner_pid=400, pgid=600), runner_pid=500).runner_pid == 500
-    assert JobProcesses.of(JobState(runner_pid=400, pgid=600)).runner_pid == 400
+def test_a_state_from_another_boot_names_no_processes() -> None:
+    """Its pids were reissued from 1 and its scopes did not survive: a kill
+    at any of them would land on whatever this boot put at those numbers."""
+    other = JobState(runner_pid=500, pgid=600, cgroup_unit="u.scope", runner_boot_id="not-this")
+    assert JobProcesses.of(other) == JobProcesses()
+    same = JobState(
+        runner_pid=500, pgid=600, cgroup_unit="u.scope", runner_boot_id=procinfo.boot_id()
+    )
+    assert JobProcesses.of(same) == JobProcesses("u.scope", 600, 500)
 
 
 JOB_GROUP = 4242

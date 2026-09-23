@@ -5,8 +5,8 @@ so `gpuc host add` is a *connect*: read that file, and if it is there, adopt
 it. A second control machine meeting a host the first one set up is therefore
 the ordinary path and not a special one, and nothing about the machine that
 bootstrapped a host first matters afterwards. Only a host that has no config at
-all is configured from the flags that registered it, and by default it owns
-every card nvidia-smi reports there.
+all is configured from the flags that registered it (`config.first_config`),
+and by default it owns every card nvidia-smi reports there.
 
 `gpuc host set` writes through to the same file. There is no local copy to set,
 so it does not work offline, which is the point.
@@ -23,13 +23,14 @@ from gpuc.control.config import (
     HostEntry,
     Settings,
     config_changes,
+    first_config,
+    load_settings,
     transport_for,
-    utc_now,
 )
-from gpuc.control.remote import read_remote_config, resolve_home, write_remote_config
+from gpuc.control.gpuinfo import table_of
+from gpuc.control.remote import HostConfigRead, read_config, resolve_home, write_config
 from gpuc.control.transport import Transport
-from gpuc.host import jobs
-from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
+from gpuc.host import gpus, jobs
 from gpuc.host.jobs import HostConfig
 
 
@@ -64,17 +65,18 @@ def connect_host(
     `fields` is the config the flags asked for, and only the keys that were
     given: on a host that already has a config each one is an explicit
     override, written through to the host and reported field by field; on a
-    host that has none they are its initial config, and a `gpus` left out of
-    them is every card the probe saw (`address.gpu_info`), less any it was
+    host that has none they are overrides of `first_config`, whose default
+    `gpus` is every card the probe saw (`address.gpu_info`), less any it was
     asked to share.
 
     `before_write` is judged once the host's own name is known and before
     anything is written to it, so a caller that refuses the result refuses it
     without having changed the host first.
     """
+    settings = settings if settings is not None else load_settings()
     transport = transport or transport_for(address, settings)
     home = resolve_home(transport, address)
-    existing = _read_config(transport, home, address.name)
+    existing = _read(transport, home, address.name)
     patch = dict(fields or {})
     entry = address
     if existing:
@@ -99,17 +101,7 @@ def connect_host(
                 f"cards), so there is nothing for it to own by default. Pass --gpus '' to "
                 f"register it with none, or fix nvidia-smi on it and add it again."
             )
-        patch.setdefault("gpus", _every_card_but_the_shared(address, patch))
-        patch.setdefault("host", address.name)
-        patch.setdefault("created_at", utc_now())
-        # The one timer with a default, and only for a host being configured
-        # for the first time: an adopted config that says nothing about
-        # `workdir_days` is a host that has been getting along without the
-        # sweep, and meeting it is not the moment to start deleting there.
-        patch.setdefault("workdir_days", DEFAULT_WORKDIR_DAYS)
-        provider = address.provider()
-        if provider is not None:
-            patch.setdefault("provider", provider)
+        patch = first_config(address, settings, patch)
     return _apply(entry, transport, home, existing, patch, env_updates, adopted=bool(existing))
 
 
@@ -124,7 +116,7 @@ def push_config(
     """`gpuc host set`: change the host's own config, and cache what it now holds."""
     transport = transport or transport_for(entry, settings)
     home = resolve_home(transport, entry)
-    existing = _read_config(transport, home, entry.name)
+    existing = _read(transport, home, entry.name)
     return _apply(
         entry, transport, home, existing, dict(fields or {}), env_updates, adopted=bool(existing)
     )
@@ -148,7 +140,7 @@ def _apply(
     # file a dispatcher is reading, and it is what the report says happened.
     # A host with no config at all is the exception -- there is the whole file.
     document = (
-        write_remote_config(transport, home, patch, python=entry.python, env=entry.env)
+        write_config(transport, home, patch, host=entry.name)
         if patch and (changes or not existing)
         else existing
     )
@@ -160,16 +152,26 @@ def _apply(
     )
 
 
-def _read_config(transport: Transport, home: str, name: str) -> dict[str, Any]:
-    document = read_remote_config(transport, home)
-    if document is None:
-        raise ConnectError(
-            f"host {name} answered, but {home}/config.json could not be read -- and what a "
-            f"host is is that file, so nothing here will replace it.\n"
+def _read(transport: Transport, home: str, name: str) -> dict[str, Any]:
+    """The host's config, or `{}` for a host that has none; never a guess."""
+    return refuse_unreadable(read_config(transport, home), name, home).document or {}
+
+
+def refuse_unreadable(
+    read: HostConfigRead, name: str, home: str, error: type[Exception] = ConnectError
+) -> HostConfigRead:
+    """A config that is there and cannot be read is a file the host is running
+    on, so nothing -- connect, `host set` or bootstrap -- writes over it.
+    `error` is the caller's own failure class, so bootstrap's refusal is a
+    bootstrap failure and connect's a connect failure."""
+    if read.unreadable:
+        raise error(
+            f"host {name} answered, but {home}/config.json could not be read ({read.unreadable}) "
+            f"-- and what a host is is that file, so nothing here will replace it.\n"
             f"Check that it is readable by this user and holds JSON; delete it to set that "
             f"host up again, or point somewhere else with --gpuc-home."
         )
-    return document
+    return read
 
 
 def _with_env(
@@ -220,12 +222,12 @@ def _refuse_overlapping_gpus(
     wanted = patch.get("gpus")
     if not isinstance(wanted, list) or force:
         return
-    cards = _by_uuid(address)
-    mine = {cards.get(str(item), str(item)) for item in wanted}
+    table = table_of(address.gpu_info)
+    mine = _cards([str(item) for item in wanted], table)
     theirs = HostConfig.from_dict(existing).gpus
     # Named as the *host* spells them, which is how the sentence below reads.
-    shared = [item for item in theirs if cards.get(item, item) in mine]
-    if not shared or {cards.get(item, item) for item in theirs} == mine:
+    shared = [item for item in theirs if _cards([item], table) & mine]
+    if not shared or _cards(theirs, table) == mine:
         return
     named = sorted(str(item) for item in wanted)
     raise ConnectError(
@@ -238,63 +240,42 @@ def _refuse_overlapping_gpus(
     )
 
 
+def _cards(entries: list[str], table: list[gpus.Gpu]) -> set[str]:
+    """The cards `entries` name, through the cards the probe saw; an entry the
+    probe did not see is left as typed -- a typo or a card this container was
+    not given, which the health check refuses at bootstrap, not something to
+    guess at here."""
+    cards = gpus.resolve(entries, table)
+    return set(cards.owned) | set(cards.missing)
+
+
 def _refuse_shared_overlap(
     entry: HostEntry, existing: Mapping[str, Any], patch: Mapping[str, Any]
 ) -> None:
-    """Refuse a config that has one card both owned and shared.
+    """Refuse a config that names one card twice: owned and shared, or as an
+    index and its own UUID.
 
     The two lists say opposite things about a card -- hand this out, and borrow
     this only while nobody else is on it -- so a card in both is never what
     anybody meant, and the dispatcher has to resolve it somehow (it keeps the
     owned claim). Judged on the *result*, patch over what the host holds, so
     `--shared-gpus 3` on a host that already owns 3 is caught as readily as
-    both flags in one command.
-
-    The host's own health check refuses this too, at bootstrap. This is the
-    copy that fires where it was typed.
+    both flags in one command -- by `gpus.resolve`'s `duplicates`, the same
+    verdict the host's own health check gives at bootstrap. This is the copy
+    that fires where it was typed: on every write, so a hand-edited config in
+    that state is refused by the next `host set` about anything, and adopting
+    one unchanged is not a write.
     """
-    if not any(key in patch for key in ("gpus", "shared_gpus")):
-        # A host whose config.json is already in this state -- hand-edited, or
-        # written by a build without this check -- must still be reachable by
-        # `gpuc host set <name> --idle-min 30`. Refusing a command that names
-        # neither list, over two flags nobody typed, would strand it.
+    if not patch:
         return
     merged = {**(existing if isinstance(existing, dict) else {}), **patch}
     config = HostConfig.from_dict(merged)
-    cards = _by_uuid(entry)
-    owned = {cards.get(item, item) for item in config.gpus}
-    both = [item for item in config.shared_gpus if cards.get(item, item) in owned]
+    both = gpus.resolve(config.gpus, table_of(entry.gpu_info), config.shared_gpus).duplicates
     if not both:
         return
     raise ConnectError(
-        f"host {entry.name} would have {', '.join(both)} in both --gpus and --shared-gpus, "
-        f"and a card is either ours to hand out or somebody else's to borrow.\n"
+        f"host {entry.name} would have {', '.join(both)} named twice, in both --gpus and "
+        f"--shared-gpus or as an index and its own UUID, and a card is either ours to hand "
+        f"out or somebody else's to borrow, and one card once.\n"
         f"Owned: {', '.join(config.gpus) or 'none'}. Shared: {', '.join(config.shared_gpus)}."
     )
-
-
-def _every_card_but_the_shared(address: HostEntry, patch: Mapping[str, Any]) -> list[str]:
-    """What a host with no config owns when `--gpus` was not given: all of it.
-
-    By UUID, as a provisioned pod is, since nobody typed an index here to
-    preserve. `--shared-gpus` alone is then a way of saying "everything else
-    is mine": a card is either owned or borrowed, never both, so the shared
-    ones are taken out rather than refused.
-    """
-    cards = _by_uuid(address)
-    shared = {cards.get(str(item), str(item)) for item in patch.get("shared_gpus") or []}
-    return [uuid for uuid in address.gpu_info if uuid not in shared]
-
-
-def _by_uuid(address: HostEntry) -> dict[str, str]:
-    """`index -> uuid` for the cards this host's probe saw, plus uuid -> itself.
-
-    Cards the probe did not see are left as they were typed: an unresolvable
-    entry is a typo or a card this container was not given, which the health
-    check refuses at bootstrap, not something to guess at here.
-    """
-    cards = {uuid: uuid for uuid in address.gpu_info}
-    for uuid, info in address.gpu_info.items():
-        if info.index is not None:
-            cards[str(info.index)] = uuid
-    return cards

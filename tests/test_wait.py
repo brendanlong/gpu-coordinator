@@ -41,7 +41,7 @@ from gpuc.control.s3index import IndexEntry, LocalIndex
 from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
-from tests.conftest import host_entry
+from tests.conftest import accept_job, host_entry
 from tests.fakeprovider import FakeProvider
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -77,12 +77,18 @@ def host_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env: Path
 
 
 def put_job(home: Path, job_id: str = JOB, *, name: str = "lego-s4", **state: Any) -> None:
-    """A job on the host, in whatever state the test needs it to be in."""
+    """A job on the host, in whatever state the test needs it to be in:
+    accepted the way `submit` gets one accepted the first time, and only its
+    state re-written after that, as the runner would."""
     with mock.patch.dict(os.environ, {"GPUC_HOME": str(home)}):
-        jobs.write_spec(
-            JobSpec.from_dict({"job_id": job_id, "name": name, "command": "train", "gpus": 1})
+        wanted = JobState(**{"status": "running", "phase": "main", **state})
+        if paths.job_dir(job_id).exists():
+            jobs.write_state(job_id, wanted)
+            return
+        accept_job(
+            JobSpec.from_dict({"job_id": job_id, "name": name, "command": "train", "gpus": 1}),
+            **wanted.to_dict(),
         )
-        jobs.write_state(job_id, JobState(**{"status": "running", "phase": "main", **state}))
 
 
 def after_polls(
@@ -373,7 +379,7 @@ def test_wait_reads_a_terminated_rental_from_the_mirror_without_waiting_out_the_
     with registry_transaction() as registry:
         registry.put(
             host_entry(
-                name="gpuc-pod", kind="runpod", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=prefix
+                name="gpuc-pod", kind="rental", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=prefix
             )
         )
     ended = Pod(id="pod-1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
@@ -490,6 +496,47 @@ def test_wait_json_carries_the_error_and_where_the_answer_came_from(
     assert document["errors"] == [job["error"]]
 
 
+def test_wait_reports_the_jobs_it_found_and_exits_four_for_the_one_nobody_has(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One typo in a list of twenty must not throw away nineteen outcomes."""
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    unknown = "20260101-000000-aaaaaa"
+    assert main(["wait", JOB, unknown, "--host", "local", "--json"]) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    by_id = {job["job_id"]: job for job in document["jobs"]}
+    assert by_id[JOB]["status"] == "succeeded" and by_id[JOB]["error"] is None
+    assert "has no job" in by_id[unknown]["error"]
+    assert document["errors"] == [by_id[unknown]["error"]]
+
+
+def test_wait_reads_the_mirror_at_once_for_a_host_this_machine_has_forgotten(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ordinary end of a rental: the pod idled out, `status` forgot the
+    entry, and the index still names it. Nothing can be asked, so the mirror
+    is the answer -- not exit 4, and not five minutes of asking nobody."""
+    from tests.fakes3 import FakeS3Client
+
+    prefix = "s3://bucket/gpuc/gpuc-pod"
+    key = f"bucket/gpuc/gpuc-pod/jobs/{JOB}/state.json"
+    state = json.dumps({"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0})
+    monkeypatch.setattr(
+        "gpuc.control.s3index.S3Index.client",
+        property(lambda self: FakeS3Client(objects={key: state.encode()})),
+    )
+    config_file().write_text('s3_bucket = "bucket"\n')
+    LocalIndex().record(IndexEntry(job_id=JOB, host="gpuc-pod", name="lego-s4", s3_prefix=prefix))
+    sleeps = [0]
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: sleeps.__setitem__(0, sleeps[0] + 1))
+
+    assert main(["wait", JOB]) == EXIT_OK
+    captured = capsys.readouterr()
+    assert "succeeded" in captured.out and "from the S3 mirror" in captured.out
+    assert "not registered on this machine" in captured.err
+    assert sleeps[0] == 0
+
+
 # -- `gpuc logs -f` ------------------------------------------------------------
 
 
@@ -519,6 +566,35 @@ def test_follow_a_failed_job_exits_with_it(
     write_log(host_home, JOB, "no CUDA device\n")
     assert main(["logs", JOB, "-f"]) == EXIT_ERROR
     assert "failed (gpu-preflight)" in capfd.readouterr().out
+
+
+def test_follow_rides_out_a_blip_on_the_first_poll_like_wait_does(
+    host_home: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A host that does not answer the first poll is the wait's trouble, not
+    exit 1 from opening the stream: the stream starts once the host answers,
+    and here the job has ended by then, so the tail is the ordinary read."""
+    from gpuc.control import remote
+
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    write_log(host_home, JOB, "epoch 1\nepoch 2\n")
+    real = remote.open_session
+    calls = [0]
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise TransportError(message="ssh: connect to host local port 22: Connection refused")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(remote, "open_session", flaky)
+    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: None)
+
+    assert main(["logs", JOB, "-f", "--host", "local"]) == EXIT_OK
+    captured = capfd.readouterr()
+    assert "epoch 2" in captured.out
+    assert captured.out.strip().endswith("on local: succeeded")
+    assert "Connection refused; still waiting" in captured.err
 
 
 def test_follow_streams_a_running_job_and_stops_when_it_ends(
@@ -603,3 +679,44 @@ def test_a_follow_retries_a_log_that_is_not_written_yet_and_a_read_does_not() ->
     assert tail_command("/j/log.txt", 10, follow=True, retry=True).startswith("tail -F ")
     assert tail_command("/j/log.txt", 10, follow=True).startswith("tail -f ")
     assert tail_command("/j/log.txt", 10).startswith("tail -n ")
+
+
+def test_wait_without_a_host_still_reports_the_jobs_it_found_beside_the_one_nobody_has(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without `--host` the locator asks every host for each id, and the id
+    nobody has used to be exit 4 before anything was waited for."""
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    unknown = "20260101-000000-aaaaaa"
+    assert main(["wait", JOB, unknown, "--json"]) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    by_id = {job["job_id"]: job for job in document["jobs"]}
+    assert by_id[JOB]["status"] == "succeeded" and by_id[JOB]["error"] is None
+    assert "no registered host knows" in by_id[unknown]["error"]
+    assert document["errors"] == [by_id[unknown]["error"]]
+
+
+def test_wait_reports_a_job_whose_hosts_registry_entry_it_cannot_read(
+    host_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Not gone, so not the mirror's moment; not askable, so not five minutes
+    of polling either: one line saying which entry to fix, and exit 1."""
+    from gpuc.control.config import hosts_file
+
+    document = json.loads(hosts_file().read_text())
+    document["hosts"]["gpuc-old"] = {
+        "name": "gpuc-old",
+        "kind": "runpod",
+        "ssh": "root@1.2.3.4",
+        "pod_id": "podOLD",
+    }
+    hosts_file().write_text(json.dumps(document))
+    other = "20260101-000000-aaaaaa"
+    LocalIndex().record(IndexEntry(job_id=other, host="gpuc-old", name="j"))
+    put_job(host_home, status="succeeded", phase=None, ended_at=jobs.utc_now())
+    assert main(["wait", JOB, other, "--json"]) == EXIT_ERROR
+    document = json.loads(capsys.readouterr().out)
+    by_id = {job["job_id"]: job for job in document["jobs"]}
+    assert by_id[JOB]["status"] == "succeeded"
+    assert by_id[other]["host"] == "gpuc-old"
+    assert "registry entry could not be read" in by_id[other]["error"]

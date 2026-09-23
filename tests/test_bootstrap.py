@@ -4,14 +4,21 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import pytest
 
-from gpuc.control.bootstrap import BootstrapError, bootstrap_host, package_files
+from gpuc.control import version as version_mod
+from gpuc.control.bootstrap import (
+    BootstrapError,
+    HealthOptions,
+    bootstrap_host,
+    deliver_s3_credentials,
+    package_files,
+)
 from gpuc.control.config import HostEntry
-from gpuc.control.remote import NO_CONFIG
-from gpuc.control.transport import CommandResult
-from gpuc.host import jobs
+from gpuc.control.remote import NO_CONFIG, HostConfigRead, HostSession
+from gpuc.control.transport import CommandResult, Transport
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry
 
@@ -58,12 +65,6 @@ class ScriptedHost:
     def _answer(self, command: str) -> tuple[int, str]:
         if command.startswith("if [ -f") and "config.json" in command:
             return 0, NO_CONFIG if self.config is None else json.dumps(self.config)
-        if "-m gpuc.host config --merge" in command:
-            # The host's own merge, done by the host's own code: whichever
-            # control machine sends a patch, this is what applies it.
-            patch = json.loads(self.puts[command.rsplit(" ", 1)[1]][0])
-            self.config = jobs.merged_config(self.config or {}, patch)
-            return 0, json.dumps(self.config)
         if command.startswith("mv -f") and "config.json" in command:
             source, target = command.split()[2].strip('"'), command.split()[3].strip('"')
             self.config = json.loads(self.puts[source][0])
@@ -86,10 +87,13 @@ class ScriptedHost:
             return 0, ""
         if ".local/bin/hf" in command and "-x" in command:
             return 0, "/home/u/.local/bin/hf\n" if self.hf_present else ""
-        if "cache dir" in command:
-            return 0, (
-                f"cache={self.uv_cache}\ncache_dev={self.cache_dev}\nhome_dev={self.home_dev}\n"
+        if "uv_cache_placement" in command:
+            shared = (
+                None
+                if "unknown" in (self.cache_dev, self.home_dev)
+                else self.cache_dev == self.home_dev
             )
+            return 0, json.dumps({"dir": self.uv_cache, "shares_gpuc_home_fs": shared})
         if "tool install huggingface_hub" in command:
             if self.hf_install_fails:
                 return 1, "no network"
@@ -101,8 +105,6 @@ class ScriptedHost:
             return 0, "4242\n"
         if command.startswith("printf %s"):
             return 0, "/home/u/.gpuc"
-        if "nvidia-smi --query-gpu=index,uuid" in command:
-            return 0, "0, GPU-a, NVIDIA A40, 46068\n"
         return 0, ""
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
@@ -193,50 +195,60 @@ def test_the_shipped_package_replaces_the_one_on_the_host(control_env: Path) -> 
     )
 
 
-def test_resync_package_ships_the_code_without_the_health_check(control_env: Path) -> None:
-    """What `gpuc submit` runs for a host on an older commit: the package and
-    the dispatcher, not the ten-minute half of bootstrap."""
-    from gpuc.control.bootstrap import resync_package
-
-    host = ScriptedHost(config=dict(CONFIG_ON_HOST))
-    updated = resync_package(
-        entry(python="/home/u/.local/python3.12"), transport=host, report=lambda _: None
+def _session(host: ScriptedHost) -> HostSession:
+    return HostSession(
+        entry(python="/home/u/.local/python3.12"),
+        cast("Transport", host),
+        "/home/u/.gpuc",
+        "/home/u/.local/python3.12",
+        HostConfigRead(dict(host.config) if host.config is not None else None),
     )
+
+
+def test_ensure_build_ships_the_code_without_the_health_check(control_env: Path) -> None:
+    """What `gpuc submit` runs for a host on another commit: the package and
+    the dispatcher, not the ten-minute half of bootstrap."""
+    from gpuc.control.bootstrap import ensure_build
+
+    host = ScriptedHost(config={**CONFIG_ON_HOST, "pkg_commit": "a" * 40})
+    files = ensure_build(_session(host), lambda _: None)
+    assert files
     assert any("rsync /home/u/.gpuc/pkg" in e for e in host.events)
     assert any("spawn_detached_dispatcher" in e for e in host.events)
     assert not any("gpuc.host health" in e for e in host.events)
     assert not any("astral.sh/uv" in e for e in host.events)
     # The commit, and nothing else of the host's config: a re-ship before a
     # submit is not the moment to re-decide what the host is.
-    assert host.config == {**CONFIG_ON_HOST, "pkg_commit": updated.pkg_commit}
-    assert updated.pkg_commit
+    assert host.config == {**CONFIG_ON_HOST, "pkg_commit": version_mod.local_commit()}
 
 
-def test_resync_restores_a_config_the_host_has_lost(control_env: Path) -> None:
-    """A pod that restarted with a wiped $HOME: re-shipping the package to it
-    without its config would dispatch the job to a host that owns no cards."""
-    from gpuc.control.bootstrap import resync_package
+def test_ensure_build_leaves_a_host_on_this_build_alone(control_env: Path) -> None:
+    from gpuc.control.bootstrap import ensure_build
 
-    host = ScriptedHost()
-    resync_package(
-        entry(python="/home/u/.local/python3.12", s3_prefix="s3://mine/gpuc/h"),
-        transport=host,
-        report=lambda _: None,
-    )
-    assert host.config is not None
-    assert host.config["gpus"] == ["GPU-a"]
-    assert host.config["s3_prefix"] == "s3://mine/gpuc/h"
+    host = ScriptedHost(config={**CONFIG_ON_HOST, "pkg_commit": version_mod.local_commit()})
+    assert ensure_build(_session(host), lambda _: None) is None
+    assert host.events == []
+
+
+def test_ensure_build_reships_when_the_host_named_no_commit(control_env: Path) -> None:
+    """Unknown means re-ship: a host that never recorded a commit is not
+    running this one, whatever the registry remembers shipping."""
+    from gpuc.control.bootstrap import ensure_build
+
+    host = ScriptedHost(config=dict(CONFIG_ON_HOST))
+    assert ensure_build(_session(host), lambda _: None)
+    assert host.config is not None and host.config["pkg_commit"] == version_mod.local_commit()
 
 
 def test_the_package_and_config_land_before_health_runs(control_env: Path) -> None:
     host = ScriptedHost(config=dict(CONFIG_ON_HOST))
     bootstrap_host(entry(), transport=host, report=lambda _: None)
     rsync_root, rsync_dest, files = host.rsyncs[0]
-    assert rsync_root.name == "gpu-coordinator"
+    assert (rsync_root / "gpuc" / "host" / "dispatcher.py").is_file()
     assert rsync_dest == "/home/u/.gpuc/pkg"
     assert files is not None and "gpuc/host/dispatcher.py" in files
     assert host.config is not None and host.config["gpus"] == ["GPU-a"]
-    assert host.index_of("config --merge") < host.index_of("gpuc.host health")
+    assert host.index_of("mv -f") < host.index_of("gpuc.host health")
     assert host.index_of("gpuc.host health") < host.index_of("spawn_detached_dispatcher")
 
 
@@ -259,8 +271,8 @@ def test_bootstrap_leaves_the_config_the_host_already_has_alone(control_env: Pat
     assert host.config is not None
     assert {key: host.config[key] for key in theirs} == theirs
     # And the registry now holds what the host says, not what it was told.
-    assert updated.gpus == ["GPU-b"]
-    assert updated.s3_prefix == "s3://theirs/gpuc/h"
+    assert updated.config.gpus == ["GPU-b"]
+    assert updated.config.s3_prefix == "s3://theirs/gpuc/h"
 
 
 def test_bootstrap_restores_a_config_on_a_host_that_has_none(control_env: Path) -> None:
@@ -274,7 +286,7 @@ def test_bootstrap_restores_a_config_on_a_host_that_has_none(control_env: Path) 
     assert host.config["gpus"] == ["GPU-a"]
     assert host.config["s3_prefix"] == "s3://mine/gpuc/h"
     assert host.config["host"] == "h"
-    assert updated.gpus == ["GPU-a"]
+    assert updated.config.gpus == ["GPU-a"]
 
 
 def test_bootstrap_refuses_to_replace_a_config_it_cannot_read(control_env: Path) -> None:
@@ -348,19 +360,6 @@ def test_the_dispatcher_is_started_with_the_home_tool_dirs_on_path(control_env: 
     assert command.startswith('PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"')
 
 
-def test_bootstrap_retires_the_reconcile_units_before_starting_the_dispatcher(
-    control_env: Path,
-) -> None:
-    """An earlier build installed them; no build serves them, so left alone
-    they fail every minute for ever."""
-    host = ScriptedHost()
-    bootstrap_host(entry(), transport=host, report=lambda _: None)
-    retire = host.index_of("systemctl --user disable --now gpuc-reconcile.timer")
-    assert "gpuc-reconcile.service" in host.events[retire]
-    assert "rm -f $HOME/.config/systemd/user/gpuc-reconcile.timer" in host.events[retire]
-    assert retire < host.index_of("spawn_detached_dispatcher")
-
-
 def test_a_host_without_user_systemd_still_bootstraps(control_env: Path) -> None:
     @dataclass
     class NoSystemd(ScriptedHost):
@@ -402,11 +401,17 @@ def test_a_host_without_a_mirror_only_warns_about_a_missing_aws_cli(control_env:
     assert any("aws CLI install failed" in warning for warning in result.warnings)
 
 
-def test_bootstrap_records_what_the_cards_are(control_env: Path) -> None:
-    updated, _ = bootstrap_host(entry(), transport=ScriptedHost(), report=lambda _: None)
+def test_bootstrap_keeps_the_probes_cards_and_records_the_driver(control_env: Path) -> None:
+    """The cards are the probe's one look at nvidia-smi; bootstrap does not
+    take a second, and the driver version is what health just reported."""
+    from gpuc.control.gpuinfo import GpuInfo
+
+    probed = entry(gpu_info={"GPU-a": GpuInfo(name="NVIDIA A40", vram_mib=46068, index=0)})
+    host = ScriptedHost()
+    updated, _ = bootstrap_host(probed, transport=host, report=lambda _: None)
     assert updated.gpu_info["GPU-a"].name == "NVIDIA A40"
-    assert updated.gpu_info["GPU-a"].vram_mib == 46068
     assert updated.driver_version == "580.173.02"
+    assert not any("nvidia-smi" in event for event in host.events)
 
 
 def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_env: Path) -> None:
@@ -419,33 +424,86 @@ def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_en
     )
     updated, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
     assert result.warnings == []
-    assert updated.pkg_commit == version_mod.local_commit()
+    assert updated.config.pkg_commit == version_mod.local_commit()
     assert host.config is not None
-    assert host.config["pkg_commit"] == updated.pkg_commit
+    assert host.config["pkg_commit"] == updated.config.pkg_commit
     assert host.config["schema_version"] == 1
     # Whoever registered the host first still owns when that was.
     assert host.config["created_at"] == "2020-01-01T00:00:00+00:00"
 
 
-def test_a_rented_pod_is_stamped_as_bootstrapped_in_its_own_config(control_env: Path) -> None:
-    """The pod's own record (`rented`) says when it was set up, and by
-    whichever machine did it, so a second machine adopting it can tell."""
+def test_a_rented_pods_own_record_is_not_disturbed_by_bootstrap(control_env: Path) -> None:
+    """The pod's own record (`rented`) is what a second machine adopts it by,
+    and bootstrap ships a package: it has no business rewriting it."""
     bought = {"kind": "runpod", "pod_id": "pod1", "created_at": "2026-09-15T12:00:00+00:00"}
     host = ScriptedHost(config={**CONFIG_ON_HOST, "provider": dict(bought)})
     bootstrap_host(
-        entry(kind="runpod", pod_id="pod1", provider=dict(bought)),
+        entry(kind="rental", pod_id="pod1", provider=dict(bought)),
         transport=host,
         report=lambda _: None,
     )
     assert host.config is not None
-    provider = host.config["provider"]
-    assert isinstance(provider, dict)
-    # Stamped, and nothing else about the pod's own record disturbed.
-    assert provider["bootstrapped_at"]
-    assert (provider["pod_id"], provider["created_at"]) == ("pod1", bought["created_at"])
+    assert host.config["provider"] == bought
 
 
 def test_a_host_nobody_rents_gets_no_provider_block(control_env: Path) -> None:
     host = ScriptedHost(config=dict(CONFIG_ON_HOST))
     bootstrap_host(entry(), transport=host, report=lambda _: None)
     assert host.config is not None and host.config.get("provider") is None
+
+
+def test_s3_credentials_are_delivered_0600_to_a_rental_with_a_mirror() -> None:
+    host = ScriptedHost()
+    config = HostConfig(
+        host="gpuc-x", s3_prefix="s3://bucket/gpuc/gpuc-x", provider={"kind": "runpod"}
+    )
+    progress: list[str] = []
+    assert (
+        deliver_s3_credentials(
+            host,
+            config,
+            progress.append,
+            {
+                "AWS_ACCESS_KEY_ID": "AKIA",
+                "AWS_SECRET_ACCESS_KEY": "shhh",
+                "AWS_REGION": "us-east-1",
+            },
+        )
+        is None
+    )
+    ((path, (body, mode)),) = host.puts.items()
+    assert path.endswith("/.aws/credentials")
+    assert "aws_access_key_id = AKIA" in body and "region = us-east-1" in body
+    assert mode == 0o600
+    assert not any("shhh" in line for line in progress)
+
+
+def test_s3_credentials_are_a_warning_without_them_and_nothing_without_a_mirror() -> None:
+    host = ScriptedHost()
+    rented = HostConfig(host="gpuc-x", s3_prefix="s3://b/x", provider={"kind": "runpod"})
+    warning = deliver_s3_credentials(host, rented, lambda m: None, {})
+    assert warning and "AWS_ACCESS_KEY_ID" in warning
+    assert host.puts == {}
+    no_mirror = HostConfig(host="gpuc-x", provider={"kind": "runpod"})
+    assert (
+        deliver_s3_credentials(host, no_mirror, lambda m: None, {"AWS_ACCESS_KEY_ID": "a"}) is None
+    )
+    assert host.puts == {}
+
+
+def test_s3_credentials_are_never_written_to_a_host_somebody_else_owns() -> None:
+    """A shared box's `~/.aws` is its user's; only a rental's home is ours."""
+    host = ScriptedHost()
+    shared_box = HostConfig(host="gpubox", s3_prefix="s3://b/x")
+    environ = {"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "shhh"}
+    assert deliver_s3_credentials(host, shared_box, lambda m: None, environ) is None
+    assert host.puts == {}
+
+
+def test_health_options_round_trip_through_the_hosts_own_flags() -> None:
+    options = HealthOptions.parse("--min-mbps 0.1 --download-url file:///blob")
+    assert options == HealthOptions(min_mbps=0.1, download_url="file:///blob")
+    assert options.args() == ["--min-mbps", "0.1", "--download-url", "file:///blob"]
+    assert HealthOptions.parse("") == HealthOptions()
+    with pytest.raises(ValueError, match="--health-args"):
+        HealthOptions.parse("--no-such-flag 1")

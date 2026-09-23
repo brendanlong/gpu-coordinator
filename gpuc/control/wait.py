@@ -21,19 +21,21 @@ from typing import Any
 from gpuc.control import status as status_mod
 from gpuc.control.actions import (
     EXIT_ERROR,
+    EXIT_NOT_FOUND,
     EXIT_OK,
+    Answer,
     NotFound,
-    find_job_host,
-    named_registry,
-    note,
-    provider_for_status,
+    locate,
+    mirror_is_the_answer,
+    mirrored_outcome,
+    provider_for,
 )
-from gpuc.control.config import ConfigError, HostEntry, Reporter, Settings, load_settings
+from gpuc.control.config import HostEntry, Reporter, Settings, load_settings, open_registry
+from gpuc.control.jsonout import note
 from gpuc.control.providers.base import Provider
-from gpuc.control.remote import HostSession, RemoteError, open_session
-from gpuc.control.s3index import JobIndex, job_uri
+from gpuc.control.remote import Answered, HostSession, Unaskable, ask, open_session
+from gpuc.control.s3index import JobIndex
 from gpuc.control.status import JobView
-from gpuc.control.transport import TransportError
 from gpuc.host.jobs import FINISHED_STATUSES
 
 FIRST_INTERVAL_S = 2.0
@@ -60,10 +62,10 @@ afternoon.
 FLUSH_GRACE_S = 2.0
 """What `logs -f` gives the stream to catch up before it stops it.
 
-The runner writes its terminal state *then* logs the outcome line and whatever
-its workdir cleanup has to say, so a poll that sees `succeeded` is by
-construction a little ahead of the log. A cleanup that takes longer than this
-loses its last lines from the stream, never from the log itself.
+The runner logs the outcome line before its terminal write, but what it
+says about the secrets file comes after it, so a poll that sees `succeeded`
+can be a little ahead of the log's last lines. A runner slower than this
+loses those lines from the stream, never from the log itself.
 """
 
 
@@ -154,29 +156,51 @@ class Watch:
 
     def __init__(
         self,
-        targets: Sequence[tuple[str, HostEntry]],
+        targets: Sequence[tuple[str, str, HostEntry | None]],
         settings: Settings | None = None,
         *,
         report: Reporter = note,
         provider: Provider | None = None,
+        sessions: dict[str, HostSession] | None = None,
+        gone: dict[str, str] | None = None,
+        unknown: dict[str, str] | None = None,
+        unaskable: dict[str, tuple[str, str]] | None = None,
     ) -> None:
+        """`targets` is `(job_id, host name, entry)`, the entry None for a host
+        this machine has forgotten; `gone` is the reason each host the locator
+        already found gone is not going to be asked at all; `unknown` is the
+        ids no host knows, settled before the first poll so the others are
+        still waited for and reported; `unaskable` maps an id to the host the
+        index names for it and why that host cannot be opened here, which is
+        a failure to report, not the mirror's moment."""
         # Resolved once here rather than per use: the mirror fallback needs a
         # real `Settings` to find a bucket in, and a watch outlives many reads.
         self.settings = settings if settings is not None else load_settings()
         self.report = report
         self.provider = provider
         self.index = JobIndex(self.settings)
-        self.entries = {entry.name: entry for _, entry in targets}
+        self.entries = {host: entry for _, host, entry in targets if entry is not None}
+        self.gone = dict(gone or {})
         self.jobs = {
-            job_id: Watched(
-                job_id, entry.name, mirror_prefix=self.index.mirror_prefix(job_id, entry)
-            )
-            for job_id, entry in targets
+            job_id: Watched(job_id, host, mirror_prefix=self.index.mirror_prefix(job_id, entry))
+            for job_id, host, entry in targets
         }
+        self.jobs.update(
+            {
+                job_id: Watched(job_id, "no host", error=reason, missing=True)
+                for job_id, reason in (unknown or {}).items()
+            }
+        )
+        self.jobs.update(
+            {
+                job_id: Watched(job_id, host, error=reason)
+                for job_id, (host, reason) in (unaskable or {}).items()
+            }
+        )
         self.by_host: dict[str, list[str]] = {}
-        for job_id, entry in targets:
-            self.by_host.setdefault(entry.name, []).append(job_id)
-        self._sessions: dict[str, HostSession] = {}
+        for job_id, host, _ in targets:
+            self.by_host.setdefault(host, []).append(job_id)
+        self._sessions: dict[str, HostSession] = dict(sessions or {})
         self._trouble: dict[str, tuple[float, str]] = {}
         self._dispatcher_warned: set[str] = set()
         self._announced: set[str] = set()
@@ -200,12 +224,13 @@ class Watch:
         return settled
 
     def check_known(self) -> None:
-        """Refuse ids their host has never heard of, after the first poll.
+        """Refuse an id its host has never heard of, after the first poll.
 
-        `find_job_host` believes the local index and an explicit `--host`
-        without asking anybody, so this is where a typo'd id -- or one whose
-        host lost its state -- becomes exit 4 rather than a wait that never
-        ends.
+        `locate` believes the local index and an explicit `--host` without
+        asking anybody, so this is where a typo'd id -- or one whose host lost
+        its state -- becomes exit 4 rather than a wait that never ends. For
+        `logs -f`, which follows one job; a `wait` on several carries on with
+        the rest and reports the missing one in its answer.
         """
         missing = [watched.job_id for watched in self.jobs.values() if watched.missing]
         if not missing:
@@ -214,15 +239,20 @@ class Watch:
             f"no host has job {', '.join(missing)}.\nCheck the id with `gpuc status --all`."
         )
 
+    def troubled(self, name: str) -> bool:
+        """Whether the last poll of this host got no answer."""
+        return name in self._trouble
+
     def session(self, name: str) -> HostSession:
         """The one session this watch holds for a host, opened on demand.
 
         Public because `logs -f` needs the same host to run its `tail` on, and
         opening a second one costs another round trip to resolve the same home.
+        A poll's session never writes the registry (`record=False`).
         """
         session = self._sessions.get(name)
         if session is None:
-            session = open_session(self.entries[name], self.settings)
+            session = open_session(self.entries[name], self.settings, record=False)
             self._sessions[name] = session
         return session
 
@@ -232,34 +262,40 @@ class Watch:
         ]
         if not pending:
             return
+        if name in self.gone:
+            self._trouble_with(name, pending, self.gone[name], gone=True)
+            return
         request = f"status {shlex.quote(pending[0].job_id)}" if len(pending) == 1 else "status"
-        try:
-            payload = self.session(name).host_json(request, timeout=60.0)
-        except (RemoteError, TransportError, ConfigError, OSError) as exc:
+        asked = ask(
+            self.entries[name],
+            request,
+            self.settings,
+            provider=self.provider,
+            session=self._sessions.get(name),
+        )
+        if not isinstance(asked, Answered):
             # Dropped, not kept: a session holds a resolved home and a
             # ControlMaster that may be exactly what broke.
             self._sessions.pop(name, None)
-            self._trouble_with(name, pending, str(exc).splitlines()[0])
+            self._trouble_with(name, pending, asked.reason, gone=mirror_is_the_answer(asked))
             return
-        if not isinstance(payload, dict):
-            kind = type(payload).__name__
-            self._trouble_with(name, pending, f"answered `status` with {kind}, not JSON")
-            return
+        self._sessions[name] = asked.session
         self._clear_trouble(name)
-        views = {view.job_id: view for group in status_mod.job_views(payload) for view in group}
+        view = status_mod.parse_status(self.entries[name], asked)
+        views = {job.job_id: job for job in view.queue + view.running + view.finished}
         waiting_to_start = [
-            w for w in pending if (view := views.get(w.job_id)) and view.status == "queued"
+            w for w in pending if (job := views.get(w.job_id)) and job.status == "queued"
         ]
-        self._check_dispatcher(name, payload, bool(waiting_to_start))
+        self._check_dispatcher(view, bool(waiting_to_start))
         for watched in pending:
-            view = views.get(watched.job_id)
-            if view is None:
+            job = views.get(watched.job_id)
+            if job is None:
                 self._vanished(name, watched)
                 continue
-            watched.view = view
+            watched.view = job
             watched.seen = True
 
-    def _check_dispatcher(self, name: str, payload: dict[str, Any], queued: bool) -> None:
+    def _check_dispatcher(self, view: status_mod.HostView, queued: bool) -> None:
         """Say so, once, when a reachable host has nobody serving its queue.
 
         Otherwise a queued job waits for a dispatcher that is never coming back
@@ -270,13 +306,8 @@ class Watch:
         job is written to its end by its own runner, so the wait finishes
         whatever the dispatcher is doing and the warning would be false.
         """
-        if not queued:
-            return
-        # Another build's JSON: a string here must cost a missing warning, not
-        # the whole wait.
-        age = payload.get("dispatcher_heartbeat_age_s")
-        alive = isinstance(age, (int, float)) and float(age) < status_mod.HEARTBEAT_STALE_S
-        if alive or name in self._dispatcher_warned:
+        name = view.entry.name
+        if not queued or view.dispatcher_alive or name in self._dispatcher_warned:
             return
         self._dispatcher_warned.add(name)
         self.report(
@@ -294,17 +325,18 @@ class Watch:
         # have finished and `gpuc status --all` is the place to find out.
         self._trouble_with(name, [watched], f"no longer knows job {watched.job_id}")
 
-    def _trouble_with(self, name: str, pending: Iterable[Watched], why: str) -> None:
+    def _trouble_with(
+        self, name: str, pending: Iterable[Watched], why: str, *, gone: bool = False
+    ) -> None:
         now = time.monotonic()
         since, said = self._trouble.get(name, (now, ""))
         if said != why:
             self.report(f"host {name}: {why}; still waiting")
         self._trouble[name] = (since, why)
-        # A rental the provider says has ended is not going to answer, however
-        # long we wait: it is the one case the mirror exists for, so it is read
-        # now rather than after the grace period.
-        gone = status_mod.rental_gone(self.entries[name], self.provider, self.report)
-        if gone is None and now - since < TROUBLE_GRACE_S:
+        # A host that is gone (`mirror_is_the_answer`) is not going to answer,
+        # however long we wait: it is the one case the mirror exists for, so
+        # it is read now rather than after the grace period.
+        if not gone and now - since < TROUBLE_GRACE_S:
             return
         waited = status_mod.format_duration(now - since)
         for watched in pending:
@@ -315,36 +347,18 @@ class Watch:
             # would be wrong about the one run the user was waiting for.
             if self._from_mirror(watched):
                 continue
-            watched.error = f"host {name} could not be asked for {waited}: {why}"
+            watched.error = (
+                f"host {name} cannot be asked and the mirror has no final state for this job: {why}"
+                if gone
+                else f"host {name} could not be asked for {waited}: {why}"
+            )
 
     def _from_mirror(self, watched: Watched) -> bool:
         """This job's outcome from S3, if the mirror has a terminal one."""
-        document = self.index.mirrored_state(watched.job_id, watched.mirror_prefix)
-        if document is None or not watched.mirror_prefix:
+        found = mirrored_outcome(self.index, watched.job_id, watched.mirror_prefix)
+        if found is None:
             return False
-        uri = job_uri(watched.mirror_prefix, watched.job_id, "state.json")
-        indexed = self.index.get(watched.job_id)
-        # Through `job_views`, so another build's state.json is read as
-        # tolerantly here as a host's own answer is. The two fields the file
-        # cannot carry are supplied: `name` lives in the spec, and
-        # `outputs_pending` is the host's own check against the spec, which is
-        # why a mirrored `outputs_lost` has to stand on its own here -- this is
-        # the dead-rental case, and it is the same case that loses outputs.
-        _, _, finished = status_mod.job_views(
-            {
-                "jobs": [
-                    {
-                        **document,
-                        "job_id": watched.job_id,
-                        "name": (indexed.name if indexed else "") or "",
-                        "outputs_pending": bool(document.get("outputs_lost")),
-                    }
-                ]
-            }
-        )
-        view = next((v for v in finished if v.status in FINISHED_STATUSES), None)
-        if view is None:
-            return False
+        view, uri = found
         self.report(f"read {watched.job_id} from the mirror at {uri}")
         watched.view = view
         watched.source = "mirror"
@@ -362,17 +376,48 @@ def start(
     *,
     report: Reporter = note,
 ) -> Watch:
-    """Resolve each id to a host, without asking a host anything yet."""
-    registry = named_registry()
-    targets = [
-        (job_id, find_job_host(job_id, registry, host)[0])
-        # Deduplicated, so `xargs gpuc wait` on a list with a repeat in it
-        # neither polls twice nor prints the outcome twice.
-        for job_id in dict.fromkeys(job_ids)
-    ]
+    """Resolve each id to a host. A host asked on the way is kept: its
+    session is the one the poll goes on using."""
+    read = open_registry()
+    registry = read.named()
     settings = settings if settings is not None else load_settings()
-    provider = provider_for_status([entry for _, entry in targets], settings, report)
-    return Watch(targets, settings, report=report, provider=provider)
+    provider = provider_for(list(registry.hosts.values()), settings, report)
+    targets: list[tuple[str, str, HostEntry | None]] = []
+    sessions: dict[str, HostSession] = {}
+    gone: dict[str, str] = {}
+    unknown: dict[str, str] = {}
+    unaskable: dict[str, tuple[str, str]] = {}
+    # Deduplicated, so `xargs gpuc wait` on a list with a repeat in it
+    # neither polls twice nor prints the outcome twice.
+    for job_id in dict.fromkeys(job_ids):
+        try:
+            location = locate(
+                job_id, registry, host, settings, provider=provider, skipped=read.skipped
+            )
+        except NotFound as exc:
+            # One typo in a list of twenty must not throw away the nineteen:
+            # it is reported with them, and makes the exit 4.
+            unknown[job_id] = str(exc).splitlines()[0]
+            continue
+        trouble = location.trouble
+        if location.entry is None and isinstance(trouble, Unaskable):
+            unaskable[job_id] = (location.host, trouble.reason)
+            continue
+        targets.append((job_id, location.host, location.entry))
+        if location.session is not None:
+            sessions[location.host] = location.session
+        if trouble is not None and mirror_is_the_answer(trouble):
+            gone[location.host] = trouble.reason
+    return Watch(
+        targets,
+        settings,
+        report=report,
+        provider=provider,
+        sessions=sessions,
+        gone=gone,
+        unknown=unknown,
+        unaskable=unaskable,
+    )
 
 
 def document(waited: Sequence[Watched]) -> dict[str, Any]:
@@ -406,9 +451,6 @@ def block(
             if interval is None:
                 delay = min(delay * BACKOFF, MAX_INTERVAL_S)
         settled = watch.poll()
-        # Before anything is announced: an id no host has is exit 4, not a job
-        # that ended badly.
-        watch.check_known()
         each_round()
         for watched in settled:
             on_settled(watched)
@@ -416,11 +458,21 @@ def block(
             return list(watch.jobs.values())
 
 
-def exit_code(watched: Iterable[Watched]) -> int:
-    """A wait's exit code is the jobs': 0 only if every one of them succeeded.
+def answer(waited: Sequence[Watched], text: str | None = None) -> Answer:
+    """A wait's answer carries the jobs' outcome, not its own: 0 only if every
+    one of them succeeded.
 
     The one place `gpuc` uses exit 1 for something other than its own failure,
     and deliberately -- `gpuc ssh <host> -- cmd` does the same with the remote
-    command's code, and it is what makes a wait usable in a script.
+    command's code, and it is what makes a wait usable in a script. An id no
+    host has is exit 4, as everywhere else -- after the others have been
+    waited for and reported, because one typo in a list of twenty must not
+    throw away the nineteen outcomes.
     """
-    return EXIT_OK if all(job.succeeded for job in watched) else EXIT_ERROR
+    if any(job.missing for job in waited):
+        outcome = EXIT_NOT_FOUND
+    elif all(job.succeeded for job in waited):
+        outcome = EXIT_OK
+    else:
+        outcome = EXIT_ERROR
+    return Answer(document(waited), text, outcome=outcome)

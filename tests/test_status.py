@@ -22,6 +22,7 @@ from gpuc.control.status import (
     render,
 )
 from gpuc.control.transport import TransportError
+from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry
 from tests.fakeprovider import FakeProvider
 
@@ -167,12 +168,11 @@ def test_a_running_job_the_host_names_no_cards_for_still_renders() -> None:
     assert "gpu=none" in render(busy(running_job(gpus=[])))
 
 
-def test_an_unreachable_host_says_what_to_run_next() -> None:
-    down = HostView(
-        entry=host_entry(name="gpubox", kind="ssh", ssh="me@box"), error="ssh timed out"
-    )
-    text = render(down)
-    assert "UNREACHABLE" in text
+def test_an_unaskable_host_says_what_to_run_next() -> None:
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box")
+    text = render(gather(entry, session=cast(Any, _RefusingSession()), provider=None))
+    assert "UNASKABLE" in text
+    assert "ERROR ssh: connect to 1.2.3.4 port 22: No route to host" in text
     assert "gpuc host probe gpubox" in text
 
 
@@ -187,7 +187,7 @@ def test_the_two_utilizations_say_where_they_came_from() -> None:
     """The provider's number and the host sampler's legitimately differ; an
     unlabelled pair of percentages reads as a bug."""
     pod_view = view()
-    pod_view.entry = host_entry(name="pod", kind="runpod", pod_id="p1", gpus=[GPU, "GPU-b"])
+    pod_view.entry = host_entry(name="pod", kind="rental", pod_id="p1", gpus=[GPU, "GPU-b"])
     pod_view.pod = Pod(
         id="p1",
         name="gpuc-pod",
@@ -236,7 +236,7 @@ def _provider(pod: Pod | None = None) -> FakeProvider:
 
 def _runpod_entry() -> HostEntry:
     return host_entry(
-        name="gpuc-e2e-1", kind="runpod", ssh="root@1.2.3.4", port=22, pod_id="pod-1", gpus=[GPU]
+        name="gpuc-e2e-1", kind="rental", ssh="root@1.2.3.4", port=22, pod_id="pod-1", gpus=[GPU]
     )
 
 
@@ -245,29 +245,37 @@ def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
         raise AssertionError("status must not ssh to a pod that no longer exists")
 
     view = gather(_runpod_entry(), session=cast(Any, explode), provider=_provider())
-    assert view.pod_gone and view.pod_terminated and not view.reachable
-    assert "missing" in (view.error or "")
+    assert view.gone and not view.reachable
+    assert "no longer exists" in (view.error or "")
     # The rental ended, which is not a host the command could not read.
     assert view.failure is None
     text = render(view)
-    assert "POD GONE" in text
+    assert "GONE" in text and "ERROR" not in text
     assert "this rental has ended" in text
     assert "host probe" not in text
 
 
 def test_a_terminated_pod_reads_as_gone_too() -> None:
     view = gather(_runpod_entry(), provider=_provider(_pod("TERMINATED")))
-    assert view.pod_gone and view.pod_terminated and view.failure is None
+    assert view.gone and view.failure is None
     assert "TERMINATED" in render(view)
 
 
-def test_a_stopped_pod_is_a_failure_and_is_not_forgotten() -> None:
+def test_a_stopped_pod_is_unaskable_and_is_not_forgotten() -> None:
     """An EXITED pod is one the provider still has: nothing runs on it, and only
     a person decides whether to fix it or drop it."""
     view = gather(_runpod_entry(), provider=_provider(_pod("EXITED")))
-    assert view.pod_gone and not view.pod_terminated
+    assert view.state is HostState.UNASKABLE and not view.reachable
     assert view.failure is not None
+    assert "gpuc host terminate gpuc-e2e-1" in (view.error or "")
     assert "gpuc host remove gpuc-e2e-1" in (view.error or "")
+    # Still billing, so never printed as gone: the words are the pod's status.
+    text = render(view)
+    assert "UNASKABLE" in text and "ERROR pod pod-1 is EXITED" in text and "GONE" not in text
+    assert "host probe" not in text
+    document = host_json(view)
+    assert (document["state"], document["reachable"]) == ("unaskable", False)
+    assert "pod_gone" not in document
 
 
 def test_a_host_that_answered_still_prints_a_provider_error() -> None:
@@ -399,7 +407,7 @@ def test_a_lost_output_says_so_louder() -> None:
             "outputs_lost": True,
         }
     )
-    view = HostView(entry=host_entry(name="pod", kind="runpod"), state=HostState.ANSWERED)
+    view = HostView(entry=host_entry(name="pod", kind="rental"), state=HostState.ANSWERED)
     view.queue, view.running, view.finished = job_views(document)
     assert "OUTPUTS LOST" in render(view)
 
@@ -475,8 +483,7 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
             gpus=["0", "7"],
             gpus_resolved=[{"index": 0, "uuid": GPU}],
             gpus_unavailable=["7"],
-        ),
-        entry,
+        )
     )
     host_view.unavailable = ["7"]
     host_view.queue, host_view.running, host_view.finished = job_views(payload())
@@ -489,11 +496,11 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     assert host_json(host_view)["gpus"][-1] == {"owned_as": "7", "available": False}
 
 
-def test_a_host_from_before_the_resolved_table_still_reports_its_gpus() -> None:
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
-    owned, indices = owned_gpus(payload(), entry)
-    assert owned == [GPU, "GPU-b"]
-    assert indices == {}
+def test_only_the_hosts_resolved_table_names_owned_cards() -> None:
+    """`config.gpus` may be indices, and the cache is nobody's evidence: a
+    payload with no resolved table owns nothing until the host says."""
+    owned, indices = owned_gpus(payload())
+    assert (owned, indices) == ([], {})
 
 
 def in_minutes(minutes: float) -> str:
@@ -714,10 +721,11 @@ def test_job_links_need_a_whole_wandb_run_and_no_mirror_for_a_queued_job() -> No
 class _ScriptedSession:
     """A host that answers `status` with one payload and nothing else."""
 
-    def __init__(self, document: dict[str, Any]) -> None:
+    def __init__(self, document: dict[str, Any], config: dict[str, Any] | None = None) -> None:
         self.document = document
+        self.config = HostConfig.from_dict(config or {})
 
-    def host_json(self, args: str, timeout: float = 60.0) -> Any:
+    def host_json(self, args: str, timeout: float = 60.0, check: bool = True) -> Any:
         assert args == "status"
         return self.document
 
@@ -726,11 +734,16 @@ def test_gather_takes_the_build_and_the_config_from_the_hosts_own_answer() -> No
     """Everything `gpuc status` says about what a host is is the host's, so a
     box configured from somebody else's laptop reads as what it now is."""
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
-    session = _ScriptedSession(payload(pkg_commit="c" * 40, gpus=["0", "1"]))
+    resolved = [{"index": 0, "uuid": "GPU-x"}, {"index": 1, "uuid": "GPU-y"}]
+    session = _ScriptedSession(
+        payload(pkg_commit="c" * 40, gpus_resolved=resolved), {"s3_prefix": "s3://live/p"}
+    )
     got = gather(entry, session=cast(Any, session))
     assert got.pkg_commit == "c" * 40
-    assert got.owned == ["0", "1"]
+    assert got.owned == ["GPU-x", "GPU-y"]
     assert host_json(got)["pkg_commit"] == "c" * 40
+    # The mirror links come from the config the session read, not the cache.
+    assert got.mirror_prefix == "s3://live/p"
 
 
 def test_a_reachable_host_that_never_reported_a_commit_is_not_read_as_current() -> None:
@@ -743,7 +756,8 @@ def test_a_reachable_host_that_never_reported_a_commit_is_not_read_as_current() 
     got = gather(entry, session=cast(Any, _ScriptedSession(document)))
     assert got.reachable and got.pkg_commit is None
     assert host_json(got)["pkg_commit"] is None
-    assert any("too old to say which" in warning for warning in host_warnings(got))
+    assert any("named no commit" in warning for warning in host_warnings(got))
+    assert host_json(got)["warnings"] and host_json(got)["errors"] == []
 
 
 def waiting(job_id: str, **overrides: Any) -> JobView:
@@ -944,9 +958,9 @@ def test_the_placement_of_a_job_in_its_hosts_queue() -> None:
     assert queue_note(started) == "  queue: dispatched already; it is running now"
 
 
-def test_an_unreachable_host_places_nothing_rather_than_reporting_an_empty_queue() -> None:
+def test_an_unaskable_host_places_nothing_rather_than_reporting_an_empty_queue() -> None:
     """Null is not `not queued`: the job was enqueued before anything asked."""
-    view = HostView(entry=HostEntry(name="gpubox", ssh="me@box"), state=HostState.UNREACHABLE)
+    view = HostView(entry=HostEntry(name="gpubox", ssh="me@box"), state=HostState.UNASKABLE)
     placement = queue_placement(view, "j-next")
     assert set(placement.values()) == {None}
     assert queue_note(placement) is None

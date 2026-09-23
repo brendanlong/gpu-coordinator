@@ -10,12 +10,14 @@ variable and letting the cache drift onto another volume.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from gpuc.control.bootstrap import bootstrap_host, resolve_cache_dir
-from gpuc.control.probe import parse_probe
-from gpuc.control.remote import HostSession, env_prefix
+from gpuc.control.config import HostEntry
+from gpuc.control.remote import HostConfigRead, HostSession, env_prefix
+from gpuc.control.transport import Transport
 from gpuc.host import dispatcher, health, jobs, runner
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, make_spec
@@ -46,7 +48,7 @@ def test_the_runner_does_not_invent_a_uv_cache_dir(
 ) -> None:
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     monkeypatch.delenv("UV_LINK_MODE", raising=False)
-    env = runner.build_env(make_spec(), [], jobs.read_config())
+    env = runner.build_env(make_spec(), [])
     assert "UV_CACHE_DIR" not in env
     assert "UV_LINK_MODE" not in env
 
@@ -62,16 +64,18 @@ def test_the_dispatcher_does_not_invent_a_uv_cache_dir(
 
 
 def test_the_host_config_env_is_the_only_thing_that_sets_the_cache(gpuc_home: Path) -> None:
-    config = HostConfig(host="h", env={"UV_CACHE_DIR": "/vol/me/.cache/uv"})
-    jobs.write_config(config)
-    assert runner.build_env(make_spec(), [], config)["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
+    """Applied once, by the dispatcher, to everything it spawns; the runner
+    inherits it and adds nothing of its own."""
+    jobs.write_config(HostConfig(host="h", env={"UV_CACHE_DIR": "/vol/me/.cache/uv"}))
     assert dispatcher._child_env(Path("/pkg"))["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
 
 
-def test_a_job_can_still_override_the_host_cache(gpuc_home: Path) -> None:
-    config = HostConfig(host="h", env={"UV_CACHE_DIR": "/vol/me/.cache/uv"})
+def test_a_job_can_still_override_the_host_cache(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UV_CACHE_DIR", "/vol/me/.cache/uv")
     spec = make_spec(env={"UV_CACHE_DIR": "/tmp/mine"})
-    assert runner.build_env(spec, [], config)["UV_CACHE_DIR"] == "/tmp/mine"
+    assert runner.build_env(spec, [])["UV_CACHE_DIR"] == "/tmp/mine"
 
 
 # -- the host's UV_CACHE_DIR reaches everything that runs on the host ---------
@@ -80,14 +84,17 @@ def test_a_job_can_still_override_the_host_cache(gpuc_home: Path) -> None:
 def test_the_hosts_cache_dir_reaches_every_remote_step() -> None:
     """One variable in the host's own `env`, which is where it lives."""
     host = host_entry(name="h", cache_dir="/vol/me/.cache/uv")
-    assert host.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
-    assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in env_prefix(host.env)
-    session = HostSession(host, ScriptedHost(), "/vol/me/gpuc", "/usr/bin/python3")
+    assert host.config.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
+    assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in env_prefix(host.config.env)
+    # The session's env is the config it read off the host, not the cache.
+    session = session_for(host, ScriptedHost())
     assert session.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
+    session.config_read = HostConfigRead({"host": "h"})
+    assert "UV_CACHE_DIR" not in session.env
 
 
 def test_no_cache_dir_means_no_variable() -> None:
-    assert "UV_CACHE_DIR" not in host_entry(name="h").env
+    assert "UV_CACHE_DIR" not in host_entry(name="h").config.env
 
 
 # -- (b) the bootstrap rule ---------------------------------------------------
@@ -112,18 +119,19 @@ def test_every_managed_cache_goes_beside_gpuc_home_under_its_own_name() -> None:
 
 def test_one_filesystem_leaves_the_cache_alone(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="66")
-    assert resolve_cache_dir(host, entry(), "/uv", "/home/u/.gpuc", lambda _: None) is None
+    assert resolve_cache_dir(session_for(entry(), host), lambda _: None) is None
 
 
 def test_two_filesystems_move_the_cache_next_to_gpuc_home(control_env: Path) -> None:
     host = ScriptedHost(uv_cache="/root/.cache/uv", cache_dev="66", home_dev="99")
-    picked = resolve_cache_dir(host, entry(), "/uv", "/workspace/me/gpuc", lambda _: None)
-    assert picked == "/workspace/me/.cache/uv"
+    session = session_for(entry(), host, home="/workspace/me/gpuc")
+    assert resolve_cache_dir(session, lambda _: None) == "/workspace/me/.cache/uv"
 
 
 def test_an_unreadable_filesystem_changes_nothing(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="unknown", home_dev="99")
-    assert resolve_cache_dir(host, entry(), "/uv", "/workspace/me/gpuc", lambda _: None) is None
+    session = session_for(entry(), host, home="/workspace/me/gpuc")
+    assert resolve_cache_dir(session, lambda _: None) is None
 
 
 def test_a_cache_the_host_already_names_is_never_overridden(control_env: Path) -> None:
@@ -132,13 +140,14 @@ def test_a_cache_the_host_already_names_is_never_overridden(control_env: Path) -
     itself, and only when it is empty."""
     host = ScriptedHost(cache_dev="66", home_dev="99")
     for pinned in (entry(cache_dir="/mnt/big/uv"), entry(env={"UV_CACHE_DIR": "/mnt/big/uv"})):
-        assert resolve_cache_dir(host, pinned, "/uv", "/workspace/me/gpuc", lambda _: None) is None
+        session = session_for(pinned, host, home="/workspace/me/gpuc")
+        assert resolve_cache_dir(session, lambda _: None) is None
 
 
 def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="99")
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert updated.env.get("UV_CACHE_DIR") == "/home/u/.cache/uv"
+    assert updated.config.env.get("UV_CACHE_DIR") == "/home/u/.cache/uv"
     assert host.config is not None
     # No persistent root, so the user's own Hugging Face cache is left alone.
     assert host.config["env"] == {"UV_CACHE_DIR": "/home/u/.cache/uv"}
@@ -147,7 +156,7 @@ def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path)
 def test_bootstrap_on_one_filesystem_writes_no_cache_dir(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="66")
     updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert "UV_CACHE_DIR" not in updated.env
+    assert "UV_CACHE_DIR" not in updated.config.env
     assert host.config is not None
     assert host.config["env"] == {}
 
@@ -156,22 +165,26 @@ def test_the_cache_is_resolved_before_uv_tool_install(control_env: Path) -> None
     """`uv tool install` should already be filling the cache this host will use."""
     host = ScriptedHost(hf_present=False, cache_dev="66", home_dev="99")
     bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert host.index_of("cache dir") < host.index_of("tool install huggingface_hub")
+    assert host.index_of("uv_cache_placement") < host.index_of("tool install huggingface_hub")
     install = host.events[host.index_of("tool install huggingface_hub")]
     assert 'UV_CACHE_DIR="/home/u/.cache/uv"' in install
 
 
-# -- (c) probe and health both report it --------------------------------------
+# -- (c) health is the one report of it ------------------------------------
 
 
 def test_health_reports_the_cache_size_and_a_shared_filesystem(gpuc_home: Path) -> None:
     cache = gpuc_home.parent / "uv-cache"
     cache.mkdir()
     (cache / "wheel.bin").write_bytes(b"w" * 40_000)
-    check = health.check_uv_cache(HostConfig(host="h", env={"UV_CACHE_DIR": str(cache)}))
+    config = HostConfig(host="h", env={"UV_CACHE_DIR": str(cache)})
+    check = health.check_uv_cache(config)
     assert check.ok and not check.warn
     assert "same filesystem" in check.detail
     assert isinstance(check.value, float | int) and check.value > 0
+    placement = health.uv_cache_placement(config)
+    assert placement["dir"] == str(cache) and placement["shares_gpuc_home_fs"] is True
+    assert placement["size_bytes"] == check.value
 
 
 def test_health_warns_loudly_when_the_cache_is_on_another_filesystem(
@@ -196,48 +209,9 @@ def test_the_configured_cache_dir_wins_over_the_process_environment(
     config = HostConfig(host="h", env={"UV_CACHE_DIR": "/from/config"})
     assert health.uv_cache_dir(config) == Path("/from/config")
     assert health.uv_cache_dir(HostConfig(host="h")) == Path("/from/environ")
-
-
-PROBE_SHARED = """===uv_cache===
-dir=/home/u/.cache/uv
-size=18G
-gpuc_home=/home/u/.gpuc
-cache_dev=66
-home_dev=66
-"""
-
-PROBE_SPLIT = """===uv_cache===
-dir=/root/.cache/uv
-size=12G
-gpuc_home=/workspace/me/gpuc
-cache_dev=66
-home_dev=99
-"""
-
-
-def test_probe_reports_the_cache_size_and_that_it_is_shared() -> None:
-    report = parse_probe("gpubox", PROBE_SHARED)
-    assert report.uv_cache["size"] == "18G"
-    assert report.cache_shares_gpuc_home_fs is True
-    rendered = report.render()
-    assert "uv_cache: /home/u/.cache/uv size 18G" in rendered
-    assert "same filesystem as gpuc home /home/u/.gpuc: yes" in rendered
-    assert "different filesystems" not in rendered
-
-
-def test_probe_calls_out_a_split_cache_and_names_the_fix() -> None:
-    report = parse_probe("pod", PROBE_SPLIT)
-    assert report.cache_shares_gpuc_home_fs is False
-    rendered = report.render()
-    assert "same filesystem as gpuc home /workspace/me/gpuc: NO" in rendered
-    assert "copies each one instead" in rendered
-    assert "gpuc host bootstrap pod" in rendered
-
-
-def test_probe_says_unknown_rather_than_guessing() -> None:
-    report = parse_probe("h", "===uv_cache===\ndir=/x\nsize=absent\ncache_dev=unknown\n")
-    assert report.cache_shares_gpuc_home_fs is None
-    assert "unknown" in report.render()
+    monkeypatch.delenv("UV_CACHE_DIR")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/xdg")
+    assert health.uv_cache_dir(HostConfig(host="h")) == Path("/xdg/uv")
 
 
 # -- gpuc host clean --uv-cache -----------------------------------------------
@@ -250,11 +224,20 @@ class PruningHost(ScriptedHost):
         return super()._answer(command)
 
 
+def session_for(entry: HostEntry, host: ScriptedHost, home: str = "/home/u/.gpuc") -> HostSession:
+    return HostSession(
+        entry, cast("Transport", host), home, "/py", HostConfigRead(entry.cache.config)
+    )
+
+
 def test_host_clean_prunes_rather_than_cleans(control_env: Path) -> None:
     from gpuc.control.clean import prune_uv_cache
 
     host = PruningHost()
-    report = prune_uv_cache(entry(uv="/home/u/.local/bin/uv"), transport=host)
+    report = prune_uv_cache(
+        entry(uv="/home/u/.local/bin/uv"),
+        session=session_for(entry(uv="/home/u/.local/bin/uv"), host),
+    )
     assert "pruned 18.0 GiB -> ?" in report.render()
     # A side whose `du` failed is null, not zero, and so is what was freed.
     assert report.document() == {
@@ -276,7 +259,10 @@ def test_host_clean_passes_the_hosts_cache_dir(control_env: Path) -> None:
     from gpuc.control.clean import prune_uv_cache
 
     host = PruningHost()
-    prune_uv_cache(entry(cache_dir="/vol/me/.cache/uv"), transport=host)
+    prune_uv_cache(
+        entry(cache_dir="/vol/me/.cache/uv"),
+        session=session_for(entry(cache_dir="/vol/me/.cache/uv"), host),
+    )
     pruned = next(e for e in host.events if "cache prune" in e)
     assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in pruned
 
@@ -291,4 +277,4 @@ def test_a_failed_prune_is_an_error_not_a_silent_no_op(control_env: Path) -> Non
             return super()._answer(command)
 
     with pytest.raises(CleanError, match="read-only"):
-        prune_uv_cache(entry(), transport=Broken())
+        prune_uv_cache(entry(), session=session_for(entry(), Broken()))

@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from gpuc.control.cli import main
-from gpuc.control.config import HostEntry, load_registry, registry_transaction
-from gpuc.control.gpuinfo import GpuInfo, parse_smi, rows, summarize, vram_text
+from gpuc.control.config import HostEntry, registry_transaction
+from gpuc.control.gpuinfo import GpuInfo, from_table, rows, summarize, table_of, vram_text
 from gpuc.control.status import HostState, HostView, JobView, render
-from tests.conftest import host_entry
+from gpuc.host import gpus
+from tests.conftest import host_entry, load_registry
 
 SMI_OUTPUT = """\
 0, GPU-80646905-50a9-afc1-4375-43ca475b15e4, NVIDIA A40, 46068
@@ -18,15 +19,15 @@ A40 = "GPU-80646905-50a9-afc1-4375-43ca475b15e4"
 A40_TWO = "GPU-83123e65-fe58-7831-6b21-1814b07c25f7"
 
 
-def test_smi_rows_parse_with_and_without_units() -> None:
+def parse_smi(text: str) -> dict[str, GpuInfo]:
+    return from_table(gpus.parse_table(text))
+
+
+def test_the_cache_is_the_hosts_table_and_back() -> None:
     parsed = parse_smi(SMI_OUTPUT)
     assert parsed[A40] == GpuInfo(name="NVIDIA A40", vram_mib=46068, index=0)
-    with_units = parse_smi("GPU-aaa, NVIDIA GeForce RTX 3060 Ti, 8192 MiB\n")
-    assert with_units["GPU-aaa"] == GpuInfo(name="NVIDIA GeForce RTX 3060 Ti", vram_mib=8192)
-
-
-def test_junk_lines_are_ignored() -> None:
-    assert parse_smi("nvidia-smi: command not found\n\n") == {}
+    assert table_of(parsed) == gpus.parse_table(SMI_OUTPUT)
+    assert table_of({"GPU-old": GpuInfo(name="?")}) == [gpus.Gpu(None, "GPU-old", "?", None)]
 
 
 def test_vram_is_reported_as_the_card_is_sold() -> None:
@@ -41,7 +42,7 @@ def test_identical_cards_are_summarised_as_one_group() -> None:
 
 
 def test_mixed_and_unknown_cards_are_still_described() -> None:
-    info = parse_smi("GPU-a, NVIDIA A40, 46068\n")
+    info = parse_smi("0, GPU-a, NVIDIA A40, 46068\n")
     assert summarize(["GPU-a", "GPU-b"], info) == "1x NVIDIA A40 45 GB, 1x unknown GPU"
 
 

@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from gpuc.control import status as status_mod
 from gpuc.control import version as version_mod
 from gpuc.control.actions import host_document
-from gpuc.control.config import HostCache, HostEntry
+from gpuc.control.config import HostCache, HostEntry, Rental
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.providers.base import Pod
 from gpuc.control.status import HostState, HostView, JobView, SharedGpu
@@ -35,7 +35,6 @@ def uuid(n: int) -> str:
 
 def entry(
     name: str,
-    kind: str,
     *,
     ssh: str | None = None,
     gpus: list[str],
@@ -57,9 +56,8 @@ def entry(
         config["s3_prefix"] = s3_prefix
     return HostEntry(
         name=name,
-        kind=kind,  # type: ignore[arg-type]
         ssh=ssh,
-        pod_id=pod_id,
+        rental=Rental(pod_id=pod_id) if pod_id else None,
         cache=HostCache(
             read_at=at(minutes=-3),
             driver_version="580.65.06",
@@ -73,7 +71,6 @@ def views() -> list[HostView]:
     desktop = HostView(
         entry=entry(
             "desktop",
-            "local",
             gpus=[uuid(1)],
             s3_prefix="s3://my-bucket/gpuc/desktop",
             model="NVIDIA GeForce RTX 4090",
@@ -116,7 +113,6 @@ def views() -> list[HostView]:
     lab = HostView(
         entry=entry(
             "lab",
-            "ssh",
             ssh="me@lab-gpu-03",
             gpus=[uuid(2), uuid(3)],
             shared=[uuid(4)],
@@ -200,7 +196,6 @@ def views() -> list[HostView]:
     rented = HostView(
         entry=entry(
             "a100-burst",
-            "runpod",
             ssh="root@1.2.3.4",
             pod_id="k7q2m9x4v1",
             gpus=[uuid(5), uuid(6)],

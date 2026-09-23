@@ -18,7 +18,6 @@ from pydantic import ValidationError
 from gpuc._version import user_agent
 from gpuc.control.config import HostEntry, Settings, index_dir
 from gpuc.control.tolerant import TolerantModel
-from gpuc.host.jobs import JobSpec
 
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
@@ -61,7 +60,8 @@ class IndexEntry(TolerantModel):
     job_id: str = ""
     host: str = ""
     name: str = ""
-    attempt: int = 1
+    requeued_from: str | None = None
+    """The job this one was requeued from, for a listing to say so."""
     submitted_at: str = ""
     s3_prefix: str | None = None
     spec_uri: str | None = None
@@ -86,12 +86,6 @@ def make_s3_client() -> S3Client:
     from botocore.config import Config
 
     return boto3.client("s3", config=Config(user_agent_extra=user_agent()))
-
-
-def default_s3_prefix(settings: Settings, host: str) -> str | None:
-    if not settings.s3_bucket:
-        return None
-    return f"s3://{settings.s3_bucket}/gpuc/{host}"
 
 
 def job_uri(s3_prefix: str, job_id: str, name: str = "") -> str:
@@ -181,9 +175,6 @@ class S3Index:
             if _is_missing(exc):
                 raise S3ObjectMissing(f"no object at s3://{self.bucket}/{key}") from exc
             raise S3IndexError(f"could not read s3://{self.bucket}/{key}: {exc}") from exc
-
-    def put_spec(self, spec: JobSpec) -> str:
-        return self._put(spec_key(spec.job_id), json.dumps(spec.to_dict(), indent=2) + "\n")
 
     def put_spec_document(self, job_id: str, document: dict[str, Any]) -> str:
         """Re-mirror a spec as raw JSON, for an edit to a spec already up there.
@@ -288,14 +279,18 @@ class JobIndex:
             return entries, f"could not read the S3 index: {exc}"
         return entries, None
 
-    def mirror_prefix(self, job_id: str, entry: HostEntry) -> str | None:
+    def mirror_prefix(self, job_id: str, entry: HostEntry | None) -> str | None:
         """Where this job's own mirror is: the index's answer, else the host's.
 
         The job's is the one that counts -- a host whose `s3_prefix` changed
-        after the job ran still has the old jobs under the old prefix.
+        after the job ran still has the old jobs under the old prefix. The
+        host's is the cached one, and that is right here: this is the last
+        resort for a host that is gone, which is the one host nothing can ask.
+        A host this machine has forgotten has no cache to fall back on.
         """
         indexed = self.get(job_id)
-        return (indexed.s3_prefix if indexed else None) or entry.s3_prefix
+        cached = entry.config.s3_prefix if entry is not None else None
+        return (indexed.s3_prefix if indexed else None) or cached
 
     def mirrored_state(self, job_id: str, prefix: str | None) -> dict[str, Any] | None:
         """The job's mirrored `state.json`, or None for anything but a document."""

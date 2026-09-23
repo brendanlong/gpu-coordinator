@@ -1,94 +1,211 @@
-"""An in-memory host, for the commands that now have to talk to one.
+"""A host in a temporary home, driven exactly as an ssh host is.
 
-`gpuc host add` reads the host's `config.json` (and writes its first one), and
-`gpuc host set` writes through to it, so a CLI test that registers a host needs
-something on the other end of the transport. This is that: a dict of files,
-plus the handful of commands those two paths send.
+Every command runs for real, through `bash -c` with `$HOME` pointed at a
+directory of its own and `$HOME/.local/bin` first on `PATH`, so the on-host
+package, the probe script, `read_config`/`write_config` and a bootstrap all
+run as they do on a box. What is faked is only what a laptop does not have:
+
+- `nvidia-smi`: `conftest.install_fake_nvidia_smi`, answering for `gpus`;
+- `uv`, `aws` and `hf`: shims in the places bootstrap looks first, answering
+  the questions it asks (`uv cache dir` is `$HOME/.cache/uv`) and installing
+  nothing. `uv python find` is a bare venv of this test's interpreter with no
+  packages in it, as a uv-managed Python on a fresh box is: the shipped
+  package under `PYTHONPATH` is the only `gpuc` the host can import, so a
+  bootstrap that runs the host's code before shipping it fails here too;
+- the provider API (`fakeprovider.FakeProvider`) and S3 (`fakes3`).
+
+A bootstrap here starts a real dispatcher in the temporary home; `close`
+stops it, and the `fake_host` fixture always does.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import shlex
-from collections.abc import Sequence
+import subprocess
+import time
+import venv
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from gpuc.control.remote import NO_CONFIG
-from gpuc.control.transport import CommandResult
-from gpuc.host import jobs
+from gpuc.control.transport import CommandResult, TransportError, rsync_argv, tail_command
+from gpuc.host import scope
+from tests.conftest import install_fake_nvidia_smi
 
-HOME = "/home/u"
-GPU_ROWS = ["0, GPU-a, NVIDIA A40, 46068 MiB", "1, GPU-b, NVIDIA A40, 46068 MiB"]
+DEFAULT_GPUS = ("GPU-a", "GPU-b")
 
-PROBE_SECTIONS = {
-    "system": "Linux 6.8.0 x86_64\nuser=u home=/home/u shell=/bin/bash",
-    "driver": "580.173.02",
-    "gpus": "\n".join(GPU_ROWS),
-    "disk": "/dev/sda1 900G 100G 800G 12% /home",
-    "home_fs": "/dev/sda1 ext4 900G 100G 800G 12% /home",
-    "killuserprocesses": "KillUserProcesses=no",
-    "systemd_scope": "yes",
-    "uv": "uv 0.9.2",
-    "uv_cache": "dir=/home/u/.cache/uv\nsize=1.2G\ncache_dev=66\nhome_dev=66",
-    "python3": "/usr/bin/python3 3.12.3",
-    "download": "20 MB in 1.0s = 20.0 MB/s",
-}
+UV_SHIM = """\
+#!/bin/sh
+# uv, as far as bootstrap and the interpreter probe ask it: nothing is installed.
+case "$1 $2" in
+  "python find") echo {python} ;;
+  "cache dir") echo "$HOME/.cache/uv" ;;
+  "--version "*) echo "uv 0.0-fake" ;;
+esac
+exit 0
+"""
+
+NO_NVIDIA_SMI = '#!/bin/sh\necho "sh: 1: nvidia-smi: not found"\nexit 127\n'
+"""What a box with no driver says, whatever this machine has on its PATH."""
 
 
 class FakeHost:
-    """A transport whose host is a dict. Every command it does not know is a no-op."""
-
     host = "fake"
 
     def __init__(
-        self, config: dict[str, Any] | None = None, *, home: str = f"{HOME}/.gpuc"
+        self,
+        root: Path,
+        *,
+        gpus: Sequence[str] | None = DEFAULT_GPUS,
+        refuse: int = 0,
+        refusal: str = "ssh: connect to host 1.2.3.4 port 22000: Connection refused",
     ) -> None:
-        self.files: dict[str, str] = {}
+        self.home_dir = root / "home"
+        self.refuse = refuse
+        """Connections to refuse before the first command that gets through,
+        as a pod whose sshd is still coming up does; `refusal` is what ssh
+        says each time."""
+        self.refusal = refusal
         self.commands: list[str] = []
-        self.home = home
-        if config is not None:
-            self.files[f"{home}/config.json"] = json.dumps(config)
+        self.gpuc_home = "$HOME/.gpuc"
+        """The host's `GPUC_HOME` as an entry spells it; `$HOME` expands here."""
+        bin_dir = self.home_dir / ".local" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        self.set_gpus(gpus)
+        _shim(bin_dir / "uv", UV_SHIM.format(python=shlex.quote(_bare_python(root / "python"))))
+        _shim(bin_dir / "hf", "#!/bin/sh\nexit 0\n")
+        _shim(self.home_dir / ".local/aws-cli/v2/current/bin/aws", "#!/bin/sh\nexit 0\n")
+
+    # -- what a test reads off the host --------------------------------------
+
+    @property
+    def home(self) -> str:
+        return self.gpuc_home.replace("$HOME", str(self.home_dir))
+
+    @property
+    def config_path(self) -> str:
+        return f"{self.home}/config.json"
 
     @property
     def config(self) -> dict[str, Any] | None:
         """What this host's `config.json` holds, if it has one."""
-        body = self.files.get(f"{self.home}/config.json")
-        document: dict[str, Any] | None = json.loads(body) if body else None
+        path = Path(self.config_path)
+        if not path.exists():
+            return None
+        document: dict[str, Any] = json.loads(path.read_text())
         return document
+
+    def path(self, remote_path: str) -> Path:
+        return Path(remote_path.replace("$HOME", str(self.home_dir)))
+
+    def root(self, name: str) -> str:
+        """An absolute path a `--persistent-root` can point at on this host."""
+        return str(self.home_dir / name)
+
+    def set_gpus(self, uuids: Sequence[str] | None) -> None:
+        """The cards the box has from now on; None is a box with no driver."""
+        bin_dir = self.home_dir / ".local" / "bin"
+        if uuids is None:
+            _shim(bin_dir / "nvidia-smi", NO_NVIDIA_SMI)
+        else:
+            install_fake_nvidia_smi(bin_dir, list(uuids))
+
+    def ship_package(self) -> None:
+        """Put this checkout's package where a bootstrap would have, for a
+        test about a host somebody already set up: without it the host has
+        no `gpuc` to answer `status` with, as a real one would not."""
+        pkg = self.path(self.home) / "pkg"
+        pkg.mkdir(parents=True, exist_ok=True)
+        link = pkg / "gpuc"
+        if not link.exists():
+            link.symlink_to(Path(__file__).resolve().parents[1] / "gpuc")
+
+    def wipe(self) -> None:
+        """Take the host's gpuc home away, as a re-imaged pod would."""
+        self.close()
+        subprocess.run(["rm", "-rf", self.home], check=True)
+
+    def close(self) -> None:
+        """Stop the dispatcher a bootstrap started, if one is running.
+
+        A bootstrap leaves a package behind; the dispatcher it spawned takes
+        its lock a moment later, so a host with a package is given that
+        moment before the lock is read."""
+        home = Path(self.home)
+        lock = home / "dispatcher.lock"
+        deadline = time.monotonic() + 3.0
+        while (home / "pkg").exists() and not lock.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not lock.exists():
+            return
+        body = lock.read_text().strip().splitlines()
+        pgid = body[0].strip() if body else ""
+        if pgid.isdigit():
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(int(pgid), 9)
+
+    # -- Transport ------------------------------------------------------------
+
+    def env(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "HOME": str(self.home_dir),
+            "PATH": f"{self.home_dir / '.local' / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
+            "XDG_CONFIG_HOME": str(self.home_dir / ".config"),
+            "XDG_DATA_HOME": str(self.home_dir / ".local" / "share"),
+            "XDG_CACHE_HOME": str(self.home_dir / ".cache"),
+            scope.ISOLATION_ENV: scope.PGID,
+        }
+
+    def argv(self, command: str) -> list[str]:
+        return ["bash", "-c", command]
+
+    def interactive_argv(self, command: str) -> list[str]:
+        return ["bash", "-lc", command]
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
         self.commands.append(command)
-        code, out = self._answer(command)
-        result = CommandResult(self.host, ["sh", "-c", command], code, out, "")
+        if self.refuse > 0:
+            self.refuse -= 1
+            result = CommandResult(self.host, ["ssh", command], 255, "", self.refusal)
+        else:
+            # In the host's home, as an ssh command lands: run from the
+            # repository, `python -c` would import `gpuc` from the cwd.
+            proc = subprocess.run(
+                self.argv(command),
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=self.env(),
+                cwd=self.home_dir,
+                stdin=subprocess.DEVNULL,
+            )
+            result = CommandResult(
+                self.host,
+                self.argv(command),
+                proc.returncode,
+                proc.stdout.decode("utf-8", "replace"),
+                proc.stderr.decode("utf-8", "replace"),
+            )
         return result.check() if check else result
 
-    def _answer(self, command: str) -> tuple[int, str]:
-        if command.startswith("printf %s"):
-            return 0, shlex.split(command)[2].replace("$HOME", HOME)
-        if command.startswith("if [ -f") and "config.json" in command:
-            body = self.files.get(f"{self.home}/config.json")
-            return 0, body if body is not None else NO_CONFIG
-        if "say()" in command:
-            return 0, "".join(f"==={name}===\n{body}\n" for name, body in PROBE_SECTIONS.items())
-        if "-m gpuc.host config --merge" in command:
-            patch = json.loads(self.files[command.rsplit(" ", 1)[1]])
-            merged = jobs.merged_config(self.config or {}, patch)
-            self.files[f"{self.home}/config.json"] = json.dumps(merged)
-            return 0, json.dumps(merged)
-        if command.startswith("mv -f "):
-            source, target = shlex.split(command)[2:4]
-            self.files[target] = self.files.pop(source, "")
-            return 0, ""
-        if command.startswith("rm -f "):
-            self.files.pop(shlex.split(command)[2], None)
-            return 0, ""
-        return 0, ""
-
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
-        self.files[remote_path] = content.decode() if isinstance(content, bytes) else content
+        path = self.path(remote_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = content.encode() if isinstance(content, str) else content
+        tmp = path.parent / f".{path.name}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        tmp.chmod(mode)
+        os.replace(tmp, path)
 
     def rsync(
         self,
@@ -97,21 +214,49 @@ class FakeHost:
         files: Sequence[str] | None = None,
         excludes: Sequence[str] = (),
     ) -> CommandResult:
-        return CommandResult(self.host, ["rsync"], 0, "", "")
+        argv = rsync_argv(
+            local_root, str(self.path(remote_path)), files, ssh_command=None, excludes=excludes
+        )
+        stdin = "".join(f"{name}\0" for name in files).encode() if files is not None else None
+        proc = subprocess.run(argv, input=stdin, capture_output=True, check=False, timeout=600.0)
+        result = CommandResult(
+            self.host, argv, proc.returncode, proc.stdout.decode(), proc.stderr.decode()
+        )
+        if result.returncode != 0:
+            raise TransportError(result)
+        return result
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        return CommandResult(self.host, ["tail"], 0, "", "")
+        return self.run(tail_command(remote_path, lines, follow), check=False)
+
+
+def _shim(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+
+
+def _bare_python(root: Path) -> str:
+    """An interpreter with nothing installed: this test's own, in a venv of
+    its own with no site-packages. A `-S` wrapper would not do -- the probe
+    records `sys.executable`, which a wrapper cannot change -- and a venv is
+    what `uv python find` answers with on a real host anyway."""
+    venv.create(root, with_pip=False, symlinks=True)
+    return str(root / "bin" / "python3")
 
 
 @pytest.fixture
-def fake_host(monkeypatch: pytest.MonkeyPatch) -> FakeHost:
-    """Point `gpuc host add|set` at an in-memory host instead of ssh."""
-    host = FakeHost()
+def fake_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeHost]:
+    """Point every command that opens a transport at a host in a temporary home."""
+    host = FakeHost(tmp_path / "host")
 
     def factory(entry: Any, settings: Any = None) -> Any:
-        host.home = entry.remote_home.replace("$HOME", HOME)
+        host.gpuc_home = entry.remote_home
         return host
 
-    for module in ("connect", "probe", "cli"):
+    for module in ("connect", "probe", "cli", "remote", "bootstrap"):
         monkeypatch.setattr(f"gpuc.control.{module}.transport_for", factory, raising=False)
-    return host
+    try:
+        yield host
+    finally:
+        host.close()

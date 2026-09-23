@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.control.config import Settings
+from gpuc.control.config import Settings, default_s3_prefix
 from gpuc.control.s3index import (
     IndexEntry,
     JobIndex,
@@ -13,7 +13,6 @@ from gpuc.control.s3index import (
     S3Index,
     S3IndexError,
     S3ObjectMissing,
-    default_s3_prefix,
     job_log_uri,
     split_uri,
 )
@@ -22,12 +21,12 @@ from tests.fakes3 import FakeS3Client
 
 
 def spec(job_id: str = "20260101-000000-abc123") -> JobSpec:
-    return JobSpec.from_dict({"job_id": job_id, "command": "true", "name": "t", "attempt": 2})
+    return JobSpec.from_dict({"job_id": job_id, "command": "true", "name": "t"})
 
 
 def test_local_index_round_trips(control_env: Path) -> None:
     index = LocalIndex()
-    entry = IndexEntry(job_id="j1", host="gpubox", name="t", attempt=3)
+    entry = IndexEntry(job_id="j1", host="gpubox", name="t", requeued_from="j0")
     index.record(entry)
     assert index.get("j1") == entry
     assert index.get("missing") is None
@@ -43,11 +42,10 @@ def test_local_index_ignores_a_corrupt_file(control_env: Path) -> None:
 
 def test_s3_spec_round_trips_for_requeue() -> None:
     s3 = S3Index("bkt", FakeS3Client())
-    uri = s3.put_spec(spec())
+    uri = s3.put_spec_document(spec().job_id, spec().to_dict())
     assert uri == "s3://bkt/gpuc/specs/20260101-000000-abc123.json"
     document = s3.get_spec("20260101-000000-abc123")
     assert document["command"] == "true"
-    assert document["attempt"] == 2
 
 
 def test_s3_index_lists_entries_for_status_all() -> None:
@@ -60,7 +58,7 @@ def test_s3_index_lists_entries_for_status_all() -> None:
 def test_a_write_failure_says_what_to_check() -> None:
     s3 = S3Index("bkt", FakeS3Client(fail_put=True))
     with pytest.raises(S3IndexError) as exc:
-        s3.put_spec(spec())
+        s3.put_spec_document(spec().job_id, spec().to_dict())
     assert "AccessDenied" in str(exc.value)
     assert "Check AWS credentials" in str(exc.value)
 

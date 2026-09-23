@@ -21,9 +21,9 @@ from pathlib import Path
 import pytest
 
 from gpuc.control.cli import main
-from gpuc.control.config import load_registry
+from gpuc.control.s3index import LocalIndex
 from gpuc.host import scope
-from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch
+from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch, load_registry
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
 
@@ -212,7 +212,6 @@ def test_probe_reports_this_machine(
     out = capsys.readouterr().out
     assert "host local" in out
     assert "systemd_scope:" in out
-    assert "MB/s" in out or "B/s" in out
 
 
 def test_submit_runs_a_job_and_logs_and_status_find_it(
@@ -226,7 +225,6 @@ def test_submit_runs_a_job_and_logs_and_status_find_it(
     state = state_of(home, job_id)
     assert (state["status"], state["exit_code"], state["attempt"]) == ("succeeded", 0, 1)
     assert (home / "jobs" / job_id / "workdir" / "hello.txt").exists()
-    assert state["workdir_removed"] is False
 
     assert main(["logs", job_id]) == 0
     assert "hello" in capsys.readouterr().out
@@ -401,7 +399,7 @@ def s3_bucket_configured() -> Iterator[None]:
             path.write_text(before)
 
 
-def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
+def test_requeue_resubmits_from_the_s3_spec_as_a_new_job_that_names_its_origin(
     bootstrapped_home: Path,
     workdir: Path,
     s3_bucket_configured: None,
@@ -425,12 +423,21 @@ def test_requeue_resubmits_from_the_s3_spec_with_the_next_attempt(
         assert main(["requeue", first, "--host", "local"]) == 0
     finally:
         os.chdir(cwd)
-    assert "attempt 2" in capsys.readouterr().out
+    assert f"requeued from {first}" in capsys.readouterr().out
     second = (_indexed_job_ids() - before).pop()
+    assert second != first
+    # The new job records where it came from, in the index and in the mirror
+    # the next requeue would read.
+    indexed = LocalIndex().get(second)
+    assert indexed is not None and indexed.requeued_from == first
+    mirrored = json.loads(fake.objects[f"bkt/gpuc/specs/{second}.json"])
+    assert (mirrored["job_id"], mirrored["requeued_from"]) == (second, first)
 
     wait_until(lambda: finished(home, second), 120, f"job {second} to finish")
     state = state_of(home, second)
-    assert (state["status"], state["attempt"]) == ("succeeded", 2)
+    # The host's `attempt` counts the launches of *this* id: a requeue is a
+    # new job, so it is 1 there however many times the spec has been run.
+    assert (state["status"], state["attempt"]) == ("succeeded", 1)
     assert "hello" in log_tail(home, second)
 
 
@@ -509,7 +516,7 @@ def test_clean_dry_run_then_real(
     real = capsys.readouterr().out
     assert job_id in real and "freed" in real
     assert not (home / "jobs" / job_id / "workdir").exists()
-    assert state_of(home, job_id)["workdir_removed"] is True
+    assert state_of(home, job_id)["workdir_bytes"] == 0
     assert (home / "jobs" / job_id / "log.txt").exists()
 
 
@@ -653,10 +660,10 @@ def test_retention_days_reaches_the_host_config(
     # `config.json` is the only copy of this setting.
     assert main(["host", "set", "local", "--retention-days", "14"]) == 0
     assert json.loads((home / "config.json").read_text())["retention_days"] == 14.0
-    assert load_registry().require("local").retention_days == 14.0
+    assert load_registry().require("local").config.retention_days == 14.0
     assert main(["host", "set", "local", "--retention-days", ""]) == 0
     assert json.loads((home / "config.json").read_text())["retention_days"] is None
-    assert load_registry().require("local").retention_days is None
+    assert load_registry().require("local").config.retention_days is None
 
 
 def test_workdir_days_reaches_the_host_config(
@@ -670,4 +677,4 @@ def test_workdir_days_reaches_the_host_config(
     assert json.loads((home / "config.json").read_text())["workdir_days"] == 3.0
     assert main(["host", "set", "local", "--workdir-days", ""]) == 0
     assert json.loads((home / "config.json").read_text())["workdir_days"] is None
-    assert load_registry().require("local").workdir_days is None
+    assert load_registry().require("local").config.workdir_days is None

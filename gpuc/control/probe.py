@@ -1,7 +1,9 @@
 """`gpuc host probe`: what a host is, before we have installed anything on it.
 
 Pure `sh` plus `python3`-if-present, because the whole point is to run against
-a host where nothing has been bootstrapped yet.
+a host where nothing has been bootstrapped yet. What needs the tool's own
+rules -- the throughput floor, whether uv's cache shares gpuc home's
+filesystem -- is the health check's, asked once the package is there.
 """
 
 from __future__ import annotations
@@ -11,8 +13,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, transport_for
-from gpuc.control.gpuinfo import GpuInfo, parse_smi
+from gpuc.control.gpuinfo import GpuInfo, from_table
+from gpuc.control.remote import usable_python
 from gpuc.control.transport import Transport
+from gpuc.host import gpus
 
 SECTION_ORDER = [
     "system",
@@ -23,37 +27,26 @@ SECTION_ORDER = [
     "killuserprocesses",
     "systemd_scope",
     "uv",
-    "uv_cache",
     "python3",
-    "download",
 ]
 
-DOWNLOAD_URL = "https://download.pytorch.org/whl/cpu/torch-2.5.1%2Bcpu-cp311-cp311-linux_x86_64.whl"
-DOWNLOAD_BYTES = 20 * 1024 * 1024
 
-
-def probe_script(gpuc_home: str) -> str:
-    """The whole probe as one `sh` script. ``gpuc_home`` may be unexpanded
-    (``$HOME/.gpuc``): it is quoted for the host's own shell to resolve."""
+def probe_script() -> str:
+    """The whole probe as one `sh` script."""
     return f"""
 say() {{ echo "===$1==="; }}
-# The nearest existing ancestor of $1, so a directory that does not exist yet
-# can still be attributed to a filesystem.
-upto() {{ d=$1; while [ ! -e "$d" ] && [ "$d" != "/" ] && [ -n "$d" ]; do d=$(dirname "$d"); done; \
-echo "${{d:-/}}"; }}
-dev() {{ stat -c %d "$(upto "$1")" 2>/dev/null || echo unknown; }}
 say system
 uname -srm; echo "user=$(id -un) home=$HOME shell=$SHELL"
 say driver
-nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1 \
+nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1 \\
   || echo "nvidia-smi not found"
 say gpus
-nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv,noheader 2>&1 \
+nvidia-smi --query-gpu={",".join(gpus.TABLE_FIELDS)} --format=csv,noheader 2>&1 \\
   || echo "nvidia-smi not found"
 say disk
 df -Ph "$HOME" | tail -1
 say home_fs
-df -T "$HOME" 2>/dev/null | tail -1 || stat -f -c '%n %T' "$HOME" 2>/dev/null \
+df -T "$HOME" 2>/dev/null | tail -1 || stat -f -c '%n %T' "$HOME" 2>/dev/null \\
   || echo "unknown unknown"
 say killuserprocesses
 kup=$(loginctl show-user "$(id -un)" -p KillUserProcesses 2>&1 | head -1)
@@ -61,54 +54,16 @@ echo "${{kup:-unknown: no logind session for this user}}"
 say systemd_scope
 if systemd-run --user --scope -- true >/dev/null 2>&1; then echo yes; else echo no; fi
 say uv
-if [ -x "$HOME/.local/bin/uv" ]; then "$HOME/.local/bin/uv" --version; \
+if [ -x "$HOME/.local/bin/uv" ]; then "$HOME/.local/bin/uv" --version; \\
 elif command -v uv >/dev/null 2>&1; then uv --version; else echo "not installed"; fi
-say uv_cache
-cache="${{UV_CACHE_DIR:-$HOME/.cache/uv}}"
-echo "dir=$cache"
-if [ -d "$cache" ]; then echo "size=$(du -sh "$cache" 2>/dev/null | cut -f1)"; \
-else echo "size=absent"; fi
-echo "gpuc_home={gpuc_home}"
-echo "cache_dev=$(dev "$cache")"
-echo "home_dev=$(dev "{gpuc_home}")"
 say python3
-if command -v python3 >/dev/null 2>&1; then python3 -c 'import sys; print(sys.executable, \
+if command -v python3 >/dev/null 2>&1; then python3 -c 'import sys; print(sys.executable, \\
 sys.version.split()[0])'; else echo "not installed"; fi
-say download
-if command -v python3 >/dev/null 2>&1; then
-python3 - <<'PYEOF'
-import time, urllib.request
-url = "{DOWNLOAD_URL}"
-want = {DOWNLOAD_BYTES}
-start = time.time()
-try:
-    req = urllib.request.Request(url, headers={{"Range": f"bytes=0-{{want - 1}}"}})
-    with urllib.request.urlopen(req, timeout=60) as response:
-        read = 0
-        while read < want:
-            chunk = response.read(1 << 20)
-            if not chunk:
-                break
-            read += len(chunk)
-    elapsed = max(time.time() - start, 1e-6)
-    print(f"{{read / 1e6:.0f}} MB in {{elapsed:.1f}}s = {{read / 1e6 / elapsed:.1f}} MB/s")
-except Exception as exc:
-    print(f"FAILED: {{exc}}")
-PYEOF
-elif command -v curl >/dev/null 2>&1; then
-  curl -s -o /dev/null -r 0-{DOWNLOAD_BYTES - 1} \
-    -w '%{{size_download}} bytes at %{{speed_download}} B/s\\n' "{DOWNLOAD_URL}"
-else
-  echo "no python3 and no curl: cannot time a download"
-fi
 """
 
 
 OVERLAY_FS_TYPES = frozenset({"overlay", "overlayfs", "aufs"})
 """Filesystem types that mean "this is a container's throwaway upper layer"."""
-
-PYTHON_FLOOR = (3, 11)
-"""What the on-host package needs; bootstrap spells the same tuple for `uv`."""
 
 
 @dataclass
@@ -133,59 +88,48 @@ class ProbeReport:
         return "not found" not in self.sections.get("driver", "not found")
 
     @property
-    def gpu_rows(self) -> list[list[str]]:
+    def table(self) -> list[gpus.Gpu]:
+        """Every card in the box, through the host's own parser."""
         if not self.has_nvidia_smi:
             return []
-        rows: list[list[str]] = []
-        for line in self.sections.get("gpus", "").splitlines():
-            cells = [c.strip() for c in line.split(",")]
-            if len(cells) >= 3 and cells[0].isdigit():
-                rows.append(cells)
-        return rows
-
-    def owns(self, cells: Sequence[str]) -> bool:
-        """Is this `gpu_rows` row one of ours?
-
-        By UUID, or by the index nvidia-smi *just* gave the card -- which is
-        the numbering `--gpus 2,3` was agreed in, and fresher than anything the
-        registry recorded."""
-        owned = set(self.owned)
-        return cells[1] in owned or cells[0] in owned
+        return gpus.parse_table(self.sections.get("gpus", ""))
 
     @property
-    def owned_rows(self) -> list[list[str]]:
-        return [cells for cells in self.gpu_rows if self.owns(cells)]
+    def cards(self) -> gpus.Resolution:
+        """The assignment against the box, by the host's own rule -- so what
+        the probe calls missing or doubled is what the health check will."""
+        return gpus.resolve(self.owned, self.table, self.shared)
 
-    def shares(self, cells: Sequence[str]) -> bool:
-        """Is this row one of the cards we borrow? Matched exactly as `owns` is."""
-        shared = set(self.shared)
-        return cells[1] in shared or cells[0] in shared
+    def owns(self, gpu: gpus.Gpu) -> bool:
+        return gpu.uuid in self.cards.owned
 
     @property
-    def shared_rows(self) -> list[list[str]]:
-        return [cells for cells in self.gpu_rows if self.shares(cells)]
+    def owned_rows(self) -> list[gpus.Gpu]:
+        return [gpu for gpu in self.table if self.owns(gpu)]
+
+    def shares(self, gpu: gpus.Gpu) -> bool:
+        return gpu.uuid in self.cards.shared
+
+    @property
+    def shared_rows(self) -> list[gpus.Gpu]:
+        return [gpu for gpu in self.table if self.shares(gpu)]
 
     @property
     def owned_missing(self) -> list[str]:
         """`--gpus` entries no card on this host answers to: a typo, a card
-        this container was not given, or a renumbered driver."""
-        if not self.has_nvidia_smi:
-            return []
-        seen = {cell for cells in self.gpu_rows for cell in cells[:2]}
-        return [item for item in self.owned if item not in seen]
+        this container was not given, or a renumbered driver. Nothing is
+        missing on a host with no driver: there is no table to be missing from."""
+        return self.cards.missing if self.has_nvidia_smi else []
 
     @property
     def shared_missing(self) -> list[str]:
         """`--shared-gpus` entries no card on this host answers to."""
-        if not self.has_nvidia_smi:
-            return []
-        seen = {cell for cells in self.gpu_rows for cell in cells[:2]}
-        return [item for item in self.shared if item not in seen]
+        return self.cards.shared_missing if self.has_nvidia_smi else []
 
     @property
     def gpu_info(self) -> dict[str, GpuInfo]:
         """The `gpus` section as the registry stores it, keyed by UUID."""
-        return parse_smi("\n".join(",".join(cells) for cells in self.gpu_rows if len(cells) > 2))
+        return from_table(self.table)
 
     @property
     def host_python(self) -> str | None:
@@ -198,14 +142,7 @@ class ProbeReport:
         replaces it with the interpreter uv picks, which is the one the
         dispatcher runs under.
         """
-        parts = self.sections.get("python3", "").split()
-        if len(parts) < 2 or not parts[0].startswith("/"):
-            return None
-        try:
-            version = tuple(int(piece) for piece in parts[1].split(".")[:2])
-        except ValueError:
-            return None
-        return parts[0] if version >= PYTHON_FLOOR else None
+        return usable_python(self.sections.get("python3", ""))
 
     @property
     def driver_version(self) -> str | None:
@@ -223,24 +160,6 @@ class ProbeReport:
     def home_is_overlay(self) -> bool:
         return (self.home_fs_type or "").lower() in OVERLAY_FS_TYPES
 
-    @property
-    def uv_cache(self) -> dict[str, str]:
-        """The `key=value` lines of the `uv_cache` section."""
-        return dict(
-            line.split("=", 1)
-            for line in self.sections.get("uv_cache", "").splitlines()
-            if "=" in line
-        )
-
-    @property
-    def cache_shares_gpuc_home_fs(self) -> bool | None:
-        """Can uv link a wheel out of its cache into a job's venv? None if unknown."""
-        values = self.uv_cache
-        cache, home = values.get("cache_dev"), values.get("home_dev")
-        if not cache or not home or "unknown" in (cache, home):
-            return None
-        return cache == home
-
     def render(self, *, all_gpus: bool = False) -> str:
         lines = [f"host {self.host}"]
         for key in SECTION_ORDER:
@@ -248,40 +167,31 @@ class ProbeReport:
             if key == "gpus":
                 lines += self._gpu_lines(all_gpus)
                 continue
-            if key == "uv_cache":
-                values = self.uv_cache
-                shared = {True: "yes", False: "NO", None: "unknown"}[self.cache_shares_gpuc_home_fs]
-                lines.append(
-                    f"  uv_cache: {values.get('dir', '?')} size {values.get('size', '?')} "
-                    f"(same filesystem as gpuc home {values.get('gpuc_home', '?')}: {shared})"
-                )
-                continue
             lines.append(f"  {key}: {value.strip() or '(no output)'}")
         lines += [f"  note: {note}" for note in self.notes]
         return "\n".join(lines)
 
     def _gpu_lines(self, all_gpus: bool) -> list[str]:
         """The `gpus` section: ours by default, the whole box with `--all-gpus`."""
-        rows, owned = self.gpu_rows, self.owned_rows
+        rows, owned = self.table, self.owned_rows
         if not rows:
             return ["  gpus:", f"    {self.sections.get('gpus', '').strip() or '(no output)'}"]
         # Nothing of ours to show is not a reason to show nothing: a host whose
         # assignment matches no card needs the whole list more than anybody.
-        ours = owned + [cells for cells in self.shared_rows if not self.owns(cells)]
+        ours = owned + self.shared_rows
         everything = all_gpus or not ours
         partly = 0 < len(ours) < len(rows)
         hidden = " (--all-gpus lists the rest)" if partly and not everything else ""
         borrowed = f", {len(ours) - len(owned)} shared" if len(ours) > len(owned) else ""
         header = f"  gpus: {len(owned)} of {len(rows)} assigned to {self.host}{borrowed}{hidden}"
         lines = [header if self.owned or self.shared else "  gpus:"]
-        for cells in rows if everything else ours:
-            index, uuid, name = cells[0], cells[1], cells[2]
-            memory = f"  {cells[3]}" if len(cells) > 3 else ""
-            if self.owns(cells):
+        for gpu in rows if everything else ours:
+            memory = f"  {gpu.memory_mib} MiB" if gpu.memory_mib is not None else ""
+            if self.owns(gpu):
                 mine = "  (assigned)" if everything and partly else ""
             else:
-                mine = "  (shared)" if self.shares(cells) else ""
-            lines.append(f"    [{index}] {name}{memory}  {uuid}{mine}")
+                mine = "  (shared)" if self.shares(gpu) else ""
+            lines.append(f"    [{gpu.index}] {gpu.name}{memory}  {gpu.uuid}{mine}")
         return lines
 
     @property
@@ -298,19 +208,11 @@ class ProbeReport:
             )
         if self.sections.get("uv") == "not installed":
             notes.append(f"uv is missing; `gpuc host bootstrap {self.host}` installs it")
-        if self.cache_shares_gpuc_home_fs is False:
-            notes.append(
-                f"uv's cache and gpuc home are on different filesystems, so uv cannot\n"
-                f"        hardlink or reflink wheels into a job's venv and copies each one "
-                f"instead\n        (~6.5 GB per torch venv). "
-                f"`gpuc host bootstrap {self.host}` fixes this by pointing\n"
-                f"        UV_CACHE_DIR at gpuc home's own volume."
-            )
         return notes
 
     def _gpu_notes(self) -> list[str]:
         """Which cards in this box are ours, and what to do about the answer."""
-        rows, owned = self.gpu_rows, self.owned_rows
+        rows, owned = self.table, self.owned_rows
         notes: list[str] = []
         if rows and not self.owned:
             notes.append(
@@ -339,11 +241,11 @@ class ProbeReport:
                 f"        `gpuc host bootstrap {self.host}` fails its gpu_uuids check on this, so "
                 f"fix the\n        list first: `gpuc host set {self.host} --gpus <list>`"
             )
-        doubled = len(self.owned) - len(self.owned_missing) - len(owned)
-        if doubled > 0:
+        doubled = self.cards.duplicates if self.has_nvidia_smi else []
+        if doubled:
             notes.append(
-                f"{len(self.owned) - len(self.owned_missing)} of the assigned entries name only "
-                f"{len(owned)} card(s) -- an index and its own UUID\n        are one card. "
+                f"{', '.join(doubled)} name a card already named -- an index and its own UUID\n"
+                f"        are one card, and a card is owned or shared, not both. "
                 f"`gpuc host bootstrap {self.host}` fails rather than promise a card twice"
             )
         return notes
@@ -356,8 +258,7 @@ class ProbeReport:
         beside it is the interpretation `render()` prints. Every card the host
         has is listed whatever `--all-gpus` said, each flagged `assigned` or not.
         """
-        assigned = {cells[1] for cells in self.owned_rows}
-        shared = {cells[1] for cells in self.shared_rows} - assigned
+        cards = self.cards
         return {
             "host": self.host,
             "sections": dict(self.sections),
@@ -367,8 +268,8 @@ class ProbeReport:
                 {
                     "uuid": uuid,
                     **info.model_dump(mode="json"),
-                    "assigned": uuid in assigned,
-                    "shared": uuid in shared,
+                    "assigned": uuid in cards.owned,
+                    "shared": uuid in cards.shared,
                 }
                 for uuid, info in self.gpu_info.items()
             ],
@@ -379,10 +280,6 @@ class ProbeReport:
             "home_fs_type": self.home_fs_type,
             "home_is_overlay": self.home_is_overlay,
             "persistent_root": self.persistent_root,
-            "uv_cache": {
-                **self.uv_cache,
-                "shares_gpuc_home_fs": self.cache_shares_gpuc_home_fs,
-            },
             "notes": self.notes,
         }
 
@@ -419,5 +316,6 @@ def probe_host(
     entry: HostEntry, settings: Settings | None = None, *, transport: Transport | None = None
 ) -> ProbeReport:
     transport = transport or transport_for(entry, settings)
-    result = transport.run(probe_script(entry.remote_home), timeout=240.0, check=False)
-    return parse_probe(entry.name, result.output, entry.root, entry.gpus, entry.config.shared_gpus)
+    result = transport.run(probe_script(), timeout=240.0, check=False)
+    config = entry.config
+    return parse_probe(entry.name, result.output, entry.root, config.gpus, config.shared_gpus)

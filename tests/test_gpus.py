@@ -16,32 +16,50 @@ def test_driver_version() -> None:
     assert gpus.driver_version(fake_smi()) == "580.173.02"
 
 
-def test_resolve_present_passes_and_fails_clearly() -> None:
-    assert gpus.resolve_present([FAKE_GPUS[0]], smi=fake_smi()) == [FAKE_GPUS[0]]
-    assert gpus.resolve_present([], smi=fake_smi()) == []
-    with pytest.raises(gpus.GpuError) as excinfo:
-        gpus.resolve_present(["GPU-stale"], smi=fake_smi())
-    assert "GPU-stale" in str(excinfo.value)
-    assert FAKE_GPUS[0] in str(excinfo.value)
+def test_the_table_carries_index_uuid_name_and_memory() -> None:
+    (first, _second) = gpus.list_gpus(fake_smi())
+    assert first == gpus.Gpu(0, FAKE_GPUS[0], "Fake A40", 46068)
+    with_units = gpus.parse_table("0, GPU-a, NVIDIA A40, 46068 MiB\n1, GPU-b, NVIDIA A40, 46068\n")
+    assert with_units == [
+        gpus.Gpu(0, "GPU-a", "NVIDIA A40", 46068),
+        gpus.Gpu(1, "GPU-b", "NVIDIA A40", 46068),
+    ]
+    assert gpus.parse_table("nvidia-smi: command not found\n\n") == []
+    with pytest.raises(gpus.GpuError, match="no card rows"):
+        gpus.list_gpus(lambda args: "No devices were found\n")
 
 
-def test_resolve_present_takes_indices_not_just_uuids() -> None:
-    """A host pinned by position hands out `2`, and everything that checks an
-    assignment has to understand that form or it rejects every job."""
-    assert gpus.resolve_present(["1"], smi=fake_smi()) == [FAKE_GPUS[1]]
-    assert gpus.resolve_present(["0", FAKE_GPUS[1]], smi=fake_smi()) == FAKE_GPUS
+def test_resolve_names_each_card_once_by_index_or_uuid() -> None:
+    table = gpus.list_gpus(fake_smi())
+    assert gpus.resolve([FAKE_GPUS[0]], table).owned == [FAKE_GPUS[0]]
+    assert gpus.resolve([], table) == gpus.Resolution([], [], [], [], [])
+    assert gpus.resolve(["1"], table).owned == [FAKE_GPUS[1]]
+    assert gpus.resolve(["0", FAKE_GPUS[1]], table).owned == FAKE_GPUS
 
 
-def test_resolve_present_refuses_an_assignment_that_names_one_card_twice() -> None:
-    """Owning a card under two names is one card; being *assigned* it twice is
-    a promise of two, and handing back one would run a 2-GPU job on one."""
-    with pytest.raises(gpus.GpuError) as excinfo:
-        gpus.resolve_present(["0", FAKE_GPUS[0]], smi=fake_smi())
-    assert "1 card(s), not 2" in str(excinfo.value)
-    with pytest.raises(gpus.GpuError) as excinfo:
-        gpus.resolve_present(["0", "9"], "assigned GPUs", smi=fake_smi())
-    assert "assigned GPUs not present on this host: 9" in str(excinfo.value)
-    assert f"0={FAKE_GPUS[0]}" in str(excinfo.value)
+def test_an_absent_uuid_is_missing_exactly_as_an_absent_index_is() -> None:
+    """A card the driver stopped reporting is never handed out to fail inside
+    a job: the rule is the same for both spellings, live and offline."""
+    table = gpus.list_gpus(fake_smi())
+    cards = gpus.resolve(["0", "7", "GPU-stale"], table)
+    assert cards.owned == [FAKE_GPUS[0]]
+    assert cards.missing == ["7", "GPU-stale"]
+    assert f"0={FAKE_GPUS[0]}" in gpus.describe_table(table)
+
+
+def test_an_index_and_its_own_uuid_are_one_card_named_twice() -> None:
+    cards = gpus.resolve(["0", FAKE_GPUS[0]], gpus.list_gpus(fake_smi()))
+    assert cards.owned == [FAKE_GPUS[0]]
+    assert cards.duplicates == [FAKE_GPUS[0]]
+
+
+def test_a_card_both_owned_and_shared_is_a_duplicate_and_owning_wins() -> None:
+    table = gpus.list_gpus(fake_smi())
+    cards = gpus.resolve(["0"], table, shared=[FAKE_GPUS[0], "1", "1"])
+    assert cards.owned == [FAKE_GPUS[0]]
+    assert cards.shared == [FAKE_GPUS[1]]
+    assert cards.duplicates == [FAKE_GPUS[0], "1"]
+    assert gpus.resolve(["0"], table, shared=["9"]).shared_missing == ["9"]
 
 
 def test_sample_utilization_filters_to_requested_uuids() -> None:
@@ -88,12 +106,12 @@ def test_unparsable_utilization_is_a_gpu_error(value: str) -> None:
 
 @pytest.mark.parametrize("value", ["[N/A]", "garbage"])
 def test_an_unparsable_index_is_a_gpu_error(value: str) -> None:
-    with pytest.raises(gpus.GpuError, match="not a number"):
+    with pytest.raises(gpus.GpuError, match="no card rows"):
         gpus.list_gpus(garbage_smi(value))
 
 
 def test_a_short_row_is_a_gpu_error_not_a_crash() -> None:
-    with pytest.raises(gpus.GpuError, match="expected 2"):
+    with pytest.raises(gpus.GpuError, match="no card rows"):
         gpus.list_gpus(lambda args: "0\n")
 
 
@@ -111,33 +129,10 @@ def test_no_samples_for_real_gpus_is_an_error_not_zero_percent() -> None:
         gpus.mean_utilization(["GPU-x"], lambda args: "")
 
 
-def test_uuid_ownership_resolves_to_itself_without_asking_nvidia_smi() -> None:
-    """Every pod, and most boxes, own UUIDs: an exec per dispatch pass to look
-    up the identity mapping would be pure cost."""
-
-    def refuse(_args: list[str]) -> str:
-        raise AssertionError("nvidia-smi should not be run for UUID ownership")
-
-    assert gpus.resolve_owned(["GPU-a", "GPU-b"], refuse) == (["GPU-a", "GPU-b"], [])
-    assert gpus.resolve_owned([], refuse) == ([], [])
-
-
-def test_owned_indices_resolve_to_the_uuids_the_driver_reports_now() -> None:
-    smi = fake_smi(["GPU-zero", "GPU-one", "GPU-two"])
-    assert gpus.resolve_owned(["1", "2"], smi) == (["GPU-one", "GPU-two"], [])
-    # A mix, and the same card named twice, is still each card once.
-    assert gpus.resolve_owned(["0", "GPU-zero", "GPU-two"], smi) == (
-        ["GPU-zero", "GPU-two"],
-        [],
-    )
-
-
-def test_an_owned_entry_the_host_cannot_see_is_reported_unavailable() -> None:
-    """A renumbered shared box must cost the cards that moved, not the rest."""
-    smi = fake_smi(["GPU-zero", "GPU-one"])
-    assert gpus.resolve_owned(["0", "7", "GPU-gone"], smi) == (["GPU-zero"], ["7", "GPU-gone"])
-    assert gpus.index_uuids(smi) == {"0": "GPU-zero", "1": "GPU-one"}
-    assert "0=GPU-zero" in gpus.describe_table(smi)
+def test_a_renumbered_box_costs_the_cards_that_moved_not_the_rest() -> None:
+    table = gpus.parse_table("0, GPU-zero, , \n1, GPU-one, , \n")
+    cards = gpus.resolve(["0", "7", "GPU-gone"], table)
+    assert (cards.owned, cards.missing) == (["GPU-zero"], ["7", "GPU-gone"])
 
 
 # -- shared GPUs: is anybody else on this card? --------------------------------

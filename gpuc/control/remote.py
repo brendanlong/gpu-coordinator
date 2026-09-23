@@ -1,8 +1,14 @@
-"""One way to invoke the on-host package, shared by bootstrap, submit and status.
+"""One way to reach a host and one way to ask it something.
 
-Every remote invocation runs the interpreter discovered at bootstrap with
-``PYTHONPATH`` pointing at the rsynced package and ``GPUC_HOME`` pinned, so a
-host whose login shell has a different `python` on PATH still runs our code.
+A `HostSession` is a transport plus the three things every on-host command
+needs: the resolved gpuc home, an interpreter to run the package with, and
+the host's own `config.json`, read fresh when the session opens. Everything
+that decides something about a host reads `session.config`; the registry's
+cache is for listings.
+
+`ask` is the one answer to "can this host be asked, and what did it say":
+`Answered`, `Unaskable` with the reason, or `Gone`. Every command that talks
+to a host goes through it, so "could not ask" is spelled once.
 """
 
 from __future__ import annotations
@@ -14,14 +20,47 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from gpuc.control.config import HostEntry, Settings, transport_for
+from gpuc.control.config import (
+    ConfigError,
+    HostEntry,
+    Settings,
+    transport_for,
+    update_cache,
+)
+from gpuc.control.providers.base import Pod, Provider, ProviderError
 from gpuc.control.transport import DEFAULT_TIMEOUT_S, CommandResult, Transport, TransportError
 from gpuc.host import jobs
+from gpuc.host.jobs import HostConfig
+
+PYTHON_FLOOR = (3, 11)
+"""What the on-host package needs; bootstrap spells the same tuple for `uv`."""
 
 
 class RemoteError(RuntimeError):
     def __init__(self, host: str, command: str, detail: str) -> None:
         super().__init__(f"{detail}\n  host: {host}\n  command: {command}")
+
+
+def reason_of(exc: BaseException) -> str:
+    """One line saying why a host could not be asked.
+
+    The last non-empty line of the stderr the failed command carried, when
+    the error carries a `CommandResult` -- or is a `RemoteError` wrapping one,
+    whose own first line repeats the argv: that is where ssh puts `Connection
+    refused`, `Permission denied (publickey)` and `Host key verification
+    failed`, while the first line of a `TransportError` is the argv, which
+    names nothing. Otherwise the first line of the message: an error with
+    words of its own keeps them.
+    """
+    result = getattr(exc, "result", None)
+    if result is None and isinstance(exc, RemoteError):
+        result = getattr(exc.__cause__, "result", None)
+    if isinstance(result, CommandResult):
+        lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return lines[0] if lines else type(exc).__name__
 
 
 def env_prefix(env: Mapping[str, str] | None) -> str:
@@ -46,19 +85,151 @@ def host_command(python: str, home: str, args: str, env: Mapping[str, str] | Non
     return f"{host_python(python, home, env)} -m gpuc.host {args}"
 
 
+def config_file(home: str) -> str:
+    return f"{home}/config.json"
+
+
+NO_CONFIG = "__gpuc_no_config__"
+"""What the host says when it has no `config.json`, so that "there is none" is
+never confused with "it is there and did not parse" -- the second is a file
+somebody's host is running on, and replacing it would be the drift this whole
+model exists to stop. A marker rather than an exit code, because a host prints
+things around our output (a MOTD, a shell rc warning) that no parse can
+distinguish from a config that is simply broken."""
+
+
+@dataclass
+class HostConfigRead:
+    """One read of a host's `config.json`: the document, no file, or a reason.
+
+    Three answers because they lead three places. A document is what the host
+    is. No file is a host nobody has set up (or whose home was wiped), and the
+    one case anything may write a first config for. Unreadable -- there but
+    not JSON, or a transport that failed mid-read -- is a file the host may be
+    running on, and nothing here writes over it.
+    """
+
+    document: dict[str, Any] | None = None
+    unreadable: str | None = None
+
+    @property
+    def missing(self) -> bool:
+        return self.document is None and self.unreadable is None
+
+    @property
+    def config(self) -> HostConfig:
+        return HostConfig.from_dict(self.document or {})
+
+
+def read_config(
+    transport: Transport, home: str, *, timeout: float = DEFAULT_TIMEOUT_S
+) -> HostConfigRead:
+    """The host's own `config.json`, the one read every command works from."""
+    path = config_file(home)
+    command = f'if [ -f "{path}" ]; then cat "{path}"; else echo {NO_CONFIG}; fi'
+    try:
+        result = transport.run(command, timeout=timeout, check=False)
+    except TransportError as exc:
+        return HostConfigRead(unreadable=reason_of(exc))
+    if result.returncode != 0:
+        return HostConfigRead(
+            unreadable=f"`cat {path}` exited {result.returncode}: {_tail(result.output, 3)}"
+        )
+    # Parsed first: a config whose own values happen to hold the marker is
+    # still a config, and it is the one thing here that must not be mistaken
+    # for a host that has none.
+    document = parse_last_json(result.stdout)
+    if isinstance(document, dict):
+        return HostConfigRead(document)
+    if NO_CONFIG in result.stdout:
+        return HostConfigRead()
+    return HostConfigRead(unreadable=f"{path} is there but holds no JSON object")
+
+
+def write_config(
+    transport: Transport, home: str, patch: Mapping[str, Any], *, host: str
+) -> dict[str, Any]:
+    """Apply `patch` to the host's `config.json` and return what it now holds.
+
+    The client is the one writer of this file: read what is there, merge with
+    the same rule the host reads it by (`jobs.merged_config`), and replace by
+    rename -- never truncated in place, because a dispatcher may be reading
+    it. A config that could not be read is left alone, however small the
+    patch: a host is that file, and a write over one we cannot see is the
+    drift the whole model exists to stop.
+    """
+    read = read_config(transport, home)
+    if read.unreadable:
+        raise RemoteError(
+            host,
+            f'cat "{config_file(home)}"',
+            f"the host's own config could not be read, so it was left alone: {read.unreadable}\n"
+            f"Check that {config_file(home)} is readable and holds JSON; delete it to start "
+            f"that host again.",
+        )
+    document = jobs.merged_config(read.document or {}, patch)
+    put_config(transport, home, document)
+    return document
+
+
+def put_config(transport: Transport, home: str, document: Mapping[str, Any]) -> None:
+    """Replace `config.json` wholesale, by rename.
+
+    Creates gpuc home 0700 *if it is not there*: this runs before
+    `paths.ensure_layout` on a host being registered for the first time, and a
+    default-umask mkdir would leave the queue and every job dir readable by
+    every other user of a shared box. An existing directory keeps its mode, as
+    `ensure_persistent_root` does -- re-chmodding one is not ours to do.
+    """
+    tmp = f"{home}/.config.json.{os.getpid()}.tmp"
+    quoted = shlex.quote(tmp)
+    transport.run(
+        f'if [ ! -d "{home}" ]; then mkdir -p "{home}"; chmod 700 "{home}"; fi',
+        timeout=DEFAULT_TIMEOUT_S,
+        check=True,
+    )
+    transport.put_file(json.dumps(dict(document), indent=2, sort_keys=True) + "\n", tmp, 0o644)
+    try:
+        transport.run(
+            f"mv -f {quoted} {shlex.quote(config_file(home))}",
+            timeout=DEFAULT_TIMEOUT_S,
+            check=True,
+        )
+    except TransportError:
+        transport.run(f"rm -f {quoted}", timeout=DEFAULT_TIMEOUT_S, check=False)
+        raise
+
+
 @dataclass
 class HostSession:
     entry: HostEntry
     transport: Transport
     home: str
     python: str
+    config_read: HostConfigRead
+    """The host's `config.json` as read when this session opened, or why it
+    could not be. Refreshed by `write_config`, so what a session decides on
+    is always the host's own answer."""
+    record: bool = True
+    """Whether what this session reads and writes goes into the registry's
+    cache on the way past. Off for a poll: a dashboard never writes the
+    registry."""
+
+    @property
+    def config(self) -> HostConfig:
+        return self.config_read.config
 
     @property
     def env(self) -> dict[str, str]:
-        return self.entry.env
+        """The host's own job environment, prefixed to every command run here."""
+        return self.config.env
 
-    def read_config(self) -> dict[str, Any] | None:
-        return read_remote_config(self.transport, self.home)
+    def write_config(self, patch: Mapping[str, Any]) -> dict[str, Any]:
+        document = write_config(self.transport, self.home, patch, host=self.entry.name)
+        self.config_read = HostConfigRead(document)
+        if self.record:
+            update_cache(self.entry.name, config=document)
+        return document
 
     def job_dir(self, job_id: str) -> str:
         return f"{self.home}/jobs/{job_id}"
@@ -83,7 +254,7 @@ class HostSession:
                 f"`python -m gpuc.host {args}` exited {result.returncode}\n"
                 f"{_tail(result.output)}\n"
                 f"If the package is missing, run: gpuc host bootstrap {self.entry.name}",
-            )
+            ) from TransportError(result)
         return result
 
     def host_json(
@@ -146,147 +317,6 @@ def _tail(text: str, lines: int = 10) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
-def config_file(home: str) -> str:
-    return f"{home}/config.json"
-
-
-NO_CONFIG = "__gpuc_no_config__"
-"""What the host says when it has no `config.json`, so that "there is none" is
-never confused with "it is there and did not parse" -- the second is a file
-somebody's host is running on, and replacing it would be the drift this whole
-model exists to stop. A marker rather than an exit code, because a host prints
-things around our output (a MOTD, a shell rc warning) that no parse can
-distinguish from a config that is simply broken."""
-
-
-def read_remote_config(
-    transport: Transport, home: str, *, timeout: float = DEFAULT_TIMEOUT_S
-) -> dict[str, Any] | None:
-    """The host's own `config.json`; ``{}`` if it has none, ``None`` if we
-    could not read it.
-
-    This file is the only copy of what the host *is* -- its cards, its mirror,
-    its env, its timers -- so everything that acts on a host reads it here
-    rather than trusting the registry's cache of it, and nothing writes over a
-    `None`: a host that could not be asked, or one whose config is there but
-    unreadable, is not a host with no config.
-    """
-    path = config_file(home)
-    try:
-        result = transport.run(
-            f'if [ -f "{path}" ]; then cat "{path}"; else echo {NO_CONFIG}; fi',
-            timeout=timeout,
-            check=False,
-        )
-    except TransportError:
-        return None
-    if result.returncode != 0:
-        return None
-    # Parsed first: a config whose own values happen to hold the marker is
-    # still a config, and it is the one thing here that must not be mistaken
-    # for a host that has none.
-    document = parse_last_json(result.stdout)
-    if isinstance(document, dict):
-        return document
-    return {} if NO_CONFIG in result.stdout else None
-
-
-def write_remote_config(
-    transport: Transport,
-    home: str,
-    patch: Mapping[str, Any],
-    *,
-    python: str | None = None,
-    env: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
-    """Apply `patch` to the host's `config.json` and return what it now holds.
-
-    Through the host's own CLI wherever the package is there: the merge then
-    happens on the host, in one atomic write, by the same code the dispatcher
-    reads the file with. A host that has not been bootstrapped yet has no
-    package to run, so the same merge is done here and the file replaced by
-    rename -- never truncated in place, because a dispatcher may be reading it.
-
-    The patch travels as a file rather than as an argument: `env` may hold a
-    token, and argv is readable by every other user of a shared box.
-    """
-    body = json.dumps(dict(patch), indent=2, sort_keys=True) + "\n"
-    if python:
-        try:
-            return _merge_on_host(transport, home, body, python, env)
-        except (RemoteError, TransportError):
-            # The package is not where the registry says it is (a wiped $HOME,
-            # a gpuc home that moved), or it is a build old enough not to have
-            # this subcommand. The host still owns its config either way, and
-            # the same merge below is what its own CLI would have done.
-            pass
-    existing = read_remote_config(transport, home)
-    if existing is None:
-        raise RemoteError(
-            transport.host,
-            f'cat "{config_file(home)}"',
-            f"the host's own config could not be read, so it was left alone.\n"
-            f"Check that {config_file(home)} is readable and holds JSON; delete it to start "
-            f"that host again.",
-        )
-    document = jobs.merged_config(existing, patch)
-    put_remote_config(transport, home, document)
-    return document
-
-
-def _merge_on_host(
-    transport: Transport,
-    home: str,
-    body: str,
-    python: str,
-    env: Mapping[str, str] | None,
-) -> dict[str, Any]:
-    remote = f"{home}/.config-patch.{os.getpid()}.json"
-    transport.put_file(body, remote, 0o600)
-    command = host_command(python, home, f"config --merge {shlex.quote(remote)}", env)
-    try:
-        result = transport.run(command, timeout=DEFAULT_TIMEOUT_S, check=False)
-    finally:
-        transport.run(f"rm -f {shlex.quote(remote)}", timeout=DEFAULT_TIMEOUT_S, check=False)
-    document = parse_last_json(result.stdout)
-    if result.returncode != 0 or not isinstance(document, dict):
-        raise RemoteError(
-            transport.host,
-            command,
-            f"`python -m gpuc.host config --merge` exited {result.returncode} and printed no "
-            f"config:\n{_tail(result.output)}",
-        )
-    return document
-
-
-def put_remote_config(transport: Transport, home: str, document: Mapping[str, Any]) -> None:
-    """Replace `config.json` wholesale on a host with no package to run.
-
-    Creates gpuc home 0700 *if it is not there*: this runs before
-    `paths.ensure_layout` on a host being registered for the first time, and a
-    default-umask mkdir would leave the queue and every job dir readable by
-    every other user of a shared box. An existing directory keeps its mode, as
-    `ensure_persistent_root` does -- re-chmodding one is not ours to do.
-    """
-    tmp = f"{home}/.config.json.{os.getpid()}.tmp"
-    quoted = shlex.quote(tmp)
-    transport.run(
-        f'if [ ! -d "{home}" ]; then mkdir -p "{home}"; chmod 700 "{home}"; fi',
-        timeout=DEFAULT_TIMEOUT_S,
-        check=True,
-    )
-    transport.put_file(json.dumps(dict(document), indent=2, sort_keys=True) + "\n", tmp, 0o644)
-    try:
-        transport.run(
-            f"mv -f {quoted} {shlex.quote(config_file(home))}",
-            timeout=DEFAULT_TIMEOUT_S,
-            check=True,
-        )
-    except TransportError:
-        transport.run(f"rm -f {quoted}", timeout=DEFAULT_TIMEOUT_S, check=False)
-        raise
-
-
 def resolve_home(
     transport: Transport, entry: HostEntry, *, timeout: float = DEFAULT_TIMEOUT_S
 ) -> str:
@@ -309,15 +339,194 @@ def resolve_home(
     return home.rstrip("/")
 
 
+_SAY_VERSION = "-c 'import sys; print(sys.executable, sys.version.split()[0])'"
+PYTHON_PROBE = (
+    'if [ -x "$HOME/.local/bin/uv" ]; then p=$(cd "$HOME" && '
+    'env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT "$HOME/.local/bin/uv" python find '
+    f"--no-project '>={PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}' 2>/dev/null); "
+    f'[ -n "$p" ] && "$p" {_SAY_VERSION}; fi; '
+    f"if command -v python3 >/dev/null 2>&1; then python3 {_SAY_VERSION}; fi"
+)
+"""An interpreter that can run the on-host package: the one uv manages for
+this user if there is one, else the system `python3`, each as `path version`
+for `usable_python` to judge. The same question `gpuc host probe` asks,
+without the rest of the probe."""
+
+
+def usable_python(text: str) -> str | None:
+    """The first `path version` line in `text` whose version can run the package.
+
+    The version is judged here rather than trusted: a `python3` that is 3.8 is
+    the commonest thing on an old box, and the package would import and then
+    fail on the first `match`.
+    """
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].startswith("/"):
+            continue
+        try:
+            version = tuple(int(piece) for piece in parts[1].split(".")[:2])
+        except ValueError:
+            continue
+        if version >= PYTHON_FLOOR:
+            return parts[0]
+    return None
+
+
+def probe_python(transport: Transport, *, timeout: float = DEFAULT_TIMEOUT_S) -> str | None:
+    result = transport.run(PYTHON_PROBE, timeout=timeout, check=False)
+    return usable_python(result.stdout)
+
+
 def open_session(
-    entry: HostEntry, settings: Settings | None = None, transport: Transport | None = None
+    entry: HostEntry,
+    settings: Settings | None = None,
+    transport: Transport | None = None,
+    *,
+    record: bool = True,
 ) -> HostSession:
+    """Open a host: resolve its home, read its config, find an interpreter.
+
+    The interpreter is the cached one where a bootstrap or probe left one,
+    else the host is asked (`PYTHON_PROBE`): a host somebody else bootstrapped
+    answers `status` and `host set` from here the moment it is registered.
+    What was read is recorded in the registry's cache on the way past
+    (`record`), so the offline listings say what the host said a moment ago;
+    a poll that runs every few seconds passes `record=False`, because a
+    dashboard must never write the registry.
+    """
     transport = transport or transport_for(entry, settings)
-    if not entry.python:
+    home = resolve_home(transport, entry)
+    config_read = read_config(transport, home)
+    python = entry.python or probe_python(transport)
+    if python is None:
         raise RemoteError(
             entry.name,
             "open_session",
-            f"host {entry.name!r} has no bootstrapped interpreter recorded.\n"
-            f"Run: gpuc host bootstrap {entry.name}",
+            f"host {entry.name!r} has no Python >= {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]} to run "
+            f"the package with.\nRun: gpuc host bootstrap {entry.name}",
         )
-    return HostSession(entry, transport, resolve_home(transport, entry), entry.python)
+    if record and (config_read.document is not None or python != entry.python):
+        update_cache(
+            entry.name,
+            config=config_read.document,
+            python=None if python == entry.python else python,
+        )
+    return HostSession(entry, transport, home, python, config_read, record)
+
+
+@dataclass
+class Answered:
+    """The host was reached; `payload` is what it printed for `verb`, or None
+    when no verb was asked. `pod` is the provider's view of a rental's pod,
+    and `pod_error` why the provider could not be asked -- an answer with one
+    of those is still an answer, and still a failure to report."""
+
+    session: HostSession
+    payload: dict[str, Any] | None = None
+    pod: Pod | None = None
+    pod_error: str | None = None
+
+
+@dataclass
+class Unaskable:
+    """The host could not be asked, and may still hold whatever it holds.
+
+    One state for every way that happens -- ssh failed, the provider still
+    has the pod and nothing can run on it, the provider could not be read, a
+    registry entry this build would not validate -- because every consumer
+    does the same thing with all of them: report the reason and infer
+    nothing. The mirror is never the answer for a host in this state. The
+    reason says what to do next; `pod` is what the provider said, for
+    `status` to print.
+    """
+
+    reason: str
+    pod: Pod | None = None
+
+
+@dataclass
+class Gone:
+    """The host does not exist any more: the provider reports its pod
+    terminated or missing, or the index names a host this machine has no
+    entry for. The state every rental reaches, not a failure: the mirror is
+    the answer, and the caller that commands share forgets the entry."""
+
+    reason: str
+    pod: Pod | None = None
+
+
+Asked = Answered | Unaskable | Gone
+"""What asking a host produces. Exactly one of three, decided once."""
+
+
+def rental_state(
+    entry: HostEntry, provider: Provider | None
+) -> Unaskable | Gone | tuple[Pod | None, str | None]:
+    """The provider's word on a rental's pod, before any ssh is tried.
+
+    A pod the provider reports gone or dead is never dialled: the ssh would
+    hang and then print a stack about a refused connection, which tells nobody
+    anything. A dead pod is `Unaskable` with the provider's status and the
+    two commands that end or forget it, since the provider still bills for
+    it. Otherwise the pod (or None for a host that is not rented) and why the
+    provider could not be asked, which rides along as a failure rather than
+    stopping the host being asked.
+    """
+    if provider is None or entry.rental is None:
+        return None, None
+    pod_id = entry.rental.pod_id
+    try:
+        pod = provider.get(pod_id)
+    except ProviderError as exc:
+        return None, f"could not read pod {pod_id}: {exc}"
+    if pod is None:
+        return Gone(f"pod {pod_id} no longer exists; this rental has ended")
+    if provider.is_gone(pod):
+        return Gone(f"pod {pod_id} is {pod.status}; this rental has ended", pod)
+    if provider.is_dead(pod):
+        return Unaskable(
+            f"pod {pod_id} is {pod.status}; `gpuc host terminate {entry.name}` ends it, "
+            f"`gpuc host remove {entry.name}` forgets it",
+            pod,
+        )
+    return pod, None
+
+
+def ask(
+    entry: HostEntry,
+    verb: str | None,
+    settings: Settings | None = None,
+    *,
+    provider: Provider | None = None,
+    session: HostSession | None = None,
+    timeout: float = 60.0,
+    check: bool = True,
+    record: bool = False,
+) -> Asked:
+    """Ask a host `verb` (an on-host subcommand, or None for the session alone).
+
+    A rental is looked up at its provider first, when one is given
+    (`rental_state`). `check=False` for a verb whose refusal *is* the document
+    -- a cancel of a finished job -- so the host's reason survives the exit
+    code. An ssh that fails is `Unaskable` with what ssh said and, after it,
+    the provider's complaint if it had one: neither is hidden.
+    """
+    state = rental_state(entry, provider)
+    if isinstance(state, (Unaskable, Gone)):
+        return state
+    pod, pod_error = state
+    try:
+        session = session or open_session(entry, settings, record=record)
+        payload = session.host_json(verb, timeout=timeout, check=check) if verb else None
+    except (RemoteError, TransportError, ConfigError, OSError) as exc:
+        return Unaskable(_with_pod_error(reason_of(exc), pod_error), pod)
+    if verb is not None and not isinstance(payload, dict):
+        kind = type(payload).__name__
+        why = f"host {entry.name} answered `{verb}` with {kind}, not a JSON object"
+        return Unaskable(_with_pod_error(why, pod_error), pod)
+    return Answered(session, payload, pod, pod_error)
+
+
+def _with_pod_error(why: str, pod_error: str | None) -> str:
+    return f"{why}; {pod_error}" if pod_error else why

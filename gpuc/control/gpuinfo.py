@@ -3,9 +3,13 @@
 The registry stores what the user typed -- a UUID, which is exactly right for
 assignment and useless to read, or an nvidia-smi index, which is readable and
 only means anything against a particular boot's numbering. Neither says whether
-those are A40s or 3060 Tis, so this is filled in by bootstrap and `gpuc host
-probe` and tolerated absent everywhere (an old registry, a host with no
+those are A40s or 3060 Tis, so this is filled in by `gpuc host add` and `gpuc
+host probe` and tolerated absent everywhere (an old registry, a host with no
 nvidia-smi, a pod that has not booted yet).
+
+The rows come from the host's own parser (`gpus.parse_table`) and are resolved
+offline by the host's own rule (`gpus.resolve`) over a table rebuilt from the
+cache: the same two functions the dispatcher uses live.
 """
 
 from __future__ import annotations
@@ -14,9 +18,8 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel
 
-from gpuc.control.transport import Transport
+from gpuc.host import gpus
 
-SMI_QUERY = "nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv,noheader,nounits"
 MIB_PER_GB = 1024.0
 
 
@@ -42,53 +45,31 @@ def vram_text(vram_mib: int | None) -> str:
     return f"{round(vram_mib / MIB_PER_GB):g} GB"
 
 
-def parse_smi(text: str) -> dict[str, GpuInfo]:
-    """`[index,] uuid, name, memory` rows, with or without a `MiB` unit suffix.
-
-    The leading index is optional: `gpuc host probe` runs its own query and
-    hands the rows here, and a registry written before indices were recorded
-    has none.
-    """
-    found: dict[str, GpuInfo] = {}
-    for line in text.splitlines():
-        cells = [cell.strip() for cell in line.split(",")]
-        index: int | None = None
-        if cells and cells[0].isdigit():
-            index, cells = int(cells[0]), cells[1:]
-        if len(cells) < 2 or not cells[0].startswith("GPU-"):
-            continue
-        memory = cells[2].split()[0] if len(cells) > 2 and cells[2] else ""
-        found[cells[0]] = GpuInfo(
-            name=cells[1],
-            vram_mib=int(float(memory)) if memory.replace(".", "", 1).isdigit() else None,
-            index=index,
-        )
-    return found
+def from_table(table: Sequence[gpus.Gpu]) -> dict[str, GpuInfo]:
+    """The rows as the registry stores them, keyed by UUID."""
+    return {
+        gpu.uuid: GpuInfo(name=gpu.name, vram_mib=gpu.memory_mib, index=gpu.index) for gpu in table
+    }
 
 
-def discover(transport: Transport) -> dict[str, GpuInfo]:
-    """Never raises: a host with no driver simply has nothing to say about it."""
-    try:
-        result = transport.run(f"{SMI_QUERY} 2>/dev/null", check=False)
-    except Exception:
-        return {}
-    return parse_smi(result.stdout) if result.returncode == 0 else {}
+def table_of(info: Mapping[str, GpuInfo]) -> list[gpus.Gpu]:
+    """The cache as the table `gpus.resolve` reads, for an offline answer."""
+    return [gpus.Gpu(entry.index, uuid, entry.name, entry.vram_mib) for uuid, entry in info.items()]
 
 
 def uuid_of(owned: str, info: Mapping[str, GpuInfo]) -> str | None:
     """The UUID an owned entry names, as far as the recorded info can tell.
 
-    A UUID is itself; an index is whichever recorded card carried that index
-    when the host was last probed. Offline and best-effort on purpose -- the
-    authority on today's numbering is the host, and it answers `status`.
+    Offline and best-effort on purpose: the cache can say what a card *is*,
+    never whether it is there, and presence is the host's answer (`status`,
+    the health check, the dispatcher's pass -- all `gpus.resolve` over a live
+    table). So a UUID names itself here whether or not the cache knows it,
+    and only an index is looked up, through the same rule.
     """
     if not owned.isdigit():
         return owned
-    index = int(owned)
-    for uuid, entry in info.items():
-        if entry.index == index:
-            return uuid
-    return None
+    resolved = gpus.resolve([owned], table_of(info)).owned
+    return resolved[0] if resolved else None
 
 
 def summarize(owned: Sequence[str], info: Mapping[str, GpuInfo]) -> str:
@@ -108,8 +89,8 @@ def rows(
     """`(index, name, vram, uuid)` per owned card, in the host's own order.
 
     `indices` is the host's *current* numbering when a caller has it (`gpuc
-    status` asks the host); without it the index recorded at bootstrap is shown,
-    and `?` when even that is unknown.
+    status` asks the host); without it the index recorded at the last probe is
+    shown, and `?` when even that is unknown.
     """
     out: list[tuple[str, str, str, str]] = []
     for item in owned:

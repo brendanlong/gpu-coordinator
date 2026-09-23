@@ -1,24 +1,35 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from gpuc.control.config import HostCache, HostEntry, HostKind, registry_transaction
+from gpuc.control.config import (
+    HostCache,
+    HostEntry,
+    HostKind,
+    Registry,
+    Rental,
+    open_registry,
+    registry_transaction,
+)
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.host import jobs, paths, scope
-from gpuc.host.jobs import HostConfig, JobSpec
+from gpuc.host import jobs, paths, queue, scope
+from gpuc.host.jobs import HostConfig, JobSpec, JobState
+from tests import fake_nvidia_smi
 
 pytest_plugins = ["tests.fakehost"]
-"""`fake_host`: the in-memory host `gpuc host add|set` talk to in these tests."""
+"""`fake_host`: a host in a temporary home that `gpuc host add|set` and the
+provisioning flow really talk to."""
 
 FAKE_GPUS = [
     "GPU-00000000-0000-0000-0000-000000000001",
@@ -81,9 +92,11 @@ def host_entry(
     if cache_dir:
         config["env"] = {**(config.get("env") or {}), "UV_CACHE_DIR": cache_dir}
     document: dict[str, Any] = {"host": name, **config}
-    if kind == "runpod":
+    rental: Rental | None = None
+    if kind == "rental" or pod_id is not None:
         # A rental is an address with a pod behind it; `kind` alone is not one.
         pod_id = pod_id or f"pod-{name}"
+        rental = Rental(provider="runpod", pod_id=pod_id)
         document.setdefault("provider", {"kind": "runpod", "pod_id": pod_id})
     return HostEntry(
         name=name,
@@ -91,7 +104,7 @@ def host_entry(
         port=port,
         gpuc_home=gpuc_home,
         persistent_root=persistent_root,
-        pod_id=pod_id,
+        rental=rental,
         bootstrapped_at=bootstrapped_at,
         cache=HostCache(
             read_at=read_at,
@@ -102,6 +115,11 @@ def host_entry(
             config=HostConfig.from_dict(document).to_dict(),
         ),
     )
+
+
+def load_registry() -> Registry:
+    """The registry as a command would read it, for a test's assertions."""
+    return open_registry().registry
 
 
 def register_host(*, gpus: str | list[str] | None = None, **fields: Any) -> HostEntry:
@@ -123,6 +141,16 @@ def _gpus(gpus: str | list[str] | None) -> list[str]:
     return list(gpus or [])
 
 
+def accept_job(spec: JobSpec, **state: Any) -> str:
+    """A job on the host, accepted the way `gpuc submit` gets one accepted
+    (`queue.enqueue`: spec and initial state written under `incoming/`, then
+    the rename), then in whatever state the test needs."""
+    job_id = queue.enqueue(spec)
+    if state:
+        jobs.write_state(job_id, JobState(**state))
+    return job_id
+
+
 def make_spec(**overrides: object) -> JobSpec:
     document: dict[str, object] = {
         "job_id": jobs.new_job_id(),
@@ -134,50 +162,21 @@ def make_spec(**overrides: object) -> JobSpec:
     return JobSpec.from_dict(document)
 
 
-FAKE_SMI_SCRIPT = """\
-import sys
-
-UUIDS = {uuids!r}
-VALUES = {{"name": "Fake A40", "memory.total": "46068", "memory.used": "0",
-          "utilization.gpu": "0", "driver_version": "580.173.02"}}
-UNITS = {{"memory.total": " MiB", "memory.used": " MiB", "utilization.gpu": " %"}}
-
-args = sys.argv[1:]
-query = next((a for a in args if a.startswith("--query-gpu=")), None)
-if query is None:
-    sys.exit("fake nvidia-smi: only --query-gpu is supported")
-fields = query.split("=", 1)[1].split(",")
-fmt = next((a for a in args if a.startswith("--format=")), "--format=csv")
-nounits = "nounits" in fmt
-wanted = args[args.index("-i") + 1].split(",") if "-i" in args else UUIDS
-for index, uuid in enumerate(UUIDS):
-    if uuid not in wanted:
-        continue
-    cells = []
-    for field in fields:
-        if field == "index":
-            cells.append(str(index))
-        elif field == "uuid":
-            cells.append(uuid)
-        else:
-            cells.append(VALUES.get(field, "") + ("" if nounits else UNITS.get(field, "")))
-    print(", ".join(cells))
-"""
-
-
 def install_fake_nvidia_smi(bin_dir: Path, uuids: list[str] | None = None) -> None:
     """Put an `nvidia-smi` for `uuids` (default `FAKE_GPUS`) in `bin_dir`.
 
-    For the tests that run the real dispatcher and runner as subprocesses on a
-    machine with no card: those find nvidia-smi on PATH, so `fake_smi` cannot
-    reach them. It answers the `--query-gpu` queries gpus.py makes and nothing
-    else.
+    For everything that execs the real binary: the dispatcher and runner as
+    subprocesses, the probe script, the health check. It runs
+    `tests/fake_nvidia_smi.py`, the same rows `fake_smi` answers in-process.
     """
     bin_dir.mkdir(parents=True, exist_ok=True)
-    script = bin_dir / "fake-nvidia-smi.py"
-    script.write_text(FAKE_SMI_SCRIPT.format(uuids=list(FAKE_GPUS if uuids is None else uuids)))
     wrapper = bin_dir / "nvidia-smi"
-    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+    script = Path(__file__).with_name("fake_nvidia_smi.py")
+    listed = ",".join(FAKE_GPUS if uuids is None else uuids)
+    wrapper.write_text(
+        f"#!/bin/sh\n{fake_nvidia_smi.UUIDS_ENV}={shlex.quote(listed)} "
+        f'exec "{sys.executable}" "{script}" "$@"\n'
+    )
     wrapper.chmod(0o755)
 
 
@@ -232,47 +231,13 @@ def fake_smi(
     uuids: list[str] | None = None,
     utilization: dict[str, float] | None = None,
     memory_used: dict[str, float] | None = None,
-):
-    """A stand-in for `nvidia-smi` that answers the queries gpus.py makes.
-
-    `--format=` is honoured rather than assumed: real nvidia-smi prints a header
-    row unless `noheader` is asked for, and a caller that forgets it gets a
-    field-name line where it expected data. A fake that never emits one would
-    hide exactly that bug.
-    """
+) -> Callable[[list[str]], str]:
+    """A stand-in for `nvidia-smi` for code that takes an injectable `smi`:
+    `fake_nvidia_smi.render` over `uuids` (default `FAKE_GPUS`)."""
     listed = FAKE_GPUS if uuids is None else uuids
 
     def run(args: list[str]) -> str:
-        query = next(a for a in args if a.startswith("--query-gpu="))
-        fields = query.split("=", 1)[1].split(",")
-        fmt = next((a for a in args if a.startswith("--format=")), "--format=csv")
-        options = fmt.split("=", 1)[1].split(",")
-        selected = listed
-        if "-i" in args:
-            wanted = args[args.index("-i") + 1].split(",")
-            selected = [u for u in listed if u in wanted]
-        rows: list[str] = []
-        for index, uuid in enumerate(listed):
-            if uuid not in selected:
-                continue
-            cells: list[str] = []
-            for field in fields:
-                if field == "index":
-                    cells.append(str(index))
-                elif field == "uuid":
-                    cells.append(uuid)
-                elif field == "driver_version":
-                    cells.append("580.173.02")
-                elif field == "utilization.gpu":
-                    cells.append(str((utilization or {}).get(uuid, 0.0)))
-                elif field == "memory.used":
-                    cells.append(str((memory_used or {}).get(uuid, 0.0)))
-                else:
-                    cells.append("")
-            rows.append(", ".join(cells))
-        if "noheader" not in options:
-            rows.insert(0, ", ".join(fields))
-        return "\n".join(rows) + "\n"
+        return fake_nvidia_smi.render(args, listed, utilization, memory_used)
 
     return run
 

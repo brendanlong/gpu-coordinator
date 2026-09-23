@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -15,6 +16,9 @@ PodStatus = Literal["PROVISIONING", "STARTING", "RUNNING", "EXITED", "ERROR", "T
 
 DEFAULT_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 DEFAULT_PREFIX = "gpuc-"
+DEFAULT_CUDA_MIN = "12.8"
+"""The CUDA floor a request carries unless `--cuda-min` says otherwise: the
+one default, so the catalog query and the create ask for the same thing."""
 
 
 def cuda_key(version: str) -> tuple[int, ...]:
@@ -31,7 +35,7 @@ class Constraints(BaseModel):
     min_vram_gb: int | None = None
     max_price_usd_hr: float | None = None
     clouds: list[Cloud] = Field(default_factory=lambda: ["SECURE"])
-    cuda_min: str | None = None
+    cuda_min: str = DEFAULT_CUDA_MIN
     gpu_count: int = 1
 
 
@@ -88,17 +92,31 @@ def owned_pods(pods: list[Pod], prefix: str = DEFAULT_PREFIX) -> list[Pod]:
 class Provider(ABC):
     """One rental provider. Everything the control side needs to know about a
     provider's vocabulary lives on the instance, so the provisioning and
-    teardown flows are written once and read it from here."""
+    teardown flows are written once and read it from here.
 
+    The defaults below are RunPod's, which every provider so far shares; a
+    provider with another vocabulary overrides them, and nothing outside
+    `providers/` names a status.
+    """
+
+    name: str
+    """What a registry entry's `rental.provider` calls this provider, and
+    the key `actions.PROVIDERS` builds it from again."""
     prefix: str
-    dead_statuses: tuple[str, ...] = ()
+    dead_statuses: tuple[str, ...] = ("EXITED", "ERROR", "TERMINATED")
     """Pod statuses nothing can run on. A pod in one is a failed host."""
-    gone_statuses: tuple[str, ...] = ()
+    gone_statuses: tuple[str, ...] = ("TERMINATED",)
     """Statuses that mean the rental has ended: forget the pod, never terminate it."""
-    broken_host: re.Pattern[str] | None = None
+    running_statuses: tuple[str, ...] = ("RUNNING",)
+    """Statuses under which the pod can be dialled and a job enqueued."""
+    broken_host: re.Pattern[str] = re.compile(
+        r"card[0-9]|device nodes|OCI runtime|runc create|failed to create shim", re.IGNORECASE
+    )
     """Log signatures of a host whose GPU device nodes are broken: re-place, never retry."""
     terminate_attempts: int = 3
     terminate_retry_s: float = 5.0
+    confirm_polls: int = 60
+    confirm_poll_s: float = 5.0
 
     def is_dead(self, pod: Pod | None) -> bool:
         return pod is None or pod.status in self.dead_statuses
@@ -106,8 +124,61 @@ class Provider(ABC):
     def is_gone(self, pod: Pod | None) -> bool:
         return pod is None or pod.status in self.gone_statuses
 
+    def is_running(self, pod: Pod | None) -> bool:
+        return pod is not None and pod.status in self.running_statuses
+
     def list_ours(self) -> list[Pod]:
         return owned_pods(self.list(), self.prefix)
+
+    def terminate_confirmed(
+        self,
+        pod_id: str,
+        *,
+        report: Callable[[str], None],
+        sleep: Callable[[float], None],
+    ) -> None:
+        """End `pod_id` and return only once the provider says it is gone.
+
+        The one place a terminate is retried, for the provisioning failure
+        path and `gpuc host terminate` alike: a 5xx or a rate limit on the
+        call that stops the bill is the worst place to give up after one try,
+        and once the caller has moved on nothing tries again. `terminate`
+        itself is the bare API call; a pod the provider no longer has counts
+        as ended. Raises `ProviderError` when the pod could not be confirmed
+        gone, so the caller can say it is still billing.
+        """
+        for attempt in range(1, self.terminate_attempts + 1):
+            try:
+                self.terminate(pod_id)
+                break
+            except ProviderError as exc:
+                if attempt == self.terminate_attempts:
+                    raise ProviderError(
+                        f"could not terminate pod {pod_id} in {attempt} attempts: {exc}"
+                    ) from exc
+                report(
+                    f"terminate {pod_id} failed ({exc}); retrying in {self.terminate_retry_s:g}s"
+                )
+                sleep(self.terminate_retry_s)
+        status = "unread"
+        for _ in range(self.confirm_polls):
+            try:
+                pod = self.get(pod_id)
+            except ProviderError as exc:
+                # The terminate went through; one 5xx on the read must not
+                # turn that into "could not confirm, still billing".
+                report(f"could not read pod {pod_id} after the terminate ({exc}); asking again")
+                sleep(self.confirm_poll_s)
+                continue
+            if self.is_gone(pod):
+                return
+            assert pod is not None
+            status = pod.status
+            sleep(self.confirm_poll_s)
+        raise ProviderError(
+            f"pod {pod_id} still {status} {self.confirm_polls * self.confirm_poll_s:.0f}s "
+            f"after terminate"
+        )
 
     @abstractmethod
     def offers(self, constraints: Constraints) -> list[Offer]: ...
@@ -121,7 +192,7 @@ class Provider(ABC):
         image: str = DEFAULT_IMAGE,
         disk_gb: int = 20,
         env: dict[str, str] | None = None,
-        cuda_min: str | None = None,
+        cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod: ...
 
@@ -132,7 +203,8 @@ class Provider(ABC):
     def logs(self, pod_id: str, tail: int = 100) -> str: ...
 
     @abstractmethod
-    def terminate(self, pod_id: str) -> None: ...
+    def terminate(self, pod_id: str) -> None:
+        """The bare terminate call, once. `terminate_confirmed` is what callers use."""
 
     @abstractmethod
     def list(self) -> list[Pod]: ...

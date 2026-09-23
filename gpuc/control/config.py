@@ -11,25 +11,26 @@ import fcntl
 import json
 import os
 import shutil
-import sys
 import time
 import tomllib
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, computed_field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from gpuc.control.gpuinfo import GpuInfo
+from gpuc.control.gpuinfo import GpuInfo, table_of
+from gpuc.control.jsonout import warn
 from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX
 from gpuc.control.tolerant import TolerantModel
 from gpuc.control.transport import Transport, make_transport
+from gpuc.host import gpus
+from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
-HostKind = Literal["local", "ssh", "runpod"]
+HostKind = Literal["local", "ssh", "rental"]
 
 DEFAULT_DISK_GB = 50
 
@@ -82,7 +83,7 @@ def known_hosts_file() -> Path:
 
 
 def pod_known_hosts_file(name: str) -> Path:
-    """One known_hosts per ephemeral host.
+    """One known_hosts per rental.
 
     RunPod recycles ``host:port`` between pods, so a shared file plus
     StrictHostKeyChecking=accept-new wedges the *second* pod to land on a
@@ -121,6 +122,13 @@ class Settings(TolerantModel):
     @property
     def ssh_key_path(self) -> str | None:
         return str(Path(self.ssh_key).expanduser()) if self.ssh_key else None
+
+
+def default_s3_prefix(settings: Settings, host: str) -> str | None:
+    """Where a host mirrors its jobs unless its config names somewhere else."""
+    if not settings.s3_bucket:
+        return None
+    return f"s3://{settings.s3_bucket}/gpuc/{host}"
 
 
 CONFIG_TEMPLATE = f"""\
@@ -180,7 +188,8 @@ class HostCache(TolerantModel):
     commands that ask nothing (`gpuc host list`, `gpuc version`) still have
     something to print -- labelled "last seen", because that is what it is.
     Nothing that decides anything reads it: a command that acts on a host
-    (submit, bootstrap, set) asks the host, and refreshes this on the way past.
+    opens a session, which reads the host's own `config.json` first and
+    refreshes this on the way past.
     """
 
     read_at: str | None = None
@@ -201,14 +210,25 @@ class HostCache(TolerantModel):
     """
 
 
+class Rental(TolerantModel):
+    """The pod behind an address: which provider is billing for it, and as what.
+
+    The one spelling of "this host is rented": `kind` and `pod_id` are read
+    off it, and "is this a rental" is `rental is not None`.
+    """
+
+    provider: str = "runpod"
+    pod_id: str = ""
+
+
 class HostEntry(TolerantModel):
     """How to reach one host, plus what this machine last saw on it.
 
     Two kinds of thing, and only two:
 
     - the **address** -- `ssh`, `port`, `gpuc_home` / `persistent_root`,
-      `pod_id` -- hand-entered, local to this machine, and saying nothing about
-      how the host behaves;
+      `rental` -- hand-entered, local to this machine, and saying nothing
+      about how the host behaves;
     - the **cache**, a copy of what the host said the last time we asked.
 
     What the host *is* -- its cards, its mirror, its env, its timers -- lives in
@@ -223,11 +243,30 @@ class HostEntry(TolerantModel):
     port: int = 22
     gpuc_home: str | None = None
     persistent_root: str | None = None
-    pod_id: str | None = None
+    rental: Rental | None = None
     bootstrapped_at: str | None = None
     """When *this* machine last bootstrapped the host. Another machine's
-    bootstrap is invisible here, which is why nothing decides on it."""
+    bootstrap is invisible here, which is why nothing decides on it: it is a
+    label on `gpuc host list` and nothing more."""
     cache: HostCache = Field(default_factory=HostCache)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_an_earlier_builds_rental(cls, data: Any) -> Any:
+        """An entry with a top-level `pod_id` and no `rental` was written by
+        a build that spelled a rental that way. Read tolerantly it would be
+        an ssh host -- never terminated, never reused, never forgotten when
+        its pod ends -- so it is refused instead, and the registry's usual
+        rule for an entry that does not validate (skip it, warn, exit 1)
+        prints the way back.
+        """
+        if isinstance(data, dict) and data.get("pod_id") and data.get("rental") is None:
+            document: dict[Any, Any] = data
+            raise ValueError(
+                f"a rental registered by an earlier build (pod {document['pod_id']}); "
+                f"run `gpuc host add <name> --pod {document['pod_id']}` again"
+            )
+        return data
 
     # -- the address ---------------------------------------------------------
 
@@ -255,28 +294,24 @@ class HostEntry(TolerantModel):
         root = self.root
         return f"{root}/gpuc" if root else "$HOME/.gpuc"
 
-    @computed_field  # still written: a build that reads `kind` routes by it
     @property
     def kind(self) -> HostKind:
-        """What the address says: a pod id makes a rental, an ssh target a
-        remote box, neither this machine. Derived, so it cannot disagree, and
-        written to the registry all the same because the build before this
-        one reads it -- and defaults a missing one to `local`, which would
-        send every command for an ssh or rented host to this machine."""
-        if self.pod_id is not None:
-            return "runpod"
+        """What the address says: a rental has a pod behind it, an ssh target
+        is a remote box, neither is this machine. Derived, never stored, so it
+        cannot disagree with the address."""
+        if self.rental is not None:
+            return "rental"
         return "ssh" if self.ssh else "local"
 
     @property
-    def ephemeral(self) -> bool:
-        """A rental: there is a pod behind this address."""
-        return self.pod_id is not None
+    def pod_id(self) -> str | None:
+        return self.rental.pod_id if self.rental is not None else None
 
-    def provider(self) -> dict[str, Any] | None:
-        """The `provider` block this address implies, for a config we initialise."""
-        if self.pod_id is None:
+    def provider_block(self) -> dict[str, Any] | None:
+        """The `provider` block a rental's own config names itself by."""
+        if self.rental is None:
             return None
-        return {"kind": self.kind, "pod_id": self.pod_id}
+        return {"kind": self.rental.provider, "pod_id": self.rental.pod_id}
 
     # -- what the host last said about itself --------------------------------
 
@@ -305,63 +340,11 @@ class HostEntry(TolerantModel):
     def config(self) -> HostConfig:
         """The host's own config as this machine last read it.
 
-        Read it for a listing and say how old it is; never act on it without
-        asking the host first. Everything that does talk to a host refreshes it
-        (`with_config`), so in practice it is one round trip old.
+        For a listing, labelled with `seen_at`; never for a decision. A
+        session (`remote.open_session`) reads the host's copy and is what
+        anything that acts on a host works from.
         """
         return HostConfig.from_dict(self.cache.config)
-
-    @property
-    def gpus(self) -> list[str]:
-        return self.config.gpus
-
-    @property
-    def env(self) -> dict[str, str]:
-        """Extra environment for every job on this host (`--env K=V`), plus the
-        `UV_CACHE_DIR` bootstrap derives from the host's own filesystem."""
-        return self.config.env
-
-    @property
-    def s3_prefix(self) -> str | None:
-        return self.config.s3_prefix
-
-    @property
-    def idle_minutes(self) -> float:
-        return self.config.idle_minutes
-
-    @property
-    def retention_days(self) -> float | None:
-        return self.config.retention_days
-
-    @property
-    def workdir_days(self) -> float | None:
-        return self.config.workdir_days
-
-    @property
-    def created_at(self) -> str | None:
-        return self.config.created_at
-
-    @property
-    def pkg_commit(self) -> str | None:
-        """The gpuc commit the host's config says its package came from.
-
-        Whoever bootstrapped last wrote it, which is the point: this machine's
-        own record of what it shipped cannot answer the question."""
-        return self.config.pkg_commit
-
-    def initial_config(self) -> HostConfig:
-        """The config to give a host that has none of its own.
-
-        A host whose gpuc home was wiped and has to be rebuilt: what we last
-        saw, with the facts only this address knows filled in.
-        """
-        config = self.config
-        return replace(
-            config,
-            host=config.host if self.cache.config.get("host") else self.name or config.host,
-            provider=config.provider or self.provider(),
-            created_at=config.created_at or utc_now(),
-        )
 
     def with_config(
         self, config: HostConfig | Mapping[str, Any], *, read_at: str | None = None
@@ -396,6 +379,34 @@ class HostEntry(TolerantModel):
             changes["gpu_info"] = {**self.cache.gpu_info, **gpu_info}
         changes["read_at"] = read_at or utc_now()
         return self.model_copy(update={"cache": self.cache.model_copy(update=changes)})
+
+
+def first_config(
+    entry: HostEntry, settings: Settings, overrides: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """The `config.json` a host that has none is given: the one constructor.
+
+    Used by `gpuc host add` on a box nobody has set up, by provisioning for a
+    pod just bought, and by bootstrap restoring a wiped home (with the last
+    config seen as `overrides`). By default the host owns every card the probe
+    saw (`entry.gpu_info`) less any it was asked to share, sweeps workdirs
+    after `DEFAULT_WORKDIR_DAYS`, and mirrors under `default_s3_prefix` when
+    there is a bucket -- the same defaults whatever kind of host it is, so
+    the machine that connects first has no say the next one cannot see in the
+    file.
+    """
+    overrides = dict(overrides or {})
+    shared_entries = [str(item) for item in overrides.get("shared_gpus") or []]
+    shared = set(gpus.resolve(shared_entries, table_of(entry.gpu_info)).owned)
+    document: dict[str, Any] = {
+        "host": entry.name,
+        "gpus": [uuid for uuid in entry.gpu_info if uuid not in shared],
+        "workdir_days": DEFAULT_WORKDIR_DAYS,
+        "s3_prefix": default_s3_prefix(settings, entry.name),
+        "created_at": utc_now(),
+        "provider": entry.provider_block(),
+    }
+    return {**document, **overrides}
 
 
 NOT_DRIFT = {"schema_version", "pkg_commit", "created_at"}
@@ -476,8 +487,7 @@ def config_changes(existing: Any, patch: Mapping[str, Any]) -> list[str]:
 
 class Registry(TolerantModel):
     schema_version: int = SCHEMA_VERSION
-    """The shape of hosts.json. Written always, accepted missing: a registry
-    from before it existed is version 1 by definition."""
+    """The shape of hosts.json. Written always, accepted missing."""
     hosts: dict[str, HostEntry] = Field(default_factory=dict)
 
     def require(self, name: str) -> HostEntry:
@@ -489,6 +499,12 @@ class Registry(TolerantModel):
                 f"Add it with: gpuc host add {name} --ssh user@host"
             )
         return entry
+
+    def listing(self, only: str | None = None) -> list[HostEntry]:
+        """Every host in registry order, or the one named (exit 4 if unknown)."""
+        if only:
+            return [self.require(only)]
+        return list(self.hosts.values())
 
     def put(self, entry: HostEntry) -> None:
         self.hosts[entry.name] = entry
@@ -507,6 +523,21 @@ class RegistryRead(BaseModel):
     """Host entries that did not validate, kept verbatim so a later write puts
     them back: they are another session's hosts, not ours to delete."""
 
+    def named(self) -> Registry:
+        """The registry, for a command given a host or job name to find.
+
+        A registry that could not be parsed is exit 3 (unknown), not exit 4
+        (does not exist): "no host named gpubox" would be a lie when the file
+        holding gpubox is the thing that is broken. Listing commands do not use
+        this -- they can honestly show what parsed.
+        """
+        if self.unreadable:
+            raise LocalStateUnreadable("\n".join(self.errors))
+        return self.registry
+
+    def require(self, name: str) -> HostEntry:
+        return self.named().require(name)
+
 
 def backup_path(path: Path) -> Path:
     return path.with_name(path.name + ".bak")
@@ -523,7 +554,7 @@ def _take_backup(path: Path) -> Path | None:
 
 
 def read_registry() -> RegistryRead:
-    """Parse hosts.json as far as it parses. Never raises on content.
+    """Parse hosts.json as far as it parses. Never raises on content, never prints.
 
     One unreadable host entry must not take the CLI with it: `status` and
     `logs` on the other hosts are exactly what someone needs while they fix it.
@@ -584,20 +615,16 @@ def read_registry() -> RegistryRead:
     return RegistryRead(registry=registry, errors=errors, skipped=skipped)
 
 
-def warn_stderr(message: str) -> None:
-    print(f"warning: {message}", file=sys.stderr)
+def open_registry() -> RegistryRead:
+    """The registry, with each entry it could not parse warned about on stderr.
 
-
-def load_registry() -> Registry:
-    """The salvaged registry, with every problem reported and none of them fatal.
-
-    Callers that need to tell "nothing registered" from "nothing readable" use
-    `read_registry()` instead; everything else can work with what parsed.
+    The one reader commands use. `.named()` is for a command given a name to
+    look up; the rest work with what parsed and report `errors` as their own.
     """
     read = read_registry()
     for error in read.errors:
-        warn_stderr(error)
-    return read.registry
+        warn(error)
+    return read
 
 
 def save_registry(registry: Registry, keep: dict[str, Any] | None = None) -> None:
@@ -664,18 +691,52 @@ def registry_transaction() -> Iterator[Registry]:
                 f"still holds."
             )
         for error in read.errors:
-            warn_stderr(error)
+            warn(error)
         yield read.registry
         save_registry(read.registry, read.skipped)
 
 
-def forget_host(name: str, pod_id: str | None = None) -> bool:
+def update_cache(
+    name: str,
+    *,
+    config: HostConfig | Mapping[str, Any] | None = None,
+    python: str | None = None,
+    uv: str | None = None,
+    gpu_info: Mapping[str, GpuInfo] | None = None,
+    driver_version: str | None = None,
+    bootstrapped_at: str | None = None,
+) -> HostEntry | None:
+    """Record what a host just said about itself: re-read under the lock and
+    write only these fields back.
+
+    The one way the cache is written. Re-read rather than written from the
+    entry a command started with, because every submit and probe does this
+    and writing back a whole entry read before an ssh round trip would undo
+    whatever a concurrent `gpuc host probe` learned about the same host in
+    between. None is the host that was removed while the command ran.
+    """
+    with registry_transaction() as registry:
+        current = registry.hosts.get(name)
+        if current is None:
+            return None
+        updated = current.with_cache(
+            python=python, uv=uv, gpu_info=gpu_info, driver_version=driver_version
+        )
+        if config is not None:
+            updated = updated.with_config(config)
+        if bootstrapped_at is not None:
+            updated = updated.model_copy(update={"bootstrapped_at": bootstrapped_at})
+        registry.put(updated)
+        return updated
+
+
+def forget_host(name: str, pod_id: str | None = None, report: Reporter = warn) -> bool:
     """Drop every local trace of one host, and say whether the entry went.
 
-    The caller must hold the state lock. False is every reason the registry
-    still lists the host -- it was never there, it is another pod's, the file
-    could not be read -- because a caller that reports "forgotten" has to be
-    reporting what happened rather than what it asked for.
+    False is every reason the registry still lists the host -- it was never
+    there, it is another pod's, the file could not be read, the lock is held
+    -- because a caller that reports "forgotten" has to be reporting what
+    happened rather than what it asked for.
 
     `pod_id` names the pod the caller is forgetting, and the registry entry is
     only removed if it is that pod's. A pod and a registry entry can disagree
@@ -684,59 +745,49 @@ def forget_host(name: str, pod_id: str | None = None) -> bool:
     registered host because a *pod* under that name went away is not something
     this should be able to do.
 
-    Deliberately not a `registry_transaction`: both callers already hold the
-    lock, and flock is per open file description, so re-taking it in the same
-    process would deadlock until the timeout.
-    """
-    pod_known_hosts_file(name).unlink(missing_ok=True)
-    read = read_registry()
-    if read.unreadable:
-        return False
-    entry = read.registry.hosts.get(name)
-    if entry is None:
-        return False
-    if pod_id is not None and entry.pod_id != pod_id:
-        # Not this pod's entry -- a box of this machine's that answers to the
-        # same name, or another pod under it.
-        return False
-    del read.registry.hosts[name]
-    save_registry(read.registry, read.skipped)
-    return True
-
-
-def forget_host_locked(name: str, pod_id: str | None, report: Reporter) -> bool:
-    """`forget_host` under the state lock, taken for just that mutation.
-
-    Never held across the provider and ssh calls that decide *whether* to
-    forget: a terminate polls for up to five minutes, and every other command
-    that touches the registry gives up on the lock after thirty seconds. A lock
-    another session is holding is a warning and a False, not a failure: the pod
-    is already gone by the time anything calls this.
+    The lock is taken for just this mutation, never across the provider and
+    ssh calls that decide *whether* to forget: a terminate polls for up to
+    five minutes, and every other command gives up on the lock after thirty
+    seconds. A lock another session is holding is a warning and a False, not
+    a failure: the pod is already gone by the time anything calls this.
     """
     try:
         with state_lock():
-            return forget_host(name, pod_id)
+            read = read_registry()
+            if read.unreadable:
+                return False
+            entry = read.registry.hosts.get(name)
+            if entry is None or (pod_id is not None and entry.pod_id != pod_id):
+                return False
+            del read.registry.hosts[name]
+            save_registry(read.registry, read.skipped)
+            # Only once the entry has gone: the pinned host key belongs to the
+            # pod the entry names, which a request about another pod leaves.
+            pod_known_hosts_file(name).unlink(missing_ok=True)
+            return True
     except ConfigError as exc:
-        report(f"WARNING: could not remove host {name} from the registry: {exc}")
+        report(f"could not remove host {name} from the registry: {exc}")
         return False
 
 
 def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transport:
     settings = settings or load_settings()
     ensure_state_dir()
-    if entry.kind == "local":
+    if entry.ssh is None:
+        if entry.rental is not None:
+            raise ConfigError(
+                f"host {entry.name!r} is a rental with no ssh target recorded.\n"
+                f"Re-add it with: gpuc host add {entry.name} --pod {entry.rental.pod_id}"
+            )
         return make_transport(entry.name)
-    if not entry.ssh:
-        raise ConfigError(
-            f"host {entry.name!r} has kind {entry.kind!r} but no ssh target.\n"
-            f"Re-add it with: gpuc host add {entry.name} --ssh user@host --gpus ..."
-        )
     return make_transport(
         entry.name,
         ssh=entry.ssh,
         port=entry.port,
         key=settings.ssh_key_path,
-        known_hosts=(pod_known_hosts_file(entry.name) if entry.ephemeral else known_hosts_file()),
+        known_hosts=(
+            pod_known_hosts_file(entry.name) if entry.rental is not None else known_hosts_file()
+        ),
     )
 
 

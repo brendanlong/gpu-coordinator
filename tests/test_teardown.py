@@ -8,10 +8,11 @@ from typing import Any
 import pytest
 
 from gpuc.control import teardown
-from gpuc.control.config import HostNotFound, Settings, load_registry, registry_transaction
+from gpuc.control.config import HostNotFound, Settings, registry_transaction
 from gpuc.control.providers.base import ProviderError
 from gpuc.control.remote import RemoteError
-from tests.conftest import host_entry
+from gpuc.host.jobs import HostConfig
+from tests.conftest import host_entry, load_registry
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
 FOREIGN = "other-someone-else"
@@ -30,7 +31,7 @@ def register(name: str = "gpuc-e2e-aaa", pod_id: str = "pod1") -> None:
         registry.put(
             host_entry(
                 name=name,
-                kind="runpod",
+                kind="rental",
                 pod_id=pod_id,
                 ssh="root@1.2.3.4",
                 python="/root/python",
@@ -56,6 +57,8 @@ def answering(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any] | None) -
     """Point `status.gather`'s ssh half at a payload, or at a host that is gone."""
 
     class Session:
+        config = HostConfig()
+
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
             if payload is None:
                 raise TimeoutError("ssh timed out")
@@ -66,7 +69,7 @@ def answering(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any] | None) -
             raise RemoteError("gpuc-e2e-aaa", "status", "ssh: connect: no route to host")
         return Session()
 
-    monkeypatch.setattr("gpuc.control.status.open_session", open_session)
+    monkeypatch.setattr("gpuc.control.remote.open_session", open_session)
 
 
 def terminate(provider: FakeProvider, target: str, **kwargs: Any) -> teardown.Termination:
@@ -138,7 +141,7 @@ def test_force_terminates_a_busy_host_without_asking_it_anything(
     def refuse(*args: object, **kwargs: object) -> None:
         raise AssertionError("--force must not ask the host anything")
 
-    monkeypatch.setattr("gpuc.control.status.open_session", refuse)
+    monkeypatch.setattr("gpuc.control.remote.open_session", refuse)
 
     result = terminate(provider, "gpuc-e2e-aaa", force=True)
 
@@ -239,7 +242,7 @@ def test_a_non_rental_host_has_nothing_to_terminate(control_env: Path) -> None:
 def test_a_pod_that_is_already_gone_still_clears_the_registry_entry(
     control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The stale-entry case `gpuc status` calls POD GONE. There is nothing to
+    """The stale-entry case `gpuc status` calls GONE. There is nothing to
     bill for and nothing that could be running, so no `--force` is demanded for
     a pod the provider itself says is dead -- the entry is all that is left."""
     register()
@@ -272,7 +275,7 @@ def test_a_pod_the_provider_has_never_heard_of_is_not_a_terminate(
 def test_an_exited_pod_is_ended_without_force(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """EXITED is `POD GONE` in `gpuc status` but a live rental at the provider.
+    """EXITED is `UNASKABLE` in `gpuc status` but a live rental at the provider.
     Nothing can be running in a container that is not running, so refusing here
     would hold the one command that stops the bill behind a flag for nothing."""
     fake = FakeProvider()
@@ -300,6 +303,38 @@ def test_a_provider_that_will_not_answer_does_not_read_as_gone(
 
     with pytest.raises(ProviderError):
         terminate(provider, "gpuc-e2e-aaa", force=True)
+    assert "gpuc-e2e-aaa" in load_registry().hosts
+
+
+def test_a_provider_read_that_fails_does_not_read_as_a_dead_pod(
+    control_env: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host says it is busy and the provider's first answer is a 503:
+    that is a live pod nobody could describe, not a dead one, and without
+    `--force` it is refused like any other busy host."""
+    register()
+    answering(
+        monkeypatch,
+        host_payload(
+            jobs=[{"job_id": "j-running", "name": "train", "status": "running", "phase": "main"}]
+        ),
+    )
+    real = provider.get
+    reads: list[str] = []
+
+    def flaky(pod_id: str) -> Any:
+        reads.append(pod_id)
+        if len(reads) == 1:
+            raise ProviderError("HTTP 503 from runpod")
+        return real(pod_id)
+
+    monkeypatch.setattr(provider, "get", flaky)
+
+    with pytest.raises(teardown.TerminateRefused) as error:
+        terminate(provider, "gpuc-e2e-aaa")
+
+    assert "train (j-running)" in str(error.value)
+    assert provider.terminated == []
     assert "gpuc-e2e-aaa" in load_registry().hosts
 
 
@@ -361,11 +396,25 @@ def test_forgotten_is_what_happened_not_what_was_asked(
     `forgotten` anyway would have `gpuc status` contradict this command's own
     JSON, and a caller keying on it would never re-run the removal."""
     register()
-    monkeypatch.setattr(
-        "gpuc.control.teardown.forget_host_locked", lambda name, pod_id, report: False
-    )
+    monkeypatch.setattr("gpuc.control.teardown.forget_host", lambda name, pod_id, report: False)
 
     result = terminate(provider, "gpuc-e2e-aaa", force=True)
 
     assert (result.terminated, result.forgotten) == (True, False)
     assert result.document()["forgotten"] is False
+
+
+def test_an_unregistered_pod_the_provider_reports_stopped_is_ended_without_force(
+    control_env: Path,
+) -> None:
+    """Nothing here can ask it, but the provider's own word that its container
+    is not running is the same answer it is for a registered one: nothing
+    can be running there, and the bill is the only thing left to stop."""
+    fake = FakeProvider()
+    stopped = running_pod("gpuc-leak-bbb", "podL").model_copy(update={"status": "EXITED"})
+    fake.adopt(stopped, PodScript(ssh_after_polls=0))
+
+    result = terminate(fake, "podL")
+
+    assert fake.terminated == ["podL"]
+    assert (result.terminated, result.checked) == (True, False)

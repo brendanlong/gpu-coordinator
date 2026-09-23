@@ -36,21 +36,6 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_config(args: argparse.Namespace) -> int:
-    """Merge a patch into this host's config.json and print the result.
-
-    The host owns its config, so the control side never writes the file
-    itself: `gpuc host set` and `gpuc host bootstrap` send the keys they
-    change and this applies them, atomically, on the host.
-
-    The patch is a file rather than an argument because `env` may hold a token,
-    and argv is readable by every other user of a shared box.
-    """
-    document = jobs.merge_config(_read_json_object(args.merge, "a config patch"))
-    print(json.dumps(document, indent=2, sort_keys=True))
-    return 0
-
-
 def _state_or_none(job_id: str) -> JobState | None:
     try:
         return jobs.read_state(job_id)
@@ -65,13 +50,6 @@ def _spec(job_id: str) -> JobSpec | None:
         return None
 
 
-def _resolve(entries: list[str]) -> tuple[list[str], list[str]]:
-    try:
-        return gpus.resolve_owned(entries)
-    except gpus.GpuError:
-        return [], list(entries)
-
-
 def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     """What `config.gpus` and `config.shared_gpus` resolve to on this host now.
 
@@ -79,24 +57,23 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     only the host knows what its driver is calling them today. The shared cards
     carry their current memory and utilization too, because whether one is
     borrowable is a fact about this second that only nvidia-smi here can answer
-    -- and when it is not, the numbers are how somebody sees why.
+    -- and when it is not, the numbers are how somebody sees why. The same
+    `gpus.resolve` the dispatcher decides with, over one reading; a driver
+    that will not answer reads as every entry unavailable, as it does there.
     """
     try:
-        indices = {gpu.uuid: gpu.index for gpu in gpus.list_gpus()}
+        table = gpus.list_gpus()
     except gpus.GpuError:
-        indices = {}
-    resolved, unavailable = _resolve(config.gpus)
-    # Owning a card beats borrowing it, exactly as the dispatcher decides it.
-    shared, shared_unavailable = _resolve(config.shared_gpus)
-    owned = set(resolved)
-    shared = [uuid for uuid in shared if uuid not in owned]
+        table = []
+    indices = {gpu.uuid: gpu.index for gpu in table}
+    cards = gpus.resolve(config.gpus, table, config.shared_gpus)
     # Through the same reader the dispatcher borrows on, so an absent entry
     # means here exactly what it means there: not a card we would take.
-    usage, _failure = gpus.usage_or_nothing(shared)
+    usage, _failure = gpus.usage_or_nothing(cards.shared)
     return {
         "gpus": config.gpus,
-        "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in resolved],
-        "gpus_unavailable": unavailable,
+        "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in cards.owned],
+        "gpus_unavailable": cards.missing,
         "shared_gpus": config.shared_gpus,
         "shared_gpus_resolved": [
             {
@@ -106,9 +83,10 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
                 "utilization_pct": usage[uuid].utilization_pct if uuid in usage else None,
                 "unused": uuid in usage and usage[uuid].unused,
             }
-            for uuid in shared
+            for uuid in cards.shared
         ],
-        "shared_gpus_unavailable": shared_unavailable,
+        "shared_gpus_unavailable": cards.shared_missing,
+        "shared_configured": len(cards.shared) + len(cards.shared_missing),
     }
 
 
@@ -184,7 +162,7 @@ def projected_starts(
         cards,
         owned_configured=len(config.gpus),
         owned_missing=table["gpus_unavailable"],
-        shared_configured=len(config.shared_entries()),
+        shared_configured=table["shared_configured"],
         theirs=theirs,
         draining=paths.draining_file().exists(),
     )
@@ -229,6 +207,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # its own business and never leaves the host.
         entry["outputs"] = [asdict(o) for o in spec.outputs] if spec else []
         entry["wandb"] = wandb_hints(spec.env) if spec else {}
+        # Which job this one was resubmitted from; the host only carries it.
+        entry["requeued_from"] = spec.requeued_from if spec else None
         # Null for a job that is not over -- a running job's workdir is being
         # written to, so any size for it would be a lie -- and for a finished
         # one only when the call's measuring budget is spent. Otherwise free
@@ -241,8 +221,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         # "this job produced something that is still only here": the control
         # side cannot work it out, since it never sees the spec's `outputs:`.
-        entry["outputs_pending"] = (
-            not cleanup.outputs_confirmed(job_id, state)[0] if state.finished else False
+        # A running job's files are its runner's; a queued one may be holding
+        # what a preempted attempt produced.
+        entry["outputs_pending"] = bool(
+            spec is not None
+            and state.status != "running"
+            and cleanup.outputs_pending(job_id, spec, state)
         )
         entries.append(entry)
     heartbeat = dispatcher.heartbeat_age()
@@ -280,8 +264,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _no_such_job(job_id: str, why: str) -> int:
+    """The answer every job verb gives for an id this host does not have.
+
+    `missing` is what tells the control side apart "no such job" (its exit 4)
+    from a refusal of a job that is here (exit 1): both are an `error`
+    document, and the words alone are not something to parse.
+    """
+    print(json.dumps({"job_id": job_id, "error": why, "missing": True}))
+    return 1
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
-    status = queue.cancel(args.job_id)
+    try:
+        status = queue.cancel(args.job_id)
+    except FileNotFoundError as exc:
+        return _no_such_job(args.job_id, str(exc))
+    except (OSError, RuntimeError) as exc:
+        print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
+        return 1
     print(json.dumps({"job_id": args.job_id, "status": status}))
     return 0
 
@@ -294,6 +295,8 @@ def cmd_preempt(args: argparse.Namespace) -> int:
     """
     try:
         status = queue.preempt(args.job_id, args.priority)
+    except FileNotFoundError as exc:
+        return _no_such_job(args.job_id, str(exc))
     except (OSError, ValueError, RuntimeError) as exc:
         print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
         return 1
@@ -306,9 +309,8 @@ def cmd_preempt(args: argparse.Namespace) -> int:
                 # What it will be queued at once its runner stops, whether or
                 # not this call changed it.
                 "priority": state.priority if state else None,
-                # The dispatcher is what puts the job back, so make sure there
-                # is one: on a host whose dispatcher died, the kill would land
-                # and nothing would ever queue the job again.
+                # The runner queues the job again; the dispatcher is what
+                # launches the next attempt, so make sure there is one.
                 "dispatcher_pid": dispatcher.spawn_detached_dispatcher(),
             }
         )
@@ -321,11 +323,11 @@ def cmd_reorder(args: argparse.Namespace) -> int:
     for a job that is not queued, like `preempt` and `estimate` answer."""
     if not queue.reorder(args.job_id, args.priority):
         state = _state_or_none(args.job_id)
+        if state is None:
+            return _no_such_job(args.job_id, f"no job {args.job_id} on this host")
         why = (
             f"job {args.job_id} is not queued (status {state.status}); only a queued job "
             f"can be reordered"
-            if state
-            else f"no job {args.job_id} on this host"
         )
         print(json.dumps({"job_id": args.job_id, "error": why}))
         return 1
@@ -366,6 +368,8 @@ def cmd_estimate(args: argparse.Namespace) -> int:
         print(json.dumps({"job_id": job_id, "error": "give MINUTES, or --clear, not both"}))
         return 1
     minutes = None if args.clear else args.minutes
+    if not paths.job_dir(job_id).is_dir():
+        return _no_such_job(job_id, f"no job with that id on this host: {job_id}")
     error = _estimate_error(job_id, minutes)
     if error is not None:
         print(json.dumps({"job_id": job_id, "error": error}))
@@ -399,7 +403,9 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    return runner.run_job(args.job_id)
+    return runner.run_job(
+        args.job_id, [uuid for uuid in args.gpus.split(",") if uuid], args.attempt
+    )
 
 
 def _selection(value: str | None) -> list[str] | None:
@@ -485,16 +491,6 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("spec", help="path to a JSON spec, or - for stdin")
     enqueue.set_defaults(func=cmd_enqueue)
 
-    config = sub.add_parser("config", help="merge a patch into this host's config.json")
-    config.add_argument(
-        "--merge",
-        required=True,
-        metavar="PATH",
-        help="a JSON object (or - for stdin) whose keys replace those in config.json "
-        "before it is printed; `env` is replaced wholesale, never merged",
-    )
-    config.set_defaults(func=cmd_config)
-
     status = sub.add_parser("status", help="host and job status as JSON")
     status.add_argument("job_id", nargs="?")
     status.set_defaults(func=cmd_status)
@@ -523,6 +519,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run one job in the foreground (used by the dispatcher)")
     run.add_argument("job_id")
+    run.add_argument(
+        "--gpus",
+        required=True,
+        metavar="UUIDS",
+        help="the cards the dispatcher assigned, comma-separated; the runner claims the job "
+        "with them",
+    )
+    run.add_argument(
+        "--attempt",
+        required=True,
+        type=int,
+        help="the attempt the dispatcher launched; the claim is for that attempt only",
+    )
     run.set_defaults(func=cmd_run)
 
     clean = sub.add_parser("clean", help="remove finished jobs' workdirs")

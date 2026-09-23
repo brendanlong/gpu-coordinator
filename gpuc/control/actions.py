@@ -5,6 +5,10 @@ Each function here does one thing a command does and returns the document its
 dashboard serves it over HTTP. Neither adds judgement of its own, so a job the
 CLI would refuse to cancel is one the dashboard refuses too, with the same
 words.
+
+An `Answer` is what a command hands back: the document, the text form, and
+what failed -- `exit_code_of` is the one place that becomes a number, and
+`exits.http_status` the one place that number becomes an HTTP status.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ from __future__ import annotations
 import json
 import shlex
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,20 +34,36 @@ from gpuc.control.config import (
     RegistryRead,
     Settings,
     config_file,
-    forget_host_locked,
+    forget_host,
     hosts_file,
     load_settings,
-    pod_known_hosts_file,
-    read_registry,
-    registry_transaction,
+    open_registry,
     state_dir,
     write_config_template,
 )
 from gpuc.control.connect import Connection
+from gpuc.control.exits import (
+    EXIT_ERROR,
+    EXIT_INTERRUPTED,
+    EXIT_LOCAL_STATE,
+    EXIT_NOT_FOUND,
+    EXIT_OK,
+    EXIT_USAGE,
+)
+from gpuc.control.jsonout import note
 from gpuc.control.providers.base import Provider, ProviderError
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.provision import ProvisionError
-from gpuc.control.remote import HostSession, RemoteError, open_session
+from gpuc.control.remote import (
+    Answered,
+    Asked,
+    Gone,
+    HostSession,
+    RemoteError,
+    Unaskable,
+    ask,
+    reason_of,
+)
 from gpuc.control.remote import config_file as remote_config_file
 from gpuc.control.s3index import (
     IndexEntry,
@@ -53,32 +73,23 @@ from gpuc.control.s3index import (
     S3IndexError,
     S3ObjectMissing,
     job_log_uri,
+    job_uri,
 )
 from gpuc.control.skill import SkillError
 from gpuc.control.submit import SubmitError
 from gpuc.control.teardown import TerminateError
 from gpuc.control.transport import TransportError
 from gpuc.host import jobs
+from gpuc.host.jobs import FINISHED_STATUSES
 
-EXIT_OK = 0
-"""Everything the command was asked to do happened."""
-EXIT_ERROR = 1
-"""Some part of the command failed: a transport error, a provider error, a
-refused submit, a host that could not be read. Whatever did work is reported
-anyway -- one unreachable host never costs the others their status."""
-EXIT_USAGE = 2
-"""The command line itself was wrong (argparse uses this too)."""
-EXIT_LOCAL_STATE = 3
-"""Local state -- the registry or the config file -- could not be read, so the
-answer is unknown. Automation must not read this as `nothing is running`."""
-EXIT_NOT_FOUND = 4
-"""The named job or host does not exist."""
-EXIT_INTERRUPTED = 130
-"""A Ctrl-C out of a command that blocks. The shell's own convention for SIGINT.
-
-Distinct from 0 because `gpuc wait` and `gpuc logs -f` exit with the *job's*
-outcome, where 0 means it succeeded: a script must never read "the user got
-bored" as "the job worked"."""
+__all__ = [
+    "EXIT_ERROR",
+    "EXIT_INTERRUPTED",
+    "EXIT_LOCAL_STATE",
+    "EXIT_NOT_FOUND",
+    "EXIT_OK",
+    "EXIT_USAGE",
+]
 
 
 class CliError(RuntimeError):
@@ -102,10 +113,15 @@ class Interrupted(CliError):
 
     Raised rather than returned so that a blocking command cannot get the exit
     code or the `--json` document wrong: `main` turns an unhandled Ctrl-C into
-    the same thing with a bare message, and this only adds detail.
+    the same thing with a bare message, and this only adds detail -- the
+    words, and under `--json` the `document` a partial run still has to show.
     """
 
     exit_code = EXIT_INTERRUPTED
+
+    def __init__(self, message: str, document: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.document = document or {}
 
 
 FAILURES = (
@@ -148,58 +164,69 @@ def failure_message(exc: BaseException) -> str:
     return str(exc)
 
 
-def warn(message: str) -> None:
-    print(f"warning: {message}", file=sys.stderr)
+@dataclass
+class Answer:
+    """What a command that ran to the end hands back.
 
-
-def note(message: str) -> None:
-    print(f"note: {message}", file=sys.stderr)
-
-
-def read_registry_warned() -> RegistryRead:
-    """The registry, with each entry it could not parse warned about on stderr."""
-    read = read_registry()
-    for error in read.errors:
-        warn(error)
-    return read
-
-
-def named_registry() -> Registry:
-    """The registry, for a command that was given a host or job name to find.
-
-    A registry that could not be parsed is exit 3 (unknown), not exit 4 (does
-    not exist): "no host named gpubox" would be a lie when the file holding
-    gpubox is the thing that is broken. Listing commands do not use this --
-    they can honestly show what parsed.
+    `document` is the `--json` form and `text` the other one (None when the
+    command already streamed its text). `failures` is everything that did not
+    work along the way -- a host that could not be read, a bootstrap that
+    failed -- and `unknown` that local state could not be read at all.
+    `outcome` is a code the command relays rather than owns: the job's, for
+    `wait`, or the remote command's, for `ssh`.
     """
-    read = read_registry_warned()
-    if read.unreadable:
-        raise LocalStateUnreadable("\n".join(read.errors))
-    return read.registry
+
+    document: dict[str, Any]
+    text: str | None = None
+    failures: list[str] = field(default_factory=list)
+    unknown: bool = False
+    outcome: int | None = None
+
+    @property
+    def exit_code(self) -> int:
+        return exit_code_of(self)
+
+
+def exit_code_of(answer: Answer) -> int:
+    """The one rule: unknown beats everything, a relayed outcome is itself,
+    else 1 for any failure and 0 for none."""
+    if answer.unknown:
+        return EXIT_LOCAL_STATE
+    if answer.outcome is not None:
+        return answer.outcome
+    return EXIT_ERROR if answer.failures else EXIT_OK
 
 
 PROVIDERS: dict[str, Callable[[Settings], Provider]] = {
     "runpod": lambda settings: RunPodProvider(prefix=settings.runpod_pod_prefix),
 }
-"""Every rental provider, by the `kind` a host's `provider` block names."""
+"""Every rental provider, by the name a host's `rental.provider` gives it."""
 
 
-def make_provider(settings: Settings, kind: str = "runpod") -> Provider:
+def make_provider(settings: Settings, provider: str = "runpod") -> Provider:
     try:
-        factory = PROVIDERS[kind]
+        factory = PROVIDERS[provider]
     except KeyError:
-        raise ProviderError(f"no such provider: {kind!r} (known: {', '.join(PROVIDERS)})") from None
+        raise ProviderError(
+            f"no such provider: {provider!r} (known: {', '.join(PROVIDERS)})"
+        ) from None
     return factory(settings)
 
 
-def provider_for_status(
+def provider_for(
     entries: Sequence[HostEntry], settings: Settings, report: Callable[[str], None] = note
 ) -> Provider | None:
-    """Only build a provider when an ephemeral host is on screen, and never fail on it."""
-    if not any(entry.ephemeral for entry in entries):
+    """The provider to ask about these hosts' pods, if any of them is rented.
+
+    Only built when a rental is on screen, and never fatal: a status of two
+    ssh boxes must not need an API key, and one with a rental must not fail
+    outright for want of one -- the pod line is missing and says so.
+    """
+    names = {entry.rental.provider for entry in entries if entry.rental is not None}
+    if not names:
         return None
     try:
-        return make_provider(settings)
+        return make_provider(settings, sorted(names)[0])
     except ProviderError as exc:
         report(f"pod status unavailable: {exc}")
         return None
@@ -227,57 +254,152 @@ def gather_all(
         )
 
 
-def hosts_for(registry: Registry, only: str | None) -> list[HostEntry]:
-    if only:
-        return [registry.require(only)]
-    return list(registry.hosts.values())
+@dataclass
+class StatusResult:
+    """Everything `gpuc status` found out, before any of it is printed.
 
-
-def status_document(
-    read: RegistryRead,
-    settings: Settings,
-    *,
-    host: str | None = None,
-    recent: int = status_mod.RECENT_FINISHED,
-    since_s: float | None = None,
-    report: Callable[[str], None] = note,
-) -> dict[str, Any]:
-    """`gpuc status --json`: one object, whatever happened.
-
-    The registry's own errors ride along as top-level `errors`, and an
-    unreadable registry is an empty `hosts` *with* an error saying so -- the
-    caller decides whether that is exit 3 or HTTP 503, but the document is the
-    same either way.
+    One object for the text form, `--json` and the dashboard, so the three
+    cannot disagree about what was asked, what failed, or -- through
+    `answer` -- what the exit code is.
     """
-    views = status_views(read, settings, host=host, report=report)
-    return status_mod.document(views, errors=status_errors(read), recent=recent, since_s=since_s)
 
+    read: RegistryRead
+    views: list[status_mod.HostView] = field(default_factory=list)
+    every_host: bool = True
+    """Whether the registry's own problems count: with `--host X` the answer
+    was never meant to cover an entry that is not X."""
+    unhosted: list[IndexEntry] = field(default_factory=list)
+    """`--all`: the jobs only the index knows, in id order."""
+    lost: set[str] = field(default_factory=set)
+    """Which of `unhosted` the mirror records as having lost their outputs."""
+    index_error: str | None = None
+    """Why `unhosted` may be short: an S3 index that could not be read."""
 
-def status_views(
-    read: RegistryRead,
-    settings: Settings,
-    *,
-    host: str | None = None,
-    report: Callable[[str], None] = note,
-) -> list[status_mod.HostView]:
-    """Every host `gpuc status` reports on, asked at once and in registry order.
+    @property
+    def errors(self) -> list[str]:
+        """The problems that belong to no host: the registry's, the index's."""
+        errors = list(self.read.errors)
+        if self.read.unreadable:
+            errors.append(
+                f"{hosts_file()} could not be read, so `hosts` is empty because nothing is known"
+            )
+        if self.index_error:
+            errors.append(f"{self.index_error}; the list of index-only jobs may be short")
+        return errors
 
-    The text output gathers the same views itself, so that it can print each
-    host as soon as it has answered rather than waiting for the slowest.
-    """
-    entries = hosts_for(read.registry, host) if not read.unreadable else []
-    provider = provider_for_status(entries, settings, report) if entries else None
-    return list(gather_all(entries, settings, provider))
+    @property
+    def failures(self) -> list[str]:
+        """What makes this exit 1: a host that could not be read, a registry
+        entry this build could not parse (only when every host was asked), an
+        index that could not be read."""
+        failures = [view.failure for view in self.views if view.failure]
+        if self.every_host:
+            failures += self.read.errors
+        if self.index_error:
+            failures.append(self.index_error)
+        return failures
 
+    @property
+    def seen(self) -> set[str]:
+        return {
+            job.job_id for view in self.views for job in view.queue + view.running + view.finished
+        }
 
-def status_errors(read: RegistryRead) -> list[str]:
-    """The `gpuc status` errors that belong to no host: the registry's own."""
-    errors = list(read.errors)
-    if read.unreadable:
-        errors.append(
-            f"{hosts_file()} could not be read, so `hosts` is empty because nothing is known"
+    def host_state(self, entry: IndexEntry) -> status_mod.HostState:
+        """What this run found the job's host to be. A host with no registry
+        entry here is gone (a rental that ended was forgotten); one whose
+        entry this build could not read was not asked."""
+        view = next((view for view in self.views if view.entry.name == entry.host), None)
+        if view is not None:
+            return view.state
+        if entry.host in self.read.skipped:
+            return status_mod.HostState.UNASKABLE
+        return status_mod.HostState.GONE
+
+    def document(
+        self, *, recent: int = status_mod.RECENT_FINISHED, since_s: float | None = None
+    ) -> dict[str, Any]:
+        return status_mod.document(
+            self.views,
+            errors=self.errors,
+            unhosted=[
+                status_mod.unhosted_json(
+                    entry, lost=entry.job_id in self.lost, state=self.host_state(entry)
+                )
+                for entry in self.unhosted
+            ],
+            recent=recent,
+            since_s=since_s,
         )
-    return errors
+
+    def unhosted_text(self, host: str | None) -> str | None:
+        if not self.unhosted:
+            return None
+        scope = f" for host {host}" if host else ""
+        lines = [f"jobs known only to the index{scope}:"]
+        lines += [
+            status_mod.unhosted_line(
+                entry, lost=entry.job_id in self.lost, state=self.host_state(entry)
+            )
+            for entry in self.unhosted
+        ]
+        first = next(
+            (e for e in self.unhosted if status_mod.requeue_offered(self.host_state(e))), None
+        )
+        if first is not None:
+            # The host is named only when it answered: it is there and empty,
+            # which is the wiped-home case; a gone host is not a place to send
+            # anything.
+            answered = self.host_state(first) is status_mod.HostState.ANSWERED
+            target = first.host if answered else "<name>"
+            lines.append(f"  bring one back with: gpuc requeue {first.job_id} --host {target}")
+        return "\n".join(lines)
+
+    def answer(
+        self,
+        *,
+        recent: int = status_mod.RECENT_FINISHED,
+        since_s: float | None = None,
+        text: str | None = None,
+    ) -> Answer:
+        return Answer(
+            self.document(recent=recent, since_s=since_s),
+            text,
+            failures=self.failures,
+            unknown=self.read.unreadable,
+        )
+
+
+def status(
+    read: RegistryRead,
+    settings: Settings,
+    *,
+    host: str | None = None,
+    all_jobs: bool = False,
+    on_view: Callable[[status_mod.HostView], None] | None = None,
+    report: Callable[[str], None] = note,
+) -> StatusResult:
+    """`gpuc status`, however it is going to be shown.
+
+    The registry's own errors ride along, and an unreadable registry is an
+    empty `hosts` *with* an error saying so -- exit 3 or HTTP 503 come from
+    the same `Answer`. `on_view` is called with each host as it answers, so
+    the text form can print each block without waiting for the slowest.
+    Nothing here writes the registry: forgetting a rental that has ended is
+    `forget_gone_rentals`, which only a typed command calls.
+    """
+    result = StatusResult(read, every_host=host is None)
+    entries = read.registry.listing(host) if not read.unreadable else []
+    provider = provider_for(entries, settings, report) if entries else None
+    for view in gather_all(entries, settings, provider):
+        result.views.append(view)
+        if on_view is not None:
+            on_view(view)
+    if all_jobs:
+        result.unhosted, result.lost, result.index_error = unhosted_jobs(
+            settings, result.seen, host
+        )
+    return result
 
 
 def forget_gone_rentals(
@@ -293,36 +415,9 @@ def forget_gone_rentals(
     nobody watching.
     """
     for view in views:
-        if view.pod_terminated:
+        if view.gone:
             report(f"forgetting host {view.entry.name}: its pod is gone")
-            forget_host_locked(view.entry.name, view.entry.pod_id, report)
-
-
-def registry_exit(read: RegistryRead) -> int:
-    """Exit code for reporting on the registry: 0 only if all of it parsed.
-
-    A registry that could not be read at all is exit 3 -- unknown -- while an
-    entry this build could not parse is one host missing from an answer that is
-    otherwise complete, so it is exit 1 with the rest of the answer printed.
-    """
-    if read.unreadable:
-        return EXIT_LOCAL_STATE
-    return EXIT_ERROR if read.errors else EXIT_OK
-
-
-def status_exit(
-    read: RegistryRead, views: Sequence[status_mod.HostView], *, every_host: bool = True
-) -> int:
-    """Exit code for `gpuc status`: 0 only if the whole answer is here.
-
-    A skipped registry entry counts only under `every_host` -- with `--host X`
-    the answer was never meant to cover an entry that is not X.
-    """
-    if read.unreadable:
-        return EXIT_LOCAL_STATE
-    if any(view.failure for view in views):
-        return EXIT_ERROR
-    return EXIT_ERROR if every_host and read.errors else EXIT_OK
+            forget_host(view.entry.name, view.entry.pod_id, report)
 
 
 def shipped_note(entry: HostEntry) -> str | None:
@@ -332,7 +427,9 @@ def shipped_note(entry: HostEntry) -> str | None:
     cached commit is all they have. What the host is *running* now is `gpuc
     status`, which asks it.
     """
-    return version_mod.shipped_commit_note(entry.name, entry.pkg_commit, version_mod.local_commit())
+    return version_mod.shipped_commit_note(
+        entry.name, entry.config.pkg_commit, version_mod.local_commit()
+    )
 
 
 def host_document(entry: HostEntry) -> dict[str, Any]:
@@ -345,9 +442,6 @@ def host_document(entry: HostEntry) -> dict[str, Any]:
     because that is the shape every consumer of this document already reads.
     """
     document: dict[str, Any] = json.loads(entry.model_dump_json())
-    # Derived from the address, so not in the dump, and the one word a reader
-    # scans the list by.
-    document["kind"] = entry.kind
     config = entry.config.to_dict()
     # The host file's own version says nothing about this document's shape, and
     # beside the address it reads as if it did.
@@ -356,19 +450,23 @@ def host_document(entry: HostEntry) -> dict[str, Any]:
     # names are reported and the values are not -- in the flattened copy and in
     # the cache it came from. The text listing shows neither, and this document
     # ends up in transcripts and bug reports.
-    names = dict.fromkeys(entry.env, "<set>")
+    names = dict.fromkeys(entry.config.env, "<set>")
     cache: dict[str, Any] = document.get("cache") or {}
     cache["config"] = {**(cache.get("config") or {}), "env": names}
     stale = shipped_note(entry)
     return {
         **document,
         **config,
+        # Derived from the address, so not in the dump, and the words a reader
+        # scans the list by.
+        "kind": entry.kind,
+        "pod_id": entry.pod_id,
         "env": names,
         "cache": cache,
-        "cache_dir": entry.env.get("UV_CACHE_DIR"),
+        "cache_dir": entry.config.env.get("UV_CACHE_DIR"),
         "config_seen_at": entry.seen_at,
         "remote_home": entry.remote_home,
-        "ephemeral": entry.ephemeral,
+        "ephemeral": entry.rental is not None,
         "warnings": [stale] if stale else [],
     }
 
@@ -378,6 +476,16 @@ def hosts_document(read: RegistryRead) -> dict[str, Any]:
         "hosts": [host_document(entry) for entry in read.registry.hosts.values()],
         "errors": list(read.errors),
     }
+
+
+def registry_answer(read: RegistryRead, document: dict[str, Any], text: str | None) -> Answer:
+    """A command reporting on the registry: 0 only if all of it parsed.
+
+    A registry that could not be read at all is unknown (exit 3), while an
+    entry this build could not parse is one host missing from an answer that
+    is otherwise complete: a failure, with the rest of the answer printed.
+    """
+    return Answer(document, text, failures=list(read.errors), unknown=read.unreadable)
 
 
 def connection_document(
@@ -407,24 +515,21 @@ def remove_host(name: str) -> dict[str, Any]:
     """Forget a host here. Nothing on the host, or at its provider, changes.
 
     A rental in particular is not terminated: after handoff it ends itself
-    when idle, and nothing on a client watches it. The document says so for an
-    ephemeral host, so a caller does not take "removed" for "stopped billing"
-    -- and names `gpuc host terminate`, which is the command that does.
+    when idle, and nothing on a client watches it. The document says so for a
+    rental, so a caller does not take "removed" for "stopped billing" -- and
+    names `gpuc host terminate`, which is the command that does.
     """
-    with registry_transaction() as registry:
-        entry = registry.require(name)
-        del registry.hosts[name]
-        pod_known_hosts_file(name).unlink(missing_ok=True)
+    entry = open_registry().require(name)
+    if not forget_host(name):
+        raise CliError(f"host {name} could not be removed from {hosts_file()}")
     notes = []
-    if entry.ephemeral:
-        pod = f"pod {entry.pod_id}" if entry.pod_id else "pod"
+    if entry.rental is not None:
         notes.append(
-            f"its {pod} is not terminated by this: it ends itself once its queue has been "
-            f"idle, and `gpuc pods` shows it until then"
+            f"its pod {entry.rental.pod_id} is not terminated by this: it ends itself once its "
+            f"queue has been idle, and `gpuc pods` shows it until then"
         )
-        if entry.pod_id:
-            # By pod id, not by name: this machine has just forgotten the name.
-            notes.append(f"`gpuc host terminate {entry.pod_id}` ends it now instead")
+        # By pod id, not by name: this machine has just forgotten the name.
+        notes.append(f"`gpuc host terminate {entry.rental.pod_id}` ends it now instead")
     return {"host": entry.name, "kind": entry.kind, "pod_id": entry.pod_id, "notes": notes}
 
 
@@ -456,17 +561,13 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
     anything here read it, `seen_at` says when that was, and `current` compares
     it with this build -- the same judgement the text output prints as
     `DIFFERS: re-bootstrap`. Neither asks the host now: what it is running this
-    minute is `gpuc status --json`'s `pkg_commit`. Nothing recorded on either
-    side is not evidence of a mismatch, so it reads as current -- `submit`
-    checks the host itself before it enqueues anyway.
+    minute is `gpuc status --json`'s `pkg_commit`.
     """
     commit = version_mod.local_commit()
     # Every host anything here has read, not only the ones *this* machine
     # bootstrapped: adopting a host is the ordinary way to register one.
     hosts = [
-        entry
-        for entry in read.registry.hosts.values()
-        if entry.pkg_commit or entry.bootstrapped_at or entry.seen_at
+        entry for entry in read.registry.hosts.values() if entry.seen_at or entry.bootstrapped_at
     ]
     return {
         "version": version_mod.__version__,
@@ -478,9 +579,9 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
         "hosts": [
             {
                 "name": entry.name,
-                "pkg_commit": entry.pkg_commit,
+                "pkg_commit": entry.config.pkg_commit,
                 "seen_at": entry.seen_at,
-                "current": version_mod.same_commit(commit, entry.pkg_commit),
+                "current": not version_mod.is_other_build(entry.config.pkg_commit, commit),
             }
             for entry in hosts
         ],
@@ -488,31 +589,143 @@ def version_document(read: RegistryRead) -> dict[str, Any]:
     }
 
 
-def find_job_host(
-    job_id: str, registry: Registry, explicit: str | None, settings: Settings | None = None
-) -> tuple[HostEntry, IndexEntry | None]:
-    """The host a job is on, and its index entry: `--host` if given, else the
-    index (local, then the mirror), else whichever registered host admits to
-    it. An id nothing knows is exit 4, never a guess."""
+Trouble = Unaskable | Gone
+"""Why a job's host could not confirm it holds the job."""
+
+
+def mirror_is_the_answer(trouble: Trouble) -> bool:
+    """The one rule `logs` and `wait` read the mirror by.
+
+    The spec reads the mirror only when the host is *gone*. For a gone host
+    the mirror is the answer, now, and nothing failed. A host that could not
+    be asked may still hold the job: `wait` keeps asking for
+    `TROUBLE_GRACE_S` before it reads the mirror, and `logs` prints what the
+    mirror has -- doing as much as it can -- but as a failure, exit 1 with
+    the reason, never as the answer.
+    """
+    return isinstance(trouble, Gone)
+
+
+@dataclass
+class Location:
+    """Where a job is: its host, its index entry, and what the host said when
+    it was asked to find it (None when nothing had to be asked). `entry` is
+    None for a host the index names that this machine cannot open: one with
+    no registry entry (`Gone`) or one whose entry it could not read
+    (`Unaskable`)."""
+
+    host: str
+    entry: HostEntry | None = None
+    index: IndexEntry | None = None
+    asked: Asked | None = None
+
+    @property
+    def session(self) -> HostSession | None:
+        return self.asked.session if isinstance(self.asked, Answered) else None
+
+    @property
+    def trouble(self) -> Trouble | None:
+        """The index says the job is on this host, and the host could not be
+        asked to confirm it: the caller decides whether that is the mirror's
+        moment or a failure."""
+        return None if self.asked is None or isinstance(self.asked, Answered) else self.asked
+
+    @property
+    def trouble_reason(self) -> str:
+        trouble = self.trouble
+        return trouble.reason if trouble is not None else ""
+
+    def require_entry(self) -> HostEntry:
+        """The host, for a caller that needs to open it -- which a forgotten
+        host cannot be: the job's remains are in the mirror, if anywhere."""
+        if self.entry is None:
+            raise CliError(
+                f"job's host {self.host} cannot be asked: {self.trouble_reason}\n"
+                f"`gpuc logs` reads its mirror; `gpuc requeue <id> --host <name>` re-runs it."
+            )
+        return self.entry
+
+
+def locate(
+    job_id: str,
+    registry: Registry,
+    explicit: str | None,
+    settings: Settings | None = None,
+    *,
+    provider: Provider | None = None,
+    skipped: Collection[str] = (),
+) -> Location:
+    """The host a job is on: `--host` if given, else the index (local, then
+    the mirror), else whichever registered host admits to it.
+
+    A name in the mirror's index is the *submitting* client's name for the
+    host, which need not be this machine's: it is asked first, not believed.
+    A host the index names that cannot be asked is still the answer -- the job
+    is there as far as anything knows -- carried as `trouble` for the caller
+    to judge, never hidden. A host the index names that this machine has no
+    entry for is `Gone`: a rental that ended and was forgotten, the ordinary
+    end of one, and `gpuc logs` and `gpuc wait` on its jobs must reach the
+    mirror rather than "no such job". One whose registry entry this build
+    could not read (warned about on the way in) is `Unaskable`: it is known,
+    may well be running the job, and was not asked. An id no answering host
+    knows is exit 4 only when every host answered: with one unaskable, the
+    job may well be on it, and "no such job" would be a lie told over a
+    connection error.
+    """
+    settings = settings if settings is not None else load_settings()
     if explicit:
         # The local index only: the caller already knows the host, and the
         # entry is a convenience for whoever wants the mirror prefix.
-        return registry.require(explicit), LocalIndex().get(job_id)
+        entry = registry.require(explicit)
+        return Location(entry.name, entry, LocalIndex().get(job_id))
     local = LocalIndex().get(job_id)
     if local is not None and local.host in registry.hosts:
-        return registry.hosts[local.host], local
-    index = local or JobIndex(settings or load_settings()).get(job_id)
-    # A name in the mirror's index is the *submitting* client's name for the
-    # host, which need not be this machine's: it is asked first, not believed.
-    first = [registry.hosts[index.host]] if index and index.host in registry.hosts else []
-    rest = [entry for entry in registry.hosts.values() if entry not in first]
-    for entry in [*first, *rest]:
-        try:
-            payload = open_session(entry).host_json(f"status {shlex.quote(job_id)}", timeout=60.0)
-        except (RemoteError, TransportError):
+        return Location(local.host, registry.hosts[local.host], local)
+    index = local or JobIndex(settings).get(job_id)
+    named = registry.hosts.get(index.host) if index is not None else None
+    if index is not None and named is None and index.host in skipped:
+        return Location(
+            index.host,
+            None,
+            index,
+            Unaskable(
+                f"host {index.host}'s registry entry could not be read (see the warning "
+                f"above), so it was not asked; fix the entry, or register the host again "
+                f"with `gpuc host add {index.host} --pod <id>`"
+            ),
+        )
+    rest = [entry for entry in registry.hosts.values() if entry is not named]
+    provider = provider or provider_for(list(registry.hosts.values()), settings)
+    named_trouble: Asked | None = None
+    unasked: list[str] = []
+    for entry in [named, *rest] if named is not None else rest:
+        asked = ask(entry, f"status {shlex.quote(job_id)}", settings, provider=provider)
+        if isinstance(asked, Answered):
+            if (asked.payload or {}).get("jobs"):
+                return Location(entry.name, entry, index, asked)
             continue
-        if isinstance(payload, dict) and payload.get("jobs"):
-            return entry, index
+        if entry is named:
+            named_trouble = asked
+        elif not isinstance(asked, Gone):
+            unasked.append(f"{entry.name}: {asked.reason}")
+    if named is not None and named_trouble is not None:
+        return Location(named.name, named, index, named_trouble)
+    if index is not None and named is None and not unasked:
+        return Location(
+            index.host,
+            None,
+            index,
+            Gone(
+                f"host {index.host} is not registered on this machine (a rental that ended "
+                f"is forgotten), so it cannot be asked"
+            ),
+        )
+    if unasked:
+        raise CliError(
+            f"no host that answered knows job {job_id}, and these could not be asked:\n"
+            + "\n".join(f"  {line}" for line in unasked)
+            + "\nPass --host <name>, or check `gpuc host list` and `gpuc status --all`."
+        )
     raise NotFound(
         f"no registered host knows job {job_id}.\n"
         f"Pass --host <name>, or check `gpuc host list` and `gpuc status --all`."
@@ -527,18 +740,21 @@ def job_verb(
     *,
     args: str = "",
     mirror: tuple[str, Any] | None = None,
-) -> tuple[HostEntry, HostSession, dict[str, Any], list[str]]:
+) -> tuple[Location, HostSession, dict[str, Any], list[str]]:
     """Run one on-host verb against one job: the path every job command takes.
 
-    Find the host, ask it, insist on a verdict, and put any spec change in the
-    mirror too. Returns the host, the session (for a follow-up question like
-    the queue placement), the host's document and the warnings so far.
+    Find the host, ask it over one session, insist on a verdict, and put any
+    spec change in the mirror too. Returns the location, the session (for a
+    follow-up question like the queue placement), the host's document and
+    the warnings so far.
 
     `check=False` on the host call: a refusal (a finished job, an id this host
     does not know) *is* the host's document, and raising on the exit code
-    would throw away the reason it gave. An answer with no `status` is an
-    error too: reporting success for a job the host never touched is worse
-    than any exception.
+    would throw away the reason it gave. A refusal that says `missing` is
+    the host answering "no such job", exit 4 like every other unknown name,
+    and told apart from a refusal of a job that is there by that key rather
+    than by the words. An answer with no `status` is an error too: reporting
+    success for a job the host never touched is worse than any exception.
 
     `mirror` is `(spec field, value)`: `requeue` submits what S3 holds, so a
     priority or estimate changed on the host and not in the mirror would hand
@@ -546,29 +762,53 @@ def job_verb(
     is a warning, never a failure: the change is already where `status` reads
     it, which is what was asked for.
     """
-    entry, _ = find_job_host(job_id, named_registry(), host)
-    session = open_session(entry, settings)
-    payload = session.host_json(f"{verb} {shlex.quote(job_id)}{args}", check=False)
-    document = payload if isinstance(payload, dict) else {}
+    read = open_registry()
+    location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
+    trouble = location.trouble
+    if location.entry is None or trouble is not None:
+        gone = trouble is not None and mirror_is_the_answer(trouble)
+        raise CliError(
+            f"job {job_id} is on host {location.host}, which "
+            f"{'is gone' if gone else 'could not be asked'}: {location.trouble_reason}"
+        )
+    entry = location.entry
+    asked = ask(
+        entry,
+        f"{verb} {shlex.quote(job_id)}{args}",
+        settings,
+        provider=provider_for([entry], settings),
+        session=location.session,
+        check=False,
+    )
+    if not isinstance(asked, Answered):
+        raise CliError(
+            f"job {job_id} is on host {entry.name}, which could not be asked: {asked.reason}"
+        )
+    document = asked.payload or {}
+    if document.get("missing"):
+        raise NotFound(
+            f"host {entry.name} has no job {job_id}: {document.get('error')}\n"
+            f"Check the id with `gpuc status --all`."
+        )
     if document.get("error"):
         raise CliError(f"host {entry.name} did not {verb} {job_id}: {document['error']}")
     if not document.get("status"):
         raise CliError(
-            f"host {entry.name} did not say what it did with {job_id}: {json.dumps(payload)[:200]}"
+            f"host {entry.name} did not say what it did with {job_id}: {json.dumps(document)[:200]}"
         )
     warnings: list[str] = []
     if mirror is not None:
-        note = mirror_spec_field(job_id, mirror[0], mirror[1], settings, what=mirror[0])
-        if note:
-            warnings.append(note)
-    return entry, session, document, warnings
+        warning = mirror_spec_field(job_id, mirror[0], mirror[1], settings, what=mirror[0])
+        if warning:
+            warnings.append(warning)
+    return location, asked.session, document, warnings
 
 
 def cancel_job(job_id: str, host: str | None, settings: Settings) -> dict[str, Any]:
-    entry, _, document, _ = job_verb("cancel", job_id, host, settings)
+    location, _, document, _ = job_verb("cancel", job_id, host, settings)
     # The host's own word for what it did: `cancelled` for a queued job it
     # dequeued, `cancelling` for a running one whose runner has been marked.
-    return {"job_id": job_id, "host": entry.name, "status": document["status"]}
+    return {"job_id": job_id, "host": location.host, "status": document["status"]}
 
 
 def check_priority(priority: int) -> None:
@@ -578,15 +818,15 @@ def check_priority(priority: int) -> None:
 
 def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings) -> dict[str, Any]:
     check_priority(priority)
-    entry, session, _, warnings = job_verb(
+    location, session, _, warnings = job_verb(
         "reorder", job_id, host, settings, args=f" {priority}", mirror=("priority", priority)
     )
     return {
         "job_id": job_id,
-        "host": entry.name,
+        "host": location.host,
         "priority": priority,
         "warnings": warnings,
-        **placement_after(entry, job_id, settings, session=session),
+        **placement_after(session, job_id, settings),
     }
 
 
@@ -603,7 +843,7 @@ def preempt_job(
     """
     if priority is not None:
         check_priority(priority)
-    entry, _, document, warnings = job_verb(
+    location, _, document, warnings = job_verb(
         "preempt",
         job_id,
         host,
@@ -613,29 +853,24 @@ def preempt_job(
     )
     return {
         "job_id": job_id,
-        "host": entry.name,
+        "host": location.host,
         "status": document["status"],
         "priority": document.get("priority"),
         "warnings": warnings,
     }
 
 
-def placement_after(
-    entry: HostEntry, job_id: str, settings: Settings, *, session: HostSession | None = None
-) -> dict[str, Any]:
+def placement_after(session: HostSession, job_id: str, settings: Settings) -> dict[str, Any]:
     """Where the job now sits in the host's queue: what `submit` and `reorder`
     answer "so when does it run" with.
 
-    Asked *after* the enqueue or the move, so it is best effort by
-    construction: whatever goes wrong here costs a document of nulls, never the
-    command's exit code -- the job is queued either way, and a submit that
-    printed a traceback over a job it had already enqueued would be worse than
-    one that said nothing about the queue.
+    Asked *after* the enqueue or the move, over the same session, so it is
+    best effort by construction: whatever goes wrong here costs a document of
+    nulls, never the command's exit code -- the job is queued either way, and
+    a submit that printed a traceback over a job it had already enqueued would
+    be worse than one that said nothing about the queue.
     """
-    try:
-        view = status_mod.gather(entry, settings, session=session)
-    except (ConfigError, ProviderError, RemoteError, TransportError, OSError):
-        return status_mod.placement_unknown()
+    view = status_mod.gather(session.entry, settings, session=session)
     return status_mod.queue_placement(view, job_id)
 
 
@@ -686,7 +921,7 @@ def estimate_job(
 
     `wanted` has been through `check_estimate`; None clears the estimate.
     """
-    entry, _, document, warnings = job_verb(
+    location, _, document, warnings = job_verb(
         "estimate",
         job_id,
         host,
@@ -700,14 +935,14 @@ def estimate_job(
         # Otherwise a host whose answer lacks the key reports a successful
         # *clear* of a job it never touched.
         raise CliError(
-            f"host {entry.name} did not say what estimate it recorded for {job_id}: "
+            f"host {location.host} did not say what estimate it recorded for {job_id}: "
             f"{json.dumps(document)[:200]}"
         )
     if document.get("warning"):
         warnings.insert(0, str(document["warning"]))
     return {
         "job_id": job_id,
-        "host": entry.name,
+        "host": location.host,
         "estimated_runtime_min": recorded,
         "status": document["status"],
         "warnings": warnings,
@@ -723,6 +958,11 @@ class LogText:
     location: str | None
     text: str = ""
     notes: list[str] = field(default_factory=list)
+    failure: str | None = None
+    """Why this is not the answer: the host may still hold the log and could
+    not be asked. The mirror was read anyway (doing as much as it can), but
+    the command exits 1 with this. None when the host produced the log, or
+    is gone and the mirror is the answer."""
 
     def document(self, job_id: str, host: str) -> dict[str, Any]:
         return {
@@ -734,10 +974,12 @@ class LogText:
             "notes": self.notes,
         }
 
-
-def job_log_path(entry: HostEntry, job_id: str, settings: Settings) -> tuple[HostSession, str]:
-    session = open_session(entry, settings)
-    return session, f"{session.job_dir(job_id)}/log.txt"
+    def answer(self, job_id: str, host: str) -> Answer:
+        return Answer(
+            self.document(job_id, host),
+            self.text,
+            failures=[self.failure] if self.failure else [],
+        )
 
 
 def read_log(
@@ -747,32 +989,52 @@ def read_log(
     settings: Settings,
     *,
     report: Callable[[str], None] = note,
-) -> tuple[HostEntry, LogText]:
-    """The tail of a job's log from its host, else from the S3 mirror."""
-    entry, index = find_job_host(job_id, named_registry(), host)
+) -> tuple[str, LogText]:
+    """The tail of a job's log from its host, else from the S3 mirror.
+
+    Host first, always: the mirror is a copy of what the host uploaded last,
+    and is read only when the host cannot produce the log. When that is
+    because the host is gone (`mirror_is_the_answer`) or the job dir was
+    purged, the mirror is the answer; when the host merely could not be
+    asked, the mirror is printed and the command still fails, because the
+    host may hold a newer log than the copy.
+    """
+    read = open_registry()
+    location = locate(job_id, read.named(), host, settings, skipped=read.skipped)
+    reached = location.asked
+    if reached is None:
+        entry = location.require_entry()
+        reached = ask(entry, None, settings, provider=provider_for([entry], settings))
     remote = None
     purged = False
-    try:
-        session, remote = job_log_path(entry, job_id, settings)
-        result = session.transport.tail(remote, lines=lines)
-        if result.returncode == 0:
-            return entry, LogText("host", remote, result.stdout)
-        purged = job_dir_gone(session, job_id)
-        why = (result.output.strip().splitlines() or ["no log file on the host"])[-1]
-    except (RemoteError, TransportError) as exc:
-        why = str(exc).splitlines()[0]
+    failed = False
+    if isinstance(reached, Answered):
+        session = reached.session
+        remote = f"{session.job_dir(job_id)}/log.txt"
+        try:
+            result = session.transport.tail(remote, lines=lines)
+            if result.returncode == 0:
+                return location.host, LogText("host", remote, result.stdout)
+            purged = job_dir_gone(session, job_id)
+            why = (result.output.strip().splitlines() or ["no log file on the host"])[-1]
+        except (RemoteError, TransportError) as exc:
+            why, failed = reason_of(exc), True
+    else:
+        why, failed = reached.reason, not mirror_is_the_answer(reached)
     # A job dir that is gone entirely is what `gpuc clean --purge` does on
     # purpose. Saying "purged" beats printing a `tail: No such file`.
     missing = (
-        f"job {job_id} was purged from host {entry.name} "
+        f"job {job_id} was purged from host {location.host} "
         f"(gpuc clean --purge removes the whole job dir once it is mirrored)"
         if purged
         else f"could not read {remote or 'the host log'}: {why}"
     )
     report(missing)
-    log = logs_from_s3(job_id, entry, index, settings, purged=purged, report=report)
+    log = logs_from_s3(job_id, location, settings, purged=purged, report=report)
     log.notes.insert(0, missing)
-    return entry, log
+    if failed:
+        log.failure = missing
+    return location.host, log
 
 
 def job_dir_gone(session: HostSession, job_id: str) -> bool:
@@ -786,18 +1048,17 @@ def job_dir_gone(session: HostSession, job_id: str) -> bool:
 
 def logs_from_s3(
     job_id: str,
-    entry: HostEntry,
-    index: IndexEntry | None,
+    location: Location,
     settings: Settings,
     *,
     purged: bool = False,
     report: Callable[[str], None] = note,
 ) -> LogText:
     s3 = S3Index.from_settings(settings)
-    prefix = JobIndex(settings).mirror_prefix(job_id, entry)
+    prefix = JobIndex(settings).mirror_prefix(job_id, location.entry)
     if s3 is None or not prefix:
         gone = (
-            f"Its job dir was purged from host {entry.name}, so this log no longer exists "
+            f"Its job dir was purged from host {location.host}, so this log no longer exists "
             f"anywhere.\n"
             if purged
             else ""
@@ -814,6 +1075,43 @@ def logs_from_s3(
     return LogText("s3", uri, s3.get_uri(uri), [fallback])
 
 
+def mirrored_outcome(
+    index: JobIndex, job_id: str, prefix: str | None
+) -> tuple[status_mod.JobView, str] | None:
+    """A job's terminal state from the S3 mirror, and where it was read, or
+    None when the mirror has no terminal state for it.
+
+    The one reader of a mirrored `state.json`: what `gpuc wait` and `gpuc logs
+    -f` fall back to once a host is gone, per the spec's "the mirror is read
+    only when the host is gone". Through `job_views`, so another build's
+    state.json is read as tolerantly here as a host's own answer is. The two
+    fields the file cannot carry are supplied: `name` lives in the spec, and
+    `outputs_pending` is the host's own check against the spec, which is why a
+    mirrored `outputs_lost` has to stand on its own here -- this is the
+    dead-rental case, and it is the same case that loses outputs.
+    """
+    document = index.mirrored_state(job_id, prefix)
+    if document is None or not prefix:
+        return None
+    indexed = index.get(job_id)
+    _, _, finished = status_mod.job_views(
+        {
+            "jobs": [
+                {
+                    **document,
+                    "job_id": job_id,
+                    "name": (indexed.name if indexed else "") or "",
+                    "outputs_pending": bool(document.get("outputs_lost")),
+                }
+            ]
+        }
+    )
+    view = next((v for v in finished if v.status in FINISHED_STATUSES), None)
+    if view is None:
+        return None
+    return view, job_uri(prefix, job_id, "state.json")
+
+
 def unhosted_jobs(
     settings: Settings, seen: set[str], host: str | None = None
 ) -> tuple[list[IndexEntry], set[str], str | None]:
@@ -823,7 +1121,9 @@ def unhosted_jobs(
     After a host loses its state -- a container whose $HOME was wiped, a pod
     that is gone -- this is the only list of what was on it, and `gpuc requeue
     <id> --host <name>` is how each one comes back, so `--host H --all` narrows
-    it to the host being recovered.
+    it to the host being recovered. "No host admitted to having" includes a
+    host that could not be asked, so each entry is labelled with what its
+    host was found to be (`StatusResult.host_state`) before anyone acts on it.
 
     Returns the entries, the ids among them whose outputs the mirror records as
     lost, and why the list may be short (None when the index was read in full).
@@ -848,13 +1148,11 @@ handful at the top of a recovery list."""
 
 def _outputs_lost_ids(index: JobIndex, entries: Sequence[IndexEntry]) -> set[str]:
     """Which of these jobs the mirror records as having lost their outputs.
-
-    Best effort: a job whose state.json is missing or unreadable simply does not
-    get the flag, because this is a note on a listing, not a decision.
-    """
-    return {
-        entry.job_id
-        for entry in entries
-        if (document := index.mirrored_state(entry.job_id, entry.s3_prefix))
-        and document.get("outputs_lost")
-    }
+    Best effort: a job whose state.json is missing or unreadable is not
+    flagged, which is a note missing from a listing and nothing more."""
+    lost: set[str] = set()
+    for entry in entries:
+        document = index.mirrored_state(entry.job_id, entry.s3_prefix)
+        if document and document.get("outputs_lost"):
+            lost.add(entry.job_id)
+    return lost
