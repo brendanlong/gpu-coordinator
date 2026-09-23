@@ -33,7 +33,8 @@ from gpuc.control.web.auth import (
     read_password_hash,
     verify,
 )
-from tests.conftest import register_host
+from gpuc.host.jobs import HostConfig
+from tests.conftest import host_entry, register_host
 
 PASSWORD = "correct horse battery"
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -371,6 +372,26 @@ def test_hosts_and_version_are_the_list_and_version_documents(
     assert status == 200 and document["version"]
 
 
+def test_a_host_that_could_not_be_read_is_the_clis_exit_one_on_the_wire(
+    logged_in: Client, control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One table from exit code to HTTP status: a status the CLI exits 1 on is
+    a 500 that still carries every host, not a 200 that hides the failure."""
+    from gpuc.control.exits import EXIT_ERROR, http_status
+
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
+
+    def unreachable(entry: HostEntry, *a: object, **k: object) -> HostView:
+        return HostView(entry=entry, state=HostState.UNREACHABLE, error="ssh timed out")
+
+    monkeypatch.setattr(status_mod, "gather", unreachable)
+    status, document = logged_in.get_json("/api/status")
+    assert status == http_status(EXIT_ERROR) == 500
+    (host,) = document["hosts"]
+    assert host["reachable"] is False and host["errors"] == ["ssh timed out"]
+    assert "error" not in document
+
+
 def test_an_unreadable_registry_is_503_with_the_reason(logged_in: Client) -> None:
     path = hosts_file()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -389,6 +410,8 @@ class StubSession:
         self.commands: list[str] = []
         self.log = log
         self.transport = self
+        self.entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU])
+        self.config = HostConfig(host="gpubox", gpus=[GPU])
 
     def host_json(self, args: str, **_: Any) -> Any:
         self.commands.append(args)
@@ -411,7 +434,7 @@ class StubSession:
 def stub(monkeypatch: pytest.MonkeyPatch, one_host: None) -> StubSession:
     session = StubSession([])
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session", lambda *a, **k: cast("HostSession", session)
+        "gpuc.control.remote.open_session", lambda *a, **k: cast("HostSession", session)
     )
     return session
 
@@ -509,18 +532,28 @@ def test_a_job_id_that_is_not_one_is_refused_before_any_host(
     assert stub.commands == []
 
 
-def test_an_unknown_job_is_404(
+def test_an_unknown_job_is_404(logged_in: Client, stub: StubSession) -> None:
+    """Every host answered and none has it: exit 4, HTTP 404."""
+    stub.answers.append({"jobs": []})
+    status, document = logged_in.post_json("/api/jobs/20260101-000000-aaaaaa/cancel", {})
+    assert status == 404
+    assert "no registered host knows job" in document["error"]
+
+
+def test_a_host_that_cannot_be_asked_is_a_failure_not_a_missing_job(
     logged_in: Client, one_host: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The host is asked and cannot answer, so the job is nowhere: exit 4, HTTP 404."""
+    """The one host that may hold the job is down: exit 1 and HTTP 500 with
+    the reason, never "no such job" told over a connection error."""
 
     def down(*a: object, **k: object) -> Any:
         raise RemoteError("gpubox", "status", "ssh timed out")
 
-    monkeypatch.setattr("gpuc.control.actions.open_session", down)
+    monkeypatch.setattr("gpuc.control.remote.open_session", down)
     status, document = logged_in.post_json("/api/jobs/20260101-000000-aaaaaa/cancel", {})
-    assert status == 404
-    assert "no registered host knows job" in document["error"]
+    assert status == 500 and document["exit_code"] == 1
+    assert "gpubox: ssh timed out" in document["error"]
+    assert "no registered host knows" not in document["error"]
 
 
 def test_a_bad_body_is_400(logged_in: Client, one_host: None) -> None:

@@ -7,9 +7,11 @@ from typing import Any, cast
 
 import pytest
 
+from gpuc.control import version as version_mod
 from gpuc.control.clean import purge_host
 from gpuc.control.cli import (
     EXIT_ERROR,
+    EXIT_INTERRUPTED,
     EXIT_LOCAL_STATE,
     EXIT_NOT_FOUND,
     EXIT_USAGE,
@@ -22,15 +24,15 @@ from gpuc.control.config import (
     Settings,
     config_file,
     hosts_file,
-    load_registry,
     load_settings,
     registry_transaction,
 )
 from gpuc.control.providers.base import Constraints, Pod
-from gpuc.control.remote import HostSession, RemoteError
+from gpuc.control.remote import NO_CONFIG, HostConfigRead, HostSession, RemoteError
 from gpuc.control.status import placement_unknown
-from gpuc.control.submit import JobSpecModel, SubmitResult, expand_job_id
-from tests.conftest import host_entry, register_host
+from gpuc.control.submit import JobSpecModel, Prepared, SubmitResult, expand_job_id
+from gpuc.host.jobs import HostConfig
+from tests.conftest import host_entry, load_registry, register_host
 from tests.fakehost import GPU_ROWS, PROBE_SECTIONS, FakeHost
 from tests.fakeprovider import FakeProvider, fake_bootstrap, running_pod
 from tests.fakes3 import FakeS3Client
@@ -45,7 +47,7 @@ def test_host_add_writes_the_first_config_of_a_host_that_has_none(
     one -- and the only place this machine decides what a host is."""
     assert main(["host", "add", "local", "--gpus", GPU]) == 0
     entry = load_registry().require("local")
-    assert (entry.kind, entry.gpus, entry.ssh) == ("local", [GPU], None)
+    assert (entry.kind, entry.config.gpus, entry.ssh) == ("local", [GPU], None)
     assert fake_host.config is not None
     assert (fake_host.config["host"], fake_host.config["gpus"]) == ("local", [GPU])
     assert fake_host.config["created_at"]
@@ -69,10 +71,10 @@ def test_host_add_adopts_the_config_a_host_already_has(
     fake_host.put_file(json.dumps(theirs), "/home/u/.gpuc/config.json")
     assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
     entry = load_registry().require("gpubox")
-    assert entry.gpus == ["2", "3"]
-    assert entry.s3_prefix == "s3://theirs/gpuc/gpubox"
-    assert entry.retention_days == 30.0
-    assert entry.env == {"HF_HOME": "/big"}
+    assert entry.config.gpus == ["2", "3"]
+    assert entry.config.s3_prefix == "s3://theirs/gpuc/gpubox"
+    assert entry.config.retention_days == 30.0
+    assert entry.config.env == {"HF_HOME": "/big"}
     assert entry.seen_at
     assert fake_host.config == theirs  # nothing was written to the host
     assert "adopted the config on the host" in capsys.readouterr().out
@@ -194,14 +196,14 @@ def test_a_second_machine_registers_the_same_box_and_agrees_with_the_first(
     monkeypatch.setenv("GPUC_STATE_DIR", str(control_env / "laptop-state"))
     assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
     second = load_registry().require("gpubox")
-    assert second.gpus == first.gpus == ["2", "3"]
-    assert second.created_at == first.created_at
+    assert second.config.gpus == first.config.gpus == ["2", "3"]
+    assert second.config.created_at == first.config.created_at
 
     # And a change from the laptop is the host's, so the desktop sees it.
     assert main(["host", "set", "gpubox", "--gpus", "2,3,4"]) == 0
     monkeypatch.setenv("GPUC_STATE_DIR", str(control_env / "state"))
     assert main(["host", "probe", "gpubox"]) == 0
-    assert load_registry().require("gpubox").gpus == ["2", "3", "4"]
+    assert load_registry().require("gpubox").config.gpus == ["2", "3", "4"]
 
 
 def test_host_set_keeps_the_cache_dir_a_new_env_did_not_mention(
@@ -233,9 +235,7 @@ def test_host_set_that_changes_nothing_does_not_rewrite_the_hosts_config(
     capsys.readouterr()
     assert main(["host", "set", "gpubox", "--gpus", "0"]) == 0
     assert "nothing changed" in capsys.readouterr().out
-    written = [
-        c for c in fake_host.commands[len(before) :] if "config --merge" in c or "mv -f" in c
-    ]
+    written = [c for c in fake_host.commands[len(before) :] if "mv -f" in c]
     assert written == []
 
 
@@ -248,7 +248,7 @@ def test_host_add_owns_every_card_by_default_on_a_host_with_no_config(
     assert fake_host.config is not None
     assert fake_host.config["gpus"] == ["GPU-a", "GPU-b"]
     assert fake_host.config.get("shared_gpus", []) == []
-    assert load_registry().require("gpubox").gpus == ["GPU-a", "GPU-b"]
+    assert load_registry().require("gpubox").config.gpus == ["GPU-a", "GPU-b"]
     out = capsys.readouterr().out
     assert "with 2 GPU(s)" in out
     assert "wrote its first config" in out
@@ -276,7 +276,7 @@ def test_host_add_without_gpus_keeps_what_a_configured_host_has(
     fake_host.put_file('{"host": "gpubox", "gpus": ["0"]}', "/home/u/.gpuc/config.json")
     assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
     assert fake_host.config is not None and fake_host.config["gpus"] == ["0"]
-    assert load_registry().require("gpubox").gpus == ["0"]
+    assert load_registry().require("gpubox").config.gpus == ["0"]
     assert "host <- gpus" not in capsys.readouterr().out
 
 
@@ -299,7 +299,7 @@ def test_host_add_registers_a_host_with_no_cards_and_says_so(
     assert "reports no GPUs" in capsys.readouterr().err
     assert main(["host", "add", "cpubox", "--ssh", "me@cpu", "--gpus", ""]) == 0
     assert fake_host.config is not None and fake_host.config["gpus"] == []
-    assert load_registry().require("cpubox").gpus == []
+    assert load_registry().require("cpubox").config.gpus == []
     out = capsys.readouterr().out
     assert "owns no GPUs (--gpus '' asked for none)" in out
     assert "gpuc host set cpubox --gpus <list>" in out
@@ -319,7 +319,7 @@ def test_host_add_ssh_records_the_target_and_port(control_env: Path) -> None:
     register_host(name="gpubox", kind="ssh", ssh="me@box", port=2222, gpus="GPU-a,GPU-b")
     entry = load_registry().require("gpubox")
     assert (entry.kind, entry.ssh, entry.port) == ("ssh", "me@box", 2222)
-    assert entry.gpus == ["GPU-a", "GPU-b"]
+    assert entry.config.gpus == ["GPU-a", "GPU-b"]
 
 
 def test_host_list_and_remove(control_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -353,26 +353,41 @@ def test_use_shared_is_an_override_of_the_spec_and_only_when_it_is_passed(
 ) -> None:
     """A flag that was not typed is not an opinion: a spec that already says
     `use_shared: true` must keep saying it."""
-    seen: list[dict[str, Any]] = []
+    seen: list[bool] = []
 
-    def capture(entry: Any, job_file: Any, settings: Any, overrides: Any = None, **_: Any) -> Any:
-        seen.append(dict(overrides or {}))
-        return SubmitResult(job_id="j", host="gpubox", attempt=1)
+    def capture(entry: Any, prepared: Prepared, *a: Any, **k: Any) -> Any:
+        seen.append(prepared.spec.use_shared)
+        return SubmitResult(job_id="j", host=entry.name)
 
-    monkeypatch.setattr("gpuc.control.submitting.submit_file", capture)
-    monkeypatch.setattr(
-        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
-    )
-    monkeypatch.setattr(
-        "gpuc.control.submitting.placement_after", lambda *a, **k: placement_unknown()
-    )
+    monkeypatch.setattr("gpuc.control.submitting.enqueue", capture)
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
 
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert main(["submit", str(job), "--host", "gpubox", "--use-shared"]) == 0
-    assert seen == [{"use_shared": None}, {"use_shared": True}]
+    assert seen == [False, True]
+    job.write_text('command: "true"\nuse_shared: true\n')
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert seen[-1] is True
+
+
+def test_an_invalid_spec_never_touches_the_host(
+    control_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything that needs no host is judged before any host is asked: a
+    typo in the job file costs no ssh round trip, and no pod."""
+    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
+    monkeypatch.setattr(
+        "gpuc.control.remote.open_session",
+        lambda *a, **k: pytest.fail("an invalid spec must not open a session"),
+    )
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\nmax_runtime_mins: 5\n')
+    assert main(["submit", str(job), "--host", "gpubox"]) == EXIT_ERROR
+    job.write_text('command: "true"\nsecrets: [NO_SUCH_SECRET_HERE]\n')
+    monkeypatch.delenv("NO_SUCH_SECRET_HERE", raising=False)
+    assert main(["submit", str(job), "--host", "gpubox"]) == EXIT_ERROR
 
 
 def test_status_with_no_hosts_is_not_an_error(
@@ -410,7 +425,7 @@ def test_submit_runpod_without_a_gpu_name_says_which_flag_is_missing(
     assert "--gpu <name>" in capsys.readouterr().err
 
 
-def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
+def test_submit_runpod_passes_the_flags_through(
     control_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job = tmp_path / "job.yaml"
@@ -426,15 +441,15 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
         seen.update(kwargs)
         seen["constraints"] = constraints
         seen["mirrored_before_provisioning"] = sorted(s3.objects)
-        return host_entry(name="gpuc-e2e-1", kind="runpod", gpus=["GPU-1"])
+        return host_entry(name="gpuc-e2e-1", kind="rental", gpus=["GPU-1"])
 
-    def fake_submit_spec(entry: HostEntry, model: object, *args: object, **kwargs: object):
+    def fake_enqueue(entry: HostEntry, prepared: Prepared, *args: object, **kwargs: object):
         seen["host"] = entry.name
-        seen["job_id"] = kwargs["job_id"]
-        return SubmitResult(job_id=str(kwargs["job_id"]), host=entry.name, attempt=1)
+        seen["job_id"] = prepared.spec.job_id
+        return SubmitResult(job_id=prepared.spec.job_id, host=entry.name)
 
     monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
-    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit_spec)
+    monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
 
     assert (
         main(
@@ -470,8 +485,9 @@ def test_submit_runpod_passes_the_flags_through_and_mirrors_the_spec_first(
     assert constraints.clouds == ["SECURE", "COMMUNITY"]
     assert (seen["idle_minutes"], seen["disk_gb"]) == (2.0, 20)
     assert (seen["reuse"], seen["name_hint"]) == (False, "e2e")
-    mirrored = seen["mirrored_before_provisioning"]
-    assert isinstance(mirrored, list) and mirrored == [f"bucket/gpuc/specs/{seen['job_id']}.json"]
+    # The spec is mirrored once, after the host has accepted it: nothing is
+    # written to S3 before a pod is bought.
+    assert seen["mirrored_before_provisioning"] == []
 
 
 def test_pods_lists_ours_and_counts_the_others(
@@ -480,7 +496,7 @@ def test_pods_lists_ours_and_counts_the_others(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider(existing=[running_pod("other-tenant", "podF")])
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
     assert main(["pods", "--no-heartbeat"]) == 0
     out = capsys.readouterr().out
     assert "gpuc-e2e-aaa" in out
@@ -501,17 +517,17 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
 
     def fake_runpod_host(constraints: Constraints, settings: Settings, **kwargs: object):
         seen["gpu_names"] = constraints.gpu_names
-        return host_entry(name="gpuc-e2e-1", kind="runpod", gpus=["GPU-1"])
+        return host_entry(name="gpuc-e2e-1", kind="rental", gpus=["GPU-1"])
 
-    def fake_submit_spec(entry: HostEntry, model: object, *args: object, **kwargs: object):
-        seen["attempt"] = kwargs["attempt"]
-        return SubmitResult(job_id="new", host=entry.name, attempt=2)
+    def fake_enqueue(entry: HostEntry, prepared: Prepared, *args: object, **kwargs: object):
+        seen["requeued_from"] = prepared.requeued_from
+        return SubmitResult(job_id="new", host=entry.name, requeued_from=prepared.requeued_from)
 
     monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
-    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit_spec)
+    monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 0
-    assert seen == {"gpu_names": ["A40"], "attempt": 2}
+    assert seen == {"gpu_names": ["A40"], "requeued_from": "20260101-000000-aaaaaa"}
 
 
 # -- first-run experience -------------------------------------------------------
@@ -612,7 +628,7 @@ def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
     created: list[object] = []
     monkeypatch.setattr(
         "gpuc.control.submitting.runpod_host",
-        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
+        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
     )
 
     assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
@@ -633,7 +649,7 @@ def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
     monkeypatch.delenv("GPUC_DEFINITELY_UNSET", raising=False)
     monkeypatch.setattr(
         "gpuc.control.submitting.runpod_host",
-        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="runpod"),
+        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
     )
 
     assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
@@ -645,12 +661,14 @@ def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
 
 
 class StubSession:
-    """A host that answers `purge` with whatever the test wants."""
+    """A host that answers `purge` (or anything else) with whatever the test wants."""
 
     def __init__(self, payloads: list[dict[str, object]]) -> None:
         self.payloads = payloads
         self.calls: list[str] = []
         self.checked: list[bool] = []
+        self.entry = mirrored_host()
+        self.config = self.entry.config
 
     def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
         self.calls.append(args)
@@ -816,7 +834,10 @@ def test_verified_mirrors_are_the_ids_with_a_log_under_the_hosts_prefix(
         },
         page_size=2,
     )
-    assert verified_mirrors(mirrored_host(), Settings(), client=client) == ["a", "b"]
+    assert verified_mirrors(mirrored_host().config.s3_prefix, Settings(), client=client) == [
+        "a",
+        "b",
+    ]
     assert {call["Prefix"] for call in client.list_calls} == {"gpuc/gpubox/jobs/"}
     assert len(client.list_calls) > 1  # followed the continuation tokens
 
@@ -825,8 +846,7 @@ def test_verified_mirrors_of_a_host_with_no_prefix_is_nothing(control_env: Path)
     from gpuc.control.clean import verified_mirrors
 
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/a/log.txt": b""})
-    entry = host_entry(name="gpubox", ssh="me@gpubox")
-    assert verified_mirrors(entry, Settings(), client=client) == []
+    assert verified_mirrors(None, Settings(), client=client) == []
     assert client.list_calls == []
 
 
@@ -838,22 +858,26 @@ def test_verified_mirrors_raises_when_the_listing_fails(control_env: Path) -> No
             raise RuntimeError("AccessDenied")
 
     with pytest.raises(CleanError, match=r"s3://bucket/gpuc/gpubox/jobs/.*AccessDenied"):
-        verified_mirrors(mirrored_host(), Settings(), client=Refusing())
+        verified_mirrors(mirrored_host().config.s3_prefix, Settings(), client=Refusing())
 
 
-# -- find_job_host --------------------------------------------------------------
+# -- locate ----------------------------------------------------------------------
 
 
 def _probes(monkeypatch: pytest.MonkeyPatch, answers: dict[str, object]) -> list[str]:
-    """Stand in for `open_session` in `find_job_host`: each host answers its
-    `status <id>` with `answers[name]`. Returns the hosts that were asked."""
+    """Stand in for `open_session` in `locate`: each host answers its
+    `status <id>` with `answers[name]`, or cannot be reached when its answer
+    is an exception. Returns the hosts that were asked."""
     asked: list[str] = []
 
     def session(entry: HostEntry, *_: object, **__: object) -> object:
         asked.append(entry.name)
-        return SimpleNamespace(host_json=lambda *a, **k: answers.get(entry.name, {"jobs": []}))
+        answer = answers.get(entry.name, {"jobs": []})
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(entry=entry, config=HostConfig(), host_json=lambda *a, **k: answer)
 
-    monkeypatch.setattr("gpuc.control.actions.open_session", session)
+    monkeypatch.setattr("gpuc.control.remote.open_session", session)
     return asked
 
 
@@ -863,7 +887,7 @@ def test_a_second_client_asks_the_host_the_mirror_names_first(
     """This machine never submitted the job, so its local index is empty; the
     S3 index entry the submitting machine wrote names the host -- by *that*
     machine's name for it, so it is asked first rather than believed."""
-    from gpuc.control.actions import find_job_host
+    from gpuc.control.actions import locate
     from gpuc.control.s3index import IndexEntry, S3Index
 
     register_host(name="first", ssh="me@first")
@@ -875,17 +899,19 @@ def test_a_second_client_asks_the_host_the_mirror_names_first(
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
 
-    entry, index = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
-    assert entry.name == "gpubox"
-    assert index is not None and index.s3_prefix == "s3://bkt/gpuc/gpubox"
+    location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert location.entry.name == "gpubox"
+    assert location.index is not None and location.index.s3_prefix == "s3://bkt/gpuc/gpubox"
     assert asked == ["gpubox"]
+    # The session that found it is the one the caller goes on using.
+    assert location.session is not None and location.trouble is None
 
 
 def test_a_mirror_index_naming_a_host_that_does_not_know_the_job_is_not_believed(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Another client's `gpu1` may be this client's `lab`."""
-    from gpuc.control.actions import find_job_host
+    from gpuc.control.actions import locate
     from gpuc.control.s3index import IndexEntry, S3Index
 
     register_host(name="gpu1", ssh="me@mine")
@@ -895,8 +921,7 @@ def test_a_mirror_index_naming_a_host_that_does_not_know_the_job_is_not_believed
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     asked = _probes(monkeypatch, {"lab": {"jobs": [{"job_id": "j1"}]}})
 
-    entry, _ = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
-    assert entry.name == "lab"
+    assert locate("j1", load_registry(), None, Settings(s3_bucket="bkt")).entry.name == "lab"
     assert asked == ["gpu1", "lab"]
 
 
@@ -904,7 +929,7 @@ def test_a_job_the_mirror_has_no_entry_for_is_found_by_asking_the_hosts(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A missing index object is "not indexed", not an error: the probe goes on."""
-    from gpuc.control.actions import find_job_host
+    from gpuc.control.actions import locate
 
     register_host(name="first", ssh="me@first")
     register_host(name="gpubox", ssh="me@gpubox")
@@ -912,22 +937,71 @@ def test_a_job_the_mirror_has_no_entry_for_is_found_by_asking_the_hosts(
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
 
-    entry, index = find_job_host("j1", load_registry(), None, Settings(s3_bucket="bkt"))
-    assert entry.name == "gpubox"
-    assert index is None
+    location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert location.entry.name == "gpubox"
+    assert location.index is None
     assert "gpubox" in asked
 
 
 def test_a_job_no_index_and_no_host_knows_is_not_found(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from gpuc.control.actions import NotFound, find_job_host
+    from gpuc.control.actions import NotFound, locate
 
     register_host(name="gpubox", ssh="me@gpubox")
     asked = _probes(monkeypatch, {})
     with pytest.raises(NotFound, match="no registered host knows job j1"):
-        find_job_host("j1", load_registry(), None, Settings())
+        locate("j1", load_registry(), None, Settings())
     assert asked == ["gpubox"]
+
+
+def test_a_host_that_could_not_be_asked_is_a_failure_with_its_reason_not_a_missing_job(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The job may well be on the host that is down. "No such job" told over a
+    connection error is a lie, and exit 4 would send a script the wrong way."""
+    from gpuc.control.actions import CliError, NotFound, locate
+
+    register_host(name="up", ssh="me@up")
+    register_host(name="down", ssh="me@down")
+    down = RemoteError("down", "printf %s", "could not reach host down: ssh timed out")
+    _probes(monkeypatch, {"down": down})
+    with pytest.raises(CliError) as caught:
+        locate("j1", load_registry(), None, Settings())
+    assert not isinstance(caught.value, NotFound)
+    assert "down: could not reach host down: ssh timed out" in str(caught.value)
+
+
+def test_a_job_the_index_puts_on_an_unreachable_host_stays_on_it(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The index says where the job is; the host cannot confirm it. The
+    location carries the trouble for the caller to judge -- `logs` reads the
+    mirror, a verb refuses with the reason -- and never hides it."""
+    from gpuc.control.actions import locate
+    from gpuc.control.s3index import IndexEntry, S3Index
+
+    register_host(name="gpubox", ssh="me@gpubox")
+    register_host(name="other", ssh="me@other")
+    client = FakeS3Client()
+    S3Index("bkt", client).put_index(IndexEntry(job_id="j1", host="gpubox"))
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    _probes(monkeypatch, {"gpubox": RemoteError("gpubox", "printf %s", "no route to host")})
+    location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
+    assert location.entry.name == "gpubox"
+    assert location.trouble is not None and "no route to host" in location.trouble_reason
+
+
+def test_a_verb_on_a_job_whose_host_is_down_is_exit_one_with_the_reason(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register_host(name="gpubox", ssh="me@gpubox")
+    _probes(monkeypatch, {"gpubox": RemoteError("gpubox", "printf %s", "no route to host")})
+    capsys.readouterr()
+    assert main(["cancel", "20260101-000000-aaaaaa", "--json"]) == EXIT_ERROR
+    document = one_document(capsys)
+    assert document["exit_code"] == EXIT_ERROR
+    assert "no route to host" in str(document["error"])
 
 
 def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path) -> None:
@@ -1085,10 +1159,10 @@ def test_an_empty_only_is_a_usage_error_not_a_silent_no_op(
 def test_retention_days_is_stored_and_cleared(control_env: Path, fake_host: FakeHost) -> None:
     add = ["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "", "--retention-days", "14"]
     assert main(add) == 0
-    assert load_registry().require("gpubox").retention_days == 14.0
+    assert load_registry().require("gpubox").config.retention_days == 14.0
     assert fake_host.config is not None and fake_host.config["retention_days"] == 14.0
     assert main(["host", "set", "gpubox", "--retention-days", ""]) == 0
-    assert load_registry().require("gpubox").retention_days is None
+    assert load_registry().require("gpubox").config.retention_days is None
     assert fake_host.config["retention_days"] is None
 
 
@@ -1106,7 +1180,7 @@ def test_a_host_getting_its_first_config_sweeps_workdirs_after_a_day(
 ) -> None:
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", ""]) == 0
     assert fake_host.config is not None and fake_host.config["workdir_days"] == 1.0
-    assert load_registry().require("gpubox").workdir_days == 1.0
+    assert load_registry().require("gpubox").config.workdir_days == 1.0
     # ...and it is the only horizon that is on without being asked for.
     assert fake_host.config["retention_days"] is None
 
@@ -1130,10 +1204,10 @@ def test_workdir_days_is_stored_and_cleared(control_env: Path, fake_host: FakeHo
     # Zero is a real horizon -- "reclaim it as soon as it finishes" -- and must
     # not be confused with the empty string that turns the sweep off.
     assert fake_host.config["workdir_days"] == 0.0
-    assert load_registry().require("gpubox").workdir_days == 0.0
+    assert load_registry().require("gpubox").config.workdir_days == 0.0
     assert main(["host", "set", "gpubox", "--workdir-days", ""]) == 0
     assert fake_host.config["workdir_days"] is None
-    assert load_registry().require("gpubox").workdir_days is None
+    assert load_registry().require("gpubox").config.workdir_days is None
 
 
 def test_a_bad_workdir_days_value_is_rejected(
@@ -1171,40 +1245,55 @@ def test_submit_and_requeue_both_take_no_git() -> None:
     assert not parser.parse_args(["submit", "job.yaml", "--host", "h"]).no_git
 
 
+class _LiveConfigHost(FakeHost):
+    """A fake host whose `config.json` is a dict the test can go on editing
+    between commands, as another machine's bootstrap would."""
+
+    def __init__(self, live: dict[str, Any] | None) -> None:
+        super().__init__()
+        self.live = live
+
+    def _answer(self, command: str) -> tuple[int, str]:
+        if command.startswith("if [ -f") and "config.json" in command:
+            return (0, NO_CONFIG) if not self.live else (0, json.dumps(self.live))
+        code, out = super()._answer(command)
+        if command.startswith("mv -f ") and "config.json" in command:
+            written = json.loads(self.files[f"{self.home}/config.json"])
+            if self.live is None:
+                self.live = written
+            else:
+                self.live.clear()
+                self.live.update(written)
+        return code, out
+
+
 def _fake_host_build(monkeypatch: pytest.MonkeyPatch, config: dict[str, Any] | None) -> list[str]:
-    """Answer `submit`'s "what build is this host running" with `config`.
-
-    ``None`` is a host that could not be asked at all, and it is faked at the
-    ssh boundary -- `open_session` raising, which is what an unreachable host
-    really does -- so that the fallback *and* the catching are both exercised.
-    Returns the list every re-ship appends its host to.
-    """
+    """A host whose `config.json` is `config` ({} for none, None for a host
+    that cannot be reached), a re-ship that records itself, and an enqueue
+    that does nothing. Returns the hosts re-shipped to."""
     resynced: list[str] = []
-    fake_session = SimpleNamespace(
-        transport=SimpleNamespace(host="gpubox"), read_config=lambda: config
-    )
+    host = _LiveConfigHost(config)
+    if config is None:
 
-    def fake_resync(entry: HostEntry, settings: object = None, **kwargs: object) -> HostEntry:
-        resynced.append(entry.name)
-        # The session opened to ask the host is the one the re-ship rides on:
-        # a second `open_session` here would be a second ssh handshake.
-        assert kwargs.get("transport") is fake_session.transport
-        # As the real one does: the host's config, or the last one seen where
-        # the host has none, plus the commit just shipped.
-        restored = config or entry.initial_config().to_dict()
-        return entry.with_config({**restored, "pkg_commit": "b" * 40})
-
-    monkeypatch.setattr("gpuc.control.submitting.resync_package", fake_resync)
-
-    def open_or_fail(*_: object, **__: object) -> Any:
-        if config is None:
+        def unreachable(*_: object, **__: object) -> Any:
             raise RemoteError("gpubox", "printf %s", "could not reach host gpubox")
-        return fake_session
 
-    monkeypatch.setattr("gpuc.control.submitting.open_session", open_or_fail)
+        monkeypatch.setattr("gpuc.control.remote.resolve_home", unreachable)
+    monkeypatch.setattr("gpuc.control.remote.transport_for", lambda entry, settings=None: host)
+
+    def fake_ensure_build(session: HostSession, report: Any, **_: Any) -> int:
+        resynced.append(session.entry.name)
+        # As the real one does: the commit just shipped, and nothing else.
+        session.write_config({"pkg_commit": version_mod.local_commit()})
+        return 1
+
+    monkeypatch.setattr("gpuc.control.submitting.ensure_build", fake_ensure_build)
     monkeypatch.setattr(
-        "gpuc.control.submitting.submit_file",
-        lambda *a, **k: SubmitResult(job_id="j", host="gpubox", attempt=1),
+        "gpuc.control.submitting.submit_spec",
+        lambda session, prepared, *a, **k: SubmitResult(job_id="j", host=session.entry.name),
+    )
+    monkeypatch.setattr(
+        "gpuc.control.submitting.placement_after", lambda *a, **k: placement_unknown()
     )
     return resynced
 
@@ -1229,7 +1318,7 @@ def test_submit_reships_the_package_to_a_host_on_another_commit(
     out = capsys.readouterr().out
     assert resynced == ["gpubox"]
     assert sum("re-syncing the package" in line for line in out.splitlines()) == 1
-    assert load_registry().require("gpubox").pkg_commit == "b" * 40
+    assert load_registry().require("gpubox").config.pkg_commit == "b" * 40
 
     # Now the host is on this build, so nothing is shipped.
     resynced.clear()
@@ -1237,12 +1326,13 @@ def test_submit_reships_the_package_to_a_host_on_another_commit(
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert resynced == []
 
-    # An unrecorded commit counts as different: those hosts are the oldest.
+    # A host whose config names no commit was never bootstrapped by any build
+    # that records one: refused, not half-installed on the way past.
     del host_config["pkg_commit"]
     assert main(["submit", str(job), "--host", "gpubox", "--no-bootstrap"]) == 0
     assert resynced == []
-    assert main(["submit", str(job), "--host", "gpubox"]) == 0
-    assert resynced == ["gpubox"]
+    assert main(["submit", str(job), "--host", "gpubox"]) == EXIT_ERROR
+    assert resynced == []
 
 
 def test_submit_asks_the_host_which_build_it_runs_not_this_machines_record(
@@ -1268,15 +1358,18 @@ def test_submit_asks_the_host_which_build_it_runs_not_this_machines_record(
     assert resynced == ["gpubox"]
     assert "host gpubox is running gpuc " + "c" * 12 in capsys.readouterr().out
     # The fake re-ship records what it shipped, as the real one does.
-    assert load_registry().require("gpubox").pkg_commit == "b" * 40
+    assert load_registry().require("gpubox").config.pkg_commit == "b" * 40
 
-    # And when there is nothing to re-ship, the record still stops repeating a
-    # bootstrap somebody else replaced: `host list` and `version` have only it.
+    # The host now runs `b`; a client on `c` re-ships again, and the record
+    # follows the host each time: `host list` and `version` have only it.
     resynced.clear()
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "c" * 40)
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert resynced == ["gpubox"]
+    assert load_registry().require("gpubox").config.pkg_commit == "c" * 40
+    resynced.clear()
+    assert main(["submit", str(job), "--host", "gpubox"]) == 0
     assert resynced == []
-    assert load_registry().require("gpubox").pkg_commit == "c" * 40
 
 
 def test_submit_records_the_hosts_commit_without_clobbering_the_rest_of_the_entry(
@@ -1301,14 +1394,12 @@ def test_submit_records_the_hosts_commit_without_clobbering_the_rest_of_the_entr
         return {"pkg_commit": "c" * 40}
 
     monkeypatch.setattr(
-        "gpuc.control.submitting.open_session",
-        lambda *a, **k: SimpleNamespace(
-            transport=SimpleNamespace(host="gpubox"), read_config=concurrent_probe
-        ),
+        "gpuc.control.remote.read_config",
+        lambda *a, **k: HostConfigRead(concurrent_probe()),
     )
     assert main(["submit", str(job), "--host", "gpubox"]) == 0
     entry = load_registry().require("gpubox")
-    assert (entry.pkg_commit, entry.driver_version) == ("c" * 40, "580.173.02")
+    assert (entry.config.pkg_commit, entry.driver_version) == ("c" * 40, "580.173.02")
 
 
 def test_submit_takes_the_hosts_config_as_it_finds_it(
@@ -1339,9 +1430,9 @@ def test_submit_takes_the_hosts_config_as_it_finds_it(
     # Nothing to warn about, and nothing to reconcile by hand.
     assert "WARNING" not in out
     entry = load_registry().require("gpubox")
-    assert entry.gpus == ["0", "1"]
-    assert entry.s3_prefix == "s3://theirs/gpuc/gpubox"
-    assert entry.retention_days is None
+    assert entry.config.gpus == ["0", "1"]
+    assert entry.config.s3_prefix == "s3://theirs/gpuc/gpubox"
+    assert entry.config.retention_days is None
 
 
 def test_submit_json_keeps_its_document_alone_and_its_warnings_on_stderr(
@@ -1376,22 +1467,24 @@ def test_submit_refuses_a_host_nobody_has_ever_bootstrapped(
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
     register_host(name="bare", kind="ssh", ssh="me@bare", gpus=GPU, bootstrapped_at=None)
-    _fake_host_build(monkeypatch, {})
+    resynced = _fake_host_build(monkeypatch, {"host": "bare", "gpus": [GPU]})
 
     assert main(["submit", str(job), "--host", "bare"]) == EXIT_ERROR
     err = capsys.readouterr().err
     assert "no gpuc on it yet" in err
     assert "gpuc host bootstrap bare" in err
+    assert resynced == []
 
 
-def test_submit_keeps_the_cached_config_of_a_host_that_has_lost_its_own(
+def test_submit_refuses_a_host_that_has_lost_its_config(
     control_env: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A host whose gpuc home was wiped answers with no config at all. That is
-    not an answer about what the host is -- the cache here is the only copy
-    left, and the re-ship this triggers is what puts it back."""
+    """A host whose gpuc home was wiped answers with no config at all. Nothing
+    says what cards it owns, so nothing is enqueued: `gpuc host bootstrap`
+    restores the last config seen, and is what the refusal names."""
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU, s3_prefix="s3://b/gpuc/gpubox")
@@ -1399,11 +1492,13 @@ def test_submit_keeps_the_cached_config_of_a_host_that_has_lost_its_own(
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
     resynced = _fake_host_build(monkeypatch, {})
 
-    assert main(["submit", str(job), "--host", "gpubox"]) == 0
-    assert resynced == ["gpubox"]
+    assert main(["submit", str(job), "--host", "gpubox"]) == EXIT_ERROR
+    assert "gpuc host bootstrap gpubox" in capsys.readouterr().err
+    assert resynced == []
+    # The cache is the only copy left, and it is left alone.
     entry = load_registry().require("gpubox")
-    assert entry.gpus == [GPU]
-    assert entry.s3_prefix == "s3://b/gpuc/gpubox"
+    assert entry.config.gpus == [GPU]
+    assert entry.config.s3_prefix == "s3://b/gpuc/gpubox"
 
 
 def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(
@@ -1411,9 +1506,8 @@ def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unreachable host is the submit behind this one's error to report, in
-    full; here it only means the record we have is the best there is -- and
-    that the ssh failure never leaves `ensure_package_current` as a traceback."""
+    """An unreachable host is the submit's own failure, reported in full and
+    exit 1; the record this machine has of the host is left as it was."""
     job = tmp_path / "job.yaml"
     job.write_text('command: "true"\n')
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
@@ -1421,9 +1515,9 @@ def test_submit_leaves_this_machines_record_alone_when_the_host_cannot_be_asked(
     monkeypatch.setattr("gpuc.control.cli.version_mod.local_commit", lambda: "b" * 40)
     resynced = _fake_host_build(monkeypatch, None)
 
-    assert main(["submit", str(job), "--host", "gpubox"]) == 0
+    assert main(["submit", str(job), "--host", "gpubox"]) == EXIT_ERROR
     assert resynced == []
-    assert load_registry().require("gpubox").pkg_commit == "b" * 40
+    assert load_registry().require("gpubox").config.pkg_commit == "b" * 40
 
 
 def _set_host(
@@ -1480,7 +1574,7 @@ def test_host_add_takes_gpu_indices_and_stores_them_as_given(
     numbering, so resolving it here would freeze this boot's mapping into the
     host's config; the host redoes it every dispatch pass."""
     assert main(["host", "add", "box", "--ssh", "me@box", "--gpus", f"2,3,{GPU}"]) == 0
-    assert load_registry().require("box").gpus == ["2", "3", GPU]
+    assert load_registry().require("box").config.gpus == ["2", "3", GPU]
     assert fake_host.config is not None and fake_host.config["gpus"] == ["2", "3", GPU]
 
 
@@ -1494,7 +1588,7 @@ def test_host_add_and_set_refuse_a_gpus_value_that_is_neither(
 
     assert main(["host", "add", "box", "--gpus", "2"]) == 0
     assert main(["host", "set", "box", "--gpus", "GPU-a,nonsense"]) == EXIT_USAGE
-    assert load_registry().require("box").gpus == ["2"]
+    assert load_registry().require("box").config.gpus == ["2"]
 
 
 # -- `--json` on every command ------------------------------------------------
@@ -1517,16 +1611,16 @@ def test_submit_json_is_the_queued_job_and_its_notes(
     job.write_text('command: "true"\n')
     register_host(name="local", gpus=GPU)
 
-    def fake_submit_file(entry: HostEntry, *args: object, **kwargs: object) -> SubmitResult:
+    def fake_enqueue(entry: HostEntry, prepared: Prepared, *args: object, **kwargs: object):
         # The progress a text submit prints inline must not land on the document.
         report = kwargs["report"]
         assert callable(report)
         report("syncing 3 files")
         return SubmitResult(
-            job_id="20260915-120000-abc123", host=entry.name, attempt=1, notes=["s3_bucket unset"]
+            job_id="20260915-120000-abc123", host=entry.name, notes=["s3_bucket unset"]
         )
 
-    monkeypatch.setattr("gpuc.control.submitting.submit_file", fake_submit_file)
+    monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
     capsys.readouterr()
     assert main(["submit", str(job), "--host", "local", "--json"]) == 0
     captured = capsys.readouterr()
@@ -1535,7 +1629,6 @@ def test_submit_json_is_the_queued_job_and_its_notes(
         "schema_version": 1,
         "job_id": "20260915-120000-abc123",
         "host": "local",
-        "attempt": 1,
         "requeued_from": None,
         "notes": ["s3_bucket unset"],
         # Nothing here can answer a `status`, so the queue fields are the
@@ -1561,8 +1654,10 @@ def test_requeue_json_names_the_job_it_came_from(
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
-        "gpuc.control.submitting.submit_spec",
-        lambda entry, *a, **k: SubmitResult(job_id="new", host=entry.name, attempt=2),
+        "gpuc.control.submitting.enqueue",
+        lambda entry, prepared, *a, **k: SubmitResult(
+            job_id="new", host=entry.name, requeued_from=prepared.requeued_from
+        ),
     )
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
@@ -1570,14 +1665,15 @@ def test_requeue_json_names_the_job_it_came_from(
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == 0
     document = one_document(capsys)
     assert document["requeued_from"] == "20260101-000000-aaaaaa"
-    assert (document["job_id"], document["attempt"]) == ("new", 2)
+    assert document["job_id"] == "new"
 
 
 class _KnowsJobs:
     """A session on a host that knows exactly the jobs it is given."""
 
-    def __init__(self, name: str, known: set[str], asked: list[str]) -> None:
-        self.name, self.known, self.asked = name, known, asked
+    def __init__(self, entry: HostEntry, known: set[str], asked: list[str]) -> None:
+        self.entry, self.name, self.known, self.asked = entry, entry.name, known, asked
+        self.config = entry.config
 
     def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
         self.asked.append(f"{self.name}: {args}")
@@ -1599,19 +1695,19 @@ def _requeue_setup(
     asked: list[str] = []
     submitted: list[str] = []
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session",
-        lambda entry, *a, **k: _KnowsJobs(entry.name, known.get(entry.name, set()), asked),
+        "gpuc.control.remote.open_session",
+        lambda entry, *a, **k: _KnowsJobs(entry, known.get(entry.name, set()), asked),
     )
-    monkeypatch.setattr(
-        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
-    )
+    monkeypatch.setattr("gpuc.control.submitting.ensure_package_current", lambda session, **k: None)
     monkeypatch.setattr(
         "gpuc.control.submitting.placement_after", lambda *a, **k: placement_unknown()
     )
 
-    def fake_submit(entry: Any, *a: Any, **k: Any) -> SubmitResult:
-        submitted.append(entry.name)
-        return SubmitResult(job_id="new", host=entry.name, attempt=k["attempt"])
+    def fake_submit(session: Any, prepared: Prepared, *a: Any, **k: Any) -> SubmitResult:
+        submitted.append(session.entry.name)
+        return SubmitResult(
+            job_id="new", host=session.entry.name, requeued_from=prepared.requeued_from
+        )
 
     monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
     for name in known:
@@ -1634,8 +1730,6 @@ def test_requeue_without_a_host_finds_the_job_on_a_host_this_client_never_submit
     assert submitted == ["b"]
     assert document["host"] == "b"
     assert document["requeued_from"] == "20260101-000000-aaaaaa"
-    # No index entry here, so the attempt counts on from the first.
-    assert document["attempt"] == 2
     assert "b: status 20260101-000000-aaaaaa" in asked
 
 
@@ -1672,75 +1766,16 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     submitted: list[JobSpecModel] = []
 
-    def fake_submit(entry: Any, model: JobSpecModel, *a: Any, **k: Any) -> SubmitResult:
-        submitted.append(model)
-        return SubmitResult(job_id="new", host=entry.name, attempt=2)
+    def fake_enqueue(entry: Any, prepared: Prepared, *a: Any, **k: Any) -> SubmitResult:
+        submitted.append(prepared.model)
+        return SubmitResult(job_id="new", host=entry.name)
 
-    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
     assert [m.command for m in submitted] == ["true"]
-
-
-def test_requeue_refuses_a_mirrored_spec_that_asks_for_no_gpu(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A requeue is a submit. An older build mirrored `gpus: 0` specs, and one
-    of those is refused the way a job file would be, not queued to fail."""
-    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
-    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
-        {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 0}
-    ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
-    monkeypatch.setattr(
-        "gpuc.control.submitting.submit_spec",
-        lambda *a, **k: pytest.fail("a spec asking for no GPU must not be submitted"),
-    )
-    register_host(name="local", gpus=GPU)
-    capsys.readouterr()
-
-    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
-    assert "gpus: Input should be greater than or equal to 1" in capsys.readouterr().err
-
-
-def test_requeue_refuses_a_mirror_an_older_build_expanded(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Older builds mirrored the spec with `{job_id}` already expanded, so what
-    they left behind names the first run's outputs. A requeue is a new job and
-    a new job never writes over an old one's outputs: refused, nothing shipped.
-    The deliberate break with the compatibility rule, pre-release, in favour
-    of never clobbering."""
-    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
-    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
-        {
-            "job_id": "20260101-000000-aaaaaa",
-            "command": "true",
-            "gpus": 1,
-            "outputs": [
-                {"path": "results", "s3": "s3://b/exp/20260101-000000-aaaaaa/results"},
-                {"path": "ckpt", "hf": "org/run-20260101-000000-aaaaaa", "hf_path": "w"},
-            ],
-        }
-    ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
-    monkeypatch.setattr(
-        "gpuc.control.submitting.ensure_package_current", lambda entry, *a, **k: entry
-    )
-    monkeypatch.setattr(
-        "gpuc.control.submit.open_session",
-        lambda *a, **k: pytest.fail("a spec pointed at an earlier run's outputs must not ship"),
-    )
-    register_host(name="local", gpus=GPU)
-    capsys.readouterr()
-
-    assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 1
-    err = capsys.readouterr().err
-    assert "s3://b/exp/20260101-000000-aaaaaa/results` does not include the job id" in err
 
 
 def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning(
@@ -1780,18 +1815,23 @@ def test_requeue_expands_the_mirrored_template_with_the_new_id(
         }
     ).encode()
     monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
-    submitted: list[JobSpecModel] = []
+    submitted: list[Prepared] = []
 
-    def fake_submit(entry: Any, model: JobSpecModel, *a: Any, **k: Any) -> SubmitResult:
-        submitted.append(model)
-        return SubmitResult(job_id="new", host=entry.name, attempt=2)
+    def fake_enqueue(entry: Any, prepared: Prepared, *a: Any, **k: Any) -> SubmitResult:
+        submitted.append(prepared)
+        return SubmitResult(job_id=prepared.spec.job_id, host=entry.name)
 
-    monkeypatch.setattr("gpuc.control.submitting.submit_spec", fake_submit)
+    monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
-    spec = submitted[0].to_spec("20260102-000000-bbbbbb")
+    (prepared,) = submitted
+    assert prepared.spec.job_id != "20260101-000000-aaaaaa"
+    assert prepared.spec.outputs[0].s3 == f"s3://b/exp/{prepared.spec.job_id}/results"
+    # And the mirror keeps the template, so the next requeue gets its own too.
+    assert prepared.mirrored()["outputs"][0]["s3"] == "s3://b/exp/{job_id}/results"
+    spec = prepared.model.to_spec("20260102-000000-bbbbbb")
     assert expand_job_id(spec).outputs[0].s3 == "s3://b/exp/20260102-000000-bbbbbb/results"
 
 
@@ -1800,7 +1840,7 @@ def test_cancel_json_is_the_hosts_own_answer(
 ) -> None:
     register_host(name="local", gpus=GPU)
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session",
+        "gpuc.control.remote.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "cancelling"}])),
     )
     capsys.readouterr()
@@ -1815,7 +1855,7 @@ def test_preempt_asks_the_host_and_repeats_what_it_said(
 ) -> None:
     register_host(name="local", gpus=GPU)
     session = StubSession([{"job_id": "j", "status": "preempting", "priority": 50}])
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
     assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == 0
     document = one_document(capsys)
@@ -1841,7 +1881,7 @@ def test_preempt_with_a_priority_passes_it_on_and_re_mirrors_the_spec(
         "20260101-000000-aaaaaa", {"command": "true", "priority": 50}
     )
     session = StubSession([{"job_id": "j", "status": "preempting", "priority": 90}])
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
     argv = ["preempt", "20260101-000000-aaaaaa", "--priority", "90", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -1857,7 +1897,7 @@ def test_preempt_reports_the_hosts_refusal_to_free_the_host_for_nothing(
     register_host(name="local", gpus=GPU)
     refusal = "nothing else is queued on this host, so preempting job j would stop it"
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session",
+        "gpuc.control.remote.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j", "error": refusal}])),
     )
     capsys.readouterr()
@@ -1871,7 +1911,7 @@ def test_preempt_reports_the_hosts_refusal(
     register_host(name="local", gpus=GPU)
     payload: dict[str, object] = {"job_id": "j", "error": "job j is queued, not running"}
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session", lambda *a, **k: as_session(StubSession([payload]))
+        "gpuc.control.remote.open_session", lambda *a, **k: as_session(StubSession([payload]))
     )
     capsys.readouterr()
     assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_ERROR
@@ -1884,7 +1924,7 @@ def test_a_host_too_old_to_know_preempt_is_never_reported_as_success(
     """Otherwise the caller frees GPUs that are still busy and submits on top."""
     register_host(name="local", gpus=GPU)
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session",
+        "gpuc.control.remote.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j"}])),
     )
     capsys.readouterr()
@@ -1909,6 +1949,9 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
     moved = "20260101-000000-aaaaaa"
 
     class Moved:
+        entry = host_entry(name="local", gpus=[GPU])
+        config = HostConfig(host="local", gpus=[GPU])
+
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
             if args.startswith("reorder"):
                 return {"job_id": moved, "status": "queued", "priority": 10}
@@ -1924,7 +1967,7 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
             }
 
     register_host(name="local", gpus=GPU)
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
     argv = ["reorder", moved, "--priority", "10", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -1941,7 +1984,7 @@ def test_estimate_json_repeats_what_the_host_recorded(
     session = StubSession(
         [{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running", "warning": None}]
     )
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
     argv = ["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -1959,7 +2002,7 @@ def test_estimate_reports_the_hosts_refusal(
     register_host(name="local", gpus=GPU)
     payload: dict[str, object] = {"job_id": "j", "error": "job j has already succeeded"}
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session", lambda *a, **k: as_session(StubSession([payload]))
+        "gpuc.control.remote.open_session", lambda *a, **k: as_session(StubSession([payload]))
     )
     capsys.readouterr()
     assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "5", "--host", "local"]) == 1
@@ -1973,7 +2016,7 @@ def test_estimate_clear_asks_the_host_to_clear_it(
     session = StubSession(
         [{"job_id": "j", "estimated_runtime_min": None, "status": "queued", "warning": None}]
     )
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: as_session(session))
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
     assert main(["estimate", "20260101-000000-aaaaaa", "--clear", "--host", "local"]) == 0
     assert session.calls == ["estimate 20260101-000000-aaaaaa --clear"]
@@ -1988,7 +2031,7 @@ def test_estimate_refuses_a_host_that_did_not_say_what_it_recorded(
     """
     register_host(name="local", gpus=GPU)
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session",
+        "gpuc.control.remote.open_session",
         lambda *a, **k: as_session(StubSession([{"job_id": "j", "status": "running"}])),
     )
     capsys.readouterr()
@@ -2011,7 +2054,7 @@ def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
         "20260101-000000-aaaaaa", {"command": "true", "some_future_field": 1}
     )
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session",
+        "gpuc.control.remote.open_session",
         lambda *a, **k: as_session(
             StubSession([{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running"}])
         ),
@@ -2031,6 +2074,9 @@ def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     from gpuc.control.s3index import S3Index
 
     class Moved:
+        entry = host_entry(name="local", gpus=[GPU])
+        config = HostConfig(host="local", gpus=[GPU])
+
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
             if args.startswith("reorder"):
                 return {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
@@ -2043,7 +2089,7 @@ def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     S3Index("bucket", s3).put_spec_document(
         "20260101-000000-aaaaaa", {"command": "true", "priority": 50, "some_future_field": 1}
     )
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
     argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -2060,6 +2106,9 @@ def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Moved:
+        entry = host_entry(name="local", gpus=[GPU])
+        config = HostConfig(host="local", gpus=[GPU])
+
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
             if args.startswith("reorder"):
                 return {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
@@ -2070,7 +2119,7 @@ def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
     monkeypatch.setattr(
         "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
     )
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Moved())
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
     argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -2089,7 +2138,7 @@ def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(
         "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
     )
     monkeypatch.setattr(
-        "gpuc.control.actions.open_session",
+        "gpuc.control.remote.open_session",
         lambda *a, **k: as_session(
             StubSession([{"job_id": "j", "estimated_runtime_min": 150.0, "status": "running"}])
         ),
@@ -2118,7 +2167,7 @@ def test_pods_json_separates_ours_from_everyone_elses(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider(existing=[running_pod("subrep-other", "podF")])
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
     capsys.readouterr()
     assert main(["pods", "--no-heartbeat", "--json"]) == 0
     document = one_document(capsys)
@@ -2202,7 +2251,6 @@ def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
 def test_host_probe_shows_only_assigned_gpus_unless_all_gpus_is_asked_for(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from gpuc.control.config import load_registry
     from gpuc.control.probe import parse_probe
 
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus="1")
@@ -2212,7 +2260,7 @@ def test_host_probe_shows_only_assigned_gpus_unless_all_gpus_is_asked_for(
     )
     monkeypatch.setattr(
         "gpuc.control.cli.probe_host",
-        lambda entry, *a, **k: parse_probe(entry.name, sample, entry.root, entry.gpus),
+        lambda entry, *a, **k: parse_probe(entry.name, sample, entry.root, entry.config.gpus),
     )
 
     capsys.readouterr()
@@ -2248,7 +2296,7 @@ def test_host_probe_json_is_written_after_the_registry_write_it_can_fail_on(
     def locked() -> object:
         raise ConfigError("state lock is held by another gpuc")
 
-    monkeypatch.setattr("gpuc.control.cli.registry_transaction", locked)
+    monkeypatch.setattr("gpuc.control.cli.update_cache", lambda *a, **k: locked())
     capsys.readouterr()
     assert main(["host", "probe", "gpubox", "--json"]) == 1
     document = one_document(capsys)
@@ -2316,7 +2364,7 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
         registry.put(
             host_entry(
                 name="pod",
-                kind="runpod",
+                kind="rental",
                 ssh="root@1.2.3.4",
                 pod_id="p1",
                 bootstrapped_at=None,
@@ -2328,7 +2376,7 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
     assert main(["host", "bootstrap", "--all"]) == 1
     assert [name for name, _ in attempted] == ["gpubox", "pod", "zbox"]
     captured = capsys.readouterr()
-    assert "error: host pod: ssh to pod failed" in captured.err
+    assert "warning: host pod: ssh to pod failed" in captured.err
     assert "2/3 host(s) bootstrapped" in captured.out
     assert "failed: pod" in captured.out
     registry = load_registry()
@@ -2360,9 +2408,9 @@ def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     with registry_transaction() as registry:
-        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+        registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: _NoPods())
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: _NoPods())
     capsys.readouterr()
 
     assert main(["host", "bootstrap", "--all"]) == 0
@@ -2379,10 +2427,10 @@ def test_host_bootstrap_all_forgets_a_terminated_rental_too(
     from gpuc.control.bootstrap import BootstrapError
 
     with registry_transaction() as registry:
-        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+        registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     terminated = Pod(id="p1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda settings: _NoPods(terminated))
+    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: _NoPods(terminated))
     capsys.readouterr()
 
     assert main(["host", "bootstrap", "--all"]) == 0
@@ -2398,10 +2446,10 @@ def test_host_bootstrap_all_keeps_a_rental_the_provider_cannot_be_asked_about(
     from gpuc.control.providers.base import ProviderError
 
     with registry_transaction() as registry:
-        registry.put(host_entry(name="pod", kind="runpod", ssh="root@1.2.3.4", pod_id="p1"))
+        registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
 
-    def unavailable(settings: Settings) -> object:
+    def unavailable(*a: object, **k: object) -> object:
         raise ProviderError("RUNPOD_API_KEY is not set")
 
     monkeypatch.setattr("gpuc.control.actions.make_provider", unavailable)
@@ -2459,10 +2507,10 @@ def test_host_bootstrap_all_interrupted_still_says_what_it_got_through(
     bootstrapping(monkeypatch, fail={"local": KeyboardInterrupt()})
     capsys.readouterr()
 
-    assert main(["host", "bootstrap", "--all"]) == 1
-    out = capsys.readouterr().out
-    assert "interrupted during local" in out
-    assert "1/2 host(s) bootstrapped" in out
+    assert main(["host", "bootstrap", "--all"]) == EXIT_INTERRUPTED
+    err = capsys.readouterr().err
+    assert "interrupted during local" in err
+    assert "1/2 host(s) bootstrapped" in err
 
 
 def test_host_bootstrap_all_with_no_hosts_is_not_an_error(
@@ -2490,7 +2538,7 @@ def adoptable(monkeypatch: pytest.MonkeyPatch, fake_host: FakeHost) -> FakeProvi
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
     fake_host.put_file(
         json.dumps(
             {
@@ -2517,12 +2565,12 @@ def test_host_add_pod_adopts_a_pod_another_machine_created(
 
     entry = load_registry().require("gpuc-e2e-aaa")
     assert (entry.kind, entry.pod_id, entry.ssh, entry.port) == (
-        "runpod",
+        "rental",
         "pod1",
         "root@1.2.3.4",
         22000,
     )
-    assert entry.gpus == ["GPU-1111"] and entry.idle_minutes == 4.0
+    assert entry.config.gpus == ["GPU-1111"] and entry.config.idle_minutes == 4.0
     out = capsys.readouterr().out
     assert "adopted the config on the host" in out
     # A pod with a dispatcher ends itself; there is nothing to warn about.
@@ -2559,7 +2607,7 @@ def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda settings: provider)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
 
     assert main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111"]) == 0
 
@@ -2576,8 +2624,8 @@ def rented_host(monkeypatch: pytest.MonkeyPatch) -> FakeProvider:
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda settings: provider)
-    register_host(name="gpuc-e2e-aaa", kind="runpod", ssh="root@1.2.3.4", pod_id="pod1")
+    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    register_host(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4", pod_id="pod1")
     return provider
 
 
@@ -2586,7 +2634,7 @@ def test_host_terminate_ends_the_pod_and_says_what_it_cost(
 ) -> None:
     provider = rented_host(monkeypatch)
     monkeypatch.setattr(
-        "gpuc.control.status.open_session",
+        "gpuc.control.remote.open_session",
         lambda *a, **k: as_session(StubSession([{"host": "gpuc-e2e-aaa", "jobs": []}])),
     )
 
@@ -2607,7 +2655,7 @@ def test_host_terminate_of_a_busy_pod_is_exit_1_and_says_how_to_insist(
         "jobs": [{"job_id": "j1", "name": "train", "status": "running", "phase": "main"}],
     }
     monkeypatch.setattr(
-        "gpuc.control.status.open_session", lambda *a, **k: as_session(StubSession([payload]))
+        "gpuc.control.remote.open_session", lambda *a, **k: as_session(StubSession([payload]))
     )
 
     assert main(["host", "terminate", "gpuc-e2e-aaa"]) == EXIT_ERROR
@@ -2618,18 +2666,19 @@ def test_host_terminate_of_a_busy_pod_is_exit_1_and_says_how_to_insist(
     assert "train (j1)" in err and "--force" in err
 
 
-def test_an_existing_gpu_overlap_does_not_block_every_other_host_set(
-    control_env: Path, fake_host: FakeHost
+def test_an_existing_gpu_overlap_is_refused_until_it_is_fixed(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A host already in that state -- hand-edited, or written by a build
-    without the check -- must still be reachable by a command about something
-    else entirely."""
+    """A hand-edited config with one card in both lists is judged on every
+    write, whatever the command was about: the fix is the one way on."""
     fake_host.put_file(
         '{"host": "gpubox", "gpus": ["0"], "shared_gpus": ["0", "1"]}',
         "/home/u/.gpuc/config.json",
     )
     assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
-    assert main(["host", "set", "gpubox", "--idle-min", "30"]) == 0
+    assert main(["host", "set", "gpubox", "--idle-min", "30"]) == EXIT_ERROR
+    assert "both --gpus and --shared-gpus" in capsys.readouterr().err
+    assert main(["host", "set", "gpubox", "--idle-min", "30", "--shared-gpus", "1"]) == 0
     assert fake_host.config is not None and fake_host.config["idle_minutes"] == 30.0
 
 
@@ -2647,7 +2696,7 @@ def test_reorder_refuses_to_report_a_move_the_host_did_not_say_it_made(
             raise RemoteError("local", "status", "host is busy")
 
     register_host(name="local", gpus=GPU)
-    monkeypatch.setattr("gpuc.control.actions.open_session", lambda *a, **k: Older())
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Older())
     capsys.readouterr()
     argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == EXIT_ERROR
@@ -2668,16 +2717,15 @@ def test_the_commands_the_dashboard_could_want_live_outside_the_cli() -> None:
     from gpuc.control import actions, cli, hosts, submitting
 
     moved = {
-        submitting: ["submit_job", "requeue_job", "ensure_package_current", "mirror_spec_first"],
+        submitting: ["submit_job", "requeue_job", "ensure_package_current", "enqueue"],
         hosts: ["add_host", "set_host", "bootstrap_and_record", "bootstrap_every_host"],
-        actions: ["unhosted_jobs"],
+        actions: ["unhosted_jobs", "status", "locate", "read_log"],
     }
     for module, names in moved.items():
         for name in names:
             assert hasattr(module, name), f"{module.__name__} lost {name}"
     for name in [
         "ensure_package_current",
-        "mirror_spec_first",
         "check_runpod_args",
         "runpod_target",
         "BootstrapTally",
@@ -2693,7 +2741,7 @@ def test_the_commands_the_dashboard_could_want_live_outside_the_cli() -> None:
         cli.cmd_host_add: "add_host",
         cli.cmd_host_set: "set_host",
         cli.cmd_host_bootstrap: "bootstrap_every_host",
-        cli.cmd_status: "status_views",
+        cli.cmd_status: "status",
     }
     for command, callee in calls.items():
         assert f"{callee}(" in inspect.getsource(command), f"{command.__name__} skips {callee}"

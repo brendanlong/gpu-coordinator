@@ -31,9 +31,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from gpuc.control import status as status_mod
 from gpuc.control.actions import (
-    EXIT_LOCAL_STATE,
     EXIT_NOT_FOUND,
     EXIT_USAGE,
+    Answer,
     UsageError,
     cancel_job,
     check_estimate,
@@ -44,11 +44,14 @@ from gpuc.control.actions import (
     hosts_document,
     preempt_job,
     read_log,
+    registry_answer,
+    remove_host,
     reorder_job,
-    status_document,
+    status,
     version_document,
 )
 from gpuc.control.config import Settings, load_settings, read_registry, utc_now
+from gpuc.control.exits import http_status
 from gpuc.control.web.auth import SESSION_COOKIE, SESSION_TTL_S, Sessions, read_password_hash
 from gpuc.host.jobs import SCHEMA_VERSION
 
@@ -59,14 +62,6 @@ MAX_LOG_LINES = 5000
 JOB_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 """Job ids are `YYYYMMDD-HHMMSS-hex`; anything outside this set is not one and
 is refused before it can reach a shell, quoted or not."""
-
-HTTP_FOR_EXIT = {
-    EXIT_USAGE: HTTPStatus.BAD_REQUEST,
-    EXIT_LOCAL_STATE: HTTPStatus.SERVICE_UNAVAILABLE,
-    EXIT_NOT_FOUND: HTTPStatus.NOT_FOUND,
-}
-"""The CLI's exit codes, on the wire. Anything else the CLI would exit 1 on --
-an unreachable host, a refused reorder -- is a 500: the command failed."""
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -130,8 +125,15 @@ class Response:
     @staticmethod
     def error(message: str, exit_code: int) -> Response:
         """The same document `--json` prints when a command fails, with an HTTP status."""
-        status = HTTP_FOR_EXIT.get(exit_code, HTTPStatus.INTERNAL_SERVER_ERROR)
-        return Response.json({"error": message, "exit_code": exit_code}, status)
+        return Response.json({"error": message, "exit_code": exit_code}, http_status(exit_code))
+
+    @staticmethod
+    def answer(answer: Answer, **extra: Any) -> Response:
+        """A command's answer on the wire: its document, under the status its
+        exit code maps to -- so a status with an unreachable host is a 500
+        carrying every host that answered, exactly as the CLI exits 1 having
+        printed them."""
+        return Response.json({**answer.document, **extra}, http_status(answer.exit_code))
 
     @staticmethod
     def redirect(location: str) -> Response:
@@ -185,6 +187,7 @@ class Dashboard:
             ("POST", re.compile(r"^/api/jobs/([^/]+)/reorder$"), Dashboard.api_reorder, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/preempt$"), Dashboard.api_preempt, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/estimate$"), Dashboard.api_estimate, True),
+            ("POST", re.compile(r"^/api/hosts/([^/]+)/remove$"), Dashboard.api_host_remove, True),
         ]
 
     def handle(self, request: Request) -> Response:
@@ -262,6 +265,9 @@ class Dashboard:
     # -- the API: `--json` documents over HTTP ---------------------------------
 
     def api_status(self, request: Request) -> Response:
+        """`gpuc status --json`, and never a registry write: a poll that
+        forgot a rental over one stray 404 would cost a live host its record
+        with nobody watching, so `forget_gone_rentals` is the CLI's alone."""
         settings = self.load_settings()
         read = read_registry()
         recent = int_param(request, "recent", status_mod.RECENT_FINISHED)
@@ -270,25 +276,27 @@ class Dashboard:
             since_s = status_mod.parse_duration(since) if since else None
         except ValueError as exc:
             raise UsageError(f"since: {exc}") from exc
-        document = status_document(
-            read, settings, host=request.param("host") or None, recent=recent, since_s=since_s
+        result = status(
+            read, settings, host=request.param("host") or None, all_jobs=bool(request.param("all"))
         )
-        document["gathered_at"] = utc_now()
-        status = HTTPStatus.SERVICE_UNAVAILABLE if read.unreadable else HTTPStatus.OK
-        return Response.json(document, status)
+        return Response.answer(result.answer(recent=recent, since_s=since_s), gathered_at=utc_now())
 
     def api_hosts(self, request: Request) -> Response:
         read = read_registry()
-        status = HTTPStatus.SERVICE_UNAVAILABLE if read.unreadable else HTTPStatus.OK
-        return Response.json(hosts_document(read), status)
+        return Response.answer(registry_answer(read, hosts_document(read), None))
 
     def api_config(self, request: Request) -> Response:
         return Response.json(config_document(self.load_settings()))
 
     def api_version(self, request: Request) -> Response:
         read = read_registry()
-        status = HTTPStatus.SERVICE_UNAVAILABLE if read.unreadable else HTTPStatus.OK
-        return Response.json(version_document(read), status)
+        return Response.answer(registry_answer(read, version_document(read), None))
+
+    def api_host_remove(self, request: Request) -> Response:
+        """`gpuc host remove`: the one host action the CLI has that needs no
+        provider, so the page offers it too."""
+        assert request.match is not None
+        return Response.json(remove_host(request.match.group(1)))
 
     def api_logs(self, request: Request) -> Response:
         job_id = job_id_of(request)
