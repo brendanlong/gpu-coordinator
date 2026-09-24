@@ -4,6 +4,7 @@ import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -17,6 +18,13 @@ def run(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, object]:
     code = cli.main(list(args))
     out = capsys.readouterr().out
     return code, json.loads(out) if out.strip() else None
+
+
+def verb(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, dict[str, Any]]:
+    """A job verb about one job: its exit code and that job's document."""
+    code, payload = run(capsys, *args)
+    assert isinstance(payload, dict) and len(payload["jobs"]) == 1
+    return code, payload["jobs"][0]
 
 
 def test_enqueue_from_a_file(
@@ -78,16 +86,78 @@ def test_status_of_one_job(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) 
     assert [j["job_id"] for j in status["jobs"]] == [job_id]
 
 
+def test_status_of_several_jobs_is_exactly_those_that_are_here(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = queue.enqueue(make_spec())
+    second = queue.enqueue(make_spec())
+    queue.enqueue(make_spec())
+    _, status = run(capsys, "status", second, "no-such-job", first, second)
+    assert isinstance(status, dict)
+    assert [j["job_id"] for j in status["jobs"]] == [second, first]
+
+
+def _finish(job_id: str, hours_ago: float, *, workdir: bool = False) -> None:
+    ended = (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
+    jobs.update_state(job_id, status="succeeded", ended_at=ended)
+    if not workdir:
+        paths.workdir(job_id).rmdir()
+
+
+def test_status_sends_only_the_window_of_finished_jobs(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """What a status costs grows with what is on the host, not its history --
+    except for a finished job still holding a workdir, whose disk and outputs
+    the host-level lines count."""
+    old, older, oldest = (queue.enqueue(make_spec()) for _ in range(3))
+    _finish(old, 1)
+    _finish(older, 5)
+    _finish(oldest, 50, workdir=True)
+    queued = queue.enqueue(make_spec())
+
+    def sent(*args: str) -> list[str]:
+        _, status = run(capsys, "status", *args)
+        assert isinstance(status, dict) and status["finished_count"] == 3
+        return sorted(j["job_id"] for j in status["jobs"])
+
+    assert sent() == sorted([old, older, oldest, queued])
+    assert sent("--recent", "1") == sorted([old, oldest, queued])
+    assert sent("--recent", "0") == sorted([oldest, queued])
+    assert sent("--since", str(3 * 3600)) == sorted([old, oldest, queued])
+
+
 def test_cancel_and_reorder(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     first = queue.enqueue(make_spec(priority=50))
     second = queue.enqueue(make_spec(priority=50))
-    code, payload = run(capsys, "reorder", second, "3")
+    code, payload = verb(capsys, "reorder", second, "--priority", "3")
     assert code == 0 and payload == {"job_id": second, "status": "queued", "priority": 3}
     assert [e.job_id for e in queue.list_queued()] == [second, first]
 
-    code, payload = run(capsys, "cancel", first)
-    assert code == 0 and isinstance(payload, dict) and payload["status"] == "cancelled"
+    code, payload = verb(capsys, "cancel", first)
+    assert code == 0 and payload["status"] == "cancelled"
     assert [e.job_id for e in queue.list_queued()] == [second]
+
+
+def test_a_verb_acts_on_every_job_it_is_given_and_refuses_each_it_cannot(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One call for a whole sweep: a refusal is that job's document, and the
+    jobs after it are still done."""
+    first = queue.enqueue(make_spec())
+    second = queue.enqueue(make_spec())
+    code, payload = run(capsys, "cancel", first, "no-such-job", second, first)
+    assert code == 1 and isinstance(payload, dict)
+    assert [j["job_id"] for j in payload["jobs"]] == [first, "no-such-job", second]
+    assert [j.get("status") for j in payload["jobs"]] == ["cancelled", None, "cancelled"]
+    assert payload["jobs"][1]["missing"] is True
+    assert queue.list_queued() == []
+
+    third = queue.enqueue(make_spec())
+    code, payload = run(capsys, "reorder", third, first, "--priority", "7")
+    assert code == 1 and isinstance(payload, dict)
+    assert payload["jobs"][0] == {"job_id": third, "status": "queued", "priority": 7}
+    assert "not queued" in payload["jobs"][1]["error"]
 
 
 def test_reorder_of_a_job_that_is_not_queued_is_a_refusal_not_a_traceback(
@@ -95,8 +165,8 @@ def test_reorder_of_a_job_that_is_not_queued_is_a_refusal_not_a_traceback(
 ) -> None:
     job_id = queue.enqueue(make_spec())
     jobs.update_state(job_id, status="running")
-    code, payload = run(capsys, "reorder", job_id, "1")
-    assert code == 1 and isinstance(payload, dict)
+    code, payload = verb(capsys, "reorder", job_id, "--priority", "1")
+    assert code == 1
     assert "not queued (status running)" in str(payload["error"])
 
 
@@ -105,8 +175,8 @@ def test_reorder_of_an_unknown_job_is_a_refusal_not_a_traceback(
 ) -> None:
     """The control side reads this command's stdout as JSON, so a typed job id
     has to come back as an error document and exit 1."""
-    code, payload = run(capsys, "reorder", "no-such-job", "1")
-    assert code == 1 and isinstance(payload, dict)
+    code, payload = verb(capsys, "reorder", "no-such-job", "--priority", "1")
+    assert code == 1 and payload["missing"] is True
     assert "no job no-such-job on this host" in str(payload["error"])
     assert jobs.list_job_ids() == []
 
@@ -115,13 +185,13 @@ def test_estimate_sets_a_queued_jobs_runtime(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec())
-    code, payload = run(capsys, "estimate", job_id, "150")
-    assert code == 0 and isinstance(payload, dict)
+    code, payload = verb(capsys, "estimate", job_id, "--minutes", "150")
+    assert code == 0
     assert payload["estimated_runtime_min"] == 150.0 and payload["status"] == "queued"
     assert jobs.read_state(job_id).estimated_runtime_min == 150.0
 
-    code, payload = run(capsys, "estimate", job_id, "--clear")
-    assert code == 0 and isinstance(payload, dict) and payload["estimated_runtime_min"] is None
+    code, payload = verb(capsys, "estimate", job_id, "--clear")
+    assert code == 0 and payload["estimated_runtime_min"] is None
     assert jobs.read_state(job_id).estimated_runtime_min is None
 
 
@@ -137,7 +207,7 @@ def test_estimate_does_not_touch_the_spec(
     paths.spec_file(job_id).write_text(json.dumps(document))
     before = paths.spec_file(job_id).read_text()
 
-    code, _ = run(capsys, "estimate", job_id, "42")
+    code, _ = verb(capsys, "estimate", job_id, "--minutes", "42")
 
     assert code == 0
     assert paths.spec_file(job_id).read_text() == before
@@ -149,12 +219,12 @@ def test_estimate_refuses_a_finished_job_and_an_unknown_one(
 ) -> None:
     job_id = queue.enqueue(make_spec())
     jobs.update_state(job_id, status="succeeded")
-    code, payload = run(capsys, "estimate", job_id, "10")
-    assert code == 1 and isinstance(payload, dict) and "already succeeded" in payload["error"]
+    code, payload = verb(capsys, "estimate", job_id, "--minutes", "10")
+    assert code == 1 and "already succeeded" in payload["error"]
     assert jobs.read_state(job_id).estimated_runtime_min is None
 
-    code, payload = run(capsys, "estimate", "no-such-job", "10")
-    assert code == 1 and isinstance(payload, dict) and "no job with that id" in payload["error"]
+    code, payload = verb(capsys, "estimate", "no-such-job", "--minutes", "10")
+    assert code == 1 and "no job with that id" in payload["error"]
 
 
 @pytest.mark.parametrize("minutes", ["0", "-5", "nan", "inf", "1e10"])
@@ -165,8 +235,8 @@ def test_estimate_refuses_a_number_that_is_not_a_runtime(
     reach `utc_in` -- so recording one would report success for a job whose
     status then shows nothing at all."""
     job_id = queue.enqueue(make_spec())
-    code, payload = run(capsys, "estimate", job_id, minutes)
-    assert code == 1 and isinstance(payload, dict) and payload["error"]
+    code, payload = verb(capsys, "estimate", job_id, "--minutes", minutes)
+    assert code == 1 and payload["error"]
     assert jobs.read_state(job_id).estimated_runtime_min is None
 
 
@@ -174,9 +244,10 @@ def test_estimate_needs_a_number_or_clear_and_not_both(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec(estimated_runtime_min=30.0))
-    for args in ((job_id,), (job_id, "60", "--clear")):
-        code, payload = run(capsys, "estimate", *args)
-        assert code == 1 and isinstance(payload, dict) and "not both" in payload["error"]
+    for args in ((job_id,), (job_id, "--minutes", "60", "--clear")):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["estimate", *args])
+        assert exc.value.code == 2
     assert jobs.read_state(job_id).estimated_runtime_min == 30.0
 
 
@@ -184,8 +255,8 @@ def test_estimate_warns_when_the_job_will_be_killed_first(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec(max_runtime_min=60.0))
-    _, payload = run(capsys, "estimate", job_id, "120")
-    assert isinstance(payload, dict) and "max_runtime_min" in (payload["warning"] or "")
+    _, payload = verb(capsys, "estimate", job_id, "--minutes", "120")
+    assert "max_runtime_min" in (payload["warning"] or "")
 
 
 def test_dispatch_is_routed_to_the_dispatcher(
@@ -319,7 +390,7 @@ def test_reorder_records_the_new_priority_in_the_state(
     dispatch: otherwise `gpuc status` could only ever report a running job's
     priority as the one it was submitted with."""
     job_id = queue.enqueue(make_spec(priority=50))
-    run(capsys, "reorder", job_id, "7")
+    run(capsys, "reorder", job_id, "--priority", "7")
     assert jobs.read_state(job_id).priority == 7
     assert jobs.read_spec(job_id).priority == 50
 
@@ -340,7 +411,7 @@ def test_preempt_records_the_intent_and_starts_a_dispatcher(
 
     code, payload = run(capsys, "preempt", job_id, "--priority", "70")
     assert code == 0 and isinstance(payload, dict)
-    assert (payload["status"], payload["priority"]) == ("preempting", 70)
+    assert payload["jobs"] == [{"job_id": job_id, "status": "preempting", "priority": 70}]
     assert payload["dispatcher_pid"] == 4242
     assert queue.stop_requested(job_id) == "preempted"
 
@@ -354,13 +425,13 @@ def test_preempt_of_a_job_that_is_not_running_is_a_refusal_not_a_traceback(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec())
-    code, payload = run(capsys, "preempt", job_id)
-    assert code == 1 and isinstance(payload, dict)
+    code, payload = verb(capsys, "preempt", job_id)
+    assert code == 1
     assert "not running" in str(payload["error"])
     assert not queue.is_preempted(job_id)
 
-    code, payload = run(capsys, "preempt", "no-such-job")
-    assert code == 1 and isinstance(payload, dict) and "no such job" in str(payload["error"])
+    code, payload = verb(capsys, "preempt", "no-such-job")
+    assert code == 1 and "no such job" in str(payload["error"])
 
 
 def test_preempt_that_would_free_the_host_for_nothing_is_refused(
@@ -372,8 +443,8 @@ def test_preempt_that_would_free_the_host_for_nothing_is_refused(
     job_id = queue.enqueue(make_spec())
     jobs.update_state(job_id, status="running")
 
-    code, payload = run(capsys, "preempt", job_id)
-    assert code == 1 and isinstance(payload, dict)
+    code, payload = verb(capsys, "preempt", job_id)
+    assert code == 1
     assert "nothing else is queued" in str(payload["error"])
     assert (started, queue.stop_requested(job_id)) == ([], None)
 
@@ -447,7 +518,7 @@ def test_status_projects_from_the_live_estimate_not_the_spec(
         "the jobs holding the cards it needs gave no end time",
     )
 
-    assert run(capsys, "estimate", first, "30")[0] == 0
+    assert run(capsys, "estimate", first, "--minutes", "30")[0] == 0
     got = projection(capsys)
     assert got[first] == (0.0, None)
     starts, _ = got[second]
@@ -548,6 +619,6 @@ def test_cancel_of_a_job_whose_state_cannot_be_read_is_a_refusal_not_a_traceback
     and has the job, it just cannot say what state it is in."""
     job_id = queue.enqueue(make_spec())
     paths.state_file(job_id).write_text("{not json")
-    code, payload = run(capsys, "cancel", job_id)
-    assert code == 1 and isinstance(payload, dict)
+    code, payload = verb(capsys, "cancel", job_id)
+    assert code == 1
     assert payload["job_id"] == job_id and "error" in payload and "missing" not in payload

@@ -68,7 +68,7 @@ from gpuc.control.remote import (
     ask,
     reason_of,
 )
-from gpuc.control.status import parse_status
+from gpuc.control.status import HOST_ONLY, parse_status
 from gpuc.control.transport import LocalToolMissing, SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
@@ -599,7 +599,7 @@ def pick_reusable_host(
     for entry in open_registry().registry.listing():
         if entry.rental is None:
             continue
-        asked = ask(entry, "status", settings, provider=provider)
+        asked = ask(entry, HOST_ONLY, settings, provider=provider)
         if isinstance(asked, Gone):
             # The pod is gone for good, so the entry can only mislead `status`,
             # `logs` and the next reuse pass. Drop it here rather than leaving

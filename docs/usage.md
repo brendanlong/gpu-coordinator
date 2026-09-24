@@ -95,7 +95,7 @@ Both are optional, and neither affects a job's outcome.
 `estimated_runtime_min` is your own guess, measured from the runner's start.
 `gpuc estimate <job-id> --minutes N` sets it on a job that is **queued or
 running**, and `--clear` takes it off; a running job picks it up within a
-minute, and a finished job is refused (exit 1). The mirrored spec is updated
+minute, and a finished job is refused. The mirrored spec is updated
 too, so a later `gpuc requeue` carries the estimate; a mirror that cannot be
 written is a warning, not a failure.
 
@@ -217,14 +217,21 @@ one of *our* jobs has it, and `IN USE` means somebody else does, with their
 memory and utilization.
 
 `--host H` narrows it; `--recent N` (default 5) and `--since 24h|7d|90m` (a bare
-number means hours) choose how much of the finished list to show; `--all` adds
-jobs only the local index and the S3 index know, and is exit 1 if the S3 index
-could not be read; `--json` is [below](#exit-codes-and---json). A host prints
+number means hours) choose how much of the finished list each host sends; `--all`
+asks each host for every job it has and adds jobs only the local index and the S3
+index know, and is exit 1 if the S3 index could not be read; `--json` is [below](#exit-codes-and---json). A host prints
 `UNASKABLE` or `GONE` in place of its status ([the host
 rule](#exit-codes-and---json)); a gone rental is forgotten as it is printed.
 A gone host is shown when it is found gone or named with `--host`.
 Card UUIDs are in `gpuc host list`, and everything a host can say about itself
 is in `gpuc host probe`.
+
+**`gpuc status <job-id> [<job-id> ...] [--host H]`** — exactly those jobs,
+whatever state they are in, one line each: one question per host however many
+ids. An id no host has is exit 4 and one that could not be asked about is exit
+1, after the rest are reported; how the jobs went is not the exit code (that is
+`wait`). A job whose host is gone is answered from the S3 mirror. Not with
+`--all`, `--recent` or `--since`.
 
 **`gpuc logs <job-id> [-f] [-n N] [--host H]`** — tails `log.txt` on the host
 (`-n` defaults to 200), or the S3 mirror when the host cannot produce it,
@@ -260,27 +267,33 @@ port, `known_hosts` and ControlMaster socket, none of which are in your
 `--print` prints the command line instead of running it. A `local` host gets your
 own `$SHELL` with no ssh at all.
 
-**`gpuc cancel <job-id>`** — see [how a job is killed](#how-a-job-is-killed). A
-finished job is not touched; its status is the answer, exit 0.
+`cancel`, `reorder`, `preempt` and `estimate` take any number of job ids and act
+on each, asking each host once for all of its jobs. One line per job it acted
+on; each refusal is an `error:` line on stderr. An id no host has is exit 4, and
+any other refusal exit 1, once the rest have been carried out.
 
-**`gpuc reorder <job-id> --priority N`** — queued jobs only (a running or
-finished job is exit 1). It prints the job's new queue position and start time,
-and records the priority in the job's spec on the host and in its S3 mirror, so
-`gpuc requeue` carries the move.
+**`gpuc cancel <job-id> [<job-id> ...]`** — see [how a job is
+killed](#how-a-job-is-killed). A finished job is not touched; its status is the
+answer, not a refusal.
 
-**`gpuc preempt <job-id>`** — stop a *running* job and queue it again as its next
+**`gpuc reorder <job-id> [...] --priority N`** — queued jobs only (a running or
+finished job is refused). It prints each job's new queue position and start
+time, and records the priority in the job's spec on the host and in its S3
+mirror, so `gpuc requeue` carries the move.
+
+**`gpuc preempt <job-id> [...]`** — stop a *running* job and queue it again as its next
 attempt. It **starts over**: `setup:` and `command:` run again from the top, in
 the workdir the stopped attempt left behind. Nothing is re-synced from here.
 
 It comes back at its own priority unless `--priority N` changes it, and at the
 same priority it takes its own cards straight back, so **queue the job you are
 making room for first, at a lower number, then preempt**. A preempt that would
-only re-run the same job is refused (exit 1), as are queued and finished jobs.
+only re-run the same job is refused, as are queued and finished jobs.
 The stopped attempt is not queued again if it had already ended on its own, was
 cancelled while stopping, or the host is draining.
 
-**`gpuc estimate <job-id> --minutes N`** — set (or `--clear`) a queued or running
-job's `estimated_runtime_min`; see [job length estimates](#job-length-estimates).
+**`gpuc estimate <job-id> [...] --minutes N`** — set (or `--clear`) queued or
+running jobs' `estimated_runtime_min`; see [job length estimates](#job-length-estimates).
 
 **`gpuc requeue <job-id>`** — re-read the spec from the S3 mirror and submit it
 again as a new job that records where it came from (`requeued_from`), with the
@@ -291,9 +304,9 @@ ran it; a job whose host is gone needs one of them. A mirrored spec this build
 will not accept is refused; submitting the job file again is the way round it.
 Keys this build does not know are dropped.
 
-`--host` is optional on `logs`, `wait`, `cancel`, `preempt`, `reorder`,
-`estimate` and `requeue`: the local job index is tried first, then every
-registered host is asked whether it knows the id. An unknown host is exit 4
+`--host` is optional on `status <job-id>`, `logs`, `wait`, `cancel`, `preempt`,
+`reorder`, `estimate` and `requeue`: the local job index is tried first, then
+every registered host is asked whether it knows the ids. An unknown host is exit 4
 unless it is [gone](#exit-codes-and---json) (never for `requeue --host` or `ssh
 --host`, which name where to go), and so is a job no host knows once every host
 has answered, and a job the host you named answers it does not have.
@@ -345,10 +358,10 @@ is held:
 | `GET /api/config` | `gpuc config show --json` |
 | `GET /api/version` | `gpuc version --json` |
 | `GET /api/jobs/<id>/logs?lines=N&host=H` | `gpuc logs --json` (no `-f`; the page re-fetches the tail instead) |
-| `POST /api/jobs/<id>/cancel` `{host?}` | `gpuc cancel --json` |
-| `POST /api/jobs/<id>/reorder` `{priority, host?}` | `gpuc reorder --json` |
-| `POST /api/jobs/<id>/preempt` `{priority?, host?}` | `gpuc preempt --json` |
-| `POST /api/jobs/<id>/estimate` `{minutes}` or `{clear: true}` | `gpuc estimate --json` |
+| `POST /api/jobs/<id>/cancel` `{host?}` | `gpuc cancel <id> --json` |
+| `POST /api/jobs/<id>/reorder` `{priority, host?}` | `gpuc reorder <id> --json` |
+| `POST /api/jobs/<id>/preempt` `{priority?, host?}` | `gpuc preempt <id> --json` |
+| `POST /api/jobs/<id>/estimate` `{minutes}` or `{clear: true}` | `gpuc estimate <id> --json` |
 | `POST /api/hosts/<name>/remove` | `gpuc host remove --json` |
 
 The HTTP status is the CLI's exit code for the same answer: 0 is 200, 1 is 500,
@@ -661,10 +674,12 @@ stopped for.
 | `submit`, `requeue` | `{job_id, host, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`. `requeued_from` is null on `submit`; `notes` are the text output's `note:` lines; `queue_position` is 1-based in dispatch order; `dispatched` is true for a job the host started before we could look; `starts_unknown` says why there is no start time. The queue fields are all null when the host could not be asked again, and the job is queued regardless |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"`, `location` the remote path or `s3://` uri, `lines` the log without trailing newlines, `notes` why the mirror was read. Not with either follow (exit 2) |
 | `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is the job's final state in the shape `status --json` gives a job, plus `host`, `source` (`"host"` or `"mirror"`) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say, and a job nothing was heard about carries only `job_id`, `host`, `source`, `error` and a null `status`. Every `error` is in `errors[]` too. The per-job outcome lines go to stderr. Exit 1 unless every job succeeded; exit 4 when an id no host has is among them, with the rest still reported |
-| `cancel` | `{job_id, host, status, source}`: `cancelled` for a queued job, `cancelling` for a running one, a finished job's own status; `source` is `host` or `mirror` |
-| `preempt` | `{job_id, host, status, priority, warnings[]}`. `status` is `preempting`; `priority` is what it will be queued again at; `warnings` carries a mirrored spec that could not be updated |
-| `reorder` | `{job_id, host, priority, warnings[]}` plus the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit`. A `warnings` entry means `gpuc requeue` would re-run the job at its old priority |
-| `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}`. `estimated_runtime_min` is what the job's state holds now (null after `--clear`); `warnings` carries a `max_runtime_min` contradiction and a mirrored spec that could not be updated |
+| `status <job-id> ...` | `wait`'s document, as things stand now rather than once the jobs end. Exit 4 when an id no host has is among them, 1 when any other job has an `error`, else 0 whatever the jobs' own status |
+| `cancel`, `preempt`, `reorder`, `estimate` | `{jobs[], errors[]}`, one entry per id in the order given: `{job_id, host, source, error, warnings[]}` plus what the host did, below. **Check `error`**: when it is not null the job was not touched and none of the fields below are there. `source` is `mirror` for a job whose host is gone, answered from the S3 mirror. `warnings` carries a mirrored spec that could not be updated, so `gpuc requeue` would not carry the change. Every `error` is in `errors[]` too. Exit 4 when an id no host has is among them, else 1 when any `error` is set |
+| ↳ `cancel` | `status`: `cancelled` for a queued job, `cancelling` for a running one, a finished job's own status |
+| ↳ `preempt` | `status` (`preempting`) and `priority`, what it will be queued again at |
+| ↳ `reorder` | `status` (`queued`), `priority`, and the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit` |
+| ↳ `estimate` | `status` and `estimated_runtime_min`, what the job's state holds now (null after `--clear`); `warnings` also carries a `max_runtime_min` contradiction |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], host, heartbeat_age_s}`; `host` is the registry name here, null if none; `others` are pods without our prefix, `{id, name, status}` only |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` is the commit the host was running when this machine last read it. Exit 1 for an entry that could not be parsed, 3 if the whole registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}`: the effective settings, file or not |

@@ -17,7 +17,7 @@ from gpuc.control.config import HostEntry, Settings, open_registry
 from gpuc.control.providers.base import Pod, Provider, owned_pods
 from gpuc.control.provision import CEILING_MINUTES
 from gpuc.control.remote import ask
-from gpuc.control.status import format_duration, parse_status
+from gpuc.control.status import HOST_ONLY, format_duration, parse_status
 
 COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "HOST", "HEARTBEAT")
 
@@ -131,7 +131,7 @@ def gather(
 def heartbeat_age(entry: HostEntry, settings: Settings) -> float | None:
     """How long ago the pod's dispatcher last beat, by the host's own `status`;
     the pod was just listed, so the provider is not asked about it again."""
-    return parse_status(entry, ask(entry, "status", settings)).heartbeat_age_s
+    return parse_status(entry, ask(entry, HOST_ONLY, settings)).heartbeat_age_s
 
 
 def _may_be_provisioning(pod: Pod) -> bool:

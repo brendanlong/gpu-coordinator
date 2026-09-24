@@ -12,7 +12,6 @@ impatient or as forgiving as it likes about a host it cannot reach.
 
 from __future__ import annotations
 
-import shlex
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -26,7 +25,8 @@ from gpuc.control.actions import (
     Answer,
     Mirrored,
     NotFound,
-    locate,
+    Unlocated,
+    locate_many,
     mirror_is_the_answer,
     provider_for,
     read_mirror,
@@ -114,6 +114,15 @@ class Watched:
         job = self.view
         if self.error is not None or job is None:
             return f"job {self.job_id} on {self.host}: {self.error or 'unknown'}"
+        if not self.finished:
+            # `gpuc status <id>` asks about jobs that have not ended.
+            phase = f" phase={job.phase}" if job.phase else ""
+            took = (
+                f" for {status_mod.format_duration(job.minutes * 60.0)}"
+                if job.minutes is not None
+                else ""
+            )
+            return f"{status_mod.job_label(job)} on {self.host}: {job.status}{phase}{took}"
         # `cancelled (cancelled)` says nothing twice, as in `gpuc status`.
         detail = job.reason if job.reason and job.reason != job.status else ""
         if not detail and job.exit_code:
@@ -150,9 +159,14 @@ class Watched:
 class Watch:
     """The jobs a wait is blocking on, and one `status` round trip per host.
 
-    One call per host per round rather than one per job: a sweep is usually
-    twenty ids on one box, and the host's own `status` already answers for all
-    of them at once.
+    One call per host per round rather than one per job, naming every job
+    still pending there: a sweep is hundreds of ids on a few boxes.
+
+    A `patient` watch gives a host that cannot be asked `TROUBLE_GRACE_S`
+    before settling its jobs, from the mirror if it has their end, else with
+    an error. One that is not settles them with the error at once, and never
+    from the mirror: that is `gpuc status <id>`, which asks once, and must not
+    report a copy as the answer for a host that may still hold a newer one.
     """
 
     def __init__(
@@ -166,6 +180,7 @@ class Watch:
         gone: dict[str, str] | None = None,
         unknown: dict[str, str] | None = None,
         unaskable: dict[str, tuple[str, str]] | None = None,
+        patient: bool = True,
     ) -> None:
         """`targets` is `(job_id, host name, entry)`, the entry None for a host
         this machine has forgotten; `gone` is the reason each host the locator
@@ -178,6 +193,7 @@ class Watch:
         # real `Settings` to find a bucket in, and a watch outlives many reads.
         self.settings = settings if settings is not None else load_settings()
         self.report = report
+        self.patient = patient
         self.provider = provider
         self.index = JobIndex(self.settings)
         self.entries = {host: entry for _, host, entry in targets if entry is not None}
@@ -266,7 +282,7 @@ class Watch:
         if name in self.gone:
             self._trouble_with(name, pending, self.gone[name], gone=True)
             return
-        request = f"status {shlex.quote(pending[0].job_id)}" if len(pending) == 1 else "status"
+        request = status_mod.status_request([watched.job_id for watched in pending])
         asked = ask(
             self.entries[name],
             request,
@@ -312,8 +328,8 @@ class Watch:
             return
         self._dispatcher_warned.add(name)
         self.report(
-            f"host {name}: dispatcher DOWN, so nothing there will start a queued job. "
-            f"Still waiting; `gpuc host bootstrap {name}` restarts it"
+            f"host {name}: dispatcher DOWN, so nothing there will start a queued job; "
+            f"`gpuc host bootstrap {name}` restarts it"
         )
 
     def _vanished(self, name: str, watched: Watched) -> None:
@@ -331,29 +347,30 @@ class Watch:
     ) -> None:
         now = time.monotonic()
         since, said = self._trouble.get(name, (now, ""))
-        if said != why:
-            self.report(f"host {name}: {why}" if gone else f"host {name}: {why}; still waiting")
-        self._trouble[name] = (since, why)
         # A host that is gone (`mirror_is_the_answer`) is not going to answer,
         # however long we wait: it is the one case the mirror exists for, so
         # it is read now rather than after the grace period.
-        if not gone and now - since < TROUBLE_GRACE_S:
+        waiting = not gone and self.patient and now - since < TROUBLE_GRACE_S
+        if said != why:
+            self.report(f"host {name}: {why}; still waiting" if waiting else f"host {name}: {why}")
+        self._trouble[name] = (since, why)
+        if waiting:
             return
-        waited = status_mod.format_duration(now - since)
+        waited = f" for {status_mod.format_duration(now - since)}" if now > since else ""
         for watched in pending:
             # The mirror before giving up, and only now: the spec's rule is
             # that monitoring asks the host and reads the mirror when the host
             # is gone. A rental that idled itself down after finishing the job
             # is exactly that, and reporting its success as "could not ask"
             # would be wrong about the one run the user was waiting for.
-            mirrored = self._from_mirror(watched)
-            if mirrored.view is not None:
+            if gone:
+                mirrored = self._from_mirror(watched)
+                if mirrored.view is None:
+                    watched.error = f"host {name} is gone ({why}), and {mirrored.lost}"
                 continue
-            watched.error = (
-                f"host {name} is gone ({why}), and {mirrored.lost}"
-                if gone
-                else f"host {name} could not be asked for {waited}: {why}"
-            )
+            if self.patient and self._from_mirror(watched).view is not None:
+                continue
+            watched.error = f"host {name} could not be asked{waited}: {why}"
 
     def _from_mirror(self, watched: Watched) -> Mirrored:
         """This job's outcome from S3, if the mirror has a terminal one."""
@@ -375,9 +392,10 @@ def start(
     settings: Settings | None = None,
     *,
     report: Reporter = note,
+    patient: bool = True,
 ) -> Watch:
-    """Resolve each id to a host. A host asked on the way is kept: its
-    session is the one the poll goes on using."""
+    """Resolve each id to a host (`locate_many`). A host asked on the way is
+    kept: its session is the one the poll goes on using."""
     read = open_registry()
     registry = read.named()
     settings = settings if settings is not None else load_settings()
@@ -389,15 +407,14 @@ def start(
     unaskable: dict[str, tuple[str, str]] = {}
     # Deduplicated, so `xargs gpuc wait` on a list with a repeat in it
     # neither polls twice nor prints the outcome twice.
-    for job_id in dict.fromkeys(job_ids):
-        try:
-            location = locate(
-                job_id, registry, host, settings, provider=provider, skipped=read.skipped
-            )
-        except NotFound as exc:
+    placed = locate_many(job_ids, registry, host, settings, provider=provider, skipped=read.skipped)
+    for job_id, location in placed.items():
+        if isinstance(location, Unlocated):
+            if not location.missing:
+                raise location.exception()
             # One typo in a list of twenty must not throw away the nineteen:
             # it is reported with them, and makes the exit 4.
-            unknown[job_id] = str(exc).splitlines()[0]
+            unknown[job_id] = location.reason
             continue
         trouble = location.trouble
         if location.entry is None and isinstance(trouble, Unaskable):
@@ -417,6 +434,30 @@ def start(
         gone=gone,
         unknown=unknown,
         unaskable=unaskable,
+        patient=patient,
+    )
+
+
+def look(
+    job_ids: Sequence[str],
+    host: str | None,
+    settings: Settings | None = None,
+    *,
+    report: Reporter = note,
+) -> Answer:
+    """`gpuc status <job-id>...`: one round of the wait's poll, reported as it
+    stands. Exit 4 for an id no host has and 1 for one that could not be
+    asked about, after the rest have been reported; how the jobs themselves
+    went is the answer, not the exit code."""
+    watch = start(job_ids, host, settings, report=report, patient=False)
+    watch.poll()
+    looked = [watch.jobs[job_id] for job_id in dict.fromkeys(job_ids)]
+    errors = [job.error for job in looked if job.error is not None]
+    return Answer(
+        document(looked),
+        "\n".join(job.line() for job in looked),
+        failures=errors,
+        outcome=EXIT_NOT_FOUND if any(job.missing for job in looked) else None,
     )
 
 

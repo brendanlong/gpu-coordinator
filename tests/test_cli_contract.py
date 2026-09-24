@@ -458,13 +458,54 @@ def test_a_verb_on_an_id_the_host_does_not_have_is_exit_four_with_its_reason(
     for real: exit 4, not "the host could not be asked" or a refusal."""
     assert main(["cancel", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == EXIT_NOT_FOUND
     document = json.loads(capsys.readouterr().out)
-    assert document["exit_code"] == EXIT_NOT_FOUND
-    assert "no such job" in document["error"] and "host local has no job" in document["error"]
+    (error,) = document["errors"]
+    assert document["jobs"][0]["error"] == error
+    assert "no such job" in error and "host local has no job" in error
     assert (
         main(["reorder", "20260101-000000-aaaaaa", "--priority", "1", "--host", "local"])
         == EXIT_NOT_FOUND
     )
     assert "no job 20260101-000000-aaaaaa on this host" in capsys.readouterr().err
+
+
+def test_a_verb_on_several_ids_does_every_one_it_can_and_exits_for_the_rest(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One call to the host for all of them; an unknown id is exit 4 and a
+    refusal is exit 1, each only after the others were carried out."""
+    unknown = "20260101-000000-aaaaaa"
+    argv = ["cancel", FINISHED_JOB, unknown, "--host", "local", "--json"]
+    assert main(argv) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    assert [job["job_id"] for job in document["jobs"]] == [FINISHED_JOB, unknown]
+    finished, missing = document["jobs"]
+    assert (finished["status"], finished["error"], finished["source"]) == ("failed", None, "host")
+    assert "no job" in missing["error"] and document["errors"] == [missing["error"]]
+
+    argv = ["estimate", RUNNING_JOB, FINISHED_JOB, "--minutes", "5", "--host", "local"]
+    assert main(argv) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert f"job {RUNNING_JOB} on host local now estimates 5 min" in captured.out
+    assert "already failed" in captured.err
+
+
+def test_status_of_named_jobs_is_those_jobs_and_exit_four_for_an_unknown_one(
+    real_local_host: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unknown = "20260101-000000-aaaaaa"
+    argv = ["status", RUNNING_JOB, unknown, FINISHED_JOB, "--host", "local", "--json"]
+    assert main(argv) == EXIT_NOT_FOUND
+    document = json.loads(capsys.readouterr().out)
+    by_id = {job["job_id"]: job for job in document["jobs"]}
+    assert list(by_id) == [RUNNING_JOB, unknown, FINISHED_JOB]
+    assert (by_id[RUNNING_JOB]["status"], by_id[RUNNING_JOB]["error"]) == ("running", None)
+    assert by_id[FINISHED_JOB]["status"] == "failed"
+    assert by_id[unknown]["error"] and document["errors"] == [by_id[unknown]["error"]]
+
+    assert main(["status", RUNNING_JOB, FINISHED_JOB, "--host", "local"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert f"({RUNNING_JOB}) on local: running" in out and "failed" in out
+    assert main(["status", RUNNING_JOB, "--all"]) == EXIT_USAGE
 
 
 def test_a_verb_the_host_refuses_for_a_job_it_has_is_exit_one(
@@ -910,7 +951,7 @@ def test_a_failure_under_json_is_a_document_and_the_same_exit_code(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A caller parsing stdout must never be handed nothing at all."""
-    assert main(["cancel", "20260101-000000-aaaaaa", "--json"]) == EXIT_NOT_FOUND
+    assert main(["logs", "20260101-000000-aaaaaa", "--json"]) == EXIT_NOT_FOUND
     captured = capsys.readouterr()
     document = json.loads(captured.out)
     assert document["exit_code"] == EXIT_NOT_FOUND

@@ -168,9 +168,103 @@ def projected_starts(
     )
 
 
+def _ended_within(ended_at: str | None, since_s: float, now: datetime) -> bool:
+    if not ended_at:
+        return False
+    try:
+        ended = datetime.fromisoformat(ended_at)
+    except ValueError:
+        return False
+    if ended.tzinfo is None:
+        ended = ended.replace(tzinfo=UTC)
+    return (now - ended).total_seconds() <= since_s
+
+
+def in_window(states: dict[str, JobState], recent: int | None, since_s: float | None) -> list[str]:
+    """The jobs a `status` that names none reports: every job that is not
+    finished, the newest `recent` finished ones that ended within `since_s`,
+    and every finished job still holding its workdir.
+
+    Trimmed here, not by the client, so that what a status costs grows with
+    what is on the host now rather than with everything it has ever run: a
+    finished job's spec, its outputs check and its workdir size are the part
+    that grows, and a long-lived box nobody purges would otherwise get slower
+    with every job. A finished job with its workdir is sent whatever its age
+    because the host-level lines are about exactly those -- the disk they
+    hold and the outputs that are only here, which `host terminate` refuses
+    over -- and without a workdir neither can apply. No window sends every job.
+    """
+    now = datetime.now(UTC)
+    finished = sorted(
+        ((state.ended_at or "", job_id) for job_id, state in states.items() if state.finished),
+        reverse=True,
+    )
+    shown = [
+        job_id
+        for ended_at, job_id in finished
+        if since_s is None or _ended_within(ended_at, since_s, now)
+    ]
+    kept = set(shown if recent is None else shown[: max(recent, 0)])
+    return [
+        job_id
+        for job_id, state in states.items()
+        if not state.finished or job_id in kept or paths.workdir(job_id).is_dir()
+    ]
+
+
+def _job_entry(
+    job_id: str, state: JobState, projection: plan.Projection, measuring_until: float
+) -> dict[str, Any]:
+    spec = _spec(job_id)
+    entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
+    # When a queued job's turn is expected, and why not if it cannot be
+    # said. Null on anything that is not queued.
+    entry["starts_in_s"] = projection.starts_in_s.get(job_id)
+    entry["starts_unknown"] = projection.unknown.get(job_id)
+    # Whether this job gives its cards up to anything more important. It
+    # changes what "running" promises, and only the spec knows.
+    entry["auto_preempt"] = spec.auto_preempt if spec else None
+    # How many cards this job asked for. A queued job holds none, so its
+    # `gpus` is empty and nothing else says whether it is waiting for one
+    # card or for eight.
+    entry["gpus_requested"] = spec.gpus if spec else None
+    # Whether this job may be dispatched to a shared card, which is half of
+    # why a queued job asking for more cards than the host owns is waiting
+    # rather than already failed.
+    entry["use_shared"] = spec.use_shared if spec else None
+    # Where the results went, for anything that wants to link to them. The
+    # W&B keys are the three that name a run; the job's env is otherwise
+    # its own business and never leaves the host.
+    entry["outputs"] = [asdict(o) for o in spec.outputs] if spec else []
+    entry["wandb"] = wandb_hints(spec.env) if spec else {}
+    # Which job this one was resubmitted from; the host only carries it.
+    entry["requeued_from"] = spec.requeued_from if spec else None
+    # Null for a job that is not over -- a running job's workdir is being
+    # written to, so any size for it would be a lie -- and for a finished
+    # one only when the call's measuring budget is spent. Otherwise free
+    # for the workdirs that are already gone, and read from `state.json`
+    # for the rest.
+    entry["workdir_bytes"] = (
+        cleanup.reported_workdir_bytes(job_id, state, deadline=measuring_until)
+        if state.finished
+        else None
+    )
+    # "this job produced something that is still only here": the control
+    # side cannot work it out, since it never sees the spec's `outputs:`.
+    # A running job's files are its runner's; a queued one may be holding
+    # what a preempted attempt produced.
+    entry["outputs_pending"] = bool(
+        spec is not None
+        and state.status != "running"
+        and cleanup.outputs_pending(job_id, spec, state)
+    )
+    return entry
+
+
 def cmd_status(args: argparse.Namespace) -> int:
+    """The host, and the jobs asked about: exactly the ids named, those this
+    host has, or with none named the ones `in_window` picks."""
     config = jobs.read_config()
-    job_ids = [args.job_id] if args.job_id else jobs.list_job_ids()
     measuring_until = time.monotonic() + cleanup.MEASURING_BUDGET_S
     states: dict[str, JobState] = {}
     for job_id in jobs.list_job_ids():
@@ -180,55 +274,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             continue
     table = _gpu_table(config)
     projection = projected_starts(config, table, states)
-    entries: list[dict[str, Any]] = []
-    for job_id in job_ids:
-        state = states.get(job_id)
-        if state is None:
-            continue
-        spec = _spec(job_id)
-        entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
-        # When a queued job's turn is expected, and why not if it cannot be
-        # said. Null on anything that is not queued.
-        entry["starts_in_s"] = projection.starts_in_s.get(job_id)
-        entry["starts_unknown"] = projection.unknown.get(job_id)
-        # Whether this job gives its cards up to anything more important. It
-        # changes what "running" promises, and only the spec knows.
-        entry["auto_preempt"] = spec.auto_preempt if spec else None
-        # How many cards this job asked for. A queued job holds none, so its
-        # `gpus` is empty and nothing else says whether it is waiting for one
-        # card or for eight.
-        entry["gpus_requested"] = spec.gpus if spec else None
-        # Whether this job may be dispatched to a shared card, which is half of
-        # why a queued job asking for more cards than the host owns is waiting
-        # rather than already failed.
-        entry["use_shared"] = spec.use_shared if spec else None
-        # Where the results went, for anything that wants to link to them. The
-        # W&B keys are the three that name a run; the job's env is otherwise
-        # its own business and never leaves the host.
-        entry["outputs"] = [asdict(o) for o in spec.outputs] if spec else []
-        entry["wandb"] = wandb_hints(spec.env) if spec else {}
-        # Which job this one was resubmitted from; the host only carries it.
-        entry["requeued_from"] = spec.requeued_from if spec else None
-        # Null for a job that is not over -- a running job's workdir is being
-        # written to, so any size for it would be a lie -- and for a finished
-        # one only when the call's measuring budget is spent. Otherwise free
-        # for the workdirs that are already gone, and read from `state.json`
-        # for the rest.
-        entry["workdir_bytes"] = (
-            cleanup.reported_workdir_bytes(job_id, state, deadline=measuring_until)
-            if state.finished
-            else None
-        )
-        # "this job produced something that is still only here": the control
-        # side cannot work it out, since it never sees the spec's `outputs:`.
-        # A running job's files are its runner's; a queued one may be holding
-        # what a preempted attempt produced.
-        entry["outputs_pending"] = bool(
-            spec is not None
-            and state.status != "running"
-            and cleanup.outputs_pending(job_id, spec, state)
-        )
-        entries.append(entry)
+    selected = (
+        [job_id for job_id in dict.fromkeys(args.job_ids) if job_id in states]
+        if args.job_ids
+        else in_window(states, args.recent, args.since)
+    )
     heartbeat = dispatcher.heartbeat_age()
     print(
         json.dumps(
@@ -256,7 +306,13 @@ def cmd_status(args: argparse.Namespace) -> int:
                     )
                     if state.status == "queued"
                 ],
-                "jobs": entries,
+                # However many `jobs` leaves out, so "none in the last hour"
+                # can still say how many older ones there are.
+                "finished_count": sum(1 for state in states.values() if state.finished),
+                "jobs": [
+                    _job_entry(job_id, states[job_id], projection, measuring_until)
+                    for job_id in selected
+                ],
             },
             indent=2,
         )
@@ -264,81 +320,83 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _no_such_job(job_id: str, why: str) -> int:
+def _no_such_job(job_id: str, why: str) -> dict[str, Any]:
     """The answer every job verb gives for an id this host does not have.
 
     `missing` is what tells the control side apart "no such job" (its exit 4)
     from a refusal of a job that is here (exit 1): both are an `error`
     document, and the words alone are not something to parse.
     """
-    print(json.dumps({"job_id": job_id, "error": why, "missing": True}))
-    return 1
+    return {"job_id": job_id, "error": why, "missing": True}
+
+
+def _answer(answers: list[dict[str, Any]], **extra: Any) -> int:
+    """Every job verb's output: `{"jobs": [...]}`, one document per id in the
+    order asked, each what was done or `{job_id, error}`; exit 1 if any job
+    was refused. One refusal never stops the others being done."""
+    print(json.dumps({"jobs": answers, **extra}))
+    return 1 if any("error" in answer for answer in answers) else 0
+
+
+def _cancel(job_id: str) -> dict[str, Any]:
+    try:
+        status = queue.cancel(job_id)
+    except FileNotFoundError as exc:
+        return _no_such_job(job_id, str(exc))
+    except (OSError, RuntimeError) as exc:
+        return {"job_id": job_id, "error": str(exc)}
+    return {"job_id": job_id, "status": status}
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
+    return _answer([_cancel(job_id) for job_id in dict.fromkeys(args.job_ids)])
+
+
+def _preempt(job_id: str, priority: int | None) -> dict[str, Any]:
+    """The error document rather than a traceback, like `estimate`: which job
+    this host will not preempt, and why, is the whole answer the control side
+    needs."""
     try:
-        status = queue.cancel(args.job_id)
+        status = queue.preempt(job_id, priority)
     except FileNotFoundError as exc:
-        return _no_such_job(args.job_id, str(exc))
-    except (OSError, RuntimeError) as exc:
-        print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
-        return 1
-    print(json.dumps({"job_id": args.job_id, "status": status}))
-    return 0
+        return _no_such_job(job_id, str(exc))
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {"job_id": job_id, "error": str(exc)}
+    state = _state_or_none(job_id)
+    # What it will be queued at once its runner stops, whether or not this
+    # call changed it.
+    return {"job_id": job_id, "status": status, "priority": state.priority if state else None}
 
 
 def cmd_preempt(args: argparse.Namespace) -> int:
-    """Stop a running job and queue it again, to run from the start.
-
-    The error document rather than a traceback, like `estimate`: which job this
-    host will not preempt, and why, is the whole answer the control side needs.
-    """
-    try:
-        status = queue.preempt(args.job_id, args.priority)
-    except FileNotFoundError as exc:
-        return _no_such_job(args.job_id, str(exc))
-    except (OSError, ValueError, RuntimeError) as exc:
-        print(json.dumps({"job_id": args.job_id, "error": str(exc)}))
-        return 1
-    state = _state_or_none(args.job_id)
-    print(
-        json.dumps(
-            {
-                "job_id": args.job_id,
-                "status": status,
-                # What it will be queued at once its runner stops, whether or
-                # not this call changed it.
-                "priority": state.priority if state else None,
-                # The runner queues the job again; the dispatcher is what
-                # launches the next attempt, so make sure there is one.
-                "dispatcher_pid": dispatcher.spawn_detached_dispatcher(),
-            }
-        )
+    """Stop running jobs and queue them again, to run from the start."""
+    answers = [_preempt(job_id, args.priority) for job_id in dict.fromkeys(args.job_ids)]
+    # The runner queues the job again; the dispatcher is what launches the
+    # next attempt, so make sure there is one.
+    started = any("error" not in answer for answer in answers)
+    return _answer(
+        answers, dispatcher_pid=dispatcher.spawn_detached_dispatcher() if started else None
     )
-    return 0
+
+
+def _reorder(job_id: str, priority: int) -> dict[str, Any]:
+    """`{"job_id", "status", "priority"}`, or `{"job_id", "error"}` for a job
+    that is not queued, like `preempt` and `estimate` answer."""
+    if queue.reorder(job_id, priority):
+        return {"job_id": job_id, "status": "queued", "priority": priority}
+    state = _state_or_none(job_id)
+    if state is None:
+        return _no_such_job(job_id, f"no job {job_id} on this host")
+    why = f"job {job_id} is not queued (status {state.status}); only a queued job can be reordered"
+    return {"job_id": job_id, "error": why}
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
-    """`{"job_id", "status", "priority"}`, or `{"job_id", "error"}` and exit 1
-    for a job that is not queued, like `preempt` and `estimate` answer."""
-    if not queue.reorder(args.job_id, args.priority):
-        state = _state_or_none(args.job_id)
-        if state is None:
-            return _no_such_job(args.job_id, f"no job {args.job_id} on this host")
-        why = (
-            f"job {args.job_id} is not queued (status {state.status}); only a queued job "
-            f"can be reordered"
-        )
-        print(json.dumps({"job_id": args.job_id, "error": why}))
-        return 1
-    print(json.dumps({"job_id": args.job_id, "status": "queued", "priority": args.priority}))
-    return 0
+    return _answer([_reorder(job_id, args.priority) for job_id in dict.fromkeys(args.job_ids)])
 
 
 def _estimate_error(job_id: str, minutes: float | None) -> str | None:
     """Why this host will not record this estimate, or None."""
-    if not paths.job_dir(job_id).is_dir():
-        return f"no job with that id on this host: {job_id}"
     if minutes is not None and not minutes > 0.0:
         return f"an estimate must be a positive number of minutes, got {minutes!r}"
     if minutes is not None and jobs.utc_in(minutes * 60.0) is None:
@@ -357,27 +415,20 @@ def _estimate_error(job_id: str, minutes: float | None) -> str | None:
     return None
 
 
-def cmd_estimate(args: argparse.Namespace) -> int:
+def _estimate(job_id: str, minutes: float | None) -> dict[str, Any]:
     """Set (or clear) `estimated_runtime_min` on a job that is already here.
 
     A running job's runner re-reads its state on a timer, so this reaches it
     without any message passing: see `runner.ESTIMATE_REFRESH_S`.
     """
-    job_id = args.job_id
-    if args.clear is (args.minutes is not None):
-        print(json.dumps({"job_id": job_id, "error": "give MINUTES, or --clear, not both"}))
-        return 1
-    minutes = None if args.clear else args.minutes
     if not paths.job_dir(job_id).is_dir():
         return _no_such_job(job_id, f"no job with that id on this host: {job_id}")
     error = _estimate_error(job_id, minutes)
     if error is not None:
-        print(json.dumps({"job_id": job_id, "error": error}))
-        return 1
+        return {"job_id": job_id, "error": error}
     state = jobs.transition(job_id, expect=("queued", "running"), estimated_runtime_min=minutes)
     if state is None:
-        print(json.dumps({"job_id": job_id, "error": f"job {job_id} finished as this ran"}))
-        return 1
+        return {"job_id": job_id, "error": f"job {job_id} finished as this ran"}
     spec = _spec(job_id)
     warning = None
     cap = spec.max_runtime_min if spec else None
@@ -389,17 +440,17 @@ def cmd_estimate(args: argparse.Namespace) -> int:
             f"max_runtime_min ({cap:g}), so it expects to be killed as "
             f"`timeout` before it finishes"
         )
-    print(
-        json.dumps(
-            {
-                "job_id": job_id,
-                "estimated_runtime_min": minutes,
-                "status": state.status,
-                "warning": warning,
-            }
-        )
-    )
-    return 0
+    return {
+        "job_id": job_id,
+        "estimated_runtime_min": minutes,
+        "status": state.status,
+        "warning": warning,
+    }
+
+
+def cmd_estimate(args: argparse.Namespace) -> int:
+    minutes = None if args.clear else args.minutes
+    return _answer([_estimate(job_id, minutes) for job_id in dict.fromkeys(args.job_ids)])
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -492,29 +543,39 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.set_defaults(func=cmd_enqueue)
 
     status = sub.add_parser("status", help="host and job status as JSON")
-    status.add_argument("job_id", nargs="?")
+    status.add_argument("job_ids", nargs="*", metavar="job_id", help="exactly these jobs")
+    status.add_argument(
+        "--recent", type=int, metavar="N", help="with no ids: only the newest N finished jobs"
+    )
+    status.add_argument(
+        "--since",
+        type=float,
+        metavar="SECONDS",
+        help="with no ids: only finished jobs that ended this recently",
+    )
     status.set_defaults(func=cmd_status)
 
-    cancel = sub.add_parser("cancel", help="cancel a queued or running job")
-    cancel.add_argument("job_id")
+    cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
+    cancel.add_argument("job_ids", nargs="+", metavar="job_id")
     cancel.set_defaults(func=cmd_cancel)
 
-    preempt = sub.add_parser("preempt", help="stop a running job and queue it again")
-    preempt.add_argument("job_id")
+    preempt = sub.add_parser("preempt", help="stop running jobs and queue them again")
+    preempt.add_argument("job_ids", nargs="+", metavar="job_id")
     preempt.add_argument(
-        "--priority", type=int, help="queue it again at this priority instead of its own"
+        "--priority", type=int, help="queue them again at this priority instead of their own"
     )
     preempt.set_defaults(func=cmd_preempt)
 
-    reorder = sub.add_parser("reorder", help="change a queued job's priority")
-    reorder.add_argument("job_id")
-    reorder.add_argument("priority", type=int)
+    reorder = sub.add_parser("reorder", help="change queued jobs' priority")
+    reorder.add_argument("job_ids", nargs="+", metavar="job_id")
+    reorder.add_argument("--priority", type=int, required=True)
     reorder.set_defaults(func=cmd_reorder)
 
-    estimate = sub.add_parser("estimate", help="set a queued or running job's runtime estimate")
-    estimate.add_argument("job_id")
-    estimate.add_argument("minutes", nargs="?", type=float)
-    estimate.add_argument("--clear", action="store_true", help="remove the estimate instead")
+    estimate = sub.add_parser("estimate", help="set queued or running jobs' runtime estimate")
+    estimate.add_argument("job_ids", nargs="+", metavar="job_id")
+    wanted = estimate.add_mutually_exclusive_group(required=True)
+    wanted.add_argument("--minutes", type=float)
+    wanted.add_argument("--clear", action="store_true", help="remove the estimate instead")
     estimate.set_defaults(func=cmd_estimate)
 
     run = sub.add_parser("run", help="run one job in the foreground (used by the dispatcher)")

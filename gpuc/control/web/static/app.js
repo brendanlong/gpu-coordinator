@@ -150,11 +150,14 @@ function notify(message, level) {
 
 // One shape for every action button: disable it, POST, report what the CLI
 // would have printed, and redraw. A failure re-enables the button so the
-// action can be retried without waiting for the next refresh.
+// action can be retried without waiting for the next refresh. A job action
+// answers `{jobs, errors}` for the one job it was sent.
 async function act(button, path, body, describe) {
   button.disabled = true;
   try {
-    const result = await post(path, body);
+    const answer = await post(path, body);
+    const result = answer.jobs ? answer.jobs[0] : answer;
+    if (result.error) throw new Error(result.error);
     for (const warning of result.warnings || []) notify(warning, "warn");
     notify(describe(result));
     await load();

@@ -153,10 +153,13 @@ destinations. Adding another of either changes nothing else in this document.
   recent results; and each job's log.
 - **A user can wait for jobs to end**, in one command that reports what
   happened to each and exits with their outcome.
+- **Asking after, waiting for, cancelling, preempting, reordering and
+  estimating jobs each take any number of job ids** in one command, at a
+  round trip per host rather than per job.
 - **A command does as much as it can, says what it could not do, and exits
   non-zero if anything failed.** One host that cannot be reached never stops
-  the others being reported, and the reason it could not be reached is never
-  hidden.
+  the others being reported, one job id that cannot be found or acted on never
+  stops the others, and the reason is never hidden.
 - **Every command that reports something supports JSON output**, and exit
   codes distinguish "failed", "usage", "local state unreadable, so unknown"
   and "no such job or host".
