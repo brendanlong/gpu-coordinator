@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,11 @@ if TYPE_CHECKING:
 
 SPEC_PREFIX = "gpuc/specs"
 INDEX_PREFIX = "gpuc/index"
+KEYS_MAX = 100_000
+"""How many keys a listing follows before it stops: a LIST is a thousand keys
+a request, so this is a hundred requests, and S3 lists in key order, so what
+is wanted -- the newest job ids -- is at the end."""
+PARALLEL_GETS = 16
 
 
 class S3IndexError(RuntimeError):
@@ -227,15 +233,24 @@ class S3Index:
         return keys[:limit]
 
     def list_index(self, limit: int = 200) -> list[IndexEntry]:
-        entries: list[IndexEntry] = []
-        for key in self.list_keys(f"{INDEX_PREFIX}/", limit):
-            if not key.endswith(".json"):
-                continue
-            try:
-                entries.append(IndexEntry.model_validate_json(self._get(key)))
-            except (S3IndexError, ValidationError):
-                continue
-        return sorted(entries, key=lambda e: e.job_id)
+        """The newest `limit` entries, in id order.
+
+        A job id starts with its submit time, so the newest are the last keys
+        S3 lists: every key is listed and only those are fetched. Fetched at
+        once, because one GET after another is two hundred round trips.
+        """
+        keys = sorted(
+            k for k in self.list_keys(f"{INDEX_PREFIX}/", KEYS_MAX) if k.endswith(".json")
+        )
+        with ThreadPoolExecutor(max_workers=PARALLEL_GETS) as pool:
+            fetched = list(pool.map(self._index_at, keys[-limit:] if limit else []))
+        return sorted((e for e in fetched if e is not None), key=lambda e: e.job_id)
+
+    def _index_at(self, key: str) -> IndexEntry | None:
+        try:
+            return IndexEntry.model_validate_json(self._get(key))
+        except (S3IndexError, ValidationError):
+            return None
 
     def get_uri(self, uri: str) -> str:
         bucket, key = split_uri(uri)

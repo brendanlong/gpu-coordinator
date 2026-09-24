@@ -500,10 +500,7 @@ class Registry(TolerantModel):
             )
         return entry
 
-    def listing(self, only: str | None = None) -> list[HostEntry]:
-        """Every host in registry order, or the one named (exit 4 if unknown)."""
-        if only:
-            return [self.require(only)]
+    def listing(self) -> list[HostEntry]:
         return list(self.hosts.values())
 
     def put(self, entry: HostEntry) -> None:

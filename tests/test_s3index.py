@@ -100,12 +100,14 @@ def test_list_index_follows_continuation_tokens() -> None:
     assert client.list_calls[1]["Token"]
 
 
-def test_list_index_stops_at_the_limit() -> None:
+def test_list_index_keeps_the_newest_at_the_limit() -> None:
+    """Job ids sort by submit time and S3 lists in key order, so a limit that
+    kept the first keys would keep the oldest jobs and drop today's."""
     client = FakeS3Client(page_size=2)
     s3 = S3Index("bkt", client)
     for index in range(7):
         s3.put_index(IndexEntry(job_id=f"j{index}", host="gpubox"))
-    assert len(s3.list_index(limit=3)) == 3
+    assert [e.job_id for e in s3.list_index(limit=3)] == ["j4", "j5", "j6"]
 
 
 def test_a_list_failure_names_the_prefix() -> None:

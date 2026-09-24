@@ -29,6 +29,7 @@ from gpuc.control.actions import (
     EXIT_NOT_FOUND,
     EXIT_OK,
     EXIT_USAGE,
+    INDEX_SHORT,
     Answer,
     CliError,
     Interrupted,
@@ -563,7 +564,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
     elif not result.views:
         lines.append(NO_HOSTS)
     if result.index_error:
-        note(f"{result.index_error}; the list of index-only jobs may be short")
+        note(f"{result.index_error}; {INDEX_SHORT}")
     unhosted = result.unhosted_text(args.host)
     if unhosted:
         lines.append(unhosted)
@@ -582,7 +583,13 @@ def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
     entry = registry.hosts.get(args.target)
     if entry is not None:
         return entry, entry.remote_home, None
-    entry = locate(args.target, registry, args.host, skipped=read.skipped).require_entry()
+    # A shell needs a host to open, so a `--host` this machine does not have
+    # is "no host named", not the gone host every read of a job treats it as.
+    entry = (
+        registry.require(args.host)
+        if args.host
+        else locate(args.target, registry, None, skipped=read.skipped).require_entry()
+    )
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
     return entry, f"{job_dir}/workdir", job_dir
 
@@ -628,8 +635,13 @@ def _job_answer(document: dict[str, Any], *text: str | None) -> Answer:
 
 def cmd_cancel(args: argparse.Namespace) -> Answer:
     document = cancel_job(args.job_id, args.host, load_settings())
+    whence = (
+        ", which is gone: it had already ended (from the S3 mirror)"
+        if document["source"] == "mirror"
+        else ""
+    )
     return _job_answer(
-        document, f"job {args.job_id} on host {document['host']}: {document['status']}"
+        document, f"job {args.job_id} on host {document['host']}{whence}: {document['status']}"
     )
 
 

@@ -466,6 +466,7 @@ def test_cancel_is_the_cancel_command(logged_in: Client, stub: StubSession) -> N
         "job_id": RUNNING_JOB,
         "host": "gpubox",
         "status": "cancelling",
+        "source": "host",
     }
     assert stub.commands == [f"cancel {RUNNING_JOB}"]
 
