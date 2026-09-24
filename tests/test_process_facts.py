@@ -173,3 +173,24 @@ def test_stop_ignores_a_group_that_is_not_there() -> None:
     JobProcesses().stop("test")
     JobProcesses(job_pgid=0).stop("test")
     JobProcesses(job_pgid=2**30).stop("test")
+
+
+def test_members_are_the_group_and_the_scope_whatever_their_comm(tmp_path: Path) -> None:
+    def fake(pid: int, pgrp: int, cgroup: str) -> None:
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "stat").write_text(f"{pid} (a ) (b) S 1 {pgrp} 1 0")
+        (tmp_path / str(pid) / "cgroup").write_text(f"0::{cgroup}\n")
+
+    fake(10, 10, "/user.slice/app.slice/job.scope")
+    fake(11, 10, "/user.slice/app.slice/other.scope")
+    fake(12, 12, "/user.slice/app.slice/job.scope")
+    fake(13, 13, "/user.slice/app.slice/not-job.scope")
+    fake(14, 13, "/user.slice/app.slice/job.scope/child")
+    fake(15, 10, "/user.slice/app.slice/job.scope")
+    stat = tmp_path / "15" / "stat"
+    stat.write_text(stat.read_text().replace(" S ", " Z "))
+    (tmp_path / "self").mkdir()
+    assert JobProcesses("job.scope", 10).members(tmp_path) == [10, 11, 12, 14]
+    assert JobProcesses(None, 10).members(tmp_path) == [10, 11]
+    assert JobProcesses("job.scope", None).members(tmp_path) == [10, 12, 14]
+    assert JobProcesses().members(tmp_path) == []

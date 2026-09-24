@@ -480,6 +480,11 @@ in its own process group where it does not (`isolation: cgroup` or `pgid` in
 grandchild that double-forks (`setsid`, `nohup`, a daemonising server) survives
 the kill and holds its GPU; it cannot leave a cgroup.
 
+A phase that exits on its own takes the same stop with it: anything it left
+running in its scope or process group (a leaked DataLoader worker, a background
+server) is stopped before its cards are freed, and the log says `>>> stopping N
+leftover process(es) of the phase`.
+
 A preempted job goes straight from `running` to `queued` as its next attempt;
 its log records the attempt that was stopped. Its workdir and secrets file are
 kept whatever `cleanup:` says.
