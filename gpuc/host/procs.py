@@ -95,14 +95,17 @@ def recorded_process_alive(
     return not (recorded_starttime and current_start and recorded_starttime != current_start)
 
 
-def _stat_pgrp(stat: str) -> int | None:
-    """Field 5 of ``/proc/<pid>/stat``, split after the comm as in `parse_starttime`."""
+def _live_pgrp(stat: str) -> int | None:
+    """Field 5 of ``/proc/<pid>/stat``, split after the comm as in
+    `parse_starttime`; None for a zombie, which holds nothing any more."""
     fields = stat.rpartition(")")[2].split()
-    return int(fields[2]) if len(fields) > 2 and fields[2].isdigit() else None
+    if len(fields) < 3 or fields[0] == "Z" or not fields[2].isdigit():
+        return None
+    return int(fields[2])
 
 
 def _in_unit(cgroup: str, unit: str) -> bool:
-    return any(line.rpartition(":")[2].endswith(f"/{unit}") for line in cgroup.splitlines())
+    return any(f"/{unit}/" in line.rpartition(":")[2] + "/" for line in cgroup.splitlines())
 
 
 def process_group_alive(pgid: int) -> bool:
@@ -202,7 +205,10 @@ class JobProcesses:
             if not entry.name.isdigit():
                 continue
             try:
-                if (pgid is not None and _stat_pgrp((entry / "stat").read_text()) == pgid) or (
+                pgrp = _live_pgrp((entry / "stat").read_text())
+                if pgrp is None:
+                    continue
+                if pgrp == pgid or (
                     unit is not None and _in_unit((entry / "cgroup").read_text(), unit)
                 ):
                     found.append(int(entry.name))

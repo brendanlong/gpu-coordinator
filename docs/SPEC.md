@@ -133,6 +133,7 @@ destinations. Adding another of either changes nothing else in this document.
   time.
 - Cancel, preempt and every other kill reap the job's whole process tree,
   using a cgroup where the host provides one and a process group otherwise.
+  So does the end of each phase: nothing a phase started outlives it.
 - A finished or lost job can be resubmitted from the mirror as a new job on
   any host, with its secrets read from the submitter's shell again.
 

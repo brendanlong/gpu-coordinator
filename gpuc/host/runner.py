@@ -389,7 +389,8 @@ class JobRunner:
         # the group (and the scope) it must take down.
         self._current = proc
         code = self._monitor(proc, phase, log, job_start)
-        self._stop_leftovers(proc, log)
+        if not self.kill_reason:
+            self._stop_leftovers(proc, log)
         self._current = None
         # Both, together: a group number outlives its processes, and a
         # `pgid` left naming a finished phase is what the dispatcher's ladder

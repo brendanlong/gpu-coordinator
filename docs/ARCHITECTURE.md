@@ -395,9 +395,9 @@ all call it. The kill path is `systemctl --user stop <unit>`, with the
 process-group kill as the fallback. The job's group is only ever the one the
 runner published for the phase now running, cleared with the unit the moment
 the phase ends; the runner's own group is never recorded as the job's. Every
-phase ends with that stop, however it ended: anything still in the scope or
-group is stopped before the unit is cleared, so no phase's processes outlive
-the phase and hold a card the dispatcher has freed.
+phase that exits on its own is followed by that stop if anything is still in
+its scope or group, before the unit is cleared, so the dispatcher never frees
+a card a phase's leftovers hold (bar the `pgid` hole below).
 `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are in `state.json` and
 `gpuc status --json`. The mode is decided once per process
 (`scope.isolation()`: what `GPUC_ISOLATION` announces, else one probe) and the

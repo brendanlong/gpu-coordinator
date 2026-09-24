@@ -186,8 +186,11 @@ def test_members_are_the_group_and_the_scope_whatever_their_comm(tmp_path: Path)
     fake(12, 12, "/user.slice/app.slice/job.scope")
     fake(13, 13, "/user.slice/app.slice/not-job.scope")
     fake(14, 13, "/user.slice/app.slice/job.scope/child")
+    fake(15, 10, "/user.slice/app.slice/job.scope")
+    stat = tmp_path / "15" / "stat"
+    stat.write_text(stat.read_text().replace(" S ", " Z "))
     (tmp_path / "self").mkdir()
-    assert JobProcesses("job.scope", 10).members(tmp_path) == [10, 11, 12]
+    assert JobProcesses("job.scope", 10).members(tmp_path) == [10, 11, 12, 14]
     assert JobProcesses(None, 10).members(tmp_path) == [10, 11]
-    assert JobProcesses("job.scope", None).members(tmp_path) == [10, 12]
+    assert JobProcesses("job.scope", None).members(tmp_path) == [10, 12, 14]
     assert JobProcesses().members(tmp_path) == []
