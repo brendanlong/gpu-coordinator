@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,25 +32,27 @@ from gpuc.control.actions import (
     INDEX_SHORT,
     Answer,
     CliError,
+    Done,
     Interrupted,
     NotFound,
     UsageError,
-    cancel_job,
+    cancel_jobs,
     check_estimate,
     config_document,
-    estimate_job,
+    estimate_jobs,
     exit_code_for,
     failure_message,
     forget_gone_rentals,
     hosts_document,
     init_config,
+    jobs_answer,
     locate,
     make_provider,
-    preempt_job,
+    preempt_jobs,
     read_log,
     registry_answer,
     remove_host,
-    reorder_job,
+    reorder_jobs,
     shipped_note,
     status,
     version_document,
@@ -540,8 +542,20 @@ def cmd_status(args: argparse.Namespace) -> Answer:
     moment the others matter most. Exit 3 is the one that means *unknown* --
     the local registry could not be read, so "no jobs running" would be a
     guess, and automation must never take it for idle.
+
+    Given job ids, it is those jobs and nothing else, whatever state they
+    are in: the one-round form of `wait`, and what anything tracking a set of
+    jobs it submitted polls.
     """
     settings = load_settings()
+    if args.job_ids:
+        if args.all or args.recent is not None or args.since:
+            raise UsageError(
+                "--all, --recent and --since choose which jobs a host lists; "
+                "naming job ids already has"
+            )
+        return wait_mod.look(args.job_ids, args.host, settings)
+    recent = status_mod.RECENT_FINISHED if args.recent is None else args.recent
     read = open_registry()
     try:
         since_s = status_mod.parse_duration(args.since) if args.since else None
@@ -549,11 +563,17 @@ def cmd_status(args: argparse.Namespace) -> Answer:
         raise UsageError(f"--since: {exc}") from exc
     # Each host as it answers, so a slow one does not hold the others' blocks.
     show = (
-        None
-        if args.json
-        else lambda v: print(status_mod.render(v, recent=args.recent, since_s=since_s))
+        None if args.json else lambda v: print(status_mod.render(v, recent=recent, since_s=since_s))
     )
-    result = status(read, settings, host=args.host, all_jobs=args.all, on_view=show)
+    result = status(
+        read,
+        settings,
+        host=args.host,
+        all_jobs=args.all,
+        recent=recent,
+        since_s=since_s,
+        on_view=show,
+    )
     forget_gone_rentals(result.views)
     lines: list[str] = []
     if read.unreadable:
@@ -568,7 +588,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
     unhosted = result.unhosted_text(args.host)
     if unhosted:
         lines.append(unhosted)
-    return result.answer(recent=args.recent, since_s=since_s, text="\n".join(lines) or None)
+    return result.answer(recent=recent, since_s=since_s, text="\n".join(lines) or None)
 
 
 def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
@@ -626,70 +646,75 @@ def cmd_ssh(args: argparse.Namespace) -> Answer:
     os.execvp(argv[0], argv)
 
 
-def _job_answer(document: dict[str, Any], *text: str | None) -> Answer:
-    """A job command's last word: its warnings on stderr, then the document or the text."""
-    for warning in document.get("warnings", []):
-        warn(warning)
-    return Answer(document, "\n".join(line for line in text if line))
+def _jobs_answer(done: list[Done], line: Callable[[Done], str]) -> Answer:
+    """A job command's last word: each job's warnings and errors on stderr,
+    then the document or a line per job it acted on."""
+    for job in done:
+        for warning in job.warnings:
+            warn(f"job {job.job_id}: {warning}")
+        if job.error is not None:
+            print(f"error: {job.error}", file=sys.stderr)
+    return jobs_answer(done, "\n".join(line(job) for job in done if job.error is None))
 
 
 def cmd_cancel(args: argparse.Namespace) -> Answer:
-    document = cancel_job(args.job_id, args.host, load_settings())
-    whence = (
-        ", which is gone: it had already ended (from the S3 mirror)"
-        if document["source"] == "mirror"
-        else ""
-    )
-    return _job_answer(
-        document, f"job {args.job_id} on host {document['host']}{whence}: {document['status']}"
-    )
+    def line(job: Done) -> str:
+        whence = (
+            ", which is gone: it had already ended (from the S3 mirror)"
+            if job.source == "mirror"
+            else ""
+        )
+        return f"job {job.job_id} on host {job.host}{whence}: {job.fields['status']}"
+
+    return _jobs_answer(cancel_jobs(args.job_ids, args.host, load_settings()), line)
 
 
 def cmd_reorder(args: argparse.Namespace) -> Answer:
-    document = reorder_job(args.job_id, args.priority, args.host, load_settings())
-    return _job_answer(
-        document,
-        f"job {args.job_id} on host {document['host']} moved to priority {args.priority}",
-        status_mod.queue_note(document),
-    )
+    def line(job: Done) -> str:
+        moved = f"job {job.job_id} on host {job.host} moved to priority {args.priority}"
+        placed = status_mod.queue_note(job.fields)
+        return f"{moved}\n{placed}" if placed else moved
+
+    return _jobs_answer(reorder_jobs(args.job_ids, args.priority, args.host, load_settings()), line)
 
 
 def cmd_preempt(args: argparse.Namespace) -> Answer:
-    """Stop a running job and put it back in its host's queue.
+    """Stop running jobs and put them back in their hosts' queues.
 
-    The text output says which priority it comes back at, because that is what
-    decides which job runs next: dispatch order is `<priority>-<job id>`, so a
-    job waiting at a lower number takes the cards, and one waiting at the
+    The text output says which priority each comes back at, because that is
+    what decides which job runs next: dispatch order is `<priority>-<job id>`,
+    so a job waiting at a lower number takes the cards, and one waiting at the
     *same* priority does not -- the preempted job was submitted first, so its
     id sorts ahead and it takes its own cards straight back. The host refuses
     outright when nothing at all would go first, rather than throw away what
     the job has done to re-run the same job.
     """
-    document = preempt_job(args.job_id, args.priority, args.host, load_settings())
-    priority = document["priority"]
-    at = f"; it will be queued again at priority {priority}" if priority is not None else ""
-    return _job_answer(
-        document, f"job {args.job_id} on host {document['host']}: {document['status']}{at}"
-    )
+
+    def line(job: Done) -> str:
+        priority = job.fields.get("priority")
+        at = f"; it will be queued again at priority {priority}" if priority is not None else ""
+        return f"job {job.job_id} on host {job.host}: {job.fields['status']}{at}"
+
+    return _jobs_answer(preempt_jobs(args.job_ids, args.priority, args.host, load_settings()), line)
 
 
 def cmd_estimate(args: argparse.Namespace) -> Answer:
-    """Add, change or clear a job's `estimated_runtime_min` after submitting it.
+    """Add, change or clear jobs' `estimated_runtime_min` after submitting them.
 
     It is the one spec field somebody else needs and only the submitter knows,
     and the job that most needs one is the long job already running when the
     next person arrives -- which is too late to edit a file before `submit`.
     """
     wanted = check_estimate(args.minutes, clear=args.clear)
-    document = estimate_job(args.job_id, wanted, args.host, load_settings())
-    recorded = document["estimated_runtime_min"]
-    job = f"job {args.job_id} on host {document['host']}"
-    return _job_answer(
-        document,
-        f"{job} no longer estimates a runtime"
-        if recorded is None
-        else f"{job} now estimates {recorded:g} min",
-    )
+
+    def line(job: Done) -> str:
+        recorded = job.fields["estimated_runtime_min"]
+        who = f"job {job.job_id} on host {job.host}"
+        if recorded is None:
+            return f"{who} no longer estimates a runtime"
+        return f"{who} now estimates {recorded:g} min"
+
+    return _jobs_answer(estimate_jobs(args.job_ids, wanted, args.host, load_settings()), line)
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
@@ -768,6 +793,9 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
         watched = watch.jobs[args.job_id]
         watch.poll()
         watch.check_known()
+        if watched.host == wait_mod.NO_HOST and watched.error is not None:
+            # Nowhere to read a log from.
+            raise CliError(watched.error)
         if watched.settled:
             # Nothing more is coming, and `tail -f` on it would simply hang.
             # The ordinary read, so a purged job falls back to the S3 mirror.
@@ -1170,15 +1198,24 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(submit)
     submit.set_defaults(func=cmd_submit)
 
-    status = sub.add_parser("status", help="per-host queue, running and recent jobs")
+    status = sub.add_parser(
+        "status",
+        help="per-host queue, running and recent jobs; or exactly the jobs named",
+        description="With no job ids, every host's cards, queue, running jobs and recent "
+        "finished ones. With job ids, those jobs and nothing else, whatever state they are "
+        "in, one line each; an id no host has is exit 4, after the rest are reported.",
+    )
+    status.add_argument("job_ids", nargs="*", metavar="job_id", help="report exactly these jobs")
     status.add_argument(
-        "--host", metavar="NAME", help="only this host; omit for every registered host"
+        "--host",
+        metavar="NAME",
+        help="only this host; omit for every registered host. With job ids: which host "
+        "they are on, if they cannot be found",
     )
     status.add_argument("--all", action="store_true", help="also list jobs only the index knows")
     status.add_argument(
         "--recent",
         type=int,
-        default=status_mod.RECENT_FINISHED,
         metavar="N",
         help=f"how many finished jobs to show per host (default {status_mod.RECENT_FINISHED})",
     )
@@ -1332,24 +1369,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ssh.set_defaults(func=cmd_ssh)
 
-    cancel = sub.add_parser("cancel", help="cancel a queued or running job")
-    cancel.add_argument("job_id")
+    cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
+    cancel.add_argument("job_ids", nargs="+", metavar="job_id")
     cancel.add_argument(
-        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
     )
     add_json_flag(cancel)
     cancel.set_defaults(func=cmd_cancel)
 
-    reorder = sub.add_parser("reorder", help="change a queued job's priority")
-    reorder.add_argument("job_id")
+    reorder = sub.add_parser("reorder", help="change queued jobs' priority")
+    reorder.add_argument("job_ids", nargs="+", metavar="job_id")
     reorder.add_argument(
         "--priority",
         type=int,
         required=True,
-        help="0-99; lower dispatches first (submit defaults to 50)",
+        help="0-99, for every job named; lower dispatches first (submit defaults to 50)",
     )
     reorder.add_argument(
-        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
     )
     add_json_flag(reorder)
     reorder.set_defaults(func=cmd_reorder)
@@ -1367,7 +1404,7 @@ def build_parser() -> argparse.ArgumentParser:
         "only stop it and start it again. Use `gpuc requeue` to re-run a finished job, or "
         "to run one on another host.",
     )
-    preempt.add_argument("job_id")
+    preempt.add_argument("job_ids", nargs="+", metavar="job_id")
     preempt.add_argument(
         "--priority",
         type=int,
@@ -1376,24 +1413,24 @@ def build_parser() -> argparse.ArgumentParser:
         "first, so a higher number keeps it out of the way)",
     )
     preempt.add_argument(
-        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
     )
     add_json_flag(preempt)
     preempt.set_defaults(func=cmd_preempt)
 
     estimate = sub.add_parser(
         "estimate",
-        help="set (or clear) a queued or running job's estimated_runtime_min",
+        help="set (or clear) queued or running jobs' estimated_runtime_min",
         description="Records how long the job expects to take, from the runner's start. "
         "Nothing kills a job for running past it: it is what `gpuc status` shows the next "
         "person deciding whether to queue behind this job. A running job's runner picks the "
         "new estimate up within a minute; a finished job is refused.",
     )
-    estimate.add_argument("job_id")
-    estimate.add_argument("--minutes", type=float, metavar="N", help="how long the job will take")
+    estimate.add_argument("job_ids", nargs="+", metavar="job_id")
+    estimate.add_argument("--minutes", type=float, metavar="N", help="how long each job will take")
     estimate.add_argument("--clear", action="store_true", help="remove the estimate instead")
     estimate.add_argument(
-        "--host", metavar="NAME", help="which host the job is on, if it cannot be found"
+        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
     )
     add_json_flag(estimate)
     estimate.set_defaults(func=cmd_estimate)

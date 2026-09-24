@@ -458,24 +458,32 @@ def stub(monkeypatch: pytest.MonkeyPatch, one_host: None) -> StubSession:
 
 
 def test_cancel_is_the_cancel_command(logged_in: Client, stub: StubSession) -> None:
-    stub.answers.append({"job_id": RUNNING_JOB, "status": "cancelling"})
+    stub.answers.append({"jobs": [{"job_id": RUNNING_JOB, "status": "cancelling"}]})
     status, document = logged_in.post_json(f"/api/jobs/{RUNNING_JOB}/cancel", {"host": "gpubox"})
     assert status == 200
     assert document == {
         "schema_version": 1,
-        "job_id": RUNNING_JOB,
-        "host": "gpubox",
-        "status": "cancelling",
-        "source": "host",
+        "jobs": [
+            {
+                "job_id": RUNNING_JOB,
+                "host": "gpubox",
+                "status": "cancelling",
+                "source": "host",
+                "error": None,
+                "warnings": [],
+            }
+        ],
+        "errors": [],
     }
     assert stub.commands == [f"cancel {RUNNING_JOB}"]
 
 
 def test_preempt_is_the_preempt_command(logged_in: Client, stub: StubSession) -> None:
-    stub.answers.append({"job_id": RUNNING_JOB, "status": "preempting", "priority": 50})
+    stub.answers.append({"jobs": [{"job_id": RUNNING_JOB, "status": "preempting", "priority": 50}]})
     status, document = logged_in.post_json(f"/api/jobs/{RUNNING_JOB}/preempt", {"host": "gpubox"})
     assert status == 200
-    assert (document["status"], document["priority"]) == ("preempting", 50)
+    (job,) = document["jobs"]
+    assert (job["status"], job["priority"]) == ("preempting", 50)
     assert stub.commands == [f"preempt {RUNNING_JOB}"]
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/preempt", {"host": "gpubox", "priority": "7"}
@@ -486,12 +494,12 @@ def test_preempt_is_the_preempt_command(logged_in: Client, stub: StubSession) ->
 def test_reorder_is_the_reorder_command_and_checks_the_range(
     logged_in: Client, stub: StubSession
 ) -> None:
-    stub.answers.append({"job_id": RUNNING_JOB, "status": "queued", "priority": 7})
+    stub.answers.append({"jobs": [{"job_id": RUNNING_JOB, "status": "queued", "priority": 7}]})
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 7}
     )
-    assert status == 200 and document["priority"] == 7
-    assert stub.commands == [f"reorder {RUNNING_JOB} 7"]
+    assert status == 200 and document["jobs"][0]["priority"] == 7
+    assert stub.commands[0] == f"reorder {RUNNING_JOB} --priority 7"
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 100}
     )
@@ -503,31 +511,55 @@ def test_reorder_is_the_reorder_command_and_checks_the_range(
 
 
 def test_a_refused_reorder_is_the_clis_refusal(logged_in: Client, stub: StubSession) -> None:
-    stub.answers.append({"job_id": RUNNING_JOB, "error": "only a queued job can be reordered"})
+    stub.answers.append(
+        {"jobs": [{"job_id": RUNNING_JOB, "error": "only a queued job can be reordered"}]}
+    )
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 7}
     )
     assert status == 500
-    assert "only a queued job can be reordered" in document["error"]
-    assert document["exit_code"] == 1
+    (error,) = document["errors"]
+    assert "only a queued job can be reordered" in error
+    assert document["jobs"][0]["error"] == error
 
 
 def test_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
     stub.answers.append(
-        {"job_id": RUNNING_JOB, "estimated_runtime_min": 90.0, "status": "running", "warning": None}
+        {
+            "jobs": [
+                {
+                    "job_id": RUNNING_JOB,
+                    "estimated_runtime_min": 90.0,
+                    "status": "running",
+                    "warning": None,
+                }
+            ]
+        }
     )
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/estimate", {"host": "gpubox", "minutes": 90}
     )
-    assert status == 200 and document["estimated_runtime_min"] == 90.0
+    assert status == 200 and document["jobs"][0]["estimated_runtime_min"] == 90.0
     stub.answers.append(
-        {"job_id": RUNNING_JOB, "estimated_runtime_min": None, "status": "running", "warning": None}
+        {
+            "jobs": [
+                {
+                    "job_id": RUNNING_JOB,
+                    "estimated_runtime_min": None,
+                    "status": "running",
+                    "warning": None,
+                }
+            ]
+        }
     )
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/estimate", {"host": "gpubox", "clear": True}
     )
-    assert status == 200 and document["estimated_runtime_min"] is None
-    assert stub.commands == [f"estimate {RUNNING_JOB} 90.0", f"estimate {RUNNING_JOB} --clear"]
+    assert status == 200 and document["jobs"][0]["estimated_runtime_min"] is None
+    assert stub.commands == [
+        f"estimate {RUNNING_JOB} --minutes 90.0",
+        f"estimate {RUNNING_JOB} --clear",
+    ]
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/estimate", {"host": "gpubox", "minutes": -5}
     )
@@ -556,7 +588,7 @@ def test_an_unknown_job_is_404(logged_in: Client, stub: StubSession) -> None:
     stub.answers.append({"jobs": []})
     status, document = logged_in.post_json("/api/jobs/20260101-000000-aaaaaa/cancel", {})
     assert status == 404
-    assert "no registered host knows job" in document["error"]
+    assert "no registered host knows job" in document["jobs"][0]["error"]
 
 
 def test_a_host_that_cannot_be_asked_is_a_failure_not_a_missing_job(
@@ -570,9 +602,10 @@ def test_a_host_that_cannot_be_asked_is_a_failure_not_a_missing_job(
 
     monkeypatch.setattr("gpuc.control.remote.open_session", down)
     status, document = logged_in.post_json("/api/jobs/20260101-000000-aaaaaa/cancel", {})
-    assert status == 500 and document["exit_code"] == 1
-    assert "gpubox: ssh timed out" in document["error"]
-    assert "no registered host knows" not in document["error"]
+    (error,) = document["errors"]
+    assert status == 500
+    assert "gpubox: ssh timed out" in error
+    assert "no registered host knows" not in error
 
 
 def test_a_bad_body_is_400(logged_in: Client, one_host: None) -> None:

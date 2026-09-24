@@ -117,8 +117,8 @@ def test_cancel_of_a_job_on_a_gone_host_says_how_it_ended(
     mirror(monkeypatch, {JOB: {"status": "failed", "ended_at": ago(minutes=5), "exit_code": 3}})
     host = ["--host", POD] if named else []
     assert main(["cancel", JOB, *host, "--json"]) == EXIT_OK
-    document = json.loads(capsys.readouterr().out)
-    assert (document["host"], document["status"], document["source"]) == (POD, "failed", "mirror")
+    (job,) = json.loads(capsys.readouterr().out)["jobs"]
+    assert (job["host"], job["status"], job["source"]) == (POD, "failed", "mirror")
 
 
 def test_reorder_of_a_job_on_a_gone_host_is_refused_with_how_it_ended(
@@ -233,8 +233,9 @@ def test_a_typod_host_for_a_job_the_index_puts_elsewhere_is_no_such_host(
         registry.put(host_entry(name="box", kind="ssh", ssh="me@box"))
     for command in ("logs", "wait", "cancel"):
         assert main([command, JOB, "--host", "boxx"]) == EXIT_NOT_FOUND, command
-        err = capsys.readouterr().err
-        assert "no host named 'boxx'" in err and "on host box" in err, command
+        captured = capsys.readouterr()
+        said = captured.out + captured.err
+        assert "no host named 'boxx'" in said and "on host box" in said, command
 
 
 def test_status_of_a_name_nothing_knows_is_no_such_host(

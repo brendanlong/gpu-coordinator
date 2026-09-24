@@ -236,7 +236,7 @@ MAX_PARALLEL_HOSTS = 8
 
 
 def gather_all(
-    entries: Sequence[HostEntry], settings: Settings, provider: Provider | None
+    entries: Sequence[HostEntry], settings: Settings, provider: Provider | None, request: str
 ) -> Iterator[status_mod.HostView]:
     """Every host's status, asked for at once and yielded in registry order.
 
@@ -250,7 +250,8 @@ def gather_all(
         return
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(entries))) as pool:
         yield from pool.map(
-            lambda entry: status_mod.gather(entry, settings, provider=provider), entries
+            lambda entry: status_mod.gather(entry, settings, request=request, provider=provider),
+            entries,
         )
 
 
@@ -420,6 +421,8 @@ def status(
     *,
     host: str | None = None,
     all_jobs: bool = False,
+    recent: int = status_mod.RECENT_FINISHED,
+    since_s: float | None = None,
     on_view: Callable[[status_mod.HostView], None] | None = None,
     report: Callable[[str], None] = note,
 ) -> StatusResult:
@@ -435,6 +438,10 @@ def status(
     A gone host's jobs are the mirror's (`fill_from_mirror`). A gone host is
     shown when it was found gone this run or is named with `--host`: listing
     every rental ever used would bury the hosts that exist.
+
+    Each host sends only the finished jobs inside `recent` and `since_s`,
+    except under `all_jobs`: a job the index knows is listed as one no host
+    has whenever its host did not send it, so that list needs every job.
     """
     result = StatusResult(read, every_host=host is None)
     index = IndexRead(settings)
@@ -459,7 +466,12 @@ def status(
             # Neither here nor in the index: a typo, not a rental that ended.
             registry.require(host)
     provider = provider_for(entries, settings, report) if entries else None
-    for view in gather_all(entries, settings, provider):
+    request = (
+        status_mod.status_request()
+        if all_jobs
+        else status_mod.status_request(recent=recent, since_s=since_s)
+    )
+    for view in gather_all(entries, settings, provider, request):
         if view.gone:
             fill_from_mirror(view, index.index, index.on(view.entry.name))
         shown(view)
@@ -783,6 +795,21 @@ def unreadable_entry(name: str) -> Unaskable:
     )
 
 
+@dataclass
+class Unlocated:
+    """Why a job could not be placed on any host. `missing` when every host
+    that could have it answered without it: "no such job", exit 4."""
+
+    reason: str
+    missing: bool = False
+
+    def exception(self) -> CliError:
+        return NotFound(self.reason) if self.missing else CliError(self.reason)
+
+
+Placed = Location | Unlocated
+
+
 def locate(
     job_id: str,
     registry: Registry,
@@ -792,11 +819,31 @@ def locate(
     provider: Provider | None = None,
     skipped: Collection[str] = (),
 ) -> Location:
-    """The host a job is on: `--host` if given, else the index (local, then
-    the mirror), else whichever registered host admits to it. A `--host` this
-    machine has no entry for is `Gone`, like any other name it does not have,
-    when the index says the job ran there: naming the host must not make the
-    answer worse than leaving it out.
+    """Where one job is, by `locate_many`'s rule, raising what it could not say."""
+    placed = locate_many(
+        [job_id], registry, explicit, settings, provider=provider, skipped=skipped
+    )[job_id]
+    if isinstance(placed, Unlocated):
+        raise placed.exception()
+    return placed
+
+
+def locate_many(
+    job_ids: Sequence[str],
+    registry: Registry,
+    explicit: str | None,
+    settings: Settings | None = None,
+    *,
+    provider: Provider | None = None,
+    skipped: Collection[str] = (),
+) -> dict[str, Placed]:
+    """The host each job is on: `--host` if given, else the index (local, then
+    the mirror), else whichever registered host admits to it. Keyed by id, in
+    the order asked, each repeat once.
+
+    A `--host` this machine has no entry for is `Gone`, like any other name it
+    does not have, when the index says the job ran there: naming the host
+    must not make the answer worse than leaving it out.
 
     A name in the mirror's index is the *submitting* client's name for the
     host, which need not be this machine's: it is asked first, not believed.
@@ -808,65 +855,156 @@ def locate(
     mirror rather than "no such job". One whose registry entry this build
     could not read (warned about on the way in) is `Unaskable`: it is known,
     may well be running the job, and was not asked. An id no answering host
-    knows is exit 4 only when every host answered: with one unaskable, the
+    knows is `missing` only when every host answered: with one unaskable, the
     job may well be on it, and "no such job" would be a lie told over a
     connection error.
+
+    However many ids there are, each host is asked at most twice, all hosts
+    at once each time: about the jobs the index says it has, then about every
+    id still unplaced. A sweep of hundreds costs a round trip per host, not
+    one per job.
     """
     settings = settings if settings is not None else load_settings()
-    local = LocalIndex().get(job_id)
+    ids = list(dict.fromkeys(job_ids))
+    local = LocalIndex()
+    index = JobIndex(settings)
     if explicit:
-        # Not asked: the caller already knows the host, and the poll or the
-        # verb that follows asks it anyway.
-        entry = registry.hosts.get(explicit)
-        if entry is not None:
-            return Location(entry.name, entry, local)
-        if explicit in skipped:
-            return Location(explicit, None, local, unreadable_entry(explicit))
-        # Gone only where the index agrees the job ran there. A typo'd host
-        # name is not a rental that ended, and treating it as one would read
-        # the mirror's copy of a job that is still running somewhere else.
-        indexed = local or JobIndex(settings).get(job_id)
-        if indexed is None or indexed.host != explicit:
-            where = f"\nThe index has job {job_id} on host {indexed.host}." if indexed else ""
-            try:
-                registry.require(explicit)
-            except HostNotFound as exc:
-                raise HostNotFound(f"{exc}{where}") from None
-        return Location(explicit, None, indexed, not_registered(explicit))
-    if local is not None and local.host in registry.hosts:
-        return Location(local.host, registry.hosts[local.host], local)
-    index = local or JobIndex(settings).get(job_id)
-    named = registry.hosts.get(index.host) if index is not None else None
-    if index is not None and named is None and index.host in skipped:
-        return Location(index.host, None, index, unreadable_entry(index.host))
-    rest = [entry for entry in registry.hosts.values() if entry is not named]
-    provider = provider or provider_for(list(registry.hosts.values()), settings)
-    named_trouble: Asked | None = None
-    unasked: list[str] = []
-    for entry in [named, *rest] if named is not None else rest:
-        asked = ask(entry, f"status {shlex.quote(job_id)}", settings, provider=provider)
-        if isinstance(asked, Answered):
-            if (asked.payload or {}).get("jobs"):
-                return Location(entry.name, entry, index, asked)
+        return {
+            job_id: _on_named_host(job_id, explicit, registry, local.get(job_id), index, skipped)
+            for job_id in ids
+        }
+    placed: dict[str, Placed] = {}
+    unplaced: dict[str, IndexEntry | None] = {}
+    for job_id in ids:
+        indexed = local.get(job_id)
+        if indexed is not None and indexed.host in registry.hosts:
+            # Not asked: the verb or the poll that follows asks it anyway.
+            placed[job_id] = Location(indexed.host, registry.hosts[indexed.host], indexed)
             continue
-        if entry is named:
-            named_trouble = asked
-        elif not isinstance(asked, Gone):
-            unasked.append(f"{entry.name}: {asked.reason}")
-    if named is not None and named_trouble is not None:
-        return Location(named.name, named, index, named_trouble)
-    if index is not None and named is None and not unasked:
-        return Location(index.host, None, index, not_registered(index.host))
-    if unasked:
-        raise CliError(
-            f"no host that answered knows job {job_id}, and these could not be asked:\n"
-            + "\n".join(f"  {line}" for line in unasked)
-            + "\nPass --host <name>, or check `gpuc host list` and `gpuc status --all`."
-        )
-    raise NotFound(
-        f"no registered host knows job {job_id}.\n"
-        f"Pass --host <name>, or check `gpuc host list` and `gpuc status --all`."
-    )
+        indexed = indexed or index.get(job_id)
+        if indexed is not None and indexed.host not in registry.hosts and indexed.host in skipped:
+            placed[job_id] = Location(indexed.host, None, indexed, unreadable_entry(indexed.host))
+            continue
+        unplaced[job_id] = indexed
+    if unplaced:
+        provider = provider or provider_for(list(registry.hosts.values()), settings)
+        placed.update(_ask_around(unplaced, registry, settings, provider))
+    return {job_id: placed[job_id] for job_id in ids}
+
+
+def _on_named_host(
+    job_id: str,
+    name: str,
+    registry: Registry,
+    local: IndexEntry | None,
+    index: JobIndex,
+    skipped: Collection[str],
+) -> Placed:
+    """A job on the host `--host` named. Not asked: the caller already knows
+    the host, and the poll or the verb that follows asks it anyway."""
+    entry = registry.hosts.get(name)
+    if entry is not None:
+        return Location(entry.name, entry, local)
+    if name in skipped:
+        return Location(name, None, local, unreadable_entry(name))
+    # Gone only where the index agrees the job ran there. A typo'd host name
+    # is not a rental that ended, and treating it as one would read the
+    # mirror's copy of a job that is still running somewhere else.
+    indexed = local or index.get(job_id)
+    if indexed is None or indexed.host != name:
+        where = f"\nThe index has job {job_id} on host {indexed.host}." if indexed else ""
+        try:
+            registry.require(name)
+        except HostNotFound as exc:
+            return Unlocated(f"{exc}{where}", missing=True)
+    return Location(name, None, indexed, not_registered(name))
+
+
+def _ask_around(
+    unplaced: dict[str, IndexEntry | None],
+    registry: Registry,
+    settings: Settings,
+    provider: Provider | None,
+) -> dict[str, Placed]:
+    """`locate_many` for the ids that need a host to say it has them."""
+    named = {
+        job_id: registry.hosts.get(indexed.host) if indexed is not None else None
+        for job_id, indexed in unplaced.items()
+    }
+    latest: dict[str, Asked] = {}
+    first: dict[str, Asked] = {}
+    found: dict[str, tuple[str, Answered]] = {}
+
+    def ask_each(questions: dict[str, list[str]]) -> None:
+        def one(name: str) -> tuple[str, Asked]:
+            before = latest.get(name)
+            session = before.session if isinstance(before, Answered) else None
+            request = status_mod.status_request(questions[name])
+            return name, ask(
+                registry.hosts[name], request, settings, provider=provider, session=session
+            )
+
+        if not questions:
+            return
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(questions))) as pool:
+            for name, asked in pool.map(one, questions):
+                latest[name] = asked
+                first.setdefault(name, asked)
+                if not isinstance(asked, Answered):
+                    continue
+                for job in (asked.payload or {}).get("jobs") or []:
+                    if isinstance(job, dict) and job.get("job_id") in questions[name]:
+                        found.setdefault(job["job_id"], (name, asked))
+
+    by_named: dict[str, list[str]] = {}
+    for job_id, entry in named.items():
+        if entry is not None:
+            by_named.setdefault(entry.name, []).append(job_id)
+    ask_each(by_named)
+    rest = [job_id for job_id in unplaced if job_id not in found]
+    everyone: dict[str, list[str]] = {}
+    for name in registry.hosts:
+        if name in latest and not isinstance(latest[name], Answered):
+            continue
+        wanted = [job_id for job_id in rest if _name(named[job_id]) != name]
+        if wanted:
+            everyone[name] = wanted
+    ask_each(everyone)
+    placed: dict[str, Placed] = {}
+    for job_id, indexed in unplaced.items():
+        entry = named[job_id]
+        if job_id in found:
+            name, asked = found[job_id]
+            placed[job_id] = Location(name, registry.hosts[name], indexed, asked)
+            continue
+        trouble = first.get(entry.name) if entry is not None else None
+        if entry is not None and trouble is not None and not isinstance(trouble, Answered):
+            placed[job_id] = Location(entry.name, entry, indexed, trouble)
+            continue
+        unasked = [
+            f"{name}: {asked.reason}"
+            for name, asked in latest.items()
+            if isinstance(asked, Unaskable) and (entry is None or name != entry.name)
+        ]
+        if indexed is not None and entry is None and not unasked:
+            placed[job_id] = Location(indexed.host, None, indexed, not_registered(indexed.host))
+        elif unasked:
+            placed[job_id] = Unlocated(
+                f"no host that answered knows job {job_id}, and these could not be asked:\n"
+                + "\n".join(f"  {line}" for line in unasked)
+                + "\nPass --host <name>, or check `gpuc host list` and `gpuc status --all`."
+            )
+        else:
+            placed[job_id] = Unlocated(
+                f"no registered host knows job {job_id}.\n"
+                f"Pass --host <name>, or check `gpuc host list` and `gpuc status --all`.",
+                missing=True,
+            )
+    return placed
+
+
+def _name(entry: HostEntry | None) -> str | None:
+    return entry.name if entry is not None else None
 
 
 def find_job(job_id: str, host: str | None, settings: Settings) -> Location:
@@ -874,41 +1012,72 @@ def find_job(job_id: str, host: str | None, settings: Settings) -> Location:
     return locate(job_id, read.named(), host, settings, skipped=read.skipped)
 
 
-def mirrored_end(job_id: str, location: Location, settings: Settings) -> Mirrored:
-    """What became of a job whose host is gone, or a failure saying it is lost."""
-    index = JobIndex(settings)
-    mirrored = read_mirror(index, job_id, index.mirror_prefix(job_id, location.entry))
-    if mirrored.view is None:
-        raise CliError(
-            f"job {job_id} was on host {location.host}, which is gone "
-            f"({location.trouble_reason}), and {mirrored.lost}"
-        )
-    return mirrored
+@dataclass
+class Done:
+    """What a job verb did to one job, or why it did not.
+
+    `fields` are the host's own words for what it did (`status`, `priority`,
+    `estimated_runtime_min`); `source` is `mirror` for a job whose host is
+    gone, answered from what the mirror says it ended as.
+    """
+
+    job_id: str
+    host: str | None
+    fields: dict[str, Any] = field(default_factory=dict)
+    source: str = "host"
+    error: str | None = None
+    missing: bool = False
+    warnings: list[str] = field(default_factory=list)
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "host": self.host,
+            **self.fields,
+            "source": self.source,
+            "error": self.error,
+            "warnings": list(self.warnings),
+        }
 
 
-def job_verb(
+def jobs_answer(done: Sequence[Done], text: str | None = None) -> Answer:
+    """The answer of every command that acts on jobs by id: `{jobs, errors}`,
+    one entry per id. Exit 4 when an id is unknown and 1 when anything else
+    failed, as `wait` does -- after every other id has been carried out, since
+    one typo in a list of twenty must not cost the nineteen."""
+    errors = [job.error for job in done if job.error is not None]
+    return Answer(
+        {"jobs": [job.document() for job in done], "errors": errors},
+        text,
+        failures=errors,
+        outcome=EXIT_NOT_FOUND if any(job.missing for job in done) else None,
+    )
+
+
+def job_verbs(
     verb: str,
-    job_id: str,
+    job_ids: Sequence[str],
     host: str | None,
     settings: Settings,
     *,
     args: str = "",
     mirror: tuple[str, Any] | None = None,
-    location: Location | None = None,
-) -> tuple[Location, HostSession, dict[str, Any], list[str]]:
-    """Run one on-host verb against one job: the path every job command takes.
+    ended_is_answer: bool = False,
+) -> tuple[list[Done], dict[str, HostSession]]:
+    """Run one on-host verb against jobs: the path every job command takes.
 
-    Find the host, ask it over one session, insist on a verdict, and put any
-    spec change in the mirror too. Returns the location, the session (for a
-    follow-up question like the queue placement), the host's document and
-    the warnings so far.
+    Find each job's host (`locate_many`), ask each host once, over the session
+    the lookup opened, about every job on it, insist on a verdict for each,
+    and put any spec change in the mirror too. Returns what became of each
+    id, in the order asked, and the session each host was asked over (for a
+    follow-up question like the queue placement).
 
     `check=False` on the host call: a refusal (a finished job, an id this host
     does not know) *is* the host's document, and raising on the exit code
-    would throw away the reason it gave. A refusal that says `missing` is
-    the host answering "no such job", exit 4 like every other unknown name,
-    and told apart from a refusal of a job that is there by that key rather
-    than by the words. An answer with no `status` is an error too: reporting
+    would throw away the reason it gave. A refusal that says `missing` is the
+    host answering "no such job", exit 4 like every other unknown name, and
+    told apart from a refusal of a job that is there by that key rather than
+    by the words. An answer with no `status` is an error too: reporting
     success for a job the host never touched is worse than any exception.
 
     `mirror` is `(spec field, value)`: `requeue` submits what S3 holds, so a
@@ -917,74 +1086,154 @@ def job_verb(
     is a warning, never a failure: the change is already where `status` reads
     it, which is what was asked for.
 
-    A job whose host is gone has ended, and the verb is refused with how, from
-    the mirror -- as a host refuses a verb on a job that has finished.
+    A job whose host is gone has ended, and the mirror says how: with
+    `ended_is_answer` that is the answer, as a host answers a cancel of a
+    finished job with its status; otherwise the verb is refused with it, as a
+    host refuses the others on a finished job.
     """
-    location = location or find_job(job_id, host, settings)
-    trouble = location.trouble
-    if trouble is not None and mirror_is_the_answer(trouble):
-        ended = mirrored_end(job_id, location, settings)
-        assert ended.view is not None
-        raise CliError(
-            f"cannot {verb} job {job_id}: it ended {ended.view.status} on host "
-            f"{location.host}, which is gone ({trouble.reason}); read from the S3 mirror "
-            f"at {ended.uri}"
+    read = open_registry()
+    registry = read.named()
+    provider = provider_for(list(registry.hosts.values()), settings)
+    placed = locate_many(job_ids, registry, host, settings, provider=provider, skipped=read.skipped)
+    done: dict[str, Done] = {}
+    on_host: dict[str, list[str]] = {}
+    for job_id, where in placed.items():
+        if isinstance(where, Unlocated):
+            done[job_id] = Done(job_id, None, error=where.reason, missing=where.missing)
+        elif where.trouble is not None and mirror_is_the_answer(where.trouble):
+            done[job_id] = ended_on_gone_host(verb, job_id, where, settings, ended_is_answer)
+        elif where.entry is None or where.trouble is not None:
+            done[job_id] = Done(
+                job_id,
+                where.host,
+                error=f"job {job_id} is on host {where.host}, which could not be asked: "
+                f"{where.trouble_reason}",
+            )
+        else:
+            on_host.setdefault(where.host, []).append(job_id)
+
+    def one_host(ids: list[str]) -> tuple[list[Done], HostSession | None]:
+        here = [where for job_id in ids if isinstance(where := placed[job_id], Location)]
+        location = here[0]
+        assert location.entry is not None
+        session = next((where.session for where in here if where.session), None)
+        asked = ask(
+            location.entry,
+            f"{verb} {' '.join(shlex.quote(job_id) for job_id in ids)}{args}",
+            settings,
+            provider=provider,
+            session=session,
+            check=False,
         )
-    if location.entry is None or trouble is not None:
-        raise CliError(
-            f"job {job_id} is on host {location.host}, which could not be asked: "
-            f"{location.trouble_reason}"
+        return _verdicts(verb, location.host, ids, asked), (
+            asked.session if isinstance(asked, Answered) else None
         )
-    entry = location.entry
-    asked = ask(
-        entry,
-        f"{verb} {shlex.quote(job_id)}{args}",
-        settings,
-        provider=provider_for([entry], settings),
-        session=location.session,
-        check=False,
-    )
-    if not isinstance(asked, Answered):
-        raise CliError(
-            f"job {job_id} is on host {entry.name}, which could not be asked: {asked.reason}"
-        )
-    document = asked.payload or {}
-    if document.get("missing"):
-        raise NotFound(
-            f"host {entry.name} has no job {job_id}: {document.get('error')}\n"
-            f"Check the id with `gpuc status --all`."
-        )
-    if document.get("error"):
-        raise CliError(f"host {entry.name} did not {verb} {job_id}: {document['error']}")
-    if not document.get("status"):
-        raise CliError(
-            f"host {entry.name} did not say what it did with {job_id}: {json.dumps(document)[:200]}"
-        )
-    warnings: list[str] = []
+
+    sessions: dict[str, HostSession] = {}
+    if on_host:
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(on_host))) as pool:
+            for name, (verdicts, session) in zip(
+                on_host, pool.map(one_host, on_host.values()), strict=True
+            ):
+                done.update((job.job_id, job) for job in verdicts)
+                if session is not None:
+                    sessions[name] = session
     if mirror is not None:
-        warning = mirror_spec_field(job_id, mirror[0], mirror[1], settings, what=mirror[0])
-        if warning:
-            warnings.append(warning)
-    return location, asked.session, document, warnings
+        changed = [job for job in done.values() if job.error is None and job.source == "host"]
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_HOSTS) as pool:
+            warnings = pool.map(
+                lambda job: mirror_spec_field(job.job_id, mirror[0], mirror[1], settings), changed
+            )
+            for job, warning in zip(changed, warnings, strict=True):
+                if warning:
+                    job.warnings.append(warning)
+    return [done[job_id] for job_id in placed], sessions
 
 
-def cancel_job(job_id: str, host: str | None, settings: Settings) -> dict[str, Any]:
-    """The host's own word for what it did: `cancelled` for a queued job it
-    dequeued, `cancelling` for a running one whose runner has been marked, a
-    finished job's own status. A job whose host is gone has already ended,
-    and the mirror says how -- the same answer its host would have given."""
-    location = find_job(job_id, host, settings)
-    if isinstance(location.asked, Gone):
-        ended = mirrored_end(job_id, location, settings)
-        assert ended.view is not None
-        return {
-            "job_id": job_id,
-            "host": location.host,
-            "status": ended.view.status,
-            "source": "mirror",
-        }
-    _, _, document, _ = job_verb("cancel", job_id, host, settings, location=location)
-    return {"job_id": job_id, "host": location.host, "status": document["status"], "source": "host"}
+def _verdicts(verb: str, host: str, job_ids: Sequence[str], asked: Asked) -> list[Done]:
+    """What one host said it did with each of these jobs."""
+    if not isinstance(asked, Answered):
+        return [
+            Done(
+                job_id,
+                host,
+                error=f"job {job_id} is on host {host}, which could not be asked: {asked.reason}",
+            )
+            for job_id in job_ids
+        ]
+    payload = asked.payload or {}
+    answers = {
+        answer["job_id"]: answer
+        for answer in payload.get("jobs") or []
+        if isinstance(answer, dict) and isinstance(answer.get("job_id"), str)
+    }
+    done: list[Done] = []
+    for job_id in job_ids:
+        answer = dict(answers.get(job_id) or {})
+        if answer.get("missing"):
+            done.append(
+                Done(
+                    job_id,
+                    host,
+                    error=f"host {host} has no job {job_id}: {answer.get('error')}; "
+                    f"check the id with `gpuc status --all`",
+                    missing=True,
+                )
+            )
+        elif answer.get("error"):
+            done.append(
+                Done(job_id, host, error=f"host {host} did not {verb} {job_id}: {answer['error']}")
+            )
+        elif not answer.get("status"):
+            said = json.dumps(answer or payload)[:200]
+            done.append(
+                Done(
+                    job_id, host, error=f"host {host} did not say what it did with {job_id}: {said}"
+                )
+            )
+        else:
+            answer.pop("job_id")
+            warning = answer.pop("warning", None)
+            done.append(Done(job_id, host, answer, warnings=[str(warning)] if warning else []))
+    return done
+
+
+def ended_on_gone_host(
+    verb: str, job_id: str, location: Location, settings: Settings, ended_is_answer: bool
+) -> Done:
+    """A verb on a job whose host is gone: what the mirror says it ended as,
+    as the answer or as the reason the verb is refused -- or, with no final
+    state there, that the job went with its host."""
+    index = JobIndex(settings)
+    mirrored = read_mirror(index, job_id, index.mirror_prefix(job_id, location.entry))
+    reason = location.trouble_reason
+    if mirrored.view is None:
+        return Done(
+            job_id,
+            location.host,
+            error=f"job {job_id} was on host {location.host}, which is gone ({reason}), and "
+            f"{mirrored.lost}",
+        )
+    status = mirrored.view.status
+    if ended_is_answer:
+        return Done(job_id, location.host, {"status": status}, source="mirror")
+    return Done(
+        job_id,
+        location.host,
+        source="mirror",
+        error=f"cannot {verb} job {job_id}: it ended {status} on host {location.host}, "
+        f"which is gone ({reason}); read from the S3 mirror at {mirrored.uri}",
+    )
+
+
+def cancel_jobs(job_ids: Sequence[str], host: str | None, settings: Settings) -> list[Done]:
+    """The host's own word for what it did to each: `cancelled` for a queued
+    job it dequeued, `cancelling` for a running one whose runner has been
+    marked, a finished job's own status. A job whose host is gone has already
+    ended, and the mirror says how -- the same answer its host would have
+    given."""
+    done, _ = job_verbs("cancel", job_ids, host, settings, ended_is_answer=True)
+    return done
 
 
 def check_priority(priority: int) -> None:
@@ -992,59 +1241,64 @@ def check_priority(priority: int) -> None:
         raise UsageError(f"priority must be 0-99 (lower dispatches first), got {priority}")
 
 
-def reorder_job(job_id: str, priority: int, host: str | None, settings: Settings) -> dict[str, Any]:
+def reorder_jobs(
+    job_ids: Sequence[str], priority: int, host: str | None, settings: Settings
+) -> list[Done]:
+    """Move queued jobs, each with where it now sits in its host's queue."""
     check_priority(priority)
-    location, session, _, warnings = job_verb(
-        "reorder", job_id, host, settings, args=f" {priority}", mirror=("priority", priority)
+    done, sessions = job_verbs(
+        "reorder",
+        job_ids,
+        host,
+        settings,
+        args=f" --priority {priority}",
+        mirror=("priority", priority),
     )
-    return {
-        "job_id": job_id,
-        "host": location.host,
-        "priority": priority,
-        "warnings": warnings,
-        **placement_after(session, job_id, settings),
+    moved = [job for job in done if job.error is None and job.host in sessions]
+    views = {
+        name: status_mod.gather(session.entry, settings, session=session)
+        for name, session in sessions.items()
+        if any(job.host == name for job in moved)
     }
+    for job in moved:
+        assert job.host is not None
+        job.fields.update(status_mod.queue_placement(views[job.host], job.job_id))
+    return done
 
 
-def preempt_job(
-    job_id: str, priority: int | None, host: str | None, settings: Settings
-) -> dict[str, Any]:
-    """Stop a running job and put it back in its host's queue.
+def preempt_jobs(
+    job_ids: Sequence[str], priority: int | None, host: str | None, settings: Settings
+) -> list[Done]:
+    """Stop running jobs and put them back in their hosts' queues.
 
-    The job keeps its id and re-runs from the start as its next attempt, from
+    Each keeps its id and re-runs from the start as its next attempt, from
     the workdir that is already on the host -- nothing is re-synced from here,
-    and the job never leaves the host it was submitted to. `gpuc requeue` is
+    and a job never leaves the host it was submitted to. `gpuc requeue` is
     the other half of that pair: a fresh job id, from the mirrored spec, on
     whichever host you name.
     """
     if priority is not None:
         check_priority(priority)
-    location, _, document, warnings = job_verb(
+    done, _ = job_verbs(
         "preempt",
-        job_id,
+        job_ids,
         host,
         settings,
         args="" if priority is None else f" --priority {priority}",
         mirror=None if priority is None else ("priority", priority),
     )
-    return {
-        "job_id": job_id,
-        "host": location.host,
-        "status": document["status"],
-        "priority": document.get("priority"),
-        "warnings": warnings,
-    }
+    return done
 
 
 def placement_after(session: HostSession, job_id: str, settings: Settings) -> dict[str, Any]:
-    """Where the job now sits in the host's queue: what `submit` and `reorder`
-    answer "so when does it run" with.
+    """Where the job now sits in the host's queue: what `submit` answers "so
+    when does it run" with.
 
-    Asked *after* the enqueue or the move, over the same session, so it is
-    best effort by construction: whatever goes wrong here costs a document of
-    nulls, never the command's exit code -- the job is queued either way, and
-    a submit that printed a traceback over a job it had already enqueued would
-    be worse than one that said nothing about the queue.
+    Asked *after* the enqueue, over the same session, so it is best effort by
+    construction: whatever goes wrong here costs a document of nulls, never
+    the command's exit code -- the job is queued either way, and a submit that
+    printed a traceback over a job it had already enqueued would be worse than
+    one that said nothing about the queue.
     """
     view = status_mod.gather(session.entry, settings, session=session)
     return status_mod.queue_placement(view, job_id)
@@ -1064,9 +1318,7 @@ def check_estimate(minutes: float | None, *, clear: bool) -> float | None:
     return wanted
 
 
-def mirror_spec_field(
-    job_id: str, field: str, value: Any, settings: Settings, *, what: str
-) -> str | None:
+def mirror_spec_field(job_id: str, field: str, value: Any, settings: Settings) -> str | None:
     """Put a change made to a job's spec on the host in its mirrored spec too,
     or say why it could not be.
 
@@ -1084,45 +1336,40 @@ def mirror_spec_field(
         s3.put_spec_document(job_id, document)
     except (S3IndexError, S3ObjectMissing, ValueError) as exc:
         return (
-            f"the host has the new {what}, but its mirrored spec still has the old one, "
+            f"the host has the new {field}, but its mirrored spec still has the old one, "
             f"so `gpuc requeue {job_id}` would not carry it: {str(exc).splitlines()[0]}"
         )
     return None
 
 
-def estimate_job(
-    job_id: str, wanted: float | None, host: str | None, settings: Settings
-) -> dict[str, Any]:
-    """Add, change or clear a job's `estimated_runtime_min` after submitting it.
+def estimate_jobs(
+    job_ids: Sequence[str], wanted: float | None, host: str | None, settings: Settings
+) -> list[Done]:
+    """Add, change or clear jobs' `estimated_runtime_min` after submitting them.
 
     `wanted` has been through `check_estimate`; None clears the estimate.
     """
-    location, _, document, warnings = job_verb(
+    done, _ = job_verbs(
         "estimate",
-        job_id,
+        job_ids,
         host,
         settings,
-        args=" --clear" if wanted is None else f" {wanted!r}",
+        args=" --clear" if wanted is None else f" --minutes {wanted!r}",
         mirror=("estimated_runtime_min", wanted),
     )
-    recorded = document.get("estimated_runtime_min")
-    expected = recorded is None if wanted is None else isinstance(recorded, (int, float))
-    if not expected:
-        # Otherwise a host whose answer lacks the key reports a successful
-        # *clear* of a job it never touched.
-        raise CliError(
-            f"host {location.host} did not say what estimate it recorded for {job_id}: "
-            f"{json.dumps(document)[:200]}"
-        )
-    if document.get("warning"):
-        warnings.insert(0, str(document["warning"]))
-    return {
-        "job_id": job_id,
-        "host": location.host,
-        "estimated_runtime_min": recorded,
-        "status": document["status"],
-        "warnings": warnings,
-    }
+    for job in done:
+        if job.error is not None:
+            continue
+        recorded = job.fields.get("estimated_runtime_min")
+        if not (recorded is None if wanted is None else isinstance(recorded, (int, float))):
+            # Otherwise a host whose answer lacks the key reports a successful
+            # *clear* of a job it never touched.
+            job.error = (
+                f"host {job.host} did not say what estimate it recorded for {job.job_id}: "
+                f"{json.dumps(job.fields)[:200]}"
+            )
+            job.fields = {}
+    return done
 
 
 @dataclass

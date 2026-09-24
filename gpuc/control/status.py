@@ -6,6 +6,7 @@ only the index knows are `actions.unhosted_jobs`. Never kills anything.
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -318,6 +319,13 @@ class HostView:
     queue: list[JobView] = field(default_factory=list)
     running: list[JobView] = field(default_factory=list)
     finished: list[JobView] = field(default_factory=list)
+    finished_count: int | None = None
+    """How many finished jobs the host has, of which `finished` is the ones
+    it sent; None where nobody counted."""
+
+    @property
+    def finished_total(self) -> int:
+        return len(self.finished) if self.finished_count is None else self.finished_count
 
     @property
     def reachable(self) -> bool:
@@ -447,15 +455,36 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
     return queued, running, finished
 
 
+def status_request(
+    job_ids: Sequence[str] = (), *, recent: int | None = None, since_s: float | None = None
+) -> str:
+    """The host's `status`: for exactly these jobs, or naming none, for the
+    finished jobs inside the window and everything that is not finished.
+    Neither ids nor a window asks for every job the host has."""
+    words = ["status", *(shlex.quote(job_id) for job_id in job_ids)]
+    if recent is not None:
+        words += ["--recent", str(recent)]
+    if since_s is not None:
+        words += ["--since", repr(float(since_s))]
+    return " ".join(words)
+
+
 def gather(
     entry: HostEntry,
     settings: Settings | None = None,
     *,
+    request: str = "status",
     session: HostSession | None = None,
     provider: Provider | None = None,
 ) -> HostView:
-    """One host's status: `ask` it, and read the answer."""
-    return parse_status(entry, ask(entry, "status", settings, provider=provider, session=session))
+    """One host's status: `ask` it, and read the answer.
+
+    A bare `status` unless the caller needs the window or particular jobs:
+    it is the one request every build of the host understands, so what only
+    needs the host's cards, dispatcher and queue -- reuse, teardown, the
+    queue placement after a submit -- keeps working against a host that has
+    not been bootstrapped since."""
+    return parse_status(entry, ask(entry, request, settings, provider=provider, session=session))
 
 
 def parse_status(entry: HostEntry, asked: Asked) -> HostView:
@@ -499,6 +528,7 @@ def parse_status(entry: HostEntry, asked: Asked) -> HostView:
     view.heartbeat_age_s = _as_float(payload.get("dispatcher_heartbeat_age_s"))
     view.draining = bool(payload.get("draining"))
     view.queue, view.running, view.finished = job_views(payload)
+    view.finished_count = _as_int(payload.get("finished_count"))
     return view
 
 
@@ -806,9 +836,9 @@ def _finished_lines(view: HostView, *, recent: int, since_s: float | None) -> li
             f"  done    {job_label(job)} {job.status}"
             f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
         )
-    if since_s is not None and not finished and view.finished:
+    if since_s is not None and not finished and view.finished_total:
         lines.append(
-            f"  done    none in the last {int(since_s // 60)} min ({len(view.finished)} older)"
+            f"  done    none in the last {int(since_s // 60)} min ({view.finished_total} older)"
         )
     return lines
 

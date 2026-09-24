@@ -726,7 +726,7 @@ class _ScriptedSession:
         self.config = HostConfig.from_dict(config or {})
 
     def host_json(self, args: str, timeout: float = 60.0, check: bool = True) -> Any:
-        assert args == "status"
+        assert args.split()[0] == "status"
         return self.document
 
 
@@ -1142,3 +1142,11 @@ def test_a_host_that_only_borrows_does_not_read_as_having_no_gpus() -> None:
     got = shared_view()
     got.owned = []
     assert "shared 1/1 free, none owned" in render(got)
+
+
+def test_none_in_the_window_counts_the_finished_jobs_the_host_did_not_send() -> None:
+    """The host sends only the window, so how many older jobs there are is its
+    count, not the length of an empty list."""
+    host_view = view(jobs=[])
+    host_view.finished_count = 12
+    assert "none in the last 60 min (12 older)" in render(host_view, since_s=3600.0)

@@ -288,3 +288,17 @@ def test_a_reused_session_that_fails_still_says_what_ssh_said() -> None:
     with pytest.raises(RemoteError) as caught:
         session("", returncode=255, stderr=SSH_STDERR).host_cli("status")
     assert reason_of(caught.value) == "root@1.2.3.4: Permission denied (publickey)."
+
+
+def test_a_host_on_a_build_that_predates_the_request_says_to_bootstrap_it() -> None:
+    """Even with `check=False`: an argparse refusal is not a verdict the host
+    gave about a job, and its usage text is not a reason anyone can act on."""
+    stderr = (
+        "usage: python -m gpuc.host [-h] ...\n"
+        "python -m gpuc.host: error: unrecognized arguments: --recent 5\n"
+    )
+    with pytest.raises(RemoteError) as caught:
+        session("", returncode=2, stderr=stderr).host_json("status --recent 5", check=False)
+    reason = reason_of(caught.value)
+    assert "runs a gpuc build that does not understand `status --recent 5`" in reason
+    assert "gpuc host bootstrap gpubox" in reason

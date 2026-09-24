@@ -35,18 +35,19 @@ from gpuc.control.actions import (
     EXIT_USAGE,
     Answer,
     UsageError,
-    cancel_job,
+    cancel_jobs,
     check_estimate,
     config_document,
-    estimate_job,
+    estimate_jobs,
     exit_code_for,
     failure_message,
     hosts_document,
-    preempt_job,
+    jobs_answer,
+    preempt_jobs,
     read_log,
     registry_answer,
     remove_host,
-    reorder_job,
+    reorder_jobs,
     status,
     version_document,
 )
@@ -277,7 +278,12 @@ class Dashboard:
         except ValueError as exc:
             raise UsageError(f"since: {exc}") from exc
         result = status(
-            read, settings, host=request.param("host") or None, all_jobs=flag_param(request, "all")
+            read,
+            settings,
+            host=request.param("host") or None,
+            all_jobs=flag_param(request, "all"),
+            recent=recent,
+            since_s=since_s,
         )
         return Response.answer(result.answer(recent=recent, since_s=since_s), gathered_at=utc_now())
 
@@ -307,7 +313,9 @@ class Dashboard:
     def api_cancel(self, request: Request) -> Response:
         job_id = job_id_of(request)
         body = request.json()
-        return Response.json(cancel_job(job_id, host_of(body), self.load_settings()))
+        return Response.answer(
+            jobs_answer(cancel_jobs([job_id], host_of(body), self.load_settings()))
+        )
 
     def api_reorder(self, request: Request) -> Response:
         job_id = job_id_of(request)
@@ -315,7 +323,9 @@ class Dashboard:
         priority = body.get("priority")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise UsageError("reorder needs an integer `priority` (0-99)")
-        return Response.json(reorder_job(job_id, priority, host_of(body), self.load_settings()))
+        return Response.answer(
+            jobs_answer(reorder_jobs([job_id], priority, host_of(body), self.load_settings()))
+        )
 
     def api_preempt(self, request: Request) -> Response:
         job_id = job_id_of(request)
@@ -323,7 +333,9 @@ class Dashboard:
         priority = body.get("priority")
         if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
             raise UsageError("preempt takes an integer `priority` (0-99), or none at all")
-        return Response.json(preempt_job(job_id, priority, host_of(body), self.load_settings()))
+        return Response.answer(
+            jobs_answer(preempt_jobs([job_id], priority, host_of(body), self.load_settings()))
+        )
 
     def api_estimate(self, request: Request) -> Response:
         job_id = job_id_of(request)
@@ -336,7 +348,9 @@ class Dashboard:
         wanted = check_estimate(
             None if minutes is None else float(minutes), clear=bool(body.get("clear"))
         )
-        return Response.json(estimate_job(job_id, wanted, host_of(body), self.load_settings()))
+        return Response.answer(
+            jobs_answer(estimate_jobs([job_id], wanted, host_of(body), self.load_settings()))
+        )
 
 
 def job_id_of(request: Request) -> str:

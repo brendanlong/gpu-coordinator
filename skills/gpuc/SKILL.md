@@ -121,6 +121,9 @@ gpuc status                      # every host: free cards, queue, running job + 
                                  # job's cards as `gpu=2,3`
 gpuc status --json               # the same, machine-readable; see "Exit codes" below
 gpuc status --all                # adds jobs only the index knows (a host that lost its state)
+gpuc status <jobid> [<jobid> ...]
+                                 # exactly these jobs, whatever state they are in; one
+                                 # question per host however many ids
 gpuc logs <jobid>                # tails the host; the S3 mirror when the host is gone
 gpuc logs <jobid> -f             # STOPS when the job does: the outcome is the last line and
                                  # gpuc exits 0 only if the job succeeded. --follow-forever
@@ -130,7 +133,10 @@ gpuc wait <jobid> [<jobid> ...]  # block until every job named has ended; one li
 gpuc ssh <host|jobid>            # a shell there (a job id lands in its workdir)
 gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc exits with that
                                  # command's own exit code
-gpuc cancel <jobid>              # SIGTERM then SIGKILL of the job's process tree; final sync still runs
+gpuc cancel <jobid> [<jobid> ...]
+                                 # SIGTERM then SIGKILL of each job's process tree; final sync
+                                 # still runs. cancel, reorder, preempt and estimate all take
+                                 # several ids: one call per host, one outcome per id
 gpuc reorder <jobid> --priority 10          # queued jobs only; prints the new position and
                                  # when the job is now expected to start
 gpuc preempt <jobid> --priority 60          # running jobs only: stop it and queue it again
@@ -199,7 +205,7 @@ mirror at once, exit 0; a job the mirror has no final state for is exit 1.
 | 1 | something failed: transport, provider, a refused submit, **a host that could not be asked**. Whatever did work is still reported, so read the output before retrying. For `gpuc wait` and `gpuc logs -f` it is the **job** that did not succeed |
 | 2 | usage: a bad or missing flag |
 | 3 | local state (`hosts.json`, `config.toml`) is unreadable, so the answer is **unknown** |
-| 4 | the job or host named does not exist, decided only once every host answered. `gpuc wait` on several ids reports the ones it found and exits 4 for the unknown one |
+| 4 | the job or host named does not exist, decided only once every host answered. A command given several ids carries out and reports the ones it found and exits 4 for the unknown one |
 | 130 | a Ctrl-C |
 
 ```bash
@@ -238,10 +244,8 @@ unchanged by the flag. Prefer it to scraping any of the text output.
 | `submit`, `requeue` | `{job_id, host, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are all null when the host could not be asked again (the job is queued regardless), and `starts_unknown` is why there is no start time |
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` uses, plus `host`, `source` (`host` or `mirror`) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say. Exit 1 unless every job succeeded |
-| `cancel` | `{job_id, host, status, source}`; `source` is `host` or `mirror` |
-| `preempt` | `{job_id, host, status, priority, warnings[]}`; `priority` is what it will be queued again at |
-| `reorder` | `{job_id, host, priority, warnings[]}` plus the same queue fields as `submit`. A `warnings` entry means the mirrored spec kept the old priority, so a `requeue` would not carry the move |
-| `estimate` | `{job_id, host, estimated_runtime_min, status, warnings[]}` |
+| `status <jobid> ...` | `wait`'s document as things stand now. Exit 4 if an id is unknown, 1 if any other job has an `error`, else 0 however the jobs went |
+| `cancel`, `preempt`, `reorder`, `estimate` | `{jobs[], errors[]}`, one entry per id: `{job_id, host, source, error, warnings[]}` plus `status` and the verb's own fields (`priority`; `estimated_runtime_min`; `reorder` adds the queue fields of `submit`). **Check `error`**: when it is set the host did not confirm the change, and the verb's fields are absent. A `warnings` entry means the mirrored spec kept the old value, so a `requeue` would not carry it. Exit 4 if an id is unknown, else 1 if any `error` |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
 | `host list` | `{hosts[], errors[]}` |

@@ -515,17 +515,25 @@ hold to, whatever the flags:
   registry's cache. A host with no cached interpreter is asked for one on the
   spot, and what a session reads is recorded in the cache on the way past,
   except by a poll, which never writes the registry.
-- A host name is looked up locally; `logs`, `wait`, `cancel`, `preempt`,
-  `reorder`, `estimate`, `requeue` and `ssh` resolve a job id the same way
-  (`actions.locate`): the job index (`s3index.JobIndex`, the local index then
-  the mirror's), then asking each host. An id no host knows is exit 4 only
-  once every host has answered. A host the index names for the job that this
-  machine has no entry for is `Gone`, whether or not `--host` named it; one
-  whose registry entry this build could not read is `Unaskable`. Every
-  per-job verb runs through `actions.job_verb`: locate the job, ask its host
-  over the one session the lookup opened, insist on a verdict, re-mirror a
-  spec field it changed. A host's refusal is its
-  `{error}` document; one that also says `missing` is "no such job", exit 4.
+- A host name is looked up locally; `status <ids>`, `logs`, `wait`, `cancel`,
+  `preempt`, `reorder`, `estimate`, `requeue` and `ssh` resolve job ids the
+  same way (`actions.locate_many`): the job index (`s3index.JobIndex`, the
+  local index then the mirror's), then asking the hosts, each at most twice
+  however many ids -- the one the index names, then every host about the ids
+  still unplaced. An id no host knows is exit 4 only once every host has
+  answered. A host the index names for the job that this machine has no entry
+  for is `Gone`, whether or not `--host` named it; one whose registry entry
+  this build could not read is `Unaskable`.
+- **Every command that takes job ids takes any number**, except `logs`,
+  `requeue` and `ssh`, and answers for each: one id it cannot find or act on
+  never stops the rest, is exit 4 if no host has it and exit 1 otherwise.
+  The verbs (`cancel`, `preempt`, `reorder`, `estimate`) run through
+  `actions.job_verbs`: locate the jobs, send each host **one** call naming
+  all of its jobs over the session the lookup opened, insist on a verdict
+  for each, re-mirror a spec field it changed. The on-host verb takes the
+  list and answers `{"jobs": [...]}`, one document per id; a refusal is that
+  job's `{job_id, error}`, and one that also says `missing` is "no such
+  job".
 - What a command does lives in `actions` (with `hosts` and `submitting` for the
   host and submit commands), one function per command returning an `Answer`:
   the document its `--json` form prints, the text form, and what failed.
@@ -602,8 +610,10 @@ say about what was in flight raises `Interrupted` to add it.
 ## Waiting for a job to end (`control/wait.py`)
 
 Purely client-side: nothing on a host knows a client is waiting, so the loop is
-free to be killed. Each round sends **one `status` per host** rather than one
-per job, backing off from 2 s to 30 s unless `--interval` pins it.
+free to be killed. Each round sends **one `status` per host** naming every job
+still pending there, backing off from 2 s to 30 s unless `--interval` pins it.
+`gpuc status <ids>` is one round of it, which settles a host that could not be
+asked with its reason at once and never from the mirror.
 
 - A host in trouble is handled by the one rule under *Control side*;
   `actions.read_mirror` is the one reader of a mirrored `state.json`, and
@@ -893,6 +903,13 @@ and restarts on failure under a start limit.
 
 What `status` prints, and every flag, is usage.md. The invariants:
 
+- **A host's `status` sends what was asked for, and what it costs grows with
+  what the host holds now, not with its history.** Given ids it sends exactly
+  those; given none it sends every job that is not finished, the finished
+  ones inside `--recent` and `--since`, and every finished job still holding
+  a workdir, whose disk and pending outputs the host-level lines count; and
+  `finished_count`. `status --all` asks for everything, since a job the index
+  knows reads as lost when its host does not send it.
 - A host is in one of three states (`status.HostState`), the three answers of
   `remote.ask` under *Control side*, read everywhere else: `UNASKABLE` is
   printed with the reason as its `ERROR` line and is a failure; `GONE` is not,
@@ -941,6 +958,11 @@ every bootstrap and reported back by `python -m gpuc.host status`
   with uncommitted changes is `<commit>-dirty-<hash of the changes>`. That
   same read is what the rest of the submit works from, and it replaces the
   registry's cache on the way past.
+- A host on another build is still asked, not shipped to: a request its
+  on-host CLI rejects (argparse's exit 2) is `Unaskable` with the reason and
+  `gpuc host bootstrap <host>`, never a traceback. What needs only the host's
+  cards, dispatcher and queue (reuse, teardown, `pods`, the placement after a
+  submit) sends a bare `status`, which every build understands.
 - `gpuc host list` and `gpuc version` never ssh: they report the commit the
   host was running when this machine last read it, labelled with its age.
 
