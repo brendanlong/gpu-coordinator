@@ -7,6 +7,7 @@ process, as it would for a user, and finds the plugin by its package name.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
@@ -14,10 +15,11 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from snakemake_executor_plugin_gpuc import index_status, job_name, truthy
+from snakemake_executor_plugin_gpuc import job_name, truthy
 from tests.conftest import install_fake_torch
 from tests.test_control_e2e import bootstrapped_home, state_of, wait_until
 
@@ -156,32 +158,6 @@ def test_a_directory_other_than_the_one_gpuc_would_copy_is_refused(
     assert "--directory is not supported" in done.stderr, done.stderr[-4000:]
 
 
-def test_status_is_indexed_across_hosts_and_lists() -> None:
-    jobs, states = index_status(
-        {
-            "hosts": [
-                {
-                    "name": "a",
-                    "state": "answered",
-                    "queued": [{"job_id": "q", "status": "queued"}],
-                    "running": [{"job_id": "r", "status": "running"}],
-                    "finished": [{"job_id": "f", "status": "failed", "reason": "exit 3"}],
-                },
-                {
-                    "name": "b",
-                    "state": "unaskable",
-                    "errors": ["ssh: timed out"],
-                    "queued": [],
-                    "running": [],
-                    "finished": [],
-                },
-            ]
-        }
-    )
-    assert jobs == {"q": ("queued", None), "r": ("running", None), "f": ("failed", "exit 3")}
-    assert states == {"a": ("answered", None), "b": ("unaskable", "ssh: timed out")}
-
-
 def test_resources_given_as_strings_still_read_as_flags() -> None:
     assert truthy("true") and truthy(1) and not truthy("0") and not truthy(False)
 
@@ -225,3 +201,37 @@ def test_ctrl_c_cancels_the_jobs_in_flight(
         60,
         f"job {job_id} to be cancelled",
     )
+
+
+def test_a_poll_fails_only_what_asking_again_would_not_change() -> None:
+    from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
+
+    from snakemake_executor_plugin_gpuc import Executor
+
+    answers = [
+        {"job_id": "ok", "status": "succeeded", "host_state": "answered", "error": None},
+        {"job_id": "bad", "status": "failed", "reason": "exit 3", "error": None},
+        {"job_id": "run", "status": "running", "host_state": "answered", "error": None},
+        {"job_id": "far", "status": None, "host_state": "unaskable", "error": "ssh: timed out"},
+        {"job_id": "lost", "status": None, "host_state": "answered", "error": "has no job"},
+    ]
+    executor = Executor.__new__(Executor)
+    executor.unaskable_shown = {}
+    executor.logger = SimpleNamespace(info=lambda _msg: None)  # type: ignore[assignment]
+    executor.gpuc = lambda *_a, **_k: {"jobs": answers}  # type: ignore[method-assign]
+    outcomes: dict[str, str] = {}
+    executor.report_job_success = lambda info: outcomes.update({info.external_jobid: "ok"})  # type: ignore[method-assign]
+    executor.report_job_error = lambda info, **_k: outcomes.update({info.external_jobid: "failed"})  # type: ignore[method-assign]
+
+    class Limiter:
+        async def __aenter__(self) -> None: ...
+        async def __aexit__(self, *_: object) -> None: ...
+
+    executor.status_rate_limiter = Limiter()  # type: ignore[assignment]
+    infos = [SubmittedJobInfo(None, external_jobid=a["job_id"]) for a in answers]  # type: ignore[arg-type]
+
+    async def poll() -> list[str]:
+        return [str(i.external_jobid) async for i in executor.check_active_jobs(infos)]
+
+    assert asyncio.run(poll()) == ["run", "far"]
+    assert outcomes == {"ok": "ok", "bad": "failed", "lost": "failed"}

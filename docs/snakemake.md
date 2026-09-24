@@ -76,10 +76,12 @@ Ctrl-C on Snakemake runs `gpuc cancel` on every job it has in flight.
 and delivered to the host in a 0600 file. It never appears in the job's
 command. A storage plugin's credentials are passed the same way.
 
-**Status.** Every poll is one `gpuc status --json` covering every job in
-flight. A job whose host could not be asked stays in flight, and the host's
-reason is printed. A job its host no longer has, or whose host is gone, has
-failed.
+**Status.** Every poll is one `gpuc status --json` naming every job in
+flight, and Ctrl-C is one `gpuc cancel` naming them all. A job whose host
+could not be asked stays in flight, and the reason is printed. A job its host
+no longer has, or whose host is gone with no end recorded in the mirror, has
+failed. A job on a rental that ended after finishing gets its outcome from the
+mirror.
 
 <a name="a-killed-controller"></a>
 **A killed controller.** Ctrl-C cancels the workflow's gpuc jobs, but a

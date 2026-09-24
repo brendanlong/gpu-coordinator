@@ -23,7 +23,6 @@ import shlex
 import subprocess
 import threading
 from collections.abc import AsyncGenerator, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -32,17 +31,6 @@ from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
 from snakemake_interface_executor_plugins.settings import CommonSettings, ExecutorSettingsBase
-
-RECENT_ALL = 1_000_000
-"""`gpuc status --recent`: every finished job the hosts still hold.
-
-The hosts return all of them anyway, and `--recent` only trims the answer; a
-job that finished while hundreds of its siblings did must not fall off the
-list before this executor has seen it end."""
-
-CANCEL_PARALLELISM = 8
-"""How many `gpuc cancel`s run at once when a workflow is stopped. Each is an
-ssh round trip, and a Ctrl-C on a sweep should not take minutes."""
 
 FAILED = ("failed", "cancelled")
 
@@ -130,7 +118,7 @@ class Executor(RemoteExecutor):
                 "so it would not be in the job's copy of that directory; run snakemake "
                 "from a directory that contains it"
             )
-        self.unaskable_shown: dict[str, str | None] = {}
+        self.unaskable_shown: dict[str, str] = {}
         # Every job submitted and not yet over. Snakemake's own `active_jobs`
         # is emptied for the length of each poll, and a poll here is an ssh
         # round trip to every host: a Ctrl-C landing in one would cancel
@@ -214,47 +202,46 @@ class Executor(RemoteExecutor):
     async def check_active_jobs(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, active_jobs: list[SubmittedJobInfo]
     ) -> AsyncGenerator[SubmittedJobInfo, None]:
-        """One `gpuc status` for every active job, not one per job: each asks
-        every host over ssh, and a sweep has hundreds of jobs in flight.
+        """One `gpuc status` naming every active job, never one per job: a
+        sweep has hundreds in flight, and gpuc asks each host once for all of
+        its own.
 
-        A job its host lists has the host's status. A job whose host could not
-        be asked is neither: it stays active, and the host's reason is shown.
-        Any other job no longer exists -- its host answered without it, is
-        gone, or is not registered here -- and has failed."""
+        A job with no `error` is where its status says. One whose host could
+        not be asked stays active, with the reason shown. Any other `error`
+        is final -- the host has no such job, or is gone and its mirror has
+        no end for it -- and the job has failed."""
         if not active_jobs:
             return
+        ids = [info.external_jobid or "" for info in active_jobs]
         async with self.status_rate_limiter:
             try:
-                document = self.gpuc(
-                    ["status", "--json", "--recent", str(RECENT_ALL)], ok_codes=(0, 1)
-                )
+                document = self.gpuc(["status", "--json", *ids], ok_codes=(0, 1, 4))
             except GpucError as exc:
                 self.logger.info(f"gpuc status failed, asking again later: {exc}")
                 for info in active_jobs:
                     yield info
                 return
 
-        jobs, hosts = index_status(document)
-        for host, (state, reason) in hosts.items():
-            shown = self.unaskable_shown.get(host)
-            if state == "unaskable" and shown != reason:
-                self.logger.info(f"gpuc host {host} could not be asked: {reason}")
-            self.unaskable_shown[host] = reason if state == "unaskable" else None
-        for info in active_jobs:
-            job_id = info.external_jobid or ""
-            host = (info.aux or {}).get("host") or ""
-            state, _ = hosts.get(host, ("not registered here", None))
-            status, reason = jobs.get(job_id, (None, None))
-            if status == "succeeded":
+        answers = {job.get("job_id"): job for job in document.get("jobs") or []}
+        for info, job_id in zip(active_jobs, ids, strict=True):
+            job = answers.get(job_id) or {"error": "gpuc status did not mention it"}
+            error, status = job.get("error"), job.get("status")
+            if error is not None and job.get("host_state") == "unaskable":
+                if self.unaskable_shown.get(job_id) != error:
+                    self.logger.info(f"gpuc job {job_id}: {error}")
+                self.unaskable_shown[job_id] = error
+                yield info
+            elif error is not None:
+                self.report_job_error(info, msg=f"gpuc job {job_id}: {error}\n")
+            elif status == "succeeded":
                 self.report_job_success(info)
             elif status in FAILED:
-                why = f"{status}: {reason}" if reason else status
+                reason = job.get("reason")
+                why = f"{status}: {reason}" if reason and reason != status else status
                 self.report_job_error(info, msg=f"gpuc job {job_id} {why}; `gpuc logs {job_id}`.\n")
-            elif status is not None or state == "unaskable":
-                yield info
             else:
-                lost = "has no such job" if state == "answered" else f"is {state}"
-                self.report_job_error(info, msg=f"gpuc job {job_id}: host {host} {lost}.\n")
+                self.unaskable_shown.pop(job_id, None)
+                yield info
 
     def report_job_success(self, job_info: SubmittedJobInfo) -> None:
         self.settled(job_info)
@@ -275,21 +262,16 @@ class Executor(RemoteExecutor):
         self.shutdown()
 
     def cancel_jobs(self, active_jobs: list[SubmittedJobInfo]) -> None:
-        def cancel(info: SubmittedJobInfo) -> str | None:
-            argv = ["cancel", str(info.external_jobid), "--json"]
-            host = (info.aux or {}).get("host")
-            if host:
-                argv += ["--host", host]
-            try:
-                self.gpuc(argv)
-            except GpucError as exc:
-                return f"gpuc cancel {info.external_jobid}: {exc}"
-            return None
-
-        with ThreadPoolExecutor(CANCEL_PARALLELISM) as pool:
-            failures = [f for f in pool.map(cancel, active_jobs) if f]
-        for failure in failures:
-            self.logger.info(failure)
+        ids = [str(info.external_jobid) for info in active_jobs if info.external_jobid]
+        if not ids:
+            return
+        try:
+            document = self.gpuc(["cancel", "--json", *ids], ok_codes=(0, 1, 4))
+        except GpucError as exc:
+            self.logger.info(f"gpuc cancel failed: {exc}")
+            return
+        for error in document.get("errors") or []:
+            self.logger.info(f"gpuc cancel: {error}")
 
     def gpuc(
         self,
@@ -301,8 +283,8 @@ class Executor(RemoteExecutor):
     ) -> dict[str, Any]:
         """Run gpuc in the project directory and return its `--json` document.
 
-        `ok_codes` are the exits that still carry the whole answer: `status`
-        exits 1 for one unreachable host and reports the rest."""
+        `ok_codes` are the exits that still carry the whole answer: a command
+        on several ids exits 1 or 4 for one of them and reports every one."""
         try:
             proc = subprocess.run(
                 [*self.gpuc_argv, *args],
@@ -326,22 +308,6 @@ class Executor(RemoteExecutor):
         if proc.returncode not in ok_codes:
             raise GpucError(f"exit {proc.returncode}: {proc.stderr.strip()}")
         return document
-
-
-def index_status(
-    document: Mapping[str, Any],
-) -> tuple[dict[str, tuple[str, str | None]], dict[str, tuple[str, str | None]]]:
-    """`gpuc status --json` as `{job_id: (status, reason)}` and
-    `{host: (state, first error)}`."""
-    jobs: dict[str, tuple[str, str | None]] = {}
-    states: dict[str, tuple[str, str | None]] = {}
-    for host in document.get("hosts") or []:
-        errors = host.get("errors") or []
-        states[host.get("name")] = (host.get("state"), errors[0] if errors else None)
-        for key in ("queued", "running", "finished"):
-            for job in host.get(key) or []:
-                jobs[job["job_id"]] = (job.get("status"), job.get("reason"))
-    return jobs, states
 
 
 def job_name(job: JobExecutorInterface) -> str:

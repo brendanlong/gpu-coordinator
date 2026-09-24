@@ -95,6 +95,11 @@ class Watched:
     resort when the host itself is gone."""
     source: str = "host"
     """`host`, or `mirror` for an outcome read from S3 after the host went."""
+    host_state: str = "answered"
+    """What the job's host was found to be: `answered`, `unaskable` or `gone`.
+    With an `error`, only `unaskable` is worth asking about again: an
+    answered host that lacks the job, and a gone one whose mirror has no end
+    for it, will say the same next time."""
 
     @property
     def status(self) -> str:
@@ -157,7 +162,13 @@ class Watched:
             if self.view is None
             else status_mod.job_json(self.view, self.mirror_prefix)
         )
-        return {**body, "host": self.host, "source": self.source, "error": self.error}
+        return {
+            **body,
+            "host": self.host,
+            "host_state": self.host_state,
+            "source": self.source,
+            "error": self.error,
+        }
 
 
 class Watch:
@@ -214,7 +225,7 @@ class Watch:
         )
         self.jobs.update(
             {
-                job_id: Watched(job_id, host, error=reason)
+                job_id: Watched(job_id, host, error=reason, host_state="unaskable")
                 for job_id, (host, reason) in (unaskable or {}).items()
             }
         )
@@ -344,10 +355,18 @@ class Watch:
         # It was there and is not now: a purge, or a host that lost its state.
         # Treated as trouble rather than an answer, because the job may well
         # have finished and `gpuc status --all` is the place to find out.
-        self._trouble_with(name, [watched], f"no longer knows job {watched.job_id}")
+        self._trouble_with(
+            name, [watched], f"no longer knows job {watched.job_id}", state="answered"
+        )
 
     def _trouble_with(
-        self, name: str, pending: Iterable[Watched], why: str, *, gone: bool = False
+        self,
+        name: str,
+        pending: Iterable[Watched],
+        why: str,
+        *,
+        gone: bool = False,
+        state: str = "unaskable",
     ) -> None:
         now = time.monotonic()
         since, said = self._trouble.get(name, (now, ""))
@@ -362,6 +381,7 @@ class Watch:
             return
         waited = f" for {status_mod.format_duration(now - since)}" if now > since else ""
         for watched in pending:
+            watched.host_state = "gone" if gone else state
             # The mirror before giving up, and only now: the spec's rule is
             # that monitoring asks the host and reads the mirror when the host
             # is gone. A rental that idled itself down after finishing the job
