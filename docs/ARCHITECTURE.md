@@ -394,7 +394,10 @@ kill, the dispatcher's escalation and the adoption of a dead runner's leftovers
 all call it. The kill path is `systemctl --user stop <unit>`, with the
 process-group kill as the fallback. The job's group is only ever the one the
 runner published for the phase now running, cleared with the unit the moment
-the phase ends; the runner's own group is never recorded as the job's.
+the phase ends; the runner's own group is never recorded as the job's. Every
+phase ends with that stop, however it ended: anything still in the scope or
+group is stopped before the unit is cleared, so no phase's processes outlive
+the phase and hold a card the dispatcher has freed.
 `isolation` (`cgroup` | `pgid`) and `cgroup_unit` are in `state.json` and
 `gpuc status --json`. The mode is decided once per process
 (`scope.isolation()`: what `GPUC_ISOLATION` announces, else one probe) and the

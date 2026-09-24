@@ -96,6 +96,9 @@ Rules that avoid the classic failures:
 - `use_shared: true` (or `gpuc submit --use-shared`) lets the job onto a host's
   **shared** cards, which gpuc takes only while nvidia-smi says nobody else is
   on them. Owned cards are always used first.
+- Nothing outlives its phase. A process `setup` starts in the background is
+  stopped before `main` runs, and whatever `main` leaves running is stopped
+  before its cards are freed; start a server the job needs inside `command`.
 - Write results incrementally and atomically (temp name, then rename), so the
   periodic sync never uploads a half-written checkpoint.
 - Pass `--device cuda` explicitly and keep `REQUIRE_CUDA=1`. A real GPU op runs

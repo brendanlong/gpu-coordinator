@@ -350,6 +350,36 @@ class JobRunner:
             log=lambda message: self._log(log, message),
         )
 
+    def _stop_leftovers(self, proc: subprocess.Popen[bytes], log: IO[bytes]) -> None:
+        """Whatever the phase left running goes with it, before its cards are
+        handed on.
+
+        A scope made with `--collect` outlives its shell for as long as any
+        process is in it, so a leaked DataLoader worker or a background server
+        kept holding GPU memory after a clean exit, and the *next* job on the
+        card died at startup with an out-of-memory error naming nobody else.
+        A stop returns once the cgroup is empty, and the driver releases a
+        process's memory as it exits, so there is nothing to poll -- least of
+        all `memory.used`, which on a shared card moves for other reasons.
+        Under `pgid` a `setsid` grandchild still escapes, as it does a cancel.
+        """
+        processes = JobProcesses(self._current_unit, proc.pid)
+        leftovers = processes.members()
+        if not leftovers:
+            return
+        self._log(
+            log,
+            f"stopping {len(leftovers)} leftover process(es) of the phase: "
+            f"{' '.join(map(str, leftovers))}",
+        )
+        processes.stop(
+            "the phase exited",
+            grace_s=self.deps.kill_grace_s,
+            sleep=self.deps.sleep,
+            now=self.deps.now,
+            log=lambda message: self._log(log, message),
+        )
+
     def _run_phase(
         self, phase: str, command: str, env: dict[str, str], log: IO[bytes], job_start: float
     ) -> int:
@@ -359,6 +389,7 @@ class JobRunner:
         # the group (and the scope) it must take down.
         self._current = proc
         code = self._monitor(proc, phase, log, job_start)
+        self._stop_leftovers(proc, log)
         self._current = None
         # Both, together: a group number outlives its processes, and a
         # `pgid` left naming a finished phase is what the dispatcher's ladder

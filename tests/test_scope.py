@@ -227,3 +227,57 @@ def test_status_json_says_which_isolation_a_running_job_has() -> None:
         )
     )
     assert document["running"][0]["iso"] == "cgroup"
+
+
+def straggling_job(pid_file: Path, *, detach: bool) -> str:
+    """Exits 0 at once, leaving a child behind: `setsid` leaves the group too."""
+    launch = "setsid bash" if detach else "bash"
+    return f"{launch} -c 'echo $$ > {pid_file}; exec sleep 300' > /dev/null 2>&1 & sleep 1; exit 0"
+
+
+@pytest.mark.usefixtures("needs_scopes")
+def test_a_phase_that_exits_cleanly_takes_its_detached_leftovers_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(scope.ISOLATION_ENV, scope.CGROUP)
+    pid_file = tmp_path / "straggler.pid"
+    job_id = prepare(straggling_job(pid_file, detach=True))
+    thread = _run_in_background(job_id)
+    pid = wait_for_pid(pid_file)
+    try:
+        thread.join(timeout=90)
+        assert not thread.is_alive()
+        assert not alive(pid), f"pid {pid} outlived a phase that exited 0"
+    finally:
+        reap(pid)
+    assert jobs.read_state(job_id).status == "succeeded"
+    log = paths.log_file(job_id).read_text()
+    assert f"stopping 1 leftover process(es) of the phase: {pid}" in log
+    assert f"stopping scope {scope.unit_name(job_id, 'main')}" in log
+
+
+def test_a_phase_that_exits_cleanly_takes_its_group_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
+    pid_file = tmp_path / "straggler.pid"
+    job_id = prepare(straggling_job(pid_file, detach=False))
+    thread = _run_in_background(job_id)
+    pid = wait_for_pid(pid_file)
+    try:
+        thread.join(timeout=90)
+        assert not thread.is_alive()
+        assert gone_within(pid, 5.0), f"pid {pid} outlived a phase that exited 0"
+    finally:
+        reap(pid)
+    assert jobs.read_state(job_id).status == "succeeded"
+    assert "leftover process(es) of the phase" in paths.log_file(job_id).read_text()
+
+
+def test_a_phase_that_leaves_nothing_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
+    job_id = prepare("true")
+    runner.run_job(
+        job_id, [FAKE_GPUS[0]], 1, RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02)
+    )
+    assert "leftover" not in paths.log_file(job_id).read_text()

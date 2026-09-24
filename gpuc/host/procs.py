@@ -95,6 +95,16 @@ def recorded_process_alive(
     return not (recorded_starttime and current_start and recorded_starttime != current_start)
 
 
+def _stat_pgrp(stat: str) -> int | None:
+    """Field 5 of ``/proc/<pid>/stat``, split after the comm as in `parse_starttime`."""
+    fields = stat.rpartition(")")[2].split()
+    return int(fields[2]) if len(fields) > 2 and fields[2].isdigit() else None
+
+
+def _in_unit(cgroup: str, unit: str) -> bool:
+    return any(line.rpartition(":")[2].endswith(f"/{unit}") for line in cgroup.splitlines())
+
+
 def process_group_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
@@ -178,6 +188,27 @@ class JobProcesses:
             sleep(0.25)
         with contextlib.suppress(ProcessLookupError):
             os.killpg(pgid, signal.SIGKILL)
+
+    def members(self, proc_root: Path = Path("/proc")) -> list[int]:
+        """Every pid still in the scope or the job's group, from one pass over
+        /proc. The scope is matched by cgroup path, so a `setsid` grandchild
+        is found where the host has one."""
+        pgid = self.job_pgid if self.job_pgid and self.job_pgid > 1 else None
+        unit = self.cgroup_unit
+        if pgid is None and unit is None:
+            return []
+        found = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if (pgid is not None and _stat_pgrp((entry / "stat").read_text()) == pgid) or (
+                    unit is not None and _in_unit((entry / "cgroup").read_text(), unit)
+                ):
+                    found.append(int(entry.name))
+            except OSError:
+                continue
+        return sorted(found)
 
     def kill(self, log: Log = lambda _: None) -> None:
         """Take the job's processes down now, with no grace: the scope, then
