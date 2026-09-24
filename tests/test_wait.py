@@ -493,6 +493,7 @@ def test_wait_json_carries_the_error_and_where_the_answer_came_from(
     assert job["source"] == "host"
     assert job["status"] is None, "never seen, so there is nothing to report as its state"
     assert "could not be asked" in job["error"]
+    assert job["host_state"] == "unaskable"
     assert document["errors"] == [job["error"]]
 
 
@@ -507,6 +508,7 @@ def test_wait_reports_the_jobs_it_found_and_exits_four_for_the_one_nobody_has(
     by_id = {job["job_id"]: job for job in document["jobs"]}
     assert by_id[JOB]["status"] == "succeeded" and by_id[JOB]["error"] is None
     assert "has no job" in by_id[unknown]["error"]
+    assert by_id[unknown]["host_state"] == by_id[JOB]["host_state"] == "answered"
     assert document["errors"] == [by_id[unknown]["error"]]
 
 
@@ -530,9 +532,10 @@ def test_wait_reads_the_mirror_at_once_for_a_host_this_machine_has_forgotten(
     sleeps = [0]
     monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: sleeps.__setitem__(0, sleeps[0] + 1))
 
-    assert main(["wait", JOB]) == EXIT_OK
+    assert main(["wait", JOB, "--json"]) == EXIT_OK
     captured = capsys.readouterr()
-    assert "succeeded" in captured.out and "from the S3 mirror" in captured.out
+    job = json.loads(captured.out)["jobs"][0]
+    assert (job["status"], job["source"], job["host_state"]) == ("succeeded", "mirror", "gone")
     assert "not registered on this machine" in captured.err
     assert sleeps[0] == 0
 
@@ -720,3 +723,4 @@ def test_wait_reports_a_job_whose_hosts_registry_entry_it_cannot_read(
     assert by_id[JOB]["status"] == "succeeded"
     assert by_id[other]["host"] == "gpuc-old"
     assert "registry entry could not be read" in by_id[other]["error"]
+    assert by_id[other]["host_state"] == "unaskable"

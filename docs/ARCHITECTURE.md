@@ -66,6 +66,7 @@ gpuc/
     providers/
       base.py      # Provider interface: offers(constraints), create, get, logs, terminate, list
       runpod.py    # v2 REST implementation
+snakemake_executor_plugin_gpuc/  # `snakemake --executor gpuc`; a second top-level package in the wheel
 skills/gpuc/SKILL.md  # the agent guide; force-included in the wheel as gpuc/SKILL.md
 tests/
 ```
@@ -549,6 +550,22 @@ Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`, `jobs/`
 `state.lock`, which serialises every registry read-modify-write across
 concurrent sessions. `Settings` (`~/.config/gpu-coordinator/config.toml`) is
 all optional and every key is in [setup.md](setup.md#settings).
+
+## Snakemake executor plugin
+
+Snakemake finds `snakemake_executor_plugin_gpuc` by its package name, so it
+ships in the same wheel and gpuc does not depend on Snakemake.
+
+- It imports nothing from `gpuc`. Every submit, poll and cancel is a `gpuc`
+  command with `--json`, run in the directory Snakemake was started from, so
+  it reads the same documents under the same compatibility rules as any
+  script.
+- One `gpuc status --json` per poll covers every job in flight. It is never
+  one per job.
+- Snakemake's `--envvars` and its storage plugins' credentials reach the job
+  as gpuc `secrets`, never as exports in the job's command.
+- A job runs in its own gpuc workdir. The Snakefile is passed relative to that
+  copy, never as the controller's absolute path.
 
 ## Shared state is read tolerantly, always
 
