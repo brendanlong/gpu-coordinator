@@ -70,6 +70,10 @@ loses those lines from the stream, never from the log itself.
 """
 
 
+NO_HOST = "no host"
+"""What a job no host could be found for is reported as being on."""
+
+
 @dataclass
 class Watched:
     """One job being waited on, and the last thing its host said about it."""
@@ -204,7 +208,7 @@ class Watch:
         }
         self.jobs.update(
             {
-                job_id: Watched(job_id, "no host", error=reason, missing=True)
+                job_id: Watched(job_id, NO_HOST, error=reason, missing=True)
                 for job_id, reason in (unknown or {}).items()
             }
         )
@@ -410,11 +414,13 @@ def start(
     placed = locate_many(job_ids, registry, host, settings, provider=provider, skipped=read.skipped)
     for job_id, location in placed.items():
         if isinstance(location, Unlocated):
-            if not location.missing:
-                raise location.exception()
             # One typo in a list of twenty must not throw away the nineteen:
-            # it is reported with them, and makes the exit 4.
-            unknown[job_id] = location.reason
+            # it is reported with them, and makes the exit 4 -- or 1, when a
+            # host that could not be asked may have it.
+            if location.missing:
+                unknown[job_id] = location.reason
+            else:
+                unaskable[job_id] = (NO_HOST, location.reason)
             continue
         trouble = location.trouble
         if location.entry is None and isinstance(trouble, Unaskable):

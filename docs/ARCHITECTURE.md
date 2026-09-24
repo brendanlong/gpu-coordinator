@@ -958,6 +958,11 @@ every bootstrap and reported back by `python -m gpuc.host status`
   with uncommitted changes is `<commit>-dirty-<hash of the changes>`. That
   same read is what the rest of the submit works from, and it replaces the
   registry's cache on the way past.
+- A host on another build is still asked, not shipped to: a request its
+  on-host CLI rejects (argparse's exit 2) is `Unaskable` with the reason and
+  `gpuc host bootstrap <host>`, never a traceback. What needs only the host's
+  cards, dispatcher and queue (reuse, teardown, `pods`, the placement after a
+  submit) sends a bare `status`, which every build understands.
 - `gpuc host list` and `gpuc version` never ssh: they report the commit the
   host was running when this machine last read it, labelled with its age.
 

@@ -1003,6 +1003,30 @@ def test_status_asks_each_host_for_the_window_it_will_show(
     assert asked == ["status --recent 5", "status --recent 3 --since 7200.0", "status"]
 
 
+def test_status_of_ids_reports_every_one_when_one_cannot_be_placed(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An id no answering host has while another host is down may be on that
+    host: exit 1 with the reason -- after the ids that were found."""
+    register_host(name="up", ssh="me@up")
+    register_host(name="down", ssh="me@down")
+    _probes(
+        monkeypatch,
+        {
+            "up": {"jobs": [{"job_id": "j1", "status": "running"}]},
+            "down": RemoteError("down", "printf %s", "ssh timed out"),
+        },
+    )
+    capsys.readouterr()
+    assert main(["status", "j1", "j2", "--json"]) == EXIT_ERROR
+    jobs = cast("list[dict[str, Any]]", one_document(capsys)["jobs"])
+    assert [(job["job_id"], job["status"], job["error"] is None) for job in jobs] == [
+        ("j1", "running", True),
+        ("j2", None, False),
+    ]
+    assert "down: ssh timed out" in jobs[1]["error"]
+
+
 def test_a_job_no_index_and_no_host_knows_is_not_found(
     control_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

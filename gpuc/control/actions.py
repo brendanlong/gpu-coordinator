@@ -1368,6 +1368,7 @@ def estimate_jobs(
                 f"host {job.host} did not say what estimate it recorded for {job.job_id}: "
                 f"{json.dumps(job.fields)[:200]}"
             )
+            job.fields = {}
     return done
 
 

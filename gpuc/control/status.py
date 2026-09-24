@@ -469,20 +469,21 @@ def status_request(
     return " ".join(words)
 
 
-HOST_ONLY = status_request(recent=0)
-"""The host as it is now: its cards, its dispatcher, its queue, its running
-jobs and the finished ones still holding a workdir, and no history."""
-
-
 def gather(
     entry: HostEntry,
     settings: Settings | None = None,
     *,
-    request: str = HOST_ONLY,
+    request: str = "status",
     session: HostSession | None = None,
     provider: Provider | None = None,
 ) -> HostView:
-    """One host's status: `ask` it, and read the answer."""
+    """One host's status: `ask` it, and read the answer.
+
+    A bare `status` unless the caller needs the window or particular jobs:
+    it is the one request every build of the host understands, so what only
+    needs the host's cards, dispatcher and queue -- reuse, teardown, the
+    queue placement after a submit -- keeps working against a host that has
+    not been bootstrapped since."""
     return parse_status(entry, ask(entry, request, settings, provider=provider, session=session))
 
 

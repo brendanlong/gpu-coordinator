@@ -35,6 +35,10 @@ from gpuc.host.jobs import HostConfig
 PYTHON_FLOOR = (3, 11)
 """What the on-host package needs; bootstrap spells the same tuple for `uv`."""
 
+USAGE_EXIT = 2
+"""What the on-host CLI exits with for an argv it does not know: argparse's
+code, and the sign of a host on a build that predates the request."""
+
 
 class RemoteError(RuntimeError):
     def __init__(self, host: str, command: str, detail: str) -> None:
@@ -247,6 +251,14 @@ class HostSession:
     ) -> CommandResult:
         command = host_command(self.python, self.home, args, self.env)
         result = self.transport.run(command, timeout=timeout, check=False)
+        if result.returncode == USAGE_EXIT and "gpuc.host: error:" in result.stderr:
+            raise RemoteError(
+                self.entry.name,
+                command,
+                f"host {self.entry.name} runs a gpuc build that does not understand "
+                f"`{args}`; `gpuc host bootstrap {self.entry.name}` ships this one, and "
+                f"running jobs are not disturbed\n{_tail(result.stderr, 2)}",
+            )
         if check and result.returncode != 0:
             raise RemoteError(
                 self.entry.name,

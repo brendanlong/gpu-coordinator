@@ -793,6 +793,9 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
         watched = watch.jobs[args.job_id]
         watch.poll()
         watch.check_known()
+        if watched.host == wait_mod.NO_HOST and watched.error is not None:
+            # Nowhere to read a log from.
+            raise CliError(watched.error)
         if watched.settled:
             # Nothing more is coming, and `tail -f` on it would simply hang.
             # The ordinary read, so a purged job falls back to the S3 mirror.
