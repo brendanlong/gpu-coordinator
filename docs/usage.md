@@ -44,11 +44,14 @@ Hugging Face repo.
 <a name="kept-outputs"></a>
 **An output with no `s3` or `hf` is kept on the host**, in the job's workdir
 where it wrote it. The sweeps delete the checkout around it and leave it;
-`gpuc status` shows `kept on host: <path>`, and `gpuc fetch <job-id>` copies it
-here whenever you like. Nothing removes it except `gpuc clean --purge --force`
-naming the job. Its `path` must be inside the workdir and not the workdir
-itself. A rental refuses kept outputs at submit, because it terminates itself
-and they would go with it.
+`gpuc status` shows `kept on host: <path>` and how much the host's kept outputs
+hold, and `gpuc fetch <job-id>` copies them here whenever you like. Only a
+forced purge that selects the job removes them (`gpuc clean --host H --purge
+--force --only <job-id>`, or `--all-finished`). Its `path` must be inside the
+workdir and not the workdir itself. A rental refuses kept outputs at submit,
+because it terminates itself and they would go with it. A host put back on a
+build from before kept outputs (an older client re-ships its own) deletes them
+with the workdir.
 
 ```yaml
 outputs:
@@ -673,7 +676,8 @@ Beyond what the example shows:
   finished. `progress_pct` survives the job; `progress_error` is why the last
   poll produced nothing.
 - `attempt` (launches of this id; a preempt adds one), `requeued_from`,
-  `kept_outputs` (the [kept](#kept-outputs) paths a finished job wrote to),
+  `kept_outputs` (the [kept](#kept-outputs) paths a finished job wrote to) and
+  `kept_bytes` (what they hold, once the checkout around them is swept),
   `started_at`, `exit_code`, `outputs_lost`, `workdir_bytes`, `outputs` (the
   spec's, as the host holds them) and `links`: one `{kind, path, target, url}`
   per place the results, W&B run or mirrored log can be opened, derived from

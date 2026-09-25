@@ -438,10 +438,9 @@ them:
   `outputs_pending`). Then everything but those paths goes, and
   `checkout_removed_at` in the job's state records it, because the directory
   is still there. Every "is there anything to sweep" question asks
-  `cleanup.has_checkout`, never whether `workdir/` exists. A job dir with kept
-  outputs is purged only when forced. Submit refuses a kept output whose path
-  is not strictly inside the workdir, and any kept output on an ephemeral
-  host.
+  `cleanup.has_checkout`, never whether `workdir/` exists. A kept path named
+  through a symlink keeps both the name and what it resolves to inside the
+  workdir. A job dir with kept outputs is purged only when forced.
 - **One question about outputs**: `cleanup.outputs_pending(job, spec, state)`,
   the reason a job's outputs are only on this host, or None. It is what the
   drain retries, what keeps a job's secrets file for that drain, what `purge`

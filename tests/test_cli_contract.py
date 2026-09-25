@@ -562,6 +562,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "outputs_pending",
         "outputs_lost",
         "kept_outputs",
+        "kept_bytes",
         "priority",
         "attempt",
         "requeued_from",

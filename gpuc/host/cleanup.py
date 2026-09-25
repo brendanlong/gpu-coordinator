@@ -332,12 +332,41 @@ def reclaimable_bytes(root: Path) -> int:
 def workdir_size(job_id: str) -> int | None:
     """Bytes a sweep of this job's workdir would free: the checkout, less the
     kept outputs it would leave. None if there is no checkout left."""
-    workdir = paths.workdir(job_id)
     if not has_checkout(job_id):
         return None
-    return reclaimable_bytes(workdir) - sum(
-        reclaimable_bytes(workdir / rel) for rel in kept_outputs(job_id)
-    )
+    root, keep = kept_paths(job_id)
+    return max(reclaimable_bytes(root) - kept_bytes(root, keep), 0)
+
+
+def kept_paths(job_id: str) -> tuple[Path, set[Path]]:
+    """The resolved workdir, and every path in it a sweep must leave: each
+    kept output as the spec names it and, when that goes through a symlink,
+    where it really is. Keeping only the name would keep a link and delete
+    what it points at."""
+    root = paths.workdir(job_id).resolve()
+    keep: set[Path] = set()
+    for rel in kept_outputs(job_id):
+        named = root / rel
+        keep.add(named)
+        real = named.resolve()
+        if real.is_relative_to(root):
+            keep.add(real)
+    return root, keep
+
+
+def kept_bytes(root: Path, keep: set[Path]) -> int:
+    """What the kept paths hold, each byte once: nested and linked paths
+    name the same files twice."""
+    real = {path.resolve() for path in keep if path.resolve().is_relative_to(root)}
+    outermost = [p for p in real if not any(p != q and p.is_relative_to(q) for q in real)]
+    return sum(reclaimable_bytes(p) if p.is_dir() else _file_bytes(p) for p in outermost)
+
+
+def _file_bytes(path: Path) -> int:
+    try:
+        return path.lstat().st_blocks * 512
+    except OSError:
+        return 0
 
 
 def has_checkout(job_id: str, state: JobState | None = None) -> bool:
@@ -475,29 +504,32 @@ def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
     has: measuring is now an ioctl per file, and doing it twice to delete once
     is most of the cost of `gpuc clean --all-finished`.
     """
-    workdir = paths.workdir(job_id)
     if not has_checkout(job_id):
         return 0
-    keep = {workdir / rel for rel in kept_outputs(job_id)}
-    if measured is None:
-        measured = reclaimable_bytes(workdir) - sum(reclaimable_bytes(path) for path in keep)
-    size = measured
+    root, keep = kept_paths(job_id)
+    held = kept_bytes(root, keep) if keep else 0
+    size = max(reclaimable_bytes(root) - held, 0) if measured is None else measured
     if not keep:
-        shutil.rmtree(workdir)
+        shutil.rmtree(paths.workdir(job_id))
         return size
-    _remove_around(workdir, keep)
-    jobs.update_state(job_id, checkout_removed_at=jobs.utc_now(), workdir_bytes=0)
+    _remove_around(root, keep)
+    jobs.update_state(job_id, checkout_removed_at=jobs.utc_now(), workdir_bytes=0, kept_bytes=held)
     return size
 
 
 def _remove_around(directory: Path, keep: set[Path]) -> None:
-    """Delete everything under `directory` except the paths in `keep` and the
-    directories that lead to them."""
+    """Delete everything under `directory` except the paths in `keep` and
+    whatever leads to them: a directory is descended into, and a symlink on
+    the way to a kept path is left, since a kept path may be named through
+    it."""
     for child in directory.iterdir():
         if child in keep:
             continue
         leads_to_kept = any(path.is_relative_to(child) for path in keep)
-        if child.is_dir() and not child.is_symlink():
+        if child.is_symlink():
+            if not leads_to_kept:
+                child.unlink()
+        elif child.is_dir():
             if leads_to_kept:
                 _remove_around(child, keep)
             else:

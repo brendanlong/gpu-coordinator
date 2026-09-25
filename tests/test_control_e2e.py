@@ -306,7 +306,9 @@ def test_a_kept_output_outlives_the_sweep_and_status_and_fetch_find_it(
     capsys.readouterr()
 
     assert main(["status", "--host", "local"]) == 0
-    assert "kept on host: results" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "kept on host: results" in out
+    assert "keep outputs on this host" in out
     assert main(["fetch", job_id, "--to", str(tmp_path)]) == 0
     assert (tmp_path / job_id / "results" / "r.txt").read_text() == "kept\n"
 
@@ -614,7 +616,7 @@ def test_status_mentions_leftover_workdirs_and_clean_clears_it(
     assert main(["clean", "--host", "local", "--all-finished"]) == 0
     capsys.readouterr()
     assert main(["status", "--host", "local"]) == 0
-    assert "gpuc clean" not in capsys.readouterr().out
+    assert "gpuc clean --host local --all-finished" not in capsys.readouterr().out
 
 
 def test_clean_removes_a_leftover_incoming_dir(

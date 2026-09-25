@@ -133,6 +133,8 @@ class JobView:
     kept_outputs: list[str] = field(default_factory=list)
     """Output paths with no destination that hold what the job wrote: on the
     host, in its workdir, for `gpuc fetch`."""
+    kept_bytes: int | None = None
+    """What those hold, once the checkout around them has been swept."""
     isolation: str | None = None
     """`cgroup` if this job's phases run in a systemd scope (a cancel reaps the
     whole tree), `pgid` if only a process group (a daemonised grandchild
@@ -444,6 +446,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
             kept_outputs=[str(p) for p in entry.get("kept_outputs") or [] if isinstance(p, str)],
+            kept_bytes=_as_int(entry.get("kept_bytes")),
             isolation=entry.get("isolation"),
             outputs=[o for o in entry.get("outputs") or [] if isinstance(o, dict)],
             wandb=_str_dict(entry.get("wandb")),
@@ -945,6 +948,14 @@ def render(
             f"{' ...' if len(at_risk) > 3 else ''}; `gpuc requeue` them or copy them off "
             f"before they are purged"
         )
+    keeping = [job for job in view.finished if job.kept_outputs]
+    if keeping:
+        held = sum(job.kept_bytes or 0 for job in keeping)
+        lines.append(
+            f"  kept    {len(keeping)} finished job(s) keep outputs on this host"
+            f"{f' ({human_bytes(held)})' if held else ''}: `gpuc fetch <id>` copies them "
+            f"here, `gpuc clean --host {entry.name} --purge --force --only <id>` deletes them"
+        )
     leftover = view.leftover_bytes
     if leftover > LEFTOVER_FLOOR_BYTES:
         held = [job for job in view.finished if (job.workdir_bytes or 0) > 0]
@@ -1040,6 +1051,7 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "outputs_pending": job.outputs_pending,
         "outputs_lost": job.outputs_lost,
         "kept_outputs": list(job.kept_outputs),
+        "kept_bytes": job.kept_bytes,
         "workdir_bytes": job.workdir_bytes,
         "outputs": [dict(o) for o in job.outputs],
         "links": job_links(job, mirror_prefix),

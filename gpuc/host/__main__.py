@@ -220,7 +220,7 @@ def in_window(states: dict[str, JobState], recent: int | None, since_s: float | 
     return [
         job_id
         for job_id, state in states.items()
-        if not state.finished or job_id in kept or cleanup.has_checkout(job_id, state)
+        if not state.finished or job_id in kept or paths.workdir(job_id).is_dir()
     ]
 
 
@@ -275,6 +275,7 @@ def _job_entry(
     entry["kept_outputs"] = (
         cleanup.kept_outputs(job_id, spec, state) if spec is not None and state.finished else []
     )
+    entry["kept_bytes"] = state.kept_bytes
     return entry
 
 

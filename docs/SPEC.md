@@ -131,7 +131,7 @@ destinations. Adding another of either changes nothing else in this document.
   checkout are never uploaded as results. Every output location includes the
   job id, so runs never overwrite each other.
 - **Kept outputs stay on their host until a person removes them.** A rental
-  refuses them at submit, since it ends itself.
+  refuses them at submit.
 - On success, uploads finish and the checkout is deleted; kept outputs stay
   where the job wrote them. On failure or cancellation the checkout is kept
   for a configurable period. A rental's shutdown

@@ -92,8 +92,8 @@ Rules that avoid the classic failures:
 - Always list the `secrets` your outputs need. A job with S3 or HF outputs and
   no credentials fails at preflight, in seconds.
 - An output with no `s3` or `hf` is kept on the host in the job's workdir;
-  the sweeps delete the checkout around it, and only `gpuc clean --purge
-  --force --only <id>` deletes it. A rental refuses one at submit. Use it for
+  the sweeps delete the checkout around it, and only a forced purge
+  (`gpuc clean --host H --purge --force --only <id>`) deletes it. A rental refuses one at submit. Use it for
   results you will `gpuc fetch`, not for anything that must survive the host.
 - `{job_id}` is required in every output destination: an `s3` without it is
   refused at submit, and so is an `hf` output with it in neither `hf` nor

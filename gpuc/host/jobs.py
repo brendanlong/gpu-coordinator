@@ -518,6 +518,9 @@ class JobState:
     """When the checkout was deleted from a `workdir/` that still holds the
     job's kept outputs. With it set, the workdir is those outputs and nothing
     else: no sweep has anything left to take, and only a purge removes them."""
+    kept_bytes: int | None = None
+    """What those kept outputs hold, measured as the checkout went: disk no
+    sweep will ever free, which `status` reports so it is not forgotten."""
 
     @staticmethod
     def from_dict(d: Any) -> JobState:
@@ -564,6 +567,7 @@ class JobState:
             outputs_lost=as_bool(fields, "outputs_lost"),
             ran=as_bool(fields, "ran", True),
             checkout_removed_at=as_opt_str(fields, "checkout_removed_at"),
+            kept_bytes=as_opt_int(fields, "kept_bytes"),
         )
 
     def to_dict(self) -> dict[str, Any]:

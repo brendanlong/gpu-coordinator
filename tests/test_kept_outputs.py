@@ -47,7 +47,9 @@ def finished_with(
 
 def tree(job_id: str) -> list[str]:
     workdir = paths.workdir(job_id)
-    return sorted(str(p.relative_to(workdir)) for p in workdir.rglob("*") if not p.is_dir())
+    return sorted(
+        str(p.relative_to(workdir)) for p in workdir.rglob("*") if p.is_symlink() or not p.is_dir()
+    )
 
 
 def test_the_sweep_takes_the_checkout_and_leaves_what_the_job_kept(gpuc_home: Path) -> None:
@@ -142,3 +144,33 @@ def test_a_rental_refuses_kept_outputs_and_takes_the_rest() -> None:
     check_kept_allowed(spec, "host box", ephemeral=False)
     uploaded = make_spec(outputs=[{"path": "ckpt", "s3": "s3://b/{job_id}"}])
     check_kept_allowed(uploaded, "host pod", ephemeral=True)
+
+
+def test_a_kept_path_named_through_a_symlink_keeps_what_it_names(gpuc_home: Path) -> None:
+    job_id = finished_with(
+        [{"path": "latest/model"}], {"a.py": "x"}, {"runs/r1/model/w.pt": "w", "runs/r0/old": "o"}
+    )
+    (paths.workdir(job_id) / "latest").symlink_to("runs/r1")
+    cleanup.clean(all_finished=True)
+    assert tree(job_id) == ["latest", "runs/r1/model/w.pt"]
+    assert (paths.workdir(job_id) / "latest" / "model" / "w.pt").read_text() == "w"
+
+
+def test_a_kept_path_that_is_a_symlink_keeps_its_target(gpuc_home: Path) -> None:
+    job_id = finished_with([{"path": "results"}], {"a.py": "x"}, {"real/r.txt": "r"})
+    (paths.workdir(job_id) / "results").symlink_to("real")
+    cleanup.clean(all_finished=True)
+    assert tree(job_id) == ["real/r.txt", "results"]
+
+
+def test_nested_kept_outputs_are_counted_once(gpuc_home: Path) -> None:
+    job_id = finished_with(
+        [{"path": "results"}, {"path": "results/ckpt"}],
+        {"a.py": "x" * 10000},
+        {"results/ckpt/w.pt": "w" * 50000, "results/log": "l"},
+    )
+    assert (cleanup.workdir_size(job_id) or 0) >= 0
+    cleanup.clean(all_finished=True)
+    held = jobs.read_state(job_id).kept_bytes
+    assert held is not None and held >= 50000
+    assert held < 2 * 50000
