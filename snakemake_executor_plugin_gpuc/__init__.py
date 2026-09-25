@@ -1,4 +1,5 @@
-"""`snakemake --executor gpuc`: every Snakemake job becomes one gpuc job.
+"""`snakemake --executor gpuc`: every Snakemake job that needs a GPU becomes
+one gpuc job, and every other runs on the controller.
 
 Snakemake finds this package by its name alone (any top-level
 `snakemake_executor_plugin_<name>` on `sys.path`), so shipping it in the gpuc
@@ -84,9 +85,9 @@ common_settings = CommonSettings(
     # job's command, and the spec forbids secrets on a command line: every
     # variable it would pass goes to gpuc as a secret instead.
     pass_envvar_declarations_to_cmd=False,
-    # That would be a `pip install --target` into the job's environment, which
-    # is a uv project's lockfile's business: the storage plugin is one of the
-    # project's dependencies.
+    # That would be a `pip install --target` into the job's environment, and
+    # a uv environment has no pip. `--gpuc-python "uv run --no-sync --with
+    # <plugin> python"` puts one there without it being in the lockfile.
     auto_deploy_default_storage_provider=False,
 )
 
@@ -118,6 +119,7 @@ class Executor(RemoteExecutor):
                 "so it would not be in the job's copy of that directory; run snakemake "
                 "from a directory that contains it"
             )
+        self.run_cpu_rules_locally()
         self.unaskable_shown: dict[str, str] = {}
         # Every job submitted and not yet over. Snakemake's own `active_jobs`
         # is emptied for the length of each poll, and a poll here is an ssh
@@ -125,6 +127,30 @@ class Executor(RemoteExecutor):
         # nothing.
         self.in_flight: dict[str, SubmittedJobInfo] = {}
         self.in_flight_lock = threading.Lock()
+
+    def run_cpu_rules_locally(self) -> None:
+        """Mark every rule whose `gpu` is unset or a constant 0 a local rule.
+
+        gpuc runs only jobs that need a GPU, and `gpu=1` on the GPU rules is
+        already how a Snakefile written for the local executor says which
+        they are. Snakemake routes a job away from the executor only if its
+        rule is local, so marking the rule is the one way to keep a job off
+        gpuc. A `gpu` given as a function is judged per job, in
+        `submission`, where 0 is an error rather than a quiet card.
+
+        `rules` and `localrules` are Snakemake's `Workflow`, beyond the
+        executor interface: it offers no way to say a job is local."""
+        workflow: Any = self.workflow
+        for rule in workflow.rules:
+            if is_set(rule.resources.get("gpu")):
+                continue
+            placed = [key for key in ("host", "runpod") if is_set(rule.resources.get(key))]
+            if placed:
+                raise WorkflowError(
+                    f"rule {rule.name} sets `{placed[0]}` but no `gpu`, so it would run on the "
+                    "controller rather than on gpuc; give it `gpu=1` or more"
+                )
+            workflow.localrules(rule.name)
 
     # The interface's own annotations on these two are narrower than what it
     # calls them for: `get_snakefile` is inferred as returning None, and
@@ -168,7 +194,13 @@ class Executor(RemoteExecutor):
             raise WorkflowError(
                 "no gpuc host: pass --gpuc-host, or give the rule a `host` or `runpod` resource"
             )
-        gpus = int(resources.get("gpu") or 1)
+        gpus = int(resources.get("gpu") or 0)
+        if gpus < 1:
+            raise WorkflowError(
+                f"rule {job.name}'s `gpu` came to {gpus} for this job, and a job without a GPU "
+                "can only run on the controller, which is decided per rule: make `gpu` a "
+                "constant 0 or leave it out, or split the rule"
+            )
         spec: dict[str, Any] = {
             "name": job_name(job),
             "command": self.format_job_exec(job),
@@ -314,6 +346,10 @@ def job_name(job: JobExecutorInterface) -> str:
     wildcards = getattr(job, "wildcards_dict", None) or {}
     detail = ",".join(f"{k}={v}" for k, v in wildcards.items())
     return f"{job.name}[{detail}]" if detail else job.name
+
+
+def is_set(resource: Any) -> bool:
+    return resource.is_evaluable() or bool(resource.value)
 
 
 def truthy(value: Any) -> bool:

@@ -29,20 +29,27 @@ SNAKEFILE = """\
 R = config["results"]
 
 rule all:
-    input: R + "/b.txt"
+    input: R + "/summary.txt"
 
 rule a:
     output: R + "/a-{n}.txt"
+    resources: gpu=1
     shell: 'test "$SMK_TOKEN" = s3cret && echo alpha {wildcards.n} > {output}'
 
 rule b:
     input: R + "/a-1.txt"
     output: R + "/b.txt"
-    resources: priority=10
+    resources: gpu=1, priority=10
     shell: "cat {input} > {output}; echo beta >> {output}"
+
+rule summary:
+    input: R + "/b.txt"
+    output: R + "/summary.txt"
+    shell: "wc -l < {input} > {output}"
 
 rule broken:
     output: R + "/never.txt"
+    resources: gpu=1
     shell: "exit 3"
 """
 
@@ -108,7 +115,7 @@ def snakemake(project: Path, results: Path, *targets: str) -> subprocess.Complet
     )
 
 
-def test_a_workflow_runs_as_gpuc_jobs_and_its_outputs_land_where_the_snakefile_said(
+def test_gpu_rules_become_gpuc_jobs_and_the_rest_run_on_the_controller(
     bootstrapped_home: Path, project: Path, tmp_path: Path
 ) -> None:
     results = tmp_path / "results"
@@ -116,6 +123,7 @@ def test_a_workflow_runs_as_gpuc_jobs_and_its_outputs_land_where_the_snakefile_s
     done = snakemake(project, results)
     assert done.returncode == 0, done.stderr[-4000:]
     assert (results / "b.txt").read_text() == "alpha 1\nbeta\n"
+    assert (results / "summary.txt").read_text().strip() == "2"
 
     submitted = [
         line.split("gpuc job ")[1].split()[0]
@@ -158,6 +166,30 @@ def test_a_directory_other_than_the_one_gpuc_would_copy_is_refused(
     assert "--directory is not supported" in done.stderr, done.stderr[-4000:]
 
 
+def test_a_rule_placed_on_a_host_without_a_gpu_is_refused(project: Path, tmp_path: Path) -> None:
+    with (project / "Snakefile").open("a") as f:
+        f.write('\nrule placed:\n    output: "x"\n    resources: host="spar"\n    shell: "true"\n')
+    done = snakemake(project, tmp_path, "x")
+    assert done.returncode != 0
+    assert "rule placed sets `host` but no `gpu`" in done.stderr, done.stderr[-4000:]
+
+
+def test_a_gpu_function_that_comes_to_zero_fails_the_job(
+    bootstrapped_home: Path, project: Path, tmp_path: Path
+) -> None:
+    with (project / "Snakefile").open("a") as f:
+        f.write(
+            '\nrule maybe:\n    output: R + "/maybe.txt"\n'
+            "    resources: gpu=lambda wildcards: 0\n"
+            '    shell: "touch {output}"\n'
+        )
+    subprocess.run(["git", "commit", "-qam", "maybe"], cwd=project, check=True)
+    done = snakemake(project, tmp_path, str(tmp_path / "maybe.txt"))
+    assert done.returncode != 0
+    assert "`gpu` came to 0 for this job" in done.stderr, done.stderr[-4000:]
+    assert not (tmp_path / "maybe.txt").exists()
+
+
 def test_resources_given_as_strings_still_read_as_flags() -> None:
     assert truthy("true") and truthy(1) and not truthy("0") and not truthy(False)
 
@@ -177,7 +209,8 @@ def test_ctrl_c_cancels_the_jobs_in_flight(
     results.mkdir()
     with (project / "Snakefile").open("a") as f:
         f.write(
-            '\nrule slow:\n    output: R + "/slow.txt"\n    shell: "sleep 120; touch {output}"\n'
+            '\nrule slow:\n    output: R + "/slow.txt"\n    resources: gpu=1\n'
+            '    shell: "sleep 120; touch {output}"\n'
         )
     subprocess.run(["git", "commit", "-qam", "slow"], cwd=project, check=True)
     controller = subprocess.Popen(

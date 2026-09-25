@@ -1,23 +1,31 @@
 # Snakemake
 
 gpuc ships a Snakemake executor plugin. `snakemake --executor gpuc` submits
-every Snakemake job as a gpuc job, so a workflow of train, evaluate and
-retrain for every seed is a Snakefile, not a job graph of your own. Snakemake
-decides what to run and in what order; gpuc decides which cards each job gets.
+every Snakemake job that needs a GPU as a gpuc job and runs the rest on the
+controller, so a workflow of train, evaluate and retrain for every seed is a
+Snakefile, not a job graph of your own. Snakemake decides what to run and in
+what order; gpuc decides which cards each job gets.
 
 ## Install
 
-The plugin is part of the `gpu-coordinator` distribution. Put gpuc and
-Snakemake in the project:
+Nothing gpuc-specific has to be in the project. The plugin is part of the
+`gpu-coordinator` distribution, and Snakemake finds it in whatever
+environment the controller runs in:
 
 ```sh
-uv add --dev "gpu-coordinator @ git+https://github.com/brendanlong/gpu-coordinator" snakemake
+uv run --with "gpu-coordinator @ git+https://github.com/brendanlong/gpu-coordinator" \
+  snakemake --executor gpuc --gpuc-host spar --jobs 20
 ```
 
-Each job runs `snakemake` again, inside its own gpuc workdir and the project's
-environment, so **Snakemake has to be a dependency of the project** (a dev
-dependency is fine: `uv sync --frozen` installs those). So does any storage
-plugin the workflow uses: the plugin never `pip install`s one into the job.
+That also puts `gpuc` on the controller's `PATH`. Putting `gpu-coordinator`
+in the project with `uv add --dev` works as well.
+
+Each GPU job runs `snakemake` again, inside its own gpuc workdir and the
+project's environment, so **Snakemake has to be a dependency of the project**
+(a dev dependency is fine: `uv sync --frozen` installs those). Anything else
+the job-side `snakemake` needs, such as a storage plugin, can come the same
+way as the plugin: `--gpuc-python "uv run --no-sync --with <package> python"`
+([object storage](#several-hosts-object-storage) below).
 
 Add `.snakemake/` to `.gitignore`. Each submit copies the working tree the way
 `gpuc submit` always does, and without the entry that copy includes
@@ -31,6 +39,8 @@ refused):
 ```sh
 uv run snakemake --executor gpuc --gpuc-host spar --jobs 20
 ```
+
+(with `--with` as above if gpuc is not in the project).
 
 **Run it in tmux** (or another session that outlives your terminal). The
 controller is an ordinary foreground process: nothing in gpuc keeps it alive,
@@ -47,11 +57,19 @@ queue decides how many of those actually run.
 | `--gpuc-python CMD` | `uv run --no-sync python` | runs the job's `snakemake` and is the spec's `python` |
 | `--gpuc-gpuc CMD` | `gpuc` | how to run gpuc on this machine, e.g. `"uv run gpuc"` |
 
-Rule resources become job spec fields:
+**A rule goes to gpuc only if it needs a GPU**, which is how a Snakefile
+written for the local executor already says it: `resources: gpu=1` or more.
+A rule with no `gpu`, or `gpu=0`, runs on the controller the way a
+`localrule: True` does, with no gpuc job, card or copy of the tree. A rule
+that sets `host` or `runpod` without `gpu` is refused before anything runs.
+A `gpu` given as a function is judged per job, and one that comes to 0 fails
+that job: whether a rule runs on the controller is decided per rule.
+
+The resources of a GPU rule become job spec fields:
 
 | resource | becomes |
 | --- | --- |
-| `gpu` | `gpus` (default 1) |
+| `gpu` | `gpus` |
 | `host` | `--host`, overriding `--gpuc-host` |
 | `runpod` | `gpuc submit --runpod --gpu <value> --gpu-count <gpu>` |
 | `vram_gb` | `--min-vram`, with `runpod` |
@@ -100,7 +118,11 @@ seen. Two layouts work.
 
 Run the controller on the GPU host, with that host registered there as
 `local`, and give every input and output an absolute path outside the job
-workdirs:
+workdirs. Registering it on itself is safe on a host another machine already
+drives: `gpuc host add local` adopts the host's existing config and queue, as
+adding it from any other machine would, and registers it under its own name
+(pass `--gpuc-home` if it was set up with `--persistent-root`). Rules
+without a GPU run there too, next to the outputs.
 
 ```python
 R = "/home/me/myproject-results"
@@ -124,20 +146,28 @@ is no shared filesystem, so each job downloads its inputs and uploads its
 outputs itself:
 
 ```sh
-uv add --dev snakemake-storage-plugin-s3
 export SNAKEMAKE_STORAGE_S3_ACCESS_KEY=... SNAKEMAKE_STORAGE_S3_SECRET_KEY=...
-uv run snakemake --executor gpuc --gpuc-host spar --jobs 20 \
+uv run --with "gpu-coordinator @ git+https://github.com/brendanlong/gpu-coordinator" \
+       --with snakemake-storage-plugin-s3 \
+  snakemake --executor gpuc --gpuc-host spar --jobs 20 \
+  --gpuc-python "uv run --no-sync --with snakemake-storage-plugin-s3 python" \
   --shared-fs-usage none \
   --default-storage-provider s3 --default-storage-prefix s3://my-bucket/myproject
 ```
+
+The storage plugin is needed on both sides: the first `--with` is the
+controller's, and `--gpuc-python` gives each job its own. The plugin never
+installs one into the job by itself. Pin the same version in both, or put the
+storage plugin in the project instead.
 
 This works across local, ssh and RunPod hosts in one workflow, at the cost of
 moving every checkpoint through the bucket.
 
 ## Limits
 
-- Every Snakemake job is one `gpuc submit`, and each submit copies the working
-  tree.
+- Every GPU job is one `gpuc submit`, and each submit copies the working tree
+  and runs `setup`.
 - Job groups (`group:`) are refused. Each Snakemake job is its own gpuc job.
-- Every job needs a GPU. Mark a rule that doesn't need one `localrule: True`,
-  so the controller runs it itself.
+- The controller runs wherever you start it, and a controller that dies
+  leaves its jobs behind. gpuc runs only jobs that need a GPU, so it cannot
+  host the controller.
