@@ -29,6 +29,8 @@ down when its work is done and nobody watching.
 - **Job**: one spec (command, GPU count, priority, options) submitted to one
   host, identified by an id that is unique across all hosts.
 - **Backup destination**: a remote store a job's outputs are copied to.
+- **Kept output**: an output with no backup destination. It stays on its
+  host, where the job wrote it.
 - **Data directory**: a directory on a host that every job there can read and
   write, for what one job keeps for a later one: a dataset it downloaded, a
   checkpoint the next step starts from.
@@ -124,12 +126,15 @@ destinations. Adding another of either changes nothing else in this document.
 - A job runs as setup, those checks, main, and a final upload, and may
   report progress or an estimated remaining time. Estimates are informational
   and never change a job's outcome.
-- **Outputs are backed up continuously** during the run, not only at the end,
-  and so are logs. Files that were already in the checkout are never uploaded
-  as results. Every output location includes the job id, so runs never
-  overwrite each other.
-- On success, uploads finish and the working tree is deleted. On failure or
-  cancellation it is kept for a configurable period. A rental's shutdown
+- **Outputs with a backup destination are backed up continuously** during the
+  run, not only at the end, and so are logs. Files that were already in the
+  checkout are never uploaded as results. Every output location includes the
+  job id, so runs never overwrite each other.
+- **Kept outputs stay on their host until a person removes them.** A rental
+  refuses them at submit, since it ends itself.
+- On success, uploads finish and the checkout is deleted; kept outputs stay
+  where the job wrote them. On failure or cancellation the checkout is kept
+  for a configurable period. A rental's shutdown
   overrides that period, and one that has retried its uploads and still cannot
   deliver them terminates anyway. A job whose outputs are not confirmed backed
   up is never deleted automatically on a host that persists.

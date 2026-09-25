@@ -410,6 +410,7 @@ function finishedTable(host) {
     let flag = null;
     if (job.outputs_lost && job.outputs_pending) flag = badge("OUTPUTS LOST", "bad");
     else if (job.outputs_pending) flag = badge("outputs not uploaded", "warn");
+    else if ((job.kept_outputs || []).length) flag = badge("kept on host", "");
     return el("tr", {},
       el("td", {}, jobLabel(job)),
       el("td", {}, badge(job.status, level), detail ? ` ${detail}` : "", progress),

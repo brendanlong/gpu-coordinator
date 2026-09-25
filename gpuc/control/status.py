@@ -130,6 +130,9 @@ class JobView:
     control side never sees the spec."""
     outputs_lost: bool = False
     """An ephemeral host's drain retried the upload to the end and gave up."""
+    kept_outputs: list[str] = field(default_factory=list)
+    """Output paths with no destination that hold what the job wrote: on the
+    host, in its workdir, for `gpuc fetch`."""
     isolation: str | None = None
     """`cgroup` if this job's phases run in a systemd scope (a cancel reaps the
     whole tree), `pgid` if only a process group (a daemonised grandchild
@@ -440,6 +443,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             workdir_bytes=_as_int(entry.get("workdir_bytes")),
             outputs_pending=bool(entry.get("outputs_pending")),
             outputs_lost=bool(entry.get("outputs_lost")),
+            kept_outputs=[str(p) for p in entry.get("kept_outputs") or [] if isinstance(p, str)],
             isolation=entry.get("isolation"),
             outputs=[o for o in entry.get("outputs") or [] if isinstance(o, dict)],
             wandb=_str_dict(entry.get("wandb")),
@@ -832,6 +836,8 @@ def _finished_lines(view: HostView, *, recent: int, since_s: float | None) -> li
             flag = "  OUTPUTS LOST"
         elif job.outputs_pending:
             flag = "  outputs not uploaded"
+        elif job.kept_outputs:
+            flag = f"  kept on host: {', '.join(job.kept_outputs)}"
         lines.append(
             f"  done    {job_label(job)} {job.status}"
             f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
@@ -1033,6 +1039,7 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "ended_at": job.ended_at,
         "outputs_pending": job.outputs_pending,
         "outputs_lost": job.outputs_lost,
+        "kept_outputs": list(job.kept_outputs),
         "workdir_bytes": job.workdir_bytes,
         "outputs": [dict(o) for o in job.outputs],
         "links": job_links(job, mirror_prefix),

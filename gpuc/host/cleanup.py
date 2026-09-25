@@ -330,11 +330,61 @@ def reclaimable_bytes(root: Path) -> int:
 
 
 def workdir_size(job_id: str) -> int | None:
-    """Bytes held by a job's workdir, or None if it has none left."""
+    """Bytes a sweep of this job's workdir would free: the checkout, less the
+    kept outputs it would leave. None if there is no checkout left."""
     workdir = paths.workdir(job_id)
-    if not workdir.is_dir():
+    if not has_checkout(job_id):
         return None
-    return reclaimable_bytes(workdir)
+    return reclaimable_bytes(workdir) - sum(
+        reclaimable_bytes(workdir / rel) for rel in kept_outputs(job_id)
+    )
+
+
+def has_checkout(job_id: str, state: JobState | None = None) -> bool:
+    """Is there still a checkout in this job's workdir for a sweep to take?
+
+    Not the same as the workdir existing: one that holds kept outputs outlives
+    the sweep that took the checkout around them."""
+    if not paths.workdir(job_id).is_dir():
+        return False
+    if state is None:
+        try:
+            state = jobs.read_state(job_id)
+        except (RuntimeError, OSError):
+            return True
+    return state.checkout_removed_at is None
+
+
+def kept_outputs(
+    job_id: str, spec: JobSpec | None = None, state: JobState | None = None
+) -> list[str]:
+    """The workdir paths of this job's kept outputs -- those with no
+    destination -- that hold anything the job wrote.
+
+    Judged as `outputs_pending` judges uploads: nothing is kept of a job whose
+    `main` never started, and a kept path holding only files from the
+    checkout is part of the checkout. Every other way of not knowing counts
+    as content. An unreadable spec keeps nothing, since it names nothing."""
+    try:
+        spec = spec if spec is not None else jobs.read_spec(job_id)
+        state = state if state is not None else jobs.read_state(job_id)
+    except (RuntimeError, ValueError, OSError):
+        return []
+    if not state.ran:
+        return []
+    workdir = paths.workdir(job_id)
+    entries = baseline.read(job_id)
+    kept: list[str] = []
+    for output in spec.outputs:
+        if not output.kept:
+            continue
+        try:
+            key = baseline.output_key(output, job_id)
+        except (KeyError, IndexError, ValueError):
+            continue
+        if baseline.has_new_content(workdir / key, entries.get(key, {})):
+            kept.append(key)
+    return kept
 
 
 def record_workdir_size(job_id: str) -> int:
@@ -352,7 +402,7 @@ def record_workdir_size(job_id: str) -> int:
     because a job with no workdir is not a candidate for anything.
     """
     size = workdir_size(job_id)
-    if size is not None and not paths.workdir(job_id).is_dir():
+    if size is not None and not has_checkout(job_id):
         size = None
     recorded = 0 if size is None else size
     with contextlib.suppress(RuntimeError, OSError, KeyError):
@@ -402,7 +452,7 @@ def reported_workdir_bytes(
     figure this call declined to go and get rather than one that does not
     exist. `MEASURING_BUDGET_S` says why there is a deadline at all.
     """
-    if not paths.workdir(job_id).is_dir():
+    if not has_checkout(job_id, state):
         return 0
     recorded = state.workdir_bytes
     if recorded is not None:
@@ -413,18 +463,47 @@ def reported_workdir_bytes(
 
 
 def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
-    """Delete `jobs/<id>/workdir` and nothing else. Returns the bytes freed.
+    """Delete the checkout in `jobs/<id>/workdir`, and nothing else. Returns
+    the bytes freed.
+
+    The whole workdir when the job keeps no outputs. Otherwise everything but
+    the kept output paths, which stay exactly where the job wrote them, so a
+    fetch finds a job's files in one place whatever has been swept; the state
+    records that the checkout is gone, since the directory is still there.
 
     `measured` is a figure the caller already walked for, which `clean` always
     has: measuring is now an ioctl per file, and doing it twice to delete once
     is most of the cost of `gpuc clean --all-finished`.
     """
     workdir = paths.workdir(job_id)
-    if not workdir.is_dir():
+    if not has_checkout(job_id):
         return 0
-    size = reclaimable_bytes(workdir) if measured is None else measured
-    shutil.rmtree(workdir)
+    keep = {workdir / rel for rel in kept_outputs(job_id)}
+    if measured is None:
+        measured = reclaimable_bytes(workdir) - sum(reclaimable_bytes(path) for path in keep)
+    size = measured
+    if not keep:
+        shutil.rmtree(workdir)
+        return size
+    _remove_around(workdir, keep)
+    jobs.update_state(job_id, checkout_removed_at=jobs.utc_now(), workdir_bytes=0)
     return size
+
+
+def _remove_around(directory: Path, keep: set[Path]) -> None:
+    """Delete everything under `directory` except the paths in `keep` and the
+    directories that lead to them."""
+    for child in directory.iterdir():
+        if child in keep:
+            continue
+        leads_to_kept = any(path.is_relative_to(child) for path in keep)
+        if child.is_dir() and not child.is_symlink():
+            if leads_to_kept:
+                _remove_around(child, keep)
+            else:
+                shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def _parse(stamp: str | None) -> datetime | None:
@@ -588,6 +667,9 @@ def may_delete(job_id: str, state: JobState, what: str, evidence: Evidence) -> s
     pending = outputs_pending(job_id, spec, state)
     if pending:
         reasons.append(pending)
+    kept = kept_outputs(job_id, spec, state)
+    if kept:
+        reasons.append(f"keeps outputs on this host: {', '.join(kept)}")
     if reasons and not evidence.force:
         return "; ".join(reasons)
     return None
@@ -613,12 +695,16 @@ def candidates(
     for job_id in jobs.list_job_ids():
         if wanted is not None and job_id not in wanted:
             continue
-        workdir = paths.workdir(job_id)
-        if not workdir.is_dir():
+        if not has_checkout(job_id):
             # Worth a line only when the caller named this job: otherwise it is
             # every job a previous clean already dealt with.
             if wanted is not None:
-                skipped.append(Skipped(job_id, "workdir already gone"))
+                gone = (
+                    "checkout already gone; only kept outputs remain"
+                    if paths.workdir(job_id).is_dir()
+                    else "workdir already gone"
+                )
+                skipped.append(Skipped(job_id, gone))
             continue
         finished = _finished_age(job_id, moment)
         if isinstance(finished, Skipped):
@@ -638,7 +724,7 @@ def candidates(
             skipped.append(Skipped(job_id, why))
             continue
         picked.append(
-            Candidate.of(state, job_id=job_id, bytes=reclaimable_bytes(workdir), age_days=age_days)
+            Candidate.of(state, job_id=job_id, bytes=workdir_size(job_id) or 0, age_days=age_days)
         )
     return picked, skipped
 
@@ -796,6 +882,8 @@ def _produced_outputs(job_id: str, spec: JobSpec) -> bool:
     workdir = paths.workdir(job_id)
     entries = baseline.read(job_id)
     for output in spec.outputs:
+        if output.kept:
+            continue
         try:
             key = baseline.output_key(output, job_id)
         except (KeyError, IndexError, ValueError):

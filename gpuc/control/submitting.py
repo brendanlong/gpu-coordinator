@@ -34,6 +34,7 @@ from gpuc.control.submit import (
     Prepared,
     SubmitResult,
     check_gpu_count,
+    check_kept_allowed,
     load_document,
     prepare,
     refuse_unreadable_config,
@@ -189,6 +190,7 @@ def submit_job(
     prepared = prepare(model, workdir, job_id=jobs.new_job_id(), use_git=use_git)
     if rental is not None:
         check_gpu_count(model, rental.gpu_count)
+        check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
         entry = rent_host(rental, settings, report)
     else:
         entry = open_registry().require(host or "")
@@ -240,6 +242,7 @@ def requeue_job(
     session: HostSession | None = None
     if rental is not None:
         check_gpu_count(model, rental.gpu_count)
+        check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
         entry = rent_host(rental, settings, report)
     else:
         # `--host` is where it goes, so it has to be one this machine has.

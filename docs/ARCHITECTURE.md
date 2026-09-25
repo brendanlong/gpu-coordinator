@@ -142,16 +142,19 @@ jobs/<jobid>/
                      #                              # measured once, as the job ended (or by
                      #                              # the first status to find it missing)
                      #  "outputs_lost": bool,       # a drain retried the outputs and gave up
-                     #  "ran": bool}                # has `main` started, in any attempt; false
+                     #  "ran": bool,                # has `main` started, in any attempt; false
                      #                              # from enqueue, set as `main` begins, never
                      #                              # cleared
+                     #  "checkout_removed_at": str|null}  # the checkout went from a workdir/
+                     #                              # that still holds kept outputs
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and must not be read as 0%. eta is null unless the job is running.
                      # progress_pct survives the job.
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
-  workdir/           # rsynced code (git-tracked + untracked, .gitignore obeyed); removed per `cleanup:`
+  workdir/           # rsynced code (git-tracked + untracked, .gitignore obeyed); removed per `cleanup:`,
+                     # except the job's kept outputs, which stay where it wrote them
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir
 dispatcher.lock      # fd flock held by the running dispatcher
@@ -429,6 +432,16 @@ them:
   also what `cleanup:` says of that status, under an automatic sweep also not
   `cleanup: never`, and under either no outputs pending. A job dir needs the
   record mirrored and no outputs pending, unless forced.
+- **Removing a workdir removes the checkout** (`cleanup.remove_workdir`): all
+  of it, unless the job has kept outputs (`cleanup.kept_outputs`: outputs with
+  no destination that hold something the job wrote, judged like
+  `outputs_pending`). Then everything but those paths goes, and
+  `checkout_removed_at` in the job's state records it, because the directory
+  is still there. Every "is there anything to sweep" question asks
+  `cleanup.has_checkout`, never whether `workdir/` exists. A job dir with kept
+  outputs is purged only when forced. Submit refuses a kept output whose path
+  is not strictly inside the workdir, and any kept output on an ephemeral
+  host.
 - **One question about outputs**: `cleanup.outputs_pending(job, spec, state)`,
   the reason a job's outputs are only on this host, or None. It is what the
   drain retries, what keeps a job's secrets file for that drain, what `purge`
@@ -494,7 +507,9 @@ prune`, never `clean`, and `--hf-cache` runs `hf cache prune`.
 The host lists the files (`python -m gpuc.host fetch`), so a job's results are
 told from its checkout by the same outputs baseline uploads use, and never by
 the client; the client then pulls exactly that list, into `<to>/<job id>/`.
-The host verb changes nothing, and nothing is ever pushed from a host.
+The host verb changes nothing, and nothing is ever pushed from a host. Kept
+outputs stay under the same `workdir/` after the checkout around them is
+swept, so a fetch looks in one place whatever has been cleaned.
 
 ## The data directory
 

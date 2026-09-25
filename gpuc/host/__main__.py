@@ -220,7 +220,7 @@ def in_window(states: dict[str, JobState], recent: int | None, since_s: float | 
     return [
         job_id
         for job_id, state in states.items()
-        if not state.finished or job_id in kept or paths.workdir(job_id).is_dir()
+        if not state.finished or job_id in kept or cleanup.has_checkout(job_id, state)
     ]
 
 
@@ -269,6 +269,11 @@ def _job_entry(
         spec is not None
         and state.status != "running"
         and cleanup.outputs_pending(job_id, spec, state)
+    )
+    # The same question for outputs with no destination, whose answer is not
+    # a warning: they are where the spec said to keep them.
+    entry["kept_outputs"] = (
+        cleanup.kept_outputs(job_id, spec, state) if spec is not None and state.finished else []
     )
     return entry
 

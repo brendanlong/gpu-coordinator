@@ -266,6 +266,12 @@ class Output:
     Off by default: a typo in a repo name should fail the job in seconds, not
     quietly create `org/lego-s4-typo` and upload a run into it."""
 
+    @property
+    def kept(self) -> bool:
+        """No destination: what the job writes here stays on the host, in the
+        workdir, when the rest of the checkout is swept."""
+        return not self.s3 and not self.hf
+
     @staticmethod
     def from_dict(d: Any) -> Output:
         return Output(
@@ -508,6 +514,10 @@ class JobState:
     drain that would upload nothing. True when a state file does not say
     (`from_dict`), and on a bare `JobState`: the point of asking is to keep
     the only copy of a result, so not knowing counts as having run."""
+    checkout_removed_at: str | None = None
+    """When the checkout was deleted from a `workdir/` that still holds the
+    job's kept outputs. With it set, the workdir is those outputs and nothing
+    else: no sweep has anything left to take, and only a purge removes them."""
 
     @staticmethod
     def from_dict(d: Any) -> JobState:
@@ -553,6 +563,7 @@ class JobState:
             workdir_bytes=as_opt_int(fields, "workdir_bytes"),
             outputs_lost=as_bool(fields, "outputs_lost"),
             ran=as_bool(fields, "ran", True),
+            checkout_removed_at=as_opt_str(fields, "checkout_removed_at"),
         )
 
     def to_dict(self) -> dict[str, Any]:
