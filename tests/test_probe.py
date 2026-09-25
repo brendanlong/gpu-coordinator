@@ -317,3 +317,5 @@ def test_render_says_scopes_need_linger() -> None:
     assert "loginctl enable-linger" in parse_probe("gpubox", no_linger).render()
     lingering = no_linger.replace("===linger===\nno", "===linger===\nyes")
     assert "loginctl enable-linger" not in parse_probe("gpubox", lingering).render()
+    # A lingering user instance holds the dispatcher's scope past logout.
+    assert "logind kills user processes" not in parse_probe("gpubox", lingering).render()

@@ -205,12 +205,14 @@ class ProbeReport:
         if not self.has_nvidia_smi:
             notes.append("no nvidia-smi, so this host cannot run jobs")
         notes += self._gpu_notes()
-        if self.sections.get("killuserprocesses", "").endswith("=yes"):
+        linger = self.sections.get("linger", "").removeprefix("Linger=") == "yes"
+        scoped = self.sections.get("systemd_scope") == "yes" and linger
+        if self.sections.get("killuserprocesses", "").endswith("=yes") and not scoped:
             notes.append(
                 "logind kills user processes at logout; the dispatcher will not "
                 "survive your SSH session ending"
             )
-        if self.sections.get("systemd_scope") == "yes" and self.sections.get("linger") != "yes":
+        if self.sections.get("systemd_scope") == "yes" and not linger:
             notes.append(
                 "user systemd stops at logout without linger, so jobs run in process "
                 "groups, not cgroup scopes;\n        `loginctl enable-linger` on the host "

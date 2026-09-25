@@ -91,12 +91,33 @@ def test_scopes_need_a_user_instance_that_outlives_logout(
         return 0, linger
 
     monkeypatch.setattr(scope, "_output", fake_output)
+    monkeypatch.setattr(scope, "under_user_manager", lambda: False)
     linger = "no"
     assert not scope.probe(use_cache=False)
     assert ran == [scope.LINGER_ARGV]
-    linger = "yes"
+    linger = "Linger=yes"
     assert scope.probe(use_cache=False)
     assert ran[-1] == scope.PROBE_ARGV
+
+
+def test_a_caller_under_the_user_manager_gets_scopes_without_linger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It dies with that manager anyway; a process group would also die when
+    its own scope is stopped, which is #95."""
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(
+        f"0::/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/x.scope\n"
+    )
+    assert scope.under_user_manager(cgroup)
+    cgroup.write_text(f"0::/user.slice/user-{os.getuid()}.slice/session-4.scope\n")
+    assert not scope.under_user_manager(cgroup)
+
+    monkeypatch.setattr(scope, "under_user_manager", lambda: True)
+    monkeypatch.setattr(
+        scope, "_output", lambda argv, _t: (0 if argv == scope.PROBE_ARGV else 1, "")
+    )
+    assert scope.probe(use_cache=False)
 
 
 def test_a_pgid_host_records_its_isolation_in_state() -> None:

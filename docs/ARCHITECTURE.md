@@ -231,9 +231,9 @@ the same second tie-break on the suffix.
 
 Started by every `enqueue` and by bootstrap, in its own session and, under
 `cgroup` isolation, its own transient scope (`dispatcher._spawn_host_process`),
-as is each runner: nothing gpuc runs on a host stays in the cgroup of the
-process that started it, so stopping that cgroup reaches no dispatcher, runner
-or job.
+as is each runner: under `cgroup` nothing gpuc runs on a host stays in the
+cgroup of the process that started it, so stopping that cgroup reaches no
+dispatcher, runner or job. Under `pgid` they share that cgroup and its fate.
 The rules it holds to:
 
 - **One dispatcher per host**, by `flock` on `dispatcher.lock` plus a heartbeat.
@@ -413,7 +413,9 @@ a card a phase's leftovers hold (bar the `pgid` hole below).
 (`scope.isolation()`: what `GPUC_ISOLATION` announces, else one probe) and the
 dispatcher announces its answer to every child, so dispatcher, runners and
 phases agree on what a kill reaches. A user instance without linger stops at
-logout and takes its scopes with it, so the probe answers `pgid` there too.
+logout and takes its scopes with it, so the probe answers `pgid` there too,
+unless the asking process is already under that instance and would die with
+it anyway.
 Under `pgid` (no lingering user systemd: every RunPod pod, most shared boxes)
 a daemonised grandchild escapes: a documented hole, not a fixed one.
 

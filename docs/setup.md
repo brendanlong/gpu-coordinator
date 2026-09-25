@@ -27,8 +27,8 @@ contract the code keeps is [ARCHITECTURE.md](ARCHITECTURE.md).
 - `systemd --user` with linger (`loginctl enable-linger`) is optional: with
   it a cancel reaps the whole process tree, without it a double-forked
   grandchild can escape (see [how a job is
-  killed](usage.md#how-a-job-is-killed)). `gpuc host probe` reports which you
-  get.
+  killed](usage.md#how-a-job-is-killed)). `gpuc host probe` reports both,
+  and `gpuc status` shows which a job got.
 
 ## Install
 
