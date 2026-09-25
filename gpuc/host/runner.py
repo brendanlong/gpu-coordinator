@@ -743,14 +743,16 @@ class JobRunner:
         state = dataclasses.replace(jobs.read_state(self.job_id), status=status)
         why = cleanup.may_delete(self.job_id, state, cleanup.WORKDIR, cleanup.Evidence(policy=True))
         if why is None:
+            kept = cleanup.kept_outputs(self.job_id, self.spec, state)
             try:
                 freed = cleanup.remove_workdir(self.job_id)
             except OSError as exc:
                 self._log(log, f"could not remove workdir (cleanup={self.spec.cleanup}): {exc}")
                 return cleanup.workdir_size(self.job_id) or 0
+            what = f"the checkout, keeping {', '.join(kept)}" if kept else "workdir"
             self._log(
                 log,
-                f"removed workdir (cleanup={self.spec.cleanup}), freeing "
+                f"removed {what} (cleanup={self.spec.cleanup}), freeing "
                 f"{cleanup.human_bytes(freed)}; spec.json, state.json and log.txt are kept",
             )
             return 0

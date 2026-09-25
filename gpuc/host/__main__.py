@@ -270,6 +270,12 @@ def _job_entry(
         and state.status != "running"
         and cleanup.outputs_pending(job_id, spec, state)
     )
+    # The same question for outputs with no destination, whose answer is not
+    # a warning: they are where the spec said to keep them.
+    entry["kept_outputs"] = (
+        cleanup.kept_outputs(job_id, spec, state) if spec is not None and state.finished else []
+    )
+    entry["kept_bytes"] = state.kept_bytes
     return entry
 
 

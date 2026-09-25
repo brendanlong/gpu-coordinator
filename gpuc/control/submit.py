@@ -16,7 +16,7 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import yaml
@@ -175,6 +175,8 @@ def expand_job_id(spec: JobSpec) -> JobSpec:
     `hf_path` uploads under the id itself.
     """
     for output in spec.outputs:
+        if output.kept:
+            check_kept_path(output.path)
         output.s3 = _expand(output, "s3", output.s3, spec.job_id)
         output.hf = _expand(output, "hf", output.hf, spec.job_id)
         output.hf_path = _expand(output, "hf_path", output.hf_path, spec.job_id)
@@ -187,6 +189,32 @@ def expand_job_id(spec: JobSpec) -> JobSpec:
         ):
             raise _no_job_id(output, "hf_path", output.hf_path, spec.job_id)
     return spec
+
+
+def check_kept_path(path: str) -> None:
+    """A kept output stays in the workdir while the sweep deletes the rest,
+    so it has to name something strictly inside the workdir: `.` would keep
+    the whole checkout, and `..` would keep, and let fetch read, what is not
+    the job's at all."""
+    parts = PurePosixPath(path).parts
+    if not parts or PurePosixPath(path).is_absolute() or ".." in parts or parts == (".",):
+        raise SubmitError(
+            f"output {path!r} has no `s3` or `hf`, so it is kept on the host in the "
+            f"workdir, and needs a path inside the workdir: a directory or file the job "
+            f"writes, such as `results`"
+        )
+
+
+def check_kept_allowed(spec: JobSpec, where: str, *, ephemeral: bool) -> None:
+    """Refuse kept outputs on a rental: the pod terminates on its own once it
+    is idle, and outputs with no destination would go with it, unannounced."""
+    kept = [output.path for output in spec.outputs if output.kept]
+    if ephemeral and kept:
+        raise SubmitError(
+            f"{where} is a rental, which terminates itself once idle, and these outputs "
+            f"have no `s3` or `hf` to go to, so they would be lost with it: {', '.join(kept)}.\n"
+            f"Give each one a destination, or submit to a host that persists."
+        )
 
 
 def _expand(output: jobs.Output, key: str, template: str | None, job_id: str) -> str | None:
@@ -545,6 +573,7 @@ def submit_spec(
     too_big = wont_fit(spec, session.config, entry.name)
     if too_big:
         raise SubmitError(too_big)
+    check_kept_allowed(spec, f"host {entry.name}", ephemeral=session.config.ephemeral)
 
     for warning in prepared.warnings:
         report(f"WARNING: {warning}")

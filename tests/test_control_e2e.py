@@ -288,6 +288,31 @@ def test_fetch_copies_a_jobs_results_and_not_what_came_with_the_checkout(
     assert "results/old.md" in listed and "results/new.txt" in listed
 
 
+def test_a_kept_output_outlives_the_sweep_and_status_and_fetch_find_it(
+    bootstrapped_home: Path, workdir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = submit(
+        workdir,
+        "name: keeper\ncommand: mkdir -p results && echo kept > results/r.txt\n"
+        "outputs: [{path: results}]\n",
+    )
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    assert state_of(home, job_id)["status"] == "succeeded", log_tail(home, job_id)
+    job_workdir = home / "jobs" / job_id / "workdir"
+    # `cleanup: on_success` took the checkout and left the kept output.
+    assert sorted(p.name for p in job_workdir.iterdir()) == ["results"]
+    assert "removed the checkout, keeping results" in log_tail(home, job_id, 50)
+    capsys.readouterr()
+
+    assert main(["status", "--host", "local"]) == 0
+    out = capsys.readouterr().out
+    assert "kept on host: results" in out
+    assert "keep outputs on this host" in out
+    assert main(["fetch", job_id, "--to", str(tmp_path)]) == 0
+    assert (tmp_path / job_id / "results" / "r.txt").read_text() == "kept\n"
+
+
 def test_wait_blocks_on_a_real_job_and_exits_with_its_outcome(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -591,7 +616,7 @@ def test_status_mentions_leftover_workdirs_and_clean_clears_it(
     assert main(["clean", "--host", "local", "--all-finished"]) == 0
     capsys.readouterr()
     assert main(["status", "--host", "local"]) == 0
-    assert "gpuc clean" not in capsys.readouterr().out
+    assert "gpuc clean --host local --all-finished" not in capsys.readouterr().out
 
 
 def test_clean_removes_a_leftover_incoming_dir(

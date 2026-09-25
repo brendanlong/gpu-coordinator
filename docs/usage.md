@@ -21,7 +21,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `use_shared` | `false` | may also use the host's [shared GPUs](#shared-gpus); `gpuc submit --use-shared` sets it |
 | `env` | `{}` | plain environment, applied after the host's `--env` |
 | `secrets` | `[]` | names read from your shell at submit and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600); one missing from your shell is refused |
-| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`; `path` is relative to the workdir |
+| `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`, or `{path}` alone to [keep it on the host](#kept-outputs); `path` is relative to the workdir |
 | `sync_interval_s` | `180` | background upload cadence; minimum 10 |
 | `priority` | `50` | `0`–`99`, lower first; see [priority](#priority-is-not-advisory) |
 | `max_runtime_min` | none | wall clock from the runner's start; over it the job is `failed: timeout` |
@@ -40,6 +40,25 @@ and `hf_path`; a destination that does not contain it after expansion is refused
 at submit, as is any other `{...}`. An `hf` output with no `hf_path` uploads
 under the id itself. `hf_create: true` lets the sync preflight create a missing
 Hugging Face repo.
+
+<a name="kept-outputs"></a>
+**An output with no `s3` or `hf` is kept on the host**, in the job's workdir
+where it wrote it. The sweeps delete the checkout around it and leave it;
+`gpuc status` shows `kept on host: <path>` and how much the host's kept outputs
+hold, and `gpuc fetch <job-id>` copies them here whenever you like. Only a
+forced purge that selects the job removes them (`gpuc clean --host H --purge
+--force --only <job-id>`, or `--all-finished`). Its `path` must be inside the
+workdir and not the workdir itself. A rental refuses kept outputs at submit,
+because it terminates itself and they would go with it. A host put back on a
+build from before kept outputs (an older client re-ships its own) deletes them
+with the workdir.
+
+```yaml
+outputs:
+  - path: results             # kept on the host; `gpuc fetch <id>` brings it here
+  - path: checkpoints
+    s3: s3://my-bucket/lego/{job_id}/checkpoints
+```
 
 **Files already under an output path are not your results.** Uploads skip files
 that were there before `setup`, and a path holding only those is `failed:
@@ -657,6 +676,8 @@ Beyond what the example shows:
   finished. `progress_pct` survives the job; `progress_error` is why the last
   poll produced nothing.
 - `attempt` (launches of this id; a preempt adds one), `requeued_from`,
+  `kept_outputs` (the [kept](#kept-outputs) paths a finished job wrote to) and
+  `kept_bytes` (what they hold, once the checkout around them is swept),
   `started_at`, `exit_code`, `outputs_lost`, `workdir_bytes`, `outputs` (the
   spec's, as the host holds them) and `links`: one `{kind, path, target, url}`
   per place the results, W&B run or mirrored log can be opened, derived from
@@ -766,7 +787,9 @@ keep working on a cleaned job.
 | `never` | kept | kept | kept |
 
 No policy touches a job that is not finished, and none deletes a workdir whose
-`outputs:` have not reached their destination. A workdir the policy keeps is
+`outputs:` have not reached their destination. Every removal takes the checkout
+and leaves [kept outputs](#kept-outputs) where they are; once only they remain,
+there is nothing left to sweep. A workdir the policy keeps is
 still swept once it is `--workdir-days` old (below); `cleanup: never` opts out
 of that too.
 
@@ -781,7 +804,8 @@ gpuc clean --host gpubox --only 20260101-120000-ab12,20260101-130000-cd34
 
 |  | `clean` | `clean --purge` |
 | --- | --- | --- |
-| `workdir/` (code, venv, outputs) | removed | removed |
+| `workdir/` (code, venv, uploaded outputs) | removed | removed |
+| kept outputs in `workdir/` | **kept** | skipped unless `--force` |
 | `spec.json`, `state.json`, `log.txt` | **kept** | removed |
 | the job's `secrets/<id>.env`, if any is left | kept | **removed** |
 | job dirs under `incoming/` a submit never finished | removed | removed |
@@ -800,7 +824,10 @@ one whose **outputs are not confirmed** (`outputs not confirmed uploaded`: a
 declared output was written and some destination has no record of its last
 upload succeeding).
 
-`--force` overrides those two and nothing else, per job. `--verify` also lists
+It also skips one that **keeps outputs** (`keeps outputs on this host:
+<paths>`).
+
+`--force` overrides those three and nothing else, per job. `--verify` also lists
 the mirrored logs under the host's prefix with your own credentials and purges
 only a job that has one. `--purge --all-finished` needs `--yes` (or
 `--dry-run`).
@@ -852,6 +879,8 @@ would free, not what `du` says they hold, measured once when the job ends.
 | a host is out of disk, or `status` shows a `disk` line | finished jobs' workdirs are still there | `gpuc clean --host <host> --all-finished`, and `cleanup: always` on jobs you never need to inspect |
 | `clean --purge` skips everything as "not backed up" | the host has no `s3_prefix` | `gpuc host set <host> --s3-prefix s3://bucket/gpuc/<host>`, or accept the loss with `--force` |
 | `status` says a job's `outputs not uploaded` | the results exist only on that host | `gpuc fetch <id>`, or `gpuc requeue <id>` |
+| `status` says `kept on host` | the job's outputs have no destination, as the spec asked | `gpuc fetch <id>` copies them here; `gpuc clean --host H --purge --force --only <id>` deletes them |
+| submit refuses: `is a rental ... would be lost with it` | an output has no `s3` or `hf`, and a rental ends itself | give it a destination, or submit to a host that persists |
 | a job is `OUTPUTS LOST` | an ephemeral host retried and gave up before terminating | fix the credential or bucket, then `gpuc requeue <id>` |
 | the automatic sweep never takes a job | it runs only while the dispatcher lives, and refuses `cleanup: never`, an unmirrored job dir and outputs still only on the host | `gpuc clean --host H --only <id>` takes the workdir; `--purge --force` takes the rest |
 | `requeue` refuses, or rebuilds the wrong code | it reads the spec from S3 (`s3_bucket` must be set) and re-syncs the workdir from your current directory | run it from the right checkout; a `--no-git` workdir cannot be rebuilt |

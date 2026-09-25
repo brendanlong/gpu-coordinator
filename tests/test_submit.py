@@ -525,6 +525,20 @@ def test_the_fit_is_judged_against_the_sessions_fresh_config_not_the_cache(
     assert host.rsyncs == []
 
 
+def test_kept_outputs_are_refused_on_a_rental_before_anything_is_shipped(
+    control_env: Path, repo: Path
+) -> None:
+    host = FakeHost()
+    live = session(host)
+    live.config_read = HostConfigRead(
+        {"host": "pod", "gpus": ["GPU-a"], "provider": {"kind": "runpod", "pod_id": "p1"}}
+    )
+    prepared = prepare(validate(job_document(outputs=[{"path": "results"}])), repo, environ={})
+    with pytest.raises(SubmitError, match="host gpubox is a rental"):
+        submit_prepared(live, prepared, Settings(), workdir=repo, report=lambda _: None)
+    assert host.rsyncs == []
+
+
 def test_a_host_with_no_config_is_refused_before_anything_is_shipped(
     control_env: Path, repo: Path
 ) -> None:
