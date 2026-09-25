@@ -46,7 +46,11 @@ def fetch_jobs(
             job.error = f"job {job.job_id}: host {job.host} answered but cannot be copied from"
             continue
         dest = to / job.job_id
-        dest.mkdir(parents=True, exist_ok=True)
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            job.error = f"job {job.job_id}: cannot create {dest}: {exc}"
+            continue
         try:
             session.transport.pull(str(job.fields["workdir"]), dest, files)
         except TransportError as exc:

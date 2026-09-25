@@ -97,3 +97,15 @@ def test_the_host_verb_answers_every_id(
     answers = json.loads(capsys.readouterr().out)["jobs"]
     assert answers[0]["status"] == "running" and names(answers[0]) == ["results/a"]
     assert answers[1]["missing"] is True
+
+
+def test_an_output_path_that_cannot_be_resolved_is_that_jobs_error(gpuc_home: Path) -> None:
+    spec = job_with({"runs/x": "x"}, outputs=[{"path": "runs/{name}"}])
+    with pytest.raises(fetch.NotFetchable, match="cannot be resolved"):
+        fetch.listing(spec.job_id, spec, [])
+
+
+def test_an_output_that_links_to_a_directory_is_followed_like_an_upload(gpuc_home: Path) -> None:
+    spec = job_with({"real/a": "a"}, outputs=[{"path": "results"}])
+    (paths.workdir(spec.job_id) / "results").symlink_to("real")
+    assert names(fetch.listing(spec.job_id, spec, [])) == ["results/a"]

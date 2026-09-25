@@ -31,9 +31,12 @@ def inside(workdir: Path, rel: str) -> Path:
 
 
 def walk(root: Path) -> Iterator[Path]:
-    """Every file and symlink under `root`, or `root` itself if it is one.
-    Symlinks are listed, never followed: rsync copies them as links."""
-    if root.is_symlink() or root.is_file():
+    """Every file and symlink under `root`, or `root` itself if it is a file.
+
+    Symlinks below `root` are listed, never followed: rsync copies them as
+    links. `root` itself is followed when it is a link to a directory, as an
+    upload follows it; `inside` has already checked where it leads."""
+    if not root.is_dir():
         yield root
         return
     for parent, dirs, names in os.walk(root):
@@ -61,7 +64,13 @@ def listing(job_id: str, spec: jobs.JobSpec, wanted: Sequence[str]) -> dict[str,
         found = baseline.read(job_id)
         roots = []
         for output in spec.outputs:
-            key = baseline.output_key(output, job_id)
+            try:
+                key = baseline.output_key(output, job_id)
+            except (KeyError, IndexError, ValueError) as exc:
+                raise NotFetchable(
+                    f"output {output.path!r} cannot be resolved ({exc!r}); name what to "
+                    f"fetch with --path"
+                ) from exc
             roots.append((key, inside(workdir, key), found.get(key, {})))
     else:
         raise NotFetchable("its spec declares no `outputs:`; name what to fetch with --path")
@@ -72,7 +81,7 @@ def listing(job_id: str, spec: jobs.JobSpec, wanted: Sequence[str]) -> dict[str,
         if not root.exists() and not root.is_symlink():
             missing.append(rel)
             continue
-        base = root if root.is_dir() and not root.is_symlink() else root.parent
+        base = root if root.is_dir() else root.parent
         preexisting = set(baseline.unchanged(base, entries))
         for path in walk(root):
             if str(path.relative_to(base)) in preexisting:
