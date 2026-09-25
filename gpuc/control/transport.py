@@ -129,6 +129,11 @@ class Transport(Protocol):
         excludes: Sequence[str] = ...,
     ) -> CommandResult: ...
 
+    def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
+        """Copy `files`, relative to `remote_root` on the host, to the same
+        relative paths under `local_root` here."""
+        ...
+
     def tail(self, remote_path: str, lines: int = ..., follow: bool = ...) -> CommandResult: ...
 
     def argv(self, command: str) -> list[str]:
@@ -223,6 +228,12 @@ class LocalTransport:
     ) -> CommandResult:
         argv = rsync_argv(local_root, remote_path, files, ssh_command=None, excludes=excludes)
         return _execute(self.host, argv, timeout=3600.0, check=True, stdin=_files_stdin(files))
+
+    def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
+        argv = pull_argv(str(Path(remote_root).expanduser()), local_root, ssh_command=None)
+        return _execute(
+            self.host, argv, timeout=PULL_TIMEOUT_S, check=True, stdin=_files_stdin(files)
+        )
 
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
         return self.run(tail_command(remote_path, lines, follow), check=False)
@@ -350,6 +361,13 @@ class SshTransport:
         )
         return _execute(self.host, argv, timeout=3600.0, check=True, stdin=_files_stdin(files))
 
+    def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
+        self._prepare()
+        argv = pull_argv(f"{self.target}:{remote_root}", local_root, self.rsync_ssh_command())
+        return _execute(
+            self.host, argv, timeout=PULL_TIMEOUT_S, check=True, stdin=_files_stdin(files)
+        )
+
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
         return self.run(
             tail_command(remote_path, lines, follow), timeout=DEFAULT_TIMEOUT_S, check=False
@@ -393,6 +411,22 @@ def rsync_argv(
         argv += ["--from0", "--files-from=-", "--ignore-missing-args"]
     argv += [f"{str(local_root).rstrip('/')}/", destination]
     return argv
+
+
+PULL_TIMEOUT_S = 24 * 3600.0
+"""A fetch is a checkpoint coming home over whatever link there is; the
+person who started it can Ctrl-C it, and a re-run skips what already came."""
+
+
+def pull_argv(source: str, local_root: Path, ssh_command: str | None) -> list[str]:
+    """rsync from the host, the named files only. `--ignore-missing-args`
+    because a running job may delete a file between the listing and the
+    copy; that file is simply not fetched."""
+    argv = ["rsync", "-a", "--partial"]
+    if ssh_command:
+        argv += ["-e", ssh_command]
+    argv += ["--from0", "--files-from=-", "--ignore-missing-args"]
+    return [*argv, f"{source.rstrip('/')}/", f"{str(local_root).rstrip('/')}/"]
 
 
 def _files_stdin(files: Sequence[str] | None) -> bytes | None:

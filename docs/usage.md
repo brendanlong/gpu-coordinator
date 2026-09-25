@@ -270,6 +270,24 @@ the log itself always has them. `--follow-forever` streams until you stop it;
 `--interval SECONDS` pins the poll (2s backing off to 30s by default). Neither
 follow can be combined with `--json`, or with the other.
 
+**`gpuc fetch <job-id> [<job-id> ...] [--host H] [--to DIR] [--path P ...] [--list]`**
+— copy jobs' files from their workdirs on the host to `DIR/<job-id>/` here
+(`DIR` defaults to the current directory), keeping their paths. Without
+`--path` it copies each job's `outputs:` paths, less the files that came with
+the checkout: the same files an upload would send. `--path` copies everything
+under a workdir path instead, and is repeatable; `.` is the whole workdir,
+venv included. `--list` prints each file and its size and copies nothing.
+
+It works on a running job (a file being written as it copies arrives
+half-written; fetch again) and on a finished one until its workdir is swept.
+A job whose workdir is gone, or whose host is gone, is an error for that job
+only. An `outputs:` path the job never wrote is a warning.
+
+```sh
+gpuc fetch 20260915-233000-112233 --list                  # what it produced so far
+gpuc fetch 20260915-233000-112233 --path runs/mx-gdot00   # what a mistyped outputs: missed
+```
+
 **`gpuc wait <job-id> [<job-id> ...] [--host H]`** — the same wait without the
 log, for several jobs at once: one line per job as it ends, and exit 0 only if
 **all** of them succeeded. A reachable host whose dispatcher is down is
@@ -328,8 +346,8 @@ ran it; a job whose host is gone needs one of them. A mirrored spec this build
 will not accept is refused; submitting the job file again is the way round it.
 Keys this build does not know are dropped.
 
-`--host` is optional on `status <job-id>`, `logs`, `wait`, `cancel`, `preempt`,
-`reorder`, `estimate` and `requeue`: the local job index is tried first, then
+`--host` is optional on `status <job-id>`, `logs`, `fetch`, `wait`, `cancel`,
+`preempt`, `reorder`, `estimate` and `requeue`: the local job index is tried first, then
 every registered host is asked whether it knows the ids. An unknown host is exit 4
 unless it is [gone](#exit-codes-and---json) (never for `requeue --host` or `ssh
 --host`, which name where to go), and so is a job no host knows once every host
@@ -677,7 +695,7 @@ Rules for anything automated:
 
 ### `--json` everywhere else
 
-`status`, `submit`, `requeue`, `logs`, `wait`, `cancel`, `preempt`, `reorder`,
+`status`, `submit`, `requeue`, `logs`, `fetch`, `wait`, `cancel`, `preempt`, `reorder`,
 `estimate`, `pods`, `version`, `clean`, `config show`, `config init`,
 `host list`, `host probe`, `host add`, `host set`, `host bootstrap`,
 `host clean`, `host remove` and `host terminate` take `--json`: **stdout is
@@ -704,6 +722,7 @@ stopped for.
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`. `source` is `"host"` or `"s3"`, `location` the remote path or `s3://` uri, `lines` the log without trailing newlines, `notes` why the mirror was read. Not with either follow (exit 2) |
 | `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is the job's final state in the shape `status --json` gives a job, plus `host`, `host_state` (`answered`, `unaskable` or `gone`, as in [the host rule](#exit-codes-and---json)), `source` (`"host"` or `"mirror"`) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say, and a job nothing was heard about carries only `job_id`, `host`, `host_state`, `source`, `error` and a null `status`. With an `error`, only a `host_state` of `unaskable` can change if asked again. Every `error` is in `errors[]` too. The per-job outcome lines go to stderr. Exit 1 unless every job succeeded; exit 4 when an id no host has is among them, with the rest still reported |
 | `status <job-id> ...` | `wait`'s document, as things stand now rather than once the jobs end. Exit 4 when an id no host has is among them, 1 when any other job has an `error`, else 0 whatever the jobs' own status |
+| `fetch` | `{jobs[], errors[]}`, one entry per id: `{job_id, host, source, error, warnings[]}` and, with no `error`, `{status, workdir, files[], bytes, missing[], to}`. Each file is `{path, bytes}`, relative to the workdir; `missing` names `outputs:` paths the job never wrote; `to` is the local directory they were copied to, null under `--list` or when there was nothing to copy. Exit 4 when an id no host has is among them, else 1 when any `error` is set |
 | `cancel`, `preempt`, `reorder`, `estimate` | `{jobs[], errors[]}`, one entry per id in the order given: `{job_id, host, source, error, warnings[]}` plus what the host did, below. **Check `error`**: when it is not null the host did not confirm doing what was asked, and none of the fields below are there. `source` is `mirror` for a job whose host is gone, answered from the S3 mirror. `warnings` carries a mirrored spec that could not be updated, so `gpuc requeue` would not carry the change. Every `error` is in `errors[]` too. Exit 4 when an id no host has is among them, else 1 when any `error` is set |
 | ↳ `cancel` | `status`: `cancelled` for a queued job, `cancelling` for a running one, a finished job's own status |
 | ↳ `preempt` | `status` (`preempting`) and `priority`, what it will be queued again at |
@@ -827,12 +846,12 @@ would free, not what `du` says they hold, measured once when the job ends.
 | `ssh ... cannot create its ControlMaster socket` | the socket path would be over the 100-byte limit | point `XDG_RUNTIME_DIR` at a short directory, or unset it to use `/tmp/gpuc-<uid>` |
 | bootstrap fails with "host health failed" | the driver, disk or network check on the host said no | fix the named check and re-run bootstrap |
 | job is `failed: gpu-preflight` | torch in the job's venv has no working CUDA, or sees the wrong number of devices | check the torch build against the host's driver (`gpuc host probe`), and that `gpus:` matches what the job expects |
-| job is `failed: sync` (or lists `sync` in `problems`) | the final upload failed | check the tail of `gpuc logs <job-id>`; usually a missing `secrets:` entry, or no `aws`/`hf` on the host (re-run bootstrap) |
+| job is `failed: sync` (or lists `sync` in `problems`) | the final upload failed | check the tail of `gpuc logs <job-id>`; usually a missing `secrets:` entry, or no `aws`/`hf` on the host (re-run bootstrap). `gpuc fetch <job-id>` copies the outputs here meanwhile |
 | job is `failed: sync-preflight` | a destination cannot be written | the log names the command and error; fix the credential or destination, or add `hf_create: true`, then re-submit |
-| job is `failed: no-outputs` | the `outputs:` path was never written, or holds only what came with the checkout | write there, relative to the workdir; use a `{job_id}` subdirectory |
+| job is `failed: no-outputs` | the `outputs:` path was never written, or holds only what came with the checkout | write there, relative to the workdir; use a `{job_id}` subdirectory. If the job wrote somewhere else, `gpuc fetch <job-id> --path <where>` gets it |
 | a host is out of disk, or `status` shows a `disk` line | finished jobs' workdirs are still there | `gpuc clean --host <host> --all-finished`, and `cleanup: always` on jobs you never need to inspect |
 | `clean --purge` skips everything as "not backed up" | the host has no `s3_prefix` | `gpuc host set <host> --s3-prefix s3://bucket/gpuc/<host>`, or accept the loss with `--force` |
-| `status` says a job's `outputs not uploaded` | the results exist only on that host | copy them off, or `gpuc requeue <id>` |
+| `status` says a job's `outputs not uploaded` | the results exist only on that host | `gpuc fetch <id>`, or `gpuc requeue <id>` |
 | a job is `OUTPUTS LOST` | an ephemeral host retried and gave up before terminating | fix the credential or bucket, then `gpuc requeue <id>` |
 | the automatic sweep never takes a job | it runs only while the dispatcher lives, and refuses `cleanup: never`, an unmirrored job dir and outputs still only on the host | `gpuc clean --host H --only <id>` takes the workdir; `--purge --force` takes the rest |
 | `requeue` refuses, or rebuilds the wrong code | it reads the spec from S3 (`s3_bucket` must be set) and re-syncs the workdir from your current directory | run it from the right checkout; a `--no-git` workdir cannot be rebuilt |
@@ -841,7 +860,7 @@ would free, not what `du` says they hold, measured once when the job ends.
 | a warning names one skipped host entry | that entry did not validate; every other host still works | fix it by hand, or `gpuc host add <name> --ssh ...` again |
 | `status` warns `host X is running gpuc <sha> and this machine has <sha>` | the host was last bootstrapped from a different build | `gpuc host bootstrap X`, or `--all` for every host; safe while jobs run |
 | `status` warns `host X has gpuc <sha> on disk but its running dispatcher was started on <sha>` | the dispatcher outlived the package under it | `gpuc host bootstrap X`; safe while jobs run |
-| a host `runs a gpuc build that does not understand` a request | it was last bootstrapped from a build older than this one's `status <ids>`, `status --recent`, or multi-id verbs | `gpuc host bootstrap X`, or `--all`; safe while jobs run |
+| a host `runs a gpuc build that does not understand` a request | it was last bootstrapped from a build older than the command asked of it (`status <ids>`, `status --recent`, the multi-id verbs, `fetch`, `host clean --data` or `--hf-cache`) | `gpuc host bootstrap X`, or `--all`; safe while jobs run |
 | `status` says `GONE` or `UNASKABLE` | the [host rule](#exit-codes-and---json); an `UNASKABLE` pod with `ERROR pod <id> is EXITED` may still be billing | `GONE`: nothing. `UNASKABLE` pod: `gpuc host terminate <name>` ends it, `gpuc host remove <name>` only forgets it |
 | `gpuc pods` shows a pod with no heartbeat and nothing running | its dispatcher died, or its provisioning client was killed; it will never idle out | `gpuc host terminate <pod-id> --force`, or if it still answers ssh, `gpuc host add <name> --pod <id>` then `gpuc host bootstrap <name>` |
 | `host terminate` says the pod could not be confirmed gone | the provider refused or did not answer, three times | the entry is kept and the pod may still be billing: run it again, then check the RunPod console |

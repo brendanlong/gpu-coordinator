@@ -33,7 +33,13 @@ from typing import Any
 
 import pytest
 
-from gpuc.control.transport import CommandResult, TransportError, rsync_argv, tail_command
+from gpuc.control.transport import (
+    CommandResult,
+    TransportError,
+    pull_argv,
+    rsync_argv,
+    tail_command,
+)
 from gpuc.host import scope
 from tests.conftest import install_fake_nvidia_smi
 
@@ -218,6 +224,17 @@ class FakeHost:
             local_root, str(self.path(remote_path)), files, ssh_command=None, excludes=excludes
         )
         stdin = "".join(f"{name}\0" for name in files).encode() if files is not None else None
+        proc = subprocess.run(argv, input=stdin, capture_output=True, check=False, timeout=600.0)
+        result = CommandResult(
+            self.host, argv, proc.returncode, proc.stdout.decode(), proc.stderr.decode()
+        )
+        if result.returncode != 0:
+            raise TransportError(result)
+        return result
+
+    def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
+        argv = pull_argv(str(self.path(remote_root)), local_root, ssh_command=None)
+        stdin = "".join(f"{name}\0" for name in files).encode()
         proc = subprocess.run(argv, input=stdin, capture_output=True, check=False, timeout=600.0)
         result = CommandResult(
             self.host, argv, proc.returncode, proc.stdout.decode(), proc.stderr.decode()

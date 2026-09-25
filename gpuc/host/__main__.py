@@ -18,6 +18,7 @@ from typing import Any
 from gpuc.host import (
     cleanup,
     dispatcher,
+    fetch,
     gpus,
     health,
     jobs,
@@ -459,6 +460,26 @@ def _estimate(job_id: str, minutes: float | None) -> dict[str, Any]:
     }
 
 
+def _fetch_list(job_id: str, wanted: list[str]) -> dict[str, Any]:
+    if not paths.job_dir(job_id).is_dir():
+        return _no_such_job(job_id, f"no such job: {job_id}")
+    try:
+        state = jobs.read_state(job_id)
+        spec = jobs.read_spec(job_id)
+    except (OSError, RuntimeError) as exc:
+        return {"job_id": job_id, "error": str(exc)}
+    try:
+        found = fetch.listing(job_id, spec, wanted)
+    except fetch.NotFetchable as exc:
+        return {"job_id": job_id, "error": str(exc)}
+    return {"job_id": job_id, "status": state.status, **found}
+
+
+def cmd_fetch_list(args: argparse.Namespace) -> int:
+    """What `gpuc fetch` copies from each job; changes nothing."""
+    return _answer([_fetch_list(job_id, args.path) for job_id in dict.fromkeys(args.job_ids)])
+
+
 def cmd_estimate(args: argparse.Namespace) -> int:
     minutes = None if args.clear else args.minutes
     return _answer([_estimate(job_id, minutes) for job_id in dict.fromkeys(args.job_ids)])
@@ -588,6 +609,11 @@ def build_parser() -> argparse.ArgumentParser:
     wanted.add_argument("--minutes", type=float)
     wanted.add_argument("--clear", action="store_true", help="remove the estimate instead")
     estimate.set_defaults(func=cmd_estimate)
+
+    fetch_list = sub.add_parser("fetch", help="list the files `gpuc fetch` copies; changes nothing")
+    fetch_list.add_argument("job_ids", nargs="+", metavar="job_id")
+    fetch_list.add_argument("--path", action="append", default=[])
+    fetch_list.set_defaults(func=cmd_fetch_list)
 
     run = sub.add_parser("run", help="run one job in the foreground (used by the dispatcher)")
     run.add_argument("job_id")

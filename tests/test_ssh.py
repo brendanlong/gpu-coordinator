@@ -44,6 +44,9 @@ class RecordingTransport:
     ) -> CommandResult:
         raise AssertionError("not used")
 
+    def pull(self, remote_root: str, local_root: Path, files: object) -> CommandResult:
+        raise AssertionError("not used")
+
     def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
         raise AssertionError("not used")
 

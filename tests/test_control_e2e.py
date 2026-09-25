@@ -253,6 +253,41 @@ def test_a_job_writes_to_the_data_dir_and_host_clean_removes_it(
     assert not (home / "data" / "kept.txt").exists()
 
 
+def test_fetch_copies_a_jobs_results_and_not_what_came_with_the_checkout(
+    bootstrapped_home: Path, workdir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    (workdir / "results").mkdir()
+    (workdir / "results" / "old.md").write_text("from the checkout\n")
+    subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
+    subprocess.run(["git", "commit", "-qm", "old"], cwd=workdir, check=True)
+    job_id = submit(
+        workdir,
+        "name: produce\n"
+        "command: echo new > results/new.txt\n"
+        "outputs: [{path: results}]\n"
+        "cleanup: never\n",
+    )
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    assert state_of(home, job_id)["status"] == "succeeded", log_tail(home, job_id)
+    capsys.readouterr()
+
+    unknown = "20260101-000000-aaaaaa"
+    to = tmp_path / "fetched"
+    assert main(["fetch", job_id, unknown, "--host", "local", "--to", str(to), "--json"]) == 4
+    document = json.loads(capsys.readouterr().out)
+    fetched, missing = document["jobs"]
+    assert [f["path"] for f in fetched["files"]] == ["results/new.txt"]
+    assert fetched["to"] == str(to / job_id)
+    assert missing["error"]
+    assert (to / job_id / "results" / "new.txt").read_text() == "new\n"
+    assert not (to / job_id / "results" / "old.md").exists()
+
+    assert main(["fetch", job_id, "--path", "results", "--list"]) == 0
+    listed = capsys.readouterr().out
+    assert "results/old.md" in listed and "results/new.txt" in listed
+
+
 def test_wait_blocks_on_a_real_job_and_exits_with_its_outcome(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
