@@ -4,6 +4,7 @@ Hugging Face cache, and the only ways either is ever emptied."""
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -129,3 +130,12 @@ def test_hf_cache_prune_on_a_host_with_no_cache_does_nothing(
         "after_bytes": 0,
         "errors": [],
     }
+
+
+def test_a_directory_too_big_to_measure_in_time_is_said_so_not_failed(tmp_path: Path) -> None:
+    (tmp_path / "set").mkdir()
+    (tmp_path / "set" / "a").write_text("a")
+    check = health.check_size("data_dir", tmp_path, budget_s=-1.0)
+    assert check.ok and check.value is None
+    assert "too large to measure" in check.detail
+    assert storage_line({"checks": [asdict(check)]}) == f"storage: data {tmp_path} (?)"

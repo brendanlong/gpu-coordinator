@@ -430,19 +430,27 @@ def cmd_host_clean(args: argparse.Namespace) -> Answer:
             uv = prune_uv_cache(entry, settings, session=session)
             document["uv_cache"] = without_host(uv.document())
             lines.append(uv.render())
-        except CleanError as exc:
+        except (CleanError, RemoteError) as exc:
             document["uv_cache"] = {"errors": [str(exc)]}
             failures.append(str(exc))
     if args.hf_cache:
-        hf, errors = prune_hf_cache(entry, settings, session=session)
-        document["hf_cache"] = {**without_host(hf.document()), "errors": errors}
-        lines.append(hf.render())
+        try:
+            hf, errors = prune_hf_cache(entry, settings, session=session)
+            document["hf_cache"] = {**without_host(hf.document()), "errors": errors}
+            lines.append(hf.render())
+        except (CleanError, RemoteError) as exc:
+            errors = [str(exc)]
+            document["hf_cache"] = {"errors": errors}
         failures += errors
     if args.data:
-        data = remove_data(entry, args.data, settings, session=session)
-        document["data"] = data.document()
-        lines.append(data.render())
-        failures += data.errors
+        try:
+            data = remove_data(entry, args.data, settings, session=session)
+            document["data"] = data.document()
+            lines.append(data.render())
+            failures += data.errors
+        except (CleanError, RemoteError) as exc:
+            document["data"] = {"errors": [str(exc)]}
+            failures.append(str(exc))
     return Answer(document, "\n".join(lines), failures=failures)
 
 

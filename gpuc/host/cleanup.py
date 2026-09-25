@@ -202,8 +202,9 @@ def shared_extent_bytes(path: str) -> int:
         os.close(fd)
 
 
-def _walk_size(root: Path, *, reclaimable_only: bool) -> int:
-    """Sum `st_blocks` under `root`, counting each inode once.
+def _walk_size(root: Path, *, reclaimable_only: bool, deadline: float | None = None) -> int | None:
+    """Sum `st_blocks` under `root`, counting each inode once; None if
+    `deadline` (a `time.monotonic()` instant) passed first.
 
     `st_blocks`, not `st_size`, so a sparse or compressed file is counted as it
     actually sits on disk -- the same thing `du` counts.
@@ -216,6 +217,8 @@ def _walk_size(root: Path, *, reclaimable_only: bool) -> int:
     shared: dict[tuple[int, int], tuple[int, int, int]] = {}
     stack = [root]
     while stack:
+        if deadline is not None and time.monotonic() > deadline:
+            return None
         current = stack.pop()
         try:
             entries = list(os.scandir(current))
@@ -262,7 +265,12 @@ def dir_size(root: Path) -> int:
     the question to ask about the uv cache, whose whole job is to hold bytes
     other trees link to.
     """
-    return _walk_size(root, reclaimable_only=False)
+    return _walk_size(root, reclaimable_only=False) or 0
+
+
+def dir_size_within(root: Path, seconds: float) -> int | None:
+    """`dir_size`, or None if the walk takes longer than `seconds`."""
+    return _walk_size(root, reclaimable_only=False, deadline=time.monotonic() + seconds)
 
 
 def reclaimable_bytes(root: Path) -> int:
@@ -318,7 +326,7 @@ def reclaimable_bytes(root: Path) -> int:
     - A file both hardlinked wholly within this tree and reflinked out of it
       counts in full: the hardlink branch does not go on to ask FIEMAP.
     """
-    return _walk_size(root, reclaimable_only=True)
+    return _walk_size(root, reclaimable_only=True) or 0
 
 
 def workdir_size(job_id: str) -> int | None:

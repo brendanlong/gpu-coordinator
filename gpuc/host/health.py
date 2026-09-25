@@ -220,13 +220,23 @@ def hf_hub_cache_dir(config: jobs.HostConfig | None = None) -> Path:
     return (Path(xdg) if xdg else Path.home() / ".cache") / "huggingface" / "hub"
 
 
-def check_size(name: str, path: Path) -> Check:
+SIZE_BUDGET_S = 20.0
+"""How long the health check spends measuring each shared directory. A data
+directory can hold millions of files on a network volume, and bootstrap's
+whole health run has one timeout: a size is worth a line, not a failed
+bootstrap."""
+
+
+def check_size(name: str, path: Path, budget_s: float = SIZE_BUDGET_S) -> Check:
     """Where a directory jobs share is, and how much it holds. Never a warning:
     a big cache is what a cache is for, and this is here so a full disk has
     somewhere to look."""
     if not path.is_dir():
         return Check(name, True, f"{path} is empty", 0, path=str(path))
-    size = cleanup.dir_size(path)
+    size = cleanup.dir_size_within(path, budget_s)
+    if size is None:
+        detail = f"{path}: too large to measure within {budget_s:g}s"
+        return Check(name, True, detail, None, path=str(path))
     return Check(name, True, f"{path} holds {cleanup.human_bytes(size)}", size, path=str(path))
 
 
