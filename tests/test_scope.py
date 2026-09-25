@@ -78,6 +78,27 @@ def test_isolation_honours_what_the_dispatcher_probed(monkeypatch: pytest.Monkey
     assert scope.isolation() == scope.PGID
 
 
+def test_scopes_need_a_user_instance_that_outlives_logout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without linger the user manager stops at logout and stops every scope
+    under it: a dispatcher placed in one would die with the SSH session that
+    submitted, and its jobs with it."""
+    ran: list[list[str]] = []
+
+    def fake_output(argv: list[str], _timeout: float) -> tuple[int, str]:
+        ran.append(argv)
+        return 0, linger
+
+    monkeypatch.setattr(scope, "_output", fake_output)
+    linger = "no"
+    assert not scope.probe(use_cache=False)
+    assert ran == [scope.LINGER_ARGV]
+    linger = "yes"
+    assert scope.probe(use_cache=False)
+    assert ran[-1] == scope.PROBE_ARGV
+
+
 def test_a_pgid_host_records_its_isolation_in_state() -> None:
     job_id = prepare("true")
     runner.run_job(

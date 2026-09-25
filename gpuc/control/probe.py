@@ -26,6 +26,7 @@ SECTION_ORDER = [
     "home_fs",
     "killuserprocesses",
     "systemd_scope",
+    "linger",
     "uv",
     "python3",
 ]
@@ -53,6 +54,9 @@ kup=$(loginctl show-user "$(id -un)" -p KillUserProcesses 2>&1 | head -1)
 echo "${{kup:-unknown: no logind session for this user}}"
 say systemd_scope
 if systemd-run --user --scope -- true >/dev/null 2>&1; then echo yes; else echo no; fi
+say linger
+linger=$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null)
+echo "${{linger:-no}}"
 say uv
 if [ -x "$HOME/.local/bin/uv" ]; then "$HOME/.local/bin/uv" --version; \\
 elif command -v uv >/dev/null 2>&1; then uv --version; else echo "not installed"; fi
@@ -205,6 +209,12 @@ class ProbeReport:
             notes.append(
                 "logind kills user processes at logout; the dispatcher will not "
                 "survive your SSH session ending"
+            )
+        if self.sections.get("systemd_scope") == "yes" and self.sections.get("linger") != "yes":
+            notes.append(
+                "user systemd stops at logout without linger, so jobs run in process "
+                "groups, not cgroup scopes;\n        `loginctl enable-linger` on the host "
+                "gives them scopes, which also reap daemonised children"
             )
         if self.sections.get("uv") == "not installed":
             notes.append(f"uv is missing; `gpuc host bootstrap {self.host}` installs it")

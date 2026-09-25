@@ -24,6 +24,8 @@ user=claude home=/home/claude shell=/bin/bash
 KillUserProcesses=yes
 ===systemd_scope===
 no
+===linger===
+no
 ===uv===
 not installed
 ===python3===
@@ -308,3 +310,10 @@ def test_the_document_flags_the_shared_cards_too() -> None:
     ]
     assert document["shared_gpus"] == ["1"]
     assert document["shared_missing"] == []
+
+
+def test_render_says_scopes_need_linger() -> None:
+    no_linger = SAMPLE.replace("===systemd_scope===\nno", "===systemd_scope===\nyes")
+    assert "loginctl enable-linger" in parse_probe("gpubox", no_linger).render()
+    lingering = no_linger.replace("===linger===\nno", "===linger===\nyes")
+    assert "loginctl enable-linger" not in parse_probe("gpubox", lingering).render()

@@ -1,4 +1,5 @@
-"""Run each job phase in a transient `systemd --user` scope where one exists.
+"""Run each job phase in a transient `systemd --user` scope where one exists
+and outlives logout.
 
 A process cannot leave its cgroup without privilege, so stopping the scope
 reaps the entire tree -- including a grandchild that double-forked out of the
@@ -27,34 +28,56 @@ STOP_TIMEOUT_S = 15.0
 90 s, which is 90 s of a held GPU."""
 
 PROBE_ARGV = ["systemd-run", "--user", "--scope", "--collect", "--quiet", "--", "true"]
+LINGER_ARGV = ["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"]
 
 _probed: bool | None = None
 
 
 def _run(argv: list[str], timeout: float) -> int:
+    return _output(argv, timeout)[0]
+
+
+def _output(argv: list[str], timeout: float) -> tuple[int, str]:
     try:
-        return subprocess.run(
+        done = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=timeout,
             check=False,
-        ).returncode
+            text=True,
+        )
     except (OSError, subprocess.SubprocessError):
-        return 1
+        return 1, ""
+    return done.returncode, done.stdout.strip()
+
+
+def lingering(*, timeout: float = 20.0) -> bool:
+    """Does this user's systemd instance outlive their last login?
+
+    Without linger it stops a few seconds after the last session ends and
+    takes every scope under it along: the dispatcher, its runners and their
+    jobs would all die when the SSH session that submitted them closed. A
+    process group left in the login session's scope survives logout (unless
+    logind has `KillUserProcesses=yes`), so without linger that is the safer
+    home.
+    """
+    code, out = _output(LINGER_ARGV, timeout)
+    return code == 0 and out == "yes"
 
 
 def probe(*, timeout: float = 20.0, use_cache: bool = True) -> bool:
-    """Can this user create transient scopes? Cached for the process's life.
+    """Can this user create transient scopes that outlive their login?
+    Cached for the process's life.
 
-    Needs a user D-Bus and cgroup delegation, not just the binary, so the only
-    reliable answer is to create one.
+    Needs linger, a user D-Bus and cgroup delegation, not just the binary, so
+    the only reliable answer is to check linger and then create one.
     """
     global _probed
     if use_cache and _probed is not None:
         return _probed
-    result = _run(PROBE_ARGV, timeout) == 0
+    result = lingering(timeout=timeout) and _run(PROBE_ARGV, timeout) == 0
     if use_cache:
         _probed = result
     return result
