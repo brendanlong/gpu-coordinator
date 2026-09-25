@@ -1,4 +1,5 @@
-"""Run each job phase in a transient `systemd --user` scope where one exists.
+"""Run each job phase in a transient `systemd --user` scope where one exists
+and outlives logout.
 
 A process cannot leave its cgroup without privilege, so stopping the scope
 reaps the entire tree -- including a grandchild that double-forked out of the
@@ -12,6 +13,7 @@ from __future__ import annotations
 import base64
 import os
 import subprocess
+from pathlib import Path
 
 CGROUP = "cgroup"
 PGID = "pgid"
@@ -27,34 +29,76 @@ STOP_TIMEOUT_S = 15.0
 90 s, which is 90 s of a held GPU."""
 
 PROBE_ARGV = ["systemd-run", "--user", "--scope", "--collect", "--quiet", "--", "true"]
+LINGER_ARGV = ["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"]
 
 _probed: bool | None = None
 
 
 def _run(argv: list[str], timeout: float) -> int:
+    return _output(argv, timeout)[0]
+
+
+def _output(argv: list[str], timeout: float) -> tuple[int, str]:
     try:
-        return subprocess.run(
+        done = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=timeout,
             check=False,
-        ).returncode
+            text=True,
+        )
     except (OSError, subprocess.SubprocessError):
-        return 1
+        return 1, ""
+    return done.returncode, done.stdout.strip()
+
+
+def lingering(*, timeout: float = 20.0) -> bool:
+    """Does this user's systemd instance outlive their last login?
+
+    systemd before 230 has no `--value` and prints `Linger=yes`.
+    """
+    code, out = _output(LINGER_ARGV, timeout)
+    return code == 0 and out.removeprefix("Linger=") == "yes"
+
+
+def under_user_manager(cgroup_file: Path = Path("/proc/self/cgroup")) -> bool:
+    """Is this process already in a cgroup of the user's systemd instance?"""
+    try:
+        text = cgroup_file.read_text()
+    except OSError:
+        return False
+    return f"/user@{os.getuid()}.service/" in text
+
+
+def scopes_outlive_caller(*, timeout: float = 20.0) -> bool:
+    """Would a user scope outlive the process asking?
+
+    The user's systemd instance, without linger, stops a few seconds after the
+    last login ends and takes every scope under it along: the dispatcher, its
+    runners and their jobs would die when the SSH session that submitted them
+    closed, whereas a process group left in the login session's scope survives
+    logout (unless logind has `KillUserProcesses=yes`). But a caller already
+    under that instance -- an agent session, a desktop terminal, a
+    `systemd-run --user --scope` wrapper -- dies with it anyway, and there a
+    process group would also die whenever the caller's own scope is stopped,
+    which is how a job forty minutes in was ended by nobody (#95).
+    """
+    return under_user_manager() or lingering(timeout=timeout)
 
 
 def probe(*, timeout: float = 20.0, use_cache: bool = True) -> bool:
-    """Can this user create transient scopes? Cached for the process's life.
+    """Can this user create transient scopes worth running in? Cached for the
+    process's life.
 
     Needs a user D-Bus and cgroup delegation, not just the binary, so the only
-    reliable answer is to create one.
+    reliable answer is to create one; and see `scopes_outlive_caller`.
     """
     global _probed
     if use_cache and _probed is not None:
         return _probed
-    result = _run(PROBE_ARGV, timeout) == 0
+    result = scopes_outlive_caller(timeout=timeout) and _run(PROBE_ARGV, timeout) == 0
     if use_cache:
         _probed = result
     return result

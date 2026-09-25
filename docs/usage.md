@@ -534,11 +534,18 @@ minutes before that ladder starts. `gpuc preempt` is the same request with a
 different ending; `max_runtime_min` is the same SIGTERM-then-SIGKILL with
 `failed: timeout`.
 
-Each phase runs in a transient `systemd --user` scope where the host has one and
-in its own process group where it does not (`isolation: cgroup` or `pgid` in
-`gpuc status`). Under `pgid`, which is every RunPod pod and most shared boxes, a
-grandchild that double-forks (`setsid`, `nohup`, a daemonising server) survives
-the kill and holds its GPU; it cannot leave a cgroup.
+Each phase runs in a transient `systemd --user` scope where the host has one
+that outlives whoever started the dispatcher -- it lingers (`loginctl
+enable-linger`), or that process was itself under it -- and in its own process
+group where it does not (`isolation: cgroup` or `pgid` in `gpuc status`).
+Under `cgroup` the dispatcher and each runner also get a scope of their own,
+so stopping the scope or service `gpuc submit` ran in stops none of them.
+Under `pgid` they stay in that process's cgroup and are stopped with it; wrap
+the command that starts the dispatcher (`systemd-run --user --scope -- gpuc
+submit ...`) if that cgroup will not last. Under `pgid`, which is every RunPod
+pod and most shared boxes, a grandchild that double-forks (`setsid`, `nohup`,
+a daemonising server) survives the kill and holds its GPU; it cannot leave a
+cgroup.
 
 A phase that exits on its own takes the same stop with it: anything it left
 running in its scope or process group (a leaked DataLoader worker, a background

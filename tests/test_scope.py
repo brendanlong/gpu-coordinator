@@ -78,6 +78,48 @@ def test_isolation_honours_what_the_dispatcher_probed(monkeypatch: pytest.Monkey
     assert scope.isolation() == scope.PGID
 
 
+def test_scopes_need_a_user_instance_that_outlives_logout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without linger the user manager stops at logout and stops every scope
+    under it: a dispatcher placed in one would die with the SSH session that
+    submitted, and its jobs with it."""
+    ran: list[list[str]] = []
+
+    def fake_output(argv: list[str], _timeout: float) -> tuple[int, str]:
+        ran.append(argv)
+        return 0, linger
+
+    monkeypatch.setattr(scope, "_output", fake_output)
+    monkeypatch.setattr(scope, "under_user_manager", lambda: False)
+    linger = "no"
+    assert not scope.probe(use_cache=False)
+    assert ran == [scope.LINGER_ARGV]
+    linger = "Linger=yes"
+    assert scope.probe(use_cache=False)
+    assert ran[-1] == scope.PROBE_ARGV
+
+
+def test_a_caller_under_the_user_manager_gets_scopes_without_linger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It dies with that manager anyway; a process group would also die when
+    its own scope is stopped, which is #95."""
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(
+        f"0::/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/x.scope\n"
+    )
+    assert scope.under_user_manager(cgroup)
+    cgroup.write_text(f"0::/user.slice/user-{os.getuid()}.slice/session-4.scope\n")
+    assert not scope.under_user_manager(cgroup)
+
+    monkeypatch.setattr(scope, "under_user_manager", lambda: True)
+    monkeypatch.setattr(
+        scope, "_output", lambda argv, _t: (0 if argv == scope.PROBE_ARGV else 1, "")
+    )
+    assert scope.probe(use_cache=False)
+
+
 def test_a_pgid_host_records_its_isolation_in_state() -> None:
     job_id = prepare("true")
     runner.run_job(

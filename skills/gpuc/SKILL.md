@@ -107,7 +107,7 @@ Rules that avoid the classic failures:
 - A phase's background processes are stopped when it ends: one `setup`
   starts is gone before `main` runs, and whatever `main` leaves running is
   stopped before its cards are freed. Start a server the job needs inside
-  `command`. On hosts without user systemd (every RunPod pod) a `setsid` or
+  `command`. On hosts without lingering user systemd (every RunPod pod) a `setsid` or
   `nohup` daemon escapes this and keeps its GPU, so do not leave one.
 - Write results incrementally and atomically (temp name, then rename), so the
   periodic sync never uploads a half-written checkpoint.

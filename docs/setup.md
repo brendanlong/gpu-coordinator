@@ -24,10 +24,11 @@ contract the code keeps is [ARCHITECTURE.md](ARCHITECTURE.md).
 - Nothing else installed by hand: `gpuc host bootstrap` puts uv, a Python
   (floor 3.11, it installs 3.12), the `gpuc.host` package, the `aws` CLI v2
   bundle and `hf` into `$HOME` over ssh, and starts the dispatcher.
-- `systemd --user` is optional: with it a cancel reaps the whole process tree,
-  without it a double-forked grandchild can escape (see [how a job is
-  killed](usage.md#how-a-job-is-killed)). `gpuc host probe` reports which you
-  get.
+- `systemd --user` with linger (`loginctl enable-linger`) is optional: with
+  it a cancel reaps the whole process tree, without it a double-forked
+  grandchild can escape (see [how a job is
+  killed](usage.md#how-a-job-is-killed)). `gpuc host probe` reports both,
+  and `gpuc status` shows which a job got.
 
 ## Install
 
@@ -133,7 +134,7 @@ gpuc host add gpubox --ssh me@gpubox --port 22 --gpus 2,3  # a box you reach ove
 gpuc host add gpubox --ssh me@gpubox                       # …one somebody already set up: adopt it
 gpuc host set gpubox --shared-gpus 4,5                     # two more it may borrow while nobody else is on them
 gpuc host probe gpubox       # driver, the cards assigned to this host as `[index] name vram uuid`,
-                             # disk, $HOME's filesystem, systemd --user, uv, python3
+                             # disk, $HOME's filesystem, systemd --user, linger, uv, python3
 gpuc host probe gpubox --all-gpus   # every card in the box, `(assigned)` on the ones this host owns
 gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idempotent
 ```
@@ -281,6 +282,15 @@ uncommitted changes is its own build (`<commit>-dirty-<hash>`), so the next
 edit to the tree is re-shipped too.
 
 Two sessions on different builds are fine: each ignores fields it does not know.
+
+Builds before `gpuc reconcile` was removed could install a
+`gpuc-reconcile.timer`, which now fails every minute. Remove it if you have one:
+
+```sh
+systemctl --user disable --now gpuc-reconcile.timer
+rm ~/.config/systemd/user/gpuc-reconcile.{timer,service}
+systemctl --user daemon-reload
+```
 
 ### The same host from two machines
 
