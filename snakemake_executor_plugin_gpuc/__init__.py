@@ -141,8 +141,9 @@ class Executor(RemoteExecutor):
         `rules` and `localrules` are Snakemake's `Workflow`, beyond the
         executor interface: it offers no way to say a job is local."""
         workflow: Any = self.workflow
+        local = []
         for rule in workflow.rules:
-            if is_set(rule.resources.get("gpu")):
+            if rule.norun or is_set(rule.resources.get("gpu")):
                 continue
             placed = [key for key in ("host", "runpod") if is_set(rule.resources.get(key))]
             if placed:
@@ -150,7 +151,10 @@ class Executor(RemoteExecutor):
                     f"rule {rule.name} sets `{placed[0]}` but no `gpu`, so it would run on the "
                     "controller rather than on gpuc; give it `gpu=1` or more"
                 )
-            workflow.localrules(rule.name)
+            local.append(rule.name)
+        workflow.localrules(*local)
+        if local:
+            self.logger.info(f"Rules without a `gpu` run here, not on gpuc: {', '.join(local)}.")
 
     # The interface's own annotations on these two are narrower than what it
     # calls them for: `get_snakefile` is inferred as returning None, and

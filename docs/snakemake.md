@@ -61,8 +61,8 @@ queue decides how many of those actually run.
 written for the local executor already says it: `resources: gpu=1` or more.
 A rule with no `gpu`, or `gpu=0`, runs on the controller the way a
 `localrule: True` does, with no gpuc job, card or copy of the tree. A rule
-that sets `host` or `runpod` without `gpu` is refused before anything runs.
-A `gpu` given as a function is judged per job, and one that comes to 0 fails
+that sets `host` or `runpod` without `gpu` is refused before anything runs,
+though a dry run (`-n`) does not check. A `gpu` given as a function is judged per job, and one that comes to 0 fails
 that job: whether a rule runs on the controller is decided per rule.
 
 The resources of a GPU rule become job spec fields:
@@ -119,10 +119,9 @@ seen. Two layouts work.
 Run the controller on the GPU host, with that host registered there as
 `local`, and give every input and output an absolute path outside the job
 workdirs. Registering it on itself is safe on a host another machine already
-drives: `gpuc host add local` adopts the host's existing config and queue, as
-adding it from any other machine would, and registers it under its own name
-(pass `--gpuc-home` if it was set up with `--persistent-root`). Rules
-without a GPU run there too, next to the outputs.
+drives: `gpuc host add local` is a [connect](setup.md#registering-hosts), so
+it adopts the same config and queue. Rules without a GPU run there too, next
+to the outputs.
 
 ```python
 R = "/home/me/myproject-results"
@@ -167,7 +166,8 @@ moving every checkpoint through the bucket.
 
 - Every GPU job is one `gpuc submit`, and each submit copies the working tree
   and runs `setup`.
-- Job groups (`group:`) are refused. Each Snakemake job is its own gpuc job.
+- Job groups (`group:`) are refused, CPU rules included: Snakemake never runs
+  a grouped rule on the controller. Each Snakemake job is its own gpuc job.
 - The controller runs wherever you start it, and a controller that dies
   leaves its jobs behind. gpuc runs only jobs that need a GPU, so it cannot
   host the controller.

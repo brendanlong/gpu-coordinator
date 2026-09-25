@@ -187,8 +187,9 @@ destinations. Adding another of either changes nothing else in this document.
 - The repository includes a skill describing how to use the tool, and the
   tool can print it.
 - The distribution includes a Snakemake executor plugin that queues each
-  Snakemake job as a job on a named host. It drives the CLI and does nothing
-  the CLI cannot.
+  Snakemake job that needs a GPU as a job on a named host, and leaves the
+  rest to run where Snakemake runs. It drives the CLI and does nothing the
+  CLI cannot.
 - Tests never rent hardware unless explicitly asked to, and tests that
   require a local GPU skip if there is none available. Local GPU tests must
   use minimal resources.

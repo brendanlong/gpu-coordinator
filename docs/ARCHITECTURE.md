@@ -564,9 +564,9 @@ ships in the same wheel and gpuc does not depend on Snakemake.
   it reads the same documents under the same compatibility rules as any
   script.
 - Only a job that needs a GPU becomes a gpuc job. A rule whose `gpu` is
-  unset or 0 is a Snakemake local rule and runs on the controller; one whose
-  `gpu` comes to 0 only for some jobs fails those jobs rather than getting a
-  card.
+  unset or a constant 0 is a Snakemake local rule and runs on the controller.
+  A `gpu` given as a function always goes to gpuc, and a job it gives 0
+  fails rather than getting a card.
 - One `gpuc status --json` per poll covers every job in flight. It is never
   one per job.
 - Snakemake's `--envvars` and its storage plugins' credentials reach the job

@@ -146,6 +146,7 @@ def test_gpu_rules_become_gpuc_jobs_and_the_rest_run_on_the_controller(
     again = snakemake(project, results)
     assert again.returncode == 0, again.stderr[-4000:]
     assert "as gpuc job" not in again.stderr
+    assert "not on gpuc: summary." in done.stderr
 
 
 def test_a_failed_gpuc_job_fails_its_snakemake_job(
