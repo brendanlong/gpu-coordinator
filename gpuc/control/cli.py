@@ -58,8 +58,15 @@ from gpuc.control.actions import (
     version_document,
 )
 from gpuc.control.bootstrap import HealthOptions
+from gpuc.control.clean import (
+    CleanError,
+    clean_host,
+    parse_only,
+    prune_hf_cache,
+    prune_uv_cache,
+    remove_data,
+)
 from gpuc.control.clean import check_flags as check_clean_flags
-from gpuc.control.clean import clean_host, parse_only, prune_uv_cache
 from gpuc.control.config import (
     ConfigError,
     HostEntry,
@@ -400,12 +407,43 @@ def cmd_clean(args: argparse.Namespace) -> Answer:
     return Answer(report.document(), report.render(), failures=list(report.errors))
 
 
+def without_host(document: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in document.items() if key != "host"}
+
+
 def cmd_host_clean(args: argparse.Namespace) -> Answer:
-    if not args.uv_cache:
-        raise UsageError("host clean needs --uv-cache (job workdirs are `gpuc clean --host H`)")
+    """Each part asked for, in order, and every one of them reported: a
+    failed prune does not stop the data paths being removed."""
+    if not (args.uv_cache or args.hf_cache or args.data):
+        raise UsageError(
+            "host clean needs --uv-cache, --hf-cache or --data PATH "
+            "(job workdirs are `gpuc clean --host H`)"
+        )
+    settings = load_settings()
     entry = open_registry().require(args.name)
-    report = prune_uv_cache(entry, load_settings())
-    return Answer(report.document(), report.render())
+    session = open_session(entry, settings)
+    document: dict[str, Any] = {"host": entry.name}
+    lines: list[str] = []
+    failures: list[str] = []
+    if args.uv_cache:
+        try:
+            uv = prune_uv_cache(entry, settings, session=session)
+            document["uv_cache"] = without_host(uv.document())
+            lines.append(uv.render())
+        except CleanError as exc:
+            document["uv_cache"] = {"errors": [str(exc)]}
+            failures.append(str(exc))
+    if args.hf_cache:
+        hf, errors = prune_hf_cache(entry, settings, session=session)
+        document["hf_cache"] = {**without_host(hf.document()), "errors": errors}
+        lines.append(hf.render())
+        failures += errors
+    if args.data:
+        data = remove_data(entry, args.data, settings, session=session)
+        document["data"] = data.document()
+        lines.append(data.render())
+        failures += data.errors
+    return Answer(document, "\n".join(lines), failures=failures)
 
 
 def cmd_host_probe(args: argparse.Namespace) -> Answer:
@@ -1144,12 +1182,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(probe)
     probe.set_defaults(func=cmd_host_probe)
 
-    host_clean = host.add_parser("clean", help="prune the host's uv cache")
+    host_clean = host.add_parser(
+        "clean", help="prune the host's caches, or remove paths from its data directory"
+    )
     host_clean.add_argument("name")
     host_clean.add_argument(
         "--uv-cache", action="store_true", help="run `uv cache prune` on the host"
     )
-    add_json_flag(host_clean, "the cache directory and its size before and after the prune")
+    host_clean.add_argument(
+        "--hf-cache",
+        action="store_true",
+        help="run `hf cache prune` on the jobs' Hugging Face cache: detached revisions and "
+        "unfinished downloads only",
+    )
+    host_clean.add_argument(
+        "--data",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="delete PATH, relative to the host's data directory ($GPUC_DATA_DIR); repeatable",
+    )
+    add_json_flag(host_clean, "one object per part asked for: uv_cache, hf_cache, data")
     host_clean.set_defaults(func=cmd_host_clean)
 
     host_list = host.add_parser("list", help="list registered hosts")

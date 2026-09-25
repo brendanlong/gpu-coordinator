@@ -1,4 +1,4 @@
-"""`gpuc clean` and `gpuc host clean --uv-cache`: reclaim disk on a host.
+"""`gpuc clean` and `gpuc host clean`: reclaim disk on a host.
 
 Both are thin: the host package decides what is safe to delete (it is the only
 thing that can read a job's `state.json` without a race), and this module asks
@@ -406,13 +406,14 @@ job's `uv sync` wants to link out of the cache and re-download every one."""
 
 @dataclass
 class PruneReport:
-    """What `uv cache prune` on a host did: the cache, and its size either side."""
+    """What a cache prune on a host did: the cache, and its size either side."""
 
     host: str
     cache_dir: str | None
     before_bytes: int | None
-    """`du -sk` of the cache before the prune, in bytes; null if `du` failed."""
+    """The cache's size before the prune, in bytes; null if it could not be measured."""
     after_bytes: int | None
+    what: str = "uv cache"
 
     @property
     def before(self) -> str | None:
@@ -430,7 +431,7 @@ class PruneReport:
 
     def render(self) -> str:
         return (
-            f"host {self.host}: uv cache {self.cache_dir or '?'} "
+            f"host {self.host}: {self.what} {self.cache_dir or '?'} "
             f"pruned {self.before or '?'} -> {self.after or '?'}"
         )
 
@@ -478,4 +479,77 @@ def prune_uv_cache(
         cache_dir=values.get("dir") or None,
         before_bytes=_kib_to_bytes(values.get("before_kib")),
         after_bytes=_kib_to_bytes(values.get("after_kib")),
+    )
+
+
+def prune_hf_cache(
+    entry: HostEntry, settings: Settings | None = None, *, session: HostSession | None = None
+) -> tuple[PruneReport, list[str]]:
+    """`hf cache prune` on the host, by the host's own code, which knows where
+    the host's `env` puts the cache. The errors are the host's."""
+    session = session or open_session(entry, settings)
+    payload = session.host_json("hf-cache-prune", timeout=960.0, check=False)
+    if not isinstance(payload, dict):
+        raise CleanError(f"host {entry.name}: hf-cache-prune printed no report")
+    report = PruneReport(
+        host=entry.name,
+        cache_dir=payload.get("cache_dir"),
+        before_bytes=payload.get("before_bytes"),
+        after_bytes=payload.get("after_bytes"),
+        what="hf cache",
+    )
+    return report, [str(e) for e in payload.get("errors") or []]
+
+
+@dataclass
+class DataReport:
+    """What `gpuc host clean --data` removed from a host's data directory."""
+
+    host: str
+    data_dir: str | None
+    removed: list[dict[str, Any]]
+    errors: list[str]
+
+    @property
+    def freed_bytes(self) -> int:
+        return sum(int(r.get("freed_bytes") or 0) for r in self.removed)
+
+    def render(self) -> str:
+        lines = [
+            f"host {self.host}: freed {human_bytes(self.freed_bytes)} from "
+            f"{len(self.removed)} path(s) in {self.data_dir or '?'}"
+        ]
+        for removed in self.removed:
+            lines.append(
+                f"  {removed['path']}  {human_bytes(int(removed.get('freed_bytes') or 0))}"
+            )
+        lines += [f"  ERROR {error}" for error in self.errors]
+        return "\n".join(lines)
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "data_dir": self.data_dir,
+            "removed": self.removed,
+            "freed_bytes": self.freed_bytes,
+            "errors": self.errors,
+        }
+
+
+def remove_data(
+    entry: HostEntry,
+    rels: list[str],
+    settings: Settings | None = None,
+    *,
+    session: HostSession | None = None,
+) -> DataReport:
+    session = session or open_session(entry, settings)
+    args = shlex.join(["data-remove", *rels])
+    payload = session.host_json(args, timeout=900.0, check=False)
+    if not isinstance(payload, dict):
+        raise CleanError(f"host {entry.name}: data-remove printed no report")
+    return DataReport(
+        host=entry.name,
+        data_dir=payload.get("data_dir"),
+        removed=list(payload.get("removed") or []),
+        errors=[str(e) for e in payload.get("errors") or []],
     )

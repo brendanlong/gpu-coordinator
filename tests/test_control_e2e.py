@@ -235,6 +235,24 @@ def test_submit_runs_a_job_and_logs_and_status_find_it(
     assert "succeeded" in status
 
 
+def test_a_job_writes_to_the_data_dir_and_host_clean_removes_it(
+    bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = bootstrapped_home
+    job_id = submit(workdir, 'name: keep\ncommand: echo kept > "$GPUC_DATA_DIR/kept.txt"\n')
+    wait_until(lambda: finished(home, job_id), 120, f"job {job_id} to finish")
+    assert state_of(home, job_id)["status"] == "succeeded", log_tail(home, job_id)
+    assert (home / "data" / "kept.txt").read_text() == "kept\n"
+    capsys.readouterr()
+
+    code = main(["host", "clean", "local", "--data", "kept.txt", "--data", "absent", "--json"])
+    document = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert document["data"]["removed"] == [{"path": "kept.txt", "freed_bytes": 5}]
+    assert document["data"]["errors"] == [f"absent: not in {home / 'data'}"]
+    assert not (home / "data" / "kept.txt").exists()
+
+
 def test_wait_blocks_on_a_real_job_and_exits_with_its_outcome(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

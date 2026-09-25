@@ -29,6 +29,9 @@ down when its work is done and nobody watching.
 - **Job**: one spec (command, GPU count, priority, options) submitted to one
   host, identified by an id that is unique across all hosts.
 - **Backup destination**: a remote store a job's outputs are copied to.
+- **Data directory**: a directory on a host that every job there can read and
+  write, for what one job keeps for a later one: a dataset it downloaded, a
+  checkpoint the next step starts from.
 - **Mirror**: an S3 location holding a copy of what must survive a host: job
   specs, the job index, and each job's log and state. It is a copy, never the
   queue.
@@ -112,7 +115,8 @@ destinations. Adding another of either changes nothing else in this document.
 
 - The job's code is the working tree the user submits from, including
   untracked and uncommitted changes. The checkout is code, not data: a job
-  fetches datasets itself.
+  fetches datasets itself, and may keep them in the host's data directory for
+  the jobs after it. Nothing empties the data directory except a person.
 - **Checks happen as early as they can.** At submit: the spec is valid, every
   secret it names is present, and its GPU count fits the host. At job start,
   before the main phase: the GPUs work inside the job's own environment, and

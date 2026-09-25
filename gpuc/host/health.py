@@ -44,6 +44,9 @@ class Check:
     detail: str
     value: float | str | None = None
     warn: bool = False
+    path: str | None = None
+    """For a check about a directory jobs share: which one. `value` is then
+    its size in bytes."""
 
 
 def check_driver(smi: SmiRunner = gpus.run_nvidia_smi) -> Check:
@@ -180,9 +183,11 @@ def check_uv_cache(config: jobs.HostConfig | None = None) -> Check:
     size = placement["size_bytes"]
     where = f"{cache} holds {cleanup.human_bytes(size)}" if cache.is_dir() else f"{cache} is empty"
     if shared is True:
-        return Check("uv_cache", True, f"{where}, on the same filesystem as {home}", size)
+        detail = f"{where}, on the same filesystem as {home}"
+        return Check("uv_cache", True, detail, size, path=str(cache))
     if shared is None:
-        return Check("uv_cache", True, f"{where}; could not compare filesystems", size, warn=True)
+        detail = f"{where}; could not compare filesystems"
+        return Check("uv_cache", True, detail, size, warn=True, path=str(cache))
     return Check(
         "uv_cache",
         True,
@@ -193,7 +198,36 @@ def check_uv_cache(config: jobs.HostConfig | None = None) -> Check:
         f"--cache-dir {home.parent}/.cache/uv && gpuc host bootstrap ...",
         size,
         warn=True,
+        path=str(cache),
     )
+
+
+def job_environ(config: jobs.HostConfig | None = None) -> dict[str, str]:
+    """This process's environment under the host config's `env`: what a job
+    would see, for the keys that decide where its caches and data go."""
+    return {**os.environ, **(config.env if config else {})}
+
+
+def hf_hub_cache_dir(config: jobs.HostConfig | None = None) -> Path:
+    """Where `huggingface_hub` keeps a job's downloads, by its own precedence:
+    `HF_HUB_CACHE`, then `HF_HOME/hub`, then the XDG cache."""
+    environ = job_environ(config)
+    if environ.get("HF_HUB_CACHE"):
+        return Path(environ["HF_HUB_CACHE"]).expanduser()
+    if environ.get("HF_HOME"):
+        return Path(environ["HF_HOME"]).expanduser() / "hub"
+    xdg = environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "huggingface" / "hub"
+
+
+def check_size(name: str, path: Path) -> Check:
+    """Where a directory jobs share is, and how much it holds. Never a warning:
+    a big cache is what a cache is for, and this is here so a full disk has
+    somewhere to look."""
+    if not path.is_dir():
+        return Check(name, True, f"{path} is empty", 0, path=str(path))
+    size = cleanup.dir_size(path)
+    return Check(name, True, f"{path} holds {cleanup.human_bytes(size)}", size, path=str(path))
 
 
 def http_download(url: str, max_bytes: int, timeout: float) -> int:
@@ -269,6 +303,8 @@ def run_checks(
         check_gpu_uuids(config.gpus, smi, shared=config.shared_gpus),
         check_disk(min_free_gb),
         check_uv_cache(config),
+        check_size("hf_cache", hf_hub_cache_dir(config)),
+        check_size("data_dir", paths.data_dir(job_environ(config))),
         check_download(url, min_mbps=min_mbps, timeout=download_timeout, downloader=downloader),
     ]
     return {

@@ -133,6 +133,8 @@ def test_run_checks_emits_json_with_every_check(gpuc_home: Path) -> None:
         "gpu_uuids",
         "disk",
         "uv_cache",
+        "hf_cache",
+        "data_dir",
         "download",
     ]
     json.dumps(report)

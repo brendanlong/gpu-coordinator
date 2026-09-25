@@ -168,6 +168,29 @@ commit, branch, origin and submitting directory.
 Nothing reads `.gitignore` in that mode, and **`gpuc requeue` cannot rebuild a
 `--no-git` workdir**.
 
+## The host's data directory
+
+Every job gets `GPUC_DATA_DIR`: a directory on the host that outlives the job
+and that every other job there can see. Download a dataset or model into it
+and skip the download when it is already there, and the next job on that
+host starts without fetching it again:
+
+```sh
+data="$GPUC_DATA_DIR/lego-v3"
+[ -d "$data" ] || aws s3 sync s3://my-bucket/datasets/lego-v3 "$data"
+```
+
+It is `data/` in the host's gpuc home unless the host names another
+(`gpuc host set <host> --env GPUC_DATA_DIR=/big/disk/data`). The runner
+creates it. Nothing in gpuc ever deletes from it except `gpuc host clean
+<host> --data PATH`, so choose names that say what a thing is, and remove it
+yourself when nobody needs it. On a rental it ends with the pod, unless it is
+on a `--persistent-root` volume. Hugging Face downloads already share one cache
+per host (`HF_HOME`), and `gpuc host clean <host> --hf-cache` prunes it.
+
+`gpuc host bootstrap` prints where the uv cache, the Hugging Face cache and
+the data directory are, and how much each holds.
+
 ## Commands
 
 **`gpuc submit <job.yaml|-> --host NAME`** — validate, sync the workdir, deliver
@@ -696,7 +719,7 @@ stopped for.
 | `host remove` | `{host, kind, pod_id, notes[]}`: what was forgotten here. A rental is **not** terminated, and `notes` says so |
 | `host terminate` | `{host, pod_id, pod_name, pod_status, cost_usd_hr, checked, running[], queued[], outputs_pending[], terminated, forgotten, notes[]}`. `pod_status` and `cost_usd_hr` are what the provider said **before** the terminate; `checked` is whether the host itself answered (false means the three lists are empty for want of an answer); `forgotten` is whether the registry entry went. A refusal is the error document, exit 1 |
 | `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}`. With `--all`: `{hosts[], total, bootstrapped[], failed[], gone[], unreadable[], interrupted, errors[]}`, one `hosts[]` entry per registered host, `{name, outcome, error, ephemeral}` plus the single-host fields (null unless it was bootstrapped). `outcome` is `bootstrapped`, `failed` (with `error`), `gone` (a rental the provider no longer has, forgotten rather than failed), `interrupted` (the host a Ctrl-C landed in) or `not_attempted` (the ones after it); `unreadable` names entries this build could not read. Exit 1 if any host failed; a Ctrl-C is exit 130 and the error document carries the same tally; a registry that stops being readable mid-run is exit 3 |
-| `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}`. All four size fields are null when `du` on the host failed |
+| `host clean` | `{host, uv_cache?, hf_cache?, data?}`, one object for each part asked for. `uv_cache` and `hf_cache` are `{cache_dir, before, after, before_bytes, after_bytes, freed_bytes}`, with the size fields null where the host could not measure them, plus `errors[]` on `hf_cache`. `data` is `{data_dir, removed[], freed_bytes, errors[]}`, each removed path `{path, freed_bytes}`; a path that is not there, or is not inside the data directory, is an error for that path only. Exit 1 if any part failed |
 | `config init` | `{config_file, existed}`; `existed` is only ever true with `--force`, since an existing file is otherwise refused (exit 1) |
 
 ```sh

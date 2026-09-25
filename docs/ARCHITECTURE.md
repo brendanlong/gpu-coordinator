@@ -33,6 +33,7 @@ gpuc/
     progress.py    # the optional `progress_command`: run it, read a percentage off it
     sync.py        # periodic upload loop, recording each destination's result in the job's state
     health.py      # host preflight: driver, owned GPUs, disk, uv cache placement, the one network throughput test
+    storage.py     # the data directory and the HF cache: `host clean --data` and `--hf-cache`
     terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
@@ -105,6 +106,7 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uui
                      #  "pkg_commit": null | "<sha>", # the commit bootstrap shipped to this host
                      #  "env": {"HF_HOME": ...}}      # host-wide; see Persistent root
 secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
+data/                # GPUC_DATA_DIR unless the host's env names another; see The data directory
 incoming/<jobid>/    # a job `gpuc submit` is still building: the rsynced workdir, then the spec.
                      # `enqueue` renames the whole dir into jobs/, which is the acceptance
 jobs/<jobid>/
@@ -482,7 +484,16 @@ bootstrap beside gpuc home when the host names nothing (the uv cache wherever
 gpuc home and `$HOME` are on different filesystems, `HF_HOME` only under a
 persistent root); `UV_INSTALL_DIR` and `UV_TOOL_BIN_DIR` name directories that
 go on every child's PATH. `gpuc host clean <host> --uv-cache` runs `uv cache
-prune`, never `clean`.
+prune`, never `clean`, and `--hf-cache` runs `hf cache prune`.
+
+## The data directory
+
+`paths.data_dir()` is `GPUC_DATA_DIR` from the host's `env` (a sticky
+`MANAGED_ENV` key), else `data/` in gpuc home. The runner exports it to every
+job and creates it 0700 if it can. Nothing on the host deletes from it: not
+the workdir sweep, not `purge`, not a rental's drain. Only `python -m
+gpuc.host data-remove PATH...` does, and only strictly inside it, resolving
+symlinks and `..` first.
 
 ## Control side: `gpuc` CLI
 

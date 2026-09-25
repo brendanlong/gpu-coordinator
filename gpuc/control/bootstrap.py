@@ -45,6 +45,7 @@ from gpuc.control.remote import (
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 from gpuc.control.version import is_other_build, local_commit, package_root, short
 from gpuc.host import health, jobs, paths
+from gpuc.host.cleanup import human_bytes
 from gpuc.host.jobs import HostConfig, cache_beside
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
@@ -524,6 +525,23 @@ def run_health(session: HostSession, options: HealthOptions) -> dict[str, Any]:
     return report
 
 
+STORAGE_CHECKS = {"uv_cache": "uv cache", "hf_cache": "hf cache", "data_dir": "data"}
+"""The health checks that say where jobs' shared bytes are and how many:
+printed in full, since "where is it and how big" is what a person reads
+bootstrap's output for, and "ok" answers neither."""
+
+
+def storage_line(health: dict[str, Any]) -> str | None:
+    parts = []
+    for check in health.get("checks", []):
+        label = STORAGE_CHECKS.get(check.get("name"))
+        size = check.get("value")
+        if label and check.get("path"):
+            held = human_bytes(int(size)) if isinstance(size, (int, float)) else "?"
+            parts.append(f"{label} {check['path']} ({held})")
+    return "storage: " + "; ".join(parts) if parts else None
+
+
 def driver_version(health: dict[str, Any]) -> str | None:
     """The `driver` check's value, so `gpuc host list` can name it for free."""
     for check in health.get("checks", []):
@@ -690,6 +708,9 @@ def bootstrap_host(
 
     health = run_health(session, health_options)
     report("health: " + "; ".join(f"{c['name']} ok" for c in health.get("checks", [])))
+    storage = storage_line(health)
+    if storage:
+        report(storage)
     for warning in health.get("warnings", []):
         warnings.append(warning)
         report(f"WARNING: {warning}")

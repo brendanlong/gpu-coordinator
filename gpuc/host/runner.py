@@ -138,6 +138,7 @@ def build_env(
     env["GPUC_JOB_DIR"] = str(paths.job_dir(spec.job_id))
     env["GPUC_OUTPUTS"] = str(paths.outputs_dir(spec.job_id))
     env["GPUC_EXPECTED_GPUS"] = str(len(assigned))
+    env["GPUC_DATA_DIR"] = str(paths.data_dir(env))
     # `hf` puts this in its own User-Agent, so a Hub-side question about our
     # traffic has something to point at. A job may still override it.
     env.setdefault("HF_HUB_USER_AGENT_ORIGIN", user_agent())
@@ -442,6 +443,10 @@ class JobRunner:
         job_start = self.deps.now()
         gpu_error = self._verify_assigned()
         env = build_env(self.spec, self.assigned, self._indices)
+        # A directory the job cannot create is the job's error to hit, in its
+        # own log, when it first writes there; the runner has a job to finish.
+        with contextlib.suppress(OSError):
+            Path(env["GPUC_DATA_DIR"]).mkdir(mode=0o700, parents=True, exist_ok=True)
         # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
         # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
         # credential file anywhere on the host.

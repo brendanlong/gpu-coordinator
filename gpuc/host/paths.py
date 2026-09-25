@@ -31,6 +31,19 @@ def config_file() -> Path:
     return home() / "config.json"
 
 
+def data_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """The host's data directory: `GPUC_DATA_DIR` if the host's `env` names
+    one, else `data/` in gpuc home.
+
+    Inside gpuc home rather than beside it like the caches: it holds what
+    jobs chose to keep, which is this host's state as much as `jobs/` is, so
+    it moves with a persistent root and goes with an `rm -rf` of gpuc home.
+    """
+    environ = os.environ if environ is None else environ
+    override = environ.get("GPUC_DATA_DIR")
+    return Path(override).expanduser() if override else home() / "data"
+
+
 def path_with_user_bins(environ: Mapping[str, str] | None = None, extra: Sequence[str] = ()) -> str:
     """``PATH`` with ``extra`` then the $HOME tool dirs in front, no duplicates.
 
