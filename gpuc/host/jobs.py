@@ -815,6 +815,7 @@ class ManagedKey:
 MANAGED_ENV: dict[str, ManagedKey] = {
     "UV_CACHE_DIR": ManagedKey(sticky=True, beside_home="uv"),
     "HF_HOME": ManagedKey(sticky=True, beside_home="huggingface"),
+    "GPUC_DATA_DIR": ManagedKey(sticky=True),
     "UV_INSTALL_DIR": ManagedKey(on_path=True),
     "UV_TOOL_BIN_DIR": ManagedKey(on_path=True),
 }

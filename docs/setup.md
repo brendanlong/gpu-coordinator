@@ -190,7 +190,7 @@ host has to answer) and reports each change as `host <- …`.
 | `--gpuc-home PATH` | `$HOME/.gpuc` | where gpuc home lives on the host |
 | `--cache-dir PATH` | bootstrap decides | `UV_CACHE_DIR` in the host's `env`, the same as `--env UV_CACHE_DIR=PATH`. Bootstrap sets one beside gpuc home when gpuc home and `~/.cache` are on different filesystems, and never overrides one the config names. Under `--persistent-root`, `HF_HOME` is set beside gpuc home the same way |
 | `--persistent-root R` | none | gpuc home moves to `R/gpuc` (below) |
-| `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. It replaces the whole set except `UV_CACHE_DIR` and `HF_HOME`, which survive an `--env` that does not name them; `--env K=` removes a key, those included |
+| `--env K=V` (repeatable) | none | extra environment for every job on this host, applied *before* the job's own `env:`. It replaces the whole set except `UV_CACHE_DIR`, `HF_HOME` and `GPUC_DATA_DIR`, which survive an `--env` that does not name them; `--env K=` removes a key, those included. `GPUC_DATA_DIR` moves the host's [data directory](usage.md#the-hosts-data-directory) |
 | `--s3-prefix s3://…` | `s3://<s3_bucket>/gpuc/<name>` on a host being configured for the first time, when `s3_bucket` is set; none otherwise | this host's own log/state mirror; `''` turns it off |
 | `--retention-days N` | none | auto-purge whole job dirs this old, only ones whose log and state are confirmed mirrored; `''` turns it off |
 | `--workdir-days N` | `1` on a host being configured for the first time | auto-sweep a finished job's `workdir/` once it ended this long ago; `''` turns it off |
@@ -295,6 +295,8 @@ them from `gpuc host list --json` on the first machine.
 ```sh
 gpuc host remove <name>        # forgets it locally; nothing on the host changes
 gpuc host clean <name> --uv-cache   # `uv cache prune` there, if you want the disk back first
+gpuc host clean <name> --hf-cache   # `hf cache prune`: detached revisions and partial downloads
+gpuc host clean <name> --data lego-v3   # delete $GPUC_DATA_DIR/lego-v3
 gpuc host terminate <name>     # a rental only: ends it at the provider, then forgets it
 ```
 

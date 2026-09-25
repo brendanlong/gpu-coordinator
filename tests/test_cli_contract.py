@@ -1288,12 +1288,14 @@ def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
     assert document == {
         "schema_version": 1,
         "host": "local",
-        "cache_dir": "/home/u/.cache/uv",
-        "before": "18.0 GiB",
-        "after": "11.0 GiB",
-        "before_bytes": 18874368 * 1024,
-        "after_bytes": 11534336 * 1024,
-        "freed_bytes": (18874368 - 11534336) * 1024,
+        "uv_cache": {
+            "cache_dir": "/home/u/.cache/uv",
+            "before": "18.0 GiB",
+            "after": "11.0 GiB",
+            "before_bytes": 18874368 * 1024,
+            "after_bytes": 11534336 * 1024,
+            "freed_bytes": (18874368 - 11534336) * 1024,
+        },
     }
 
 

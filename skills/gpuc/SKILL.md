@@ -49,7 +49,10 @@ with every card nvidia-smi reports.
 Run `gpuc submit` from inside the project checkout: the working directory is
 rsynced to the host (git-tracked *and* untracked files, `.gitignore` obeyed,
 plus a patch of uncommitted changes). Large data must come from S3 or HF inside
-the job, never from the checkout.
+the job, never from the checkout. Download it into `$GPUC_DATA_DIR/<name>`
+and skip the download when it is already there: that directory outlives the
+job, every job on the host sees it, and only `gpuc host clean <host> --data
+<name>` removes anything from it.
 
 ```yaml
 name: lego-s4                      # label only
@@ -335,6 +338,9 @@ Rules, and they are not optional:
   `--only <job-id>[,<job-id>]` does it for named jobs only. Add `--purge` for
   whole job dirs, which only removes jobs whose log, state and outputs are
   confirmed mirrored (`--force` deletes a job's only copy).
+- `gpuc host clean <host> --uv-cache --hf-cache` prunes the host's caches
+  without losing anything a job would need again. `--data <name>` deletes
+  from its data directory, which nothing else ever does.
 - After a host restarts with its `$HOME` wiped (`dispatcher DOWN`, or ssh
   failing outright): re-copy the SSH key if needed, then `gpuc host bootstrap
   <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` whatever

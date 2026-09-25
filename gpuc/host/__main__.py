@@ -15,7 +15,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from gpuc.host import cleanup, dispatcher, gpus, health, jobs, paths, plan, queue, runner
+from gpuc.host import (
+    cleanup,
+    dispatcher,
+    gpus,
+    health,
+    jobs,
+    paths,
+    plan,
+    queue,
+    runner,
+    storage,
+)
 from gpuc.host.jobs import JobSpec, JobState
 
 
@@ -646,6 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_cmd = sub.add_parser("health", help="run host health checks")
     health.add_arguments(health_cmd)
     health_cmd.set_defaults(func=health.main)
+    storage.add_parsers(sub)
     return parser
 
 
