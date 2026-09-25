@@ -156,10 +156,12 @@ destinations. Adding another of either changes nothing else in this document.
   cards and dispatcher; every queued job in dispatch order with its projected
   start; every running job with its phase, cards, utilization and estimate;
   recent results; and each job's log.
+- **A user can copy a job's outputs from its host to their machine**, while
+  it runs or after, for as long as its workdir is on the host.
 - **A user can wait for jobs to end**, in one command that reports what
   happened to each and exits with their outcome.
-- **Asking after, waiting for, cancelling, preempting, reordering and
-  estimating jobs each take any number of job ids** in one command, at a
+- **Asking after, fetching, waiting for, cancelling, preempting, reordering
+  and estimating jobs each take any number of job ids** in one command, at a
   round trip per host rather than per job.
 - **A command does as much as it can, says what it could not do, and exits
   non-zero if anything failed.** One host that cannot be reached never stops

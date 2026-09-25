@@ -34,6 +34,7 @@ gpuc/
     sync.py        # periodic upload loop, recording each destination's result in the job's state
     health.py      # host preflight: driver, owned GPUs, disk, uv cache placement, the one network throughput test
     storage.py     # the data directory and the HF cache: `host clean --data` and `--hf-cache`
+    fetch.py       # which workdir files `gpuc fetch` copies
     terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
@@ -54,9 +55,10 @@ gpuc/
     bootstrap.py   # install uv + this package on a host, run host health, start the dispatcher; `ensure_build` ships
     probe.py       # `host probe`: what a host has, before bootstrap
     remote.py      # HostSession (opened on a fresh read of config.json) and `ask`: the one way to ask a host
-    transport.py   # LocalTransport / SshTransport: run, rsync, put_file(0600), tail
+    transport.py   # LocalTransport / SshTransport: run, rsync, pull, put_file(0600), tail
     ssh.py         # `gpuc ssh`: the interactive form of the transport
-    clean.py       # `gpuc clean` / `gpuc host clean --uv-cache` over the transport
+    clean.py       # `gpuc clean` / `gpuc host clean` over the transport
+    fetch.py       # `gpuc fetch`: ask each host for its jobs' files, pull them here
     s3index.py     # the S3 mirror of specs and the job index, and the local index
     gpuinfo.py     # per-GPU name/VRAM for the registry and every listing, over the host's own table and resolver
     version.py     # this build's commit, and comparing it with a host's
@@ -485,6 +487,14 @@ gpuc home and `$HOME` are on different filesystems, `HF_HOME` only under a
 persistent root); `UV_INSTALL_DIR` and `UV_TOOL_BIN_DIR` name directories that
 go on every child's PATH. `gpuc host clean <host> --uv-cache` runs `uv cache
 prune`, never `clean`, and `--hf-cache` runs `hf cache prune`.
+
+## Fetching a job's files
+
+`gpuc fetch` reads only `jobs/<id>/workdir/`, whatever state the job is in.
+The host lists the files (`python -m gpuc.host fetch`), so a job's results are
+told from its checkout by the same outputs baseline uploads use, and never by
+the client; the client then pulls exactly that list, into `<to>/<job id>/`.
+The host verb changes nothing, and nothing is ever pushed from a host.
 
 ## The data directory
 

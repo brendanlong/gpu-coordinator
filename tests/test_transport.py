@@ -460,3 +460,12 @@ def test_an_ssh_socket_failure_raises_immediately_even_without_check(
 def test_an_ordinary_ssh_failure_still_honours_check_false(tmp_path: Path) -> None:
     result = LocalTransport().run("echo connection refused >&2; exit 255", check=False)
     assert result.returncode == 255
+
+
+def test_pull_argv_copies_a_named_list_from_the_host(tmp_path: Path) -> None:
+    argv = transport.pull_argv("me@box:/home/me/.gpuc/jobs/j/workdir", tmp_path, "ssh -p 22")
+    assert argv[:2] == ["rsync", "-a"]
+    assert argv[argv.index("-e") : argv.index("-e") + 2] == ["-e", "ssh -p 22"]
+    assert "--files-from=-" in argv and "--from0" in argv and "--ignore-missing-args" in argv
+    # Trailing slashes on both: the listed paths land relative to `tmp_path`.
+    assert argv[-2:] == ["me@box:/home/me/.gpuc/jobs/j/workdir/", f"{tmp_path}/"]

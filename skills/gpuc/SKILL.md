@@ -334,6 +334,10 @@ Rules, and they are not optional:
   from git whenever it is gone.
 - That sweep refuses a job whose spec says `cleanup: never` and one whose
   `outputs:` have not reached S3 or HF; `gpuc status` names them.
+- `gpuc fetch <job-id>` copies a job's `outputs:` (less what came with the
+  checkout) from its workdir to `./<job-id>/`, running or finished. It is the
+  way out of `failed: sync`, and `--path <dir>` recovers what a mistyped
+  `outputs:` missed. `--list` shows what it would copy.
 - `gpuc clean --host <host> --all-finished` does that sweep now, at any age.
   `--only <job-id>[,<job-id>]` does it for named jobs only. Add `--purge` for
   whole job dirs, which only removes jobs whose log, state and outputs are

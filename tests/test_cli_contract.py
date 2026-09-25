@@ -916,6 +916,7 @@ JSON_COMMANDS = [
     ["logs"],
     ["wait"],
     ["cancel"],
+    ["fetch"],
     ["preempt"],
     ["reorder"],
     ["estimate"],

@@ -80,6 +80,7 @@ from gpuc.control.config import (
     transport_for,
     update_cache,
 )
+from gpuc.control.fetch import fetch_jobs, fetch_line
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.gpuinfo import summarize
 from gpuc.control.hosts import add_host, bootstrap_and_record, bootstrap_every_host, set_host
@@ -713,6 +714,18 @@ def cmd_cancel(args: argparse.Namespace) -> Answer:
         return f"job {job.job_id} on host {job.host}{whence}: {job.fields['status']}"
 
     return _jobs_answer(cancel_jobs(args.job_ids, args.host, load_settings()), line)
+
+
+def cmd_fetch(args: argparse.Namespace) -> Answer:
+    done = fetch_jobs(
+        args.job_ids,
+        args.host,
+        load_settings(),
+        wanted=args.path,
+        to=Path(args.to),
+        list_only=args.list,
+    )
+    return _jobs_answer(done, fetch_line)
 
 
 def cmd_reorder(args: argparse.Namespace) -> Answer:
@@ -1437,6 +1450,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_json_flag(cancel)
     cancel.set_defaults(func=cmd_cancel)
+
+    fetch = sub.add_parser(
+        "fetch", help="copy jobs' outputs from their workdirs on the host to this machine"
+    )
+    fetch.add_argument("job_ids", nargs="+", metavar="job_id")
+    fetch.add_argument(
+        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
+    )
+    fetch.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="fetch everything under PATH, relative to the workdir, instead of the job's "
+        "`outputs:`; repeatable, and `.` is the whole workdir",
+    )
+    fetch.add_argument(
+        "--to",
+        default=".",
+        metavar="DIR",
+        help="where to put them: each job's files go under DIR/<job_id>/ (default: here)",
+    )
+    fetch.add_argument(
+        "--list", action="store_true", help="say what would be copied, and copy nothing"
+    )
+    add_json_flag(fetch)
+    fetch.set_defaults(func=cmd_fetch)
 
     reorder = sub.add_parser("reorder", help="change queued jobs' priority")
     reorder.add_argument("job_ids", nargs="+", metavar="job_id")
