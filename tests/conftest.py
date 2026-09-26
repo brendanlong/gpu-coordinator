@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import shlex
 import shutil
@@ -298,6 +299,13 @@ def torch_project(session_monkeypatch: pytest.MonkeyPatch) -> Path:
     override = os.environ.get("GPUC_TEST_TORCH_PROJECT")
     root = Path(override) if override else default_torch_project()
     root.mkdir(parents=True, exist_ok=True)
+    # Every xdist worker builds its own session fixtures, all on this one path.
+    with (root.parent / f"{root.name}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _sync_torch_project(root)
+
+
+def _sync_torch_project(root: Path) -> Path:
     (root / "pyproject.toml").write_text(
         textwrap.dedent(
             """

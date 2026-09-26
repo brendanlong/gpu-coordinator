@@ -28,8 +28,12 @@ def verb(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, dict[str,
 
 
 def test_enqueue_from_a_file(
-    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    gpuc_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: 4242)
     spec_path = tmp_path / "job.json"
     spec_path.write_text(json.dumps({"name": "demo", "command": "true", "gpus": 1}))
     code, payload = run(capsys, "enqueue", str(spec_path))
@@ -59,6 +63,7 @@ def test_enqueue_starts_a_dispatcher(
 def test_enqueue_from_stdin(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: 4242)
     monkeypatch.setattr(
         "sys.stdin", __import__("io").StringIO(json.dumps({"command": "true", "gpus": 1}))
     )

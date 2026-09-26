@@ -23,6 +23,7 @@ import pytest
 from gpuc.control.cli import main
 from gpuc.control.s3index import LocalIndex
 from gpuc.host import scope
+from gpuc.host.dispatcher import LockBody
 from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch, load_registry
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
@@ -160,12 +161,10 @@ def _stop_dispatcher(home: Path) -> None:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(group, 9)
     lock = home / "dispatcher.lock"
-    if not lock.exists():
-        return
-    body = lock.read_text().strip()
-    if body.isdigit():
+    pgid = LockBody.parse(lock.read_text()).pgid if lock.exists() else None
+    if pgid is not None:
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(int(body), 15)
+            os.killpg(pgid, 15)
 
 
 def submit(workdir: Path, document: str, name: str = "job.yaml") -> str:

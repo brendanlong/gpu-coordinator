@@ -151,14 +151,19 @@ class FakeHost:
         lock = home / "dispatcher.lock"
         deadline = time.monotonic() + 30.0
         spawned = (home / "dispatcher.log").exists()
-        while spawned and not lock.exists() and time.monotonic() < deadline:
+        pgid = self._lock_pgid(lock)
+        while spawned and pgid is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        if not lock.exists():
-            return
-        pgid = LockBody.parse(lock.read_text()).pgid
+            pgid = self._lock_pgid(lock)
         if pgid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pgid, 9)
+
+    @staticmethod
+    def _lock_pgid(lock: Path) -> int | None:
+        """The file is created before it is locked and written after, so an
+        empty one is a dispatcher still starting."""
+        return LockBody.parse(lock.read_text()).pgid if lock.exists() else None
 
     # -- Transport ------------------------------------------------------------
 
