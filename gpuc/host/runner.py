@@ -225,7 +225,7 @@ class JobRunner:
         sampler = deps.util_sampler()
         # Utilization is sampled for `gpuc status` only, and only in `main`:
         # setup is downloads and compiles, and a 0% there says nothing.
-        record_util = phase == "main"
+        record_util = phase == "main" and bool(self.assigned)
         phase_start = deps.now()
         next_sample = phase_start + deps.sample_interval_s
         max_runtime_s = (
@@ -495,7 +495,7 @@ class JobRunner:
         gives the nvidia-smi index of each card for `CUDA_VISIBLE_DEVICES`.
         """
         if not self.assigned:
-            return "no GPUs assigned; every job runs on at least one"
+            return None if self.spec.gpus == 0 else "no GPUs assigned to a job that asks for some"
         try:
             table = gpus.list_gpus(self.deps.smi)
         except gpus.GpuError as exc:
@@ -545,7 +545,7 @@ class JobRunner:
             if code != 0 or self.kill_reason:
                 return self._finalize(self._classify(code, "setup"), sync_loop, log)
 
-        if self.deps.preflight:
+        if self.deps.preflight and self.assigned:
             stopped = self._stopped_before("preflight", sync_loop, log)
             if stopped is not None:
                 return stopped

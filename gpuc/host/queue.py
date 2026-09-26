@@ -162,6 +162,11 @@ def preempt(job_id: str, priority: int | None = None) -> str:
             )
         if state.intent == CANCEL:
             raise ValueError(f"job {job_id} is already being cancelled, so it is not coming back")
+        if not _wants_cards(job_id):
+            raise ValueError(
+                f"job {job_id} holds no GPUs, so stopping it would free nothing for a job "
+                f"waiting; `gpuc cancel {job_id}` ends it"
+            )
         wanted = state.priority if priority is None else priority
         refuse_if_nothing_else_can_run(job_id, wanted)
         state.intent = PREEMPT
@@ -171,20 +176,30 @@ def preempt(job_id: str, priority: int | None = None) -> str:
 
 
 def queued_ahead_of(job_id: str, priority: int) -> QueueEntry | None:
-    """The first queued job that would be dispatched before this one if it came
-    back at `priority`, or None if it would go straight to the head of the queue.
+    """The first queued job wanting cards that would be dispatched before this
+    one if it came back at `priority`, or None if none would.
 
     At the same priority the tie-break is the job id, and a preempted job's id
     is older than anything queued while it was running, so it sorts ahead of
-    all of them.
+    all of them. A job asking for no cards is passed over: it is dispatched
+    whatever is running, so the cards a preempt frees are nothing to it.
     """
     mine = QueueEntry(priority, job_id)
     for entry in list_queued():
         if entry >= mine:
             break  # sorted, so nothing after this sorts earlier either
-        if entry.job_id != job_id:
+        if entry.job_id != job_id and _wants_cards(entry.job_id):
             return entry
     return None
+
+
+def _wants_cards(job_id: str) -> bool:
+    """An unreadable spec counts as wanting some: that job is about to be
+    failed, and refusing the preempt on its account would be a guess too."""
+    try:
+        return jobs.read_spec(job_id).gpus > 0
+    except (RuntimeError, ValueError, OSError):
+        return True
 
 
 def refuse_if_nothing_else_can_run(job_id: str, priority: int) -> None:
@@ -202,12 +217,12 @@ def refuse_if_nothing_else_can_run(job_id: str, priority: int) -> None:
         )
     if queued_ahead_of(job_id, priority) is not None:
         return
-    ahead = [e for e in list_queued() if e.job_id != job_id]
+    ahead = [e for e in list_queued() if e.job_id != job_id and _wants_cards(e.job_id)]
     if not ahead:
         raise ValueError(
-            f"nothing else is queued on this host, so preempting job {job_id} would stop it "
-            f"and start it again from the beginning. Queue the job you want to run first, "
-            f"then preempt this one"
+            f"nothing else is queued on this host for a GPU, so preempting job {job_id} would "
+            f"stop it and start it again from the beginning. Queue the job you want to run "
+            f"first, then preempt this one"
         )
     first = ahead[0]
     raise ValueError(

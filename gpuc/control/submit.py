@@ -68,7 +68,7 @@ class JobSpecModel(BaseModel):
     name: str = ""
     setup: str | None = None
     python: str = jobs.DEFAULT_PYTHON
-    gpus: int = Field(default=1, ge=1)
+    gpus: int = Field(default=1, ge=0)
     use_shared: bool = False
     """Let this job be dispatched to the host's shared cards -- ones gpuc does
     not own and may only borrow while nobody else is on them. Off by default."""

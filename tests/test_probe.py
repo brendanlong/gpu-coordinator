@@ -184,7 +184,7 @@ def test_a_host_with_no_assignment_sees_every_card_and_is_told_to_assign_some() 
     rendered = parse_probe("gpubox", SAMPLE).render()
     assert "  gpus:\n" in rendered
     assert TI in rendered and A40 in rendered
-    assert "no GPUs are assigned to gpubox, so nothing can be submitted to it" in rendered
+    assert "no GPUs are assigned to gpubox, so only jobs asking for none can run on it" in rendered
 
 
 def test_an_assigned_card_the_host_cannot_see_is_called_out() -> None:

@@ -12,9 +12,12 @@ The rule: the queue is taken strictly in order. A job that does not fit holds
 the cards it could take, owned and borrowed alike, and nothing behind it may
 have them -- any other rule makes priority advisory the moment the job at the
 front is wider than the free pool, and it is what made automatic preemption
-livelock. The one exemption is a job that could not fit even once every job
-of ours ends: it is short of a shared card somebody else is using, which comes
-free when *their* job ends, and that is not ours to wait on. It is stepped
+livelock. What is held is cards, not the queue: a job behind that needs none
+of them goes ahead -- a job asking for no cards on its first pass, or a
+borrower onto a shared card the holder may not use. The one exemption is a job that could
+not fit even once every job of ours ends: it is short of a shared card
+somebody else is using, which comes free when *their* job ends, and that is
+not ours to wait on. It is stepped
 over, not failed, since the configured host is big enough for it. A job that
 asks for more than the host is configured with, counting shared cards only if
 it may borrow, can never run and is failed.
@@ -118,8 +121,7 @@ def capacity_failure(gpus: int, owned: int, shared: int, *, borrows: bool) -> st
 
     Everything read here is fixed for the life of a queued job -- the
     configured counts and the spec's `use_shared` -- because the answer
-    deletes the job from the queue. `gpus` is at least one: `JobSpec` refuses
-    anything less at the reader, so a spec asking for none is `bad-spec`.
+    deletes the job from the queue.
     """
     if gpus <= owned + (shared if borrows else 0):
         return None

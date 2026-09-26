@@ -31,6 +31,9 @@ job is a queued one plus the cards `run` will pass."""
 
 
 def prepare(gpus: Sequence[str] = (FAKE_GPUS[0],), **overrides: object) -> str:
+    """`gpus` is the assignment; `gpus_` is the spec's count, if not 1."""
+    if "gpus_" in overrides:
+        overrides["gpus"] = overrides.pop("gpus_")
     job_id = queue.enqueue(make_spec(**overrides))
     ASSIGNED[job_id] = list(gpus)
     return job_id
@@ -225,9 +228,21 @@ def test_a_stale_assigned_uuid_fails_the_job_before_it_starts(gpuc_home: Path) -
     assert "SHOULD-NOT-RUN" not in log_of(job_id)
 
 
-def test_a_job_with_no_gpu_assigned_never_runs(gpuc_home: Path) -> None:
-    """Every job runs on at least one card. The dispatcher never assigns none;
-    a runner started by hand with none fails the way a missing card does."""
+def test_a_job_that_asks_for_no_gpu_runs_with_none_visible(gpuc_home: Path) -> None:
+    """No GPU check, since there is nothing to check, and an empty
+    `CUDA_VISIBLE_DEVICES` rather than an absent one, which CUDA reads as
+    every card on the machine."""
+    job_id = prepare(gpus=[], gpus_=0, command='echo "CVD=[$CUDA_VISIBLE_DEVICES]"')
+    assert run(job_id, deps(preflight=True)) == 0
+    assert jobs.read_state(job_id).status == "succeeded"
+    log = log_of(job_id)
+    assert "CVD=[]" in log
+    assert "phase=preflight" not in log
+
+
+def test_a_job_that_asks_for_gpus_and_is_assigned_none_never_runs(gpuc_home: Path) -> None:
+    """The dispatcher never does this; a runner started by hand with none
+    fails the way a missing card does."""
     job_id = prepare(gpus=[], command="echo SHOULD-NOT-RUN")
     assert run(job_id) == 1
     state = jobs.read_state(job_id)

@@ -618,9 +618,9 @@ def _fmt_cards(job: JobView) -> str:
 
     The usual job wants exactly one and saying so on every line is noise, but a
     job waiting for three is the answer to "there is a card free, why is it
-    still queued".
+    still queued". A job wanting none is never waiting for one.
     """
-    if job.gpus_requested is None or job.gpus_requested == 1:
+    if job.gpus_requested is None or job.gpus_requested <= 1:
         return ""
     return f" needs {job.gpus_requested} gpus"
 

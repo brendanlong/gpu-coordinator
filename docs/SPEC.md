@@ -92,22 +92,24 @@ destinations. Adding another of either changes nothing else in this document.
   acceptance the host never runs the job. A submit that dies before
   acceptance leaves nothing the host will run, and what it staged is
   removed.
-- A job states its requirements as a number of GPUs, at least one. A job
+- A job states its requirements as a number of GPUs, which may be none. A job
   asking for more cards than the host is configured with, counting shared
   cards only if the job opted into them, is refused at submit and fails at
   dispatch if the configuration shrinks afterwards.
 - **Priority is numeric, lower first, and strict.** The queue is taken in
   order: a job that does not yet fit holds the free cards it is waiting for,
-  and nothing behind it may take them, even at the cost of idle cards. A job
-  waiting for a shared card someone else is using is stepped over instead.
+  and nothing behind it may take them, even at the cost of idle cards. What is
+  held is those cards, not the queue: a job behind that needs none of them
+  goes ahead. A job waiting for a shared card
+  someone else is using is stepped over instead.
 - Priorities of queued jobs can be changed, and the queue reorders
   accordingly.
 - **A running job can be preempted** so that a job ahead of it in dispatch
   order can run, by command or automatically for jobs that opt in -- and
   automatically only for a strictly higher-priority job. Preemption restarts
   the job from the beginning in its existing working tree; checkpointing is the
-  job's business. A preempt is refused when nothing waiting would be
-  dispatched ahead of the preempted job.
+  job's business. A preempt is refused when nothing waiting for its cards
+  would be dispatched ahead of the preempted job.
 - **Shared GPUs** are used only by jobs that opt in, only after every free
   owned card, and only while nvidia-smi reports the card idle. Owned cards are
   trusted to have no other users. A borrowed card is held until the job ends;
@@ -121,7 +123,7 @@ destinations. Adding another of either changes nothing else in this document.
   the jobs after it. Nothing empties the data directory except a person.
 - **Checks happen as early as they can.** At submit: the spec is valid, every
   secret it names is present, and its GPU count fits the host. At job start,
-  before the main phase: the GPUs work inside the job's own environment, and
+  before the main phase: its GPUs work inside the job's own environment, and
   every backup destination is writable with the job's own credentials.
 - A job runs as setup, those checks, main, and a final upload, and may
   report progress or an estimated remaining time. Estimates are informational
@@ -210,7 +212,6 @@ destinations. Adding another of either changes nothing else in this document.
 - A scheduler that picks a host for a job, or moves jobs between hosts.
 - Requirements beyond a GPU count: no VRAM, CPU or memory matching. A CUDA
   floor informs rental selection only.
-- Jobs that need no GPU.
 - Multi-node jobs, spot or interruptible instances, running jobs in
   containers.
 - A guaranteed rental teardown. A rental ends itself when idle; one whose

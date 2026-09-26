@@ -1500,8 +1500,8 @@ def build_parser() -> argparse.ArgumentParser:
         "queues it again under the same job id as its next attempt. It re-runs from the "
         "start, in the workdir the stopped attempt left behind -- nothing is re-synced from "
         "here -- so preempt a job that tolerates being re-run over its own leftovers. "
-        "Queue the job you want to run FIRST: this is refused unless something already "
-        "waiting would be dispatched ahead of the preempted job, since otherwise it would "
+        "Queue the job you want to run FIRST: this is refused unless a job already waiting for "
+        "GPUs would be dispatched ahead of the preempted job, since otherwise it would "
         "only stop it and start it again. Use `gpuc requeue` to re-run a finished job, or "
         "to run one on another host.",
     )
@@ -1655,12 +1655,20 @@ def add_no_git_flag(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _at_least_one(raw: str) -> int:
+    """A pod with no GPU is not a host gpuc rents, whatever the spec asks for."""
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runpod", action="store_true", help="reuse or provision a RunPod pod")
     parser.add_argument("--gpu", help="comma-separated GPU names, cheapest match wins")
     parser.add_argument(
         "--gpu-count",
-        type=int,
+        type=_at_least_one,
         default=1,
         metavar="N",
         help="GPUs on the pod (default 1); the spec's `gpus:` must fit in it",

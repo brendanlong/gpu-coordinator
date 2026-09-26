@@ -149,7 +149,6 @@ def test_unknown_fields_are_rejected_by_name() -> None:
     [
         ({"command": "  "}, "command"),
         ({"gpus": -1}, "gpus"),
-        ({"gpus": 0}, "gpus"),
         ({"priority": 200}, "priority"),
         ({"outputs": [{"path": "r", "bucket": "x"}]}, "outputs.0.bucket"),
     ],
@@ -166,10 +165,11 @@ def test_a_job_names_the_python_its_gpu_check_runs_under() -> None:
     assert spec.python == ".venv/bin/python"
 
 
-def test_a_job_must_ask_for_at_least_one_gpu() -> None:
+def test_a_job_may_ask_for_no_gpu_but_not_fewer() -> None:
+    assert validate(job_document(gpus=0)).to_spec("j").gpus == 0
     with pytest.raises(SubmitError) as exc:
-        validate(job_document(gpus=0), "job.yaml")
-    assert "gpus: Input should be greater than or equal to 1" in str(exc.value)
+        validate(job_document(gpus=-1), "job.yaml")
+    assert "gpus: Input should be greater than or equal to 0" in str(exc.value)
 
 
 def test_yaml_and_json_both_load(tmp_path: Path) -> None:
@@ -663,7 +663,7 @@ def test_a_mirrored_spec_is_validated_like_a_job_file_with_unknown_keys_dropped(
     with pytest.raises(SubmitError, match="future_key"):
         validate(document)
     with pytest.raises(SubmitError, match="gpus"):
-        validate(job_document(gpus=0), tolerant=True)
+        validate(job_document(gpus=-1), tolerant=True)
 
 
 def test_the_gpu_count_of_a_pod_to_be_is_checked_before_it_is_bought() -> None:

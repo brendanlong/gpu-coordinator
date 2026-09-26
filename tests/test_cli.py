@@ -634,6 +634,26 @@ def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
     assert created == []
 
 
+def test_submit_runpod_refuses_a_pod_with_no_gpu_even_for_a_job_that_needs_none(
+    control_env: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\ngpus: 0\n')
+    created: list[object] = []
+    monkeypatch.setattr(
+        "gpuc.control.submitting.runpod_host",
+        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
+    )
+    with pytest.raises(SystemExit) as exited:
+        main(["submit", str(job), "--runpod", "--gpu-count", "0"])
+    assert exited.value.code == EXIT_USAGE
+    assert "--gpu-count: must be at least 1" in capsys.readouterr().err
+    assert created == []
+
+
 def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
     control_env: Path,
     tmp_path: Path,

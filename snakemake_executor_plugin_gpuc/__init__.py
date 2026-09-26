@@ -201,8 +201,8 @@ class Executor(RemoteExecutor):
         gpus = int(resources.get("gpu") or 0)
         if gpus < 1:
             raise WorkflowError(
-                f"rule {job.name}'s `gpu` came to {gpus} for this job, and a job without a GPU "
-                "can only run on the controller, which is decided per rule: make `gpu` a "
+                f"rule {job.name}'s `gpu` came to {gpus} for this job, and this plugin runs a job "
+                "without a GPU on the controller, which is decided per rule: make `gpu` a "
                 "constant 0 or leave it out, or split the rule"
             )
         spec: dict[str, Any] = {

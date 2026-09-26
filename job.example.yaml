@@ -9,7 +9,7 @@
 name: lego-s4                                   # a label, not an identifier
 command: uv run --no-sync python -m experiments.lego.train --k-max 6
 setup: uv sync --frozen                         # optional; runs first, phase=setup
-gpus: 1                                         # 1..N of the host's owned GPUs
+gpus: 1                                         # 0..N of the host's owned GPUs
 
 # Also let this job onto the host's shared cards (ones gpuc borrows while
 # nobody else is on them); see docs/usage.md "Shared GPUs".
