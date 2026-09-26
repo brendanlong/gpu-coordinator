@@ -59,9 +59,6 @@ gpuc config show      # the effective settings, file or not
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | default pod image (`--image` per submit) |
 | `disk_gb` | `50` | default container disk (`--disk` per submit) |
 
-Nothing limits how many pods an account runs or what they cost; `gpuc pods`
-shows what is billing.
-
 **`s3_bucket` and `--s3-prefix` are two different mirrors.** `s3_bucket` is
 written by *this machine*: job specs to `s3://<bucket>/gpuc/specs/<job-id>.json`
 and the job index to `s3://<bucket>/gpuc/index/`, read by `gpuc requeue` and
@@ -79,9 +76,10 @@ gpuc web set-password        # prompts twice; writes a bcrypt hash to ~/.config/
 gpuc web serve               # http://127.0.0.1:8646/ until Ctrl-C
 ```
 
-One password guards every page and API call. `--bind 0.0.0.0` makes it
-reachable from other machines; there is no TLS, so do that only on a VPN
-interface or behind a proxy that terminates TLS. What it shows and does is in
+One password guards every page and API call, and `serve` refuses to start
+until one is set. `--bind 0.0.0.0` makes it reachable from other machines;
+there is no TLS, so do that only on a VPN interface or behind a proxy that
+terminates TLS. What it shows and does is in
 [usage.md](usage.md#the-web-dashboard).
 
 To keep it running, `--install` writes a `systemd --user` service that serves
@@ -173,10 +171,6 @@ gpuc host add rented --pod <pod-id>        # its address from the provider, its 
 
 A pod nobody has bootstrapped has no dispatcher and so will never end itself;
 `host add` says so, and `gpuc host bootstrap <name>` gives it one.
-
-A rental registered by an earlier build of gpuc is not read: every command
-warns `registered by an earlier build` for that entry, works with the rest,
-and exits 1 until you run `gpuc host add <name> --pod <pod-id>` again.
 
 The address is the top two rows, kept here (`here <- …`) and applied to the
 host by the next `gpuc host bootstrap`. Every other flag is the host's own
@@ -284,15 +278,6 @@ edit to the tree is re-shipped too.
 
 Two sessions on different builds are fine: each ignores fields it does not know.
 
-Builds before `gpuc reconcile` was removed could install a
-`gpuc-reconcile.timer`, which now fails every minute. Remove it if you have one:
-
-```sh
-systemctl --user disable --now gpuc-reconcile.timer
-rm ~/.config/systemd/user/gpuc-reconcile.{timer,service}
-systemctl --user daemon-reload
-```
-
 ### The same host from two machines
 
 Registering one box from a desktop *and* a laptop is the ordinary `gpuc host
@@ -315,30 +300,8 @@ gpuc host terminate <name>     # a rental only: ends it at the provider, then fo
 gpuc home (`gpuc ssh <host> -- rm -rf ~/.gpuc`, or the persistent root's `gpuc`
 directory) while nothing is running.
 
-**Terminating a pod deliberately.**
-
-```sh
-gpuc host terminate <name>             # end the rental now, and forget it here
-gpuc host terminate <pod-id> --force   # one that cannot answer: do not ask it anything
-```
-
-Without `--force` the host has to say it is idle; the refusals are in
-[usage.md](usage.md#terminate). Either way the terminate is confirmed with the
-provider before this machine forgets the host, and a pod that may still be
-billing keeps its registry entry.
-
-**To let the pod finish first**, tell it to stop itself instead:
-
-```sh
-gpuc pods                           # confirm the name and what it is doing
-gpuc host set <name> --idle-min 0   # stop as soon as the queue is empty
-gpuc cancel <job-id>                # and end a job you are not waiting for
-```
-
-**Nothing on this machine watches a pod after it is set up.** One whose
-dispatcher has died will never idle out: `gpuc pods` shows it with its hourly
-cost and its heartbeat, and `gpuc host terminate <pod-id> --force` ends it.
-Check `gpuc pods` before you walk away.
+What `host terminate` refuses, `--force`, and letting a pod stop itself
+instead are in [usage.md](usage.md#terminate).
 
 **Disabling the dashboard service.**
 

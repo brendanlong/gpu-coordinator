@@ -18,10 +18,8 @@ use_shared: false
 env:                                            # plain environment, stored in the spec
   REQUIRE_CUDA: "1"
 
-# Read from *your* shell at submit time and delivered to the host as
-# ~/.gpuc/secrets/<job_id>.env (0600). Never in argv, never in the pod's env,
-# never in a log. The runner puts them in the job's environment and in the
-# environment its upload commands run with, so these are all S3 and HF need.
+# Read from *your* shell at submit time and put in the job's environment and
+# in the one its uploads run with, so these are all S3 and HF need.
 secrets:
   - AWS_ACCESS_KEY_ID
   - AWS_SECRET_ACCESS_KEY
@@ -43,8 +41,7 @@ priority: 50                                    # 0 (first) .. 99 (last)
 max_runtime_min: 600                            # null for no limit
 
 # How long this is expected to take, from the runner's start. Nothing enforces
-# it -- it is what `gpuc status` shows the next person, so they can decide
-# between queueing behind this job and paying for another host.
+# it; `gpuc status` shows it.
 estimated_runtime_min: 480
 
 # Optional, and better than the guess above: run during phase `main`, its last
