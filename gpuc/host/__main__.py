@@ -10,7 +10,7 @@ import json
 import sys
 import time
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -234,7 +234,7 @@ def projected_starts(
         running=stoppable,
         draining=paths.draining_file().exists(),
     )
-    return plan.Projection(projection.starts_in_s, {**unknown, **projection.unknown})
+    return replace(projection, unknown={**unknown, **projection.unknown})
 
 
 def _ended_within(ended_at: str | None, since_s: float, now: datetime) -> bool:
