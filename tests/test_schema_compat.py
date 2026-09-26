@@ -363,6 +363,8 @@ def test_job_state_coerces_the_types_it_acts_on() -> None:
     assert state.gpus == ["GPU-1", "2"]
     assert state.util_recent == [1.0, 2.5, None, None]
     assert (state.util_sum, state.util_samples) == (180.5, 2)
+    older = JobState.from_dict({"status": "succeeded", "util_recent": [50.0]})
+    assert (older.util_sum, older.util_samples) == (0.0, 0)
     assert state.outputs_lost is True
     assert JobState.from_dict({"pgid": "not a pid", "runner_pid": []}).pgid is None
 
