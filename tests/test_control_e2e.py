@@ -756,3 +756,14 @@ def test_workdir_days_reaches_the_host_config(
     assert main(["host", "set", "local", "--workdir-days", ""]) == 0
     assert json.loads((home / "config.json").read_text())["workdir_days"] is None
     assert load_registry().require("local").config.workdir_days is None
+
+
+def test_logs_on_a_named_host_for_an_id_it_never_had_is_not_a_purge(
+    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A job's `name` passed where an id belongs: nothing has checked it exists,
+    # and "purged" would send the user looking for a job that never was.
+    assert main(["logs", "--host", "local", "ekfac-smoke"]) == 4
+    err = capsys.readouterr().err
+    assert "host local has no job ekfac-smoke, and that is not a job id" in err
+    assert "purged" not in err

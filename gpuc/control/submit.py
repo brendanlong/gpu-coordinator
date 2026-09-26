@@ -302,8 +302,50 @@ def prepare(
             git_tracked_files(workdir)
         except TransportError as exc:
             raise _not_a_repo(workdir, exc) from exc
-    warnings = [*preexisting_output_warnings(spec, workdir), *timeout_warnings(spec)]
+    warnings = [
+        *shell_syntax_warnings(model),
+        *preexisting_output_warnings(spec, workdir),
+        *timeout_warnings(spec),
+    ]
     return Prepared(model, spec, secrets_body, requeued_from, warnings)
+
+
+def shell_syntax_warnings(model: JobSpecModel) -> list[str]:
+    """What `bash -n` says about each script the host will run.
+
+    A multi-line script in a YAML block scalar is where specs go wrong: the
+    block strips one common indent, so a heredoc terminator YAML left indented
+    is no terminator, and the job fails minutes later on the host -- or runs
+    the rest of the script as the heredoc's body. bash reports that only as a
+    warning, hence reporting any stderr. A warning and not a refusal, because
+    `bash -n` also flags scripts that run: it does not execute `shopt -s
+    extglob` before parsing the `!(...)` after it, and it is the client's bash
+    -- 3.2 on macOS -- not the host's.
+    """
+    warnings: list[str] = []
+    scripts = {
+        "setup": model.setup,
+        "command": model.command,
+        "progress_command": model.progress_command,
+    }
+    for key, script in scripts.items():
+        if script is None:
+            continue
+        try:
+            result = subprocess.run(
+                ["bash", "-n", "-c", script], capture_output=True, text=True, timeout=30
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return warnings
+        if result.returncode != 0 or result.stderr.strip():
+            listing = "\n".join(f"  | {line}" for line in script.rstrip("\n").splitlines())
+            warnings.append(
+                f"`bash -n` on `{key}` says:\n{result.stderr.rstrip()}\n"
+                f"bash was given, after YAML parsing:\n{listing}\n"
+                "Put anything longer than a line or two in a script in the repo and run "
+                "that: `command: bash run.sh`."
+            )
+    return warnings
 
 
 def check_gpu_count(model: JobSpecModel, gpu_count: int | None) -> None:

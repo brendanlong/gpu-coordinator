@@ -89,6 +89,11 @@ cleanup: on_success                # workdir deleted after a successful run
 
 Rules that avoid the classic failures:
 
+- Keep `command:` and `setup:` to a line. Loops, heredocs and embedded Python
+  go in a script in the repo, run as `command: bash run.sh`: a YAML block
+  scalar mangles their indentation. A submit `WARNING:` from `bash -n` shows
+  the script as bash received it; fix it before the job runs.
+
 - Always list the `secrets` your outputs need. A job with S3 or HF outputs and
   no credentials fails at preflight, in seconds.
 - An output with no `s3` or `hf` is kept on the host in the job's workdir;

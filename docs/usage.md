@@ -13,7 +13,7 @@ commented example; `-` as the file name reads the spec from stdin.
 
 | field | default | meaning |
 | --- | --- | --- |
-| `command` | **required** | run in `workdir/` as phase `main`; blank is refused at submit |
+| `command` | **required** | a bash script, run in `workdir/` as phase `main`; blank is refused at submit |
 | `name` | `""` | a label for `status`; not an identifier |
 | `setup` | none | run first, as phase `setup` |
 | `python` | `uv run --no-sync python` | how the GPU check before `main` runs Python inside the job's environment; a repo that is not a uv project names its own (`.venv/bin/python`) |
@@ -34,6 +34,12 @@ commented example; `-` as the file name reads the spec from stdin.
 | `requeued_from` | none | set by `gpuc requeue`, never by you |
 
 Unknown keys are refused at submit.
+
+**Anything longer than a line or two goes in a script in the repo**, run as
+`command: bash run.sh`; the workdir sync carries it. Submit runs `bash -n` on
+`setup`, `command` and `progress_command` with the submitting machine's bash,
+and prints a `WARNING:` with the script as bash received it for any error or
+warning. The job is queued regardless.
 
 **Every output destination must name the job.** `{job_id}` expands in `s3`, `hf`
 and `hf_path`; a destination that does not contain it after expansion is refused
@@ -285,7 +291,9 @@ ids. An id no host has is exit 4 and one that could not be asked about is exit
 **`gpuc logs <job-id> [-f] [-n N] [--host H]`** — tails `log.txt` on the host
 (`-n` defaults to 200), or the S3 mirror when the host cannot produce it,
 which needs `s3_bucket` set here **and** an `s3_prefix` for that job. A job
-whose dir was purged reads from the mirror with exit 0.
+whose dir was purged reads from the mirror with exit 0. With `--host`, an
+argument that is not shaped like a job id and that the host has no dir for
+is exit 4.
 
 **`-f` follows until the job ends**, prints the job's outcome as its last line,
 and exits 0 only if the job succeeded. A job that has already finished prints
