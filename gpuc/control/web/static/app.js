@@ -328,7 +328,7 @@ function gpuRow(gpu) {
     const what = gpu.shared ? "borrowed from" : "dispatched to";
     return cardRow(gpu.entry, [badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`], "");
   }
-  const [text, tone] = CARD_BADGES[gpu.state];
+  const [text, tone] = CARD_BADGES[gpu.state] || [gpu.state, "warn"];
   return cardRow(gpu.index, [badge(gpu.shared ? `shared, ${text}` : text, tone), usage(gpu)], model(gpu));
 }
 

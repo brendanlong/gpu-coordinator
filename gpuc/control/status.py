@@ -412,11 +412,28 @@ class HostView:
         points at two of them. A card the host never resolved falls back to its
         UUID rather than a `?` that could be any of several.
         """
+        index = self.index_of(uuid)
+        return uuid if index is None else str(index)
+
+    def index_of(self, uuid: str) -> int | None:
+        """The index the host calls this card now, else the one last probed."""
         index = next((c.index for c in self.cards if c.uuid == uuid), None)
         if index is None:
             info = self.entry.gpu_info.get(uuid)
             index = info.index if info else None
-        return uuid if index is None else str(index)
+        return index
+
+    def card_rows(self) -> list[CardView | MissingCard]:
+        """What the text view and `--json` list, in their order: owned cards and
+        any owned entry nvidia-smi does not report, then the same for shared."""
+        return [
+            item
+            for shared in (False, True)
+            for item in [
+                *(c for c in self.cards if c.shared == shared),
+                *(m for m in self.missing if m.shared == shared),
+            ]
+        ]
 
     def gpu_holder(self, uuid: str) -> str | None:
         """Which running job has this card, per the host's own state."""
@@ -818,8 +835,7 @@ CARD_WORDS = {
 
 
 def _gpu_lines(view: HostView) -> list[str]:
-    """One line per card: owned, then shared, then any configured card
-    nvidia-smi does not report.
+    """One line per card, in `card_rows` order.
 
     No UUID and no holder: the question asked of this block is "is there a card
     for my job", and the running lines below name their own cards. `gpuc host
@@ -828,20 +844,21 @@ def _gpu_lines(view: HostView) -> list[str]:
     read is `IN USE` for exactly that reason, and `(? MiB, ?% util)` says so.
     """
     lines: list[str] = []
-    for card in sorted(view.cards, key=lambda c: c.shared):
-        info = view.entry.gpu_info.get(card.uuid) or GpuInfo()
-        index = card.index if card.index is not None else info.index
-        kind = "shared" if card.shared else "gpu"
-        state = CARD_WORDS[view.card_state(card)]
-        usage = describe_usage(card.memory_mib, card.utilization_pct)
+    for item in view.card_rows():
+        kind = "shared" if item.shared else "gpu"
+        if isinstance(item, MissingCard):
+            verb = "borrowed from" if item.shared else "dispatched to"
+            lines.append(
+                f"  {kind:<7} [{item.entry}] UNAVAILABLE  nvidia-smi does not report this card "
+                f"on the host, so nothing is {verb} it"
+            )
+            continue
+        info = view.entry.gpu_info.get(item.uuid) or GpuInfo()
+        index = view.index_of(item.uuid)
+        state = CARD_WORDS[view.card_state(item)]
+        usage = describe_usage(item.memory_mib, item.utilization_pct)
         lines.append(
             f"  {kind:<7} [{'?' if index is None else index}] {state} {info.label()} ({usage})"
-        )
-    for missing in sorted(view.missing, key=lambda m: m.shared):
-        kind, verb = ("shared", "borrowed from") if missing.shared else ("gpu", "dispatched to")
-        lines.append(
-            f"  {kind:<7} [{missing.entry}] UNAVAILABLE  nvidia-smi does not report this card "
-            f"on the host, so nothing is {verb} it"
         )
     return lines
 
@@ -1165,38 +1182,39 @@ def gpu_json(view: HostView) -> list[dict[str, Any]]:
     """Every card in the order the text view lists them. `state` is decided
     here so the dashboard renders it rather than deciding it a second time."""
     out: list[dict[str, Any]] = []
-    for card in sorted(view.cards, key=lambda c: c.shared):
-        info = view.entry.gpu_info.get(card.uuid) or GpuInfo()
-        out.append(
-            {
-                "index": card.index if card.index is not None else info.index,
-                "uuid": card.uuid,
-                "entry": None,
-                "shared": card.shared,
-                "state": view.card_state(card).value,
-                "name": info.name,
-                "vram_mib": info.vram_mib,
-                "busy_job": view.gpu_holder(card.uuid),
-                "memory_mib": card.memory_mib,
-                "utilization_pct": card.utilization_pct,
-            }
-        )
-    for missing in sorted(view.missing, key=lambda m: m.shared):
-        out.append(
-            {
-                "index": None,
-                "uuid": None,
-                "entry": missing.entry,
-                "shared": missing.shared,
-                "state": CardState.UNAVAILABLE.value,
-                "name": None,
-                "vram_mib": None,
-                "busy_job": None,
-                "memory_mib": None,
-                "utilization_pct": None,
-            }
-        )
+    for item in view.card_rows():
+        row: dict[str, Any] = dict.fromkeys(CARD_JSON_KEYS)
+        row["shared"] = item.shared
+        if isinstance(item, MissingCard):
+            row.update(entry=item.entry, state=CardState.UNAVAILABLE.value)
+        else:
+            info = view.entry.gpu_info.get(item.uuid) or GpuInfo()
+            row.update(
+                index=view.index_of(item.uuid),
+                uuid=item.uuid,
+                state=view.card_state(item).value,
+                name=info.name,
+                vram_mib=info.vram_mib,
+                busy_job=view.gpu_holder(item.uuid),
+                memory_mib=item.memory_mib,
+                utilization_pct=item.utilization_pct,
+            )
+        out.append(row)
     return out
+
+
+CARD_JSON_KEYS = (
+    "index",
+    "uuid",
+    "entry",
+    "shared",
+    "state",
+    "name",
+    "vram_mib",
+    "busy_job",
+    "memory_mib",
+    "utilization_pct",
+)
 
 
 def host_json(

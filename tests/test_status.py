@@ -1128,6 +1128,52 @@ def test_a_shared_card_nvidia_smi_could_not_read_says_so() -> None:
     assert "shared  [4] IN USE ? (? MiB, ?% util)" in render(got)
 
 
+def test_every_card_state_and_its_place_in_the_list() -> None:
+    """One order for the text view and `--json`: each kind's cards, then its
+    configured entries nvidia-smi does not report. An owned card is free when
+    nobody of ours holds it, whatever `unused` says: it is trusted."""
+    view = busy(running_job(gpus=["GPU-owned-busy", "GPU-shared-busy"]))
+    view.cards, view.missing = host_cards(
+        payload(
+            cards=[
+                {"index": 0, "uuid": "GPU-owned-free", "unused": False},
+                {"index": 1, "uuid": "GPU-owned-busy"},
+                {"index": 4, "uuid": "GPU-shared-busy", "shared": True},
+                {"index": 5, "uuid": "GPU-shared-theirs", "shared": True, "unused": False},
+                {"index": 6, "uuid": "GPU-shared-free", "shared": True, "unused": True},
+            ],
+            cards_missing=[{"entry": "9", "shared": True}, {"entry": "7", "shared": False}],
+        )
+    )
+    lines = [line for line in render(view).splitlines() if line.startswith(("  gpu ", "  shared "))]
+    expected = [
+        "  gpu     [0] free ",
+        "  gpu     [1] busy ",
+        "  gpu     [7] UNAVAILABLE ",
+        "  shared  [4] busy ",
+        "  shared  [5] IN USE ",
+        "  shared  [6] free ",
+        "  shared  [9] UNAVAILABLE ",
+    ]
+    assert len(lines) == len(expected)
+    assert all(line.startswith(prefix) for line, prefix in zip(lines, expected, strict=True))
+    rows = host_json(view)["gpus"]
+    assert [
+        (r["index"] if r["entry"] is None else r["entry"], r["shared"], r["state"]) for r in rows
+    ] == [
+        (0, False, "free"),
+        (1, False, "busy"),
+        ("7", False, "unavailable"),
+        (4, True, "busy"),
+        (5, True, "in_use"),
+        (6, True, "free"),
+        ("9", True, "unavailable"),
+    ]
+    assert rows[3]["busy_job"] == "j-running"
+    assert view.free == ["GPU-owned-free"]
+    assert [c.uuid for c in view.borrowable] == ["GPU-shared-free"]
+
+
 def test_a_shared_entry_the_host_cannot_see_says_so() -> None:
     got = shared_view(cards=[], cards_missing=[{"entry": "7", "shared": True}])
     assert "shared  [7] UNAVAILABLE" in render(got)

@@ -749,8 +749,8 @@ jobs that went with it, else null), `state` (`answered`, `unaskable` or `gone`, 
 above; `errors[]` carries the reason and decides the exit code, `warnings[]`
 carries the build mismatch and does not), `pod` (the provider's view of a
 rental's pod), `pkg_commit` (the host's own answer for the build it runs; `null`
-means it did not say). `gpus` lists owned cards, then shared ones, then any
-configured card nvidia-smi does not report. Each card's `state` is what the text
+means it did not say). `gpus` lists owned cards, then shared ones, each kind
+followed by any configured card of it nvidia-smi does not report. Each card's `state` is what the text
 view prints: `free`, `busy` (`busy_job`, one of *our* jobs, has it), `in_use`
 (a shared card somebody else is on, or that nvidia-smi could not read) or
 `unavailable`, where `entry` is the configured index or UUID and `uuid`, `index`,

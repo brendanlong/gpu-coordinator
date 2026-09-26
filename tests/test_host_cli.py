@@ -814,6 +814,18 @@ def test_status_steps_over_a_borrower_short_of_somebody_elses_card(
     )
 
 
+def test_status_dispatches_to_an_owned_card_somebody_else_is_on(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owned cards are trusted to have no other users: the host reports the
+    card not unused, and the projection starts the job on it anyway."""
+    use_smi(monkeypatch, [FAKE_GPUS[0]], utilization={FAKE_GPUS[0]: 98.0})
+    jobs.write_config(HostConfig(host="test-host", gpus=[FAKE_GPUS[0]]))
+    job = queue.enqueue(make_spec())
+
+    assert projection(capsys)[job] == (0.0, None)
+
+
 def test_cancel_of_a_job_whose_state_cannot_be_read_is_a_refusal_not_a_traceback(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
