@@ -3,6 +3,7 @@ start times that replays it (`plan.project`). Pure: no host, no filesystem."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 
 import pytest
@@ -12,12 +13,10 @@ from gpuc.host.plan import (
     Assigned,
     Card,
     Fails,
-    Filling,
-    Fills,
     Holds,
     Pool,
+    Preemptable,
     Projection,
-    Reclaims,
     Request,
     SteppedOver,
 )
@@ -31,11 +30,18 @@ def req(
     *,
     borrows: bool = False,
     est_min: float | None = None,
+    priority: int = 50,
     fills: bool = False,
-    occupying: Sequence[str] = (),
 ) -> Request:
     estimate = None if est_min is None else est_min * MIN
-    return Request(job_id, gpus, borrows, estimate, fills=fills, occupying=tuple(occupying))
+    return Request(job_id, gpus, borrows, estimate, priority=priority, fills=fills)
+
+
+def running(
+    job_id: str, cards: Sequence[str], *, priority: int = 90, started: float = 0.0
+) -> Preemptable:
+    n_shared = sum(1 for c in cards if c.startswith("s"))
+    return Preemptable(job_id, priority, list(cards), started, len(cards) - n_shared, n_shared)
 
 
 def owned(*releases_min: float | None) -> list[Card]:
@@ -58,6 +64,7 @@ def project(
     owned_missing: Sequence[str] = (),
     theirs: int = 0,
     shared_missing: int = 0,
+    running: Sequence[tuple[Preemptable, Request]] = (),
     draining: bool = False,
 ) -> Projection:
     """`plan.project` with the configured counts read off the cards: every
@@ -71,6 +78,7 @@ def project(
         owned_missing=owned_missing,
         shared_configured=n_shared + theirs + shared_missing,
         theirs=theirs,
+        running=running,
         draining=draining,
     )
 
@@ -118,6 +126,7 @@ def pool(
     shared_configured: int | None = None,
     coming: Sequence[str] = (),
     shared: Sequence[str] = (),
+    preemptable: Sequence[Preemptable] = (),
 ) -> tuple[Pool, list[int]]:
     """A pool whose shared cards are read through a counting `sample`."""
     calls: list[int] = []
@@ -137,6 +146,7 @@ def pool(
             sample=sample,
             shared=frozenset([*free, *shared]),
             coming=list(coming),
+            preemptable=list(preemptable),
         ),
         calls,
     )
@@ -240,31 +250,37 @@ def test_a_shared_card_somebody_else_is_on_still_counts_against_never() -> None:
     assert not isinstance(plan.plan([req("j", 3, borrows=True)], p)[0], Fails)
 
 
-def test_cards_a_stopping_job_hands_back_are_reclaimed_not_assigned() -> None:
-    """The stop in flight covers the gap, so the job is not stuck -- which is
-    what `preempt_for_waiting` asks -- and it holds the free card it will start
-    on, so nothing behind it can take that in the meantime."""
+def test_a_job_the_cards_on_their_way_back_cover_is_not_stuck() -> None:
+    """The stop in flight covers the gap, so `preempt_for_waiting` stops
+    nothing more for it, and no filler takes the card it will start on."""
     p, _ = pool(["a"], owned_configured=2, shared_free=[], coming=["s"], shared=["s"])
     p.shared_configured = p.shared_visible = 1
-    assert plan.plan([req("j", 2, borrows=True), req("k", fills=True)], p) == [
-        Reclaims("j", ["a", "s"], ()),
-        Holds("k", 0, 0, 1),
+    assert plan.plan([req("j", 2, borrows=True), req("f", fills=True)], p) == [
+        Holds("j", 1, 1, 0),
+        Holds("f", 0, 0, 1),
     ]
 
 
-# -- plan: fillers ------------------------------------------------------------
+# -- plan: auto_preempt jobs on held cards -------------------------------------
 
 
-def test_an_auto_preempt_job_fills_a_card_held_for_the_job_ahead() -> None:
+def test_an_auto_preempt_job_takes_a_card_held_for_the_job_ahead() -> None:
     p, _ = pool(["a"], owned_configured=2)
-    assert plan.plan([req("wide", 2), req("plain"), req("filler", fills=True)], p) == [
+    requests = [req("wide", 2), req("plain"), req("filler", fills=True)]
+    assert plan.plan(requests, p) == [
         Holds("wide", 1, 0, 1),
         Holds("plain", 0, 0, 1),
-        Fills("filler", ["a"], ("wide",)),
+        Assigned("filler", ["a"], ("wide",)),
     ]
 
 
-def test_a_filler_too_wide_for_the_held_cards_holds_like_any_other() -> None:
+def test_equal_priority_is_no_bar_to_filling() -> None:
+    p, _ = pool(["a"], owned_configured=2)
+    requests = [req("wide", 2, priority=50), req("filler", priority=50, fills=True)]
+    assert plan.plan(requests, p)[1] == Assigned("filler", ["a"], ("wide",))
+
+
+def test_a_filler_too_wide_for_the_free_cards_holds_like_any_other() -> None:
     p, _ = pool(["a"], owned_configured=3)
     assert plan.plan([req("wide", 3), req("filler", 2, fills=True)], p) == [
         Holds("wide", 1, 0, 2),
@@ -272,55 +288,54 @@ def test_a_filler_too_wide_for_the_held_cards_holds_like_any_other() -> None:
     ]
 
 
-def test_a_running_filler_keeps_its_card_while_the_job_ahead_is_still_short() -> None:
-    p, _ = pool([], owned_configured=2)
-    assert plan.plan([req("wide", 2), req("filler", occupying=["a"])], p) == [
-        Holds("wide", 1, 0, 1),
-        Filling("filler", ("wide",)),
-    ]
-
-
-def test_the_job_ahead_reclaims_a_fillers_card_once_the_rest_arrive() -> None:
-    """And holds the free one, so nothing behind can take it while the filler
-    stops."""
-    p, _ = pool(["b"], owned_configured=2)
-    requests = [req("wide", 2), req("filler", occupying=["a"]), req("next", fills=True)]
+def test_a_job_preemption_will_start_keeps_its_cards_from_fillers() -> None:
+    """Else the filler would be stopped next pass along with the job the wide
+    one is really waiting on."""
+    p, _ = pool(["a"], owned_configured=2, preemptable=[running("cheap", ["b"], priority=80)])
+    requests = [req("wide", 2, priority=10), req("filler", priority=90, fills=True)]
     assert plan.plan(requests, p) == [
-        Reclaims("wide", ["b", "a"], ("filler",)),
-        Filling("filler", ("wide",)),
-        Holds("next", 0, 0, 1),
+        Holds("wide", 1, 0, 1, ("cheap",)),
+        Holds("filler", 0, 0, 1),
     ]
 
 
-def test_a_fillers_card_is_not_on_offer_to_a_job_behind_it() -> None:
-    p, _ = pool(["b"], owned_configured=2)
-    assert plan.plan([req("filler", occupying=["a"]), req("wide", 2)], p) == [
-        Filling("filler", ()),
-        Holds("wide", 1, 0, 1),
+def test_a_job_the_stops_in_flight_cover_keeps_its_cards_from_fillers() -> None:
+    """The stopped filler is queued again right behind: it must not be able to
+    take the card it just gave up, or the next one the one it came back to."""
+    p, _ = pool(["a"], owned_configured=2, coming=["b"])
+    assert plan.plan([req("wide", 2), req("stopped", fills=True)], p) == [
+        Holds("wide", 2, 0, 0),
+        Holds("stopped", 0, 0, 1),
     ]
 
 
-def test_free_cards_are_taken_before_a_filler_is_stopped() -> None:
-    p, _ = pool(["b"], owned_configured=2)
-    assert plan.plan([req("narrow"), req("filler", occupying=["a"])], p) == [
-        Assigned("narrow", ["b"]),
-        Filling("filler", ()),
+def test_only_a_job_behind_is_stopped_for_one_ahead_of_it() -> None:
+    p, _ = pool([], owned_configured=1)
+    ahead = running("20260101-a", ["a"], priority=50)
+    assert plan.plan([req("20260101-b", priority=50)], replace_pool(p, ahead)) == [
+        Holds("20260101-b", 0, 0, 1),
+    ]
+    behind = running("20260101-c", ["a"], priority=50)
+    assert plan.plan([req("20260101-b", priority=50)], replace_pool(p, behind)) == [
+        Holds("20260101-b", 0, 0, 1, ("20260101-c",)),
     ]
 
 
-def test_a_filler_only_takes_a_borrowed_card_if_it_may_borrow() -> None:
+def replace_pool(p: Pool, *preemptable: Preemptable) -> Pool:
+    return dataclasses.replace(p, preemptable=list(preemptable))
+
+
+def test_a_borrowing_filler_takes_a_held_shared_card() -> None:
     p, _ = pool([], owned_configured=1, shared_free=["s"])
-    assert plan.plan(
-        [
-            req("wide", 2, borrows=True),
-            req("plain", fills=True),
-            req("b", fills=True, borrows=True),
-        ],
-        p,
-    ) == [
+    requests = [
+        req("wide", 2, borrows=True),
+        req("plain", fills=True),
+        req("b", fills=True, borrows=True),
+    ]
+    assert plan.plan(requests, p) == [
         Holds("wide", 0, 1, 1),
         Holds("plain", 0, 0, 1),
-        Fills("b", ["s"], ("wide",)),
+        Assigned("b", ["s"], ("wide",)),
     ]
 
 
@@ -474,41 +489,42 @@ def test_project_starts(
     assert not set(projection.starts_in_s) & set(projection.unknown)
 
 
-def test_project_starts_a_filler_on_the_held_card_and_the_wide_job_on_time() -> None:
+def test_project_starts_a_filler_now_and_the_wide_job_when_its_other_card_frees() -> None:
     projection = project(
-        [req("wide", 2, est_min=30), req("filler", fills=True, est_min=120)], owned(0, 60)
+        [req("wide", 2, priority=10, est_min=30), req("filler", priority=90, fills=True)],
+        owned(0, 60),
     )
-    assert minutes(projection) == {"wide": 60.0, "filler": 0.0}
+    assert minutes(projection) == {"filler": 0.0, "wide": 60.0}
 
 
 def test_project_does_not_wait_on_a_running_filler_with_no_estimate() -> None:
-    """Without modelling the filler, its card would never come back and the
-    wide job would have no start at all."""
-    projection = project([req("wide", 2), req("filler", occupying=["o0"])], owned(None, 60))
+    """Without modelling automatic preemption the filler's card never comes
+    back, and the wide job would have no start at all."""
+    filler = (running("filler", ["o0"]), req("filler", priority=90, fills=True))
+    projection = project([req("wide", 2, priority=10)], owned(None, 60), running=[filler])
     assert minutes(projection) == {"wide": 60.0}
-    assert projection.held_for == {"filler": ["wide"]}
+    assert projection.yields_to == {"filler": "wide"}
 
 
-def test_project_hands_back_a_filler_card_it_frees_on_its_own() -> None:
+def test_project_starts_a_stopped_job_again_behind_the_one_it_made_room_for() -> None:
+    cheap = (running("cheap", ["o0"], priority=80), req("cheap", priority=80, est_min=10))
     projection = project(
-        [req("wide", 2, est_min=30), req("filler", occupying=["o0"]), req("next")],
+        [req("urgent", priority=10, est_min=30), req("next", priority=90)],
+        owned(None),
+        running=[cheap],
+    )
+    # `urgent` 0-30, then `cheap` again 30-40, then `next`.
+    assert minutes(projection) == {"urgent": 0.0, "next": 40.0}
+
+
+def test_project_counts_a_filler_that_ends_on_its_own() -> None:
+    filler = (running("filler", ["o0"]), req("filler", priority=90, fills=True))
+    projection = project(
+        [req("wide", 2, priority=10, est_min=30), req("next", priority=20)],
         owned(20, 60),
+        running=[filler],
     )
     assert minutes(projection) == {"wide": 60.0, "next": 90.0}
-
-
-def test_project_frees_the_card_of_a_filler_evicted_for_its_other_one() -> None:
-    """A two-card filler stopped for one of them hands back both, and runs
-    again from the start once there are two."""
-    projection = project(
-        [
-            req("narrow", est_min=10),
-            req("filler", 2, est_min=30, occupying=["o0", "o1"]),
-            req("next"),
-        ],
-        owned(None, None),
-    )
-    assert minutes(projection) == {"narrow": 0.0, "next": 40.0}
 
 
 # -- project: why a job has no start ------------------------------------------

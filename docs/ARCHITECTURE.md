@@ -132,8 +132,6 @@ jobs/<jobid>/
                      #  "isolation": "cgroup"|"pgid", "cgroup_unit": str|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null,          # the runner, from its own claim
-                     #  "filler": bool,                        # launched onto cards held for a job
-                     #                                        # ahead; from the claim
                      #  "util_recent": [float|null, ...],
                      #  "progress_pct": float|null, "progress_error": str|null, "eta": str|null,
                      #  "uploads": [{"to": uri, "output": path|null, "ok_at": str|null, "error": str|null}],
@@ -210,9 +208,8 @@ defaults.
                                         # its last line of stdout is a percentage. See Estimates
   "progress_interval_s": 60,
   "auto_preempt": false,                # let the dispatcher stop this job, as often as it
-                                        # takes, whenever that starts a strictly more
-                                        # important queued one right away; and start
-                                        # it on cards held for a job ahead of it
+                                        # takes, whenever that starts a queued one ahead
+                                        # of it right away; it may take held cards
   "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
   "requeued_from": null                 # the job `gpuc requeue` resubmitted this one from;
@@ -252,28 +249,22 @@ The rules it holds to:
   in `(priority, job_id)` order, the owned cards free now, the configured
   counts, and one nvidia-smi reading of the shared cards taken only if a job
   needs to borrow. Per job it decides assigned, holds, stepped over or fails,
-  and `launch_ready` acts on it every 2 s. The same function is how
-  automatic preemption finds the one job the queue is stuck on, and run
-  forward over the running jobs' etas (`plan.project`) it is how the host
-  says when each queued job will start.
-- **Fillers are decided by that same walk.** An `auto_preempt` job that
-  would hold is launched onto free held cards instead (`plan.Fills`), and its
-  runner records `filler: true` in the claim. A running filler with no stop
-  intent stands in the walk at its own `(priority, job_id)`; its cards are on
-  offer to every job ahead of it, and one that needs them to fit
-  (`plan.Reclaims`) holds them and has the filler preempted. Cards of a job
-  on its way out are on offer the same way (`Pool.coming`), with nobody to
-  stop, so no second filler takes a card the job ahead is waiting on: a
-  stop intent, or a last state written (queued again, or finished) by a
-  runner not yet reaped. A filler spawned but not yet claimed stands in the
-  walk already. A filler is never an automatic-preemption candidate.
+  and, for a job that holds, which running `auto_preempt` jobs would cover its
+  gap; `launch_ready` acts on it every 2 s, and automatic preemption on that
+  set for the first job with a gap. Run forward over the running jobs' etas
+  (`plan.project`) it is how the host says when each queued job will start.
+- **An `auto_preempt` job may take held cards**, launched like any other,
+  unless the holder is *covered*: short of nothing once the cards on their
+  way back arrive, or short only of what the preemption set frees. Cards on
+  their way back are those of a runner with a stop intent, or one whose last
+  state is written (queued again, finished) but which has not been reaped.
 - **Acceptance is a rename.** `gpuc submit` builds the job dir under
   `incoming/`; the host's `enqueue` writes the spec and initial state there
   and renames the dir into `jobs/`. A dir left under `incoming/` an hour after
   its last change is a submit that died, and is removed.
 - **A launch is a spawn; the runner claims the job.** The dispatcher starts
-  `python -m gpuc.host run <id> --gpus <uuids> --attempt <n> [--filler]` and
-  writes nothing; the runner's first act is the compare-and-set from `queued` at that
+  `python -m gpuc.host run <id> --gpus <uuids> --attempt <n>` and writes
+  nothing; the runner's first act is the compare-and-set from `queued` at that
   attempt to `running`. A runner that dies before claiming is failed
   `runner-died` from `queued`.
 - **A card is busy if any runner holds it**: the cards of every runner this
@@ -298,11 +289,11 @@ The rules it holds to:
   finished in between. An attempt that ended on its own first, or was
   cancelled while stopping, ends that way instead. A draining host refuses
   one.
-- **Automatic preemption** (`preempt_for_waiting`, before `launch_ready`): for
+- **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
   `auto_preempt` jobs that together cover the gap, least important first, and
-  only at a strictly higher priority number. Nothing is stopped on a host that
-  is going away.
+  only jobs the waiting one is ahead of in `(priority, job_id)`. Nothing is
+  stopped on a host that is going away.
 - **Reorder** and **estimate** write the job's state and nothing else; the
   spec is never rewritten after enqueue. The control side re-mirrors the spec
   after both; a mirror it cannot write is a warning.
@@ -400,7 +391,8 @@ submitter is [usage.md](usage.md#job-length-estimates).
 - The **host** projects each queued job's start (`plan.project`, published by
   `python -m gpuc.host status` as `starts_in_s`, with `starts_unknown` saying
   why not) by running the dispatch rule forward over the running jobs' etas,
-  a filler's cards coming back when the job ahead reclaims them. A
+  and automatic preemption with it: an `auto_preempt` job's cards come back,
+  and it is queued again, when the job it yields to can start. A
   card held by a job that published no eta is not schedulable, so a job whose
   turn depends on it is unknown; a draining host projects nothing. The control
   side renders the answer and computes nothing.

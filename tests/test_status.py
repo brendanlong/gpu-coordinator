@@ -1152,8 +1152,8 @@ def test_none_in_the_window_counts_the_finished_jobs_the_host_did_not_send() -> 
     assert "none in the last 60 min (12 older)" in render(host_view, since_s=3600.0)
 
 
-def test_a_filler_says_whose_card_it_is_running_on() -> None:
-    """A job at priority 90 running ahead of one at 10, then dying, is not a
+def test_a_running_auto_preempt_job_says_which_job_it_yields_to() -> None:
+    """A job at priority 90 running while one at 10 waits, then dying, is not a
     bug, and the line has to say so."""
     queued, running, _ = job_views(
         payload(
@@ -1163,12 +1163,11 @@ def test_a_filler_says_whose_card_it_is_running_on() -> None:
                     "status": "running",
                     "gpus": [GPU],
                     "auto_preempt": True,
-                    "held_for": ["j-wide"],
+                    "yields_to": "j-wide",
                 },
-                {"job_id": "j-wide", "status": "queued", "held_for": None},
+                {"job_id": "j-wide", "status": "queued", "yields_to": None},
             ]
         )
     )
-    assert running[0].held_for == ["j-wide"] and queued[0].held_for is None
-    text = render(busy(running[0]))
-    assert "auto-preempt, on a card held for j-wide" in text
+    assert running[0].yields_to == "j-wide" and queued[0].yields_to is None
+    assert "auto-preempt, yields to j-wide" in render(busy(running[0]))

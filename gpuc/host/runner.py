@@ -147,20 +147,13 @@ def build_env(
 
 class JobRunner:
     def __init__(
-        self,
-        job_id: str,
-        assigned: Sequence[str],
-        attempt: int,
-        deps: RunnerDeps | None = None,
-        *,
-        filler: bool = False,
+        self, job_id: str, assigned: Sequence[str], attempt: int, deps: RunnerDeps | None = None
     ) -> None:
         self.job_id = job_id
         self.assigned: list[str] = list(assigned)
         self.attempt = attempt
         """The attempt the dispatcher launched this runner for; the claim is
         for exactly that one."""
-        self.filler = filler
         self.deps = deps or RunnerDeps()
         self.spec = jobs.read_spec(job_id)
         self.state = jobs.read_state(job_id)
@@ -492,7 +485,6 @@ class JobRunner:
             runner_pid=pid,
             runner_boot_id=boot_id(),
             runner_starttime=starttime(pid),
-            filler=self.filler,
         )
 
     def _verify_assigned(self) -> str | None:
@@ -839,11 +831,6 @@ class JobRunner:
 
 
 def run_job(
-    job_id: str,
-    assigned: Sequence[str],
-    attempt: int,
-    deps: RunnerDeps | None = None,
-    *,
-    filler: bool = False,
+    job_id: str, assigned: Sequence[str], attempt: int, deps: RunnerDeps | None = None
 ) -> int:
-    return JobRunner(job_id, assigned, attempt, deps, filler=filler).run()
+    return JobRunner(job_id, assigned, attempt, deps).run()

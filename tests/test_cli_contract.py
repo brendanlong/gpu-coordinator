@@ -557,7 +557,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "starts_in_s",
         "starts_at",
         "starts_unknown",
-        "held_for",
+        "yields_to",
         "iso",
         "ended_at",
         "outputs_pending",

@@ -183,8 +183,8 @@ function jobLabel(job) {
     job.auto_preempt && (job.status === "queued" || job.status === "running")
       ? el("span", { class: "muted", title: "stopped and queued again whenever that lets a more important job start" }, " auto-preempt")
       : null,
-    job.held_for && job.held_for.length && job.status === "running"
-      ? el("span", { class: "muted", title: "stopped as soon as that job's other cards arrive" }, `, on a card held for ${job.held_for.join(", ")}`)
+    job.yields_to && job.status === "running"
+      ? el("span", { class: "muted", title: "stopped as soon as that job can start" }, `, yields to ${job.yields_to}`)
       : null,
   );
 }

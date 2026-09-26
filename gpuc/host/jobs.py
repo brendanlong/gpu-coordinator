@@ -520,10 +520,6 @@ class JobState:
     kept_bytes: int | None = None
     """What those kept outputs hold, measured as the checkout went: disk no
     sweep will ever free, which `status` reports so it is not forgotten."""
-    filler: bool = False
-    """This attempt was launched onto cards held for a job ahead of it, and
-    is stopped as soon as a job ahead of it can start on them (`plan`).
-    Written by the runner's claim; a queued state never carries it."""
 
     @staticmethod
     def from_dict(d: Any) -> JobState:
@@ -571,7 +567,6 @@ class JobState:
             ran=as_bool(fields, "ran", True),
             checkout_removed_at=as_opt_str(fields, "checkout_removed_at"),
             kept_bytes=as_opt_int(fields, "kept_bytes"),
-            filler=as_bool(fields, "filler"),
         )
 
     def to_dict(self) -> dict[str, Any]:
