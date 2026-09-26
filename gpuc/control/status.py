@@ -306,7 +306,7 @@ class HostView:
     pod: Pod | None = None
     session: HostSession | None = None
     """The session the answer came over, for a caller with a follow-up
-    question (`submit` and `reorder` ask where the job landed)."""
+    question (`submit` and `set --priority` ask where the job landed)."""
     mirror_prefix: str | None = None
     """The host's own `s3_prefix`, from the config the session read."""
     pkg_commit: str | None = None
@@ -601,7 +601,7 @@ def _fmt_eta(job: JobView) -> str:
     A running job whose host published no `eta` falls back to the estimate the
     same host reports, rendered as a total rather than a remaining time. The
     runner re-reads the estimate every `ESTIMATE_REFRESH_S`, which bounds the
-    window after `gpuc estimate` but does not close it, and inside it `--json`
+    window after `gpuc set --estimate` but does not close it, and inside it `--json`
     carries an estimate the text would otherwise not show -- a scripted caller
     seeing what the operator cannot, which `tests/test_control_e2e.py` pins."""
     remaining = job.eta_seconds
@@ -656,7 +656,7 @@ def _fmt_estimate(job: JobView, *, total: bool = False) -> str:
 
 
 def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
-    """Where one job sits in its host's queue, for `submit` and `reorder` to
+    """Where one job sits in its host's queue, for `submit` and `set --priority` to
     print: the answer to "so when does it run".
 
     Every field is null when the host could not be asked, which is not the same
@@ -693,7 +693,7 @@ def placement_unknown() -> dict[str, Any]:
 
 
 def queue_note(placement: dict[str, Any]) -> str | None:
-    """The one line `submit` and `reorder` print about the queue, or nothing
+    """The one line `submit` and `set --priority` print about the queue, or nothing
     when the host could not be asked (their own output already says so)."""
     if placement.get("dispatched"):
         return "  queue: dispatched already; it is running now"

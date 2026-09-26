@@ -14,10 +14,9 @@ what failed -- `exit_code_of` is the one place that becomes a number, and
 from __future__ import annotations
 
 import json
-import math
 import shlex
 import sys
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -80,7 +79,7 @@ from gpuc.control.skill import SkillError
 from gpuc.control.submit import SubmitError
 from gpuc.control.teardown import TerminateError
 from gpuc.control.transport import TransportError
-from gpuc.host import jobs
+from gpuc.host import settable
 from gpuc.host.jobs import FINISHED_STATUSES
 
 __all__ = [
@@ -1062,7 +1061,7 @@ def job_verbs(
     settings: Settings,
     *,
     args: str = "",
-    mirror: tuple[str, Any] | None = None,
+    mirror: Mapping[str, Any] | None = None,
     ended_is_answer: bool = False,
 ) -> tuple[list[Done], dict[str, HostSession]]:
     """Run one on-host verb against jobs: the path every job command takes.
@@ -1081,9 +1080,9 @@ def job_verbs(
     by the words. An answer with no `status` is an error too: reporting
     success for a job the host never touched is worse than any exception.
 
-    `mirror` is `(spec field, value)`: `requeue` submits what S3 holds, so a
-    priority or estimate changed on the host and not in the mirror would hand
-    a re-run back with the old one, silently. A mirror that cannot be updated
+    `mirror` is the spec fields the verb changed: `requeue` submits what S3
+    holds, so a priority or estimate changed on the host and not in the mirror
+    would hand a re-run back with the old one, silently. A mirror that cannot be updated
     is a warning, never a failure: the change is already where `status` reads
     it, which is what was asked for.
 
@@ -1139,11 +1138,11 @@ def job_verbs(
                 done.update((job.job_id, job) for job in verdicts)
                 if session is not None:
                     sessions[name] = session
-    if mirror is not None:
+    if mirror:
         changed = [job for job in done.values() if job.error is None and job.source == "host"]
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_HOSTS) as pool:
             warnings = pool.map(
-                lambda job: mirror_spec_field(job.job_id, mirror[0], mirror[1], settings), changed
+                lambda job: mirror_spec_fields(job.job_id, mirror, settings), changed
             )
             for job, warning in zip(changed, warnings, strict=True):
                 if warning:
@@ -1237,36 +1236,6 @@ def cancel_jobs(job_ids: Sequence[str], host: str | None, settings: Settings) ->
     return done
 
 
-def check_priority(priority: int) -> None:
-    if not 0 <= priority <= 99:
-        raise UsageError(f"priority must be 0-99 (lower dispatches first), got {priority}")
-
-
-def reorder_jobs(
-    job_ids: Sequence[str], priority: int, host: str | None, settings: Settings
-) -> list[Done]:
-    """Move queued jobs, each with where it now sits in its host's queue."""
-    check_priority(priority)
-    done, sessions = job_verbs(
-        "reorder",
-        job_ids,
-        host,
-        settings,
-        args=f" --priority {priority}",
-        mirror=("priority", priority),
-    )
-    moved = [job for job in done if job.error is None and job.host in sessions]
-    views = {
-        name: status_mod.gather(session.entry, settings, session=session)
-        for name, session in sessions.items()
-        if any(job.host == name for job in moved)
-    }
-    for job in moved:
-        assert job.host is not None
-        job.fields.update(status_mod.queue_placement(views[job.host], job.job_id))
-    return done
-
-
 def preempt_jobs(
     job_ids: Sequence[str], priority: int | None, host: str | None, settings: Settings
 ) -> list[Done]:
@@ -1279,14 +1248,14 @@ def preempt_jobs(
     whichever host you name.
     """
     if priority is not None:
-        check_priority(priority)
+        check_patch({"priority": priority})
     done, _ = job_verbs(
         "preempt",
         job_ids,
         host,
         settings,
         args="" if priority is None else f" --priority {priority}",
-        mirror=None if priority is None else ("priority", priority),
+        mirror=None if priority is None else {"priority": priority},
     )
     return done
 
@@ -1305,31 +1274,14 @@ def placement_after(session: HostSession, job_id: str, settings: Settings) -> di
     return status_mod.queue_placement(view, job_id)
 
 
-def check_estimate(minutes: float | None, *, clear: bool) -> float | None:
-    """The estimate a request asks for, or a usage error before any host is asked."""
-    if clear is (minutes is not None):
-        raise UsageError("give --minutes N or --clear, not both")
-    wanted: float | None = None if clear else minutes
-    if wanted is not None and not wanted > 0.0:
-        raise UsageError(f"--minutes must be a positive number of minutes, got {wanted:g}")
-    if wanted is not None and jobs.utc_in(wanted * 60.0) is None:
-        # An `inf`, or the `1e10` units typo: no date can hold it, so the host
-        # would record it and then publish no eta at all.
-        raise UsageError(f"--minutes {wanted:g} is too far away to be an end time")
-    return wanted
+def check_patch(patch: Mapping[str, Any]) -> None:
+    """A usage error for a patch no job could take, before any host is asked."""
+    error = settable.patch_error(patch)
+    if error is not None:
+        raise UsageError(error)
 
 
-def check_max_runtime(minutes: float | None, *, clear: bool) -> float | None:
-    """The wall-clock limit a request asks for, or a usage error before any
-    host is asked."""
-    if clear is (minutes is not None):
-        raise UsageError("give one of --minutes N or --clear")
-    if minutes is not None and not 0.0 < minutes < math.inf:
-        raise UsageError(f"--minutes must be a positive number of minutes, got {minutes:g}")
-    return minutes
-
-
-def mirror_spec_field(job_id: str, field: str, value: Any, settings: Settings) -> str | None:
+def mirror_spec_fields(job_id: str, fields: Mapping[str, Any], settings: Settings) -> str | None:
     """Put a change made to a job's spec on the host in its mirrored spec too,
     or say why it could not be.
 
@@ -1343,73 +1295,52 @@ def mirror_spec_field(job_id: str, field: str, value: Any, settings: Settings) -
         return None
     try:
         document = s3.get_spec(job_id)
-        document[field] = value
+        document.update(fields)
         s3.put_spec_document(job_id, document)
     except (S3IndexError, S3ObjectMissing, ValueError) as exc:
         return (
-            f"the host has the new {field}, but its mirrored spec still has the old one, "
+            f"the host has the new {', '.join(fields)}, but its mirrored spec still has the "
+            f"old, "
             f"so `gpuc requeue {job_id}` would not carry it: {str(exc).splitlines()[0]}"
         )
     return None
 
 
-def estimate_jobs(
-    job_ids: Sequence[str], wanted: float | None, host: str | None, settings: Settings
+def set_jobs(
+    job_ids: Sequence[str], patch: Mapping[str, Any], host: str | None, settings: Settings
 ) -> list[Done]:
-    """Add, change or clear jobs' `estimated_runtime_min` after submitting them.
+    """Change queued or running jobs' settings (`gpuc.host.settable`), each
+    one all or nothing. A job whose priority moved says where it now sits.
 
-    `wanted` has been through `check_estimate`; None clears the estimate.
+    `patch` maps a settable field to its new value; None clears it.
     """
-    done, _ = job_verbs(
-        "estimate",
-        job_ids,
-        host,
-        settings,
-        args=" --clear" if wanted is None else f" --minutes {wanted!r}",
-        mirror=("estimated_runtime_min", wanted),
+    check_patch(patch)
+    args = "".join(
+        f" --field {shlex.quote(f'{name}={json.dumps(value)}')}" for name, value in patch.items()
     )
+    done, sessions = job_verbs("set", job_ids, host, settings, args=args, mirror=patch)
     for job in done:
         if job.error is not None:
             continue
-        recorded = job.fields.get("estimated_runtime_min")
-        if not (recorded is None if wanted is None else isinstance(recorded, (int, float))):
-            # Otherwise a host whose answer lacks the key reports a successful
-            # *clear* of a job it never touched.
+        unsaid = [name for name in patch if job.fields.get(name, "absent") != patch[name]]
+        if unsaid:
+            # Otherwise a host whose answer lacks a key reports a successful
+            # clear of a job it never touched.
             job.error = (
-                f"host {job.host} did not say what estimate it recorded for {job.job_id}: "
+                f"host {job.host} did not confirm {', '.join(unsaid)} for {job.job_id}: "
                 f"{json.dumps(job.fields)[:200]}"
             )
             job.fields = {}
-    return done
-
-
-def max_runtime_jobs(
-    job_ids: Sequence[str], wanted: float | None, host: str | None, settings: Settings
-) -> list[Done]:
-    """Raise, lower or clear jobs' `max_runtime_min` after submitting them.
-
-    `wanted` has been through `check_max_runtime`; None removes the limit.
-    """
-    done, _ = job_verbs(
-        "max-runtime",
-        job_ids,
-        host,
-        settings,
-        args=" --clear" if wanted is None else f" --minutes {wanted!r}",
-        mirror=("max_runtime_min", wanted),
-    )
-    for job in done:
-        if job.error is not None:
-            continue
-        recorded = job.fields.get("max_runtime_min", "absent")
-        if not (recorded is None if wanted is None else isinstance(recorded, (int, float))):
-            # As for the estimate: a host whose answer lacks the key would
-            # otherwise report a successful clear of a job it never touched.
-            job.error = (
-                f"host {job.host} did not say what limit it recorded for {job.job_id}: "
-                f"{json.dumps(job.fields)[:200]}"
-            )
-            job.fields = {}
+    if "priority" in patch:
+        moved = [job for job in done if job.error is None and job.host in sessions]
+        views = {
+            name: status_mod.gather(session.entry, settings, session=session)
+            for name, session in sessions.items()
+            if any(job.host == name for job in moved)
+        }
+        for job in moved:
+            assert job.host is not None
+            job.fields.update(status_mod.queue_placement(views[job.host], job.job_id))
     return done
 
 

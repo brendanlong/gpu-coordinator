@@ -416,7 +416,7 @@ def test_preempt_refuses_when_it_would_only_re_run_the_same_job(
     wait_until(lambda: finished(home, job_id), 120, "the job to be cancelled")
 
 
-def test_estimate_reaches_a_running_job_and_status_and_json_agree(
+def test_set_reaches_a_running_job_and_status_and_json_agree(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The bug this command exists for: a job submitted without an estimate,
@@ -430,9 +430,10 @@ def test_estimate_reaches_a_running_job_and_status_and_json_agree(
     )
     capsys.readouterr()
 
-    assert main(["estimate", job_id, "--minutes", "150"]) == 0
-    assert "150 min" in capsys.readouterr().out
+    assert main(["set", job_id, "--estimate", "150", "--max-runtime", "600"]) == 0
+    assert "estimate 150 min, max-runtime 600 min" in capsys.readouterr().out
     assert state_of(home, job_id)["estimated_runtime_min"] == pytest.approx(150.0)
+    assert state_of(home, job_id)["max_runtime_min"] == pytest.approx(600.0)
 
     assert main(["status", "--host", "local"]) == 0
     text = capsys.readouterr().out
@@ -444,7 +445,7 @@ def test_estimate_reaches_a_running_job_and_status_and_json_agree(
 
     assert main(["cancel", job_id]) == 0
     wait_until(lambda: finished(home, job_id), 120, "the job to be cancelled")
-    assert main(["estimate", job_id, "--minutes", "10"]) == 1
+    assert main(["set", job_id, "--estimate", "10"]) == 1
     assert "already cancelled" in capsys.readouterr().err
 
 

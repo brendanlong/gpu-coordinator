@@ -99,7 +99,7 @@ function short(commit) {
   return commit ? commit.slice(0, 12) : "unknown";
 }
 
-// The line `gpuc submit` and `gpuc reorder` print about where the job landed.
+// The line `gpuc submit` and `gpuc set --priority` print about where the job landed.
 function queueNote(result) {
   if (result.dispatched) return "dispatched already; it is running now";
   if (result.queue_position === null || result.queue_position === undefined) return "";
@@ -249,65 +249,48 @@ function priorityControl(host, job) {
     onclick: () => {
       const priority = Number.parseInt(input.value, 10);
       if (Number.isNaN(priority)) return;
-      act(button, jobPath(job, "reorder"), { host: host.name, priority }, (r) => {
+      act(button, jobPath(job, "set"), { host: host.name, priority }, (r) => {
         const note = queueNote(r);
         return `job ${job.job_id} on ${r.host} moved to priority ${r.priority}${note ? `; ${note}` : ""}`;
       });
     },
-  }, "Reorder");
+  }, "Set priority");
   return el("span", { class: "actions" }, input, button);
 }
 
-function estimateButton(host, job) {
+// `gpuc set --estimate` and `--max-runtime`: a number of minutes, or blank to clear.
+function minutesButton(host, job, field, label, question, described) {
   const button = el("button", {
     type: "button",
     onclick: () => {
-      const raw = window.prompt(`Estimated runtime for ${job.name || job.job_id}, in minutes (blank clears it):`,
-        job.estimated_runtime_min ?? "");
+      const raw = window.prompt(`${question} for ${job.name || job.job_id}, in minutes from its start (blank clears it):`,
+        job[field] ?? "");
       if (raw === null) return;
       const body = { host: host.name };
       if (raw.trim() === "") {
-        body.clear = true;
+        body[field] = null;
       } else {
         const minutes = Number(raw);
         if (!Number.isFinite(minutes)) {
           notify(`${raw.trim()} is not a number of minutes`, "bad");
           return;
         }
-        body.minutes = minutes;
+        body[field] = minutes;
       }
-      act(button, jobPath(job, "estimate"), body, (r) => (r.estimated_runtime_min === null
-        ? `job ${job.job_id} on ${r.host} no longer estimates a runtime`
-        : `job ${job.job_id} on ${r.host} now estimates ${r.estimated_runtime_min} min`));
+      act(button, jobPath(job, "set"), body, (r) => `job ${job.job_id} on ${r.host} ${described(r[field])}`);
     },
-  }, "Estimate");
+  }, label);
   return button;
 }
 
+function estimateButton(host, job) {
+  return minutesButton(host, job, "estimated_runtime_min", "Estimate", "Estimated runtime",
+    (m) => (m === null ? "no longer estimates a runtime" : `now estimates ${m} min`));
+}
+
 function maxRuntimeButton(host, job) {
-  const button = el("button", {
-    type: "button",
-    onclick: () => {
-      const raw = window.prompt(`Wall-clock limit for ${job.name || job.job_id}, in minutes from its start (blank removes it):`,
-        job.max_runtime_min ?? "");
-      if (raw === null) return;
-      const body = { host: host.name };
-      if (raw.trim() === "") {
-        body.clear = true;
-      } else {
-        const minutes = Number(raw);
-        if (!Number.isFinite(minutes)) {
-          notify(`${raw.trim()} is not a number of minutes`, "bad");
-          return;
-        }
-        body.minutes = minutes;
-      }
-      act(button, jobPath(job, "max-runtime"), body, (r) => (r.max_runtime_min === null
-        ? `job ${job.job_id} on ${r.host} no longer has a wall-clock limit`
-        : `job ${job.job_id} on ${r.host} is now limited to ${r.max_runtime_min} min`));
-    },
-  }, "Limit");
-  return button;
+  return minutesButton(host, job, "max_runtime_min", "Limit", "Wall-clock limit",
+    (m) => (m === null ? "no longer has a wall-clock limit" : `is now limited to ${m} min`));
 }
 
 function table(headers, rows) {

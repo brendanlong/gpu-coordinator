@@ -431,25 +431,26 @@ class JobState:
     a new job id and starts at 1 again; see `JobSpec.requeued_from`."""
     priority: int = 50
     """The priority the job is (or was) ordered by. Starts as the spec's and
-    is what `gpuc reorder` and `gpuc preempt --priority` change; the queue is
+    is what `gpuc set --priority` and `gpuc preempt --priority` change; the queue is
     every `queued` state sorted by `(priority, job_id)`, so this is the one
     copy of it."""
     estimated_runtime_min: float | None = None
-    """The submitter's estimate, as `gpuc estimate` last left it. The spec is
-    never rewritten after enqueue, so the live value is here and the runner
-    re-reads it from here."""
+    """The submitter's estimate, as `gpuc set --estimate` last left it. The
+    spec is never rewritten after enqueue, so the live value is here and the
+    runner re-reads it from here. See `settable` for everything else `set`
+    changes."""
     max_runtime_min: float | None = None
-    """The wall-clock limit in force, as `gpuc max-runtime` last left it; the
-    runner re-reads it like the estimate. Meant only when `live_max_runtime`
-    says so: see `max_runtime`."""
+    """The wall-clock limit in force, as `gpuc set --max-runtime` last left
+    it; the runner re-reads it like the estimate. Meant only when
+    `live_max_runtime` says so: see `max_runtime`."""
     live_max_runtime: bool = False
     """Whether `max_runtime_min` above is the limit, rather than the spec's.
 
     False in a state an earlier build wrote, which never carried the limit:
     there a null would read as "no limit" when the spec has one. It is also
-    how `gpuc max-runtime` tells whether a running job will see the change: a
-    runner from before that command claimed the job with a build that drops
-    this key, and it enforces the limit it started with."""
+    how `gpuc set --max-runtime` tells whether a running job will see the
+    change: a runner from before the limit was live claimed the job with a
+    build that drops this key, and it enforces the limit it started with."""
     reason: str | None = None
     """What ended the job, one word: see usage.md's table."""
     problems: list[str] = field(default_factory=list)

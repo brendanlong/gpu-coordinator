@@ -322,7 +322,7 @@ def test_max_runtime_kills_with_reason_timeout(gpuc_home: Path) -> None:
 
 
 def test_a_raised_max_runtime_reaches_a_running_job(gpuc_home: Path) -> None:
-    """`gpuc max-runtime` writes the state; the runner re-reads it on the
+    """`gpuc set --max-runtime` writes the state; the runner re-reads it on the
     estimate's timer, so a limit raised mid-run is the one it is held to."""
     job_id = prepare(command="sleep 1", max_runtime_min=0.005)
     jobs.update_state(job_id, max_runtime_min=1.0)

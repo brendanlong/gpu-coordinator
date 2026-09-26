@@ -90,7 +90,7 @@ def claim(job_id: str, attempt: int, spec: JobSpec | None = None, **fields: obje
 
     A state an earlier build enqueued gets the spec's wall-clock limit made
     live here, under the same lock as the check: decided from a copy read any
-    earlier, it would undo a `gpuc max-runtime` that landed in between.
+    earlier, it would undo a `gpuc set --max-runtime` that landed in between.
     """
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
@@ -101,13 +101,6 @@ def claim(job_id: str, attempt: int, spec: JobSpec | None = None, **fields: obje
             state.live_max_runtime = True
         jobs.write_state(job_id, jobs.apply_fields(state, fields))
     return True
-
-
-def reorder(job_id: str, priority: int) -> bool:
-    """Move a queued job. False for a job that is not queued, or not here."""
-    if not paths.job_dir(job_id).is_dir():
-        return False
-    return jobs.transition(job_id, expect="queued", priority=priority) is not None
 
 
 def cancel(job_id: str) -> str:
@@ -170,7 +163,7 @@ def preempt(job_id: str, priority: int | None = None) -> str:
         if state.status != "running":
             raise ValueError(
                 f"job {job_id} is {state.status}, not running, so it is already waiting its "
-                f"turn; `gpuc reorder {job_id} --priority N` moves it"
+                f"turn; `gpuc set {job_id} --priority N` moves it"
             )
         if state.intent == CANCEL:
             raise ValueError(f"job {job_id} is already being cancelled, so it is not coming back")

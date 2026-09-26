@@ -2093,7 +2093,7 @@ def test_preempt_asks_the_host_and_repeats_what_it_said(
 def test_preempt_with_a_priority_passes_it_on_and_re_mirrors_the_spec(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same trap as `reorder`: `requeue` submits what the mirror holds, and
+    """Same trap as `set`: `requeue` submits what the mirror holds, and
     would hand the job back at the priority it was pushed off the GPU from."""
     from gpuc.control.s3index import S3Index
 
@@ -2171,7 +2171,7 @@ def test_preempt_refuses_a_priority_outside_the_range(
     assert "0-99" in capsys.readouterr().err
 
 
-def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
+def test_set_priority_json_repeats_the_priority_it_set_and_where_the_job_landed(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A move you cannot see is a move you have to re-check by hand: the
@@ -2183,7 +2183,7 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
         config = HostConfig(host="local", gpus=[GPU])
 
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
-            if args.startswith("reorder"):
+            if args.startswith("set"):
                 return {"jobs": [{"job_id": moved, "status": "queued", "priority": 10}]}
             return {
                 "host": "local",
@@ -2199,7 +2199,7 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
     register_host(name="local", gpus=GPU)
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
-    argv = ["reorder", moved, "--priority", "10", "--host", "local", "--json"]
+    argv = ["set", moved, "--priority", "10", "--host", "local", "--json"]
     assert main(argv) == 0
     document = one_job(capsys)
     assert document["priority"] == 10
@@ -2207,7 +2207,7 @@ def test_reorder_json_repeats_the_priority_it_set_and_where_the_job_landed(
     assert (document["dispatched"], document["starts_in_s"]) == (False, 0.0)
 
 
-def test_estimate_json_repeats_what_the_host_recorded(
+def test_set_estimate_json_repeats_what_the_host_recorded(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register_host(name="local", gpus=GPU)
@@ -2227,17 +2227,17 @@ def test_estimate_json_repeats_what_the_host_recorded(
     )
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
-    argv = ["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local", "--json"]
+    argv = ["set", "20260101-000000-aaaaaa", "--estimate", "150", "--host", "local", "--json"]
     assert main(argv) == 0
     document = one_job(capsys)
     assert document["estimated_runtime_min"] == 150.0 and document["status"] == "running"
     # `check=False`: the host's refusal is a document, and raising on the exit
     # code would throw away the reason it gave.
     assert session.checked == [False]
-    assert session.calls == ["estimate 20260101-000000-aaaaaa --minutes 150.0"]
+    assert session.calls == ["set 20260101-000000-aaaaaa --field estimated_runtime_min=150.0"]
 
 
-def test_estimate_reports_the_hosts_refusal(
+def test_set_estimate_reports_the_hosts_refusal(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register_host(name="local", gpus=GPU)
@@ -2248,11 +2248,11 @@ def test_estimate_reports_the_hosts_refusal(
         "gpuc.control.remote.open_session", lambda *a, **k: as_session(StubSession([payload]))
     )
     capsys.readouterr()
-    assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "5", "--host", "local"]) == 1
+    assert main(["set", "20260101-000000-aaaaaa", "--estimate", "5", "--host", "local"]) == 1
     assert "already succeeded" in capsys.readouterr().err
 
 
-def test_estimate_clear_asks_the_host_to_clear_it(
+def test_set_estimate_clear_asks_the_host_to_clear_it(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register_host(name="local", gpus=GPU)
@@ -2272,12 +2272,12 @@ def test_estimate_clear_asks_the_host_to_clear_it(
     )
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: as_session(session))
     capsys.readouterr()
-    assert main(["estimate", "20260101-000000-aaaaaa", "--clear", "--host", "local"]) == 0
-    assert session.calls == ["estimate 20260101-000000-aaaaaa --clear"]
-    assert "no longer estimates" in capsys.readouterr().out
+    assert main(["set", "20260101-000000-aaaaaa", "--clear-estimate", "--host", "local"]) == 0
+    assert session.calls == ["set 20260101-000000-aaaaaa --field estimated_runtime_min=null"]
+    assert "estimate cleared" in capsys.readouterr().out
 
 
-def test_estimate_refuses_a_host_that_did_not_say_what_it_recorded(
+def test_set_estimate_refuses_a_host_that_did_not_say_what_it_recorded(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Otherwise a build that does not know this command -- or any document
@@ -2291,15 +2291,16 @@ def test_estimate_refuses_a_host_that_did_not_say_what_it_recorded(
         ),
     )
     capsys.readouterr()
-    assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "5", "--host", "local"]) == 1
-    assert "did not say what estimate it recorded" in capsys.readouterr().err
+    assert main(["set", "20260101-000000-aaaaaa", "--estimate", "5", "--host", "local"]) == 1
+    assert "did not confirm estimated_runtime_min" in capsys.readouterr().err
 
 
-def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
+def test_set_updates_the_mirrored_spec_so_requeue_carries_it(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`requeue` submits what the mirror holds, so an estimate left only on the
-    host would be dropped by a re-run without a word."""
+    """`requeue` submits what the mirror holds, so a change left only on the
+    host would be dropped by a re-run without a word. Every field is sent in
+    the one call and mirrored together."""
     from gpuc.control.s3index import S3Index
 
     register_host(name="local", gpus=GPU)
@@ -2319,6 +2320,7 @@ def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
                             {
                                 "job_id": "20260101-000000-aaaaaa",
                                 "estimated_runtime_min": 150.0,
+                                "max_runtime_min": None,
                                 "status": "running",
                             }
                         ]
@@ -2328,13 +2330,16 @@ def test_estimate_updates_the_mirrored_spec_so_requeue_carries_it(
         ),
     )
     capsys.readouterr()
-    assert main(["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local"]) == 0
+    argv = ["set", "20260101-000000-aaaaaa", "--estimate", "150", "--clear-max-runtime"]
+    assert main([*argv, "--host", "local"]) == 0
+    assert "estimate 150 min, max-runtime cleared" in capsys.readouterr().out
     mirrored = S3Index("bucket", s3).get_spec("20260101-000000-aaaaaa")
     assert mirrored["estimated_runtime_min"] == 150.0
+    assert mirrored["max_runtime_min"] is None
     assert mirrored["some_future_field"] == 1
 
 
-def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
+def test_set_priority_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Same trap as the estimate: `requeue` submits what the mirror holds, so a
@@ -2346,7 +2351,7 @@ def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
         config = HostConfig(host="local", gpus=[GPU])
 
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
-            if args.startswith("reorder"):
+            if args.startswith("set"):
                 return {
                     "jobs": [
                         {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
@@ -2363,7 +2368,7 @@ def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     )
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
-    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
+    argv = ["set", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == 0
     mirrored = S3Index("bucket", s3).get_spec("20260101-000000-aaaaaa")
     assert mirrored["priority"] == 5
@@ -2374,7 +2379,7 @@ def test_reorder_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     assert (document["priority"], document["queue_position"]) == (5, None)
 
 
-def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
+def test_set_priority_says_so_when_the_mirror_kept_the_old_priority(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Moved:
@@ -2382,7 +2387,7 @@ def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
         config = HostConfig(host="local", gpus=[GPU])
 
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
-            if args.startswith("reorder"):
+            if args.startswith("set"):
                 return {
                     "jobs": [
                         {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
@@ -2397,13 +2402,13 @@ def test_reorder_says_so_when_the_mirror_kept_the_old_priority(
     )
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
-    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
+    argv = ["set", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == 0
     warnings = one_job(capsys)["warnings"]
     assert isinstance(warnings, list) and "requeue" in warnings[0]
 
 
-def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(
+def test_set_estimate_says_so_when_the_mirror_kept_the_old_estimate(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The host has it, so the command succeeded; but a silent divergence is
@@ -2432,21 +2437,29 @@ def test_estimate_says_so_when_the_mirror_kept_the_old_estimate(
         ),
     )
     capsys.readouterr()
-    argv = ["estimate", "20260101-000000-aaaaaa", "--minutes", "150", "--host", "local", "--json"]
+    argv = ["set", "20260101-000000-aaaaaa", "--estimate", "150", "--host", "local", "--json"]
     assert main(argv) == 0
     warnings = one_job(capsys)["warnings"]
     assert isinstance(warnings, list) and "requeue" in warnings[0]
 
 
 @pytest.mark.parametrize(
-    "flags", [[], ["--minutes", "5", "--clear"], ["--minutes", "0"], ["--minutes", "1e10"]]
+    "flags",
+    [
+        [],
+        ["--estimate", "5", "--clear-estimate"],
+        ["--estimate", "0"],
+        ["--estimate", "1e10"],
+        ["--max-runtime", "inf"],
+        ["--priority", "100"],
+    ],
 )
-def test_estimate_refuses_a_bad_invocation_before_asking_any_host(
+def test_set_refuses_a_bad_invocation_before_asking_any_host(
     control_env: Path, capsys: pytest.CaptureFixture[str], flags: list[str]
 ) -> None:
     register_host(name="local", gpus=GPU)
     capsys.readouterr()
-    assert main(["estimate", "20260101-000000-aaaaaa", "--host", "local", *flags]) == EXIT_USAGE
+    assert main(["set", "20260101-000000-aaaaaa", "--host", "local", *flags]) == EXIT_USAGE
 
 
 def test_pods_json_separates_ours_from_everyone_elses(
@@ -2978,7 +2991,7 @@ def test_an_existing_gpu_overlap_is_refused_until_it_is_fixed(
     assert fake_host.config is not None and fake_host.config["idle_minutes"] == 30.0
 
 
-def test_reorder_refuses_to_report_a_move_the_host_did_not_say_it_made(
+def test_set_priority_refuses_to_report_a_move_the_host_did_not_say_it_made(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A host answer with no `status` (an older build's `{"reordered": true}`
@@ -2987,14 +3000,14 @@ def test_reorder_refuses_to_report_a_move_the_host_did_not_say_it_made(
 
     class Older:
         def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
-            if args.startswith("reorder"):
+            if args.startswith("set"):
                 return {"jobs": [{"job_id": "20260101-000000-aaaaaa", "reordered": True}]}
             raise RemoteError("local", "status", "host is busy")
 
     register_host(name="local", gpus=GPU)
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Older())
     capsys.readouterr()
-    argv = ["reorder", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
+    argv = ["set", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == EXIT_ERROR
     job = one_job(capsys)
     assert "did not say what it did with 20260101-000000-aaaaaa" in str(job["error"])

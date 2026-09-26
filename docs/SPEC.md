@@ -141,7 +141,8 @@ destinations. Adding another of either changes nothing else in this document.
   deliver them terminates anyway. A job whose outputs are not confirmed backed
   up is never deleted automatically on a host that persists.
 - A job may set a wall-clock limit and will be terminated if it exceeds that
-  time.
+  time. The limit can be changed after submit, and on a running job without
+  restarting it.
 - Cancel, preempt and every other kill reap the job's whole process tree,
   using a cgroup where the host provides one and a process group otherwise.
   So does the end of each phase: nothing a phase started outlives it.
@@ -167,8 +168,8 @@ destinations. Adding another of either changes nothing else in this document.
   it runs or after, for as long as its workdir is on the host.
 - **A user can wait for jobs to end**, in one command that reports what
   happened to each and exits with their outcome.
-- **Asking after, fetching, waiting for, cancelling, preempting, reordering
-  and estimating jobs each take any number of job ids** in one command, at a
+- **Asking after, fetching, waiting for, cancelling, preempting and changing
+  jobs each take any number of job ids** in one command, at a
   round trip per host rather than per job.
 - **A command does as much as it can, says what it could not do, and exits
   non-zero if anything failed.** One host that cannot be reached never stops

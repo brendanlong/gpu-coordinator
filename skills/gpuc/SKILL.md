@@ -77,7 +77,7 @@ sync_interval_s: 180               # upload cadence while running, and at the en
 priority: 50                       # 0 first, 99 last. The queue is taken strictly in this
                                    # order: a job that does not fit HOLDS the free cards it is
                                    # waiting for (a `gpus: 0` job needs none, so goes ahead)
-max_runtime_min: 720               # optional wall-clock cap; `gpuc max-runtime` changes it later
+max_runtime_min: 720               # optional wall-clock cap; `gpuc set --max-runtime` changes it later
 estimated_runtime_min: 480         # optional; what `gpuc status` shows the next person
 progress_command: "tail -1 results/progress.txt"   # optional; last stdout line is a percentage
 progress_interval_s: 60            # prints `0.42` or `42%`; a bare `42` is refused; min 5
@@ -124,7 +124,7 @@ Rules that avoid the classic failures:
   12.8 (`--cuda-min` to change it).
 - Say how long the job will take. `progress_command` gives `gpuc status` a
   live end time instead of your guess; a progress command that breaks is
-  ignored, never fatal. `gpuc estimate <jobid> --minutes N` sets an estimate
+  ignored, never fatal. `gpuc set <jobid> --estimate N` sets an estimate
   on a job that is already queued or running.
 
 ## Submit, watch, finish
@@ -153,23 +153,21 @@ gpuc ssh <host|jobid> -- ls -la  # one command, run by a login bash there; gpuc 
                                  # command's own exit code
 gpuc cancel <jobid> [<jobid> ...]
                                  # SIGTERM then SIGKILL of each job's process tree; final sync
-                                 # still runs. cancel, reorder, preempt, estimate and max-runtime take
+                                 # still runs. cancel, preempt and set all take
                                  # several ids: one call per host, one outcome per id
-gpuc reorder <jobid> --priority 10          # queued jobs only; prints the new position and
-                                 # when the job is now expected to start
 gpuc preempt <jobid> --priority 60          # running jobs only: stop it and queue it again
                                  # under the same id. It RE-RUNS FROM THE START in the same
                                  # workdir. QUEUE THE OTHER JOB FIRST: this is refused (exit 1)
                                  # unless a job waiting for cards would be dispatched ahead of the
                                  # preempted job, and at the SAME priority the preempted job
                                  # wins the tie, so --priority is how you put it behind
-gpuc estimate <jobid> --minutes 150
-                                 # set estimated_runtime_min on a queued or running job
-                                 # (--clear removes it)
-gpuc max-runtime <jobid> --minutes 600
-                                 # raise (or lower, or --clear) max_runtime_min on a queued or
-                                 # running job, WITHOUT restarting it; a running job picks it up
-                                 # within a minute. Never preempt just to change the limit
+gpuc set <jobid> --priority 10 --estimate 150 --max-runtime 600
+                                 # change a submitted job WITHOUT restarting it; any subset of
+                                 # the flags, all applied or none. --priority: queued jobs only,
+                                 # prints the new position and start. --estimate/--max-runtime:
+                                 # queued or running; a running job picks them up within a
+                                 # minute (--clear-estimate / --clear-max-runtime remove them).
+                                 # Never preempt just to change the limit
 gpuc requeue <jobid> --host <host>
                                  # re-run from the mirrored spec as a new job; needs s3_bucket
                                  # set, and re-syncs the workdir from your current directory
@@ -280,7 +278,7 @@ unchanged by the flag. Prefer it to scraping any of the text output.
 | `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
 | `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` uses, plus `host`, `source` (`host` or `mirror`) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say. Exit 1 unless every job succeeded |
 | `status <jobid> ...` | `wait`'s document as things stand now. Exit 4 if an id is unknown, 1 if any other job has an `error`, else 0 however the jobs went |
-| `cancel`, `preempt`, `reorder`, `estimate`, `max-runtime` | `{jobs[], errors[]}`, one entry per id: `{job_id, host, source, error, warnings[]}` plus `status` and the verb's own fields (`priority`; `estimated_runtime_min`; `max_runtime_min`; `reorder` adds the queue fields of `submit`). **Check `error`**: when it is set the host did not confirm the change, and the verb's fields are absent. A `warnings` entry means the mirrored spec kept the old value, so a `requeue` would not carry it. Exit 4 if an id is unknown, else 1 if any `error` |
+| `cancel`, `preempt`, `set` | `{jobs[], errors[]}`, one entry per id: `{job_id, host, source, error, warnings[]}` plus `status` and the verb's own fields (`priority`; each field `set` changed, and with `priority` the queue fields of `submit`). **Check `error`**: when it is set the host did not confirm the change, and the verb's fields are absent. A `warnings` entry means the mirrored spec kept the old value, so a `requeue` would not carry it. Exit 4 if an id is unknown, else 1 if any `error` |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
 | `host list` | `{hosts[], errors[]}` |

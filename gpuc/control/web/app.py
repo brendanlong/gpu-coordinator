@@ -36,26 +36,23 @@ from gpuc.control.actions import (
     Answer,
     UsageError,
     cancel_jobs,
-    check_estimate,
-    check_max_runtime,
     config_document,
-    estimate_jobs,
     exit_code_for,
     failure_message,
     hosts_document,
     jobs_answer,
-    max_runtime_jobs,
     preempt_jobs,
     read_log,
     registry_answer,
     remove_host,
-    reorder_jobs,
+    set_jobs,
     status,
     version_document,
 )
 from gpuc.control.config import Settings, load_settings, read_registry, utc_now
 from gpuc.control.exits import http_status
 from gpuc.control.web.auth import SESSION_COOKIE, SESSION_TTL_S, Sessions, read_password_hash
+from gpuc.host import settable as settable_mod
 from gpuc.host.jobs import SCHEMA_VERSION
 
 DEFAULT_BIND = "127.0.0.1"
@@ -187,15 +184,8 @@ class Dashboard:
             ("GET", re.compile(r"^/api/version$"), Dashboard.api_version, True),
             ("GET", re.compile(r"^/api/jobs/([^/]+)/logs$"), Dashboard.api_logs, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/cancel$"), Dashboard.api_cancel, True),
-            ("POST", re.compile(r"^/api/jobs/([^/]+)/reorder$"), Dashboard.api_reorder, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/preempt$"), Dashboard.api_preempt, True),
-            ("POST", re.compile(r"^/api/jobs/([^/]+)/estimate$"), Dashboard.api_estimate, True),
-            (
-                "POST",
-                re.compile(r"^/api/jobs/([^/]+)/max-runtime$"),
-                Dashboard.api_max_runtime,
-                True,
-            ),
+            ("POST", re.compile(r"^/api/jobs/([^/]+)/set$"), Dashboard.api_set, True),
             ("POST", re.compile(r"^/api/hosts/([^/]+)/remove$"), Dashboard.api_host_remove, True),
         ]
 
@@ -325,16 +315,6 @@ class Dashboard:
             jobs_answer(cancel_jobs([job_id], host_of(body), self.load_settings()))
         )
 
-    def api_reorder(self, request: Request) -> Response:
-        job_id = job_id_of(request)
-        body = request.json()
-        priority = body.get("priority")
-        if isinstance(priority, bool) or not isinstance(priority, int):
-            raise UsageError("reorder needs an integer `priority` (0-99)")
-        return Response.answer(
-            jobs_answer(reorder_jobs([job_id], priority, host_of(body), self.load_settings()))
-        )
-
     def api_preempt(self, request: Request) -> Response:
         job_id = job_id_of(request)
         body = request.json()
@@ -345,34 +325,13 @@ class Dashboard:
             jobs_answer(preempt_jobs([job_id], priority, host_of(body), self.load_settings()))
         )
 
-    def api_estimate(self, request: Request) -> Response:
+    def api_set(self, request: Request) -> Response:
+        """`gpuc set`: the body names the fields to change, and a null clears one."""
         job_id = job_id_of(request)
         body = request.json()
-        minutes = body.get("minutes")
-        if minutes is not None and (
-            isinstance(minutes, bool) or not isinstance(minutes, (int, float))
-        ):
-            raise UsageError("estimate needs a number of `minutes`, or `clear: true`")
-        wanted = check_estimate(
-            None if minutes is None else float(minutes), clear=bool(body.get("clear"))
-        )
+        patch = {name: body[name] for name in settable_mod.BY_FIELD if name in body}
         return Response.answer(
-            jobs_answer(estimate_jobs([job_id], wanted, host_of(body), self.load_settings()))
-        )
-
-    def api_max_runtime(self, request: Request) -> Response:
-        job_id = job_id_of(request)
-        body = request.json()
-        minutes = body.get("minutes")
-        if minutes is not None and (
-            isinstance(minutes, bool) or not isinstance(minutes, (int, float))
-        ):
-            raise UsageError("max-runtime needs a number of `minutes`, or `clear: true`")
-        wanted = check_max_runtime(
-            None if minutes is None else float(minutes), clear=bool(body.get("clear"))
-        )
-        return Response.answer(
-            jobs_answer(max_runtime_jobs([job_id], wanted, host_of(body), self.load_settings()))
+            jobs_answer(set_jobs([job_id], patch, host_of(body), self.load_settings()))
         )
 
 

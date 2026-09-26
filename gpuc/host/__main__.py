@@ -28,6 +28,7 @@ from gpuc.host import (
     runner,
     storage,
 )
+from gpuc.host import settable as settable_mod
 from gpuc.host.jobs import JobSpec, JobState
 
 
@@ -373,7 +374,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def _preempt(job_id: str, priority: int | None) -> dict[str, Any]:
-    """The error document rather than a traceback, like `estimate`: which job
+    """The error document rather than a traceback, like `set`: which job
     this host will not preempt, and why, is the whole answer the control side
     needs."""
     try:
@@ -399,140 +400,6 @@ def cmd_preempt(args: argparse.Namespace) -> int:
     )
 
 
-def _reorder(job_id: str, priority: int) -> dict[str, Any]:
-    """`{"job_id", "status", "priority"}`, or `{"job_id", "error"}` for a job
-    that is not queued, like `preempt` and `estimate` answer."""
-    if queue.reorder(job_id, priority):
-        return {"job_id": job_id, "status": "queued", "priority": priority}
-    state = _state_or_none(job_id)
-    if state is None:
-        return _no_such_job(job_id, f"no job {job_id} on this host")
-    why = f"job {job_id} is not queued (status {state.status}); only a queued job can be reordered"
-    return {"job_id": job_id, "error": why}
-
-
-def cmd_reorder(args: argparse.Namespace) -> int:
-    return _answer([_reorder(job_id, args.priority) for job_id in dict.fromkeys(args.job_ids)])
-
-
-def _estimate_error(job_id: str, minutes: float | None) -> str | None:
-    """Why this host will not record this estimate, or None."""
-    if minutes is not None and not minutes > 0.0:
-        return f"an estimate must be a positive number of minutes, got {minutes!r}"
-    if minutes is not None and jobs.utc_in(minutes * 60.0) is None:
-        # `1e10` -- the units typo `utc_in` already defends the runner against
-        # -- is not an end time any date can hold, so the runner would publish
-        # no eta and this command would have reported success for nothing.
-        return f"an estimate of {minutes:g} minutes is too far away to be an end time"
-    try:
-        state = jobs.read_state(job_id)
-    except (RuntimeError, FileNotFoundError) as exc:
-        return f"could not read the state of {job_id}: {exc}"
-    if state.finished:
-        # Nothing would ever show it: `eta` is a live job's business, and the
-        # status line of a finished job says how long it actually took.
-        return f"job {job_id} has already {state.status}, so an estimate cannot change anything"
-    return None
-
-
-def _estimate(job_id: str, minutes: float | None) -> dict[str, Any]:
-    """Set (or clear) `estimated_runtime_min` on a job that is already here.
-
-    A running job's runner re-reads its state on a timer, so this reaches it
-    without any message passing: see `runner.ESTIMATE_REFRESH_S`.
-    """
-    if not paths.job_dir(job_id).is_dir():
-        return _no_such_job(job_id, f"no job with that id on this host: {job_id}")
-    error = _estimate_error(job_id, minutes)
-    if error is not None:
-        return {"job_id": job_id, "error": error}
-    state = jobs.transition(job_id, expect=("queued", "running"), estimated_runtime_min=minutes)
-    if state is None:
-        return {"job_id": job_id, "error": f"job {job_id} finished as this ran"}
-    return {
-        "job_id": job_id,
-        "estimated_runtime_min": minutes,
-        "status": state.status,
-        "warning": _outlives_its_limit(minutes, state.max_runtime(_spec(job_id))),
-    }
-
-
-def _outlives_its_limit(estimate: float | None, limit: float | None) -> str | None:
-    """The contradiction `submit` warns about, and the only place anyone will
-    see it before the job dies as `timeout`."""
-    if estimate is None or limit is None or estimate <= limit:
-        return None
-    return (
-        f"estimated_runtime_min ({estimate:g}) is longer than this job's "
-        f"max_runtime_min ({limit:g}), so it expects to be killed as "
-        f"`timeout` before it finishes"
-    )
-
-
-def _running_for_s(state: JobState) -> float | None:
-    if state.started_at is None:
-        return None
-    try:
-        return (datetime.now(UTC) - datetime.fromisoformat(state.started_at)).total_seconds()
-    except (ValueError, TypeError):
-        return None
-
-
-def _max_runtime_error(job_id: str, minutes: float | None) -> str | None:
-    """Why this host will not set this wall-clock limit, or None."""
-    if minutes is not None and not (0.0 < minutes < float("inf")):
-        return f"a wall-clock limit must be a positive number of minutes, got {minutes!r}"
-    try:
-        state = jobs.read_state(job_id)
-    except (RuntimeError, FileNotFoundError) as exc:
-        return f"could not read the state of {job_id}: {exc}"
-    if state.finished:
-        return f"job {job_id} has already {state.status}, so its limit cannot change anything"
-    if state.status != "running":
-        return None
-    if not state.live_max_runtime:
-        return (
-            f"job {job_id} was started by a gpuc build that reads max_runtime_min only "
-            f"at start, so it keeps the limit it has; `gpuc preempt` runs it again "
-            f"from the start under this build, which would honour a new one"
-        )
-    elapsed = _running_for_s(state)
-    if minutes is not None and elapsed is not None and minutes * 60.0 <= elapsed:
-        # Almost certainly a units slip, and it would throw the run away as
-        # `timeout` within a minute. Stopping it on purpose is `gpuc cancel`.
-        return (
-            f"job {job_id} has been running {elapsed / 60.0:.0f} min, so a limit of "
-            f"{minutes:g} min would end it at once as `timeout`; `gpuc cancel` stops it"
-        )
-    return None
-
-
-def _max_runtime(job_id: str, minutes: float | None) -> dict[str, Any]:
-    """Set (or clear) the wall-clock limit of a job that is already here.
-
-    The state's copy is the one in force (`JobState.live_max_runtime`), and a
-    running job's runner re-reads it with the estimate. Lowering is allowed
-    too: the limit is the submitter's to set, and the only lowering refused is
-    one that would kill the job on the spot.
-    """
-    if not paths.job_dir(job_id).is_dir():
-        return _no_such_job(job_id, f"no job with that id on this host: {job_id}")
-    error = _max_runtime_error(job_id, minutes)
-    if error is not None:
-        return {"job_id": job_id, "error": error}
-    state = jobs.transition(
-        job_id, expect=("queued", "running"), max_runtime_min=minutes, live_max_runtime=True
-    )
-    if state is None:
-        return {"job_id": job_id, "error": f"job {job_id} finished as this ran"}
-    return {
-        "job_id": job_id,
-        "max_runtime_min": minutes,
-        "status": state.status,
-        "warning": _outlives_its_limit(state.estimated_runtime_min, minutes),
-    }
-
-
 def _fetch_list(job_id: str, wanted: list[str]) -> dict[str, Any]:
     if not paths.job_dir(job_id).is_dir():
         return _no_such_job(job_id, f"no such job: {job_id}")
@@ -553,14 +420,35 @@ def cmd_fetch_list(args: argparse.Namespace) -> int:
     return _answer([_fetch_list(job_id, args.path) for job_id in dict.fromkeys(args.job_ids)])
 
 
-def cmd_estimate(args: argparse.Namespace) -> int:
-    minutes = None if args.clear else args.minutes
-    return _answer([_estimate(job_id, minutes) for job_id in dict.fromkeys(args.job_ids)])
+def _patch(fields: Sequence[str]) -> dict[str, Any]:
+    """`--field name=<json>` pairs as a patch; a JSON `null` clears a field."""
+    patch: dict[str, Any] = {}
+    for item in fields:
+        name, sep, raw = item.partition("=")
+        if not sep:
+            raise SystemExit(f"--field wants name=<json value>, got {item!r}")
+        try:
+            value = json.loads(raw)
+        except ValueError as exc:
+            raise SystemExit(f"--field {name}: {raw!r} is not JSON: {exc}") from exc
+        settable = settable_mod.BY_FIELD.get(name)
+        if settable is not None and settable.kind is int and isinstance(value, float):
+            value = int(value) if value == int(value) else value
+        patch[name] = value
+    return patch
 
 
-def cmd_max_runtime(args: argparse.Namespace) -> int:
-    minutes = None if args.clear else args.minutes
-    return _answer([_max_runtime(job_id, minutes) for job_id in dict.fromkeys(args.job_ids)])
+def cmd_set(args: argparse.Namespace) -> int:
+    """Change queued or running jobs' settings: see `settable.apply`.
+
+    A patch no job could take is one refusal per job rather than an argparse
+    error, so the control side reads the reason like any other."""
+    patch = _patch(args.field)
+    error = settable_mod.patch_error(patch)
+    ids = dict.fromkeys(args.job_ids)
+    if error is not None:
+        return _answer([{"job_id": job_id, "error": error} for job_id in ids])
+    return _answer([settable_mod.apply(job_id, patch) for job_id in ids])
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -676,24 +564,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preempt.set_defaults(func=cmd_preempt)
 
-    reorder = sub.add_parser("reorder", help="change queued jobs' priority")
-    reorder.add_argument("job_ids", nargs="+", metavar="job_id")
-    reorder.add_argument("--priority", type=int, required=True)
-    reorder.set_defaults(func=cmd_reorder)
-
-    estimate = sub.add_parser("estimate", help="set queued or running jobs' runtime estimate")
-    estimate.add_argument("job_ids", nargs="+", metavar="job_id")
-    wanted = estimate.add_mutually_exclusive_group(required=True)
-    wanted.add_argument("--minutes", type=float)
-    wanted.add_argument("--clear", action="store_true", help="remove the estimate instead")
-    estimate.set_defaults(func=cmd_estimate)
-
-    max_runtime = sub.add_parser("max-runtime", help="set queued or running jobs' wall-clock limit")
-    max_runtime.add_argument("job_ids", nargs="+", metavar="job_id")
-    limit = max_runtime.add_mutually_exclusive_group(required=True)
-    limit.add_argument("--minutes", type=float)
-    limit.add_argument("--clear", action="store_true", help="remove the limit instead")
-    max_runtime.set_defaults(func=cmd_max_runtime)
+    set_ = sub.add_parser("set", help="change queued or running jobs' settings")
+    set_.add_argument("job_ids", nargs="+", metavar="job_id")
+    set_.add_argument(
+        "--field",
+        action="append",
+        required=True,
+        metavar="NAME=JSON",
+        help="a field and its new value as JSON; null clears it",
+    )
+    set_.set_defaults(func=cmd_set)
 
     fetch_list = sub.add_parser("fetch", help="list the files `gpuc fetch` copies; changes nothing")
     fetch_list.add_argument("job_ids", nargs="+", metavar="job_id")

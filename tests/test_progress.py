@@ -243,7 +243,7 @@ def test_estimated_runtime_min_publishes_an_eta_from_the_first_phase(gpuc_home: 
 def test_an_estimate_added_while_the_job_runs_becomes_an_eta(gpuc_home: Path) -> None:
     """The case the whole command exists for: the long job already running when
     the next person arrives is the one nobody could estimate in time. The spec
-    is written once, so `gpuc estimate` puts the new figure in the state and
+    is written once, so `gpuc set` puts the new figure in the state and
     the runner re-reads it from there."""
     job_id = prepare(command="sleep 0.6")
     seen: list[str | None] = []

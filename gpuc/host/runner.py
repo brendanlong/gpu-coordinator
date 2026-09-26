@@ -51,7 +51,7 @@ ESTIMATE_REFRESH_S = 30.0
 """How often the monitor re-reads the job's estimate and wall-clock limit
 while it runs.
 
-`gpuc estimate` and `gpuc max-runtime` change the state of a job that is
+`gpuc set --estimate` and `--max-runtime` change the state of a job that is
 already running, and the values loaded at job start would never see them --
 which is the job that most needs them: nobody can add an end time before it
 started, and a limit that turns out too tight is found out while it runs."""
