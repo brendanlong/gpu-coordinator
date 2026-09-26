@@ -136,9 +136,6 @@ def test_a_claim_is_for_one_attempt(gpuc_home: Path) -> None:
     assert queue.claim(job_id, 2, status="running")
 
 
-# -- reordering ---------------------------------------------------------------
-
-
 # -- cancelling ---------------------------------------------------------------
 
 

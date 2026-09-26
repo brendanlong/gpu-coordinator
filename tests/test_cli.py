@@ -2374,7 +2374,7 @@ def test_set_priority_updates_the_mirrored_spec_so_requeue_carries_the_new_prior
     assert mirrored["priority"] == 5
     assert mirrored["some_future_field"] == 1
     # The host could not be asked where the job landed, which is a document of
-    # nulls and never a failed reorder.
+    # nulls and never a failed set.
     document = one_job(capsys)
     assert (document["priority"], document["queue_position"]) == (5, None)
 

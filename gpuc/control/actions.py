@@ -79,7 +79,7 @@ from gpuc.control.skill import SkillError
 from gpuc.control.submit import SubmitError
 from gpuc.control.teardown import TerminateError
 from gpuc.control.transport import TransportError
-from gpuc.host import settable
+from gpuc.host import jobs, settable
 from gpuc.host.jobs import FINISHED_STATUSES
 
 __all__ = [
