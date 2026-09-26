@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from snakemake_executor_plugin_gpuc import job_name, truthy
+from snakemake_executor_plugin_gpuc import GpucError, job_name, truthy
 from tests.conftest import install_fake_torch
 from tests.test_control_e2e import bootstrapped_home, state_of, wait_until
 
@@ -298,6 +298,7 @@ def killed_mid_job(bootstrapped_home: Path, project: Path, results: Path, second
         if "as gpuc job" in line:
             job_id = line.split("gpuc job ")[1].split()[0]
             break
+    assert job_id, "the controller never submitted"
     wait_until(lambda: state_of(bootstrapped_home, job_id).get("phase") == "main", 60, "phase main")
     controller.kill()
     controller.communicate(timeout=30)
@@ -322,7 +323,7 @@ def test_a_restarted_controller_adopts_a_running_job(
 ) -> None:
     results = tmp_path / "results"
     results.mkdir()
-    job_id = killed_mid_job(bootstrapped_home, project, results, 8)
+    job_id = killed_mid_job(bootstrapped_home, project, results, 20)
     assert state_of(bootstrapped_home, job_id).get("status") == "running"
 
     again = restart(project, results)
@@ -355,6 +356,29 @@ def test_a_restarted_controller_keeps_what_a_job_finished_while_it_was_down(
     assert "Nothing to be done" in settled.stderr, settled.stderr[-4000:]
 
 
+def test_a_restarted_controller_replaces_a_job_whose_rule_changed(
+    bootstrapped_home: Path, project: Path, tmp_path: Path
+) -> None:
+    results = tmp_path / "results"
+    results.mkdir()
+    stale = killed_mid_job(bootstrapped_home, project, results, 60)
+    snakefile = project / "Snakefile"
+    snakefile.write_text(snakefile.read_text().replace("sleep 60", "sleep 1"))
+    subprocess.run(["git", "commit", "-qam", "faster"], cwd=project, check=True)
+
+    again = restart(project, results)
+    assert again.returncode == 0, again.stderr[-4000:]
+    assert f"Not adopting gpuc job {stale}" in again.stderr, again.stderr[-4000:]
+    fresh = submitted_ids(again.stderr)
+    assert len(fresh) == 1 and fresh != [stale], again.stderr[-4000:]
+    assert (results / "slow.txt").read_text().strip() == fresh[0]
+    wait_until(
+        lambda: state_of(bootstrapped_home, stale).get("status") == "cancelled",
+        60,
+        f"job {stale} to be cancelled",
+    )
+
+
 def test_an_earlier_job_is_adopted_unless_it_ended_badly() -> None:
     from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 
@@ -373,9 +397,14 @@ def test_an_earlier_job_is_adopted_unless_it_ended_badly() -> None:
         "far": ["old-far"],
         "redo": ["old-failed", "old-lost"],
         "fresh": [],
+        "stale": ["old-run", "old-far", "old-failed"],
     }
     executor = Executor.__new__(Executor)
     executor.earlier = answers  # type: ignore[assignment]
+    executor.earlier_failure = None
+    executor.unlike = lambda job, _id: "changed" if job.jobid == "stale" else None  # type: ignore[method-assign]
+    cancelled: list[str] = []
+    executor.cancel_ids = cancelled.extend  # type: ignore[method-assign]
     executor.in_flight = {}
     executor.in_flight_lock = threading.Lock()
     executor.logger = SimpleNamespace(info=lambda _msg: None)  # type: ignore[assignment]
@@ -400,5 +429,29 @@ def test_an_earlier_job_is_adopted_unless_it_ended_badly() -> None:
         "far": "polled old-far",
         "redo": "submit",
         "fresh": "submit",
+        "stale": "submit",
     }
     assert sorted(executor.in_flight) == ["old-far", "old-run"]
+    assert sorted(cancelled) == ["old-far", "old-run"]
+
+
+def test_a_job_with_an_earlier_one_fails_when_gpuc_cannot_be_asked() -> None:
+    from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
+
+    from snakemake_executor_plugin_gpuc import Executor
+
+    executor = Executor.__new__(Executor)
+    executor.gpuc = lambda *_a, **_k: (_ for _ in ()).throw(GpucError("exit 3"))  # type: ignore[method-assign]
+    executor.workflow = SimpleNamespace(  # type: ignore[assignment]
+        persistence=SimpleNamespace(external_jobids=lambda job: ["old"] if job.jobid else [])
+    )
+    marked, unmarked = SimpleNamespace(jobid=1), SimpleNamespace(jobid=0)
+    for job in (marked, unmarked):
+        job.is_group = lambda: False
+    executor.earlier, executor.earlier_failure = executor.earlier_jobs([marked, unmarked])  # type: ignore[list-item]
+    errors: list[str] = []
+    executor.report_job_error = lambda _info, msg=None, **_k: errors.append(str(msg))  # type: ignore[method-assign]
+
+    assert executor.adopt(marked, SubmittedJobInfo(marked, aux={}))  # type: ignore[arg-type]
+    assert not executor.adopt(unmarked, SubmittedJobInfo(unmarked, aux={}))  # type: ignore[arg-type]
+    assert len(errors) == 1 and "exit 3" in errors[0]

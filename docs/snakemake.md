@@ -121,12 +121,24 @@ A job with a marker is then settled against the gpuc job it names, in one
 | queued or running | polls it as if it had submitted it |
 | succeeded | reports the Snakemake job done, keeping its outputs |
 | its host could not be asked | polls it until the host answers |
-| failed, cancelled, or no host has it | submits the job again |
+| failed, cancelled, or no host or mirror has it | submits the job again |
+
+Only a gpuc job that ran what the job would run now is adopted: the same rule
+code (script or notebook included), params, shell command, input and output
+paths and config, with no input newer than its submit. The plugin records
+that in `.snakemake/auxiliary/gpuc/` when it submits. A job that differs, or
+that `-F`, `-R` or `-f` forces, is submitted again, and its old gpuc job is
+cancelled if it is still queued or running. So is every job under
+`--immediate-submit`. If `gpuc status` itself fails, every job with a marker
+fails rather than risk running twice; restart again once gpuc works.
 
 `--rerun-incomplete` deletes nothing on the controller: under this executor
 an incomplete job's outputs are removed only by the job that is submitted to
-replace them. Without it Snakemake refuses to start, and without `--unlock`
-it refuses the lock the killed controller held.
+replace them. Without it Snakemake refuses to start while an incomplete job's
+outputs exist. Without `--unlock` it refuses the lock the killed controller
+held. **Unlock only once the old controller is dead**: the lock is what stops
+two controllers running at once, and two would each submit every job that
+becomes ready.
 
 So a supervisor (a restart loop, a systemd user unit) can restart the
 controller unattended. Bound its restarts: a job that fails on its own fails
