@@ -484,7 +484,8 @@ def test_a_finished_job_reports_its_mean_utilization() -> None:
     assert "cpu (j-cpu) succeeded 1h ago\n" in text + "\n"
     finished = {job["job_id"]: job for job in host_json(host_view)["finished"]}
     assert (finished["j-sweep"]["util_mean"], finished["j-sweep"]["util_samples"]) == (22.0, 700)
-    assert (finished["j-cpu"]["util_mean"], finished["j-cpu"]["util_samples"]) == (None, 0)
+    # A host that did not say is not a host that sampled nothing.
+    assert (finished["j-cpu"]["util_mean"], finished["j-cpu"]["util_samples"]) == (None, None)
 
 
 def test_problems_and_upload_errors_reach_the_json() -> None:

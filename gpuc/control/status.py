@@ -104,11 +104,12 @@ class JobView:
     ended_at: str | None = None
     util_recent: list[float] = field(default_factory=list)
     util_sum: float = 0.0
-    util_samples: int = 0
+    util_samples: int | None = None
     """Every good `main`-phase sample of the attempt, summed and counted: what
     says how busy a finished job kept its cards, long after `util_recent` has
     rotated out. The count travels with the mean so 22% over 700 samples can
-    be told from 22% over 3."""
+    be told from 22% over 3. None from a host whose build does not count, which
+    is not the same answer as a job that was never sampled."""
     progress_pct: float | None = None
     """How far along the job's own `progress_command` last said it was."""
     eta: str | None = None
@@ -173,7 +174,7 @@ class JobView:
 
     @property
     def util_mean(self) -> float | None:
-        return self.util_sum / self.util_samples if self.util_samples > 0 else None
+        return self.util_sum / self.util_samples if self.util_samples else None
 
     @property
     def eta_seconds(self) -> float | None:
@@ -453,7 +454,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
                 float(u) for u in entry.get("util_recent") or [] if isinstance(u, (int, float))
             ],
             util_sum=_as_float(entry.get("util_sum")) or 0.0,
-            util_samples=_as_int(entry.get("util_samples")) or 0,
+            util_samples=_as_int(entry.get("util_samples")),
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
@@ -588,11 +589,11 @@ def _fmt_util(job: JobView, *, source: bool = False) -> str:
     return f"util --{tag}" if job.last_util is None else f"util {job.last_util:.0f}%{tag}"
 
 
-def _fmt_util_mean(job: JobView) -> str:
+def fmt_util_mean(job: JobView) -> str:
     """`, avg util 22% on 1 gpu`: a measurement, not a verdict -- whether 22%
     is low depends on what the job was meant to do, which only its owner
     knows. Nothing for a job with no good sample (no card, or never reached
-    `main`)."""
+    `main`). Shared with `gpuc wait`, where a user learns how a job ended."""
     mean = job.util_mean
     if mean is None:
         return ""
@@ -884,7 +885,7 @@ def _finished_lines(view: HostView, *, recent: int, since_s: float | None) -> li
         lines.append(
             f"  done    {job_label(job)} {job.status}"
             f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}"
-            f"{_fmt_util_mean(job)}{flag}"
+            f"{fmt_util_mean(job)}{flag}"
         )
     if since_s is not None and not finished and view.finished_total:
         lines.append(

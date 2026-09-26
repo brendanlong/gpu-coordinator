@@ -70,8 +70,9 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     carry their current memory and utilization too, because whether one is
     borrowable is a fact about this second that only nvidia-smi here can answer
     -- and when it is not, the numbers are how somebody sees why. Owned cards
-    carry the same readings, from the same call, as the live answer to how hard
-    each card is working. The same
+    carry the same readings, as the live answer to how hard each card is
+    working, from a call of their own: one owned card nvidia-smi cannot read
+    must not blank the shared ones the dispatcher would still borrow. The same
     `gpus.resolve` the dispatcher decides with, over one reading; a driver
     that will not answer reads as every entry unavailable, as it does there.
     """
@@ -83,15 +84,18 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     cards = gpus.resolve(config.gpus, table, config.shared_gpus)
     # Through the same reader the dispatcher borrows on, so an absent entry
     # means here exactly what it means there: not a card we would take.
-    usage, _failure = gpus.usage_or_nothing([*cards.owned, *cards.shared])
+    usage, _failure = gpus.usage_or_nothing(cards.shared)
+    owned_usage, _failure = gpus.usage_or_nothing(cards.owned)
     return {
         "gpus": config.gpus,
         "gpus_resolved": [
             {
                 "index": indices.get(uuid),
                 "uuid": uuid,
-                "memory_mib": usage[uuid].memory_mib if uuid in usage else None,
-                "utilization_pct": usage[uuid].utilization_pct if uuid in usage else None,
+                "memory_mib": owned_usage[uuid].memory_mib if uuid in owned_usage else None,
+                "utilization_pct": (
+                    owned_usage[uuid].utilization_pct if uuid in owned_usage else None
+                ),
             }
             for uuid in cards.owned
         ],

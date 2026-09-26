@@ -244,7 +244,7 @@ memory and utilization nvidia-smi reads on it now, whoever is using it) and per
 last util, the cards they hold (`gpu=2,3`) and any
 [end-time estimate](#job-length-estimates), and recent finished jobs with the
 mean utilization of their cards over `main` (`avg util 22% on 1 gpu`; absent
-when no sample was taken). Every job is `name (job-id)`.
+when there is no sample to average). Every job is `name (job-id)`.
 
 ```
 host local [local]  gpus 0/1 free (driver 580.173.02)
@@ -699,8 +699,9 @@ Beyond what the example shows:
   what the job declared and never checked.
 - `util_mean` is the mean of every sample of the attempt's `main` phase, each
   already the mean over the job's cards, and `util_samples` how many there
-  were (one per 30 s); `util_mean` is null at zero samples. Setup and failed
-  readings are in neither.
+  were (one per 30 s); `util_mean` is null at zero samples, and both are null
+  from a host whose build does not record them. Setup and failed readings are
+  in neither.
 - `util` is the job's last sample from the host's own nvidia-smi; a pod's
   `provider_util` is the provider's per-GPU reading for the whole pod, null
   elsewhere.
