@@ -11,7 +11,7 @@ import pytest
 from gpuc.host import destinations, jobs, paths, sync
 from gpuc.host.destinations import S3, HuggingFace
 from gpuc.host.jobs import Output
-from tests.conftest import accept_job, make_spec
+from tests.conftest import accept_job, make_spec, wait_until
 
 
 class RecordingRunner:
@@ -349,7 +349,7 @@ def test_a_capped_tick_is_skipped_with_a_log_line_and_is_not_an_error(
     for index in range(sync.MAX_EXCLUDES + 1):
         (outputs / f"shard-{index:04d}.bin").write_text("x")
     loop.start()
-    _wait_for(lambda: "skipping this sync tick" in paths.log_file(job_id).read_text())
+    wait_until(lambda: "skipping this sync tick" in paths.log_file(job_id).read_text())
     loop.stop()
     assert loop.last_error is None
     assert jobs.read_state(job_id).upload_errors() == []
@@ -361,7 +361,7 @@ def test_a_missing_output_dir_is_warned_about_on_a_periodic_tick(
     job_id = jobs.new_job_id()
     loop = loop_for(job_id, RecordingRunner())
     loop.start()
-    _wait_for(lambda: "does not exist" in paths.log_file(job_id).read_text())
+    wait_until(lambda: "does not exist" in paths.log_file(job_id).read_text())
     loop.stop()
     assert "WARNING" in paths.log_file(job_id).read_text()
     assert loop.last_error is None
@@ -378,9 +378,9 @@ def test_a_periodic_missing_output_is_the_destinations_error_and_the_loop_goes_o
     loop = loop_for(job_id, runner)
     loop.start()
     try:
-        _wait_for(lambda: loop._missing_ticks >= 1)
+        wait_until(lambda: loop._missing_ticks >= 1)
         assert jobs.read_state(job_id).upload_errors() == []
-        _wait_for(lambda: jobs.read_state(job_id).upload_errors() != [])
+        wait_until(lambda: jobs.read_state(job_id).upload_errors() != [])
         assert loop._missing_ticks > sync.MISSING_TICKS
         (record,) = jobs.read_state(job_id).output_uploads()
         assert (record.to, record.output) == ("s3://b/o", "outputs")
@@ -388,7 +388,7 @@ def test_a_periodic_missing_output_is_the_destinations_error_and_the_loop_goes_o
         assert loop._thread is not None and loop._thread.is_alive()
         # The next tick, with the path written, uploads it and clears the error.
         (paths.workdir(job_id) / "outputs").mkdir(parents=True)
-        _wait_for(lambda: jobs.read_state(job_id).upload_errors() == [])
+        wait_until(lambda: jobs.read_state(job_id).upload_errors() == [])
     finally:
         loop.stop()
     (record,) = jobs.read_state(job_id).output_uploads()
@@ -407,7 +407,7 @@ def test_the_periodic_thread_survives_any_exception_and_records_it(
     loop = loop_for(job_id, exploding)
     (paths.workdir(job_id) / "outputs").mkdir(parents=True)
     loop.start()
-    _wait_for(lambda: loop.last_error is not None)
+    wait_until(lambda: loop.last_error is not None)
     assert loop._thread is not None and loop._thread.is_alive()
     loop.stop()
     assert "something unspeakable" in (loop.last_error or "")
@@ -455,15 +455,6 @@ def test_the_final_sync_has_no_wall_clock_timeout(gpuc_home: Path, fake_aws: str
     (paths.workdir(job_id) / "outputs").mkdir(parents=True)
     loop.final()
     assert runner.timeouts == [None]
-
-
-def _wait_for(predicate, timeout: float = 20.0) -> None:  # type: ignore[no-untyped-def]
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return
-        time.sleep(0.05)
-    raise AssertionError("condition never became true")
 
 
 # -- recording the backup -----------------------------------------------------

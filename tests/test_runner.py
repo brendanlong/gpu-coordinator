@@ -22,6 +22,7 @@ from tests.conftest import (
     install_fake_nvidia_smi,
     install_fake_torch,
     make_spec,
+    wait_until,
 )
 
 ASSIGNED: dict[str, list[str]] = {}
@@ -290,7 +291,7 @@ def test_a_preempted_job_whose_final_upload_fails_still_comes_back(
     written = paths.workdir(job_id) / "results/a.txt"
 
     def preempt_once_written() -> None:
-        _wait_until(written.exists)
+        wait_until(written.exists)
         queue.preempt(job_id)
 
     thread = threading.Thread(target=preempt_once_written, daemon=True)
@@ -386,7 +387,7 @@ def test_cancel_kills_the_whole_process_group_including_grandchildren(
     thread = threading.Thread(target=run_it, daemon=True)
     thread.start()
     try:
-        _wait_until(lambda: pid_file.exists() and pid_file.read_text().strip().isdigit())
+        wait_until(lambda: pid_file.exists() and pid_file.read_text().strip().isdigit())
         grandchild = int(pid_file.read_text().strip())
         pgid = jobs.read_state(job_id).pgid
         assert pgid and os.getpgid(grandchild) == pgid
@@ -394,7 +395,7 @@ def test_cancel_kills_the_whole_process_group_including_grandchildren(
         queue.cancel(job_id)
         thread.join(timeout=30)
         assert not thread.is_alive()
-        _wait_until(lambda: not _pid_exists(grandchild))
+        wait_until(lambda: not _pid_exists(grandchild))
     finally:
         pgid = jobs.read_state(job_id).pgid
         if pgid:
@@ -404,15 +405,6 @@ def test_cancel_kills_the_whole_process_group_including_grandchildren(
     state = jobs.read_state(job_id)
     assert (state.status, state.reason) == ("cancelled", "cancelled")
     assert result["code"] != 0
-
-
-def _wait_until(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return
-        time.sleep(0.05)
-    raise AssertionError("condition never became true")
 
 
 def _pid_exists(pid: int) -> bool:
@@ -503,7 +495,7 @@ def run_detached(job_id: str, home: Path) -> subprocess.Popen[bytes]:
 
 
 def wait_for_job_pgid(job_id: str) -> int:
-    _wait_until(lambda: jobs.read_state(job_id).pgid is not None)
+    wait_until(lambda: jobs.read_state(job_id).pgid is not None)
     pgid = jobs.read_state(job_id).pgid
     assert pgid is not None
     return pgid
@@ -516,7 +508,7 @@ def test_sigterm_kills_the_job_group_and_writes_failed_terminated(gpuc_home: Pat
         pgid = wait_for_job_pgid(job_id)
         proc.send_signal(signal.SIGTERM)
         assert proc.wait(timeout=60) == runner.TERMINATED_EXIT_CODE
-        _wait_until(lambda: not procs.process_group_alive(pgid))
+        wait_until(lambda: not procs.process_group_alive(pgid))
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -974,7 +966,7 @@ def test_a_preempted_job_goes_straight_from_running_to_queued(gpuc_home: Path) -
     watcher.start()
 
     def preempt_once_seen_running(wanted: str) -> None:
-        _wait_until(lambda: ("running", 1) in seen)
+        wait_until(lambda: ("running", 1) in seen)
         queue.preempt(wanted)
 
     try:
@@ -1028,7 +1020,7 @@ def preempt_in_main(job_id: str) -> None:
     the attempt has something to stop and a final sync to run afterwards."""
 
     def once_in_main() -> None:
-        _wait_until(lambda: jobs.read_state(job_id).phase == "main")
+        wait_until(lambda: jobs.read_state(job_id).phase == "main")
         queue.preempt(job_id)
 
     threading.Thread(target=once_in_main, daemon=True).start()

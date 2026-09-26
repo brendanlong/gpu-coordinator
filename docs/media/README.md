@@ -22,8 +22,8 @@ gpuc host bootstrap workstation
 
 `$DEMO/project` is a git repo with a `pyproject.toml` depending on `torch`, a
 `train.py`, and the two specs `demo.sh` submits. The job has to keep a card
-*busy*: the first take's loop slept between steps, so `gpuc status` honestly
-reported `util 9%` and the recording looked like an idle GPU.
+*busy*, with no sleep in its loop, or `gpuc status` reports low utilization
+and the recording looks like an idle GPU.
 
 ```python
 # train.py: STEPS and TAG come from argv.
@@ -86,8 +86,7 @@ Both were taken at 1280 wide with the browser in dark mode (Playwright's
 run over the result.
 
 Curating a state means curating every field the page reads. Leaving one null
-does not leave a blank: it printed a re-bootstrap warning on every host, an
+does not leave a blank: it prints a re-bootstrap warning on every host, an
 `idle undefinedm`, and a `borrowing unknown`. `docs/media` is in pyright's
-`include` for the same reason — a `GpuInfo(memory_mib=…)` that pydantic
-silently dropped took the VRAM off every card in the first version of these
-screenshots.
+`include` for the same reason: a field a model does not declare is dropped
+silently at runtime, and pyright is what catches it.

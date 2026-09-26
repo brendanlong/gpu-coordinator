@@ -1421,14 +1421,11 @@ def test_logs_json_carries_the_lines_and_where_they_came_from(
 def test_logs_json_says_when_it_fell_back_to_the_mirror(
     real_local_host: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from tests.fakes3 import FakeS3Client
+    from tests.fakes3 import fake_s3
 
     (config_file()).write_text('s3_bucket = "bucket"\n')
     uri = f"bucket/gpuc/local/jobs/{RUNNING_JOB}/log.txt"
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client",
-        property(lambda self: FakeS3Client(objects={uri: b"mirrored\n"})),
-    )
+    fake_s3(monkeypatch, objects={uri: b"mirrored\n"})
     entry = load_registry().require("local")
     entry = entry.with_config({**entry.cache.config, "s3_prefix": "s3://bucket/gpuc/local"})
     write_hosts({"hosts": {"local": json.loads(entry.model_dump_json())}})

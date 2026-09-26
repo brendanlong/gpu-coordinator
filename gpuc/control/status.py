@@ -15,25 +15,21 @@ from typing import Any
 from urllib.parse import quote
 
 from gpuc.control import version
-from gpuc.control.config import HostEntry, Settings, parse_timestamp
+from gpuc.control.config import HostEntry, Settings
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.jsonout import OUTPUT_SCHEMA_VERSION
 from gpuc.control.providers.base import Pod, Provider
 from gpuc.control.remote import Asked, Gone, HostSession, Unaskable, ask
 from gpuc.control.s3index import IndexEntry, job_uri
+from gpuc.host import jobs
 from gpuc.host.cleanup import human_bytes
+from gpuc.host.gpus import Usage
 
 HEARTBEAT_STALE_S = 30.0
 RECENT_FINISHED = 5
 LEFTOVER_FLOOR_BYTES = 1 << 30
 """Only mention finished jobs' workdirs once they add up to something worth a
 command. A job dir under a gigabyte is noise next to a 6.5 GB torch venv."""
-
-
-def describe_usage(memory_mib: float | None, utilization_pct: float | None) -> str:
-    memory = "?" if memory_mib is None else f"{memory_mib:.0f}"
-    util = "?" if utilization_pct is None else f"{utilization_pct:.0f}"
-    return f"{memory} MiB, {util}% util"
 
 
 class CardState(Enum):
@@ -186,8 +182,8 @@ class JobView:
     def minutes(self) -> float | None:
         if not self.started_at:
             return None
-        end = parse_timestamp(self.ended_at) if self.ended_at else datetime.now(UTC)
-        start = parse_timestamp(self.started_at)
+        end = jobs.parse_time(self.ended_at) if self.ended_at else datetime.now(UTC)
+        start = jobs.parse_time(self.started_at)
         if start is None or end is None:
             return None
         return (end - start).total_seconds() / 60.0
@@ -207,7 +203,7 @@ class JobView:
         Read here rather than on the host so a `status` of a host whose clock
         or whose last report is minutes old still counts down.
         """
-        when = parse_timestamp(self.eta)
+        when = jobs.parse_time(self.eta)
         return None if when is None else (when - datetime.now(UTC)).total_seconds()
 
 
@@ -234,7 +230,7 @@ def parse_duration(text: str) -> float:
 
 def format_age(stamp: str | None, now: datetime | None = None) -> str:
     """`3m ago`, `2d ago`: enough to tell last night's run from last month's."""
-    when = parse_timestamp(stamp)
+    when = jobs.parse_time(stamp)
     if when is None:
         return "age unknown"
     seconds = ((now or datetime.now(UTC)) - when).total_seconds()
@@ -856,7 +852,7 @@ def _gpu_lines(view: HostView) -> list[str]:
         info = view.entry.gpu_info.get(item.uuid) or GpuInfo()
         index = view.index_of(item.uuid)
         state = CARD_WORDS[view.card_state(item)]
-        usage = describe_usage(item.memory_mib, item.utilization_pct)
+        usage = Usage(item.uuid, item.memory_mib, item.utilization_pct).describe()
         lines.append(
             f"  {kind:<7} [{'?' if index is None else index}] {state} {info.label()} ({usage})"
         )
@@ -866,7 +862,7 @@ def _gpu_lines(view: HostView) -> list[str]:
 def within(job: JobView, since_s: float | None, now: datetime | None = None) -> bool:
     if since_s is None:
         return True
-    ended = parse_timestamp(job.ended_at)
+    ended = jobs.parse_time(job.ended_at)
     if ended is None:
         return False
     return ((now or datetime.now(UTC)) - ended).total_seconds() <= since_s

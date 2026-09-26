@@ -8,7 +8,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,11 @@ LOCAL_GPU_UUID = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 SEEN_AT = "2026-09-15T12:00:00+00:00"
 """When a test entry's cache was filled. A fixed stamp, so a listing that says
 how old the cache is has something stable to say."""
+
+
+def ago(**delta: float) -> str:
+    """An ISO timestamp `delta` before now; a negative delta is in the future."""
+    return (datetime.now(UTC) - timedelta(**delta)).isoformat()
 
 
 @pytest.fixture
@@ -173,6 +180,20 @@ def make_spec(**overrides: object) -> JobSpec:
     return JobSpec.from_dict(document)
 
 
+def wait_until(
+    predicate: Callable[[], bool],
+    timeout: float = 30.0,
+    what: str = "condition",
+    interval: float = 0.05,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(interval)
+    raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+
+
 def install_fake_nvidia_smi(bin_dir: Path, uuids: list[str] | None = None) -> None:
     """Put an `nvidia-smi` for `uuids` (default `FAKE_GPUS`) in `bin_dir`.
 
@@ -253,20 +274,16 @@ def fake_smi(
     return run
 
 
-def nvidia_smi_available() -> bool:
-    if shutil.which("nvidia-smi") is None:
-        return False
-    proc = subprocess.run(
+requires_gpu = pytest.mark.skipif(
+    shutil.which("nvidia-smi") is None
+    or LOCAL_GPU_UUID
+    not in subprocess.run(
         ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
         capture_output=True,
         text=True,
         check=False,
-    )
-    return proc.returncode == 0 and LOCAL_GPU_UUID in proc.stdout
-
-
-requires_gpu = pytest.mark.skipif(
-    not nvidia_smi_available(), reason=f"no local NVIDIA GPU {LOCAL_GPU_UUID}"
+    ).stdout,
+    reason=f"no local NVIDIA GPU {LOCAL_GPU_UUID}",
 )
 
 
@@ -276,11 +293,6 @@ def session_monkeypatch() -> Iterator[pytest.MonkeyPatch]:
     patch = pytest.MonkeyPatch()
     yield patch
     patch.undo()
-
-
-def default_torch_project() -> Path:
-    """A per-user path: /tmp is shared, and two users must not collide there."""
-    return Path(tempfile.gettempdir()) / f"gpuc-test-torch-project-{os.getuid()}"
 
 
 @pytest.fixture(scope="session")
@@ -296,8 +308,9 @@ def torch_project(session_monkeypatch: pytest.MonkeyPatch) -> Path:
     # so the variable does not outlive the session that wanted it.
     if "UV_LINK_MODE" not in os.environ:
         session_monkeypatch.setenv("UV_LINK_MODE", "symlink")
-    override = os.environ.get("GPUC_TEST_TORCH_PROJECT")
-    root = Path(override) if override else default_torch_project()
+    # Per user by default: /tmp is shared, and two users must not collide there.
+    default = Path(tempfile.gettempdir()) / f"gpuc-test-torch-project-{os.getuid()}"
+    root = Path(os.environ.get("GPUC_TEST_TORCH_PROJECT") or default)
     root.mkdir(parents=True, exist_ok=True)
     # Every xdist worker builds its own session fixtures, all on this one path.
     with (root.parent / f"{root.name}.lock").open("w") as lock:

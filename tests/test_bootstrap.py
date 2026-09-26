@@ -225,24 +225,6 @@ def test_ensure_build_ships_the_code_without_the_health_check(control_env: Path)
     assert host.config == {**CONFIG_ON_HOST, "pkg_commit": version_mod.local_commit()}
 
 
-def test_ensure_build_leaves_a_host_on_this_build_alone(control_env: Path) -> None:
-    from gpuc.control.bootstrap import ensure_build
-
-    host = ScriptedHost(config={**CONFIG_ON_HOST, "pkg_commit": version_mod.local_commit()})
-    assert ensure_build(_session(host), lambda _: None) is None
-    assert host.events == []
-
-
-def test_ensure_build_reships_when_the_host_named_no_commit(control_env: Path) -> None:
-    """Unknown means re-ship: a host that never recorded a commit is not
-    running this one, whatever the registry remembers shipping."""
-    from gpuc.control.bootstrap import ensure_build
-
-    host = ScriptedHost(config=dict(CONFIG_ON_HOST))
-    assert ensure_build(_session(host), lambda _: None)
-    assert host.config is not None and host.config["pkg_commit"] == version_mod.local_commit()
-
-
 def test_the_package_and_config_land_before_health_runs(control_env: Path) -> None:
     host = ScriptedHost(config=dict(CONFIG_ON_HOST))
     bootstrap_host(entry(), transport=host, report=lambda _: None)

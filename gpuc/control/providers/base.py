@@ -53,11 +53,23 @@ class Offer(TolerantModel):
     availability: Availability = "NONE"
     cuda_versions: list[str] = Field(default_factory=list)
 
-    def matches_cuda_floor(self, cuda_min: str | None) -> bool:
-        if cuda_min is None:
-            return True
+    def matches_cuda_floor(self, cuda_min: str) -> bool:
         floor = cuda_key(cuda_min)
         return any(cuda_key(v) >= floor for v in self.cuda_versions)
+
+
+def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
+    wanted = {name.casefold() for name in constraints.gpu_names}
+    if wanted and not wanted & {offer.gpu_id.casefold(), offer.name.casefold()}:
+        return False
+    if constraints.min_vram_gb is not None and offer.vram_gb < constraints.min_vram_gb:
+        return False
+    cap = constraints.max_price_usd_hr
+    if cap is not None and offer.price_usd_hr > cap:
+        return False
+    if constraints.clouds and offer.cloud not in constraints.clouds:
+        return False
+    return offer.matches_cuda_floor(constraints.cuda_min)
 
 
 class SshEndpoint(BaseModel):

@@ -24,7 +24,7 @@ from gpuc.control.actions import (
     mirror_is_the_answer,
     placement_after,
 )
-from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build, host_build
+from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build
 from gpuc.control.config import HostEntry, Reporter, Settings, open_registry
 from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
 from gpuc.control.provision import runpod_host
@@ -42,7 +42,6 @@ from gpuc.control.submit import (
     validate,
     with_overrides,
 )
-from gpuc.host import jobs
 
 DEFAULT_IDLE_MINUTES = 15.0
 """How long a rental sits with an empty queue before it ends itself, unless
@@ -82,7 +81,11 @@ class RentalOptions:
         )
 
 
-def rent_host(rental: RentalOptions, settings: Settings, report: Reporter) -> HostEntry:
+def rent_host(
+    rental: RentalOptions, prepared: Prepared, settings: Settings, report: Reporter
+) -> HostEntry:
+    check_gpu_count(prepared.model, rental.gpu_count)
+    check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
     return runpod_host(
         rental.constraints(),
         settings,
@@ -120,12 +123,12 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
     if not bootstrap:
         return
     refuse_unreadable_config(session)
-    if session.config_read.missing or host_build(session) is None:
+    host_commit = session.config.pkg_commit
+    if session.config_read.missing or host_commit is None:
         raise CliError(
             f"host {session.entry.name} has no gpuc on it yet: its own config records no "
             f"bootstrap.\nRun: gpuc host bootstrap {session.entry.name}"
         )
-    host_commit = host_build(session)
     local = version_mod.local_commit()
     if not version_mod.is_other_build(host_commit, local):
         return
@@ -134,8 +137,7 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
         f"machine has {version_mod.short(local)}: re-syncing the package and restarting the "
         f"dispatcher before enqueueing"
     )
-    # Decided above; `always` keeps `ensure_build` from asking the same question.
-    ensure_build(session, _quiet, always=True)
+    ensure_build(session, _quiet)
 
 
 def _quiet(_: str) -> None:
@@ -187,11 +189,9 @@ def submit_job(
         raise UsageError("submit needs --host <name> (see `gpuc host list`)")
     document = with_overrides(load_document(job_file), **(overrides or {}))
     model = validate(document, str(job_file))
-    prepared = prepare(model, workdir, job_id=jobs.new_job_id(), use_git=use_git)
+    prepared = prepare(model, workdir, use_git=use_git)
     if rental is not None:
-        check_gpu_count(model, rental.gpu_count)
-        check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
-        entry = rent_host(rental, settings, report)
+        entry = rent_host(rental, prepared, settings, report)
     else:
         entry = open_registry().require(host or "")
     return enqueue(
@@ -236,14 +236,10 @@ def requeue_job(
             f"set can be requeued."
         ) from exc
     model = validate(document, f"spec for {job_id}", tolerant=True)
-    prepared = prepare(
-        model, workdir, job_id=jobs.new_job_id(), requeued_from=job_id, use_git=use_git
-    )
+    prepared = prepare(model, workdir, requeued_from=job_id, use_git=use_git)
     session: HostSession | None = None
     if rental is not None:
-        check_gpu_count(model, rental.gpu_count)
-        check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
-        entry = rent_host(rental, settings, report)
+        entry = rent_host(rental, prepared, settings, report)
     else:
         # `--host` is where it goes, so it has to be one this machine has.
         # Otherwise where the job ran, by the same lookup every other job

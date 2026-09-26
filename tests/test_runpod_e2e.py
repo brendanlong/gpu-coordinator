@@ -39,7 +39,6 @@ pytestmark = pytest.mark.runpod
 BUCKET = "brendanlong-experiments"
 OUTPUT_PREFIX = "gpuc-e2e"
 NAME_HINT = "e2e"
-PROVISION_TIMEOUT_S = 900.0
 JOB_TIMEOUT_S = 1500.0
 IDLE_TIMEOUT_S = 900.0
 

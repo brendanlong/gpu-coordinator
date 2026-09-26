@@ -109,30 +109,6 @@ def wandb_hints(env: dict[str, str]) -> dict[str, str]:
     return {name: env[key] for key, name in WANDB_HINTS.items() if env.get(key)}
 
 
-def _seconds_until(stamp: str | None) -> float | None:
-    if not stamp:
-        return None
-    try:
-        when = datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return max(0.0, (when - datetime.now(UTC)).total_seconds())
-
-
-def _seconds_since(stamp: str | None) -> float:
-    if not stamp:
-        return 0.0
-    try:
-        when = datetime.fromisoformat(stamp)
-    except ValueError:
-        return 0.0
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return (datetime.now(UTC) - when).total_seconds()
-
-
 def projected_starts(
     config: jobs.HostConfig, table: dict[str, Any], states: dict[str, JobState]
 ) -> plan.Projection:
@@ -152,7 +128,8 @@ def projected_starts(
         state = holder.get(uuid)
         if state is None or state.intent is not None:
             return 0.0
-        return _seconds_until(state.eta)
+        eta = jobs.parse_time(state.eta)
+        return None if eta is None else max(0.0, (eta - datetime.now(UTC)).total_seconds())
 
     cards: list[plan.Card] = []
     theirs = 0
@@ -196,7 +173,8 @@ def projected_starts(
         spec = _spec(job_id)
         if spec is None or not spec.auto_preempt or state.intent is not None:
             continue
-        since = _seconds_since(state.started_at)
+        started = jobs.parse_time(state.started_at)
+        since = 0.0 if started is None else (datetime.now(UTC) - started).total_seconds()
         stoppable.append(
             (
                 plan.Preemptable(
@@ -230,15 +208,8 @@ def projected_starts(
 
 
 def _ended_within(ended_at: str | None, since_s: float, now: datetime) -> bool:
-    if not ended_at:
-        return False
-    try:
-        ended = datetime.fromisoformat(ended_at)
-    except ValueError:
-        return False
-    if ended.tzinfo is None:
-        ended = ended.replace(tzinfo=UTC)
-    return (now - ended).total_seconds() <= since_s
+    ended = jobs.parse_time(ended_at)
+    return ended is not None and (now - ended).total_seconds() <= since_s
 
 
 def in_window(states: dict[str, JobState], recent: int | None, since_s: float | None) -> list[str]:
@@ -366,7 +337,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 # which is not the same question: a dispatcher imports its code
                 # once and keeps serving the queue from it however many times
                 # the package underneath is replaced.
-                "dispatcher_pkg_commit": dispatcher.holder_pkg_commit(),
+                "dispatcher_pkg_commit": dispatcher.lock_holder().pkg_commit,
                 **table,
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),

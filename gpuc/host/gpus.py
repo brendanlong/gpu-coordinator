@@ -266,19 +266,6 @@ class Usage:
         return f"{memory} MiB, {util}% util"
 
 
-def sample_usage(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> dict[str, Usage]:
-    """Memory held and utilization, per card. Cards nvidia-smi skipped are absent."""
-    if not uuids:
-        return {}
-    wanted = set(uuids)
-    rows = _query(["uuid", "memory.used", "utilization.gpu"], smi, extra=["-i", ",".join(uuids)])
-    return {
-        uuid: Usage(uuid, _maybe_float(memory), _maybe_float(util))
-        for uuid, memory, util in rows
-        if uuid in wanted
-    }
-
-
 USAGE_FIELDS = ("memory.used", "utilization.gpu")
 
 
@@ -308,24 +295,6 @@ def snapshot(smi: SmiRunner = run_nvidia_smi) -> tuple[list[Gpu], dict[str, Usag
     return table, usage
 
 
-def usage_or_nothing(
-    uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
-) -> tuple[dict[str, Usage], str | None]:
-    """Every reading nvidia-smi gives for `uuids`, and why there are none.
-
-    The one place "nvidia-smi would not answer" turns into "we know nothing
-    about these cards", for the dispatcher deciding whether to borrow one.
-    `status` reads the same `Usage` from `snapshot`, so the verdict on a
-    reading -- `Usage.unused` -- is still written once.
-    """
-    if not uuids:
-        return {}, None
-    try:
-        return sample_usage(uuids, smi), None
-    except GpuError as exc:
-        return {}, str(exc)
-
-
 def unused_gpus(
     uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
 ) -> tuple[list[str], dict[str, str]]:
@@ -335,9 +304,19 @@ def unused_gpus(
     them. Every way of not knowing -- nvidia-smi failing, a card it did not
     answer about, a reading it would not give -- lands in the second half: this
     decides whether to run a job on somebody else's GPU, so the absence of
-    evidence has to count against.
+    evidence has to count against. `status` reads the same `Usage` from
+    `snapshot`, so the verdict on a reading -- `Usage.unused` -- is written once.
     """
-    samples, failure = usage_or_nothing(uuids, smi)
+    if not uuids:
+        return [], {}
+    samples: dict[str, Usage] = {}
+    failure: str | None = None
+    try:
+        fields = ["uuid", *USAGE_FIELDS]
+        rows = _query(fields, smi, extra=["-i", ",".join(uuids)])
+        samples = {u: Usage(u, _maybe_float(mem), _maybe_float(util)) for u, mem, util in rows}
+    except GpuError as exc:
+        failure = str(exc)
     unused: list[str] = []
     in_use: dict[str, str] = {}
     for uuid in uuids:

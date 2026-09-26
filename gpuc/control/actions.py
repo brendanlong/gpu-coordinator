@@ -424,7 +424,6 @@ def status(
     recent: int = status_mod.RECENT_FINISHED,
     since_s: float | None = None,
     on_view: Callable[[status_mod.HostView], None] | None = None,
-    report: Callable[[str], None] = note,
 ) -> StatusResult:
     """`gpuc status`, however it is going to be shown.
 
@@ -465,11 +464,9 @@ def status(
         else:
             # Neither here nor in the index: a typo, not a rental that ended.
             registry.require(host)
-    provider = provider_for(entries, settings, report) if entries else None
-    request = (
-        status_mod.status_request()
-        if all_jobs
-        else status_mod.status_request(recent=recent, since_s=since_s)
+    provider = provider_for(entries, settings) if entries else None
+    request = status_mod.status_request(
+        recent=None if all_jobs else recent, since_s=None if all_jobs else since_s
     )
     for view in gather_all(entries, settings, provider, request):
         if view.gone:
@@ -532,9 +529,7 @@ def fill_from_mirror(
     view.finished.sort(key=lambda job: job.ended_at or "", reverse=True)
 
 
-def forget_gone_rentals(
-    views: Sequence[status_mod.HostView], report: Callable[[str], None] = note
-) -> None:
+def forget_gone_rentals(views: Sequence[status_mod.HostView]) -> None:
     """Drop the registry entry of every rental the provider says no longer exists.
 
     A rental ends itself when its queue goes idle, so this is the ordinary end
@@ -546,8 +541,8 @@ def forget_gone_rentals(
     """
     for view in views:
         if view.gone and view.registered:
-            report(f"forgetting host {view.entry.name}: its pod is gone")
-            forget_host(view.entry.name, view.entry.pod_id, report)
+            note(f"forgetting host {view.entry.name}: its pod is gone")
+            forget_host(view.entry.name, view.entry.pod_id, note)
 
 
 def shipped_note(entry: HostEntry) -> str | None:
@@ -966,7 +961,7 @@ def _ask_around(
     for name in registry.hosts:
         if name in latest and not isinstance(latest[name], Answered):
             continue
-        wanted = [job_id for job_id in rest if _name(named[job_id]) != name]
+        wanted = [job_id for job_id in rest if (e := named[job_id]) is None or e.name != name]
         if wanted:
             everyone[name] = wanted
     ask_each(everyone)
@@ -1001,10 +996,6 @@ def _ask_around(
                 missing=True,
             )
     return placed
-
-
-def _name(entry: HostEntry | None) -> str | None:
-    return entry.name if entry is not None else None
 
 
 def find_job(job_id: str, host: str | None, settings: Settings) -> Location:
@@ -1382,8 +1373,6 @@ def read_log(
     host: str | None,
     lines: int,
     settings: Settings,
-    *,
-    report: Callable[[str], None] = note,
 ) -> tuple[str, LogText]:
     """The tail of a job's log from its host, else from the S3 mirror.
 
@@ -1432,8 +1421,8 @@ def read_log(
         if purged
         else f"could not read {remote or 'the host log'}: {why}"
     )
-    report(missing)
-    log = logs_from_s3(job_id, location, settings, purged=purged, report=report)
+    note(missing)
+    log = logs_from_s3(job_id, location, settings, purged=purged)
     log.notes.insert(0, missing)
     if failed:
         log.failure = missing
@@ -1455,7 +1444,6 @@ def logs_from_s3(
     settings: Settings,
     *,
     purged: bool = False,
-    report: Callable[[str], None] = note,
 ) -> LogText:
     index = JobIndex(settings)
     prefix = index.mirror_prefix(job_id, location.entry)
@@ -1471,7 +1459,7 @@ def logs_from_s3(
     s3 = index.s3
     uri = job_log_uri(prefix, job_id)
     fallback = f"falling back to the S3 mirror at {uri}"
-    report(fallback)
+    note(fallback)
     return LogText("s3", uri, s3.get_uri(uri), [fallback])
 
 

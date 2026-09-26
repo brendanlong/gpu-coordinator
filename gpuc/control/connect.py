@@ -110,10 +110,9 @@ def push_config(
     *,
     fields: Mapping[str, Any] | None = None,
     env_updates: Mapping[str, str | None] | None = None,
-    transport: Transport | None = None,
 ) -> Connection:
     """`gpuc host set`: change the host's own config, and cache what it now holds."""
-    transport = transport or transport_for(entry, settings)
+    transport = transport_for(entry, settings)
     home = resolve_home(transport, entry)
     existing = _read(transport, home, entry.name)
     return _apply(
@@ -277,7 +276,7 @@ def _refuse_shared_overlap(
     """
     if not patch:
         return
-    merged = {**(existing if isinstance(existing, dict) else {}), **patch}
+    merged = {**existing, **patch}
     config = HostConfig.from_dict(merged)
     both = gpus.resolve(config.gpus, table_of(entry.gpu_info), config.shared_gpus).duplicates
     if not both:

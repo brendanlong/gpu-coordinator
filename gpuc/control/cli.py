@@ -40,6 +40,7 @@ from gpuc.control.actions import (
     config_document,
     exit_code_for,
     failure_message,
+    find_job,
     forget_gone_rentals,
     hosts_document,
     init_config,
@@ -406,7 +407,6 @@ def cmd_clean(args: argparse.Namespace) -> Answer:
         purge=args.purge,
         force=args.force,
         verify=args.verify,
-        yes=args.yes,
         only=only,
     )
     return Answer(report.document(), report.render(), failures=list(report.errors))
@@ -827,8 +827,7 @@ def cmd_logs(args: argparse.Namespace) -> Answer:
     check_interval(args, polls=args.follow)
     settings = load_settings()
     if args.follow_forever:
-        read = open_registry()
-        location = locate(args.job_id, read.named(), args.host, settings, skipped=read.skipped)
+        location = find_job(args.job_id, args.host, settings)
         session = location.session or open_session(location.require_entry(), settings)
         return _follow_forever(session, args.job_id, args.lines)
     if args.follow:
@@ -933,8 +932,7 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
         if not ended:
             where = f"is still {watched.status} on {watched.host}" if watched else "was not reached"
             raise Interrupted(f"interrupted; job {args.job_id} {where}") from None
-    if watched is None:
-        raise CliError(f"job {args.job_id} was never looked up")
+    assert watched is not None
     return wait_mod.answer([watched], watched.line())
 
 
@@ -1136,7 +1134,6 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument(
         "--idle-min",
         type=float,
-        default=None,
         metavar="MINUTES",
         help="how long a rental may sit with an empty queue before it terminates itself "
         "(the host's own default is 15); ignored for hosts that are not rented",
@@ -1432,9 +1429,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wait.add_argument("job_ids", nargs="+", metavar="job_id")
     add_interval_flag(wait)
-    wait.add_argument(
-        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
-    )
+    add_jobs_host_flag(wait)
     add_json_flag(wait, "each job's final state, as `status --json` reports one")
     wait.set_defaults(func=cmd_wait)
 
@@ -1464,9 +1459,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cancel = sub.add_parser("cancel", help="cancel queued or running jobs")
     cancel.add_argument("job_ids", nargs="+", metavar="job_id")
-    cancel.add_argument(
-        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
-    )
+    add_jobs_host_flag(cancel)
     add_json_flag(cancel)
     cancel.set_defaults(func=cmd_cancel)
 
@@ -1474,9 +1467,7 @@ def build_parser() -> argparse.ArgumentParser:
         "fetch", help="copy jobs' outputs from their workdirs on the host to this machine"
     )
     fetch.add_argument("job_ids", nargs="+", metavar="job_id")
-    fetch.add_argument(
-        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
-    )
+    add_jobs_host_flag(fetch)
     fetch.add_argument(
         "--path",
         action="append",
@@ -1518,9 +1509,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="0-99; queue it again at this priority instead of its own (lower dispatches "
         "first, so a higher number keeps it out of the way)",
     )
-    preempt.add_argument(
-        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
-    )
+    add_jobs_host_flag(preempt)
     add_json_flag(preempt)
     preempt.set_defaults(func=cmd_preempt)
 
@@ -1547,9 +1536,7 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help=f"remove the job's {settable.option.replace('-', ' ')}",
             )
-    set_.add_argument(
-        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
-    )
+    add_jobs_host_flag(set_)
     add_json_flag(set_)
     set_.set_defaults(func=cmd_set)
 
@@ -1641,11 +1628,15 @@ def add_json_flag(parser: argparse.ArgumentParser, help_text: str = JSON_HELP) -
     parser.add_argument("--json", action="store_true", help=help_text)
 
 
+def add_jobs_host_flag(parser: argparse.ArgumentParser) -> None:
+    help_text = "which host the jobs are on, if they cannot be found"
+    parser.add_argument("--host", metavar="NAME", help=help_text)
+
+
 def add_interval_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--interval",
         type=float,
-        default=None,
         metavar="SECONDS",
         help=f"how often to ask the host whether the job has ended; the default backs off "
         f"from {wait_mod.FIRST_INTERVAL_S:g}s to {wait_mod.MAX_INTERVAL_S:g}s as the wait "
@@ -1710,7 +1701,6 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--idle-min",
         type=float,
-        default=None,
         metavar="MINUTES",
         help=f"terminate the pod once its queue has been empty this long "
         f"(default {DEFAULT_IDLE_MINUTES:g})",

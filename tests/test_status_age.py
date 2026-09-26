@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-
 import pytest
 
 from gpuc.control.status import (
@@ -16,11 +14,7 @@ from gpuc.control.status import (
     render,
     within,
 )
-from tests.conftest import host_entry
-
-
-def ago(**delta: float) -> str:
-    return (datetime.now(UTC) - timedelta(**delta)).isoformat()
+from tests.conftest import ago, host_entry
 
 
 def finished(job_id: str, status: str = "succeeded", reason: str | None = None, **delta: float):

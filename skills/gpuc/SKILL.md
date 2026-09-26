@@ -23,9 +23,8 @@ it), so nothing is needed from you. A host whose config names no build was
 never bootstrapped, and `submit` refuses it until `gpuc host bootstrap <host>`
 has run.
 
-`gpuc skill` prints this file, and `gpuc skill --install [DIR]` writes a copy
-to `DIR/.claude/skills/gpuc/SKILL.md`. If `gpuc` is not on PATH, run it as `uv
-run gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
+`gpuc skill` prints this file. If `gpuc` is not on PATH, run it as `uv run
+gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
 `docs/setup.md` in the repo, not this guide.
 
 ## Pick a host
@@ -183,8 +182,7 @@ the venv), `sync-preflight` (aws/hf or credentials missing), `timeout`
 host), `no-outputs` (the output path was never written), `terminated`,
 `runner-died`. A job that ended for a reason of its own and *also* lost its
 upload keeps its reason and lists `sync` or `no-outputs` under `problems`. A
-preempted job goes straight back to `queued` and never shows `preempted`
-unless its state was edited by hand.
+preempted job goes straight back to `queued`.
 
 `gpuc status` also flags jobs: `UPLOAD FAILING` on a running job means an
 output is not reaching its destination (usually an `outputs:` path that does
@@ -285,13 +283,8 @@ unchanged by the flag. Prefer it to scraping any of the text output.
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
 | `host list` | `{hosts[], errors[]}` |
-| `host probe` | `{host, sections{}, driver_version, gpus[] each with assigned, assigned_gpus[], notes[], ...}` |
-| `host add`, `host set` | one `host list` entry as the registry now holds it, plus `adopted`, `config_path`, `changes[]`, `warnings[]` (`set` adds `address{}`) |
-| `host bootstrap` | `{host, home, files, pkg_commit, dispatcher_pid, warnings[]}`; with `--all`, `{hosts[], total, bootstrapped[], failed[], gone[], unreadable[], interrupted, errors[]}` where each of `hosts[]` is `{name, outcome, error, ...}` and `outcome` is `bootstrapped`, `failed`, `gone`, `interrupted` or `not_attempted` |
-| `host clean --uv-cache` | `{host, cache_dir, before, after, before_bytes, after_bytes, freed_bytes}` |
 | `host remove` | `{host, kind, pod_id, notes[]}`; a rental is not terminated by this |
 | `host terminate` | `{host, pod_id, pod_name, pod_status, cost_usd_hr, checked, running[], queued[], outputs_pending[], terminated, forgotten, notes[]}`; `checked` false means the host could not be asked, so the three lists are empty for want of an answer |
-| `config init` | `{config_file, existed}` |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
 
 Rules, and they are not optional:
@@ -341,9 +334,7 @@ Rules, and they are not optional:
   stopped is `UNASKABLE`, exit 1, and stays until `gpuc host terminate <name>`
   ends it or `gpuc host remove <name>` forgets it and leaves it billing.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
-  create. It is also the fix when a command warns `skipping host ... registered
-  by an earlier build`: that entry is ignored (and the command exits 1) until
-  it is re-added.
+  create, and is the fix for a `registered by an earlier build` warning.
 - Only act on pods named `gpuc-*`. Others belong to other people.
 
 ## Housekeeping

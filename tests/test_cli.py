@@ -38,7 +38,7 @@ from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, load_registry, register_host
 from tests.fakehost import FakeHost
 from tests.fakeprovider import FakeProvider, running_pod
-from tests.fakes3 import FakeS3Client
+from tests.fakes3 import FakeS3Client, fake_s3
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 
@@ -463,8 +463,7 @@ def test_submit_runpod_passes_the_flags_through(
     job.write_text('command: "true"\ngpus: 1\n')
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    s3 = fake_s3(monkeypatch)
 
     seen: dict[str, object] = {}
 
@@ -539,11 +538,10 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
+    s3 = fake_s3(monkeypatch)
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
         {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 1, "attempt": 1}
     ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     seen: dict[str, object] = {}
 
     def fake_runpod_host(constraints: Constraints, settings: Settings, **kwargs: object):
@@ -878,7 +876,7 @@ def test_verified_mirrors_are_the_ids_with_a_log_under_the_hosts_prefix(
         },
         page_size=2,
     )
-    assert verified_mirrors(mirrored_host().config.s3_prefix, Settings(), client=client) == [
+    assert verified_mirrors(mirrored_host().config.s3_prefix, client=client) == [
         "a",
         "b",
     ]
@@ -890,7 +888,7 @@ def test_verified_mirrors_of_a_host_with_no_prefix_is_nothing(control_env: Path)
     from gpuc.control.clean import verified_mirrors
 
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/a/log.txt": b""})
-    assert verified_mirrors(None, Settings(), client=client) == []
+    assert verified_mirrors(None, client=client) == []
     assert client.list_calls == []
 
 
@@ -902,7 +900,7 @@ def test_verified_mirrors_raises_when_the_listing_fails(control_env: Path) -> No
             raise RuntimeError("AccessDenied")
 
     with pytest.raises(CleanError, match=r"s3://bucket/gpuc/gpubox/jobs/.*AccessDenied"):
-        verified_mirrors(mirrored_host().config.s3_prefix, Settings(), client=Refusing())
+        verified_mirrors(mirrored_host().config.s3_prefix, client=Refusing())
 
 
 # -- locate ----------------------------------------------------------------------
@@ -936,11 +934,10 @@ def test_a_second_client_asks_the_host_the_mirror_names_first(
 
     register_host(name="first", ssh="me@first")
     register_host(name="gpubox", ssh="me@gpubox")
-    client = FakeS3Client()
+    client = fake_s3(monkeypatch)
     S3Index("bkt", client).put_index(
         IndexEntry(job_id="j1", host="gpubox", s3_prefix="s3://bkt/gpuc/gpubox")
     )
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
 
     location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
@@ -960,9 +957,8 @@ def test_a_mirror_index_naming_a_host_that_does_not_know_the_job_is_not_believed
 
     register_host(name="gpu1", ssh="me@mine")
     register_host(name="lab", ssh="me@theirs")
-    client = FakeS3Client()
+    client = fake_s3(monkeypatch)
     S3Index("bkt", client).put_index(IndexEntry(job_id="j1", host="gpu1"))
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     asked = _probes(monkeypatch, {"lab": {"jobs": [{"job_id": "j1"}]}})
 
     assert locate("j1", load_registry(), None, Settings(s3_bucket="bkt")).host == "lab"
@@ -977,8 +973,7 @@ def test_a_job_the_mirror_has_no_entry_for_is_found_by_asking_the_hosts(
 
     register_host(name="first", ssh="me@first")
     register_host(name="gpubox", ssh="me@gpubox")
-    client = FakeS3Client()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    fake_s3(monkeypatch)
     asked = _probes(monkeypatch, {"gpubox": {"jobs": [{"job_id": "j1"}]}})
 
     location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
@@ -1113,9 +1108,8 @@ def test_a_job_the_index_puts_on_an_unreachable_host_stays_on_it(
 
     register_host(name="gpubox", ssh="me@gpubox")
     register_host(name="other", ssh="me@other")
-    client = FakeS3Client()
+    client = fake_s3(monkeypatch)
     S3Index("bkt", client).put_index(IndexEntry(job_id="j1", host="gpubox"))
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     _probes(monkeypatch, {"gpubox": RemoteError("gpubox", "printf %s", "no route to host")})
     location = locate("j1", load_registry(), None, Settings(s3_bucket="bkt"))
     assert location.host == "gpubox"
@@ -1139,14 +1133,14 @@ def _mirrored_log(monkeypatch: pytest.MonkeyPatch, host: str, job_id: str) -> Fa
     from gpuc.control.s3index import IndexEntry, S3Index
 
     prefix = f"s3://bkt/gpuc/{host}"
-    client = FakeS3Client(
+    client = fake_s3(
+        monkeypatch,
         objects={
             f"bkt/gpuc/{host}/jobs/{job_id}/log.txt": b"epoch 1\nepoch 2\n",
             f"bkt/gpuc/{host}/jobs/{job_id}/state.json": b'{"status": "succeeded"}',
-        }
+        },
     )
     S3Index("bkt", client).put_index(IndexEntry(job_id=job_id, host=host, s3_prefix=prefix))
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
     config_file().write_text('s3_bucket = "bkt"\n')
     return client
 
@@ -1233,7 +1227,6 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
         session=as_session(session),
         purge=True,
         all_finished=True,
-        yes=True,
     )
     assert "--older-than 0.0" in session.calls[0]
     assert "purging every finished job (horizon 0)" in report.render()
@@ -1779,9 +1772,7 @@ def test_requeue_of_an_unknown_job_is_exit_four(
     control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
-    )
+    fake_s3(monkeypatch)
     register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
     assert main(["requeue", "20260101-000000-nosuch", "--host", "gpubox"]) == EXIT_NOT_FOUND
     assert "no mirrored spec for job" in capsys.readouterr().err
@@ -1886,11 +1877,10 @@ def test_requeue_json_names_the_job_it_came_from(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
+    s3 = fake_s3(monkeypatch)
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
         {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 1}
     ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
         "gpuc.control.submitting.enqueue",
         lambda entry, prepared, *a, **k: SubmitResult(
@@ -1925,11 +1915,10 @@ def _requeue_setup(
     """A mirrored spec, no local index entry (this is a second client), and
     one fake session per registered host. Returns (hosts asked, hosts submitted to)."""
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
+    s3 = fake_s3(monkeypatch)
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
         {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 1}
     ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     asked: list[str] = []
     submitted: list[str] = []
     monkeypatch.setattr(
@@ -1990,7 +1979,7 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
     before the watchdog went, and a submit's typo check is the wrong tool for
     a file no person typed."""
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
+    s3 = fake_s3(monkeypatch)
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
         {
             "job_id": "20260101-000000-aaaaaa",
@@ -2001,7 +1990,6 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
             "outputs": [{"path": "out", "s3": "s3://b/{job_id}/out", "hf_private": True}],
         }
     ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     submitted: list[JobSpecModel] = []
 
     def fake_enqueue(entry: Any, prepared: Prepared, *a: Any, **k: Any) -> SubmitResult:
@@ -2021,7 +2009,7 @@ def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
+    s3 = fake_s3(monkeypatch)
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
         {
             "job_id": "20260101-000000-aaaaaa",
@@ -2030,7 +2018,6 @@ def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning
             "outputs": [{"path": "results", "s3": "s3://b/exp/results"}],
         }
     ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     monkeypatch.setattr(
         "gpuc.control.submitting.runpod_host",
         lambda *a, **k: pytest.fail("no pod may be bought for a spec that is refused"),
@@ -2043,7 +2030,7 @@ def test_requeue_expands_the_mirrored_template_with_the_new_id(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
+    s3 = fake_s3(monkeypatch)
     s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
         {
             "job_id": "20260101-000000-aaaaaa",
@@ -2052,7 +2039,6 @@ def test_requeue_expands_the_mirrored_template_with_the_new_id(
             "outputs": [{"path": "results", "s3": "s3://b/exp/{job_id}/results"}],
         }
     ).encode()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
     submitted: list[Prepared] = []
 
     def fake_enqueue(entry: Any, prepared: Prepared, *a: Any, **k: Any) -> SubmitResult:
@@ -2117,8 +2103,7 @@ def test_preempt_with_a_priority_passes_it_on_and_re_mirrors_the_spec(
 
     main(["host", "add", "local", "--gpus", GPU])
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    s3 = fake_s3(monkeypatch)
     S3Index("bucket", s3).put_spec_document(
         "20260101-000000-aaaaaa", {"command": "true", "priority": 50}
     )
@@ -2308,8 +2293,7 @@ def test_set_updates_the_mirrored_spec_so_requeue_carries_it(
 
     register_host(name="local", gpus=GPU)
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    s3 = fake_s3(monkeypatch)
     S3Index("bucket", s3).put_spec_document(
         "20260101-000000-aaaaaa", {"command": "true", "some_future_field": 1}
     )
@@ -2364,8 +2348,7 @@ def test_set_priority_updates_the_mirrored_spec_so_requeue_carries_the_new_prior
 
     main(["host", "add", "local", "--gpus", GPU])
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = FakeS3Client()
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: s3))
+    s3 = fake_s3(monkeypatch)
     S3Index("bucket", s3).put_spec_document(
         "20260101-000000-aaaaaa", {"command": "true", "priority": 50, "some_future_field": 1}
     )
@@ -2400,9 +2383,7 @@ def test_set_priority_says_so_when_the_mirror_kept_the_old_priority(
 
     main(["host", "add", "local", "--gpus", GPU])
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
-    )
+    fake_s3(monkeypatch)
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
     argv = ["set", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]

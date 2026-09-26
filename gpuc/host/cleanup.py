@@ -538,16 +538,6 @@ def _remove_around(directory: Path, keep: set[Path]) -> None:
             child.unlink()
 
 
-def _parse(stamp: str | None) -> datetime | None:
-    if not stamp:
-        return None
-    try:
-        parsed = datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
 @dataclass
 class Candidate:
     job_id: str
@@ -772,7 +762,7 @@ def _finished_age(job_id: str, moment: datetime) -> tuple[JobState, float | None
         return Skipped(job_id, "no readable state.json")
     if not state.finished:
         return Skipped(job_id, f"status {state.status}")
-    ended = _parse(state.ended_at)
+    ended = jobs.parse_time(state.ended_at)
     return state, None if ended is None else (moment - ended).total_seconds() / 86400.0
 
 

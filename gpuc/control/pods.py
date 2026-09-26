@@ -73,7 +73,6 @@ class PodsView:
     """Whose vocabulary says which of these pods still bill."""
     rows: list[PodRow] = field(default_factory=list)
     others: list[Pod] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
 
     @property
     def hourly(self) -> float:
@@ -95,7 +94,7 @@ class PodsView:
             "others": [
                 {"id": pod.id, "name": pod.name, "status": pod.status} for pod in self.others
             ],
-            "notes": list(self.notes),
+            "notes": [],
         }
 
 
@@ -170,5 +169,4 @@ def render(view: PodsView) -> str:
     if view.others:
         names = ", ".join(f"{pod.name} ({pod.status})" for pod in view.others)
         lines.append(f"{len(view.others)} other pod(s) in the account, never touched: {names}")
-    lines += [f"note: {note}" for note in view.notes]
     return "\n".join(lines)

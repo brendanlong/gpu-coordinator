@@ -482,29 +482,31 @@ def push_workdir(
 ) -> None:
     remote = f"{session.staging_dir(job_id)}/workdir"
     session.transport.run(f'mkdir -p "{remote}"', check=True)
-    if not use_git:
-        _push_without_git(session, job_id, workdir, remote, report)
-        return
-    try:
-        summary = git_summary(workdir)
-    except TransportError as exc:
-        raise _not_a_repo(workdir, exc) from exc
-    report(summary.render())
-    if summary.files:
-        session.transport.rsync(workdir, remote, summary.files)
-    patch = uncommitted_patch(workdir)
-    if patch:
-        session.transport.put_file(patch, f"{session.staging_dir(job_id)}/uncommitted.patch", 0o644)
+    if use_git:
+        try:
+            summary = git_summary(workdir)
+        except TransportError as exc:
+            raise _not_a_repo(workdir, exc) from exc
+        report(summary.render())
+        if summary.files:
+            session.transport.rsync(workdir, remote, summary.files)
+        patch = uncommitted_patch(workdir)
+        if patch:
+            staged = f"{session.staging_dir(job_id)}/uncommitted.patch"
+            session.transport.put_file(patch, staged, 0o644)
+        source = git_source(workdir)
+    else:
+        source = _push_without_git(session, workdir, remote, report)
     session.transport.put_file(
-        json.dumps(git_source(workdir), indent=2) + "\n",
+        json.dumps(source, indent=2) + "\n",
         f"{session.staging_dir(job_id)}/source.json",
         0o644,
     )
 
 
 def _push_without_git(
-    session: HostSession, job_id: str, workdir: Path, remote: str, report: Reporter
-) -> None:
+    session: HostSession, workdir: Path, remote: str, report: Reporter
+) -> dict[str, Any]:
     """`--no-git`: rsync the directory, minus the things that are always junk.
 
     Loud, because nothing here can tell a 40 GB dataset from a checkpoint
@@ -516,12 +518,7 @@ def _push_without_git(
         f"cannot re-create this workdir from a commit."
     )
     session.transport.rsync(workdir, remote, None, NO_GIT_EXCLUDES)
-    source = {"submitted_from": str(workdir), "submitted_at": utc_now(), "git": None}
-    session.transport.put_file(
-        json.dumps(source, indent=2) + "\n",
-        f"{session.staging_dir(job_id)}/source.json",
-        0o644,
-    )
+    return {"submitted_from": str(workdir), "submitted_at": utc_now(), "git": None}
 
 
 def enqueue_spec(session: HostSession, prepared: Prepared) -> dict[str, Any]:
