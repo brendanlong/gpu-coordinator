@@ -263,8 +263,8 @@ starts_in_s, starts_at, starts_unknown, iso, ended_at, outputs_pending`
 jobs only the index knows, each `{job_id, name, host, host_state, status,
 requeue, requeued_from, submitted_at, s3_prefix, outputs_lost}`. **Requeue one only if
 `requeue` is true**: an `unaskable` host may still be running that job, and a
-second copy is not recovery. Each entry in `shared_gpus` adds `memory_mib`,
-`utilization_pct` and `unused`.
+second copy is not recovery. Every card in `gpus` and `shared_gpus` carries
+`memory_mib` and `utilization_pct`; each shared one adds `unused`.
 
 `priority` (0-99, **lower runs first**) is the field that explains queue order,
 and `queued` is already in dispatch order. `starts_in_s` is when that job's

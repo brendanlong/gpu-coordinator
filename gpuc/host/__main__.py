@@ -67,11 +67,11 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     """What `config.gpus` and `config.shared_gpus` resolve to on this host now.
 
     The control side cannot work this out: both may name cards by index, and
-    only the host knows what its driver is calling them today. The shared cards
-    carry their current memory and utilization too, because whether one is
+    only the host knows what its driver is calling them today. Every card
+    carries its current memory and utilization, as the live answer to how hard
+    it is working; a shared card adds `unused`, because whether one is
     borrowable is a fact about this second that only nvidia-smi here can answer
-    -- and when it is not, the numbers are how somebody sees why. Owned cards
-    carry the same readings, as the live answer to how hard each is working.
+    -- and when it is not, its reading is how somebody sees why.
     The same `gpus.resolve` the dispatcher decides with, over one reading; a
     driver that will not answer reads as no cards, as it does there.
     """
@@ -82,28 +82,23 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
         table, usage, error = [], {}, str(exc)
     indices = {gpu.uuid: gpu.index for gpu in table}
     cards = gpus.resolve(config.gpus, table, config.shared_gpus)
+
+    def card(uuid: str) -> dict[str, Any]:
+        reading = usage.get(uuid)
+        return {
+            "index": indices.get(uuid),
+            "uuid": uuid,
+            "memory_mib": reading.memory_mib if reading else None,
+            "utilization_pct": reading.utilization_pct if reading else None,
+        }
+
     return {
         "gpus": config.gpus,
-        "gpus_resolved": [
-            {
-                "index": indices.get(uuid),
-                "uuid": uuid,
-                "memory_mib": usage[uuid].memory_mib if uuid in usage else None,
-                "utilization_pct": usage[uuid].utilization_pct if uuid in usage else None,
-            }
-            for uuid in cards.owned
-        ],
+        "gpus_resolved": [card(uuid) for uuid in cards.owned],
         "gpus_unavailable": cards.missing,
         "shared_gpus": config.shared_gpus,
         "shared_gpus_resolved": [
-            {
-                "index": indices.get(uuid),
-                "uuid": uuid,
-                "memory_mib": usage[uuid].memory_mib if uuid in usage else None,
-                "utilization_pct": usage[uuid].utilization_pct if uuid in usage else None,
-                "unused": uuid in usage and usage[uuid].unused,
-            }
-            for uuid in cards.shared
+            {**card(uuid), "unused": uuid in usage and usage[uuid].unused} for uuid in cards.shared
         ],
         "shared_gpus_unavailable": cards.shared_missing,
         "gpus_error": error,

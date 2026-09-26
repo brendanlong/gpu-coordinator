@@ -428,6 +428,35 @@ def test_status_resolves_the_owned_gpus(
     assert status["gpus_unavailable"] == ["9"]
 
 
+def test_status_reads_shared_cards_like_owned_ones_plus_whether_they_are_unused(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cli.gpus,
+        "snapshot",
+        lambda *_: (
+            [cli.gpus.Gpu(0, FAKE_GPUS[0]), cli.gpus.Gpu(1, FAKE_GPUS[1])],
+            {
+                FAKE_GPUS[0]: cli.gpus.Usage(FAKE_GPUS[0], 512.0, 40.0),
+                FAKE_GPUS[1]: cli.gpus.Usage(FAKE_GPUS[1], 0.0, 0.0),
+            },
+        ),
+    )
+    jobs.write_config(HostConfig(host="test-host", gpus=["0"], shared_gpus=["1"]))
+
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    assert status["shared_gpus_resolved"] == [
+        {
+            "index": 1,
+            "uuid": FAKE_GPUS[1],
+            "memory_mib": 0.0,
+            "utilization_pct": 0.0,
+            "unused": True,
+        }
+    ]
+
+
 def test_status_does_not_flag_a_queued_job_as_holding_outputs(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

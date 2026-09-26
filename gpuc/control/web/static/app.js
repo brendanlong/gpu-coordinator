@@ -315,15 +315,13 @@ function missingRow(entry, as, what) {
   return gpuRow(entry[as], [badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`], "");
 }
 
-// `?` and not `0` for a reading the host could not take: that card is out
-// *because* nothing is known about it, and "0 MiB, 0% util" beside IN USE
-// reads as a bug.
+// `?` and not `0` for a reading the host could not take: "0 MiB, 0% util"
+// beside IN USE reads as a bug.
 function reading(v) {
   return v === null || v === undefined ? "?" : Math.round(v);
 }
 
-function ownedReading(gpu) {
-  if (gpu.utilization_pct == null && gpu.memory_mib == null) return null;
+function usage(gpu) {
   return el("span", { class: "muted" }, ` ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`);
 }
 
@@ -333,9 +331,9 @@ function gpuTable(host) {
   // No holder column: the running table below names each job's cards.
   const rows = host.gpus.map((gpu) => (gpu.available === false
     ? missingRow(gpu, "owned_as", "dispatched to")
-    : gpuRow(gpu.index, [gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), ownedReading(gpu)], model(gpu))));
-  // Shared cards are somebody else's, and `IN USE` is theirs, not ours: the
-  // numbers beside it are why a job that asked for one is still queued.
+    : gpuRow(gpu.index, [gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), usage(gpu)], model(gpu))));
+  // `IN USE` is somebody else's, not ours: the reading beside it is why a job
+  // that asked for the card is still queued.
   for (const gpu of shared) {
     if (gpu.available === false) {
       rows.push(missingRow(gpu, "shared_as", "borrowed from"));
@@ -344,8 +342,8 @@ function gpuTable(host) {
     let state;
     if (gpu.busy_job) state = badge("shared, busy", "warn");
     else if (gpu.unused) state = badge("shared, free", "good");
-    else state = [badge("shared, IN USE", "bad"), el("span", { class: "muted" }, ` somebody else: ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`)];
-    rows.push(gpuRow(gpu.index, state, model(gpu)));
+    else state = badge("shared, IN USE", "bad");
+    rows.push(gpuRow(gpu.index, [state, usage(gpu)], model(gpu)));
   }
   return table([{ text: "card" }, { text: "state" }, { text: "model" }], rows);
 }

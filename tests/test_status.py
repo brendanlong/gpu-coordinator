@@ -12,6 +12,7 @@ from gpuc.control.status import (
     HostView,
     JobView,
     gather,
+    gpu_usage,
     host_json,
     host_warnings,
     job_json,
@@ -511,7 +512,7 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     numbering -- so free/busy, and the per-card lines, come from its answer."""
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "7"])
     host_view = HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=2.0)
-    host_view.owned, host_view.indices, host_view.owned_usage = owned_gpus(
+    host_view.owned, host_view.indices = owned_gpus(
         payload(
             gpus=["0", "7"],
             gpus_resolved=[{"index": 0, "uuid": GPU}],
@@ -532,24 +533,24 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
 def test_only_the_hosts_resolved_table_names_owned_cards() -> None:
     """`config.gpus` may be indices, and the cache is nobody's evidence: a
     payload with no resolved table owns nothing until the host says."""
-    assert owned_gpus(payload()) == ([], {}, {})
+    assert owned_gpus(payload()) == ([], {})
 
 
 def test_each_owned_card_shows_what_nvidia_smi_just_read_on_it() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "1"])
     host_view = HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=2.0)
-    host_view.owned, host_view.indices, host_view.owned_usage = owned_gpus(
-        payload(
-            gpus_resolved=[
-                {"index": 0, "uuid": GPU, "memory_mib": 21504.0, "utilization_pct": 97.0},
-                {"index": 1, "uuid": "GPU-other", "memory_mib": None, "utilization_pct": None},
-            ],
-        )
+    document = payload(
+        gpus_resolved=[
+            {"index": 0, "uuid": GPU, "memory_mib": 21504.0, "utilization_pct": 97.0},
+            {"index": 1, "uuid": "GPU-other", "memory_mib": None, "utilization_pct": None},
+        ],
     )
+    host_view.owned, host_view.indices = owned_gpus(document)
+    host_view.usage = gpu_usage(document)
     text = render(host_view)
     assert "gpu     [0] free ? (21504 MiB, 97% util)" in text
     # No reading is no reading, not a zero.
-    assert "[1] free ?\n" in text + "\n"
+    assert "gpu     [1] free ? (? MiB, ?% util)" in text
     cards = host_json(host_view)["gpus"]
     assert (cards[0]["memory_mib"], cards[0]["utilization_pct"]) == (21504.0, 97.0)
     assert (cards[1]["memory_mib"], cards[1]["utilization_pct"]) == (None, None)
@@ -1099,12 +1100,11 @@ def test_a_shared_card_somebody_else_is_on_is_rendered_with_their_numbers() -> N
         ]
     )
     rendered = render(got)
-    assert "shared  [4] IN USE" in rendered
-    assert "(somebody else: 21504 MiB, 98% util)" in rendered
+    assert "shared  [4] IN USE ? (21504 MiB, 98% util)" in rendered
     assert got.borrowable == []
 
 
-def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_not_in_use() -> None:
+def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_with_its_reading() -> None:
     got = shared_view(
         jobs=[
             {
@@ -1126,8 +1126,27 @@ def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_not_in_use() -> None
             }
         ],
     )
-    assert "shared  [4] busy" in render(got)
+    assert "shared  [4] busy ? (8192 MiB, 90% util)" in render(got)
+    card = host_json(got)["shared_gpus"][0]
+    assert (card["memory_mib"], card["utilization_pct"]) == (8192.0, 90.0)
     assert got.borrowable == []
+
+
+def test_a_shared_card_nvidia_smi_could_not_read_says_so() -> None:
+    """The host reports an unreadable card not unused, so it reads `IN USE`;
+    the question marks are the only thing saying why."""
+    got = shared_view(
+        shared_gpus_resolved=[
+            {
+                "index": 4,
+                "uuid": SHARED,
+                "memory_mib": None,
+                "utilization_pct": None,
+                "unused": False,
+            }
+        ]
+    )
+    assert "shared  [4] IN USE ? (? MiB, ?% util)" in render(got)
 
 
 def test_a_shared_entry_the_host_cannot_see_says_so() -> None:
