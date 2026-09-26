@@ -225,6 +225,18 @@ def as_str_list(d: Any, key: str) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
 
 
+def as_opt_str_list(d: Any, key: str) -> list[str] | None:
+    """None only for an explicit null: a missing key, a document that is not
+    an object, or a value that is not a list reads as empty, so a deleted or
+    hand-mangled file claims no cards rather than every card on somebody's
+    box."""
+    fields = fields_of(d)
+    if key in fields and fields[key] is None:
+        return None
+    value = fields.get(key)
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
 def as_opt_float_list(d: Any, key: str) -> list[float | None]:
     """A list of samples where `null` means "we could not read one"."""
     value = fields_of(d).get(key)
@@ -860,9 +872,16 @@ def cache_beside(home: str, name: str) -> str:
 class HostConfig:
     schema_version: int = SCHEMA_VERSION
     host: str = "local"
-    gpus: list[str] = field(default_factory=list)
-    """The cards this host owns, stored exactly as they were given: nvidia-smi
-    indices, UUIDs, or a mix.
+    gpus: list[str] | None = field(default_factory=list)
+    """The most this host may own, stored exactly as given: nvidia-smi indices,
+    UUIDs, or a mix. None -- written only as an explicit null, which every
+    first config is -- is every card nvidia-smi reports that is not shared,
+    cards that appear later included.
+
+    A ceiling, not a promise: what the host owns on a pass is the entries that
+    resolve to a card nvidia-smi reports then. A card that has died is not
+    waited for, and one added to a box that owns everything is used without
+    anyone reconfiguring it.
 
     An index is how a share of a shared box is agreed ("you get 2 and 3"), and
     resolving it to a UUID at registration would freeze one boot's numbering
@@ -931,7 +950,7 @@ class HostConfig:
         return HostConfig(
             schema_version=as_int(fields, "schema_version", SCHEMA_VERSION),
             host=as_str(fields, "host", "local") or "local",
-            gpus=as_str_list(fields, "gpus"),
+            gpus=as_opt_str_list(fields, "gpus"),
             shared_gpus=as_str_list(fields, "shared_gpus"),
             provider=provider if isinstance(provider, dict) else None,
             idle_minutes=as_float(fields, "idle_minutes", 15.0),

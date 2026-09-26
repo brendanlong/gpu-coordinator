@@ -1034,7 +1034,7 @@ def test_host_add_json_is_the_host_as_list_reports_it_plus_what_add_did(
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--json"]) == EXIT_OK
     document = document_of(capsys)
     assert (document["name"], document["kind"], document["ssh"]) == ("gpubox", "ssh", "me@box")
-    assert document["gpus"] == ["GPU-a", "GPU-b"]
+    assert document["gpus"] is None  # every card, written as null
     assert document["adopted"] is False
     assert document["config_path"] == fake_host.config_path
     assert document["warnings"] == []

@@ -95,9 +95,9 @@ have its User-Agent overridden.
 ## On-host state: `~/.gpuc/`
 
 ```
-config.json          # {"schema_version": 1, "host": "<name>", "gpus": ["GPU-uuid" | "<index>", ...],
-                     #                              # what this host owns, as it was registered;
-                     #                              # see GPU ownership
+config.json          # {"schema_version": 1, "host": "<name>", "gpus": null | ["GPU-uuid" | "<index>", ...],
+                     #                              # the most this host owns, as it was registered
+                     #                              # (null: every unshared card); see GPU ownership
                      #  "shared_gpus": ["<index>" | "GPU-uuid", ...],  # cards it may borrow while
                      #                              # nobody else is on them; see Shared GPUs
                      #  "provider": null | {"kind":"runpod","pod_id":..},
@@ -246,9 +246,10 @@ The rules it holds to:
   if the lock still names it. A dispatcher whose own commit is unrecorded
   replaces nobody.
 - **One dispatch rule** (`plan.plan`), pure, over one pass's inputs: the queue
-  in `(priority, job_id)` order, the owned cards free now, the configured
-  counts, and one nvidia-smi reading of the shared cards taken only if a job
-  needs to borrow. Per job it decides assigned, holds, stepped over or fails,
+  in `(priority, job_id)` order, the owned cards free now, how many owned and
+  shared cards nvidia-smi reports (capacity: a job wider than that fails), and
+  one nvidia-smi reading of the shared cards taken only if a job needs to
+  borrow. Per job it decides assigned, holds, stepped over or fails,
   and `launch_ready` acts on it every 2 s. The same function over the cards a
   stop in flight will hand back is how automatic preemption finds the one job
   the queue is stuck on, and run forward over the running jobs' etas
@@ -794,7 +795,16 @@ and nowhere else, so one box driven from two machines has one configuration.
 ## GPU ownership: indices in, UUIDs out
 
 `--gpus` takes nvidia-smi indices, UUIDs, or a mix, and the registry and
-`config.json` store **exactly what was given** (`HostConfig.gpus`).
+`config.json` store **exactly what was given** (`HostConfig.gpus`), or null for
+`all`: every card nvidia-smi reports that no `shared_gpus` entry names.
+
+**The config is a ceiling; the cards are what nvidia-smi reports.** What a host
+owns on a pass is the entries that resolve then, and capacity -- at submit,
+where the client reads the host's nvidia-smi before shipping anything, and at
+dispatch -- is counted from those. A job wider than that fails; nothing waits
+for a card to come back, and a card added to an `all` host is used on the next
+pass. A pass on which nvidia-smi cannot be read fails nothing, until it has
+failed to answer for `SMI_PATIENCE_S`.
 
 Everything downstream is UUIDs. **One table and one rule**: `gpus.parse_table`
 reads `nvidia-smi --query-gpu=index,uuid,name,memory.total` wherever it is
@@ -808,16 +818,19 @@ again is the job's own `CUDA_VISIBLE_DEVICES`, translated from the UUIDs by
 the runner at that instant and pinned with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 
 An entry that resolves to nothing (an index the driver no longer uses or a
-UUID it no longer reports) is logged, treated as unavailable (jobs wait, they
-do not fail), and reported by `gpuc status` and the health check's
-`gpu_uuids`. An entry naming a card already named (an index and its own UUID,
-or a card in both lists) is a `duplicate`: the health check and `gpuc host
-add|set` refuse it, the dispatcher hands the card out once, and the runner
-fails an assignment that carries one.
+UUID it no longer reports) is logged, owns nothing, and is reported by `gpuc
+status` and as a warning by the health check's `gpu_uuids`. An entry naming a
+card already named (an index and its own UUID, or a card in both lists) is a
+`duplicate`: the health check and `gpuc host add|set` refuse it, the
+dispatcher hands the card out once, and the runner fails an assignment that
+carries one.
 
-A host given its first config with no `--gpus` owns every card the probe saw,
-as UUIDs, less any named by `--shared-gpus`. A host that already has a config
-is never defaulted.
+Only an explicit `"gpus": null` means all. A missing key, a missing or
+unparseable file, or a value that is not a list owns nothing: a mangled config
+on a shared box must not claim everybody's cards.
+
+A host given its first config with no `--gpus` gets `"gpus": null`. A host that
+already has a config is never defaulted.
 
 Every listing names a card `[index] name vram`; `gpuc host list` adds the UUID,
 `gpuc status` adds free/busy and names each running job's cards, and `gpuc host

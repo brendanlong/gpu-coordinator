@@ -779,7 +779,7 @@ def _gpu_lines(view: HostView) -> list[str]:
     for missing in view.unavailable:
         lines.append(
             f"  gpu     [{missing}] UNAVAILABLE  nvidia-smi does not report this card on the "
-            f"host; nothing is dispatched to it, and a job waiting for it holds the queue"
+            f"host, so nothing is dispatched to it"
         )
     return lines + _shared_gpu_lines(view)
 

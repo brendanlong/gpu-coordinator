@@ -278,10 +278,15 @@ def test_host_config_from_a_null_or_junk_document_never_raises() -> None:
         }
     )
     assert junk.host == "local"
+    assert junk.gpus is None
     assert junk.idle_minutes == 15.0
     assert junk.retention_days is None
     assert junk.provider is None
     assert junk.env == {}
+
+
+def test_a_gpus_value_that_is_not_a_list_owns_nothing_rather_than_everything() -> None:
+    assert HostConfig.from_dict({"gpus": "0,1"}).gpus == []
 
 
 def test_a_string_number_is_still_a_number() -> None:
@@ -373,6 +378,15 @@ def test_a_config_from_before_shared_gpus_borrows_nothing() -> None:
 
     explicit_null = HostConfig.from_dict({"gpus": ["0"], "shared_gpus": None})
     assert explicit_null.shared_gpus == []
+
+
+def test_an_empty_gpus_list_still_owns_nothing_and_null_round_trips() -> None:
+    """Every older build wrote a list, so `[]` from one keeps meaning no cards;
+    only null (or no key) is every card."""
+    assert HostConfig.from_dict({"gpus": []}).gpus == []
+    everything = HostConfig.from_dict({"gpus": None})
+    assert everything.gpus is None
+    assert HostConfig.from_dict(everything.to_dict()).gpus is None
 
 
 def test_a_spec_from_before_use_shared_does_not_borrow_either() -> None:

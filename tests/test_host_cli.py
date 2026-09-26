@@ -552,11 +552,11 @@ def test_status_projects_nothing_on_a_draining_host(
     )
 
 
-def test_status_holds_the_queue_for_a_missing_owned_card(
+def test_status_says_a_job_needing_a_missing_owned_card_will_not_run(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Owned by index, and index 9 is not there: the host holds for it, and
-    the job at the front is told which card is the problem."""
+    """Owned by index, and index 9 is not there: the job that needs it is told
+    which card is the problem, and the one behind it does not wait on it."""
     use_smi(monkeypatch, FAKE_GPUS[:1])
     jobs.write_config(HostConfig(host="test-host", gpus=["0", "9"]))
     start_running([FAKE_GPUS[0]], 45)
@@ -566,10 +566,29 @@ def test_status_holds_the_queue_for_a_missing_owned_card(
     got = projection(capsys)
     assert got[wide] == (
         None,
-        "it needs 2 card(s) and only 1 of the 2 this host owns answer to nvidia-smi "
-        "(9 missing), so it is held until they do",
+        "needs 2 GPUs, host owns 1 that nvidia-smi reports (9 listed but missing), "
+        "so it will never be dispatched",
     )
-    assert got[narrow] == (None, f"job {wide} is ahead of it and has no start time yet")
+    assert got[narrow][0] == pytest.approx(45 * 60, abs=5)
+
+
+def test_status_does_not_call_a_job_hopeless_while_nvidia_smi_is_unreadable(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher holds GPU jobs through a driver that will not answer, so
+    status says why they wait rather than that they never will."""
+
+    def unreadable(args: list[str]) -> str:
+        raise cli.gpus.GpuError("nvidia-smi timed out")
+
+    monkeypatch.setattr(cli.gpus.list_gpus, "__defaults__", (unreadable,))
+    jobs.write_config(HostConfig(host="test-host", gpus=None))
+    gpu = queue.enqueue(make_spec(gpus=1))
+    cpu = queue.enqueue(make_spec(gpus=0))
+
+    got = projection(capsys)
+    assert got[gpu] == (None, "nvidia-smi could not be read on the host (nvidia-smi timed out)")
+    assert got[cpu] == (0.0, None)
 
 
 def test_status_lets_a_borrower_start_on_an_idle_shared_card(

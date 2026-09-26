@@ -114,14 +114,15 @@ def test_the_provider_block_comes_from_the_rental_for_a_config_we_initialise() -
     assert initial["s3_prefix"] == "s3://b/gpuc/pod1"
 
 
-def test_first_config_owns_every_card_seen_less_the_shared_ones() -> None:
+def test_first_config_owns_every_card_less_the_shared_ones() -> None:
     """The one constructor for a host that has none: the same defaults for a
-    box, a pod and a wiped home, and overrides on top."""
+    box, a pod and a wiped home, and overrides on top. It owns every card, not
+    the ones the probe saw, so a card added later is used too."""
     address = HostEntry(name="box", ssh="me@box").with_cache(
         gpu_info={"GPU-a": GpuInfo(index=0), "GPU-b": GpuInfo(index=1)}
     )
     document = first_config(address, Settings(), {"shared_gpus": ["1"], "idle_minutes": 5.0})
-    assert document["gpus"] == ["GPU-a"]
+    assert "gpus" in document and document["gpus"] is None
     assert document["shared_gpus"] == ["1"]
     assert (document["idle_minutes"], document["workdir_days"], document["s3_prefix"]) == (
         5.0,
@@ -268,8 +269,13 @@ def test_config_changes_names_every_key_a_flag_would_change_on_the_host() -> Non
     assert config_changes(existing, {"retention_days": 7.0}) == ["retention_days none -> 7.0"]
     assert config_changes({}, {}) == []
     # But a key it has never written, set to the default it already behaves by,
-    # is not: `--gpus ''` on a host with no cards changes nothing.
+    # is not: a host with no gpus key owns nothing, so `--gpus ''` changes
+    # nothing there and `--gpus all` does.
     assert config_changes({"host": "gpubox"}, {"gpus": [], "idle_minutes": 15.0}) == []
+    assert config_changes({"host": "gpubox"}, {"gpus": None}) == ["gpus none -> all"]
+    assert config_changes({"gpus": None}, {"gpus": []}) == ["gpus all -> none"]
+    assert config_changes({"gpus": None}, {"gpus": ["0", "1"]}) == ["gpus all -> 0,1"]
+    assert config_changes(existing, {"gpus": None}) == ["gpus 0 -> all"]
 
 
 def test_config_drift_is_quiet_about_a_config_just_written() -> None:

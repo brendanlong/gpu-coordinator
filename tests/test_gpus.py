@@ -62,6 +62,21 @@ def test_a_card_both_owned_and_shared_is_a_duplicate_and_owning_wins() -> None:
     assert gpus.resolve(["0"], table, shared=["9"]).shared_missing == ["9"]
 
 
+def test_owning_every_card_is_every_card_no_shared_entry_names() -> None:
+    table = gpus.list_gpus(fake_smi())
+    assert gpus.resolve(None, table) == gpus.Resolution(FAKE_GPUS, [], [], [], [])
+    assert gpus.resolve(None, []) == gpus.Resolution([], [], [], [], [])
+    for spelling in ("1", FAKE_GPUS[1]):
+        cards = gpus.resolve(None, table, shared=[spelling])
+        assert (cards.owned, cards.shared) == ([FAKE_GPUS[0]], [FAKE_GPUS[1]])
+        assert cards.duplicates == []
+    # A shared entry that names nothing takes nothing away, and is still missing.
+    absent = gpus.resolve(None, table, shared=["9"])
+    assert (absent.owned, absent.shared_missing) == (FAKE_GPUS, ["9"])
+    # One card shared under both spellings is still named twice.
+    assert gpus.resolve(None, table, shared=["1", FAKE_GPUS[1]]).duplicates == [FAKE_GPUS[1]]
+
+
 def test_sample_utilization_filters_to_requested_uuids() -> None:
     smi = fake_smi(utilization={FAKE_GPUS[0]: 91.0, FAKE_GPUS[1]: 3.0})
     assert gpus.sample_utilization([FAKE_GPUS[0]], smi) == {FAKE_GPUS[0]: 91.0}

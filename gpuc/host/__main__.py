@@ -71,12 +71,13 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     borrowable is a fact about this second that only nvidia-smi here can answer
     -- and when it is not, the numbers are how somebody sees why. The same
     `gpus.resolve` the dispatcher decides with, over one reading; a driver
-    that will not answer reads as every entry unavailable, as it does there.
+    that will not answer reads as no cards, as it does there.
     """
+    error: str | None = None
     try:
         table = gpus.list_gpus()
-    except gpus.GpuError:
-        table = []
+    except gpus.GpuError as exc:
+        table, error = [], str(exc)
     indices = {gpu.uuid: gpu.index for gpu in table}
     cards = gpus.resolve(config.gpus, table, config.shared_gpus)
     # Through the same reader the dispatcher borrows on, so an absent entry
@@ -98,7 +99,7 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
             for uuid in cards.shared
         ],
         "shared_gpus_unavailable": cards.shared_missing,
-        "shared_configured": len(cards.shared) + len(cards.shared_missing),
+        "gpus_error": error,
     }
 
 
@@ -169,15 +170,22 @@ def projected_starts(
                 None if estimate is None else estimate * 60.0,
             )
         )
-    return plan.project(
+    unknown: dict[str, str] = {}
+    if table["gpus_error"]:
+        # The dispatcher holds these for `SMI_PATIENCE_S` rather than failing
+        # them on a reading that says nothing about the cards.
+        why = f"nvidia-smi could not be read on the host ({table['gpus_error']})"
+        unknown = {r.job_id: why for r in requests if r.gpus}
+        requests = [r for r in requests if not r.gpus]
+    projection = plan.project(
         requests,
         cards,
-        owned_configured=len(config.gpus),
         owned_missing=table["gpus_unavailable"],
-        shared_configured=table["shared_configured"],
+        shared_missing=table["shared_gpus_unavailable"],
         theirs=theirs,
         draining=paths.draining_file().exists(),
     )
+    return plan.Projection(projection.starts_in_s, {**unknown, **projection.unknown})
 
 
 def _ended_within(ended_at: str | None, since_s: float, now: datetime) -> bool:

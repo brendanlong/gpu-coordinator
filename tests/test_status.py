@@ -880,17 +880,22 @@ def test_a_queued_job_with_no_start_renders_no_start() -> None:
     assert "starts" not in narrow
 
 
-def test_a_missing_owned_card_is_called_out_as_holding_the_queue() -> None:
+def test_a_missing_owned_card_is_called_out() -> None:
     view = busy(
         running_job(gpus=[GPU], eta=in_minutes(45)),
         queued=[
-            waiting("j-wide", gpus_requested=2, starts_unknown="(7 missing)"),
-            waiting("j-narrow", starts_unknown="job j-wide is ahead of it"),
+            waiting(
+                "j-wide",
+                gpus_requested=2,
+                starts_unknown="(7 listed but missing), so it will never be dispatched",
+            ),
         ],
     )
     view.owned = [GPU]
     view.unavailable = ["7"]
-    assert "a job waiting for it holds the queue" in render(view)
+    rendered = render(view)
+    assert "gpu     [7] UNAVAILABLE" in rendered
+    assert "does not report this card on the host, so nothing is dispatched to it" in rendered
 
 
 def test_nothing_is_dated_on_a_draining_host() -> None:

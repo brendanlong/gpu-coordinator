@@ -126,7 +126,8 @@ def test_happy_path_registers_a_bootstrapped_host(
     assert entry.name.startswith("gpuc-e2e-")
     assert entry.ssh == "root@1.2.3.4"
     assert entry.port == 22000
-    assert entry.config.gpus == list(POD_GPUS)
+    assert entry.config.gpus is None
+    assert set(entry.gpu_info) == set(POD_GPUS)
     assert entry.python and entry.bootstrapped_at
     assert entry.config.idle_minutes == 2.0
     # The bootstrap ran for real: the package is on the host and a dispatcher was started.
