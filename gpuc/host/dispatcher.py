@@ -1007,7 +1007,7 @@ class Dispatcher:
             coming=[
                 uuid
                 for job_id, entry in self.running.items()
-                if self._leaving(entry, self._state_or_empty(job_id))
+                if self._leaving(entry, job_id)
                 for uuid in entry.gpus
                 if uuid in visible
             ],
@@ -1015,7 +1015,7 @@ class Dispatcher:
         )
 
     @staticmethod
-    def _leaving(entry: _Running, state: jobs.JobState) -> bool:
+    def _leaving(entry: _Running, job_id: str) -> bool:
         """Is this runner's attempt over, bar the runner exiting?
 
         Asked of the state and the attempt, not of the intent alone: a runner
@@ -1025,8 +1025,12 @@ class Dispatcher:
         them stopped being covered, a filler took the free card it held, and
         two fillers could take turns on a wide job's cards for ever. A runner
         not yet claimed (`queued` at the attempt it was launched for) is
-        arriving, not leaving.
+        arriving, not leaving, and one whose state cannot be read is neither.
         """
+        try:
+            state = jobs.read_state(job_id)
+        except RuntimeError:
+            return False
         if state.status == "running":
             return state.intent is not None
         return not (state.status == "queued" and state.attempt == entry.attempt)

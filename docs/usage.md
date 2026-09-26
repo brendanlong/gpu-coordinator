@@ -88,8 +88,8 @@ otherwise a job like any other, except that `gpuc preempt` refuses it. A
 running one keeps a rental from going idle.
 
 A job with [`auto_preempt: true`](#automatic-preemption) may be started on
-held cards, whatever its priority, and is stopped once the job holding them
-can start.
+held cards, whatever its priority, and is stopped when that lets a job ahead of
+it start.
 
 A job waiting for a [shared card](#shared-gpus) somebody else is using does not
 hold: the queue behind it runs. A job short of an *owned* card holds even when
@@ -698,7 +698,8 @@ Beyond what the example shows:
   `starts_unknown` says why. It counts automatic preemption: an
   `auto_preempt` job's cards come back when the job it yields to can start.
 - `yields_to`: on a running `auto_preempt` job, the first queued job ahead of
-  it that its cards could start; null on anything else.
+  it that could use its cards; null on anything else. It says why the job is
+  running while that one waits, not that it is the job it will be stopped for.
 - `problems`: what else went wrong on the way out of a finished job (`sync`,
   `no-outputs`). `upload_errors`: the last failure standing at each upload
   destination; a running job with one says `UPLOAD FAILING` in the text.

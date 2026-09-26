@@ -25,8 +25,9 @@ The other exemption is a job that said it may be stopped (`auto_preempt`). It
 may take free cards held for a job ahead of it: a card waiting for its
 siblings does work in the meantime, and automatic preemption stops it once
 that is what the job ahead is short of. Not a card held for a job that is
-already *covered* -- one that starts once the stops in flight land, or once
-the `auto_preempt` jobs behind it are stopped -- or the stopped jobs would be
+already *covered* -- one that starts once the stops in flight land, or the
+first job with a gap when the `auto_preempt` jobs behind it cover it, since
+those are the ones automatic preemption is about to stop -- or the stopped jobs would be
 relaunched onto the very cards they gave up, one after another, for ever.
 Estimates are informational, so unlike Slurm's backfill nothing proves a
 filler ends in time; it is the promise to be stopped that makes it safe.
@@ -229,7 +230,9 @@ def plan(requests: Sequence[Request], pool: Pool) -> list[Decision]:
     held: dict[str, str] = {}
     """Card -> the job holding it."""
     covered: set[str] = set()
-    candidates = list(pool.preemptable)
+    stuck = False
+    """Whether the first job with a gap has been passed: automatic preemption
+    acts for that one only, so only that one is covered by it."""
     for request in requests:
         failure = capacity_failure(
             request.gpus, pool.owned_configured, pool.shared_configured, borrows=request.borrows
@@ -257,17 +260,17 @@ def plan(requests: Sequence[Request], pool: Pool) -> list[Decision]:
         if request.gpus > ours:
             decisions.append(SteppedOver(request.job_id, request.gpus - ours))
             continue
-        fill = _fill(request, pool, held, covered) if request.fills else None
+        fill = _fill(request, pool, held, covered) if request.fills and short else None
         if fill is not None:
             _take(pool, fill.gpus)
             decisions.append(fill)
             continue
-        preempts = (
-            enough_to_start(candidates, request.key, short, borrowing=request.borrows)
-            if short
-            else []
-        )
-        candidates = [c for c in candidates if c not in preempts]
+        preempts = []
+        if short and not stuck:
+            stuck = True
+            preempts = enough_to_start(
+                pool.preemptable, request.key, short, borrowing=request.borrows
+            )
         taken = [*free, *coming]
         for card in taken:
             held[card] = request.job_id
@@ -341,9 +344,10 @@ class Projection:
 
 
 def yields_to(job: Preemptable, requests: Sequence[Request]) -> str | None:
-    """The first queued job ahead of this running one that its cards could
-    help start: `enough_to_start`'s own test, so it is exactly the job whose
-    turn ends this one's."""
+    """The first queued job ahead of this running one that could use its
+    cards, by `enough_to_start`'s own test. For `status`, to say why a job at
+    priority 90 is running while one at 10 waits: it is not necessarily the
+    job it will be stopped for, which only a dispatch pass decides."""
     for request in requests:
         if request.key < job.key and request.gpus and job.frees(borrowing=request.borrows):
             return request.job_id
@@ -410,15 +414,6 @@ def project(
             theirs=theirs,
         )
         decisions = plan(pending, pool)
-        stuck = next((d for d in decisions if isinstance(d, Holds) and d.gap), None)
-        if stuck is not None and stuck.preempts:
-            for job_id in stuck.preempts:
-                stopped, again = stoppable.pop(job_id)
-                for uuid in stopped.gpus:
-                    releases[uuid] = clock
-                pending.append(again)
-            pending.sort(key=lambda r: r.key)
-            continue  # the next walk, at the same moment, starts the job stopped for
         by_id = {r.job_id: r for r in pending}
         for decision in decisions:
             if not isinstance(decision, Assigned):
@@ -443,6 +438,17 @@ def project(
                     request,
                 )
                 ends[request.job_id] = done
+        # As the dispatcher does: launch what fits, then stop what covers the
+        # first stuck job, and walk again at the same moment to start it.
+        stuck = next((d for d in decisions if isinstance(d, Holds) and d.gap), None)
+        if stuck is not None and stuck.preempts:
+            for job_id in stuck.preempts:
+                stopped, again = stoppable.pop(job_id)
+                for uuid in stopped.gpus:
+                    releases[uuid] = clock
+                pending.append(again)
+            pending.sort(key=lambda r: r.key)
+            continue
         later = [at for at in releases.values() if at is not None and at > clock]
         if not later:
             break

@@ -321,6 +321,35 @@ def test_only_a_job_behind_is_stopped_for_one_ahead_of_it() -> None:
     ]
 
 
+def test_a_filler_whose_own_card_is_coming_back_waits_for_it() -> None:
+    p, _ = pool(["a"], owned_configured=2, shared_free=[], coming=["s"], shared=["s"])
+    p.shared_configured = p.shared_visible = 1
+    requests = [req("wide", 2), req("filler", borrows=True, fills=True)]
+    assert plan.plan(requests, p) == [Holds("wide", 1, 0, 1), Holds("filler", 0, 1, 0)]
+
+
+def test_only_the_first_stuck_job_is_covered_by_preemption() -> None:
+    """Automatic preemption acts for that one alone, so a later holder's
+    cards are not kept idle for stops nobody will make."""
+    p, _ = pool(
+        [],
+        owned_configured=1,
+        shared_free=["s0"],
+        preemptable=[running("cheap", ["s1"]), running("cheap2", ["a"])],
+    )
+    p.shared_configured = p.shared_visible = 2
+    requests = [
+        req("first", priority=10),
+        req("borrower", 2, borrows=True, priority=20),
+        req("filler", borrows=True, fills=True),
+    ]
+    assert plan.plan(requests, p) == [
+        Holds("first", 0, 0, 1, ("cheap2",)),
+        Holds("borrower", 0, 1, 1),
+        Assigned("filler", ["s0"], ("borrower",)),
+    ]
+
+
 def replace_pool(p: Pool, *preemptable: Preemptable) -> Pool:
     return dataclasses.replace(p, preemptable=list(preemptable))
 
@@ -515,6 +544,19 @@ def test_project_starts_a_stopped_job_again_behind_the_one_it_made_room_for() ->
     )
     # `urgent` 0-30, then `cheap` again 30-40, then `next`.
     assert minutes(projection) == {"urgent": 0.0, "next": 40.0}
+
+
+def test_project_launches_what_fits_before_it_stops_anything() -> None:
+    """As the dispatcher does: `a` takes the free shared card in the same pass
+    that the filler is stopped for `w`, so `w` starts now."""
+    filler = (running("filler", ["o1"]), req("filler", priority=90, fills=True))
+    projection = project(
+        [req("a", borrows=True, priority=5, est_min=30), req("w", priority=10)],
+        [*owned(60, None), *shared(0)],
+        running=[filler],
+    )
+    assert minutes(projection) == {"a": 0.0, "w": 0.0}
+    assert projection.yields_to == {"filler": "a"}
 
 
 def test_project_counts_a_filler_that_ends_on_its_own() -> None:

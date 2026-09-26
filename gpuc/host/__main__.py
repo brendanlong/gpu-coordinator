@@ -147,8 +147,12 @@ def projected_starts(
     holder = {uuid: s for s in running.values() for uuid in s.gpus}
 
     def release(uuid: str) -> float | None:
+        """Now for a card nobody holds or whose job is being stopped, as the
+        dispatcher counts it; its holder's eta otherwise."""
         state = holder.get(uuid)
-        return 0.0 if state is None else _seconds_until(state.eta)
+        if state is None or state.intent is not None:
+            return 0.0
+        return _seconds_until(state.eta)
 
     cards = [plan.Card(row["uuid"], False, release(row["uuid"])) for row in table["gpus_resolved"]]
     theirs = 0
