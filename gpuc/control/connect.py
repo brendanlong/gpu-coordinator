@@ -66,8 +66,7 @@ def connect_host(
     given: on a host that already has a config each one is an explicit
     override, written through to the host and reported field by field; on a
     host that has none they are overrides of `first_config`, whose default
-    `gpus` is every card the probe saw (`address.gpu_info`), less any it was
-    asked to share.
+    `gpus` is null: every card the host has that is not shared.
 
     `before_write` is judged once the host's own name is known and before
     anything is written to it, so a caller that refuses the result refuses it
@@ -92,10 +91,10 @@ def connect_host(
         # somebody's host.
         before_write(entry)
     else:
-        if "gpus" not in patch and "shared_gpus" not in patch and not address.gpu_info:
-            # An empty default is a driver that is still coming up, or an
-            # nvidia-smi that is missing, as often as a box with no cards.
-            # Writing "owns nothing" as the host's first config would stick.
+        if not isinstance(patch.get("gpus"), list) and not address.gpu_info:
+            # No cards is a driver that is still coming up, or an nvidia-smi
+            # that is missing, as often as a box with none; owning all of
+            # them there fails the health check's driver probe at bootstrap.
             raise ConnectError(
                 f"{address.name} reports no GPUs (nvidia-smi is missing there, or found no "
                 f"cards), so there is nothing for it to own by default. Pass --gpus '' to "
@@ -253,8 +252,8 @@ def _refuse_overlapping_gpus(
 def _cards(entries: list[str], table: list[gpus.Gpu]) -> set[str]:
     """The cards `entries` name, through the cards the probe saw; an entry the
     probe did not see is left as typed -- a typo or a card this container was
-    not given, which the health check refuses at bootstrap, not something to
-    guess at here."""
+    not given, which the health check warns about at bootstrap, not something
+    to guess at here."""
     cards = gpus.resolve(entries, table)
     return set(cards.owned) | set(cards.missing)
 

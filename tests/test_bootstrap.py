@@ -315,7 +315,7 @@ def test_bootstrap_says_so_when_the_config_it_restores_owns_no_card(
     _, result = bootstrap_host(host_entry(name="h", gpus=[]), transport=host, report=lambda _: None)
     (warning,) = result.warnings
     assert "no config of its own" in warning
-    assert "gpuc host set h --gpus all" in warning
+    assert "gpuc host set h --gpus <list>" in warning
 
 
 def test_bootstrap_gives_a_bare_host_it_knows_nothing_about_every_card(
@@ -324,7 +324,9 @@ def test_bootstrap_gives_a_bare_host_it_knows_nothing_about_every_card(
     """An entry with no config cached restores the default, which owns every
     card the host turns out to have -- nothing to warn about."""
     host = ScriptedHost()
-    updated, result = bootstrap_host(host_entry(name="h"), transport=host, report=lambda _: None)
+    bare = host_entry(name="h")
+    bare = bare.model_copy(update={"cache": bare.cache.model_copy(update={"config": {}})})
+    updated, result = bootstrap_host(bare, transport=host, report=lambda _: None)
     assert result.warnings == []
     assert host.config is not None
     assert "gpus" in host.config and host.config["gpus"] is None

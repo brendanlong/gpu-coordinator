@@ -42,7 +42,7 @@ run gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
 Prefer a host you already have over a pod you pay for; a busy host queues your
 job behind the running one, which is usually fine. If nothing is registered,
 `gpuc host add local` then `gpuc host bootstrap local` gives you this machine
-with every card nvidia-smi reports.
+with every card nvidia-smi reports, including cards added later.
 
 ## Write a job spec
 
@@ -60,7 +60,9 @@ setup: uv sync --frozen            # phase "setup"; venv is cached across jobs o
 command: uv run --no-sync python -m experiments.lego.train --k-max 6 --device cuda
 # python: .venv/bin/python        # only for a repo that is not a uv project: how the
                                   # GPU check before `main` runs Python in the job's env
-gpus: 1                            # 0 for a CPU-only job: never waits, sees no card
+gpus: 1                            # 0 for a CPU-only job: never waits, sees no card. More
+                                   # than the host has (the cards nvidia-smi reports there
+                                   # now) is refused at submit, or failed at dispatch
 use_shared: false                  # also use cards the host borrows rather than owns
 env:
   REQUIRE_CUDA: "1"
