@@ -36,12 +36,10 @@ commented example; `-` as the file name reads the spec from stdin.
 Unknown keys are refused at submit.
 
 **Anything longer than a line or two goes in a script in the repo**, run as
-`command: bash run.sh`; the workdir sync carries it. A YAML block scalar
-strips one common indent, which a heredoc terminator or any other
-column-sensitive code inside it does not survive. `setup`, `command` and
-`progress_command` are each checked with `bash -n` at submit, on the
-submitting machine, and one bash reports an error or a warning for is
-refused with the script as bash saw it after YAML parsing.
+`command: bash run.sh`; the workdir sync carries it. Submit runs `bash -n` on
+`setup`, `command` and `progress_command` with the submitting machine's bash,
+and prints a `WARNING:` with the script as bash received it for any error or
+warning. The job is queued regardless.
 
 **Every output destination must name the job.** `{job_id}` expands in `s3`, `hf`
 and `hf_path`; a destination that does not contain it after expansion is refused
@@ -293,8 +291,9 @@ ids. An id no host has is exit 4 and one that could not be asked about is exit
 **`gpuc logs <job-id> [-f] [-n N] [--host H]`** — tails `log.txt` on the host
 (`-n` defaults to 200), or the S3 mirror when the host cannot produce it,
 which needs `s3_bucket` set here **and** an `s3_prefix` for that job. A job
-whose dir was purged reads from the mirror with exit 0. An id the `--host` has
-no dir for and no index has ever recorded is exit 4: a job's `name` is not an id.
+whose dir was purged reads from the mirror with exit 0. With `--host`, an
+argument that is not shaped like a job id and that the host has no dir for
+is exit 4.
 
 **`-f` follows until the job ends**, prints the job's outcome as its last line,
 and exits 0 only if the job succeeded. A job that has already finished prints

@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import secrets
 import time
 from collections.abc import Iterator, Mapping
@@ -79,6 +80,11 @@ def normalize_cleanup(value: object, *, origin: str = "cleanup") -> str:
 
 def new_job_id() -> str:
     return f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
+
+
+def is_job_id(text: str) -> bool:
+    """Could `new_job_id` have made this? A job's `name` usually could not."""
+    return re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{6}", text) is not None
 
 
 def utc_now() -> str:

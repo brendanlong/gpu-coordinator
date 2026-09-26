@@ -172,7 +172,7 @@ def test_a_job_may_ask_for_no_gpu_but_not_fewer() -> None:
     assert "gpus: Input should be greater than or equal to 0" in str(exc.value)
 
 
-def test_a_heredoc_yaml_indented_past_its_terminator_is_refused_at_submit(
+def test_a_heredoc_yaml_indented_past_its_terminator_is_flagged_at_submit(
     tmp_path: Path, repo: Path
 ) -> None:
     job = tmp_path / "job.yaml"
@@ -184,18 +184,18 @@ def test_a_heredoc_yaml_indented_past_its_terminator_is_refused_at_submit(
         "    PY\n"
         "  done\n"
     )
-    with pytest.raises(SubmitError) as exc:
-        prepare(validate(load_document(job)), repo, environ={})
-    assert "`command` is not a valid bash script" in str(exc.value)
-    assert "here-document" in str(exc.value)
-    assert "  |   PY" in str(exc.value)
-    assert "command: bash run.sh" in str(exc.value)
+    [warning] = prepare(validate(load_document(job)), repo, environ={}).warnings
+    assert "`bash -n` on `command` says" in warning
+    assert "here-document" in warning
+    assert "  |   PY" in warning
+    assert "command: bash run.sh" in warning
 
 
 @pytest.mark.parametrize("key", ["setup", "command", "progress_command"])
 def test_every_script_is_syntax_checked_at_submit(key: str, repo: Path) -> None:
-    with pytest.raises(SubmitError, match=f"`{key}` is not a valid bash script"):
-        prepare(validate(job_document(**{key: "for s in 0 1; do echo $s"})), repo, environ={})
+    document = job_document(**{key: "for s in 0 1; do echo $s"})
+    prepared = prepare(validate(document), repo, environ={})
+    assert [w for w in prepared.warnings if f"`bash -n` on `{key}`" in w]
 
 
 def test_yaml_and_json_both_load(tmp_path: Path) -> None:

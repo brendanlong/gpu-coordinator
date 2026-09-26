@@ -765,5 +765,5 @@ def test_logs_on_a_named_host_for_an_id_it_never_had_is_not_a_purge(
     # and "purged" would send the user looking for a job that never was.
     assert main(["logs", "--host", "local", "ekfac-smoke"]) == 4
     err = capsys.readouterr().err
-    assert "host local has no job ekfac-smoke" in err
+    assert "host local has no job ekfac-smoke, and that is not a job id" in err
     assert "purged" not in err

@@ -1438,13 +1438,14 @@ def read_log(
             if result.returncode == 0:
                 return location.host, LogText("host", remote, result.stdout)
             purged = job_dir_gone(session, job_id)
-            # With --host nothing has checked the id exists; a job dir that was
-            # never there is not one that was purged.
-            if purged and location.index is None and JobIndex(settings).get(job_id) is None:
+            # With --host nothing has checked the id exists. Judged by its shape,
+            # not by the indexes: a mirror that cannot be read, or none set up
+            # here, would make a job purged elsewhere look like one never made.
+            if purged and not jobs.is_job_id(job_id):
                 raise NotFound(
-                    f"host {location.host} has no job {job_id}, and no index has ever "
-                    f"recorded one.\nA job id looks like 20260917-184548-43bc15; a job's "
-                    f"`name` is not one. `gpuc status --host {location.host}` lists them."
+                    f"host {location.host} has no job {job_id}, and that is not a job id "
+                    f"(they look like 20260917-184548-43bc15); a job's `name` is not one.\n"
+                    f"`gpuc status --host {location.host}` lists the ids."
                 )
             why = (result.output.strip().splitlines() or ["no log file on the host"])[-1]
         except (RemoteError, TransportError) as exc:
