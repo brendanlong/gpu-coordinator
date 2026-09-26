@@ -69,7 +69,9 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     only the host knows what its driver is calling them today. The shared cards
     carry their current memory and utilization too, because whether one is
     borrowable is a fact about this second that only nvidia-smi here can answer
-    -- and when it is not, the numbers are how somebody sees why. The same
+    -- and when it is not, the numbers are how somebody sees why. Owned cards
+    carry the same readings, from the same call, as the live answer to how hard
+    each card is working. The same
     `gpus.resolve` the dispatcher decides with, over one reading; a driver
     that will not answer reads as every entry unavailable, as it does there.
     """
@@ -81,10 +83,18 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     cards = gpus.resolve(config.gpus, table, config.shared_gpus)
     # Through the same reader the dispatcher borrows on, so an absent entry
     # means here exactly what it means there: not a card we would take.
-    usage, _failure = gpus.usage_or_nothing(cards.shared)
+    usage, _failure = gpus.usage_or_nothing([*cards.owned, *cards.shared])
     return {
         "gpus": config.gpus,
-        "gpus_resolved": [{"index": indices.get(uuid), "uuid": uuid} for uuid in cards.owned],
+        "gpus_resolved": [
+            {
+                "index": indices.get(uuid),
+                "uuid": uuid,
+                "memory_mib": usage[uuid].memory_mib if uuid in usage else None,
+                "utilization_pct": usage[uuid].utilization_pct if uuid in usage else None,
+            }
+            for uuid in cards.owned
+        ],
         "gpus_unavailable": cards.missing,
         "shared_gpus": config.shared_gpus,
         "shared_gpus_resolved": [

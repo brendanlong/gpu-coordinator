@@ -290,12 +290,19 @@ def test_status_resolves_the_owned_gpus(
     """The control side cannot: `gpus` may name cards by index, and only the
     host knows today's numbering."""
     monkeypatch.setattr(cli.gpus, "list_gpus", lambda *_: [cli.gpus.Gpu(3, FAKE_GPUS[0])])
+    monkeypatch.setattr(
+        cli.gpus,
+        "usage_or_nothing",
+        lambda uuids, *_: ({u: cli.gpus.Usage(u, 512.0, 40.0) for u in uuids}, None),
+    )
     jobs.write_config(HostConfig(host="test-host", gpus=["3", "9"]))
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
     assert status["gpus"] == ["3", "9"]
-    assert status["gpus_resolved"] == [{"index": 3, "uuid": FAKE_GPUS[0]}]
+    assert status["gpus_resolved"] == [
+        {"index": 3, "uuid": FAKE_GPUS[0], "memory_mib": 512.0, "utilization_pct": 40.0}
+    ]
     assert status["gpus_unavailable"] == ["9"]
 
 

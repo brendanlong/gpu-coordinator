@@ -606,7 +606,15 @@ def test_status_json_is_one_document_with_the_promised_shape(
     if row.get("available") is False:
         assert row == {"owned_as": GPU, "available": False}
     else:
-        assert set(row) == {"index", "uuid", "name", "vram_mib", "busy_job"}
+        assert set(row) == {
+            "index",
+            "uuid",
+            "name",
+            "vram_mib",
+            "busy_job",
+            "memory_mib",
+            "utilization_pct",
+        }
         assert row["uuid"] == GPU
         assert row["busy_job"] == RUNNING_JOB
 

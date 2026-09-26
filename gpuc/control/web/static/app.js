@@ -310,13 +310,18 @@ function reading(v) {
   return v === null || v === undefined ? "?" : Math.round(v);
 }
 
+function ownedReading(gpu) {
+  if (gpu.utilization_pct == null && gpu.memory_mib == null) return null;
+  return el("span", { class: "muted" }, ` ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`);
+}
+
 function gpuTable(host) {
   const shared = host.shared_gpus || [];
   if (!host.gpus.length && !shared.length) return el("p", { class: "empty" }, "no GPUs");
   // No holder column: the running table below names each job's cards.
   const rows = host.gpus.map((gpu) => (gpu.available === false
     ? missingRow(gpu, "owned_as", "dispatched to")
-    : gpuRow(gpu.index, gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), model(gpu))));
+    : gpuRow(gpu.index, [gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), ownedReading(gpu)], model(gpu))));
   // Shared cards are somebody else's, and `IN USE` is theirs, not ours: the
   // numbers beside it are why a job that asked for one is still queued.
   for (const gpu of shared) {
