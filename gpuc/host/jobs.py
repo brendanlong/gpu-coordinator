@@ -93,6 +93,15 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
+def parse_time(stamp: str | None) -> datetime | None:
+    """An ISO time, read as UTC if it names no zone; None if missing or unreadable."""
+    try:
+        when = datetime.fromisoformat(stamp) if stamp else None
+    except (ValueError, TypeError):
+        return None
+    return when if when is None or when.tzinfo else when.replace(tzinfo=UTC)
+
+
 def utc_in(seconds: float) -> str | None:
     """A timestamp `seconds` from now, or None if that is not a date.
 
@@ -826,27 +835,6 @@ def update_state(job_id: str, **fields: Any) -> JobState:
     with locked(job_id):
         state = apply_fields(read_state(job_id), fields)
         write_state(job_id, state)
-        return state
-
-
-def transition(
-    job_id: str, *, expect: str | tuple[str, ...], attempt: int | None = None, **fields: Any
-) -> JobState | None:
-    """Update the state only if its `status` is still one of `expect` -- and,
-    when `attempt` is given, only if that is still the attempt.
-
-    The compare-and-set every change of ownership goes through: the runner
-    claims a queued job, a cancel ends a queued job, a requeue puts a finished
-    one back. Two of those racing on one job -- a cancel landing as the
-    dispatcher launches it -- cannot both win, and the loser learns it from
-    the None rather than from a job that is both running and cancelled.
-    """
-    wanted = (expect,) if isinstance(expect, str) else expect
-    with locked(job_id):
-        state = read_state(job_id)
-        if state.status not in wanted or (attempt is not None and state.attempt != attempt):
-            return None
-        write_state(job_id, apply_fields(state, fields))
         return state
 
 

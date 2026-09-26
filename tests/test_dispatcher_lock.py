@@ -360,7 +360,7 @@ def test_acquire_records_the_commit_this_dispatcher_is_running(gpuc_home: Path) 
     assert lock.acquire()
     lock.release()
     assert LockBody.parse(paths.lock_file().read_text()).pkg_commit == SHIPPED
-    assert dispatcher.holder_pkg_commit() == SHIPPED
+    assert dispatcher.lock_holder().pkg_commit == SHIPPED
 
 
 def test_a_holder_that_stands_down_is_never_killed_afterwards(gpuc_home: Path) -> None:

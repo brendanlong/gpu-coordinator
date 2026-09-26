@@ -65,14 +65,6 @@ OUTPUT_RETRY_INTERVAL_S = 60.0
 OUTPUT_RETRY_BUDGET_S = 300.0
 
 
-def _timestamp(stamp: str | None) -> float:
-    """An ISO time as epoch seconds, 0 for one that is missing or unreadable."""
-    try:
-        return datetime.fromisoformat(stamp).timestamp() if stamp else 0.0
-    except ValueError:
-        return 0.0
-
-
 def log_line(message: str, now: datetime | None = None) -> None:
     """Append one stamped line to the dispatcher log.
 
@@ -147,16 +139,16 @@ def running_pkg_commit() -> str | None:
     return None
 
 
-def holder_pkg_commit() -> str | None:
-    """The commit recorded by whoever last took the lock, if they said.
+def lock_holder() -> LockBody:
+    """Whoever last took the lock, as its file says; empty if it says nothing.
 
-    For `gpuc status`, which pairs it with the heartbeat: the lock file outlives
-    the process that wrote it, so this answers "what was the last dispatcher
-    here built from", and only a fresh heartbeat makes that a fact about now.
+    The file outlives the process that wrote it, so for `gpuc status` its
+    `pkg_commit` answers "what was the last dispatcher here built from", and
+    only a fresh heartbeat makes that a fact about now.
     """
     with contextlib.suppress(OSError, ValueError):
-        return LockBody.parse(paths.lock_file().read_text()).pkg_commit
-    return None
+        return LockBody.parse(paths.lock_file().read_text())
+    return LockBody()
 
 
 def heartbeat_age(now: Callable[[], float] = time.time) -> float | None:
@@ -175,15 +167,12 @@ class DispatcherLock:
     def __init__(
         self,
         *,
-        stale_after_s: float = HEARTBEAT_STALE_S,
         heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S,
         now: Callable[[], float] = time.time,
-        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self.stale_after_s = stale_after_s
         self.heartbeat_interval_s = heartbeat_interval_s
         self._now = now
-        self._sleep = sleep
+        self._sleep: Callable[[float], None] = time.sleep
         self._fd: int | None = None
         self._last_beat = 0.0
         self._beat_stop = threading.Event()
@@ -191,33 +180,20 @@ class DispatcherLock:
         self.takeover_pgid: int | None = None
         self.pkg_commit = running_pkg_commit()
 
-    @property
-    def lock_path(self) -> Path:
-        return paths.lock_file()
-
-    @property
-    def heartbeat_path(self) -> Path:
-        return paths.heartbeat_file()
-
     def heartbeat_age(self) -> float | None:
         return heartbeat_age(self._now)
 
     def holder_is_fresh(self) -> bool:
         age = self.heartbeat_age()
-        return age is not None and age < self.stale_after_s
-
-    def holder(self) -> LockBody:
-        with contextlib.suppress(OSError, ValueError):
-            return LockBody.parse(self.lock_path.read_text())
-        return LockBody()
+        return age is not None and age < HEARTBEAT_STALE_S
 
     def acquire(self, takeover_wait_s: float = 10.0, handoff_wait_s: float = 30.0) -> bool:
         paths.ensure_layout()
-        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(paths.lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
         if self._try_flock(fd):
             self._adopt(fd)
             return True
-        incumbent = self.holder()
+        incumbent = lock_holder()
         if self.holder_is_fresh():
             if not self._is_another_build(incumbent):
                 os.close(fd)
@@ -259,7 +235,7 @@ class DispatcherLock:
         whether the thing on the other end of our SIGTERM is the thing about to
         get our SIGKILL.
         """
-        now = self.holder()
+        now = lock_holder()
         return now.pid == incumbent.pid and now.starttime == incumbent.starttime
 
     def _take_over(self, fd: int, wait_s: float) -> bool:
@@ -355,7 +331,7 @@ class DispatcherLock:
         lock file has been shown to still be the dispatcher that wrote it.
         """
         self._signal_holder(
-            signal.SIGKILL, self.holder(), "its heartbeat is stale, so it is wedged"
+            signal.SIGKILL, lock_holder(), "its heartbeat is stale, so it is wedged"
         )
 
     def _try_flock(self, fd: int) -> bool:
@@ -397,9 +373,10 @@ class DispatcherLock:
         if not force and now - self._last_beat < self.heartbeat_interval_s:
             return
         self._last_beat = now
-        self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-        self.heartbeat_path.touch()
-        os.utime(self.heartbeat_path, (now, now))
+        beat = paths.heartbeat_file()
+        beat.parent.mkdir(parents=True, exist_ok=True)
+        beat.touch()
+        os.utime(beat, (now, now))
 
     def start_heartbeat(self) -> None:
         """Beat from a thread, so a long drain or final sync in the main loop
@@ -1236,7 +1213,7 @@ class Dispatcher:
                     job_id,
                     state.priority,
                     list(entry.gpus),
-                    _timestamp(state.started_at),
+                    started.timestamp() if (started := jobs.parse_time(state.started_at)) else 0.0,
                     owned=sum(1 for uuid in entry.gpus if uuid in owned),
                     borrowed=sum(1 for uuid in entry.gpus if uuid in shared),
                 )

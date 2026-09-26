@@ -72,10 +72,8 @@ def test_spec_round_trip_applies_defaults(gpuc_home: Path) -> None:
     assert loaded == spec
 
 
-def test_update_state_and_transition_reject_unknown_fields(gpuc_home: Path) -> None:
+def test_update_state_rejects_unknown_fields(gpuc_home: Path) -> None:
     jobs.write_state("j1", JobState())
-    with pytest.raises(KeyError):
-        jobs.transition("j1", expect="queued", nonsense=1)
     jobs.update_state("j1", status="running")
     assert jobs.read_state("j1").status == "running"
     with pytest.raises(KeyError):
@@ -128,36 +126,6 @@ def test_state_round_trips_every_field_a_write_sets(gpuc_home: Path) -> None:
     )
     jobs.write_state("j1", state)
     assert jobs.read_state("j1") == state
-
-
-def test_transition_writes_nothing_when_the_status_is_not_what_was_expected(
-    gpuc_home: Path,
-) -> None:
-    """The compare-and-set every change of a job's ownership goes through: the
-    loser of a race learns it from the None, not from a job that is both
-    running and cancelled."""
-    jobs.write_state("j1", JobState())
-
-    claimed = jobs.transition("j1", expect="queued", status="running", gpus=["GPU-x"])
-    assert claimed is not None and claimed.status == "running"
-
-    again = jobs.transition("j1", expect="queued", status="cancelled", gpus=["GPU-y"])
-    assert again is None
-    state = jobs.read_state("j1")
-    assert (state.status, state.gpus) == ("running", ["GPU-x"])
-
-
-def test_transition_takes_any_of_the_statuses_it_was_given(gpuc_home: Path) -> None:
-    """A caller may take a job that is still queued or one already running,
-    and neither is a race it lost."""
-    jobs.write_state("j1", JobState(status="running"))
-    for status in ("queued", "running"):
-        jobs.update_state("j1", status=status)
-        assert jobs.transition("j1", expect=("queued", "running"), estimated_runtime_min=15.0)
-
-    jobs.update_state("j1", status="succeeded")
-    assert jobs.transition("j1", expect=("queued", "running"), estimated_runtime_min=1.0) is None
-    assert jobs.read_state("j1").estimated_runtime_min == 15.0
 
 
 def test_an_intent_this_build_does_not_understand_is_no_intent(gpuc_home: Path) -> None:

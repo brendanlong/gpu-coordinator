@@ -58,15 +58,6 @@ class Settable:
         return None
 
 
-def _running_for_s(state: JobState) -> float | None:
-    if state.started_at is None:
-        return None
-    try:
-        return (datetime.now(UTC) - datetime.fromisoformat(state.started_at)).total_seconds()
-    except (ValueError, TypeError):
-        return None
-
-
 def _max_runtime_check(job_id: str, minutes: float | None, state: JobState) -> str | None:
     if state.status != "running":
         return None
@@ -79,7 +70,8 @@ def _max_runtime_check(job_id: str, minutes: float | None, state: JobState) -> s
             f"start, so it keeps the limit it has; `gpuc preempt` runs it again from the "
             f"start under this build, which would honour a new one"
         )
-    elapsed = _running_for_s(state)
+    started = jobs.parse_time(state.started_at)
+    elapsed = None if started is None else (datetime.now(UTC) - started).total_seconds()
     if minutes is not None and elapsed is not None and minutes * 60.0 <= elapsed:
         # Almost certainly a units slip, and it would throw the run away as
         # `timeout` within a minute. Stopping it on purpose is `gpuc cancel`.
