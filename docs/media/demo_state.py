@@ -126,9 +126,8 @@ def views() -> list[HostView]:
         heartbeat_age_s=1.0,
         owned=[uuid(2), uuid(3)],
         indices={uuid(2): 0, uuid(3): 1, uuid(4): 2},
-        shared=[
-            SharedGpu(uuid=uuid(4), index=2, memory_mib=38210.0, utilization_pct=99.0, unused=False)
-        ],
+        usage={uuid(4): (38210.0, 99.0)},
+        shared=[SharedGpu(uuid=uuid(4), index=2, unused=False)],
         running=[
             JobView(
                 job_id="20260918-131055-7b02de",

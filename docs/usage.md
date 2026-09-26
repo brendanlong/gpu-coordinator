@@ -277,15 +277,16 @@ host spar [ssh]  gpus 0/2 free (driver 535.309.01)
   gpu     [2] busy NVIDIA A40 45 GB (38912 MiB, 100% util)
   gpu     [3] busy NVIDIA A40 45 GB (38400 MiB, 99% util)
   shared  [4] free NVIDIA A40 45 GB
-  shared  [5] IN USE NVIDIA A40 45 GB (somebody else: 21504 MiB, 98% util)
+  shared  [5] IN USE NVIDIA A40 45 GB (21504 MiB, 98% util)
   running paper-diff (20260915-222409-7a2b60) phase=main 1h16m util 100% gpu=2
   running paper-plain (20260915-224057-9f10c3) phase=main 59m util 100% gpu=3
   queued  sweep (20260915-233000-112233) prio=50 est 6h00m
 ```
 
 On a `shared` line, `free` means gpuc would take the card right now, `busy` means
-one of *our* jobs has it, and `IN USE` means somebody else does, with their
-memory and utilization.
+one of *our* jobs has it, and `IN USE` means somebody else does. Every card
+line ends with the memory and utilization nvidia-smi just read on it, whoever
+is using it.
 
 `--host H` narrows it; `--recent N` (default 5) and `--since 24h|7d|90m` (a bare
 number means hours) choose how much of the finished list each host sends; `--all`
