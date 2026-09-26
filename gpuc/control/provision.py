@@ -380,7 +380,7 @@ def _try_offer(
         transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
         # The one look at the pod's cards, the same probe `gpuc host add`
-        # takes; the connect below owns every card it saw.
+        # takes; the connect below owns every card it has, now or later.
         probed = probe_host(address, settings, transport=transport)
         if not probed.gpu_info:
             raise ProvisionError(

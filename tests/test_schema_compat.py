@@ -133,7 +133,7 @@ def test_a_null_non_optional_field_falls_back_to_its_default() -> None:
     entry = HostEntry.model_validate(
         {"name": "gpubox", "port": None, "rental": None, "cache": {"config": None}}
     )
-    assert (entry.port, entry.rental, entry.config.gpus, entry.config.env) == (22, None, None, {})
+    assert (entry.port, entry.rental, entry.config.gpus, entry.config.env) == (22, None, [], {})
 
 
 OPTIONAL_REGISTRY_FIELDS = ["ssh", "rental", "gpuc_home", "persistent_root", "bootstrapped_at"]
@@ -264,7 +264,7 @@ def test_settings_an_older_build_wrote_still_load() -> None:
 
 def test_host_config_from_a_null_or_junk_document_never_raises() -> None:
     assert HostConfig.from_dict(None).host == "local"
-    assert HostConfig.from_dict([1, 2, 3]).gpus is None
+    assert HostConfig.from_dict([1, 2, 3]).gpus == []
     junk = HostConfig.from_dict(
         {
             "host": None,

@@ -558,6 +558,11 @@ def wont_fit(
             "Add `use_shared: true` to the spec to let it wait for the shared cards, "
             "or lower `gpus:`."
         )
+    if "listed but missing" in failure:
+        fix = (
+            f"Bring the missing card back, correct the list with `gpuc host set {host} "
+            f"--gpus <list>`, or lower `gpus:`."
+        )
     return f"host {host} cannot run this job: it {failure}.\n{fix}"
 
 
@@ -591,7 +596,8 @@ def submit_spec(
             f"host {entry.name} has no config.json, so nothing says which cards it owns.\n"
             f"Run: gpuc host bootstrap {entry.name}"
         )
-    too_big = wont_fit(spec, session.config, read_cards(session), entry.name)
+    table = read_cards(session) if spec.gpus else None
+    too_big = wont_fit(spec, session.config, table, entry.name)
     if too_big:
         raise SubmitError(too_big)
     check_kept_allowed(spec, f"host {entry.name}", ephemeral=session.config.ephemeral)

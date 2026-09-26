@@ -101,7 +101,7 @@ def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:
     assert entry.seen_at == SEEN_AT
     # Nothing is known about a host nobody has read yet, and it says so.
     blank = HostEntry(name="gpubox", ssh="me@box")
-    assert (blank.config.gpus, blank.config.s3_prefix, blank.seen_at) == (None, None, None)
+    assert (blank.config.gpus, blank.config.s3_prefix, blank.seen_at) == ([], None, None)
 
 
 def test_the_provider_block_comes_from_the_rental_for_a_config_we_initialise() -> None:
@@ -182,7 +182,7 @@ def test_a_pre_split_registry_entry_parses_as_an_address_with_an_empty_cache() -
         }
     )
     assert (entry.name, entry.kind, entry.ssh) == ("gpubox", "ssh", "me@box")
-    assert entry.config.gpus is None
+    assert entry.config.gpus == []
     assert entry.python is None
     assert entry.config.env == {}
     assert entry.config.pkg_commit is None
@@ -269,10 +269,11 @@ def test_config_changes_names_every_key_a_flag_would_change_on_the_host() -> Non
     assert config_changes(existing, {"retention_days": 7.0}) == ["retention_days none -> 7.0"]
     assert config_changes({}, {}) == []
     # But a key it has never written, set to the default it already behaves by,
-    # is not: `--gpus all` on a host with no gpus key changes nothing...
-    assert config_changes({"host": "gpubox"}, {"gpus": None, "idle_minutes": 15.0}) == []
-    # ...while `--gpus ''` there takes every card away, and says so.
-    assert config_changes({"host": "gpubox"}, {"gpus": []}) == ["gpus all -> none"]
+    # is not: a host with no gpus key owns nothing, so `--gpus ''` changes
+    # nothing there and `--gpus all` does.
+    assert config_changes({"host": "gpubox"}, {"gpus": [], "idle_minutes": 15.0}) == []
+    assert config_changes({"host": "gpubox"}, {"gpus": None}) == ["gpus none -> all"]
+    assert config_changes({"gpus": None}, {"gpus": []}) == ["gpus all -> none"]
     assert config_changes({"gpus": None}, {"gpus": ["0", "1"]}) == ["gpus all -> 0,1"]
     assert config_changes(existing, {"gpus": None}) == ["gpus 0 -> all"]
 

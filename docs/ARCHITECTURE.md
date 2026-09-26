@@ -809,10 +809,15 @@ the runner at that instant and pinned with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 
 An entry that resolves to nothing (an index the driver no longer uses or a
 UUID it no longer reports) is logged, owns nothing, and is reported by `gpuc
-status` and as a warning by the health check's `gpu_uuids`. An entry naming a card already named (an index and its own UUID,
-or a card in both lists) is a `duplicate`: the health check and `gpuc host
-add|set` refuse it, the dispatcher hands the card out once, and the runner
-fails an assignment that carries one.
+status` and as a warning by the health check's `gpu_uuids`. An entry naming a
+card already named (an index and its own UUID, or a card in both lists) is a
+`duplicate`: the health check and `gpuc host add|set` refuse it, the
+dispatcher hands the card out once, and the runner fails an assignment that
+carries one.
+
+Only an explicit `"gpus": null` means all. A missing key, a missing or
+unparseable file, or a value that is not a list owns nothing: a mangled config
+on a shared box must not claim everybody's cards.
 
 A host given its first config with no `--gpus` gets `"gpus": null`. A host that
 already has a config is never defaulted.

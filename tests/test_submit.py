@@ -683,7 +683,7 @@ def test_wont_fit_resolves_the_config_against_the_table() -> None:
     assert wont_fit(borrowing, listed, table, "gpubox") is None
     assert wont_fit(spec, jobs.HostConfig(gpus=None), table, "gpubox") is None
     three = jobs.JobSpec(job_id="j", command="true", gpus=3)
-    too_wide = wont_fit(three, jobs.HostConfig(), table, "gpubox")
+    too_wide = wont_fit(three, jobs.HostConfig(gpus=None), table, "gpubox")
     assert too_wide is not None and "needs 3 GPUs, host owns 2" in too_wide
     assert "missing" not in too_wide
 

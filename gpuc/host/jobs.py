@@ -220,12 +220,14 @@ def as_str_list(d: Any, key: str) -> list[str]:
 
 
 def as_opt_str_list(d: Any, key: str) -> list[str] | None:
-    """None only for a missing key or an explicit null: anything else that is
-    not a list reads as empty, so a hand-edited `"gpus": "0,1"` claims no
-    cards rather than every card on somebody's box."""
-    value = fields_of(d).get(key)
-    if value is None:
+    """None only for an explicit null: a missing key, a document that is not
+    an object, or a value that is not a list reads as empty, so a deleted or
+    hand-mangled file claims no cards rather than every card on somebody's
+    box."""
+    fields = fields_of(d)
+    if key in fields and fields[key] is None:
         return None
+    value = fields.get(key)
     return [str(item) for item in value] if isinstance(value, list) else []
 
 
@@ -864,9 +866,10 @@ def cache_beside(home: str, name: str) -> str:
 class HostConfig:
     schema_version: int = SCHEMA_VERSION
     host: str = "local"
-    gpus: list[str] | None = None
+    gpus: list[str] | None = field(default_factory=list)
     """The most this host may own, stored exactly as given: nvidia-smi indices,
-    UUIDs, or a mix. None is every card nvidia-smi reports that is not shared,
+    UUIDs, or a mix. None -- written only as an explicit null, which every
+    first config is -- is every card nvidia-smi reports that is not shared,
     cards that appear later included.
 
     A ceiling, not a promise: what the host owns on a pass is the entries that

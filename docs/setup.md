@@ -153,9 +153,10 @@ gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idem
 - the host has **no** config: one is written owning **every card** nvidia-smi
   reports there (`--gpus all`), including cards added later. `--gpus` narrows
   that (`--gpus ''` for a host whose cards gpuc may not use), and
-  `--shared-gpus` takes its cards out of the owned set. A host that reports no cards at all is refused unless `--gpus ''` says
-  so on purpose; a host left owning nothing is registered, and nothing can be
-  submitted to it until `gpuc host set <name> --gpus <list>` assigns some.
+  `--shared-gpus` takes its cards out of the owned set. A host that reports no
+  cards at all is refused unless a `--gpus` list (`''` for none) says what it
+  owns; a host left owning nothing is registered, and nothing can be submitted
+  to it until `gpuc host set <name> --gpus <list>` assigns some.
 
 A `config.json` that is there but does not parse stops all of this; the error
 says to fix or delete it.

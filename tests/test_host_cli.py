@@ -572,6 +572,25 @@ def test_status_says_a_job_needing_a_missing_owned_card_will_not_run(
     assert got[narrow][0] == pytest.approx(45 * 60, abs=5)
 
 
+def test_status_does_not_call_a_job_hopeless_while_nvidia_smi_is_unreadable(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher holds GPU jobs through a driver that will not answer, so
+    status says why they wait rather than that they never will."""
+
+    def unreadable(args: list[str]) -> str:
+        raise cli.gpus.GpuError("nvidia-smi timed out")
+
+    monkeypatch.setattr(cli.gpus.list_gpus, "__defaults__", (unreadable,))
+    jobs.write_config(HostConfig(host="test-host", gpus=None))
+    gpu = queue.enqueue(make_spec(gpus=1))
+    cpu = queue.enqueue(make_spec(gpus=0))
+
+    got = projection(capsys)
+    assert got[gpu] == (None, "nvidia-smi could not be read on the host (nvidia-smi timed out)")
+    assert got[cpu] == (0.0, None)
+
+
 def test_status_lets_a_borrower_start_on_an_idle_shared_card(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
