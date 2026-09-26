@@ -29,13 +29,20 @@ class FakeRunnerProcess:
     _next_pid = 500000
 
     def __init__(
-        self, job_id: str, gpus: Sequence[str], attempt: int = 1, *, claim: bool = True
+        self,
+        job_id: str,
+        gpus: Sequence[str],
+        attempt: int = 1,
+        *,
+        claim: bool = True,
+        filler: bool = False,
     ) -> None:
         FakeRunnerProcess._next_pid += 1
         self.pid = FakeRunnerProcess._next_pid
         self.job_id = job_id
         self.gpus = list(gpus)
         self.attempt = attempt
+        self.filler = filler
         self.returncode: int | None = None
         self.claimed = claim and self.claim()
 
@@ -49,6 +56,7 @@ class FakeRunnerProcess:
             started_at=jobs.utc_now(),
             runner_pid=self.pid,
             runner_boot_id=procinfo.boot_id(),
+            filler=self.filler,
         )
 
     def poll(self) -> int | None:
@@ -87,8 +95,10 @@ def make_dispatcher(
     have not claimed their job yet, for the window between spawn and claim."""
     spawned: dict[str, FakeRunnerProcess] = {}
 
-    def spawn(job_id: str, gpus: Sequence[str], attempt: int) -> subprocess.Popen[bytes]:
-        proc = FakeRunnerProcess(job_id, gpus, attempt, claim=claim)
+    def spawn(
+        job_id: str, gpus: Sequence[str], attempt: int, filler: bool
+    ) -> subprocess.Popen[bytes]:
+        proc = FakeRunnerProcess(job_id, gpus, attempt, claim=claim, filler=filler)
         spawned[job_id] = proc
         return cast("subprocess.Popen[bytes]", proc)
 
@@ -1392,7 +1402,9 @@ def test_a_runner_that_cannot_be_spawned_fails_the_job_instead_of_phantom_runnin
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, _ = make_dispatcher()
 
-    def refuse(_job_id: str, _gpus: Sequence[str], _attempt: int) -> subprocess.Popen[bytes]:
+    def refuse(
+        _job_id: str, _gpus: Sequence[str], _attempt: int, _filler: bool
+    ) -> subprocess.Popen[bytes]:
         raise OSError("fork: Resource temporarily unavailable")
 
     dispatcher.deps.spawn_runner = refuse
@@ -2445,9 +2457,9 @@ def test_a_card_claimed_between_the_plan_and_the_launch_is_not_handed_out(
     foreign: list[FakeRunnerProcess] = []
 
     def spawn_then_lose_the_other_card(
-        job_id: str, gpus: Sequence[str], attempt: int
+        job_id: str, gpus: Sequence[str], attempt: int, filler: bool
     ) -> subprocess.Popen[bytes]:
-        proc = real_spawn(job_id, gpus, attempt)
+        proc = real_spawn(job_id, gpus, attempt, filler)
         if not foreign:
             # While the first launch of the pass is under way, a runner the
             # old dispatcher started claims the other job on the other card.
@@ -2465,3 +2477,95 @@ def test_a_card_claimed_between_the_plan_and_the_launch_is_not_handed_out(
     assert other not in dispatcher.running
     assert jobs.read_state(other).gpus == foreign[0].gpus
     assert "claimed by a runner since this pass began" in paths.dispatcher_log().read_text()
+
+
+def test_an_auto_preempt_job_fills_a_card_held_for_a_wide_one_and_gives_it_back(
+    gpuc_home: Path,
+) -> None:
+    dispatcher, spawned = make_dispatcher()
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=20))
+    plain = queue.enqueue(make_spec(gpus=1, priority=80))
+    filler = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    dispatcher.run_once()
+
+    state = jobs.read_state(filler)
+    assert (state.status, state.gpus, state.filler) == ("running", [FAKE_GPUS[1]], True)
+    assert jobs.read_state(plain).status == "queued", "only an auto_preempt job may fill"
+    assert f"running on card(s) held for job {wide}" in paths.log_file(filler).read_text()
+
+    spawned[busy].finish()
+    dispatcher.run_once()
+    assert jobs.read_state(filler).intent == jobs.PREEMPT
+    assert f"held for job {wide}, whose other cards have arrived" in (
+        paths.log_file(filler).read_text()
+    )
+    # While it stops, the card that came free stays with the wide job.
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(plain).status == "queued"
+
+    spawned[filler].requeue()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+    for _ in range(3):
+        dispatcher.run_once()
+    # The livelock signature is an attempt counter that climbs once a pass.
+    state = jobs.read_state(filler)
+    assert (state.status, state.attempt, state.filler) == ("queued", 2, False)
+
+
+def test_a_filler_that_ends_on_its_own_hands_the_card_back_to_the_wide_job(
+    gpuc_home: Path,
+) -> None:
+    dispatcher, spawned = make_dispatcher()
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=20))
+    filler = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    dispatcher.run_once()
+    spawned[filler].finish()
+    plain = queue.enqueue(make_spec(gpus=1, priority=80))
+    dispatcher.run_once()
+    assert jobs.read_state(plain).status == "queued"
+
+    spawned[busy].finish()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+
+
+def test_a_second_filler_does_not_take_the_card_that_came_free_while_the_first_stops(
+    gpuc_home: Path,
+) -> None:
+    """Otherwise the wide job chases one filler after another for ever."""
+    dispatcher, spawned = make_dispatcher()
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=20))
+    first = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    dispatcher.run_once()
+    second = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    spawned[busy].finish()
+    dispatcher.run_once()
+    dispatcher.run_once()
+    assert jobs.read_state(first).intent == jobs.PREEMPT
+    assert jobs.read_state(second).status == "queued"
+
+    spawned[first].requeue()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+
+
+def test_a_filler_is_not_auto_preempted_for_the_job_it_is_filling_for(gpuc_home: Path) -> None:
+    """Its card is already counted towards that job: stopping it would close
+    no gap and cost an attempt."""
+    dispatcher, _ = make_dispatcher()
+    queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=20))
+    filler = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    for _ in range(3):
+        dispatcher.run_once()
+    state = jobs.read_state(filler)
+    assert (state.status, state.intent) == ("running", None)

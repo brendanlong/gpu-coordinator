@@ -1,12 +1,11 @@
 """The dispatch rule, as one pure function over one pass's inputs.
 
 `plan` decides what a dispatch pass does with each queued job, in queue order:
-assign it cards, hold cards for it, step over it, or fail it. The dispatcher
-acts on the decisions; automatic preemption runs the same walk over the cards a
-stop in flight will hand back, to find the one job the queue is stuck on; and
-`project` runs it forward over the running jobs' end times to say when each
-queued job is expected to start. Three questions, one rule, so they cannot
-disagree.
+assign it cards, hold cards for it, step over it, fail it, or launch it as a
+filler. The dispatcher acts on the decisions; automatic preemption runs the
+same walk to find the one job the queue is stuck on; and `project` runs it
+forward over the running jobs' end times to say when each queued job is
+expected to start. Three questions, one rule, so they cannot disagree.
 
 The rule: the queue is taken strictly in order. A job that does not fit holds
 the cards it could take, owned and borrowed alike, and nothing behind it may
@@ -21,12 +20,38 @@ not ours to wait on. It is stepped
 over, not failed, since the configured host is big enough for it. A job that
 asks for more than the host is configured with, counting shared cards only if
 it may borrow, can never run and is failed.
+
+**Fillers.** A held card that is free does no work until its siblings arrive,
+which on a two- or four-card host is a large share of everything the user has.
+So a job that said it may be stopped (`auto_preempt`) and would otherwise hold
+may be launched onto held cards (`Fills`). It occupies them; it does not
+acquire them. A running filler stays in the walk at its own place in the
+queue, and its cards are on offer to every job ahead of it exactly as free
+ones are, except that a job which needs them to fit is not assigned but
+`Reclaims` them: the filler is stopped, and the job starts once it is gone.
+Being stopped queues the filler again at its own `(priority, job_id)`, which
+is still behind the job it made room for, so it cannot take the card back --
+the livelock of a stopped job relaunched onto the card it gave up cannot
+happen. A filler that ends on its own hands the card back to the walk, where
+the job ahead of it holds it again.
+
+Slurm's conservative backfill can let any job onto a reserved node because it
+can prove the job ends before the reservation starts. Estimates here are
+informational, so instead of proving the filler finishes in time the host
+keeps the right to stop it, and only a job that agreed to that is eligible.
+The price is that the job filled for starts a little later than it would have:
+the pass that notices, plus the stop's grace period.
+
+Cards a stop in flight is handing back (`Pool.coming`) are on offer the same
+way: a job that fits with them `Reclaims` with nobody to stop, and holds the
+free cards it will start on. Without that, each card freed by one stop would
+be taken by the next filler, and the job waiting would chase them for ever.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 Sample = Callable[[], tuple[list[str], int]]
 """Read the shared cards once: the UUIDs nobody is on, and how many somebody
@@ -37,7 +62,7 @@ else's training run, so it is taken fresh each pass and never inferred."""
 
 @dataclass(frozen=True)
 class Request:
-    """One queued job, as the rule sees it."""
+    """One queued job, or one running filler, as the rule sees it."""
 
     job_id: str
     gpus: int
@@ -45,6 +70,12 @@ class Request:
     """`HostConfig.may_borrow(spec)`: the job asked and the host has shared cards."""
     estimate_s: float | None = None
     """How long it expects to run, for `project` only."""
+    fills: bool = False
+    """The spec's `auto_preempt`: it may be launched onto cards held for a job
+    ahead of it."""
+    occupying: tuple[str, ...] = ()
+    """Set for a running filler: the held cards it is on. It stands at its
+    place in the queue so that only the jobs ahead of it can reclaim them."""
 
 
 @dataclass
@@ -66,9 +97,12 @@ class Pool:
     """Shared cards nvidia-smi reports, for whether a short job holds."""
     sample: Sample | None = None
     """How to read the shared cards, if a job needs them."""
-    shared_extra: list[str] = field(default_factory=list)
-    """Shared cards on offer without a reading: those a stopping job is about
-    to hand back. Only `preempt_for_waiting` has any."""
+    shared: frozenset[str] = frozenset()
+    """Every visible shared card, to tell a borrowed card in `coming` or under
+    a filler from an owned one."""
+    coming: list[str] = field(default_factory=list)
+    """Cards a stop in flight is handing back, owned and borrowed; no reading
+    is needed for a shared one, since the job on it is ours."""
     shared_free: list[str] | None = None
     """Set once `sample` has been called."""
     theirs: int = 0
@@ -77,7 +111,7 @@ class Pool:
     def borrowable(self) -> list[str]:
         if self.shared_free is None:
             free, self.theirs = self.sample() if self.sample else ([], 0)
-            self.shared_free = [*free, *self.shared_extra]
+            self.shared_free = list(free)
         return self.shared_free
 
 
@@ -113,7 +147,36 @@ class Fails:
     reason: str
 
 
-Decision = Assigned | Holds | SteppedOver | Fails
+@dataclass(frozen=True)
+class Reclaims:
+    """Fits, counting cards under fillers behind it and cards a stop in flight
+    is handing back. Holds all of `gpus`; `evicts` are the fillers to stop."""
+
+    job_id: str
+    gpus: list[str]
+    evicts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Fills:
+    """An `auto_preempt` job that would hold, launched onto held cards."""
+
+    job_id: str
+    gpus: list[str]
+    held_for: tuple[str, ...]
+    """The jobs holding the cards it is launched onto."""
+
+
+@dataclass(frozen=True)
+class Filling:
+    """A running filler, reached in its place in the queue: nothing ahead of
+    it needs its cards to start. `held_for` is who holds them now, if anybody."""
+
+    job_id: str
+    held_for: tuple[str, ...]
+
+
+Decision = Assigned | Holds | SteppedOver | Fails | Reclaims | Fills | Filling
 
 
 def capacity_failure(gpus: int, owned: int, shared: int, *, borrows: bool) -> str | None:
@@ -137,41 +200,95 @@ def plan(requests: Sequence[Request], pool: Pool) -> list[Decision]:
     """One decision per request, in order, consuming `pool` as it goes.
 
     Owned cards first, always: a job borrows only its shortfall, so a shared
-    card is held for the shortest time that runs the job. The cards a job
-    ahead is holding are not on offer to the ones behind it.
+    card is held for the shortest time that runs the job. Free cards before
+    ones in the way, so a job that can start now does, and a job that has to
+    stop a filler stops as few as it can. The cards a job ahead is holding
+    are not on offer to the ones behind it, except to fill.
     """
     decisions: list[Decision] = []
-    held = held_shared = 0
+    held: dict[str, str] = {}
+    """Card -> the job holding it, for the walk so far."""
+    occupant = {card: r.job_id for r in requests for card in r.occupying}
+    """Cards under a filler not yet reached, which is to say behind this job."""
     for request in requests:
+        if request.occupying:
+            for card in request.occupying:
+                occupant.pop(card, None)
+            holders = dict.fromkeys(held[c] for c in request.occupying if c in held)
+            decisions.append(Filling(request.job_id, tuple(holders)))
+            continue
         failure = capacity_failure(
             request.gpus, pool.owned_configured, pool.shared_configured, borrows=request.borrows
         )
         if failure is not None:
             decisions.append(Fails(request.job_id, failure))
             continue
-        owned_part = pool.owned_free[: min(request.gpus, max(0, len(pool.owned_free) - held))]
+
+        def usable(card: str, request: Request = request) -> bool:
+            return card not in held and (request.borrows or card not in pool.shared)
+
+        want = request.gpus
+        owned_part = [c for c in pool.owned_free if c not in held][:want]
         shared_part: list[str] = []
-        short = request.gpus - len(owned_part)
-        if short and request.borrows:
-            free_shared = pool.borrowable()
-            shared_part = free_shared[: min(short, max(0, len(free_shared) - held_shared))]
-            short -= len(shared_part)
-        if short:
-            ours = pool.owned_configured
-            if request.borrows:
-                ours += pool.shared_visible - pool.theirs
-            if request.gpus <= ours:
-                held += len(owned_part)
-                held_shared += len(shared_part)
-                decisions.append(Holds(request.job_id, len(owned_part), len(shared_part), short))
-            else:
-                decisions.append(SteppedOver(request.job_id, request.gpus - ours))
+        if len(owned_part) < want and request.borrows:
+            shared_part = [c for c in pool.borrowable() if c not in held]
+            shared_part = shared_part[: want - len(owned_part)]
+        free = [*owned_part, *shared_part]
+        in_the_way: list[str] = []
+        if len(free) < want:
+            candidates = [c for c in [*pool.coming, *occupant] if usable(c)]
+            candidates.sort(key=lambda c: c in pool.shared)
+            in_the_way = candidates[: want - len(free)]
+        short = want - len(free) - len(in_the_way)
+        if not short:
+            _take(pool, free)
+            if not in_the_way:
+                decisions.append(Assigned(request.job_id, free))
+                continue
+            for card in in_the_way:
+                held[card] = request.job_id
+            evicts = dict.fromkeys(occupant[c] for c in in_the_way if c in occupant)
+            decisions.append(Reclaims(request.job_id, [*free, *in_the_way], tuple(evicts)))
             continue
-        pool.owned_free = pool.owned_free[len(owned_part) :]
-        if shared_part:
-            pool.shared_free = pool.borrowable()[len(shared_part) :]
-        decisions.append(Assigned(request.job_id, [*owned_part, *shared_part]))
+        ours = pool.owned_configured
+        if request.borrows:
+            ours += pool.shared_visible - pool.theirs
+        if request.gpus > ours:
+            decisions.append(SteppedOver(request.job_id, request.gpus - ours))
+            continue
+        fill = _fill(request, pool, held) if request.fills else None
+        if fill is not None:
+            _take(pool, fill.gpus)
+            decisions.append(fill)
+            continue
+        taken = [*free, *in_the_way]
+        for card in taken:
+            held[card] = request.job_id
+        n_shared = sum(1 for c in taken if c in pool.shared or c in shared_part)
+        decisions.append(Holds(request.job_id, len(taken) - n_shared, n_shared, short))
     return decisions
+
+
+def _take(pool: Pool, cards: Sequence[str]) -> None:
+    gone = set(cards)
+    pool.owned_free = [c for c in pool.owned_free if c not in gone]
+    if pool.shared_free is not None:
+        pool.shared_free = [c for c in pool.shared_free if c not in gone]
+
+
+def _fill(request: Request, pool: Pool, held: dict[str, str]) -> Fills | None:
+    """The free cards, held ones included, that would start `request` now.
+
+    Unheld before held and owned before borrowed, so it sits on as few held
+    cards as it can. Only free ones: a filler never displaces anything.
+    """
+    owned = sorted(pool.owned_free, key=lambda c: c in held)
+    shared = sorted(pool.borrowable(), key=lambda c: c in held) if request.borrows else []
+    cards = [*owned, *shared][: request.gpus]
+    if len(cards) < request.gpus:
+        return None
+    holders = dict.fromkeys(held[c] for c in cards if c in held)
+    return Fills(request.job_id, cards, tuple(holders))
 
 
 @dataclass(frozen=True)
@@ -195,6 +312,8 @@ class Projection:
     """Seconds until each queued job is expected to start, for those that can be."""
     unknown: dict[str, str]
     """Why each of the rest has no start time."""
+    held_for: dict[str, list[str]] = field(default_factory=dict)
+    """For each running filler, the jobs holding the cards it is on now."""
 
 
 def project(
@@ -216,44 +335,88 @@ def project(
     projects nothing, since nothing more will be dispatched on it.
 
     A job that starts is assumed to run for its own estimate; one with none
-    holds its cards for ever as far as this projection can tell.
+    holds its cards for ever as far as this projection can tell -- except a
+    filler, whose cards are reclaimed the moment the job ahead can start.
+    That moment is when the reclaiming job is projected to start, not the pass
+    and grace period later that it really does. A filler is projected to start
+    when it is launched as one, and to run again from the start after it is
+    stopped, like any queued job; its start is the first of those.
+
+    `requests` includes the running fillers, each at its place in the queue
+    and occupying cards whose `release_s` is its own eta.
     """
     if draining:
         why = "the host is draining, so nothing more will be dispatched"
-        return Projection({}, {r.job_id: why for r in requests})
+        return Projection({}, {r.job_id: why for r in requests if not r.occupying})
     releases: dict[str, float | None] = {card.uuid: card.release_s for card in cards}
     is_shared = {card.uuid: card.shared for card in cards}
     shared_visible = sum(1 for card in cards if card.shared) + theirs
     pending = list(requests)
+    until: dict[str, float | None] = {
+        r.job_id: releases.get(r.occupying[0]) for r in requests if r.occupying
+    }
     starts: dict[str, float] = {}
+    held_for: dict[str, list[str]] | None = None
     clock = 0.0
     decisions: list[Decision] = []
     while pending:
-        free = [uuid for uuid, at in releases.items() if at is not None and at <= clock]
+        pending = [
+            r for r in pending if not r.occupying or (at := until[r.job_id]) is None or at > clock
+        ]
+        occupied = {card for r in pending for card in r.occupying}
+        free = [
+            uuid
+            for uuid, at in releases.items()
+            if at is not None and at <= clock and uuid not in occupied
+        ]
         pool = Pool(
             owned_free=[u for u in free if not is_shared[u]],
             owned_configured=owned_configured,
             shared_configured=shared_configured,
             shared_visible=shared_visible,
+            shared=frozenset(u for u, shared in is_shared.items() if shared),
             shared_free=[u for u in free if is_shared[u]],
             theirs=theirs,
         )
         decisions = plan(pending, pool)
+        if held_for is None:
+            held_for = {d.job_id: list(d.held_for) for d in decisions if isinstance(d, Filling)}
         by_id = {r.job_id: r for r in pending}
+        evicted = {e for d in decisions if isinstance(d, Reclaims) for e in d.evicts}
+        for i, request in enumerate(pending):
+            if request.job_id in evicted:
+                # Queued again, and whatever the reclaiming job does not take
+                # is free now rather than at the filler's own end.
+                for uuid in request.occupying:
+                    releases[uuid] = clock
+                until.pop(request.job_id, None)
+                pending[i] = replace(request, occupying=())
         for decision in decisions:
-            if not isinstance(decision, Assigned):
+            if not isinstance(decision, (Assigned, Reclaims, Fills)):
                 continue
             request = by_id[decision.job_id]
-            starts[request.job_id] = clock
+            starts.setdefault(request.job_id, clock)
             done = None if request.estimate_s is None else clock + request.estimate_s
             for uuid in decision.gpus:
                 releases[uuid] = done
-            pending.remove(request)
+            if isinstance(decision, Fills):
+                until[request.job_id] = done
+                pending[pending.index(request)] = replace(request, occupying=tuple(decision.gpus))
+            else:
+                pending.remove(request)
+        if evicted:
+            continue  # a card no reclaim took is free now; take the queue again
         later = [at for at in releases.values() if at is not None and at > clock]
         if not later:
             break
         clock = min(later)
-    return Projection(starts, _unknown_reasons(decisions, pending, owned_configured, owned_missing))
+    running = {r.job_id for r in requests if r.occupying}
+    queued = [r for r in pending if not r.occupying and r.job_id not in starts]
+    return Projection(
+        {job_id: at for job_id, at in starts.items() if job_id not in running},
+        _unknown_reasons(decisions, queued, owned_configured, owned_missing),
+        held_for or {},
+    )
 
 
 def _unknown_reasons(

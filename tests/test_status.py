@@ -1150,3 +1150,25 @@ def test_none_in_the_window_counts_the_finished_jobs_the_host_did_not_send() -> 
     host_view = view(jobs=[])
     host_view.finished_count = 12
     assert "none in the last 60 min (12 older)" in render(host_view, since_s=3600.0)
+
+
+def test_a_filler_says_whose_card_it_is_running_on() -> None:
+    """A job at priority 90 running ahead of one at 10, then dying, is not a
+    bug, and the line has to say so."""
+    queued, running, _ = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j-fill",
+                    "status": "running",
+                    "gpus": [GPU],
+                    "auto_preempt": True,
+                    "held_for": ["j-wide"],
+                },
+                {"job_id": "j-wide", "status": "queued", "held_for": None},
+            ]
+        )
+    )
+    assert running[0].held_for == ["j-wide"] and queued[0].held_for is None
+    text = render(busy(running[0]))
+    assert "auto-preempt, on a card held for j-wide" in text

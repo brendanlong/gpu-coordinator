@@ -102,6 +102,10 @@ destinations. Adding another of either changes nothing else in this document.
   held is those cards, not the queue: a job behind that needs none of them
   goes ahead. A job waiting for a shared card
   someone else is using is stepped over instead.
+- **A job that allows automatic preemption may run on held cards** while
+  their job waits for the rest. It occupies them without acquiring them, and
+  is stopped as soon as a job ahead of it can start on them. The job it filled
+  for starts that much later: the time it takes to stop.
 - Priorities of queued jobs can be changed, and the queue reorders
   accordingly.
 - **A running job can be preempted** so that a job ahead of it in dispatch

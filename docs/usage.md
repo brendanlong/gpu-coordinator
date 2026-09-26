@@ -87,6 +87,10 @@ empty `CUDA_VISIBLE_DEVICES`, skips the GPU check (so needs no torch), and is
 otherwise a job like any other, except that `gpuc preempt` refuses it. A
 running one keeps a rental from going idle.
 
+A job with [`auto_preempt: true`](#automatic-preemption) behind one that is
+holding cards may be started on the held cards, and is stopped as soon as a job
+ahead of it can start on them.
+
 A job waiting for a [shared card](#shared-gpus) somebody else is using does not
 hold: the queue behind it runs. A job short of an *owned* card holds even when
 that card has dropped off `nvidia-smi`; `gpuc status` marks the card
@@ -171,8 +175,18 @@ while a host is draining. A borrowed card is never freed for a job that did not
 ask to borrow. The stopped job is queued again at its own priority, behind the
 job it made room for.
 
-`gpuc status` shows `auto-preempt` on those jobs, and the dispatcher log and the
-job's own log name the job each preempt made room for.
+Such a job also **fills**: when a job ahead of it is holding free cards while
+it waits for the rest, an `auto_preempt` job that fits in those cards is
+started on them, whatever its priority. The cards stay held. As soon as a job
+ahead of the filler could start with them, the filler is stopped and queued
+again behind it, like any preempt; if it finishes first, the cards go back to
+being held. The job it filled for starts a pass plus the 15 s stop grace later
+than it would have. Only free cards are filled, and a card a stop in flight is
+handing back stays with the job it is coming back to.
+
+`gpuc status` shows `auto-preempt` on those jobs, and `on a card held for
+<job>` on a filler. The dispatcher log and the job's own log name the job each
+preempt made room for, and the job a filler was started and stopped for.
 
 ## What gets synced to the host
 
@@ -680,7 +694,11 @@ Beyond what the example shows:
 - `gpus_requested` is what the spec asked for; a queued job holds no `gpus` yet.
 - `starts_in_s` / `starts_at`: when a queued job's turn is expected; null for
   anything else, and for a queued job whose turn cannot be dated, when
-  `starts_unknown` says why.
+  `starts_unknown` says why. The projection counts fillers: a filler's cards
+  come back when the job ahead can start, and a queued `auto_preempt` job's
+  start may be when it is started as a filler.
+- `held_for`: on a running filler, the jobs holding the cards it is on
+  (empty when nothing holds them any more); null on anything else.
 - `problems`: what else went wrong on the way out of a finished job (`sync`,
   `no-outputs`). `upload_errors`: the last failure standing at each upload
   destination; a running job with one says `UPLOAD FAILING` in the text.

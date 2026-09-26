@@ -482,11 +482,13 @@ def _spawn_host_process(*args: str, label: str) -> subprocess.Popen[bytes]:
 
 
 def default_spawn_runner(
-    job_id: str, assigned: Sequence[str], attempt: int
+    job_id: str, assigned: Sequence[str], attempt: int, filler: bool = False
 ) -> subprocess.Popen[bytes]:
     """Start the runner for `job_id` on `assigned`, for `attempt`. Both travel
     on the command line: UUIDs and a number, not a secret, and the runner
-    claims exactly that attempt with them as its first act."""
+    claims exactly that attempt with them as its first act -- and records
+    `filler` in the same write, so every later pass can tell a job on cards
+    held for another from one that owns its cards."""
     return _spawn_host_process(
         "run",
         job_id,
@@ -494,6 +496,7 @@ def default_spawn_runner(
         ",".join(assigned),
         "--attempt",
         str(attempt),
+        *(["--filler"] if filler else []),
         label=f"run-{job_id}",
     )
 
@@ -515,7 +518,7 @@ class DispatcherDeps:
     smi: SmiRunner = gpus.run_nvidia_smi
     command_runner: sync.CommandRunner = sync.run_command
     terminate_call: TerminateCall | None = None
-    spawn_runner: Callable[[str, Sequence[str], int], subprocess.Popen[bytes]] = (
+    spawn_runner: Callable[[str, Sequence[str], int, bool], subprocess.Popen[bytes]] = (
         default_spawn_runner
     )
     monotonic: Callable[[], float] = time.monotonic
@@ -1004,9 +1007,10 @@ class Dispatcher:
 
     def _requests(self) -> list[tuple[queue.QueueEntry, plan.Request]]:
         """The queue as `plan` sees it: every queued job this dispatcher has
-        not already started a runner for. A job whose spec cannot be read is
-        failed here: it is the one thing about a queued job that only the
-        dispatcher can decide."""
+        not already started a runner for, and every running filler at the
+        place in the queue it would have if it were queued. A job whose spec
+        cannot be read is failed here: it is the one thing about a queued job
+        that only the dispatcher can decide."""
         requests: list[tuple[queue.QueueEntry, plan.Request]] = []
         for entry in self.queued():
             if entry.job_id in self.running:
@@ -1018,22 +1022,49 @@ class Dispatcher:
                 self._fail_queued(entry.job_id, "bad-spec")
                 continue
             requests.append(
-                (entry, plan.Request(entry.job_id, spec.gpus, self.config.may_borrow(spec)))
+                (
+                    entry,
+                    plan.Request(
+                        entry.job_id,
+                        spec.gpus,
+                        self.config.may_borrow(spec),
+                        fills=spec.auto_preempt,
+                    ),
+                )
             )
-        return requests
+        visible = {*self.owned_gpus(), *self.shared_gpus()}
+        for job_id, running in self.running.items():
+            state = self._state_or_empty(job_id)
+            cards = tuple(uuid for uuid in running.gpus if uuid in visible)
+            if state.status != "running" or not state.filler or state.intent or not cards:
+                continue
+            requests.append(
+                (
+                    queue.QueueEntry(state.priority, job_id, state.attempt),
+                    plan.Request(job_id, len(running.gpus), False, occupying=cards),
+                )
+            )
+        return sorted(requests, key=lambda pair: pair[0])
 
-    def _pool(
-        self, *, extra_owned: Sequence[str] = (), extra_shared: Sequence[str] = ()
-    ) -> plan.Pool:
-        """This pass's cards. `extra_*` are the ones a stop in flight will hand
-        back, which `preempt_for_waiting` counts as free."""
+    def _pool(self) -> plan.Pool:
+        """This pass's cards, with the ones a stop in flight will hand back
+        as `coming`. A card that has dropped off nvidia-smi is in no list,
+        since it is never handed out at all."""
+        visible = {*self.owned_gpus(), *self.shared_gpus()}
         return plan.Pool(
-            owned_free=[*self.free_gpus(), *extra_owned],
+            owned_free=self.free_gpus(),
             owned_configured=len(self.config.gpus),
             shared_configured=len(self.shared_gpus()) + len(self._shared_unavailable),
             shared_visible=len(self.shared_gpus()),
             sample=self.borrowable_gpus,
-            shared_extra=list(extra_shared),
+            shared=frozenset(self.shared_gpus()),
+            coming=[
+                uuid
+                for job_id, entry in self.running.items()
+                if self._stopping(job_id)
+                for uuid in entry.gpus
+                if uuid in visible
+            ],
         )
 
     def launch_ready(self) -> None:
@@ -1043,6 +1074,11 @@ class Dispatcher:
         like any other: `config.gpus` says the host has that card, so the host
         is misconfigured or broken, and idling the queue behind the job is how
         that gets noticed rather than quietly worked around.
+
+        Fillers are started (`plan.Fills`) and stopped (`plan.Reclaims`) here
+        and nowhere else, because the walk that decides it is the dispatch
+        rule itself. A filler is stopped with an ordinary preempt, which is
+        what queues it again behind the job it made room for.
         """
         if self.going_away is not None:
             return
@@ -1053,12 +1089,36 @@ class Dispatcher:
             job_id = decision.job_id
             if isinstance(decision, plan.Fails):
                 self._fail_queued(job_id, decision.reason)
-                continue
-            if not isinstance(decision, plan.Assigned):
-                continue
-            self._launch(job_id, decision.gpus, attempts[job_id])
+            elif isinstance(decision, plan.Assigned):
+                self._launch(job_id, decision.gpus, attempts[job_id])
+            elif isinstance(decision, plan.Fills):
+                self._launch(job_id, decision.gpus, attempts[job_id], decision.held_for)
+            elif isinstance(decision, plan.Reclaims):
+                for filler in decision.evicts:
+                    self._reclaim_from(filler, job_id)
 
-    def _launch(self, job_id: str, assigned: list[str], attempt: int) -> None:
+    def _reclaim_from(self, filler: str, waiting: str) -> None:
+        try:
+            queue.preempt(filler)
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.log(
+                f"job {filler} is filling cards held for {waiting} but was not stopped "
+                f"({exc}); it keeps them"
+            )
+            return
+        self.log(
+            f"job {filler} was running on card(s) held for job {waiting}, whose other cards "
+            f"have arrived; stopping it"
+        )
+        queue.note(
+            filler,
+            f"stopping: this attempt ran on card(s) held for job {waiting}, whose other "
+            f"cards have arrived",
+        )
+
+    def _launch(
+        self, job_id: str, assigned: list[str], attempt: int, held_for: Sequence[str] = ()
+    ) -> None:
         """Start a runner for the job, and count its cards as taken from now.
 
         The state is not touched: the runner claims the job itself, as its
@@ -1083,7 +1143,7 @@ class Dispatcher:
             )
             return
         try:
-            proc = self.deps.spawn_runner(job_id, assigned, attempt)
+            proc = self.deps.spawn_runner(job_id, assigned, attempt, bool(held_for))
         except OSError as exc:
             self.log(f"job {job_id}: could not spawn a runner ({exc})")
             self._fail_queued(job_id, "spawn-failed")
@@ -1092,6 +1152,14 @@ class Dispatcher:
         shared = set(self.shared_gpus())
         borrowed = [uuid for uuid in assigned if uuid in shared]
         note = f", borrowing {','.join(borrowed)}" if borrowed else ""
+        if held_for:
+            filling = f"running on card(s) held for job {', '.join(held_for)}"
+            note += f", {filling} until its other cards arrive"
+            queue.note(
+                job_id,
+                f"auto_preempt: {filling}; it is stopped and queued again as soon as that "
+                f"job's other cards arrive",
+            )
         self.log(f"launched {job_id} (pid {proc.pid}) on {','.join(assigned) or 'cpu'}{note}")
 
     # -- automatic preemption --------------------------------------------
@@ -1113,7 +1181,8 @@ class Dispatcher:
         discards an attempt and starts neither.
 
         What the walk does pass is a job that is not stuck: one already holding
-        every card it needs, because a stop in flight is bringing them, and the
+        every card it needs, because a stop in flight is bringing them or a
+        filler is about to be stopped for it (`plan.Reclaims`), and the
         one job the strict order steps over, which is short of a shared card
         somebody else is using and so holds nothing (`plan.SteppedOver`).
 
@@ -1154,25 +1223,12 @@ class Dispatcher:
         candidates = self.auto_preemptable()
         if not candidates:
             return
-        # Cards held by a job that is already stopping count as free: a gap the
-        # cards of a preempt already in flight will cover needs no second job
-        # stopped for it. A card that has dropped off nvidia-smi is in neither
-        # list, since it is never handed out at all.
-        owned = set(self.owned_gpus())
-        shared = set(self.shared_gpus())
-        stopping = [
-            uuid
-            for job_id, entry in self.running.items()
-            if self._stopping(job_id)
-            for uuid in entry.gpus
-        ]
+        # Cards held by a job that is already stopping are in the pool as
+        # `coming`: a gap the cards of a preempt already in flight will cover
+        # needs no second job stopped for it.
         requests = self._requests()
         by_id = {request.job_id: (entry, request) for entry, request in requests}
-        pool = self._pool(
-            extra_owned=[u for u in stopping if u in owned],
-            extra_shared=[u for u in stopping if u in shared],
-        )
-        for decision in plan.plan([request for _, request in requests], pool):
+        for decision in plan.plan([request for _, request in requests], self._pool()):
             if not isinstance(decision, plan.Holds):
                 continue
             waiting, request = by_id[decision.job_id]
@@ -1189,7 +1245,10 @@ class Dispatcher:
         """The running jobs whose spec said they may be stopped for better work.
 
         Never one that is already stopping: its cards are counted as coming
-        free instead, and a second kill request would say nothing new.
+        free instead, and a second kill request would say nothing new. Never a
+        filler either: the walk already counts its cards towards every job
+        ahead of it, so stopping it would close no gap, and when one of those
+        jobs can start, `launch_ready` stops it.
         """
         found: list[Preemptable] = []
         owned = set(self.owned_gpus())
@@ -1202,7 +1261,7 @@ class Dispatcher:
             except (RuntimeError, ValueError):
                 continue
             state = self._state_or_empty(job_id)
-            if not spec.auto_preempt or state.status != "running":
+            if not spec.auto_preempt or state.status != "running" or state.filler:
                 continue
             found.append(
                 Preemptable(

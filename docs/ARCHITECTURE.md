@@ -132,6 +132,8 @@ jobs/<jobid>/
                      #  "isolation": "cgroup"|"pgid", "cgroup_unit": str|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null,          # the runner, from its own claim
+                     #  "filler": bool,                        # launched onto cards held for a job
+                     #                                        # ahead; from the claim
                      #  "util_recent": [float|null, ...],
                      #  "progress_pct": float|null, "progress_error": str|null, "eta": str|null,
                      #  "uploads": [{"to": uri, "output": path|null, "ok_at": str|null, "error": str|null}],
@@ -209,7 +211,8 @@ defaults.
   "progress_interval_s": 60,
   "auto_preempt": false,                # let the dispatcher stop this job, as often as it
                                         # takes, whenever that starts a strictly more
-                                        # important queued one right away
+                                        # important queued one right away; and start
+                                        # it on cards held for a job ahead of it
   "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
   "requeued_from": null                 # the job `gpuc requeue` resubmitted this one from;
@@ -249,17 +252,26 @@ The rules it holds to:
   in `(priority, job_id)` order, the owned cards free now, the configured
   counts, and one nvidia-smi reading of the shared cards taken only if a job
   needs to borrow. Per job it decides assigned, holds, stepped over or fails,
-  and `launch_ready` acts on it every 2 s. The same function over the cards a
-  stop in flight will hand back is how automatic preemption finds the one job
-  the queue is stuck on, and run forward over the running jobs' etas
-  (`plan.project`) it is how the host says when each queued job will start.
+  and `launch_ready` acts on it every 2 s. The same function is how
+  automatic preemption finds the one job the queue is stuck on, and run
+  forward over the running jobs' etas (`plan.project`) it is how the host
+  says when each queued job will start.
+- **Fillers are decided by that same walk.** An `auto_preempt` job that
+  would hold is launched onto free held cards instead (`plan.Fills`), and its
+  runner records `filler: true` in the claim. A running filler with no stop
+  intent stands in the walk at its own `(priority, job_id)`; its cards are on
+  offer to every job ahead of it, and one that needs them to fit
+  (`plan.Reclaims`) holds them and has the filler preempted. Cards of a job
+  already stopping are on offer the same way (`Pool.coming`), with nobody to
+  stop, so no second filler takes a card the job ahead is waiting on. A
+  filler is never an automatic-preemption candidate.
 - **Acceptance is a rename.** `gpuc submit` builds the job dir under
   `incoming/`; the host's `enqueue` writes the spec and initial state there
   and renames the dir into `jobs/`. A dir left under `incoming/` an hour after
   its last change is a submit that died, and is removed.
 - **A launch is a spawn; the runner claims the job.** The dispatcher starts
-  `python -m gpuc.host run <id> --gpus <uuids> --attempt <n>` and writes
-  nothing; the runner's first act is the compare-and-set from `queued` at that
+  `python -m gpuc.host run <id> --gpus <uuids> --attempt <n> [--filler]` and
+  writes nothing; the runner's first act is the compare-and-set from `queued` at that
   attempt to `running`. A runner that dies before claiming is failed
   `runner-died` from `queued`.
 - **A card is busy if any runner holds it**: the cards of every runner this
@@ -385,7 +397,8 @@ submitter is [usage.md](usage.md#job-length-estimates).
   ends; `progress_pct` is not.
 - The **host** projects each queued job's start (`plan.project`, published by
   `python -m gpuc.host status` as `starts_in_s`, with `starts_unknown` saying
-  why not) by running the dispatch rule forward over the running jobs' etas. A
+  why not) by running the dispatch rule forward over the running jobs' etas,
+  a filler's cards coming back when the job ahead reclaims them. A
   card held by a job that published no eta is not schedulable, so a job whose
   turn depends on it is unknown; a draining host projects nothing. The control
   side renders the answer and computes nothing.

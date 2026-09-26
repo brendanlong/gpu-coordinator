@@ -133,6 +133,7 @@ def projected_starts(
     """
     running = {job_id: s for job_id, s in states.items() if s.status == "running"}
     holder = {uuid: s for s in running.values() for uuid in s.gpus}
+    visible = {row["uuid"] for row in (*table["gpus_resolved"], *table["shared_gpus_resolved"])}
 
     def release(uuid: str) -> float | None:
         state = holder.get(uuid)
@@ -148,10 +149,12 @@ def projected_starts(
     # The queue from the same snapshot as everything else in this document:
     # listed separately, a job the dispatcher claimed in between would be
     # reported queued with no start time and no reason.
+    # Running fillers stand in the queue too, where the dispatcher puts them.
     queued = sorted(
         queue.QueueEntry(state.priority, job_id)
         for job_id, state in states.items()
         if state.status == "queued"
+        or (state.status == "running" and state.filler and state.intent is None)
     )
     requests: list[plan.Request] = []
     for entry in queued:
@@ -161,12 +164,17 @@ def projected_starts(
             # A spec the dispatcher is about to fail: the next call will say.
             continue
         estimate = state.estimated_runtime_min
+        occupying = tuple(uuid for uuid in state.gpus if uuid in visible)
+        if state.status == "running" and not occupying:
+            continue
         requests.append(
             plan.Request(
                 entry.job_id,
                 spec.gpus,
                 config.may_borrow(spec),
                 None if estimate is None else estimate * 60.0,
+                fills=spec.auto_preempt,
+                occupying=occupying if state.status == "running" else (),
             )
         )
     return plan.project(
@@ -233,6 +241,9 @@ def _job_entry(
     # said. Null on anything that is not queued.
     entry["starts_in_s"] = projection.starts_in_s.get(job_id)
     entry["starts_unknown"] = projection.unknown.get(job_id)
+    # The jobs holding the cards a running filler is on: it is stopped as
+    # soon as one of them can start. Null on anything that is not a filler.
+    entry["held_for"] = projection.held_for.get(job_id)
     # Whether this job gives its cards up to anything more important. It
     # changes what "running" promises, and only the spec knows.
     entry["auto_preempt"] = spec.auto_preempt if spec else None
@@ -493,7 +504,10 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     return runner.run_job(
-        args.job_id, [uuid for uuid in args.gpus.split(",") if uuid], args.attempt
+        args.job_id,
+        [uuid for uuid in args.gpus.split(",") if uuid],
+        args.attempt,
+        filler=args.filler,
     )
 
 
@@ -635,6 +649,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         help="the attempt the dispatcher launched; the claim is for that attempt only",
+    )
+    run.add_argument(
+        "--filler",
+        action="store_true",
+        help="the cards are held for a job ahead of this one, which stops it when it can start",
     )
     run.set_defaults(func=cmd_run)
 

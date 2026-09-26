@@ -115,6 +115,9 @@ class JobView:
     """This job asked to be stopped and queued again whenever that lets a more
     important one start, so a `running` line for it is not a promise that it
     will still be running in a minute. None from a host that did not say."""
+    held_for: list[str] | None = None
+    """For a running filler, the jobs holding the cards it is on: it stops as
+    soon as one of them can start. None for anything else."""
     progress_error: str | None = None
     """Why this job's `progress_command` last produced nothing.
 
@@ -441,6 +444,11 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             starts_in_s=_as_float(entry.get("starts_in_s")),
             starts_unknown=_as_str(entry.get("starts_unknown")),
             auto_preempt=_as_bool(entry.get("auto_preempt")),
+            held_for=(
+                [str(j) for j in entry["held_for"] if isinstance(j, str)]
+                if isinstance(entry.get("held_for"), list)
+                else None
+            ),
             progress_error=_as_str(entry.get("progress_error")),
             workdir_bytes=_as_int(entry.get("workdir_bytes")),
             outputs_pending=bool(entry.get("outputs_pending")),
@@ -640,7 +648,11 @@ def _fmt_upload_error(job: JobView) -> str:
 
 
 def _fmt_auto_preempt(job: JobView) -> str:
-    """` auto-preempt`: this job gives its cards up to anything more important."""
+    """` auto-preempt`: this job gives its cards up to anything more important.
+    A filler says whose cards those are, since otherwise a job at priority 90
+    starting ahead of one at 10, then dying, looks like a bug."""
+    if job.held_for:
+        return f" auto-preempt, on a card held for {', '.join(job.held_for)}"
     return " auto-preempt" if job.auto_preempt else ""
 
 
@@ -1039,6 +1051,7 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),
         "estimated_runtime_min": job.estimated_runtime_min,
         "auto_preempt": job.auto_preempt,
+        "held_for": job.held_for,
         "progress_error": job.progress_error,
         "gpus": list(job.gpus),
         "gpus_requested": job.gpus_requested,

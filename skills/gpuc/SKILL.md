@@ -83,7 +83,9 @@ progress_command: "tail -1 results/progress.txt"   # optional; last stdout line 
 progress_interval_s: 60            # prints `0.42` or `42%`; a bare `42` is refused; min 5
 auto_preempt: false                # true: the host stops this job whenever that lets a job
                                    # queued at a LOWER priority number start now, and queues it
-                                   # again. It RE-RUNS FROM THE START, any number of times
+                                   # again. It RE-RUNS FROM THE START, any number of times. It
+                                   # may also start early on cards HELD for a wider job, and is
+                                   # stopped when that job's other cards arrive
 cleanup: on_success                # workdir deleted after a successful run
 ```
 
