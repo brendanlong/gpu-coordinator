@@ -327,10 +327,12 @@ def test_an_estimate_added_in_setup_survives_the_phase_that_follows(gpuc_home: P
 def test_a_state_that_cannot_be_read_leaves_the_estimate_where_it_was(gpuc_home: Path) -> None:
     """A state.json being replaced under us is a transient condition, not a
     reason to end a job that is running fine."""
-    job_id = prepare(command="true", estimated_runtime_min=90.0)
-    with live_runner(job_id) as (started, _log):
+    job_id = prepare(command="true", estimated_runtime_min=90.0, max_runtime_min=120.0)
+    with live_runner(job_id) as (started, log):
         paths.state_file(job_id).write_text("{ not json")
-        assert started._live_estimate() == 90.0  # pyright: ignore[reportPrivateUsage]
+        started._reread_live_fields(log)  # pyright: ignore[reportPrivateUsage]
+        assert started._estimate == 90.0  # pyright: ignore[reportPrivateUsage]
+        assert started._max_runtime == 120.0  # pyright: ignore[reportPrivateUsage]
 
 
 def test_no_estimate_and_no_progress_command_means_no_eta(gpuc_home: Path) -> None:

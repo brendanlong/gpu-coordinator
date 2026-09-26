@@ -566,6 +566,38 @@ def test_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
     assert status == 400
 
 
+def test_max_runtime_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
+    for minutes in (600.0, None):
+        stub.answers.append(
+            {
+                "jobs": [
+                    {
+                        "job_id": RUNNING_JOB,
+                        "max_runtime_min": minutes,
+                        "status": "running",
+                        "warning": None,
+                    }
+                ]
+            }
+        )
+    status, document = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/max-runtime", {"host": "gpubox", "minutes": 600}
+    )
+    assert status == 200 and document["jobs"][0]["max_runtime_min"] == 600.0
+    status, document = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/max-runtime", {"host": "gpubox", "clear": True}
+    )
+    assert status == 200 and document["jobs"][0]["max_runtime_min"] is None
+    assert stub.commands == [
+        f"max-runtime {RUNNING_JOB} --minutes 600.0",
+        f"max-runtime {RUNNING_JOB} --clear",
+    ]
+    status, _ = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/max-runtime", {"host": "gpubox", "minutes": 0}
+    )
+    assert status == 400
+
+
 def test_logs_is_the_logs_document(logged_in: Client, stub: StubSession) -> None:
     status, document = logged_in.get_json(f"/api/jobs/{RUNNING_JOB}/logs?host=gpubox&lines=2")
     assert status == 200

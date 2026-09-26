@@ -259,6 +259,88 @@ def test_estimate_warns_when_the_job_will_be_killed_first(
     assert "max_runtime_min" in (payload["warning"] or "")
 
 
+def test_max_runtime_sets_and_clears_a_queued_jobs_limit(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=60.0))
+    before = paths.spec_file(job_id).read_text()
+    code, payload = verb(capsys, "max-runtime", job_id, "--minutes", "480")
+    assert code == 0
+    assert payload["max_runtime_min"] == 480.0 and payload["status"] == "queued"
+    state = jobs.read_state(job_id)
+    assert state.max_runtime(jobs.read_spec(job_id)) == 480.0
+    assert paths.spec_file(job_id).read_text() == before
+
+    code, payload = verb(capsys, "max-runtime", job_id, "--clear")
+    assert code == 0 and payload["max_runtime_min"] is None
+    assert jobs.read_state(job_id).max_runtime(jobs.read_spec(job_id)) is None
+
+
+def test_max_runtime_raises_a_running_jobs_limit_and_status_reports_it(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=420.0, estimated_runtime_min=500.0))
+    started = (datetime.now(UTC) - timedelta(minutes=97)).isoformat()
+    jobs.update_state(job_id, status="running", started_at=started)
+    code, payload = verb(capsys, "max-runtime", job_id, "--minutes", "600")
+    assert code == 0 and payload["status"] == "running" and payload["warning"] is None
+    capsys.readouterr()
+    assert cli.main(["status"]) == 0
+    (entry,) = json.loads(capsys.readouterr().out)["jobs"]
+    assert entry["max_runtime_min"] == 600.0 and "live_max_runtime" not in entry
+
+    _, payload = verb(capsys, "max-runtime", job_id, "--minutes", "450")
+    assert "max_runtime_min" in (payload["warning"] or "")
+
+
+def test_max_runtime_refuses_a_limit_the_running_job_has_already_outlived(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
+    started = (datetime.now(UTC) - timedelta(minutes=97)).isoformat()
+    jobs.update_state(job_id, status="running", started_at=started)
+    code, payload = verb(capsys, "max-runtime", job_id, "--minutes", "90")
+    assert code == 1 and "would end it at once" in payload["error"]
+    assert jobs.read_state(job_id).max_runtime_min == 420.0
+
+
+def test_max_runtime_refuses_a_job_run_by_a_build_that_would_not_see_it(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A runner from before the limit lived in the state enforces the spec's,
+    so recording a new one would report success for nothing."""
+    job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
+    jobs.write_state(job_id, jobs.JobState(status="running"))
+    code, payload = verb(capsys, "max-runtime", job_id, "--minutes", "600")
+    assert code == 1 and "reads max_runtime_min only at start" in payload["error"]
+
+    queued = queue.enqueue(make_spec(max_runtime_min=420.0))
+    jobs.write_state(queued, jobs.JobState(status="queued"))
+    code, _ = verb(capsys, "max-runtime", queued, "--minutes", "600")
+    assert code == 0 and jobs.read_state(queued).max_runtime(jobs.read_spec(queued)) == 600.0
+
+
+@pytest.mark.parametrize("minutes", ["0", "-5", "nan", "inf"])
+def test_max_runtime_refuses_a_number_that_is_not_a_limit(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], minutes: str
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=60.0))
+    code, payload = verb(capsys, "max-runtime", job_id, "--minutes", minutes)
+    assert code == 1 and payload["error"]
+    assert jobs.read_state(job_id).max_runtime_min == 60.0
+
+
+def test_max_runtime_refuses_a_finished_job_and_an_unknown_one(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, status="failed")
+    code, payload = verb(capsys, "max-runtime", job_id, "--minutes", "10")
+    assert code == 1 and "already failed" in payload["error"]
+    code, payload = verb(capsys, "max-runtime", "no-such-job", "--minutes", "10")
+    assert code == 1 and payload["missing"] is True
+
+
 def test_dispatch_is_routed_to_the_dispatcher(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

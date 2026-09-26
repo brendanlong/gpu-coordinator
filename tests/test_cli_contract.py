@@ -421,6 +421,7 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
         started_at=started,
         util_recent=[90.0, 95.0],
         isolation="cgroup",
+        live_max_runtime=True,
     )
     accept_job(
         JobSpec.from_dict(
@@ -488,6 +489,12 @@ def test_a_verb_on_several_ids_does_every_one_it_can_and_exits_for_the_rest(
     assert f"job {RUNNING_JOB} on host local now estimates 5 min" in captured.out
     assert "already failed" in captured.err
 
+    argv = ["max-runtime", RUNNING_JOB, FINISHED_JOB, "--minutes", "600", "--host", "local"]
+    assert main(argv) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert f"job {RUNNING_JOB} on host local is now limited to 600 min" in captured.out
+    assert "already failed" in captured.err
+
 
 def test_status_of_named_jobs_is_those_jobs_and_exit_four_for_an_unknown_one(
     real_local_host: Path, capsys: pytest.CaptureFixture[str]
@@ -549,6 +556,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "eta",
         "eta_s",
         "estimated_runtime_min",
+        "max_runtime_min",
         "auto_preempt",
         "progress_error",
         "gpus",
@@ -922,6 +930,7 @@ JSON_COMMANDS = [
     ["preempt"],
     ["reorder"],
     ["estimate"],
+    ["max-runtime"],
     ["pods"],
     ["version"],
     ["clean"],

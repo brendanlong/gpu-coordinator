@@ -24,7 +24,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `outputs` | `[]` | `{path, s3}` and/or `{path, hf, hf_path, hf_create}`, or `{path}` alone to [keep it on the host](#kept-outputs); `path` is relative to the workdir |
 | `sync_interval_s` | `180` | background upload cadence; minimum 10 |
 | `priority` | `50` | `0`–`99`, lower first; see [priority](#priority-is-not-advisory) |
-| `max_runtime_min` | none | wall clock from the runner's start; over it the job is `failed: timeout` |
+| `max_runtime_min` | none | wall clock from the runner's start; over it the job is `failed: timeout`. `gpuc max-runtime` changes it after submit |
 | `estimated_runtime_min` | none | your guess, measured the same way; see [estimates](#job-length-estimates) |
 | `progress_command` | none | run in the workdir during `main`; its last stdout line is the job's progress |
 | `progress_interval_s` | `60` | how often to run it; minimum 5 |
@@ -370,6 +370,14 @@ cancelled while stopping, or the host is draining.
 **`gpuc estimate <job-id> [...] --minutes N`** — set (or `--clear`) queued or
 running jobs' `estimated_runtime_min`; see [job length estimates](#job-length-estimates).
 
+**`gpuc max-runtime <job-id> [...] --minutes N`** — raise, lower or (`--clear`)
+remove queued or running jobs' `max_runtime_min`, still measured from the
+runner's start. A running job picks it up within a minute, without restarting.
+Refused for a finished job, for a limit a running job has already run past
+(`gpuc cancel` is how to stop it), and for a job whose runner was started by a
+gpuc build from before this command, which keeps the limit it started with. The
+mirrored spec is updated as for `estimate`.
+
 **`gpuc requeue <job-id>`** — re-read the spec from the S3 mirror and submit it
 again as a new job that records where it came from (`requeued_from`), with the
 workdir re-synced from your *current* directory. It **needs `s3_bucket`** and
@@ -380,7 +388,7 @@ will not accept is refused; submitting the job file again is the way round it.
 Keys this build does not know are dropped.
 
 `--host` is optional on `status <job-id>`, `logs`, `fetch`, `wait`, `cancel`,
-`preempt`, `reorder`, `estimate` and `requeue`: the local job index is tried first, then
+`preempt`, `reorder`, `estimate`, `max-runtime` and `requeue`: the local job index is tried first, then
 every registered host is asked whether it knows the ids. An unknown host is exit 4
 unless it is [gone](#exit-codes-and---json) (never for `requeue --host` or `ssh
 --host`, which name where to go), and so is a job no host knows once every host
@@ -664,7 +672,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
         { "job_id": "20260915-120000-abc123", "name": "lego-s4", "status": "running",
           "reason": null, "phase": "main", "priority": 50, "elapsed_s": 4210.5, "util": 96.0,
           "progress_pct": 37.0, "eta": "2026-09-15T16:31:00+00:00", "eta_s": 12060.0,
-          "estimated_runtime_min": 480.0, "progress_error": null,
+          "estimated_runtime_min": 480.0, "max_runtime_min": 600.0, "progress_error": null,
           "gpus": ["GPU-8064..."], "gpus_requested": 1, "use_shared": false,
           "iso": "pgid", "ended_at": null,
           "outputs_pending": false }
@@ -765,11 +773,12 @@ stopped for.
 | `wait` | `{jobs[], errors[]}`, printed once every job has ended. Each of `jobs[]` is the job's final state in the shape `status --json` gives a job, plus `host`, `host_state` (`answered`, `unaskable` or `gone`, as in [the host rule](#exit-codes-and---json)), `source` (`"host"` or `"mirror"`) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say, and a job nothing was heard about carries only `job_id`, `host`, `host_state`, `source`, `error` and a null `status`. With an `error`, only a `host_state` of `unaskable` can change if asked again. Every `error` is in `errors[]` too. The per-job outcome lines go to stderr. Exit 1 unless every job succeeded; exit 4 when an id no host has is among them, with the rest still reported |
 | `status <job-id> ...` | `wait`'s document, as things stand now rather than once the jobs end. Exit 4 when an id no host has is among them, 1 when any other job has an `error`, else 0 whatever the jobs' own status |
 | `fetch` | `{jobs[], errors[]}`, one entry per id: `{job_id, host, source, error, warnings[]}` and, with no `error`, `{status, workdir, files[], bytes, missing[], to}`. Each file is `{path, bytes}`, relative to the workdir; `missing` names `outputs:` paths the job never wrote; `to` is the local directory they were copied to, null under `--list` or when there was nothing to copy. Exit 4 when an id no host has is among them, else 1 when any `error` is set |
-| `cancel`, `preempt`, `reorder`, `estimate` | `{jobs[], errors[]}`, one entry per id in the order given: `{job_id, host, source, error, warnings[]}` plus what the host did, below. **Check `error`**: when it is not null the host did not confirm doing what was asked, and none of the fields below are there. `source` is `mirror` for a job whose host is gone, answered from the S3 mirror. `warnings` carries a mirrored spec that could not be updated, so `gpuc requeue` would not carry the change. Every `error` is in `errors[]` too. Exit 4 when an id no host has is among them, else 1 when any `error` is set |
+| `cancel`, `preempt`, `reorder`, `estimate`, `max-runtime` | `{jobs[], errors[]}`, one entry per id in the order given: `{job_id, host, source, error, warnings[]}` plus what the host did, below. **Check `error`**: when it is not null the host did not confirm doing what was asked, and none of the fields below are there. `source` is `mirror` for a job whose host is gone, answered from the S3 mirror. `warnings` carries a mirrored spec that could not be updated, so `gpuc requeue` would not carry the change. Every `error` is in `errors[]` too. Exit 4 when an id no host has is among them, else 1 when any `error` is set |
 | ↳ `cancel` | `status`: `cancelled` for a queued job, `cancelling` for a running one, a finished job's own status |
 | ↳ `preempt` | `status` (`preempting`) and `priority`, what it will be queued again at |
 | ↳ `reorder` | `status` (`queued`), `priority`, and the same `queue_position`, `queue_length`, `dispatched`, `starts_in_s`, `starts_at` and `starts_unknown` as `submit` |
 | ↳ `estimate` | `status` and `estimated_runtime_min`, what the job's state holds now (null after `--clear`); `warnings` also carries a `max_runtime_min` contradiction |
+| ↳ `max-runtime` | `status` and `max_runtime_min`, what the job's state holds now (null after `--clear`); `warnings` also carries an `estimated_runtime_min` the new limit is shorter than |
 | `pods` | `{pods[], hourly_usd, others[], notes[]}`. Each pod is `{id, name, status, gpu_name, gpu_count, cost_usd_hr, cuda_version, age_s, created_at, gpu_utils[], host, heartbeat_age_s}`; `host` is the registry name here, null if none; `others` are pods without our prefix, `{id, name, status}` only |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` is the commit the host was running when this machine last read it. Exit 1 for an entry that could not be parsed, 3 if the whole registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}`: the effective settings, file or not |

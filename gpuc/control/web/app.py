@@ -37,12 +37,14 @@ from gpuc.control.actions import (
     UsageError,
     cancel_jobs,
     check_estimate,
+    check_max_runtime,
     config_document,
     estimate_jobs,
     exit_code_for,
     failure_message,
     hosts_document,
     jobs_answer,
+    max_runtime_jobs,
     preempt_jobs,
     read_log,
     registry_answer,
@@ -188,6 +190,12 @@ class Dashboard:
             ("POST", re.compile(r"^/api/jobs/([^/]+)/reorder$"), Dashboard.api_reorder, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/preempt$"), Dashboard.api_preempt, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/estimate$"), Dashboard.api_estimate, True),
+            (
+                "POST",
+                re.compile(r"^/api/jobs/([^/]+)/max-runtime$"),
+                Dashboard.api_max_runtime,
+                True,
+            ),
             ("POST", re.compile(r"^/api/hosts/([^/]+)/remove$"), Dashboard.api_host_remove, True),
         ]
 
@@ -350,6 +358,21 @@ class Dashboard:
         )
         return Response.answer(
             jobs_answer(estimate_jobs([job_id], wanted, host_of(body), self.load_settings()))
+        )
+
+    def api_max_runtime(self, request: Request) -> Response:
+        job_id = job_id_of(request)
+        body = request.json()
+        minutes = body.get("minutes")
+        if minutes is not None and (
+            isinstance(minutes, bool) or not isinstance(minutes, (int, float))
+        ):
+            raise UsageError("max-runtime needs a number of `minutes`, or `clear: true`")
+        wanted = check_max_runtime(
+            None if minutes is None else float(minutes), clear=bool(body.get("clear"))
+        )
+        return Response.answer(
+            jobs_answer(max_runtime_jobs([job_id], wanted, host_of(body), self.load_settings()))
         )
 
 

@@ -106,6 +106,8 @@ class JobView:
     where there is one, from the spec's `estimated_runtime_min` otherwise."""
     estimated_runtime_min: float | None = None
     """The submitter's own estimate, which is all a *queued* job has."""
+    max_runtime_min: float | None = None
+    """The wall-clock limit the job is killed as `timeout` at, if any."""
     starts_in_s: float | None = None
     """When the host expects this queued job's turn to come, by replaying its
     own dispatch rule over the running jobs' etas. Null when it cannot say."""
@@ -438,6 +440,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
+            max_runtime_min=_as_float(entry.get("max_runtime_min")),
             starts_in_s=_as_float(entry.get("starts_in_s")),
             starts_unknown=_as_str(entry.get("starts_unknown")),
             auto_preempt=_as_bool(entry.get("auto_preempt")),
@@ -1038,6 +1041,7 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "eta": job.eta,
         "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),
         "estimated_runtime_min": job.estimated_runtime_min,
+        "max_runtime_min": job.max_runtime_min,
         "auto_preempt": job.auto_preempt,
         "progress_error": job.progress_error,
         "gpus": list(job.gpus),

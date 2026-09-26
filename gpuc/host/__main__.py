@@ -229,6 +229,8 @@ def _job_entry(
 ) -> dict[str, Any]:
     spec = _spec(job_id)
     entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
+    entry["max_runtime_min"] = state.max_runtime(spec)
+    entry.pop("live_max_runtime")
     # When a queued job's turn is expected, and why not if it cannot be
     # said. Null on anything that is not queued.
     entry["starts_in_s"] = projection.starts_in_s.get(job_id)
@@ -447,22 +449,87 @@ def _estimate(job_id: str, minutes: float | None) -> dict[str, Any]:
     state = jobs.transition(job_id, expect=("queued", "running"), estimated_runtime_min=minutes)
     if state is None:
         return {"job_id": job_id, "error": f"job {job_id} finished as this ran"}
-    spec = _spec(job_id)
-    warning = None
-    cap = spec.max_runtime_min if spec else None
-    if minutes is not None and cap is not None and minutes > cap:
-        # The same contradiction `submit` warns about, and the only place
-        # anyone will see it before the job dies as `timeout`.
-        warning = (
-            f"estimated_runtime_min ({minutes:g}) is longer than this job's "
-            f"max_runtime_min ({cap:g}), so it expects to be killed as "
-            f"`timeout` before it finishes"
-        )
     return {
         "job_id": job_id,
         "estimated_runtime_min": minutes,
         "status": state.status,
-        "warning": warning,
+        "warning": _outlives_its_limit(minutes, state.max_runtime(_spec(job_id))),
+    }
+
+
+def _outlives_its_limit(estimate: float | None, limit: float | None) -> str | None:
+    """The contradiction `submit` warns about, and the only place anyone will
+    see it before the job dies as `timeout`."""
+    if estimate is None or limit is None or estimate <= limit:
+        return None
+    return (
+        f"estimated_runtime_min ({estimate:g}) is longer than this job's "
+        f"max_runtime_min ({limit:g}), so it expects to be killed as "
+        f"`timeout` before it finishes"
+    )
+
+
+def _running_for_s(state: JobState) -> float | None:
+    if state.started_at is None:
+        return None
+    try:
+        return (datetime.now(UTC) - datetime.fromisoformat(state.started_at)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _max_runtime_error(job_id: str, minutes: float | None) -> str | None:
+    """Why this host will not set this wall-clock limit, or None."""
+    if minutes is not None and not (0.0 < minutes < float("inf")):
+        return f"a wall-clock limit must be a positive number of minutes, got {minutes!r}"
+    try:
+        state = jobs.read_state(job_id)
+    except (RuntimeError, FileNotFoundError) as exc:
+        return f"could not read the state of {job_id}: {exc}"
+    if state.finished:
+        return f"job {job_id} has already {state.status}, so its limit cannot change anything"
+    if state.status != "running":
+        return None
+    if not state.live_max_runtime:
+        return (
+            f"job {job_id} was started by a gpuc build that reads max_runtime_min only "
+            f"at start, so it keeps the limit it has; `gpuc preempt` runs it again "
+            f"from the start under this build, which would honour a new one"
+        )
+    elapsed = _running_for_s(state)
+    if minutes is not None and elapsed is not None and minutes * 60.0 <= elapsed:
+        # Almost certainly a units slip, and it would throw the run away as
+        # `timeout` within a minute. Stopping it on purpose is `gpuc cancel`.
+        return (
+            f"job {job_id} has been running {elapsed / 60.0:.0f} min, so a limit of "
+            f"{minutes:g} min would end it at once as `timeout`; `gpuc cancel` stops it"
+        )
+    return None
+
+
+def _max_runtime(job_id: str, minutes: float | None) -> dict[str, Any]:
+    """Set (or clear) the wall-clock limit of a job that is already here.
+
+    The state's copy is the one in force (`JobState.live_max_runtime`), and a
+    running job's runner re-reads it with the estimate. Lowering is allowed
+    too: the limit is the submitter's to set, and the only lowering refused is
+    one that would kill the job on the spot.
+    """
+    if not paths.job_dir(job_id).is_dir():
+        return _no_such_job(job_id, f"no job with that id on this host: {job_id}")
+    error = _max_runtime_error(job_id, minutes)
+    if error is not None:
+        return {"job_id": job_id, "error": error}
+    state = jobs.transition(
+        job_id, expect=("queued", "running"), max_runtime_min=minutes, live_max_runtime=True
+    )
+    if state is None:
+        return {"job_id": job_id, "error": f"job {job_id} finished as this ran"}
+    return {
+        "job_id": job_id,
+        "max_runtime_min": minutes,
+        "status": state.status,
+        "warning": _outlives_its_limit(state.estimated_runtime_min, minutes),
     }
 
 
@@ -489,6 +556,11 @@ def cmd_fetch_list(args: argparse.Namespace) -> int:
 def cmd_estimate(args: argparse.Namespace) -> int:
     minutes = None if args.clear else args.minutes
     return _answer([_estimate(job_id, minutes) for job_id in dict.fromkeys(args.job_ids)])
+
+
+def cmd_max_runtime(args: argparse.Namespace) -> int:
+    minutes = None if args.clear else args.minutes
+    return _answer([_max_runtime(job_id, minutes) for job_id in dict.fromkeys(args.job_ids)])
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -615,6 +687,13 @@ def build_parser() -> argparse.ArgumentParser:
     wanted.add_argument("--minutes", type=float)
     wanted.add_argument("--clear", action="store_true", help="remove the estimate instead")
     estimate.set_defaults(func=cmd_estimate)
+
+    max_runtime = sub.add_parser("max-runtime", help="set queued or running jobs' wall-clock limit")
+    max_runtime.add_argument("job_ids", nargs="+", metavar="job_id")
+    limit = max_runtime.add_mutually_exclusive_group(required=True)
+    limit.add_argument("--minutes", type=float)
+    limit.add_argument("--clear", action="store_true", help="remove the limit instead")
+    max_runtime.set_defaults(func=cmd_max_runtime)
 
     fetch_list = sub.add_parser("fetch", help="list the files `gpuc fetch` copies; changes nothing")
     fetch_list.add_argument("job_ids", nargs="+", metavar="job_id")

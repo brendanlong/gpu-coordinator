@@ -121,6 +121,9 @@ jobs/<jobid>/
                      #  "priority": p,                         # the live priority; the queue is
                      #                                        # every `queued` state in (priority, id) order
                      #  "estimated_runtime_min": null | m,     # the live estimate, as `gpuc estimate` left it
+                     #  "max_runtime_min": null | m,           # the live wall-clock limit, as
+                     #  "live_max_runtime": bool,              # `gpuc max-runtime` left it; meant only
+                     #                                        # when live_max_runtime, else the spec's
                      #  "reason": str|null, "problems": [str, ...],  # what ended it, and what else went wrong
                      #  "exit_code": int|null, "gpus": [...],   # UUIDs, from the runner's claim
                      #  "started_at", "ended_at",
@@ -200,7 +203,8 @@ defaults.
   "sync_interval_s": 180,
   "priority": 50,                       # copied into the state at enqueue; the state's copy is
                                         # the live one (`gpuc reorder`, `gpuc preempt --priority`)
-  "max_runtime_min": null,
+  "max_runtime_min": null,              # copied into the state at enqueue, where `gpuc max-runtime`
+                                        # edits it; a state an earlier build wrote gets it at the claim
   "estimated_runtime_min": null,        # the submitter's own guess, measured from the runner's
                                         # start exactly as max_runtime_min is. Informational only;
                                         # copied into the state at enqueue, where `gpuc estimate` edits it
@@ -289,7 +293,7 @@ The rules it holds to:
   `auto_preempt` jobs that together cover the gap, least important first, and
   only at a strictly higher priority number. Nothing is stopped on a host that
   is going away.
-- **Reorder** and **estimate** write the job's state and nothing else; the
+- **Reorder**, **estimate** and **max-runtime** write the job's state and nothing else; the
   spec is never rewritten after enqueue. The control side re-mirrors the spec
   after both; a mirror it cannot write is a warning.
 - **Idle terminate** (only with `config.provider` set): no running jobs and an
@@ -372,8 +376,10 @@ submitter is [usage.md](usage.md#job-length-estimates).
 
 - `estimated_runtime_min` is published as `eta` from the first phase on. The
   monitor loop re-reads it from the job's state every `ESTIMATE_REFRESH_S`,
-  which is how `gpuc estimate` reaches a running job; it is the one thing a
-  running job re-reads.
+  which is how `gpuc estimate` reaches a running job. The wall-clock limit is
+  re-read with it, the same way; they are the only things a running job
+  re-reads. `gpuc max-runtime` refuses a running job whose state is not
+  `live_max_runtime`: its runner is from a build that does not re-read the limit.
 - `progress_command` runs in `workdir/` with the job's environment, during
   `main` only; `progress.parse` accepts a fraction with a decimal point or a
   percentage with a `%`, and nothing else. Above 0% the runner replaces `eta`

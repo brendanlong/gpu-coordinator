@@ -38,6 +38,7 @@ from gpuc.control.actions import (
     UsageError,
     cancel_jobs,
     check_estimate,
+    check_max_runtime,
     config_document,
     estimate_jobs,
     exit_code_for,
@@ -48,6 +49,7 @@ from gpuc.control.actions import (
     jobs_answer,
     locate,
     make_provider,
+    max_runtime_jobs,
     preempt_jobs,
     read_log,
     registry_answer,
@@ -774,6 +776,25 @@ def cmd_estimate(args: argparse.Namespace) -> Answer:
         return f"{who} now estimates {recorded:g} min"
 
     return _jobs_answer(estimate_jobs(args.job_ids, wanted, args.host, load_settings()), line)
+
+
+def cmd_max_runtime(args: argparse.Namespace) -> Answer:
+    """Raise, lower or clear jobs' `max_runtime_min` after submitting them.
+
+    The limit is the one spec field that is enforced and often only known to
+    be wrong once the job is running and has measured itself; the alternative
+    was a preempt, which re-runs hours of work from the start to change it.
+    """
+    wanted = check_max_runtime(args.minutes, clear=args.clear)
+
+    def line(job: Done) -> str:
+        recorded = job.fields["max_runtime_min"]
+        who = f"job {job.job_id} on host {job.host}"
+        if recorded is None:
+            return f"{who} no longer has a wall-clock limit"
+        return f"{who} is now limited to {recorded:g} min"
+
+    return _jobs_answer(max_runtime_jobs(args.job_ids, wanted, args.host, load_settings()), line)
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
@@ -1536,6 +1557,26 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(estimate)
     estimate.set_defaults(func=cmd_estimate)
 
+    max_runtime = sub.add_parser(
+        "max-runtime",
+        help="set (or clear) queued or running jobs' max_runtime_min",
+        description="Changes the wall-clock limit a job is killed as `timeout` at, measured "
+        "from the runner's start as in the spec. A running job's runner picks the new limit "
+        "up within a minute. Refused for a finished job, for a limit a running job has "
+        "already outlived, and for a job started by a gpuc build that reads the limit only "
+        "at start.",
+    )
+    max_runtime.add_argument("job_ids", nargs="+", metavar="job_id")
+    max_runtime.add_argument(
+        "--minutes", type=float, metavar="N", help="the new limit, from the runner's start"
+    )
+    max_runtime.add_argument("--clear", action="store_true", help="remove the limit instead")
+    max_runtime.add_argument(
+        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
+    )
+    add_json_flag(max_runtime)
+    max_runtime.set_defaults(func=cmd_max_runtime)
+
     requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
     requeue.add_argument("job_id")
     requeue.add_argument(
@@ -1579,7 +1620,7 @@ def build_parser() -> argparse.ArgumentParser:
         "records. The dashboard is a thin view over the same code the CLI runs: what it "
         "shows is `gpuc status --json`, `gpuc host list --json` and `gpuc config show "
         "--json`, and what it can do is `gpuc cancel`, `gpuc preempt`, `gpuc reorder`, "
-        "`gpuc estimate` and `gpuc host remove`.",
+        "`gpuc estimate`, `gpuc max-runtime` and `gpuc host remove`.",
     )
     serve.add_argument(
         "--bind",

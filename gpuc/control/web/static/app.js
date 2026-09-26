@@ -284,6 +284,32 @@ function estimateButton(host, job) {
   return button;
 }
 
+function maxRuntimeButton(host, job) {
+  const button = el("button", {
+    type: "button",
+    onclick: () => {
+      const raw = window.prompt(`Wall-clock limit for ${job.name || job.job_id}, in minutes from its start (blank removes it):`,
+        job.max_runtime_min ?? "");
+      if (raw === null) return;
+      const body = { host: host.name };
+      if (raw.trim() === "") {
+        body.clear = true;
+      } else {
+        const minutes = Number(raw);
+        if (!Number.isFinite(minutes)) {
+          notify(`${raw.trim()} is not a number of minutes`, "bad");
+          return;
+        }
+        body.minutes = minutes;
+      }
+      act(button, jobPath(job, "max-runtime"), body, (r) => (r.max_runtime_min === null
+        ? `job ${job.job_id} on ${r.host} no longer has a wall-clock limit`
+        : `job ${job.job_id} on ${r.host} is now limited to ${r.max_runtime_min} min`));
+    },
+  }, "Limit");
+  return button;
+}
+
 function table(headers, rows) {
   return el("table", {},
     el("thead", {}, el("tr", {}, headers.map((h) => el("th", { class: h.num ? "num" : null, title: h.title }, h.text)))),
@@ -373,7 +399,7 @@ function runningTable(host) {
     el("td", { class: "mono" }, gpuLabels(host, job)),
     el("td", {}, fmtEta(job), job.progress_error ? el("span", { class: "muted", title: job.progress_error }, " (progress error)") : null),
     el("td", {}, links(job)),
-    el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), preemptButton(host, job), cancelButton(host, job)),
+    el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), maxRuntimeButton(host, job), preemptButton(host, job), cancelButton(host, job)),
   ));
   return section("running", [{ text: "job" }, { text: "phase" }, { text: "elapsed", num: true }, { text: "util", num: true },
     { text: "gpu" }, { text: "eta" }, { text: "links" }, { text: "" }], rows);
@@ -391,7 +417,7 @@ function queuedTable(host) {
     el("td", {}, job.estimated_runtime_min === null ? "" : `est ${fmtDuration(job.estimated_runtime_min * 60)}`),
     el("td", {}, fmtStarts(job)),
     el("td", {}, links(job)),
-    el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), cancelButton(host, job)),
+    el("td", { class: "actions" }, logsButton(host, job), estimateButton(host, job), maxRuntimeButton(host, job), cancelButton(host, job)),
   ));
   return section("queued", [{ text: "job" }, { text: "priority", title: "lower dispatches first" }, { text: "estimate" },
     { text: "starts" }, { text: "links" }, { text: "" }], rows);

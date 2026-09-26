@@ -77,7 +77,7 @@ def list_queued() -> list[QueueEntry]:
     return sorted(entries)
 
 
-def claim(job_id: str, attempt: int, **state: object) -> bool:
+def claim(job_id: str, attempt: int, spec: JobSpec | None = None, **fields: object) -> bool:
     """Take a job out of the queue, recording what became of it: the runner's
     first act, for the job and the attempt it was started for.
 
@@ -87,8 +87,20 @@ def claim(job_id: str, attempt: int, **state: object) -> bool:
     that was slow to start, lost that claim, and arrives after the attempt it
     lost to has been preempted and queued again was assigned its cards for a
     pass that is over, and must not take them now.
+
+    A state an earlier build enqueued gets the spec's wall-clock limit made
+    live here, under the same lock as the check: decided from a copy read any
+    earlier, it would undo a `gpuc max-runtime` that landed in between.
     """
-    return jobs.transition(job_id, expect="queued", attempt=attempt, **state) is not None
+    with jobs.locked(job_id):
+        state = jobs.read_state(job_id)
+        if state.status != "queued" or state.attempt != attempt:
+            return False
+        if spec is not None and not state.live_max_runtime:
+            state.max_runtime_min = spec.max_runtime_min
+            state.live_max_runtime = True
+        jobs.write_state(job_id, jobs.apply_fields(state, fields))
+    return True
 
 
 def reorder(job_id: str, priority: int) -> bool:
@@ -248,9 +260,10 @@ def next_attempt(job_id: str, *, ran: bool) -> int | None:
     One write under the job's lock, fresh rather than patched: the job runs
     from the start, so the exit code, the end time and the GPUs of the attempt
     that was stopped would all be lies about a queued job. What a queued job is
-    still ordered and described by survives -- the live priority and estimate,
-    and whether any attempt has reached `main` (`ran`, which the stopped
-    attempt reports), since the outputs it produced are still in the workdir.
+    still ordered and described by survives -- the live priority, estimate and
+    wall-clock limit, and whether any attempt has reached `main` (`ran`, which
+    the stopped attempt reports), since the outputs it produced are still in
+    the workdir.
     The job goes straight from `running` to `queued`: nothing ever sees it
     finished in between, and no other process has to notice the intent.
 
@@ -270,6 +283,8 @@ def next_attempt(job_id: str, *, ran: bool) -> int | None:
                 attempt=attempt,
                 priority=state.priority,
                 estimated_runtime_min=state.estimated_runtime_min,
+                max_runtime_min=state.max_runtime_min,
+                live_max_runtime=state.live_max_runtime,
                 ran=state.ran or ran,
             ),
         )

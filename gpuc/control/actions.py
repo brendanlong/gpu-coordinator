@@ -14,6 +14,7 @@ what failed -- `exit_code_of` is the one place that becomes a number, and
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import sys
 from collections.abc import Callable, Collection, Iterator, Sequence
@@ -1318,6 +1319,16 @@ def check_estimate(minutes: float | None, *, clear: bool) -> float | None:
     return wanted
 
 
+def check_max_runtime(minutes: float | None, *, clear: bool) -> float | None:
+    """The wall-clock limit a request asks for, or a usage error before any
+    host is asked."""
+    if clear is (minutes is not None):
+        raise UsageError("give --minutes N or --clear, not both")
+    if minutes is not None and not 0.0 < minutes < math.inf:
+        raise UsageError(f"--minutes must be a positive number of minutes, got {minutes:g}")
+    return minutes
+
+
 def mirror_spec_field(job_id: str, field: str, value: Any, settings: Settings) -> str | None:
     """Put a change made to a job's spec on the host in its mirrored spec too,
     or say why it could not be.
@@ -1366,6 +1377,36 @@ def estimate_jobs(
             # *clear* of a job it never touched.
             job.error = (
                 f"host {job.host} did not say what estimate it recorded for {job.job_id}: "
+                f"{json.dumps(job.fields)[:200]}"
+            )
+            job.fields = {}
+    return done
+
+
+def max_runtime_jobs(
+    job_ids: Sequence[str], wanted: float | None, host: str | None, settings: Settings
+) -> list[Done]:
+    """Raise, lower or clear jobs' `max_runtime_min` after submitting them.
+
+    `wanted` has been through `check_max_runtime`; None removes the limit.
+    """
+    done, _ = job_verbs(
+        "max-runtime",
+        job_ids,
+        host,
+        settings,
+        args=" --clear" if wanted is None else f" --minutes {wanted!r}",
+        mirror=("max_runtime_min", wanted),
+    )
+    for job in done:
+        if job.error is not None:
+            continue
+        recorded = job.fields.get("max_runtime_min", "absent")
+        if not (recorded is None if wanted is None else isinstance(recorded, (int, float))):
+            # As for the estimate: a host whose answer lacks the key would
+            # otherwise report a successful clear of a job it never touched.
+            job.error = (
+                f"host {job.host} did not say what limit it recorded for {job.job_id}: "
                 f"{json.dumps(job.fields)[:200]}"
             )
             job.fields = {}
