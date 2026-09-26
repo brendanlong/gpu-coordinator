@@ -271,16 +271,44 @@ def sample_usage(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> dict[
     }
 
 
+USAGE_FIELDS = ("memory.used", "utilization.gpu")
+
+
+def snapshot(smi: SmiRunner = run_nvidia_smi) -> tuple[list[Gpu], dict[str, Usage]]:
+    """Every card and what is on each, from one nvidia-smi call.
+
+    For `status`, which wants both at the same instant: a card that breaks
+    nvidia-smi breaks the listing anyway, so a second call for the readings
+    only adds a window for the two to disagree. Per row, not per call: a row
+    that does not parse costs that card its reading and nothing else. (No
+    JSON to lean on instead -- nvidia-smi's only structured output is the
+    full `-q -x` XML dump, far slower than a `--query-gpu`.)
+    """
+    fields = [*TABLE_FIELDS, *USAGE_FIELDS]
+    text = smi([f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"])
+    table = parse_table(text)
+    if not table and text.strip():
+        raise GpuError(
+            f"nvidia-smi --query-gpu={','.join(fields)} returned no card rows: "
+            f"{text.strip()[-200:]!r}"
+        )
+    usage: dict[str, Usage] = {}
+    for line in text.splitlines():
+        cells = [cell.strip() for cell in line.split(",")]
+        if len(cells) == len(fields) and cells[1].startswith("GPU-"):
+            usage[cells[1]] = Usage(cells[1], _maybe_float(cells[4]), _maybe_float(cells[5]))
+    return table, usage
+
+
 def usage_or_nothing(
     uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
 ) -> tuple[dict[str, Usage], str | None]:
     """Every reading nvidia-smi gives for `uuids`, and why there are none.
 
     The one place "nvidia-smi would not answer" turns into "we know nothing
-    about these cards". Both the dispatcher, which decides whether to borrow
-    one, and the `status` payload, which reports whether it would, have to
-    reach the same verdict forever; this is what makes that structural rather
-    than a rule written down twice.
+    about these cards", for the dispatcher deciding whether to borrow one.
+    `status` reads the same `Usage` from `snapshot`, so the verdict on a
+    reading -- `Usage.unused` -- is still written once.
     """
     if not uuids:
         return {}, None
