@@ -322,7 +322,6 @@ function reading(v) {
 }
 
 function usage(gpu) {
-  if (gpu.utilization_pct == null && gpu.memory_mib == null) return null;
   return el("span", { class: "muted" }, ` ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`);
 }
 

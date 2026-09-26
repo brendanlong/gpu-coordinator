@@ -258,9 +258,9 @@ is queued either way. A job the dispatcher got to first prints `dispatched
 already; it is running now`. `gpuc set --priority` prints the same line.
 
 **`gpuc status`** — per host: kind, reachability, free cards, dispatcher
-heartbeat, one line per owned card (`free` / `busy` / `UNAVAILABLE`, with the
-memory and utilization nvidia-smi reads on it now, whoever is using it) and per
-[shared](#shared-gpus) one, the queue, running jobs with phase, elapsed time,
+heartbeat, one line per owned card (`free` / `busy` / `UNAVAILABLE`) and per
+[shared](#shared-gpus) one, each with the memory and utilization nvidia-smi
+reads on it now, whoever is using it (`?` for what it could not read), the queue, running jobs with phase, elapsed time,
 last util, the cards they hold (`gpu=2,3`) and any
 [end-time estimate](#job-length-estimates), and recent finished jobs with the
 mean utilization of their cards over `main` (`avg util 22% on 1 gpu`; absent
@@ -276,7 +276,7 @@ host spar [ssh]  gpus 0/2 free (driver 535.309.01)
   dispatcher 2s ago
   gpu     [2] busy NVIDIA A40 45 GB (38912 MiB, 100% util)
   gpu     [3] busy NVIDIA A40 45 GB (38400 MiB, 99% util)
-  shared  [4] free NVIDIA A40 45 GB
+  shared  [4] free NVIDIA A40 45 GB (0 MiB, 0% util)
   shared  [5] IN USE NVIDIA A40 45 GB (21504 MiB, 98% util)
   running paper-diff (20260915-222409-7a2b60) phase=main 1h16m util 100% gpu=2
   running paper-plain (20260915-224057-9f10c3) phase=main 59m util 100% gpu=3
@@ -284,9 +284,8 @@ host spar [ssh]  gpus 0/2 free (driver 535.309.01)
 ```
 
 On a `shared` line, `free` means gpuc would take the card right now, `busy` means
-one of *our* jobs has it, and `IN USE` means somebody else does. Every card
-line ends with the memory and utilization nvidia-smi just read on it, whoever
-is using it.
+one of *our* jobs has it, and `IN USE` means somebody else does, or that
+nvidia-smi could not read the card.
 
 `--host H` narrows it; `--recent N` (default 5) and `--since 24h|7d|90m` (a bare
 number means hours) choose how much of the finished list each host sends; `--all`

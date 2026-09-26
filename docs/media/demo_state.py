@@ -82,6 +82,7 @@ def views() -> list[HostView]:
         heartbeat_age_s=2.0,
         owned=[uuid(1)],
         indices={uuid(1): 0},
+        usage={uuid(1): (19870.0, 96.0)},
         running=[
             JobView(
                 job_id="20260918-142201-9f31ac",
@@ -126,7 +127,7 @@ def views() -> list[HostView]:
         heartbeat_age_s=1.0,
         owned=[uuid(2), uuid(3)],
         indices={uuid(2): 0, uuid(3): 1, uuid(4): 2},
-        usage={uuid(4): (38210.0, 99.0)},
+        usage={uuid(2): (31744.0, 90.0), uuid(3): (31610.0, 93.0), uuid(4): (38210.0, 99.0)},
         shared=[SharedGpu(uuid=uuid(4), index=2, unused=False)],
         running=[
             JobView(
@@ -208,6 +209,7 @@ def views() -> list[HostView]:
         heartbeat_age_s=3.0,
         owned=[uuid(5), uuid(6)],
         indices={uuid(5): 0, uuid(6): 1},
+        usage={uuid(5): (71230.0, 98.0), uuid(6): (70988.0, 97.0)},
         pod=Pod(
             id="k7q2m9x4v1",
             name="gpuc-a100-burst",

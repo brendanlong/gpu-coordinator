@@ -816,8 +816,9 @@ def gpu_usage(payload: dict[str, Any]) -> dict[str, tuple[float | None, float | 
 
 
 def _usage_note(view: HostView, uuid: str) -> str:
-    reading = view.usage.get(uuid)
-    return f" ({describe_usage(*reading)})" if reading else ""
+    """Printed even with no reading: a shared card nvidia-smi could not read is
+    `IN USE` for exactly that reason, and `(? MiB, ?% util)` is what says so."""
+    return f" ({describe_usage(*view.usage.get(uuid, (None, None)))})"
 
 
 def _gpu_lines(view: HostView) -> list[str]:
