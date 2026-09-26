@@ -67,10 +67,6 @@ def test_a_scoped_phase_hides_the_script_from_systemds_expansion() -> None:
     assert base64.b64decode(argv[13]).decode() == "set -eo pipefail\necho $$ && echo ${HOME}\n"
 
 
-def test_the_unit_name_carries_the_job_and_phase() -> None:
-    assert scope.unit_name("20260915-120000-abc", "main") == "gpuc-20260915-120000-abc-main.scope"
-
-
 def test_isolation_honours_what_the_dispatcher_probed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(scope.ISOLATION_ENV, scope.CGROUP)
     assert scope.isolation() == scope.CGROUP
@@ -120,16 +116,17 @@ def test_a_caller_under_the_user_manager_gets_scopes_without_linger(
     assert scope.probe(use_cache=False)
 
 
-def test_a_pgid_host_records_its_isolation_in_state() -> None:
+def test_a_pgid_host_records_its_isolation_and_a_clean_phase_logs_no_leftovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
     job_id = prepare("true")
     runner.run_job(
-        job_id,
-        [FAKE_GPUS[0]],
-        1,
-        RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02),
+        job_id, [FAKE_GPUS[0]], 1, RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02)
     )
     state = jobs.read_state(job_id)
     assert (state.isolation, state.cgroup_unit) == ("pgid", None)
+    assert "leftover" not in paths.log_file(job_id).read_text()
 
 
 @pytest.mark.usefixtures("needs_scopes")
@@ -314,12 +311,3 @@ def test_a_phase_that_exits_cleanly_takes_its_group_with_it(
         reap(pid)
     assert jobs.read_state(job_id).status == "succeeded"
     assert "leftover process(es) of the phase" in paths.log_file(job_id).read_text()
-
-
-def test_a_phase_that_leaves_nothing_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
-    job_id = prepare("true")
-    runner.run_job(
-        job_id, [FAKE_GPUS[0]], 1, RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02)
-    )
-    assert "leftover" not in paths.log_file(job_id).read_text()

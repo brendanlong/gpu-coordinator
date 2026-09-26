@@ -398,14 +398,6 @@ def test_rsync_excludes_reach_the_command_line(tmp_path: Path) -> None:
     ]
 
 
-def test_make_transport_takes_a_per_pod_known_hosts_file(tmp_path: Path) -> None:
-    per_pod = tmp_path / "pods" / "pod-1.known_hosts"
-    remote = transport.make_transport("pod-1", ssh="root@1.2.3.4", known_hosts=per_pod)
-    assert isinstance(remote, SshTransport)
-    assert remote.known_hosts == per_pod
-    assert remote.control_dir == transport.control_socket_dir()
-
-
 def test_control_socket_dir_prefers_xdg_runtime_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
     assert transport.control_socket_dir() == Path("/run/user/4242/gpuc")

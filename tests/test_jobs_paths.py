@@ -72,8 +72,10 @@ def test_spec_round_trip_applies_defaults(gpuc_home: Path) -> None:
     assert loaded == spec
 
 
-def test_update_state_rejects_unknown_fields(gpuc_home: Path) -> None:
+def test_update_state_and_transition_reject_unknown_fields(gpuc_home: Path) -> None:
     jobs.write_state("j1", JobState())
+    with pytest.raises(KeyError):
+        jobs.transition("j1", expect="queued", nonsense=1)
     jobs.update_state("j1", status="running")
     assert jobs.read_state("j1").status == "running"
     with pytest.raises(KeyError):
@@ -105,9 +107,15 @@ def test_the_layout_is_private_to_the_owner(gpuc_home: Path) -> None:
     assert stat.S_IMODE(paths.secrets_dir().stat().st_mode) == 0o700
 
 
-def test_state_round_trips_the_new_identity_and_upload_fields(gpuc_home: Path) -> None:
+def test_state_round_trips_every_field_a_write_sets(gpuc_home: Path) -> None:
+    """The intent and the live priority are what somebody changed after the job
+    was submitted, and the spec is never rewritten, so the state is the only
+    copy of either."""
     state = jobs.JobState(
         status="running",
+        intent=jobs.PREEMPT,
+        priority=7,
+        estimated_runtime_min=30.0,
         runner_pid=7,
         runner_boot_id="boot",
         runner_starttime="123",
@@ -150,20 +158,6 @@ def test_transition_takes_any_of_the_statuses_it_was_given(gpuc_home: Path) -> N
     jobs.update_state("j1", status="succeeded")
     assert jobs.transition("j1", expect=("queued", "running"), estimated_runtime_min=1.0) is None
     assert jobs.read_state("j1").estimated_runtime_min == 15.0
-
-
-def test_transition_rejects_unknown_fields(gpuc_home: Path) -> None:
-    jobs.write_state("j1", JobState())
-    with pytest.raises(KeyError):
-        jobs.transition("j1", expect="queued", nonsense=1)
-
-
-def test_state_carries_the_intent_and_the_live_priority(gpuc_home: Path) -> None:
-    """Both are what somebody changed after the job was submitted, and the spec
-    is never rewritten, so the state is the only copy of either."""
-    state = JobState(status="running", intent=jobs.PREEMPT, priority=7, estimated_runtime_min=30.0)
-    jobs.write_state("j1", state)
-    assert jobs.read_state("j1") == state
 
 
 def test_an_intent_this_build_does_not_understand_is_no_intent(gpuc_home: Path) -> None:

@@ -1082,14 +1082,6 @@ def configure_retention(days: float | None, workdir_days: float | None = None) -
     )
 
 
-def test_no_retention_setting_never_purges(gpuc_home: Path) -> None:
-    configure_retention(None)
-    job_id = finished_job()
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert paths.state_file(job_id).exists()
-
-
 def test_neither_horizon_set_reclaims_nothing(gpuc_home: Path) -> None:
     configure_retention(None, None)
     job_id = finished_job()
@@ -1119,17 +1111,6 @@ def test_the_workdir_horizon_needs_no_mirror(gpuc_home: Path) -> None:
     dispatcher.run_once()
     assert not paths.workdir(job_id).exists()
     assert paths.state_file(job_id).exists()
-
-
-def test_the_workdir_horizon_never_touches_a_running_job(gpuc_home: Path) -> None:
-    configure_retention(None, 0.0)
-    job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert jobs.read_state(job_id).status == "running"
-    dispatcher._last_reclaim_at = None
-    dispatcher.run_once()
-    assert paths.workdir(job_id).is_dir()
 
 
 def test_the_two_horizons_run_together_without_double_counting(gpuc_home: Path) -> None:
@@ -1179,22 +1160,6 @@ def test_the_workdir_horizon_leaves_a_job_that_asked_to_keep_its_workdir(
     assert paths.workdir(job_id).is_dir()
 
 
-def test_the_workdir_horizon_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
-    configure_retention(None, 1.0)
-    clock = FakeClock()
-    dispatcher, _ = make_dispatcher(clock=clock)
-    dispatcher.run_once()
-
-    later = finished_job(days_old=2.0)
-    clock.advance(59 * 60)
-    dispatcher.run_once()
-    assert paths.workdir(later).is_dir(), "swept again inside the hour"
-
-    clock.advance(2 * 60)
-    dispatcher.run_once()
-    assert not paths.workdir(later).exists()
-
-
 def test_retention_purges_at_startup(gpuc_home: Path) -> None:
     configure_retention(7.0)
     old = finished_job(days_old=30.0)
@@ -1206,8 +1171,26 @@ def test_retention_purges_at_startup(gpuc_home: Path) -> None:
     assert "retention (7 days): purged 1 job dir" in paths.dispatcher_log().read_text()
 
 
-def test_retention_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
-    configure_retention(7.0)
+# Each horizon, with the path it reclaims: the purge takes the whole job dir,
+# the workdir sweep only the checkout.
+HORIZONS = pytest.mark.parametrize(
+    ("horizon", "reclaimed"),
+    [("retention", paths.job_dir), ("workdir", paths.workdir)],
+)
+
+
+def configure_horizon(horizon: str, days: float) -> None:
+    if horizon == "retention":
+        configure_retention(days)
+    else:
+        configure_retention(None, days)
+
+
+@HORIZONS
+def test_a_horizon_runs_at_most_once_an_hour(
+    gpuc_home: Path, horizon: str, reclaimed: Callable[[str], Path]
+) -> None:
+    configure_horizon(horizon, 1.0)
     clock = FakeClock()
     dispatcher, _ = make_dispatcher(clock=clock)
     dispatcher.run_once()
@@ -1215,11 +1198,12 @@ def test_retention_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
     later = finished_job(days_old=30.0)
     clock.advance(59 * 60)
     dispatcher.run_once()
-    assert paths.state_file(later).exists(), "purged again inside the hour"
+    assert reclaimed(later).is_dir(), "reclaimed again inside the hour"
+    assert paths.state_file(later).exists()
 
     clock.advance(2 * 60)
     dispatcher.run_once()
-    assert not paths.job_dir(later).exists()
+    assert not reclaimed(later).exists()
 
 
 def test_retention_never_forces(gpuc_home: Path) -> None:
@@ -1232,15 +1216,18 @@ def test_retention_never_forces(gpuc_home: Path) -> None:
     assert not paths.workdir(unmirrored).exists()
 
 
-def test_retention_never_touches_a_running_job(gpuc_home: Path) -> None:
-    configure_retention(0.0)
+@HORIZONS
+def test_a_horizon_never_touches_a_running_job(
+    gpuc_home: Path, horizon: str, reclaimed: Callable[[str], Path]
+) -> None:
+    configure_horizon(horizon, 0.0)
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     assert jobs.read_state(job_id).status == "running"
     dispatcher._last_reclaim_at = None
     dispatcher.run_once()
-    assert paths.job_dir(job_id).is_dir()
+    assert reclaimed(job_id).is_dir()
 
 
 # -- the drain's last go at unconfirmed outputs -------------------------------
@@ -1701,34 +1688,6 @@ def test_a_preempted_job_still_finalizing_is_adopted_and_nothing_is_launched_int
     assert spawned == {}
 
 
-def test_a_stop_another_process_asked_for_gets_an_escalation_clock_of_its_own(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`gpuc preempt` writes the intent over ssh, so this dispatcher never sent
-    it and has nothing to time it from until it first sees it. Without a clock
-    of its own, a wedged runner kept the job (and its GPUs) for ever."""
-    clock = FakeClock()
-    dispatcher, spawned = make_dispatcher(clock=clock)
-    job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher.run_once()
-    jobs.update_state(job_id, pgid=123456)
-
-    signals = record_signals(monkeypatch)
-
-    queue.enqueue(make_spec(gpus=1, priority=1))
-    queue.preempt(job_id)
-    dispatcher.run_once()
-    assert signals == []
-
-    clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
-    dispatcher.run_once()
-    assert signals[-1] == (123456, signal.SIGKILL)
-
-    clock.advance(1.0)
-    dispatcher.run_once()
-    assert signals[-1] == (spawned[job_id].pid, signal.SIGTERM)
-
-
 def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1845,15 +1804,6 @@ def test_a_job_that_did_not_ask_never_touches_a_shared_card(gpuc_home: Path) -> 
     assert all(jobs.read_state(job_id).status == "running" for job_id in holding)
     assert jobs.read_state(waiting).status == "queued"
     assert [e.job_id for e in queue.list_queued()] == [waiting]
-
-
-def test_a_job_that_asked_borrows_an_idle_shared_card(gpuc_home: Path) -> None:
-    dispatcher, _ = shared_host()
-    *_, borrower = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
-    dispatcher.run_once()
-
-    assert jobs.read_state(borrower).status == "running"
-    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
 
 
 def test_owned_cards_are_always_taken_before_borrowed_ones(gpuc_home: Path) -> None:

@@ -169,7 +169,6 @@ def test_nested_kept_outputs_are_counted_once(gpuc_home: Path) -> None:
         {"a.py": "x" * 10000},
         {"results/ckpt/w.pt": "w" * 50000, "results/log": "l"},
     )
-    assert (cleanup.workdir_size(job_id) or 0) >= 0
     cleanup.clean(all_finished=True)
     held = jobs.read_state(job_id).kept_bytes
     assert held is not None and held >= 50000

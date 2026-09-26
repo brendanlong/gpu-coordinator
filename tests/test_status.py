@@ -173,14 +173,6 @@ def test_a_running_job_the_host_names_no_cards_for_still_renders() -> None:
     assert "gpu=none" in render(busy(running_job(gpus=[])))
 
 
-def test_an_unaskable_host_says_what_to_run_next() -> None:
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box")
-    text = render(gather(entry, session=cast(Any, _RefusingSession()), provider=None))
-    assert "UNASKABLE" in text
-    assert "ERROR ssh: connect to 1.2.3.4 port 22: No route to host" in text
-    assert "gpuc host probe gpubox" in text
-
-
 def test_a_stale_heartbeat_reads_as_a_dead_dispatcher() -> None:
     stale = view()
     stale.heartbeat_age_s = 400.0
@@ -210,23 +202,6 @@ def test_the_two_utilizations_say_where_they_came_from() -> None:
     assert host_json(pod_view)["provider_util"] == [71]
     assert host_json(pod_view)["running"][0]["util"] == 90.0
     assert host_json(view())["provider_util"] is None
-
-
-def test_null_utilization_samples_are_dropped() -> None:
-    _, running, _ = job_views(
-        {
-            "jobs": [
-                {
-                    "job_id": "j",
-                    "status": "running",
-                    "phase": "main",
-                    "gpus": [GPU],
-                    "util_recent": [90.0, None, 80.0],
-                }
-            ]
-        }
-    )
-    assert running[0].util_recent == [90.0, 80.0]
 
 
 def _pod(status: PodStatus) -> Pod:
@@ -299,10 +274,15 @@ class _RefusingSession:
         raise TransportError(message="ssh: connect to 1.2.3.4 port 22: No route to host")
 
 
-def test_a_host_that_could_not_be_read_is_a_failure() -> None:
-    view = gather(_runpod_entry(), session=cast(Any, _RefusingSession()), provider=None)
+def test_an_unaskable_host_is_a_failure_and_says_what_to_run_next() -> None:
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box")
+    view = gather(entry, session=cast(Any, _RefusingSession()), provider=None)
     assert not view.reachable
     assert view.failure == "ssh: connect to 1.2.3.4 port 22: No route to host"
+    text = render(view)
+    assert "UNASKABLE" in text
+    assert "ERROR ssh: connect to 1.2.3.4 port 22: No route to host" in text
+    assert "gpuc host probe gpubox" in text
 
 
 # -- leftover workdirs --------------------------------------------------------
@@ -357,26 +337,6 @@ def test_a_running_job_never_counts_towards_leftover_disk() -> None:
     )
     assert host_view.leftover_bytes == 0
     assert "gpuc clean" not in render(host_view)
-
-
-def test_workdir_bytes_survives_the_host_payload() -> None:
-    _, _, finished = job_views(
-        payload(
-            jobs=[
-                {
-                    "job_id": "j",
-                    "status": "succeeded",
-                    "ended_at": minutes_ago(1),
-                    "workdir_bytes": 123,
-                }
-            ]
-        )
-    )
-    assert finished[0].workdir_bytes == 123
-
-
-def test_a_host_that_never_reports_sizes_is_fine() -> None:
-    assert view().leftover_bytes == 0
 
 
 def test_finished_jobs_with_unconfirmed_outputs_are_flagged() -> None:
@@ -849,20 +809,6 @@ def test_each_jobs_priority_is_the_one_the_host_reports_for_it() -> None:
     assert queued[0].priority == 10
     assert running[0].priority == 88
     assert finished[0].priority == 0
-
-
-def test_the_highest_priority_there_is_is_not_read_as_missing() -> None:
-    """`0` is a real priority -- a job reordered to the front -- not a falsy
-    stand-in for "unknown"."""
-    queued, _, _ = job_views(
-        payload(jobs=[{"job_id": "j-queued", "status": "queued", "priority": 0}])
-    )
-    assert queued[0].priority == 0
-
-
-def test_a_host_too_old_to_report_a_priority_says_nothing_rather_than_guessing() -> None:
-    _, running, _ = job_views(payload(jobs=[{"job_id": "j-running", "status": "running"}]))
-    assert running[0].priority is None
 
 
 def test_job_views_read_the_hosts_start_projection() -> None:

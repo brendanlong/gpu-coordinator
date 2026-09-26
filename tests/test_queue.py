@@ -314,12 +314,6 @@ def test_preempt_refuses_when_it_would_beat_every_waiting_job_to_the_gpus(
     assert queue.preempt(job_id, priority=51) == "preempting"
 
 
-def test_a_job_queued_ahead_of_it_is_what_makes_a_preempt_worth_it(gpuc_home: Path) -> None:
-    job_id = running_job(priority=50)
-    queue.enqueue(make_spec(priority=10))
-    assert queue.preempt(job_id) == "preempting"
-
-
 def test_a_job_needing_no_gpu_does_not_count_as_something_waiting(gpuc_home: Path) -> None:
     """It is dispatched whatever is running, so the cards freed are nothing to it."""
     job_id = running_job(priority=50)

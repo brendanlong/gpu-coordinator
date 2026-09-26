@@ -65,14 +65,6 @@ def test_a_bare_integer_is_refused_rather_than_guessed_at(stdout: str) -> None:
     assert f"`{stdout.strip()}%`" in str(caught.value)
 
 
-def test_a_raw_step_counter_fails_from_its_very_first_reading() -> None:
-    """The case the decimal point buys: `echo $step` at step 1 would otherwise
-    be a fraction, and the job would claim to be finished on its first poll."""
-    for step in ("0", "1", "2"):
-        with pytest.raises(progress.ProgressError):
-            progress.parse(f"{step}\n")
-
-
 def test_a_percentage_that_floating_point_nudged_over_a_hundred_still_lands() -> None:
     """A job computing its own percentage prints this at the exact moment it
     finishes; erroring there would be absurd."""

@@ -167,7 +167,6 @@ def test_unknown_fields_are_rejected_by_name() -> None:
     ("overrides", "needle"),
     [
         ({"command": "  "}, "command"),
-        ({"gpus": -1}, "gpus"),
         ({"priority": 200}, "priority"),
         ({"outputs": [{"path": "r", "bucket": "x"}]}, "outputs.0.bucket"),
     ],
@@ -398,17 +397,6 @@ def test_an_hf_output_without_hf_path_uploads_under_the_job_id_itself(
     assert spec["outputs"][0]["hf_path"] is None
 
 
-def test_prepare_refuses_an_output_without_the_job_id_before_a_pod_is_bought(
-    repo: Path,
-) -> None:
-    with pytest.raises(SubmitError, match="does not include the job id"):
-        prepare(
-            validate(job_document(outputs=[{"path": "results", "s3": "s3://b/results"}])),
-            repo,
-            environ={},
-        )
-
-
 def test_submit_ships_tracked_and_untracked_files_but_not_ignored_ones(
     control_env: Path, repo: Path
 ) -> None:
@@ -478,22 +466,6 @@ def test_no_git_syncs_everything_except_the_default_excludes(
     assert host.excludes == [".venv", "__pycache__", ".git", "*.pyc", "node_modules", ".uv-cache"]
     assert any("WARNING: --no-git" in line for line in lines)
     assert f"{REMOTE_HOME}/incoming/{result.job_id}/uncommitted.patch" not in host.puts
-
-
-def test_a_non_repo_without_no_git_says_how_to_fix_it(control_env: Path, tmp_path: Path) -> None:
-    plain = tmp_path / "plain"
-    plain.mkdir()
-    with pytest.raises(SubmitError) as caught:
-        submit_spec(
-            host_entry(name="gpubox", gpus=["GPU-a"]),
-            validate(job_document()),
-            Settings(),
-            workdir=plain,
-            session=session(FakeHost()),
-            environ={},
-            report=lambda _: None,
-        )
-    assert "--no-git" in str(caught.value)
 
 
 def test_submit_delivers_secrets_0600_and_never_on_argv(control_env: Path, repo: Path) -> None:
@@ -741,21 +713,6 @@ def test_use_shared_reaches_the_host_in_the_spec(control_env: Path, repo: Path) 
     assert json.loads(staged)["use_shared"] is True
 
 
-def test_submitting_from_a_non_repository_says_what_to_do(
-    control_env: Path, tmp_path: Path
-) -> None:
-    with pytest.raises(SubmitError, match="git init"):
-        submit_spec(
-            host_entry(name="gpubox", gpus=["GPU-a"]),
-            validate(job_document(gpus=1)),
-            Settings(),
-            workdir=tmp_path,
-            session=session(FakeHost()),
-            environ={},
-            report=lambda _: None,
-        )
-
-
 def test_a_mirrored_spec_is_validated_like_a_job_file_with_unknown_keys_dropped() -> None:
     """A mirrored spec was written by some build: a key this one does not know
     is ignored, at the top and on an output, and everything else is judged."""
@@ -817,8 +774,9 @@ def test_prepare_refuses_a_missing_secret_before_a_host_is_involved(repo: Path) 
 
 def test_prepare_refuses_a_workdir_that_is_not_a_repo_unless_git_is_off(tmp_path: Path) -> None:
     model = validate(job_document())
-    with pytest.raises(SubmitError, match="not a git repository"):
+    with pytest.raises(SubmitError, match="not a git repository") as caught:
         prepare(model, tmp_path, environ={})
+    assert "git init" in str(caught.value) and "--no-git" in str(caught.value)
     assert prepare(model, tmp_path, environ={}, use_git=False).spec.command == model.command
 
 

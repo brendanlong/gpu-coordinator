@@ -273,11 +273,6 @@ def test_a_job_whose_workdir_is_already_gone_has_no_outputs_left_to_lose(
     assert [c.job_id for c in cleanup.purge(older_than_days=7.0).purged] == [job_id]
 
 
-def test_a_spec_that_declares_no_outputs_needs_no_confirmation(gpuc_home: Path) -> None:
-    job_id = make_job(outputs=False)
-    assert [c.job_id for c in cleanup.purge(older_than_days=7.0).purged] == [job_id]
-
-
 def test_an_unreadable_spec_fails_closed_on_outputs(gpuc_home: Path) -> None:
     job_id = make_job(outputs=True)
     paths.spec_file(job_id).unlink()
@@ -297,11 +292,10 @@ def test_a_dry_run_deletes_nothing(gpuc_home: Path) -> None:
 
 
 def test_a_dry_run_does_not_count_a_purged_workdir_twice(gpuc_home: Path) -> None:
-    job_id = make_job()
+    make_job()
     result = cleanup.purge(older_than_days=7.0, dry_run=True)
     assert [c.job_id for c in result.removed] == []
     assert result.freed_bytes == result.purged[0].bytes
-    assert job_id
 
 
 def test_purge_implies_the_workdir_clean_for_jobs_it_keeps(gpuc_home: Path) -> None:

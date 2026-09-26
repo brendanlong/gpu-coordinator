@@ -23,6 +23,7 @@ import pytest
 from gpuc.control.cli import main
 from gpuc.control.s3index import LocalIndex
 from gpuc.host import scope
+from gpuc.host.dispatcher import LockBody
 from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch, load_registry
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
@@ -160,12 +161,10 @@ def _stop_dispatcher(home: Path) -> None:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(group, 9)
     lock = home / "dispatcher.lock"
-    if not lock.exists():
-        return
-    body = lock.read_text().strip()
-    if body.isdigit():
+    pgid = LockBody.parse(lock.read_text()).pgid if lock.exists() else None
+    if pgid is not None:
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(int(body), 15)
+            os.killpg(pgid, 15)
 
 
 def submit(workdir: Path, document: str, name: str = "job.yaml") -> str:
@@ -724,7 +723,6 @@ def test_logs_and_status_after_a_purge(
     captured = capsys.readouterr()
     assert "purged from host local" in captured.err
     assert "no S3 mirror to fall back on" in captured.err
-    assert "purged from host local" in captured.err
 
     assert main(["status", "--all"]) == 0
     out = capsys.readouterr().out
@@ -732,32 +730,21 @@ def test_logs_and_status_after_a_purge(
     assert job_id in out
 
 
-def test_retention_days_reaches_the_host_config(
-    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(("key", "default"), [("retention_days", None), ("workdir_days", 1.0)])
+def test_a_days_setting_reaches_the_host_config(
+    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str], key: str, default: float | None
 ) -> None:
     home = bootstrapped_home
-    # Through the host's own CLI, on the host, with no bootstrap in between:
-    # `config.json` is the only copy of this setting.
-    assert main(["host", "set", "local", "--retention-days", "14"]) == 0
-    assert json.loads((home / "config.json").read_text())["retention_days"] == 14.0
-    assert load_registry().require("local").config.retention_days == 14.0
-    assert main(["host", "set", "local", "--retention-days", ""]) == 0
-    assert json.loads((home / "config.json").read_text())["retention_days"] is None
-    assert load_registry().require("local").config.retention_days is None
-
-
-def test_workdir_days_reaches_the_host_config(
-    bootstrapped_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    home = bootstrapped_home
-    assert json.loads((home / "config.json").read_text())["workdir_days"] == 1.0
+    flag = "--" + key.replace("_", "-")
+    assert json.loads((home / "config.json").read_text())[key] == default
     # No bootstrap between these: `host set` is a write-through to the host's
     # own config, and there is no local copy for it to have changed instead.
-    assert main(["host", "set", "local", "--workdir-days", "3"]) == 0
-    assert json.loads((home / "config.json").read_text())["workdir_days"] == 3.0
-    assert main(["host", "set", "local", "--workdir-days", ""]) == 0
-    assert json.loads((home / "config.json").read_text())["workdir_days"] is None
-    assert load_registry().require("local").config.workdir_days is None
+    assert main(["host", "set", "local", flag, "14"]) == 0
+    assert json.loads((home / "config.json").read_text())[key] == 14.0
+    assert getattr(load_registry().require("local").config, key) == 14.0
+    assert main(["host", "set", "local", flag, ""]) == 0
+    assert json.loads((home / "config.json").read_text())[key] is None
+    assert getattr(load_registry().require("local").config, key) is None
 
 
 def test_logs_on_a_named_host_for_an_id_it_never_had_is_not_a_purge(

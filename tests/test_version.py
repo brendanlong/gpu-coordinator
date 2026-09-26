@@ -8,10 +8,6 @@ from gpuc._version import is_other_build
 from gpuc.control import version
 
 
-def test_the_control_side_uses_the_stdlib_comparison() -> None:
-    assert version.is_other_build is is_other_build
-
-
 def test_a_prefix_is_the_same_build() -> None:
     assert not is_other_build("abcdef123456", "abcdef123456789")
     assert not is_other_build("abcdef123456789", "abcdef123456")

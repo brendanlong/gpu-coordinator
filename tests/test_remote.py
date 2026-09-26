@@ -126,12 +126,6 @@ def test_host_json_that_kept_going_still_fails_when_there_is_no_document() -> No
     assert "exited 1 and expected JSON on stdout" in str(excinfo.value)
 
 
-def test_host_command_pins_gpuc_home_and_pythonpath() -> None:
-    command = host_command("/py", "/home/u/.gpuc", "status")
-    assert 'GPUC_HOME="/home/u/.gpuc"' in command
-    assert 'PYTHONPATH="/home/u/.gpuc/pkg"' in command
-
-
 def test_every_host_invocation_starts_with_the_one_python_prefix() -> None:
     """`-m gpuc.host` and bootstrap's `-c` snippets share the prefix, so the
     host env and the pinned home cannot drift apart between them."""

@@ -24,6 +24,7 @@ dev = [
     "boto3-stubs[s3]",
     "snakemake>=9.27.0",
     "snakemake-interface-executor-plugins>=9.4.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [build-system]

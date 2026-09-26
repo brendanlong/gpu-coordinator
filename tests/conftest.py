@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import shlex
 import shutil
@@ -41,6 +42,16 @@ LOCAL_GPU_UUID = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 SEEN_AT = "2026-09-15T12:00:00+00:00"
 """When a test entry's cache was filled. A fixed stamp, so a listing that says
 how old the cache is has something stable to say."""
+
+
+@pytest.fixture
+def empty_caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the uv and Hugging Face caches the health check sizes at empty
+    directories: sizing the developer's own took seconds per test, and made
+    the result depend on the machine."""
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
 
 
 @pytest.fixture
@@ -288,6 +299,13 @@ def torch_project(session_monkeypatch: pytest.MonkeyPatch) -> Path:
     override = os.environ.get("GPUC_TEST_TORCH_PROJECT")
     root = Path(override) if override else default_torch_project()
     root.mkdir(parents=True, exist_ok=True)
+    # Every xdist worker builds its own session fixtures, all on this one path.
+    with (root.parent / f"{root.name}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _sync_torch_project(root)
+
+
+def _sync_torch_project(root: Path) -> Path:
     (root / "pyproject.toml").write_text(
         textwrap.dedent(
             """

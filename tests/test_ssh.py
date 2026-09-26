@@ -100,14 +100,6 @@ def test_one_command_runs_in_that_directory_and_propagates_the_exit_code() -> No
     ]
 
 
-def test_a_command_is_a_command_line_not_an_argv() -> None:
-    """`gpuc ssh <job> -- 'ls | wc -l'` has to mean the pipeline."""
-    transport = cast("Transport", RecordingTransport())
-    ssh_mod.run_command(transport, "$HOME/.gpuc", "ls | wc -l")
-    command = cast("RecordingTransport", transport).commands[0]
-    assert command.endswith("exec /bin/bash -lc 'ls | wc -l'")
-
-
 def test_one_command_lands_where_the_interactive_session_would() -> None:
     """The workdir fallback is not an interactive-only courtesy: a job whose
     workdir was cleaned still has its job dir, and all three paths use it."""

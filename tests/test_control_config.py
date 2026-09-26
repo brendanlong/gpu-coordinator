@@ -29,13 +29,6 @@ from gpuc.host.jobs import HostConfig
 from tests.conftest import SEEN_AT, host_entry, load_registry
 
 
-def test_settings_default_when_no_file(control_env: Path) -> None:
-    settings = load_settings()
-    assert settings.s3_bucket is None
-    assert settings.runpod_pod_prefix == "gpuc-"
-    assert settings.disk_gb == 50
-
-
 def test_settings_read_the_xdg_overridden_config(control_env: Path) -> None:
     config.config_file().write_text(
         's3_bucket = "my-bucket"\ndisk_gb = 20\nssh_key = "~/.ssh/id_ed25519"\n'

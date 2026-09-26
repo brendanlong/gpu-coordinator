@@ -28,8 +28,12 @@ def verb(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, dict[str,
 
 
 def test_enqueue_from_a_file(
-    gpuc_home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    gpuc_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: 4242)
     spec_path = tmp_path / "job.json"
     spec_path.write_text(json.dumps({"name": "demo", "command": "true", "gpus": 1}))
     code, payload = run(capsys, "enqueue", str(spec_path))
@@ -59,6 +63,7 @@ def test_enqueue_starts_a_dispatcher(
 def test_enqueue_from_stdin(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(dispatcher, "spawn_detached_dispatcher", lambda: 4242)
     monkeypatch.setattr(
         "sys.stdin", __import__("io").StringIO(json.dumps({"command": "true", "gpus": 1}))
     )
@@ -76,14 +81,6 @@ def test_status(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert status["ephemeral"] is False
     assert status["jobs"][0]["job_id"] == job_id
     assert status["queue"] == [{"priority": 12, "job_id": job_id}]
-
-
-def test_status_of_one_job(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    job_id = queue.enqueue(make_spec())
-    queue.enqueue(make_spec())
-    _, status = run(capsys, "status", job_id)
-    assert isinstance(status, dict)
-    assert [j["job_id"] for j in status["jobs"]] == [job_id]
 
 
 def test_status_of_several_jobs_is_exactly_those_that_are_here(
@@ -170,16 +167,6 @@ def test_a_verb_acts_on_every_job_it_is_given_and_refuses_each_it_cannot(
     assert "already cancelled" in payload["jobs"][1]["error"]
 
 
-def test_setting_the_priority_of_a_running_job_is_a_refusal_not_a_traceback(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    job_id = queue.enqueue(make_spec())
-    jobs.update_state(job_id, status="running")
-    code, payload = verb(capsys, "set", job_id, "--field", "priority=1")
-    assert code == 1
-    assert "only on a queued job" in str(payload["error"])
-
-
 def test_set_on_an_unknown_job_is_a_refusal_not_a_traceback(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -220,17 +207,18 @@ def test_set_does_not_touch_the_spec(gpuc_home: Path, capsys: pytest.CaptureFixt
     assert jobs.read_state(job_id).estimated_runtime_min == 42.0
 
 
-def test_set_estimate_refuses_a_finished_job_and_an_unknown_one(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("field", "status"), [("estimated_runtime_min", "succeeded"), ("max_runtime_min", "failed")]
+)
+def test_set_refuses_a_finished_job(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], field: str, status: str
 ) -> None:
     job_id = queue.enqueue(make_spec())
-    jobs.update_state(job_id, status="succeeded")
-    code, payload = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=10")
-    assert code == 1 and "already succeeded" in payload["error"]
-    assert jobs.read_state(job_id).estimated_runtime_min is None
-
-    code, payload = verb(capsys, "set", "no-such-job", "--field", "estimated_runtime_min=10")
-    assert code == 1 and payload["missing"] is True
+    jobs.update_state(job_id, status=status)
+    before = getattr(jobs.read_state(job_id), field)
+    code, payload = verb(capsys, "set", job_id, "--field", f"{field}=10")
+    assert code == 1 and f"already {status}" in payload["error"]
+    assert getattr(jobs.read_state(job_id), field) == before
 
 
 @pytest.mark.parametrize("minutes", ["0", "-5", "NaN", "Infinity", "1e10"])
@@ -368,17 +356,6 @@ def test_set_max_runtime_refuses_a_number_that_is_not_a_limit(
     assert jobs.read_state(job_id).max_runtime_min == 60.0
 
 
-def test_set_max_runtime_refuses_a_finished_job_and_an_unknown_one(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    job_id = queue.enqueue(make_spec())
-    jobs.update_state(job_id, status="failed")
-    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=10")
-    assert code == 1 and "already failed" in payload["error"]
-    code, payload = verb(capsys, "set", "no-such-job", "--field", "max_runtime_min=10")
-    assert code == 1 and payload["missing"] is True
-
-
 def test_dispatch_is_routed_to_the_dispatcher(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -388,6 +365,7 @@ def test_dispatch_is_routed_to_the_dispatcher(
     assert ran
 
 
+@pytest.mark.usefixtures("empty_caches")
 def test_health_is_routed_to_health(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

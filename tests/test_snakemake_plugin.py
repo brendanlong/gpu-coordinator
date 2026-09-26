@@ -276,13 +276,19 @@ def test_a_poll_fails_only_what_asking_again_would_not_change() -> None:
     assert outcomes == {"ok": "ok", "bad": "failed", "lost": "failed"}
 
 
-def killed_mid_job(bootstrapped_home: Path, project: Path, results: Path, seconds: int) -> str:
-    """Run a one-job workflow, SIGKILL its controller once the gpuc job is in
-    `main`, and return that job's id."""
+def wait_for(release: Path) -> str:
+    """Shell that holds a job in `main` until the test creates `release`, so
+    the test decides when it ends rather than racing a sleep."""
+    return f"until [ -e {release} ]; do sleep 0.1; done; "
+
+
+def killed_mid_job(bootstrapped_home: Path, project: Path, results: Path, release: Path) -> str:
+    """Run a one-job workflow whose job waits for `release`, SIGKILL its
+    controller once the gpuc job is in `main`, and return that job's id."""
     with (project / "Snakefile").open("a") as f:
         f.write(
             '\nrule slow:\n    output: R + "/slow.txt"\n    resources: gpu=1\n'
-            f'    shell: "sleep {seconds}; echo $GPUC_JOB_ID > {{output}}"\n'
+            f'    shell: "{wait_for(release)}echo $GPUC_JOB_ID > {{output}}"\n'
         )
     subprocess.run(["git", "commit", "-qam", "slow"], cwd=project, check=True)
     controller = subprocess.Popen(
@@ -305,8 +311,8 @@ def killed_mid_job(bootstrapped_home: Path, project: Path, results: Path, second
     return job_id
 
 
-def restart(project: Path, results: Path) -> subprocess.CompletedProcess[str]:
-    unlock = subprocess.run(
+def unlock(project: Path, results: Path) -> None:
+    unlocked = subprocess.run(
         [*snakemake_argv(results, str(results / "slow.txt")), "--unlock"],
         cwd=project,
         env=snakemake_env(),
@@ -314,7 +320,11 @@ def restart(project: Path, results: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=120,
     )
-    assert unlock.returncode == 0, unlock.stderr[-4000:]
+    assert unlocked.returncode == 0, unlocked.stderr[-4000:]
+
+
+def restart(project: Path, results: Path) -> subprocess.CompletedProcess[str]:
+    unlock(project, results)
     return snakemake(project, results, str(results / "slow.txt"), "--rerun-incomplete")
 
 
@@ -323,13 +333,37 @@ def test_a_restarted_controller_adopts_a_running_job(
 ) -> None:
     results = tmp_path / "results"
     results.mkdir()
-    job_id = killed_mid_job(bootstrapped_home, project, results, 20)
+    release = tmp_path / "release"
+    job_id = killed_mid_job(bootstrapped_home, project, results, release)
     assert state_of(bootstrapped_home, job_id).get("status") == "running"
 
-    again = restart(project, results)
-    assert again.returncode == 0, again.stderr[-4000:]
-    assert submitted_ids(again.stderr) == [], again.stderr[-4000:]
-    assert f"Adopted gpuc job {job_id}" in again.stderr, again.stderr[-4000:]
+    unlock(project, results)
+    controller = subprocess.Popen(
+        [*snakemake_argv(results, str(results / "slow.txt")), "--rerun-incomplete"],
+        cwd=project,
+        env=snakemake_env(),
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert controller.stderr is not None
+    # Without the adoption line nothing would release the job, and the
+    # controller would wait on it forever: fail instead of hanging.
+    watchdog = threading.Timer(120, release.touch)
+    watchdog.start()
+    seen: list[str] = []
+    for line in controller.stderr:
+        seen.append(line)
+        if f"Adopted gpuc job {job_id}" in line:
+            break
+    assert not release.exists(), "".join(seen)[-4000:]
+    watchdog.cancel()
+    assert state_of(bootstrapped_home, job_id).get("status") == "running", "".join(seen)
+    release.touch()
+    _, rest = controller.communicate(timeout=300)
+    stderr = "".join(seen) + rest
+    assert controller.returncode == 0, stderr[-4000:]
+    assert submitted_ids(stderr) == [], stderr[-4000:]
+    assert f"Adopted gpuc job {job_id}" in stderr, stderr[-4000:]
     assert (results / "slow.txt").read_text().strip() == job_id
 
 
@@ -338,7 +372,9 @@ def test_a_restarted_controller_keeps_what_a_job_finished_while_it_was_down(
 ) -> None:
     results = tmp_path / "results"
     results.mkdir()
-    job_id = killed_mid_job(bootstrapped_home, project, results, 2)
+    release = tmp_path / "release"
+    job_id = killed_mid_job(bootstrapped_home, project, results, release)
+    release.touch()
     wait_until(
         lambda: state_of(bootstrapped_home, job_id).get("status") == "succeeded",
         60,
@@ -361,9 +397,10 @@ def test_a_restarted_controller_replaces_a_job_whose_rule_changed(
 ) -> None:
     results = tmp_path / "results"
     results.mkdir()
-    stale = killed_mid_job(bootstrapped_home, project, results, 60)
+    release = tmp_path / "release"
+    stale = killed_mid_job(bootstrapped_home, project, results, release)
     snakefile = project / "Snakefile"
-    snakefile.write_text(snakefile.read_text().replace("sleep 60", "sleep 1"))
+    snakefile.write_text(snakefile.read_text().replace(wait_for(release), ""))
     subprocess.run(["git", "commit", "-qam", "faster"], cwd=project, check=True)
 
     again = restart(project, results)

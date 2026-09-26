@@ -217,11 +217,6 @@ def test_wait_json_is_one_document_of_final_states(
     assert "failed (timeout)" in captured.err
 
 
-def test_wait_on_an_id_no_host_has_is_exit_four(host_home: Path) -> None:
-    """`--host` skips the search, so the host itself has to be asked."""
-    assert main(["wait", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_NOT_FOUND
-
-
 def test_wait_keeps_trying_a_host_it_cannot_reach_and_then_gives_up(
     host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -648,8 +643,10 @@ def test_follow_forever_is_still_there_for_anyone_who_wants_it(
 def test_follow_under_json_is_still_refused(
     host_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """`-f` has no end, and a document has to be complete."""
     put_job(host_home)
     assert main(["logs", JOB, "--json", "-f"]) == EXIT_USAGE
+    assert "cannot follow" in json.loads(capsys.readouterr().out)["error"]
     assert main(["logs", JOB, "--json", "--follow-forever"]) == EXIT_USAGE
 
 

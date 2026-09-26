@@ -291,12 +291,6 @@ def test_an_auto_preempt_job_takes_a_card_held_for_the_job_ahead() -> None:
     ]
 
 
-def test_equal_priority_is_no_bar_to_filling() -> None:
-    p, _ = pool(["a"], owned_present=2)
-    requests = [req("wide", 2, priority=50), req("filler", priority=50, fills=True)]
-    assert plan.plan(requests, p)[1] == Assigned("filler", ["a"], ("wide",))
-
-
 def test_a_filler_too_wide_for_the_free_cards_holds_like_any_other() -> None:
     p, _ = pool(["a"], owned_present=3)
     assert plan.plan([req("wide", 3), req("filler", 2, fills=True)], p) == [

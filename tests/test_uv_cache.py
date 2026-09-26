@@ -9,6 +9,7 @@ variable and letting the cache drift onto another volume.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -43,22 +44,17 @@ def test_nothing_in_the_job_path_ever_sets_uv_link_mode() -> None:
         assert "UV_LINK_MODE" not in path.read_text(), path
 
 
-def test_the_runner_does_not_invent_a_uv_cache_dir(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "child_env",
+    [lambda: runner.build_env(make_spec(), []), lambda: dispatcher._child_env(Path("/pkg"))],
+    ids=["runner", "dispatcher"],
+)
+def test_no_child_env_invents_a_uv_cache_dir(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, child_env: Callable[[], Mapping[str, str]]
 ) -> None:
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     monkeypatch.delenv("UV_LINK_MODE", raising=False)
-    env = runner.build_env(make_spec(), [])
-    assert "UV_CACHE_DIR" not in env
-    assert "UV_LINK_MODE" not in env
-
-
-def test_the_dispatcher_does_not_invent_a_uv_cache_dir(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
-    monkeypatch.delenv("UV_LINK_MODE", raising=False)
-    env = dispatcher._child_env(Path("/pkg"))
+    env = child_env()
     assert "UV_CACHE_DIR" not in env
     assert "UV_LINK_MODE" not in env
 
@@ -91,10 +87,6 @@ def test_the_hosts_cache_dir_reaches_every_remote_step() -> None:
     assert session.env["UV_CACHE_DIR"] == "/vol/me/.cache/uv"
     session.config_read = HostConfigRead({"host": "h"})
     assert "UV_CACHE_DIR" not in session.env
-
-
-def test_no_cache_dir_means_no_variable() -> None:
-    assert "UV_CACHE_DIR" not in host_entry(name="h").config.env
 
 
 # -- (b) the bootstrap rule ---------------------------------------------------
@@ -187,6 +179,7 @@ def test_health_reports_the_cache_size_and_a_shared_filesystem(gpuc_home: Path) 
     assert placement["size_bytes"] == check.value
 
 
+@pytest.mark.usefixtures("empty_caches")
 def test_health_warns_loudly_when_the_cache_is_on_another_filesystem(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -43,8 +43,9 @@ for step in "${steps[@]}"; do
       run uv run --frozen pyright gpuc snakemake_executor_plugin_gpuc tests docs/media
       ;;
     test)
-      # Which markers run by default is `addopts` in pyproject.toml.
-      run uv run --frozen pytest -q --durations=10
+      # Which markers run by default is `addopts` in pyproject.toml. Most of
+      # the suite waits on real subprocesses, so it runs in parallel.
+      run uv run --frozen pytest -q -n auto --durations=10
       ;;
   esac
 done
