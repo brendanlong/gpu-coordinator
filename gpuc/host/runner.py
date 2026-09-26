@@ -176,11 +176,11 @@ class JobRunner:
         the spec's estimate is no longer published: it is a guess, and this is
         a measurement."""
         self._estimate = self.state.estimated_runtime_min
-        self._max_runtime = self.state.max_runtime(self.spec)
-        """The wall-clock limit as the last re-read found it, like `_estimate`."""
         """The estimate as the last re-read found it, which outlives the phase
         that read it: an estimate added during `setup` must not be undone by
         `main` starting from the value loaded at job start."""
+        self._max_runtime = self.state.max_runtime(self.spec)
+        """The wall-clock limit as the last re-read found it, like `_estimate`."""
         self._published_estimate: float | None = None
         """The `estimated_runtime_min` behind the eta now in the state file,
         null when that eta is not ours. Kept so the spec re-read only writes

@@ -1323,7 +1323,7 @@ def check_max_runtime(minutes: float | None, *, clear: bool) -> float | None:
     """The wall-clock limit a request asks for, or a usage error before any
     host is asked."""
     if clear is (minutes is not None):
-        raise UsageError("give --minutes N or --clear, not both")
+        raise UsageError("give one of --minutes N or --clear")
     if minutes is not None and not 0.0 < minutes < math.inf:
         raise UsageError(f"--minutes must be a positive number of minutes, got {minutes:g}")
     return minutes
@@ -1596,6 +1596,11 @@ def read_mirror(
                         "job_id": job_id,
                         "name": (indexed.name if indexed else "") or "",
                         "outputs_pending": bool(document.get("outputs_lost")),
+                        # An earlier build's state has no limit and the spec's
+                        # is not read here, so not saying beats saying "none".
+                        "max_runtime_min": document.get("max_runtime_min")
+                        if document.get("live_max_runtime") is True
+                        else None,
                     }
                 ]
             }

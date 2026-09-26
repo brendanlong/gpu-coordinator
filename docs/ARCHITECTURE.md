@@ -293,9 +293,9 @@ The rules it holds to:
   `auto_preempt` jobs that together cover the gap, least important first, and
   only at a strictly higher priority number. Nothing is stopped on a host that
   is going away.
-- **Reorder**, **estimate** and **max-runtime** write the job's state and nothing else; the
-  spec is never rewritten after enqueue. The control side re-mirrors the spec
-  after both; a mirror it cannot write is a warning.
+- **Reorder**, **estimate** and **max-runtime** write the job's state and
+  nothing else; the spec is never rewritten after enqueue. The control side
+  re-mirrors the spec after each; a mirror it cannot write is a warning.
 - **Idle terminate** (only with `config.provider` set): no running jobs and an
   empty queue for `idle_minutes` -> `draining`, retry unconfirmed outputs,
   mirror every job's state and log, then `terminate.self_terminate()`. Only a
