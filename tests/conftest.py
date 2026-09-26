@@ -44,6 +44,16 @@ how old the cache is has something stable to say."""
 
 
 @pytest.fixture
+def empty_caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the uv and Hugging Face caches the health check sizes at empty
+    directories: sizing the developer's own took seconds per test, and made
+    the result depend on the machine."""
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+
+
+@pytest.fixture
 def gpuc_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     home = tmp_path / "gpuc-home"
     monkeypatch.setenv("GPUC_HOME", str(home))

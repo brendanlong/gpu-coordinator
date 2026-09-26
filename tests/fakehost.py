@@ -41,6 +41,7 @@ from gpuc.control.transport import (
     tail_command,
 )
 from gpuc.host import scope
+from gpuc.host.dispatcher import LockBody
 from tests.conftest import install_fake_nvidia_smi
 
 DEFAULT_GPUS = ("GPU-a", "GPU-b")
@@ -139,21 +140,25 @@ class FakeHost:
     def close(self) -> None:
         """Stop the dispatcher a bootstrap started, if one is running.
 
-        A bootstrap leaves a package behind; the dispatcher it spawned takes
-        its lock a moment later, so a host with a package is given that
-        moment before the lock is read."""
+        A spawned dispatcher takes its lock a moment after the spawn opens
+        its log, so a host with that log is given that moment before the lock
+        is read. One with only a package never had a dispatcher to wait for.
+        The moment is generous because the lock is never removed, so only a
+        dispatcher that died before locking waits it out, while one that
+        locks after we stop waiting outlives the test: under `-n auto` that
+        took over 3s."""
         home = Path(self.home)
         lock = home / "dispatcher.lock"
-        deadline = time.monotonic() + 3.0
-        while (home / "pkg").exists() and not lock.exists() and time.monotonic() < deadline:
+        deadline = time.monotonic() + 30.0
+        spawned = (home / "dispatcher.log").exists()
+        while spawned and not lock.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         if not lock.exists():
             return
-        body = lock.read_text().strip().splitlines()
-        pgid = body[0].strip() if body else ""
-        if pgid.isdigit():
+        pgid = LockBody.parse(lock.read_text()).pgid
+        if pgid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(int(pgid), 9)
+                os.killpg(pgid, 9)
 
     # -- Transport ------------------------------------------------------------
 

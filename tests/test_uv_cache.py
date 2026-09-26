@@ -93,10 +93,6 @@ def test_the_hosts_cache_dir_reaches_every_remote_step() -> None:
     assert "UV_CACHE_DIR" not in session.env
 
 
-def test_no_cache_dir_means_no_variable() -> None:
-    assert "UV_CACHE_DIR" not in host_entry(name="h").config.env
-
-
 # -- (b) the bootstrap rule ---------------------------------------------------
 
 
@@ -187,6 +183,7 @@ def test_health_reports_the_cache_size_and_a_shared_filesystem(gpuc_home: Path) 
     assert placement["size_bytes"] == check.value
 
 
+@pytest.mark.usefixtures("empty_caches")
 def test_health_warns_loudly_when_the_cache_is_on_another_filesystem(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

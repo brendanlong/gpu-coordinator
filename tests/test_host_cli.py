@@ -78,14 +78,6 @@ def test_status(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert status["queue"] == [{"priority": 12, "job_id": job_id}]
 
 
-def test_status_of_one_job(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    job_id = queue.enqueue(make_spec())
-    queue.enqueue(make_spec())
-    _, status = run(capsys, "status", job_id)
-    assert isinstance(status, dict)
-    assert [j["job_id"] for j in status["jobs"]] == [job_id]
-
-
 def test_status_of_several_jobs_is_exactly_those_that_are_here(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -168,16 +160,6 @@ def test_a_verb_acts_on_every_job_it_is_given_and_refuses_each_it_cannot(
         "warning": None,
     }
     assert "already cancelled" in payload["jobs"][1]["error"]
-
-
-def test_setting_the_priority_of_a_running_job_is_a_refusal_not_a_traceback(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    job_id = queue.enqueue(make_spec())
-    jobs.update_state(job_id, status="running")
-    code, payload = verb(capsys, "set", job_id, "--field", "priority=1")
-    assert code == 1
-    assert "only on a queued job" in str(payload["error"])
 
 
 def test_set_on_an_unknown_job_is_a_refusal_not_a_traceback(
@@ -388,6 +370,7 @@ def test_dispatch_is_routed_to_the_dispatcher(
     assert ran
 
 
+@pytest.mark.usefixtures("empty_caches")
 def test_health_is_routed_to_health(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

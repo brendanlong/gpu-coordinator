@@ -1084,6 +1084,9 @@ every bootstrap and reported back by `python -m gpuc.host status`
   too: `addopts` in `pyproject.toml` excludes the `runpod` marker, so the tests
   that rent hardware never run by accident -- opt in with `pytest -m runpod`.
   Nothing else is excluded by default.
+- `./check.sh` runs the suite in parallel (`pytest-xdist`, `-n auto`), so a
+  test owns everything it touches: paths under its own `tmp_path`, ports the
+  OS picked, and any process it or its host started, stopped before it ends.
 - Unit tests run without a GPU (one fake `nvidia-smi`, `tests/fake_nvidia_smi.py`,
   answering in-process and on `PATH`; temp `~/.gpuc`). The CLI and provisioning
   tests drive a real host in a temporary home (`tests/fakehost.py`): every

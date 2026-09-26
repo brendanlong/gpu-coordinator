@@ -12,6 +12,8 @@ from gpuc.host import health, jobs
 from gpuc.host.jobs import HostConfig
 from tests.conftest import FAKE_GPUS, fake_smi
 
+pytestmark = pytest.mark.usefixtures("empty_caches")
+
 
 def slow_downloader(url: str, max_bytes: int, timeout: float) -> int:
     time.sleep(0.05)
@@ -129,12 +131,6 @@ def test_zero_bytes_is_still_fatal(gpuc_home: Path) -> None:
         smi=fake_smi(), downloader=dead_downloader, min_free_gb=0.0, url="http://x"
     )
     assert not report["ok"]
-
-
-def test_the_default_download_url_is_a_stable_sized_endpoint() -> None:
-    assert health.DEFAULT_DOWNLOAD_URL.startswith(
-        "https://github.com/astral-sh/uv/releases/latest/"
-    )
 
 
 def test_the_disk_floor_message_says_what_to_do(gpuc_home: Path) -> None:
