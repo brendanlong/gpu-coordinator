@@ -42,10 +42,10 @@ uv run snakemake --executor gpuc --gpuc-host spar --jobs 20
 
 (with `--with` as above if gpuc is not in the project).
 
-**Run it in tmux**, or under something that restarts it. The controller is an
-ordinary foreground process: nothing in gpuc keeps it alive, and a controller
-that dies leaves its jobs running for the next one to adopt (see [a killed
-controller](#a-killed-controller) below).
+**Run it in tmux**, so it survives a disconnect and its log stays on screen.
+The controller is an ordinary foreground process: nothing in gpuc keeps it
+alive, and one that dies leaves its jobs running for the next one to adopt
+(see [a killed controller](#a-killed-controller) below).
 
 `--jobs` is how many gpuc jobs are queued or running at once. The host's
 queue decides how many of those actually run.
@@ -140,12 +140,9 @@ held. **Unlock only once the old controller is dead**: the lock is what stops
 two controllers running at once, and two would each submit every job that
 becomes ready.
 
-So a supervisor (a restart loop, a systemd user unit) can restart the
-controller unattended. Bound its restarts: a job that fails on its own fails
-the controller too, and each restart submits it again. One gap remains: a
-controller killed while a `gpuc submit` is still running writes no marker for
-that job, so if the submit completes the job runs twice. `gpuc status` lists
-both by rule name.
+One gap remains: a controller killed while a `gpuc submit` is still running
+writes no marker for that job, so if the submit completes the job runs twice.
+`gpuc status` lists both by rule name.
 
 ## Where files live
 
@@ -208,4 +205,5 @@ moving every checkpoint through the bucket.
   and runs `setup`.
 - Job groups (`group:`) are refused, CPU rules included: Snakemake never runs
   a grouped rule on the controller. Each Snakemake job is its own gpuc job.
-- The controller runs wherever you start it, and nothing in gpuc restarts it.
+- The controller runs wherever you start it, and nothing in gpuc keeps it
+  running or restarts it.
