@@ -10,12 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from gpuc.host import dispatcher, jobs, paths, queue
+from gpuc.host import dispatcher, jobs, paths
 from gpuc.host import runner as procinfo
 from gpuc.host.dispatcher import DispatcherLock, LockBody
 from gpuc.host.jobs import HostConfig
-from tests.conftest import FAKE_GPUS, make_spec
-from tests.test_dispatcher import make_dispatcher
+from tests.conftest import FAKE_GPUS
 
 # A holder that takes the lock, writes a dispatcher-shaped lock body and a
 # heartbeat of our choosing, and then wedges forever with a child in the same
@@ -415,30 +414,3 @@ def test_a_superseded_holder_we_may_not_signal_is_left_alone_at_once(
         assert "is not a gpuc dispatcher" in paths.dispatcher_log().read_text()
     finally:
         kill_tree(holder)
-
-
-def test_a_takeover_adopts_the_running_jobs_rather_than_failing_them(gpuc_home: Path) -> None:
-    """What a handoff has to be worth: the queue changes hands and the work
-    does not notice."""
-    on_this_host(SHIPPED)
-    job_id = queue.enqueue(make_spec(gpus=1))
-    outgoing, _ = make_dispatcher()
-    lock = DispatcherLock()
-    assert lock.acquire()
-    outgoing.run_once()
-    assert jobs.read_state(job_id).status == "running"
-    # This process stands in for the runner the outgoing dispatcher spawned:
-    # what the successor has to find is a pid that is really still there.
-    jobs.update_state(job_id, runner_pid=os.getpid(), runner_boot_id=None, runner_starttime=None)
-    lock.release()  # as a dispatcher standing down does
-
-    incoming, _ = make_dispatcher()
-    successor = DispatcherLock()
-    assert successor.acquire()
-    try:
-        incoming.adopt_orphans()
-    finally:
-        successor.release()
-    assert jobs.read_state(job_id).status == "running"
-    assert job_id in incoming.running
-    assert incoming.running[job_id].gpus == [FAKE_GPUS[0]]

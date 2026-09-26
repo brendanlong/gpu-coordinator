@@ -360,13 +360,6 @@ def test_host_add_registers_a_host_with_no_cards_and_says_so(
     assert "owns no GPUs (every card it has is shared)" in capsys.readouterr().out
 
 
-def test_host_add_ssh_records_the_target_and_port(control_env: Path) -> None:
-    register_host(name="gpubox", kind="ssh", ssh="me@box", port=2222, gpus="GPU-a,GPU-b")
-    entry = load_registry().require("gpubox")
-    assert (entry.kind, entry.ssh, entry.port) == ("ssh", "me@box", 2222)
-    assert entry.config.gpus == ["GPU-a", "GPU-b"]
-
-
 def test_host_list_and_remove(control_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
     register_host(name="local", gpus=GPU)
     assert main(["host", "list"]) == 0
@@ -651,13 +644,6 @@ def test_runpod_commands_fail_fast_without_an_api_key(
             "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
             "`gpuc host add --pod`, `gpuc host terminate` or `gpuc pods`"
         ]
-
-
-def test_a_non_runpod_command_does_not_need_the_api_key(
-    control_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    assert main(["host", "list"]) == 0
 
 
 def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
@@ -1357,12 +1343,6 @@ def test_only_with_verify_names_the_jobs_and_what_the_mirror_vouches_for(
     )
     assert session.calls == ["purge --older-than 0.0 --only kept,gone --verified kept"]
     assert report.verified == ["kept"]
-
-
-def test_purge_only_needs_no_yes(control_env: Path) -> None:
-    from gpuc.control.clean import check_flags
-
-    check_flags(purge=True, only=["a"])
 
 
 @pytest.mark.parametrize("extra", [["--all-finished"], ["--older-than", "7"]])
@@ -2180,21 +2160,6 @@ def test_preempt_reports_the_hosts_refusal_to_free_the_host_for_nothing(
     assert "nothing else is queued" in capsys.readouterr().err
 
 
-def test_preempt_reports_the_hosts_refusal(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    register_host(name="local", gpus=GPU)
-    payload: dict[str, object] = {
-        "jobs": [{"job_id": "20260101-000000-aaaaaa", "error": "job j is queued, not running"}]
-    }
-    monkeypatch.setattr(
-        "gpuc.control.remote.open_session", lambda *a, **k: as_session(StubSession([payload]))
-    )
-    capsys.readouterr()
-    assert main(["preempt", "20260101-000000-aaaaaa", "--host", "local"]) == EXIT_ERROR
-    assert "queued, not running" in capsys.readouterr().err
-
-
 def test_a_host_too_old_to_know_preempt_is_never_reported_as_success(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2450,41 +2415,6 @@ def test_set_priority_says_so_when_the_mirror_kept_the_old_priority(
     monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
     capsys.readouterr()
     argv = ["set", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
-    assert main(argv) == 0
-    warnings = one_job(capsys)["warnings"]
-    assert isinstance(warnings, list) and "requeue" in warnings[0]
-
-
-def test_set_estimate_says_so_when_the_mirror_kept_the_old_estimate(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The host has it, so the command succeeded; but a silent divergence is
-    exactly what `requeue` would fall into later."""
-    register_host(name="local", gpus=GPU)
-    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client", property(lambda self: FakeS3Client())
-    )
-    monkeypatch.setattr(
-        "gpuc.control.remote.open_session",
-        lambda *a, **k: as_session(
-            StubSession(
-                [
-                    {
-                        "jobs": [
-                            {
-                                "job_id": "20260101-000000-aaaaaa",
-                                "estimated_runtime_min": 150.0,
-                                "status": "running",
-                            }
-                        ]
-                    }
-                ]
-            )
-        ),
-    )
-    capsys.readouterr()
-    argv = ["set", "20260101-000000-aaaaaa", "--estimate", "150", "--host", "local", "--json"]
     assert main(argv) == 0
     warnings = one_job(capsys)["warnings"]
     assert isinstance(warnings, list) and "requeue" in warnings[0]

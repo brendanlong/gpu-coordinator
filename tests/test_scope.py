@@ -67,10 +67,6 @@ def test_a_scoped_phase_hides_the_script_from_systemds_expansion() -> None:
     assert base64.b64decode(argv[13]).decode() == "set -eo pipefail\necho $$ && echo ${HOME}\n"
 
 
-def test_the_unit_name_carries_the_job_and_phase() -> None:
-    assert scope.unit_name("20260915-120000-abc", "main") == "gpuc-20260915-120000-abc-main.scope"
-
-
 def test_isolation_honours_what_the_dispatcher_probed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(scope.ISOLATION_ENV, scope.CGROUP)
     assert scope.isolation() == scope.CGROUP

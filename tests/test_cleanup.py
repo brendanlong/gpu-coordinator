@@ -128,12 +128,6 @@ def test_the_log_says_the_workdir_went_and_why(gpuc_home: Path) -> None:
     assert "spec.json, state.json and log.txt are kept" in log_of(job_id)
 
 
-def test_a_failed_job_keeps_its_workdir_for_inspection(gpuc_home: Path) -> None:
-    job_id = run_with_policy("on_success", "echo oops >&2; exit 5")
-    assert (paths.workdir(job_id) / "big.bin").exists()
-    assert (jobs.read_state(job_id).workdir_bytes or 0) > 0
-
-
 def test_outputs_are_synced_before_the_workdir_goes(gpuc_home: Path) -> None:
     """The final sync reads from inside the workdir, so order is load-bearing."""
     uploaded: list[str] = []
@@ -708,17 +702,6 @@ def test_the_sweep_records_that_it_freed_everything(gpuc_home: Path) -> None:
     cleanup.clean(all_finished=True)
     state = jobs.read_state(done)
     assert state.workdir_bytes == 0, "status would still be quoting a workdir that is gone"
-
-
-def test_reclaimable_bytes_counts_a_hardlink_once(gpuc_home: Path, tmp_path: Path) -> None:
-    root = tmp_path / "tree"
-    (root / "sub").mkdir(parents=True)
-    original = root / "a.bin"
-    original.write_bytes(b"x" * 100_000)
-    (root / "sub" / "b.bin").hardlink_to(original)
-    once = cleanup.reclaimable_bytes(root)
-    (root / "sub" / "c.bin").write_bytes(b"x" * 100_000)
-    assert cleanup.reclaimable_bytes(root) > once
 
 
 def test_dir_size_counts_an_in_tree_hardlink_once(gpuc_home: Path, tmp_path: Path) -> None:

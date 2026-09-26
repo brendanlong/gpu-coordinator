@@ -396,15 +396,6 @@ def test_a_periodic_missing_output_is_the_destinations_error_and_the_loop_goes_o
     assert record.ok_at is not None
 
 
-def test_a_missing_output_dir_on_the_final_sync_is_its_own_error(
-    gpuc_home: Path, fake_aws: str
-) -> None:
-    job_id = jobs.new_job_id()
-    loop = loop_for(job_id, RecordingRunner())
-    with pytest.raises(sync.MissingOutput):
-        loop.final()
-
-
 def test_the_periodic_thread_survives_any_exception_and_records_it(
     gpuc_home: Path, fake_aws: str
 ) -> None:

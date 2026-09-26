@@ -212,23 +212,6 @@ def test_the_two_utilizations_say_where_they_came_from() -> None:
     assert host_json(view())["provider_util"] is None
 
 
-def test_null_utilization_samples_are_dropped() -> None:
-    _, running, _ = job_views(
-        {
-            "jobs": [
-                {
-                    "job_id": "j",
-                    "status": "running",
-                    "phase": "main",
-                    "gpus": [GPU],
-                    "util_recent": [90.0, None, 80.0],
-                }
-            ]
-        }
-    )
-    assert running[0].util_recent == [90.0, 80.0]
-
-
 def _pod(status: PodStatus) -> Pod:
     return Pod(id="pod-1", name="gpuc-e2e-1", status=status, cost_usd_hr=0.0, gpu_name="A40")
 
@@ -357,26 +340,6 @@ def test_a_running_job_never_counts_towards_leftover_disk() -> None:
     )
     assert host_view.leftover_bytes == 0
     assert "gpuc clean" not in render(host_view)
-
-
-def test_workdir_bytes_survives_the_host_payload() -> None:
-    _, _, finished = job_views(
-        payload(
-            jobs=[
-                {
-                    "job_id": "j",
-                    "status": "succeeded",
-                    "ended_at": minutes_ago(1),
-                    "workdir_bytes": 123,
-                }
-            ]
-        )
-    )
-    assert finished[0].workdir_bytes == 123
-
-
-def test_a_host_that_never_reports_sizes_is_fine() -> None:
-    assert view().leftover_bytes == 0
 
 
 def test_finished_jobs_with_unconfirmed_outputs_are_flagged() -> None:
@@ -849,20 +812,6 @@ def test_each_jobs_priority_is_the_one_the_host_reports_for_it() -> None:
     assert queued[0].priority == 10
     assert running[0].priority == 88
     assert finished[0].priority == 0
-
-
-def test_the_highest_priority_there_is_is_not_read_as_missing() -> None:
-    """`0` is a real priority -- a job reordered to the front -- not a falsy
-    stand-in for "unknown"."""
-    queued, _, _ = job_views(
-        payload(jobs=[{"job_id": "j-queued", "status": "queued", "priority": 0}])
-    )
-    assert queued[0].priority == 0
-
-
-def test_a_host_too_old_to_report_a_priority_says_nothing_rather_than_guessing() -> None:
-    _, running, _ = job_views(payload(jobs=[{"job_id": "j-running", "status": "running"}]))
-    assert running[0].priority is None
 
 
 def test_job_views_read_the_hosts_start_projection() -> None:

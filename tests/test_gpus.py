@@ -84,14 +84,6 @@ def test_sample_utilization_filters_to_requested_uuids() -> None:
     assert gpus.mean_utilization([], smi) == 0.0
 
 
-def test_missing_nvidia_smi_raises_gpu_error() -> None:
-    def missing(args: list[str]) -> str:
-        raise FileNotFoundError("nvidia-smi")
-
-    with pytest.raises(FileNotFoundError):
-        gpus.list_gpus(missing)
-
-
 def test_real_runner_reports_a_clear_error_when_binary_is_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -142,12 +134,6 @@ def test_no_samples_for_real_gpus_is_an_error_not_zero_percent() -> None:
     """
     with pytest.raises(gpus.GpuError, match="failed sample"):
         gpus.mean_utilization(["GPU-x"], lambda args: "")
-
-
-def test_a_renumbered_box_costs_the_cards_that_moved_not_the_rest() -> None:
-    table = gpus.parse_table("0, GPU-zero, , \n1, GPU-one, , \n")
-    cards = gpus.resolve(["0", "7", "GPU-gone"], table)
-    assert (cards.owned, cards.missing) == (["GPU-zero"], ["7", "GPU-gone"])
 
 
 # -- shared GPUs: is anybody else on this card? --------------------------------

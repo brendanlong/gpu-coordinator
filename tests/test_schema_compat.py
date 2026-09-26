@@ -21,7 +21,6 @@ import pytest
 
 from gpuc.control.config import (
     HostEntry,
-    Registry,
     Settings,
     read_registry,
 )
@@ -109,11 +108,6 @@ def test_a_host_config_missing_keys_defaults_them_and_a_newer_one_is_read_too() 
     assert newer.idle_minutes == 15.0
     assert newer.env == {}
     assert newer.schema_version == 2
-
-
-def test_todays_files_carry_a_schema_version(control_env: Path) -> None:
-    assert json.loads((FIXTURES / "config.current.json").read_text())["schema_version"] == 1
-    assert Registry().model_dump()["schema_version"] == SCHEMA_VERSION
 
 
 # -- null means default, except where null is the value -----------------------

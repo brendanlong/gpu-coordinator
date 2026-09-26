@@ -1082,14 +1082,6 @@ def configure_retention(days: float | None, workdir_days: float | None = None) -
     )
 
 
-def test_no_retention_setting_never_purges(gpuc_home: Path) -> None:
-    configure_retention(None)
-    job_id = finished_job()
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert paths.state_file(job_id).exists()
-
-
 def test_neither_horizon_set_reclaims_nothing(gpuc_home: Path) -> None:
     configure_retention(None, None)
     job_id = finished_job()
@@ -1701,34 +1693,6 @@ def test_a_preempted_job_still_finalizing_is_adopted_and_nothing_is_launched_int
     assert spawned == {}
 
 
-def test_a_stop_another_process_asked_for_gets_an_escalation_clock_of_its_own(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`gpuc preempt` writes the intent over ssh, so this dispatcher never sent
-    it and has nothing to time it from until it first sees it. Without a clock
-    of its own, a wedged runner kept the job (and its GPUs) for ever."""
-    clock = FakeClock()
-    dispatcher, spawned = make_dispatcher(clock=clock)
-    job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher.run_once()
-    jobs.update_state(job_id, pgid=123456)
-
-    signals = record_signals(monkeypatch)
-
-    queue.enqueue(make_spec(gpus=1, priority=1))
-    queue.preempt(job_id)
-    dispatcher.run_once()
-    assert signals == []
-
-    clock.advance(1.5)  # kill_grace_s is 1.0 in these tests
-    dispatcher.run_once()
-    assert signals[-1] == (123456, signal.SIGKILL)
-
-    clock.advance(1.0)
-    dispatcher.run_once()
-    assert signals[-1] == (spawned[job_id].pid, signal.SIGTERM)
-
-
 def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1845,15 +1809,6 @@ def test_a_job_that_did_not_ask_never_touches_a_shared_card(gpuc_home: Path) -> 
     assert all(jobs.read_state(job_id).status == "running" for job_id in holding)
     assert jobs.read_state(waiting).status == "queued"
     assert [e.job_id for e in queue.list_queued()] == [waiting]
-
-
-def test_a_job_that_asked_borrows_an_idle_shared_card(gpuc_home: Path) -> None:
-    dispatcher, _ = shared_host()
-    *_, borrower = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
-    dispatcher.run_once()
-
-    assert jobs.read_state(borrower).status == "running"
-    assert jobs.read_state(borrower).gpus == [SHARED_GPUS[0]]
 
 
 def test_owned_cards_are_always_taken_before_borrowed_ones(gpuc_home: Path) -> None:

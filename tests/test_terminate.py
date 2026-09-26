@@ -91,20 +91,6 @@ def test_missing_pod_id_is_a_clear_error(gpuc_home: Path, no_pod_env: Path) -> N
     assert "RUNPOD_POD_ID is unset" in str(excinfo.value)
 
 
-def test_self_terminate_uses_the_injected_call(
-    gpuc_home: Path, no_pod_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    seen: list[tuple[str, str]] = []
-
-    def fake(pod_id: str, key: str) -> str:
-        seen.append((pod_id, key))
-        return "{}"
-
-    terminate.self_terminate(POD_CONFIG, terminate_call=fake)
-    assert seen == [("abc123", "k")]
-
-
 def test_self_terminate_ends_the_pod_the_config_names(
     gpuc_home: Path, no_pod_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

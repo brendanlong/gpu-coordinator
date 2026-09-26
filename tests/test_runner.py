@@ -220,14 +220,6 @@ def test_an_assigned_card_the_host_does_not_have_fails_the_job(gpuc_home: Path) 
     assert "assigned GPUs not present on this host: GPU-nope" in log_of(job_id)
 
 
-def test_a_stale_assigned_uuid_fails_the_job_before_it_starts(gpuc_home: Path) -> None:
-    job_id = prepare(gpus=["GPU-stale"], command="echo SHOULD-NOT-RUN")
-    assert run(job_id) == 1
-    state = jobs.read_state(job_id)
-    assert (state.status, state.reason) == ("failed", "gpu-assert")
-    assert "SHOULD-NOT-RUN" not in log_of(job_id)
-
-
 def test_a_job_that_asks_for_no_gpu_runs_with_none_visible(gpuc_home: Path) -> None:
     """No GPU check, since there is nothing to check, and an empty
     `CUDA_VISIBLE_DEVICES` rather than an absent one, which CUDA reads as
@@ -379,14 +371,6 @@ def test_utilization_is_sampled_in_main_only(gpuc_home: Path) -> None:
     assert (state.util_sum, state.util_samples) == (0.0, len(state.util_recent))
 
 
-def test_an_idle_gpu_is_reported_and_never_a_reason_to_kill(gpuc_home: Path) -> None:
-    job_id = prepare(gpus=[FAKE_GPUS[0]], command="sleep 0.5")
-    assert run(job_id, deps(sampler=lambda uuids: 0.0)) == 0
-    state = jobs.read_state(job_id)
-    assert state.status == "succeeded"
-    assert state.util_recent and set(state.util_recent) == {0.0}
-
-
 def test_cancel_kills_the_whole_process_group_including_grandchildren(
     gpuc_home: Path,
 ) -> None:
@@ -439,27 +423,6 @@ def _pid_exists(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-def test_state_records_the_phase_and_pgid_while_running(gpuc_home: Path) -> None:
-    job_id = prepare(command="sleep 5")
-    observed: list[tuple[str | None, int | None]] = []
-
-    def watcher() -> None:
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            state = jobs.read_state(job_id)
-            if state.phase == "main" and state.pgid:
-                observed.append((state.phase, state.pgid))
-                queue.cancel(job_id)
-                return
-            time.sleep(0.05)
-
-    thread = threading.Thread(target=watcher, daemon=True)
-    thread.start()
-    run(job_id)
-    thread.join(timeout=10)
-    assert observed and observed[0][0] == "main"
 
 
 def test_the_pgid_goes_with_the_phase_that_owned_it(

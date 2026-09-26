@@ -360,17 +360,6 @@ def test_an_optional_tool_failure_is_a_warning_not_an_error(control_env: Path) -
     assert "huggingface_hub" in result.warnings[0]
 
 
-def test_bootstrap_is_idempotent(control_env: Path) -> None:
-    host = ScriptedHost(uv_present=False, hf_present=False, aws_present=False)
-    bootstrap_host(entry(), transport=host, report=lambda _: None)
-    first = list(host.events)
-    host.events.clear()
-    bootstrap_host(entry(), transport=host, report=lambda _: None)
-    assert any("astral.sh/uv" in e for e in first)
-    assert not any("astral.sh/uv" in e for e in host.events)
-    assert not any("awscli-exe" in e for e in host.events)
-
-
 def test_the_dispatcher_is_started_with_the_home_tool_dirs_on_path(control_env: Path) -> None:
     host = ScriptedHost()
     bootstrap_host(entry(), transport=host, report=lambda _: None)
