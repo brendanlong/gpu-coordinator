@@ -767,14 +767,3 @@ def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transpo
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def parse_timestamp(stamp: str | None) -> datetime | None:
-    """An ISO stamp from any file the two halves share, as an aware datetime, or None."""
-    if not stamp:
-        return None
-    try:
-        parsed = datetime.fromisoformat(stamp)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
