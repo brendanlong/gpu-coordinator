@@ -17,11 +17,11 @@ from urllib.parse import quote
 from gpuc.control import version
 from gpuc.control.config import HostEntry, Settings, parse_timestamp
 from gpuc.control.gpuinfo import GpuInfo
+from gpuc.control.jsonout import OUTPUT_SCHEMA_VERSION
 from gpuc.control.providers.base import Pod, Provider
 from gpuc.control.remote import Asked, Gone, HostSession, Unaskable, ask
 from gpuc.control.s3index import IndexEntry, job_uri
 from gpuc.host.cleanup import human_bytes
-from gpuc.host.jobs import SCHEMA_VERSION
 
 HEARTBEAT_STALE_S = 30.0
 RECENT_FINISHED = 5
@@ -1334,7 +1334,7 @@ def document(
     knows, empty without the flag.
     """
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": OUTPUT_SCHEMA_VERSION,
         "hosts": [host_json(view, recent=recent, since_s=since_s) for view in views],
         "unhosted": list(unhosted),
         "errors": list(errors),

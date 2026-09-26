@@ -697,7 +697,8 @@ parse.
 `--json` is on every command that has an answer to give, and means the same
 thing on each: stdout is one object carrying `schema_version`, everything else
 goes to stderr, and a failure prints `{schema_version, error, exit_code}` rather
-than nothing. The flag never changes an exit code. With either follow,
+than nothing. That `schema_version` is the documents' own
+(`jsonout.OUTPUT_SCHEMA_VERSION`), not the files'. The flag never changes an exit code. With either follow,
 `gpuc logs --json` is exit 2: a follow is a stream.
 
 `gpuc wait` and `gpuc logs -f` exit with the *job's* outcome rather than their

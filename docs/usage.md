@@ -664,7 +664,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "hosts": [
     {
       "name": "gpubox",
@@ -781,7 +781,8 @@ Rules for anything automated:
 `pods`, `version`, `clean`, `config show`, `config init`,
 `host list`, `host probe`, `host add`, `host set`, `host bootstrap`,
 `host clean`, `host remove` and `host terminate` take `--json`: **stdout is
-exactly one JSON object**, it carries `schema_version`, and everything the text
+exactly one JSON object**, it carries `schema_version` (2; bumped only when a
+document changes incompatibly, never for an added key), and everything the text
 output would print alongside it (progress, warnings, `note:` lines) goes to
 stderr. Exit codes are unchanged by the flag. `ssh`, `skill`, `web serve`,
 `web set-password` and `skill --install` have no document.
@@ -789,7 +790,7 @@ stderr. Exit codes are unchanged by the flag. `ssh`, `skill`, `web serve`,
 **A command that failed prints a document too:**
 
 ```json
-{ "schema_version": 1, "error": "no registered host knows job 20260915-120000-abc123.\n...",
+{ "schema_version": 2, "error": "no registered host knows job 20260915-120000-abc123.\n...",
   "exit_code": 4 }
 ```
 

@@ -51,8 +51,8 @@ from gpuc.control.actions import (
 )
 from gpuc.control.config import Settings, load_settings, read_registry, utc_now
 from gpuc.control.exits import http_status
+from gpuc.control.jsonout import OUTPUT_SCHEMA_VERSION
 from gpuc.control.web.auth import SESSION_COOKIE, SESSION_TTL_S, Sessions, read_password_hash
-from gpuc.host.jobs import SCHEMA_VERSION
 
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8646
@@ -113,7 +113,7 @@ class Response:
 
     @staticmethod
     def json(document: dict[str, Any], status: int = HTTPStatus.OK) -> Response:
-        payload = {"schema_version": SCHEMA_VERSION, **document}
+        payload = {"schema_version": OUTPUT_SCHEMA_VERSION, **document}
         return Response(
             status,
             json.dumps(payload, indent=2).encode(),
