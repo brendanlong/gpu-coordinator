@@ -31,7 +31,7 @@ from gpuc.control.config import (
     utc_now,
 )
 from gpuc.control.connect import refuse_unreadable
-from gpuc.control.gpuinfo import summarize
+from gpuc.control.gpuinfo import describe_owned, owned_entries, summarize
 from gpuc.control.remote import (
     PYTHON_FLOOR,
     HostConfigRead,
@@ -644,13 +644,12 @@ def bootstrap_host(
         read = HostConfigRead(patch)
         report(
             f"{home}/config.json does not exist on {entry.name}: initialising it with "
-            f"{len(read.config.gpus)} GPU(s)"
+            f"GPUs {describe_owned(read.config.gpus)}"
         )
-        if not read.config.gpus:
+        if read.config.gpus == []:
             warnings.append(
-                f"host {entry.name} has no config of its own and this machine has no cards "
-                f"recorded for it, so it will run no GPU job until "
-                f"`gpuc host set {entry.name} --gpus <list>`"
+                f"host {entry.name} has no config of its own and the one recorded here owns no "
+                f"GPUs, so it will run no GPU job until `gpuc host set {entry.name} --gpus all`"
             )
             report(f"WARNING: {warnings[-1]}")
     config = read.config
@@ -720,8 +719,9 @@ def bootstrap_host(
 
     # The cards are the probe's to record (`host add`, `host probe`); this
     # keeps what the entry has and adds the driver health just reported.
-    if session.config.gpus:
-        report(f"gpus: {summarize(session.config.gpus, entry.gpu_info)}")
+    owned = owned_entries(session.config.gpus, session.config.shared_gpus, entry.gpu_info)
+    if owned:
+        report(f"gpus: {summarize(owned, entry.gpu_info)}")
     updated = (
         entry.with_cache(uv=uv, python=python, driver_version=driver_version(health))
         .with_config(session.config_read.document or {})

@@ -180,8 +180,18 @@ def test_all_gpus_marks_nothing_when_every_card_is_ours() -> None:
     assert "(assigned)" not in parse_probe("gpubox", SAMPLE, None, ["0", "1"]).render(all_gpus=True)
 
 
-def test_a_host_with_no_assignment_sees_every_card_and_is_told_to_assign_some() -> None:
-    rendered = parse_probe("gpubox", SAMPLE).render()
+def test_a_host_with_no_list_owns_every_card_it_sees() -> None:
+    report = parse_probe("gpubox", SAMPLE)
+    rendered = report.render()
+    assert "  gpus: 2 of 2 assigned to gpubox\n" in rendered
+    assert TI in rendered and A40 in rendered
+    assert "no GPUs are assigned" not in rendered
+    assert report.owned_missing == []
+    assert report.document()["assigned_gpus"] is None
+
+
+def test_a_host_assigned_none_sees_every_card_and_is_told_to_assign_some() -> None:
+    rendered = parse_probe("gpubox", SAMPLE, None, []).render()
     assert "  gpus:\n" in rendered
     assert TI in rendered and A40 in rendered
     assert "no GPUs are assigned to gpubox, so only jobs asking for none can run on it" in rendered

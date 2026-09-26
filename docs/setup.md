@@ -150,10 +150,10 @@ gpuc host bootstrap gpubox   # installs uv, the package and the dispatcher; idem
   cards the host already has is refused unless `--force`; a disjoint list goes
   through. The host is registered under the name it calls itself, unless a
   *different* host already has that name here.
-- the host has **no** config: one is written, owning **every card** nvidia-smi
-  reports there, by UUID. `--gpus` narrows that (`--gpus ''` for a host whose
-  cards gpuc may not use), and `--shared-gpus` takes its cards out of the owned
-  set. A host that reports no cards at all is refused unless `--gpus ''` says
+- the host has **no** config: one is written owning **every card** nvidia-smi
+  reports there (`--gpus all`), including cards added later. `--gpus` narrows
+  that (`--gpus ''` for a host whose cards gpuc may not use), and
+  `--shared-gpus` takes its cards out of the owned set. A host that reports no cards at all is refused unless `--gpus ''` says
   so on purpose; a host left owning nothing is registered, and nothing can be
   submitted to it until `gpuc host set <name> --gpus <list>` assigns some.
 
@@ -186,7 +186,7 @@ host has to answer) and reports each change as `host <- …`.
 | --- | --- | --- |
 | `--ssh user@host` / `--port N` | this machine / `22` | omit `--ssh` for a `local` host |
 | `--pod POD_ID` (`host add`) | none | adopt a pod the account is renting; the provider says where it is. Needs `RUNPOD_API_KEY`. Add `--gpuc-home` if that pod keeps gpuc somewhere other than `$HOME/.gpuc` |
-| `--gpus 2,3` or `--gpus GPU-8064…,3` | every card nvidia-smi reports, on a host with no config; what the host has, on one that does | nvidia-smi **indices**, UUIDs, or a mix, stored as typed and re-resolved to UUIDs on every dispatch pass. An owned card the host cannot see is `UNAVAILABLE` and jobs wait for it |
+| `--gpus 2,3`, `--gpus GPU-8064…,3` or `--gpus all` | `all` on a host with no config; what the host has, on one that does | the most this host may own: nvidia-smi **indices**, UUIDs, or a mix, stored as typed and re-resolved to UUIDs on every dispatch pass, or `all` for every card not in `--shared-gpus`, now or later. Only the cards nvidia-smi reports count; a listed card it does not is `UNAVAILABLE` |
 | `--shared-gpus 4,5` | none | cards gpuc may **borrow** but does not own, spelled like `--gpus` and never overlapping it; see [shared GPUs](usage.md#shared-gpus) |
 | `--gpuc-home PATH` | `$HOME/.gpuc` | where gpuc home lives on the host |
 | `--cache-dir PATH` | bootstrap decides | `UV_CACHE_DIR` in the host's `env`, the same as `--env UV_CACHE_DIR=PATH`. Bootstrap sets one beside gpuc home when gpuc home and `~/.cache` are on different filesystems, and never overrides one the config names. Under `--persistent-root`, `HF_HOME` is set beside gpuc home the same way |
@@ -200,8 +200,8 @@ host has to answer) and reports each change as `host <- …`.
 On a box you share, pass `--gpus`: `host probe` lists only those cards and says
 how many it hid (`2 of 8 assigned to gpubox`); `--all-gpus` shows the box as
 nvidia-smi sees it. Either way the probe records every card's name and VRAM.
-An assigned entry no card answers to is called out, as are two entries naming
-one card; `gpuc host bootstrap` fails its `gpu_uuids` check on both.
+An assigned entry no card answers to is called out, and `gpuc host bootstrap`
+warns about it; two entries naming one card fail bootstrap's `gpu_uuids` check.
 
 `gpuc host list` shows what is registered, one block per host, with each card as
 `gpu [index] name vram uuid` and a `pkg` line naming the commit the host was

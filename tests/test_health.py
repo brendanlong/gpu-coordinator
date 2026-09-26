@@ -46,22 +46,44 @@ def test_driver_check_fails_loudly_without_nvidia_smi() -> None:
     assert "nvidia-smi not found" in check.detail
 
 
-def test_uuid_check_fails_when_an_owned_uuid_is_absent() -> None:
+def test_uuid_check_warns_when_an_owned_uuid_is_absent() -> None:
+    """The list is a ceiling: a card that has gone is named, not a reason to
+    refuse the host the cards it still has."""
     check = health.check_gpu_uuids(["GPU-gone"], fake_smi())
-    assert not check.ok
+    assert check.ok and check.warn
     assert "GPU-gone" in check.detail
 
 
 def test_uuid_check_resolves_owned_indices_and_names_the_ones_that_are_gone() -> None:
-    """A host may own its share of a box by index, and the index that no longer
-    exists is exactly the failure this check is for."""
+    """A host may own its share of a box by index, and an index that no longer
+    exists is named alongside what nvidia-smi does report."""
     ok = health.check_gpu_uuids(["0", "1"], fake_smi())
-    assert ok.ok and ok.value == 2
+    assert ok.ok and not ok.warn and ok.value == 2
 
     check = health.check_gpu_uuids(["0", "7"], fake_smi())
-    assert not check.ok
-    assert "7" in check.detail
+    assert check.ok and check.warn and check.value == 1
+    assert "config.gpus entries not present on this host: 7" in check.detail
     assert f"0={FAKE_GPUS[0]}" in check.detail
+
+
+def test_uuid_check_on_a_host_that_owns_every_card_counts_what_is_there() -> None:
+    check = health.check_gpu_uuids(None, fake_smi())
+    assert check.ok and not check.warn and check.value == 2
+
+    borrowing = health.check_gpu_uuids(None, fake_smi(), shared=["1"])
+    assert borrowing.ok and borrowing.value == 1
+    assert "1 shared" in borrowing.detail
+
+
+def test_uuid_check_on_a_host_that_owns_every_card_needs_nvidia_smi() -> None:
+    def broken(args: list[str]) -> str:
+        from gpuc.host.gpus import GpuError
+
+        raise GpuError("nvidia-smi not found on PATH")
+
+    check = health.check_gpu_uuids(None, broken)
+    assert not check.ok
+    assert "nvidia-smi not found" in check.detail
 
 
 def test_disk_check_measures_the_gpuc_volume(gpuc_home: Path) -> None:
@@ -167,8 +189,8 @@ def test_the_uuid_check_covers_the_shared_cards_too() -> None:
     assert "1 shared" in ok.detail
 
     check = health.check_gpu_uuids(["0"], fake_smi(), shared=["7"])
-    assert not check.ok
-    assert "config.shared_gpus entries not present" in check.detail
+    assert check.ok and check.warn
+    assert "config.shared_gpus entries not present on this host: 7" in check.detail
 
 
 def test_a_card_that_is_both_owned_and_shared_fails_the_check() -> None:

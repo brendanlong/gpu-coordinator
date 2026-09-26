@@ -57,6 +57,22 @@ def table_of(info: Mapping[str, GpuInfo]) -> list[gpus.Gpu]:
     return [gpus.Gpu(entry.index, uuid, entry.name, entry.vram_mib) for uuid, entry in info.items()]
 
 
+def owned_entries(
+    owned: Sequence[str] | None, shared: Sequence[str], info: Mapping[str, GpuInfo]
+) -> list[str]:
+    """`config.gpus` as entries: its list, or for a host that owns every card,
+    the unshared ones the cache last saw."""
+    if owned is not None:
+        return list(owned)
+    return gpus.resolve(None, table_of(info), shared).owned
+
+
+def describe_owned(owned: Sequence[str] | None) -> str:
+    if owned is None:
+        return "all"
+    return ", ".join(owned) or "none"
+
+
 def uuid_of(owned: str, info: Mapping[str, GpuInfo]) -> str | None:
     """The UUID an owned entry names, as far as the recorded info can tell.
 

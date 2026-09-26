@@ -63,20 +63,15 @@ def project(
     *,
     owned_missing: Sequence[str] = (),
     theirs: int = 0,
-    shared_missing: int = 0,
+    shared_missing: Sequence[str] = (),
     running: Sequence[tuple[Preemptable, Request]] = (),
     draining: bool = False,
 ) -> Projection:
-    """`plan.project` with the configured counts read off the cards: every
-    visible card is configured, plus whatever is missing or somebody else's."""
-    n_owned = sum(1 for card in cards if not card.shared)
-    n_shared = sum(1 for card in cards if card.shared)
     return plan.project(
         requests,
         cards,
-        owned_configured=n_owned + len(owned_missing),
         owned_missing=owned_missing,
-        shared_configured=n_shared + theirs + shared_missing,
+        shared_missing=shared_missing,
         theirs=theirs,
         running=running,
         draining=draining,
@@ -120,13 +115,14 @@ def test_capacity_failure(
 def pool(
     owned_free: list[str],
     *,
-    owned_configured: int | None = None,
+    owned_present: int | None = None,
     shared_free: list[str] | None = None,
     theirs: int = 0,
-    shared_configured: int | None = None,
     coming: Sequence[str] = (),
     shared: Sequence[str] = (),
     preemptable: Sequence[Preemptable] = (),
+    owned_absent: Sequence[str] = (),
+    shared_absent: Sequence[str] = (),
 ) -> tuple[Pool, list[int]]:
     """A pool whose shared cards are read through a counting `sample`."""
     calls: list[int] = []
@@ -140,9 +136,10 @@ def pool(
     return (
         Pool(
             owned_free=list(owned_free),
-            owned_configured=len(owned_free) if owned_configured is None else owned_configured,
-            shared_configured=visible if shared_configured is None else shared_configured,
+            owned_present=len(owned_free) if owned_present is None else owned_present,
             shared_visible=visible,
+            owned_absent=owned_absent,
+            shared_absent=shared_absent,
             sample=sample,
             shared=frozenset([*free, *shared]),
             coming=list(coming),
@@ -159,27 +156,27 @@ def test_a_job_that_fits_is_assigned_owned_cards_first() -> None:
 
 
 def test_a_borrower_borrows_only_its_shortfall() -> None:
-    p, calls = pool(["a"], owned_configured=2, shared_free=["s0", "s1"])
+    p, calls = pool(["a"], owned_present=2, shared_free=["s0", "s1"])
     assert plan.plan([req("j", 2, borrows=True)], p) == [Assigned("j", ["a", "s0"])]
     assert calls == [1]
 
 
 def test_the_shared_cards_are_read_at_most_once_a_pass() -> None:
-    p, calls = pool([], owned_configured=1, shared_free=["s0", "s1"])
+    p, calls = pool([], owned_present=1, shared_free=["s0", "s1"])
     decisions = plan.plan([req("a", borrows=True), req("b", borrows=True)], p)
     assert decisions == [Assigned("a", ["s0"]), Assigned("b", ["s1"])]
     assert calls == [1]
 
 
 def test_a_job_that_did_not_ask_never_triggers_a_reading() -> None:
-    p, calls = pool([], owned_configured=1, shared_free=["s"])
+    p, calls = pool([], owned_present=1, shared_free=["s"])
     assert plan.plan([req("j")], p) == [Holds("j", 0, 0, 1)]
     assert calls == []
 
 
 def test_a_job_that_does_not_fit_holds_and_nothing_behind_it_takes_those_cards() -> None:
     """Strict order: the card is idle, and the narrow job behind still waits."""
-    p, _ = pool(["a"], owned_configured=2)
+    p, _ = pool(["a"], owned_present=2)
     assert plan.plan([req("wide", 2), req("narrow")], p) == [
         Holds("wide", 1, 0, 1),
         Holds("narrow", 0, 0, 1),
@@ -189,7 +186,7 @@ def test_a_job_that_does_not_fit_holds_and_nothing_behind_it_takes_those_cards()
 def test_a_job_that_needs_no_cards_goes_ahead_of_the_ones_holding_them() -> None:
     """What is held is cards: a job behind that needs none of them is not
     held up by them, however much else is waiting."""
-    p, calls = pool(["a"], owned_configured=2, shared_free=["s"])
+    p, calls = pool(["a"], owned_present=2, shared_free=["s"])
     assert plan.plan([req("wide", 2), req("narrow"), req("cpu", 0, borrows=True)], p) == [
         Holds("wide", 1, 0, 1),
         Holds("narrow", 0, 0, 1),
@@ -199,7 +196,7 @@ def test_a_job_that_needs_no_cards_goes_ahead_of_the_ones_holding_them() -> None
 
 
 def test_a_held_shared_card_is_not_on_offer_behind_the_holder() -> None:
-    p, _ = pool([], owned_configured=2, shared_free=["s"])
+    p, _ = pool([], owned_present=2, shared_free=["s"])
     assert plan.plan([req("wide", 2, borrows=True), req("small", borrows=True)], p) == [
         Holds("wide", 0, 1, 1),
         Holds("small", 0, 0, 1),
@@ -217,18 +214,38 @@ def test_a_borrower_short_of_somebody_elses_card_is_stepped_over() -> None:
 
 
 def test_a_borrower_short_only_of_an_owned_card_holds_like_any_other() -> None:
-    p, _ = pool(["a"], owned_configured=2, shared_free=["s"])
+    p, _ = pool(["a"], owned_present=2, shared_free=["s"])
     assert plan.plan([req("wide", 3, borrows=True), req("narrow")], p) == [
         Holds("wide", 1, 1, 1),
         Holds("narrow", 0, 0, 1),
     ]
 
 
-def test_a_job_short_of_a_missing_owned_card_holds() -> None:
-    """Configured is what "could it ever fit" is judged against, so a card off
-    nvidia-smi this minute makes the job wait, not fail."""
-    p, _ = pool(["a"], owned_configured=2)
-    assert plan.plan([req("wide", 2)], p) == [Holds("wide", 1, 0, 1)]
+def test_a_job_short_of_a_missing_owned_card_fails_and_holds_nothing() -> None:
+    """Held, it would hold the queue for a card that may never come back, which
+    on a rental is a pod that never idles out (#69)."""
+    p, _ = pool(["a"], owned_absent=["7"])
+    failed, after = plan.plan([req("wide", 2), req("next")], p)
+    assert failed == Fails(
+        "wide",
+        "needs 2 GPUs, host owns 1 that nvidia-smi reports (7 listed but missing)",
+    )
+    assert after == Assigned("next", ["a"])
+
+
+def test_missing_cards_are_not_blamed_for_a_job_they_would_not_fit() -> None:
+    p, _ = pool(["a"], owned_absent=["7"])
+    assert plan.plan([req("huge", 3)], p) == [Fails("huge", "needs 3 GPUs, host owns 1")]
+
+
+def test_a_missing_shared_card_is_named_only_to_a_borrower() -> None:
+    p, _ = pool(["a"], shared_absent=["5"])
+    decisions = plan.plan([req("plain", 2), req("borrower", 2, borrows=True)], p)
+    assert [d.reason for d in decisions if isinstance(d, Fails)] == [
+        "needs 2 GPUs, host owns 1",
+        "needs 2 GPUs, host owns 1 and may borrow 0 shared that nvidia-smi reports "
+        "(5 listed but missing)",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -253,8 +270,8 @@ def test_a_shared_card_somebody_else_is_on_still_counts_against_never() -> None:
 def test_a_job_the_cards_on_their_way_back_cover_is_not_stuck() -> None:
     """The stop in flight covers the gap, so `preempt_for_waiting` stops
     nothing more for it, and no filler takes the card it will start on."""
-    p, _ = pool(["a"], owned_configured=2, shared_free=[], coming=["s"], shared=["s"])
-    p.shared_configured = p.shared_visible = 1
+    p, _ = pool(["a"], owned_present=2, shared_free=[], coming=["s"], shared=["s"])
+    p.shared_visible = 1
     assert plan.plan([req("j", 2, borrows=True), req("f", fills=True)], p) == [
         Holds("j", 1, 1, 0),
         Holds("f", 0, 0, 1),
@@ -265,7 +282,7 @@ def test_a_job_the_cards_on_their_way_back_cover_is_not_stuck() -> None:
 
 
 def test_an_auto_preempt_job_takes_a_card_held_for_the_job_ahead() -> None:
-    p, _ = pool(["a"], owned_configured=2)
+    p, _ = pool(["a"], owned_present=2)
     requests = [req("wide", 2), req("plain"), req("filler", fills=True)]
     assert plan.plan(requests, p) == [
         Holds("wide", 1, 0, 1),
@@ -275,13 +292,13 @@ def test_an_auto_preempt_job_takes_a_card_held_for_the_job_ahead() -> None:
 
 
 def test_equal_priority_is_no_bar_to_filling() -> None:
-    p, _ = pool(["a"], owned_configured=2)
+    p, _ = pool(["a"], owned_present=2)
     requests = [req("wide", 2, priority=50), req("filler", priority=50, fills=True)]
     assert plan.plan(requests, p)[1] == Assigned("filler", ["a"], ("wide",))
 
 
 def test_a_filler_too_wide_for_the_free_cards_holds_like_any_other() -> None:
-    p, _ = pool(["a"], owned_configured=3)
+    p, _ = pool(["a"], owned_present=3)
     assert plan.plan([req("wide", 3), req("filler", 2, fills=True)], p) == [
         Holds("wide", 1, 0, 2),
         Holds("filler", 0, 0, 2),
@@ -291,7 +308,7 @@ def test_a_filler_too_wide_for_the_free_cards_holds_like_any_other() -> None:
 def test_a_job_preemption_will_start_keeps_its_cards_from_fillers() -> None:
     """Else the filler would be stopped next pass along with the job the wide
     one is really waiting on."""
-    p, _ = pool(["a"], owned_configured=2, preemptable=[running("cheap", ["b"], priority=80)])
+    p, _ = pool(["a"], owned_present=2, preemptable=[running("cheap", ["b"], priority=80)])
     requests = [req("wide", 2, priority=10), req("filler", priority=90, fills=True)]
     assert plan.plan(requests, p) == [
         Holds("wide", 1, 0, 1, ("cheap",)),
@@ -302,7 +319,7 @@ def test_a_job_preemption_will_start_keeps_its_cards_from_fillers() -> None:
 def test_a_job_the_stops_in_flight_cover_keeps_its_cards_from_fillers() -> None:
     """The stopped filler is queued again right behind: it must not be able to
     take the card it just gave up, or the next one the one it came back to."""
-    p, _ = pool(["a"], owned_configured=2, coming=["b"])
+    p, _ = pool(["a"], owned_present=2, coming=["b"])
     assert plan.plan([req("wide", 2), req("stopped", fills=True)], p) == [
         Holds("wide", 2, 0, 0),
         Holds("stopped", 0, 0, 1),
@@ -310,7 +327,7 @@ def test_a_job_the_stops_in_flight_cover_keeps_its_cards_from_fillers() -> None:
 
 
 def test_only_a_job_behind_is_stopped_for_one_ahead_of_it() -> None:
-    p, _ = pool([], owned_configured=1)
+    p, _ = pool([], owned_present=1)
     ahead = running("20260101-a", ["a"], priority=50)
     assert plan.plan([req("20260101-b", priority=50)], replace_pool(p, ahead)) == [
         Holds("20260101-b", 0, 0, 1),
@@ -322,8 +339,8 @@ def test_only_a_job_behind_is_stopped_for_one_ahead_of_it() -> None:
 
 
 def test_a_filler_whose_own_card_is_coming_back_waits_for_it() -> None:
-    p, _ = pool(["a"], owned_configured=2, shared_free=[], coming=["s"], shared=["s"])
-    p.shared_configured = p.shared_visible = 1
+    p, _ = pool(["a"], owned_present=2, shared_free=[], coming=["s"], shared=["s"])
+    p.shared_visible = 1
     requests = [req("wide", 2), req("filler", borrows=True, fills=True)]
     assert plan.plan(requests, p) == [Holds("wide", 1, 0, 1), Holds("filler", 0, 1, 0)]
 
@@ -333,11 +350,11 @@ def test_only_the_first_stuck_job_is_covered_by_preemption() -> None:
     cards are not kept idle for stops nobody will make."""
     p, _ = pool(
         [],
-        owned_configured=1,
+        owned_present=1,
         shared_free=["s0"],
         preemptable=[running("cheap", ["s1"]), running("cheap2", ["a"])],
     )
-    p.shared_configured = p.shared_visible = 2
+    p.shared_visible = 2
     requests = [
         req("first", priority=10),
         req("borrower", 2, borrows=True, priority=20),
@@ -355,7 +372,7 @@ def replace_pool(p: Pool, *preemptable: Preemptable) -> Pool:
 
 
 def test_a_borrowing_filler_takes_a_held_shared_card() -> None:
-    p, _ = pool([], owned_configured=1, shared_free=["s"])
+    p, _ = pool([], owned_present=1, shared_free=["s"])
     requests = [
         req("wide", 2, borrows=True),
         req("plain", fills=True),
@@ -404,11 +421,11 @@ STARTS: list[tuple[str, list[Request], list[Card], dict[str, object], dict[str, 
         {"wide": 90.0, "narrow": 120.0},
     ),
     (
-        "a missing owned card holds the whole queue",
+        "a job needing a missing owned card does not hold the queue",
         [req("wide", 2), req("narrow"), req("wide-too", 2)],
         owned(45),
         {"owned_missing": ["7"]},
-        {},
+        {"narrow": 45.0},
     ),
     (
         "a job behind one whose card never frees has no start",
@@ -627,11 +644,11 @@ REASONS: list[tuple[str, list[Request], list[Card], dict[str, object], dict[str,
         {"wide": "it needs 1 shared card(s) somebody else is using"},
     ),
     (
-        "stepped over, the shared entry is missing from nvidia-smi",
+        "a borrower short of a shared entry missing from nvidia-smi",
         [req("q", 3, borrows=True)],
         owned(0, 0),
-        {"shared_missing": 1},
-        {"q": "somebody else is using"},
+        {"shared_missing": ["5"]},
+        {"q": "(5 listed but missing), so it will never be dispatched"},
     ),
     (
         "the only job, every card busy with no end time",
@@ -655,17 +672,11 @@ REASONS: list[tuple[str, list[Request], list[Card], dict[str, object], dict[str,
         {"wide": NO_END, "narrow": "job wide is ahead of it and has no start time yet"},
     ),
     (
-        "held on a missing owned card",
-        [req("wide", 2), req("narrow"), req("wide-too", 2)],
+        "short of a missing owned card",
+        [req("wide", 2), req("narrow")],
         owned(45),
         {"owned_missing": ["7"]},
-        {
-            "wide": "it needs 2 card(s) and only 1 of the 2 this host owns answer to "
-            "nvidia-smi (7 missing), so it is held until they do",
-            # Behind the holder, each is waiting on the queue, not the card.
-            "narrow": "job wide is ahead of it",
-            "wide-too": "job wide is ahead of it",
-        },
+        {"wide": "(7 listed but missing), so it will never be dispatched"},
     ),
     (
         "a wide borrower waiting on our card is not told it waits on somebody else",
@@ -688,12 +699,6 @@ def test_project_says_why(
     unknown = project(requests, cards, **kwargs).unknown  # type: ignore[arg-type]
     for job_id, fragment in expected.items():
         assert fragment in unknown.get(job_id, ""), (job_id, unknown)
-
-
-def test_a_job_behind_a_holder_is_not_told_about_the_missing_card() -> None:
-    unknown = project([req("wide", 2), req("wide-too", 2)], owned(45), owned_missing=["7"]).unknown
-    assert "missing" in unknown["wide"]
-    assert "missing" not in unknown["wide-too"]
 
 
 def test_an_empty_queue_projects_nothing() -> None:

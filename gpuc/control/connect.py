@@ -27,7 +27,7 @@ from gpuc.control.config import (
     load_settings,
     transport_for,
 )
-from gpuc.control.gpuinfo import table_of
+from gpuc.control.gpuinfo import describe_owned, owned_entries, table_of
 from gpuc.control.remote import HostConfigRead, read_config, resolve_home, write_config
 from gpuc.control.transport import Transport
 from gpuc.host import gpus, jobs
@@ -219,20 +219,30 @@ def _refuse_overlapping_gpus(
     2,3` and `--gpus GPU-a,GPU-b` can name the same two cards -- and an index
     is the spelling somebody copies off the probe's own output.
     """
-    wanted = patch.get("gpus")
-    if not isinstance(wanted, list) or force:
+    if "gpus" not in patch or force:
         return
+    wanted = patch["gpus"]
     table = table_of(address.gpu_info)
+    held = HostConfig.from_dict(existing)
+    if wanted is None:
+        # `all` is the cards the probe saw less the shared ones, and claims
+        # them as surely as listing them would.
+        after = HostConfig.from_dict({**existing, **patch})
+        wanted = owned_entries(None, after.shared_gpus, address.gpu_info)
+        named = "all"
+    elif isinstance(wanted, list):
+        named = ",".join(sorted(str(item) for item in wanted))
+    else:
+        return
     mine = _cards([str(item) for item in wanted], table)
-    theirs = HostConfig.from_dict(existing).gpus
+    theirs = owned_entries(held.gpus, held.shared_gpus, address.gpu_info)
     # Named as the *host* spells them, which is how the sentence below reads.
     shared = [item for item in theirs if _cards([item], table) & mine]
     if not shared or _cards(theirs, table) == mine:
         return
-    named = sorted(str(item) for item in wanted)
     raise ConnectError(
-        f"host {address.name} is already configured with GPUs {', '.join(theirs)}, and "
-        f"--gpus {','.join(named)} shares {', '.join(shared)} with that list without "
+        f"host {address.name} is already configured with GPUs {describe_owned(held.gpus)}, and "
+        f"--gpus {named} shares {', '.join(shared)} with that list without "
         f"matching it.\n"
         f"That is the one difference that can hand one card to two jobs, so it is refused "
         f"rather than warned about: drop --gpus to adopt what the host has, name a disjoint "
@@ -277,5 +287,5 @@ def _refuse_shared_overlap(
         f"host {entry.name} would have {', '.join(both)} named twice, in both --gpus and "
         f"--shared-gpus or as an index and its own UUID, and a card is either ours to hand "
         f"out or somebody else's to borrow, and one card once.\n"
-        f"Owned: {', '.join(config.gpus) or 'none'}. Shared: {', '.join(config.shared_gpus)}."
+        f"Owned: {describe_owned(config.gpus)}. Shared: {', '.join(config.shared_gpus)}."
     )

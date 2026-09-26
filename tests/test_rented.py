@@ -42,7 +42,7 @@ def test_an_address_is_only_what_the_provider_says() -> None:
         22000,
         "pod1",
     )
-    assert address.config.gpus == []
+    assert address.config.gpus is None
 
 
 def test_a_pod_with_no_ssh_endpoint_has_no_address_yet() -> None:
