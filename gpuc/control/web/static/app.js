@@ -307,12 +307,8 @@ function model(gpu) {
   return [gpu.name || "?", gpu.vram_mib ? ` ${Math.round(gpu.vram_mib / 1024)} GB` : ""];
 }
 
-function gpuRow(index, state, model) {
+function cardRow(index, state, model) {
   return el("tr", {}, el("td", { class: "gpu-index" }, `[${index ?? "?"}]`), el("td", {}, state), el("td", {}, model));
-}
-
-function missingRow(entry, as, what) {
-  return gpuRow(entry[as], [badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`], "");
 }
 
 // `?` and not `0` for a reading the host could not take: "0 MiB, 0% util"
@@ -325,34 +321,27 @@ function usage(gpu) {
   return el("span", { class: "muted" }, ` ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`);
 }
 
-function gpuTable(host) {
-  const shared = host.shared_gpus || [];
-  if (!host.gpus.length && !shared.length) return el("p", { class: "empty" }, "no GPUs");
-  // No holder column: the running table below names each job's cards.
-  const rows = host.gpus.map((gpu) => (gpu.available === false
-    ? missingRow(gpu, "owned_as", "dispatched to")
-    : gpuRow(gpu.index, [gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), usage(gpu)], model(gpu))));
-  // `IN USE` is somebody else's, not ours: the reading beside it is why a job
-  // that asked for the card is still queued.
-  for (const gpu of shared) {
-    if (gpu.available === false) {
-      rows.push(missingRow(gpu, "shared_as", "borrowed from"));
-      continue;
-    }
-    let state;
-    if (gpu.busy_job) state = badge("shared, busy", "warn");
-    else if (gpu.unused) state = badge("shared, free", "good");
-    else state = badge("shared, IN USE", "bad");
-    rows.push(gpuRow(gpu.index, [state, usage(gpu)], model(gpu)));
+const CARD_BADGES = { free: ["free", "good"], busy: ["busy", "warn"], in_use: ["IN USE", "bad"] };
+
+function gpuRow(gpu) {
+  if (gpu.state === "unavailable") {
+    const what = gpu.shared ? "borrowed from" : "dispatched to";
+    return cardRow(gpu.entry, [badge("UNAVAILABLE", "bad"), ` nvidia-smi does not report this card, so nothing is ${what} it`], "");
   }
-  return table([{ text: "card" }, { text: "state" }, { text: "model" }], rows);
+  const [text, tone] = CARD_BADGES[gpu.state];
+  return cardRow(gpu.index, [badge(gpu.shared ? `shared, ${text}` : text, tone), usage(gpu)], model(gpu));
+}
+
+function gpuTable(host) {
+  if (!host.gpus.length) return el("p", { class: "empty" }, "no GPUs");
+  // No holder column: the running table below names each job's cards.
+  return table([{ text: "card" }, { text: "state" }, { text: "model" }], host.gpus.map(gpuRow));
 }
 
 function gpuLabels(host, job) {
   if (!job.gpus.length) return "none";
-  const cards = [...host.gpus, ...(host.shared_gpus || [])];
   return job.gpus.map((uuid) => {
-    const card = cards.find((g) => g.uuid === uuid);
+    const card = host.gpus.find((g) => g.uuid === uuid);
     return card && card.index !== null && card.index !== undefined ? String(card.index) : uuid;
   }).join(",");
 }
@@ -362,7 +351,7 @@ function gpuLabels(host, job) {
 // it at all. Only said on a host that has shared cards: everywhere else it is
 // a line about borrowing on a host that never borrows.
 function borrowLabel(host, job) {
-  if (!(host.shared_gpus || []).length) return null;
+  if (!host.gpus.some((g) => g.shared)) return null;
   // Dotted off rather than run on: ` needs 2 gpus owned cards only` reads as
   // one phrase about the two cards.
   if (job.use_shared === null || job.use_shared === undefined) {
@@ -441,12 +430,14 @@ function finishedTable(host) {
 }
 
 function cardsSummary(host) {
-  const available = host.gpus.filter((g) => g.available !== false);
-  const shared = (host.shared_gpus || []).filter((g) => g.available !== false);
+  const present = host.gpus.filter((g) => g.state !== "unavailable");
+  const owned = present.filter((g) => !g.shared);
+  const shared = present.filter((g) => g.shared);
+  const free = (cards) => cards.filter((g) => g.state === "free").length;
   // A host that owns nothing and borrows something is a real configuration,
   // and `no GPUs` above a list of shared cards contradicts itself.
-  if (available.length) return `gpus ${available.filter((g) => !g.busy_job).length}/${available.length} free`;
-  if (shared.length) return `shared ${shared.filter((g) => g.unused && !g.busy_job).length}/${shared.length} free, none owned`;
+  if (owned.length) return `gpus ${free(owned)}/${owned.length} free`;
+  if (shared.length) return `shared ${free(shared)}/${shared.length} free, none owned`;
   return "no GPUs";
 }
 

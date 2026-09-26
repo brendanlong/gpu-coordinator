@@ -23,7 +23,7 @@ from gpuc.control import web
 from gpuc.control.cli import EXIT_USAGE, main
 from gpuc.control.config import HostEntry, Settings, hosts_file
 from gpuc.control.remote import HostSession, RemoteError
-from gpuc.control.status import HostState, HostView
+from gpuc.control.status import CardView, HostState, HostView
 from gpuc.control.web.app import Dashboard, ServerThread
 from gpuc.control.web.auth import (
     SESSION_COOKIE,
@@ -133,7 +133,9 @@ def minutes_ago(minutes: float) -> str:
 
 
 def fake_host_view(entry: HostEntry, *a: object, **k: object) -> HostView:
-    view = HostView(entry=entry, state=HostState.ANSWERED, owned=[GPU], heartbeat_age_s=2.0)
+    view = HostView(
+        entry=entry, state=HostState.ANSWERED, cards=[CardView(GPU)], heartbeat_age_s=2.0
+    )
     view.queue, view.running, view.finished = status_mod.job_views(
         {
             "queue": [{"priority": 50, "job_id": "20260915-130000-aaaaaa"}],

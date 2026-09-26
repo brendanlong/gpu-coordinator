@@ -675,12 +675,12 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
       "dispatcher": { "alive": true, "heartbeat_age_s": 2.0, "pkg_commit": "8f1616c..." },
       "provider_util": null,
       "gpus": [
-        { "index": 0, "uuid": "GPU-8064...", "name": "NVIDIA A40", "vram_mib": 46068,
-          "busy_job": "20260915-120000-abc123", "memory_mib": 38912.0, "utilization_pct": 100.0 }
-      ],
-      "shared_gpus": [
-        { "index": 4, "uuid": "GPU-aaaa...", "name": "NVIDIA A40", "vram_mib": 46068,
-          "busy_job": null, "memory_mib": 0.0, "utilization_pct": 0.0, "unused": true }
+        { "index": 0, "uuid": "GPU-8064...", "entry": null, "shared": false, "state": "busy",
+          "name": "NVIDIA A40", "vram_mib": 46068, "busy_job": "20260915-120000-abc123",
+          "memory_mib": 38912.0, "utilization_pct": 100.0 },
+        { "index": 4, "uuid": "GPU-aaaa...", "entry": null, "shared": true, "state": "free",
+          "name": "NVIDIA A40", "vram_mib": 46068, "busy_job": null,
+          "memory_mib": 0.0, "utilization_pct": 0.0 }
       ],
       "queued": [
         { "job_id": "20260915-130000-d4e5f6", "name": "sweep", "status": "queued",
@@ -749,11 +749,13 @@ jobs that went with it, else null), `state` (`answered`, `unaskable` or `gone`, 
 above; `errors[]` carries the reason and decides the exit code, `warnings[]`
 carries the build mismatch and does not), `pod` (the provider's view of a
 rental's pod), `pkg_commit` (the host's own answer for the build it runs; `null`
-means it did not say). A card the host cannot see appears in `gpus` as
-`{"owned_as": "3", "available": false}`, and `memory_mib` / `utilization_pct` on
-a card are null when nvidia-smi gave no reading; `shared_gpus` has the same shape plus
-`unused` (no memory held, no work running) and `busy_job` (one of *our* jobs
-has it), and a missing one is `{"shared_as": "5", "available": false}`.
+means it did not say). `gpus` lists owned cards, then shared ones, then any
+configured card nvidia-smi does not report. Each card's `state` is what the text
+view prints: `free`, `busy` (`busy_job`, one of *our* jobs, has it), `in_use`
+(a shared card somebody else is on, or that nvidia-smi could not read) or
+`unavailable`, where `entry` is the configured index or UUID and `uuid`, `index`,
+`name` and `vram_mib` are null. `memory_mib` / `utilization_pct` are null when
+nvidia-smi gave no reading.
 `--recent` and `--since` apply to `--json`; `--all` fills `unhosted[]` with the
 jobs only the index knows, each `{job_id, name, host, host_state, status,
 requeue, requeued_from, submitted_at, s3_prefix, outputs_lost}`. `status` is

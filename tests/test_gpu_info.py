@@ -7,7 +7,7 @@ from pathlib import Path
 from gpuc.control.cli import main
 from gpuc.control.config import HostEntry, registry_transaction
 from gpuc.control.gpuinfo import GpuInfo, from_table, rows, summarize, table_of, vram_text
-from gpuc.control.status import HostState, HostView, JobView, render
+from gpuc.control.status import CardView, HostState, HostView, JobView, render
 from gpuc.host import gpus
 from tests.conftest import host_entry, load_registry
 
@@ -76,7 +76,7 @@ def test_status_names_the_cards_and_who_holds_them() -> None:
         entry=entry_with_cards(),
         state=HostState.ANSWERED,
         heartbeat_age_s=2.0,
-        owned=[A40, A40_TWO],
+        cards=[CardView(A40), CardView(A40_TWO)],
         running=[JobView(job_id="20260915-1", status="running", gpus=[A40])],
     )
     text = render(view)

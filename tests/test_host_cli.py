@@ -421,14 +421,20 @@ def test_status_resolves_the_owned_gpus(
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
-    assert status["gpus"] == ["3", "9"]
-    assert status["gpus_resolved"] == [
-        {"index": 3, "uuid": FAKE_GPUS[0], "memory_mib": 512.0, "utilization_pct": 40.0}
+    assert status["cards"] == [
+        {
+            "index": 3,
+            "uuid": FAKE_GPUS[0],
+            "shared": False,
+            "memory_mib": 512.0,
+            "utilization_pct": 40.0,
+            "unused": False,
+        }
     ]
-    assert status["gpus_unavailable"] == ["9"]
+    assert status["cards_missing"] == [{"entry": "9", "shared": False}]
 
 
-def test_status_reads_shared_cards_like_owned_ones_plus_whether_they_are_unused(
+def test_status_reads_shared_cards_like_owned_ones(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -446,10 +452,11 @@ def test_status_reads_shared_cards_like_owned_ones_plus_whether_they_are_unused(
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
-    assert status["shared_gpus_resolved"] == [
+    assert [card for card in status["cards"] if card["shared"]] == [
         {
             "index": 1,
             "uuid": FAKE_GPUS[1],
+            "shared": True,
             "memory_mib": 0.0,
             "utilization_pct": 0.0,
             "unused": True,

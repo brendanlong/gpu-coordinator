@@ -37,7 +37,7 @@ from gpuc.control.config import (
     read_registry,
 )
 from gpuc.control.s3index import S3IndexError
-from gpuc.control.status import HostState, HostView
+from gpuc.control.status import CardView, HostState, HostView
 from tests.conftest import (
     FAKE_GPUS,
     accept_job,
@@ -612,20 +612,23 @@ def test_status_json_is_one_document_with_the_promised_shape(
     # One row for the owned card. Which shape it takes says whether nvidia-smi
     # on *this* machine could resolve it, which is not what this test is about.
     (row,) = host["gpus"]
-    if row.get("available") is False:
-        assert row == {"owned_as": GPU, "available": False}
+    assert set(row) == {
+        "index",
+        "uuid",
+        "entry",
+        "shared",
+        "state",
+        "name",
+        "vram_mib",
+        "busy_job",
+        "memory_mib",
+        "utilization_pct",
+    }
+    assert row["shared"] is False
+    if row["state"] == "unavailable":
+        assert (row["entry"], row["uuid"]) == (GPU, None)
     else:
-        assert set(row) == {
-            "index",
-            "uuid",
-            "name",
-            "vram_mib",
-            "busy_job",
-            "memory_mib",
-            "utilization_pct",
-        }
-        assert row["uuid"] == GPU
-        assert row["busy_job"] == RUNNING_JOB
+        assert (row["uuid"], row["state"], row["busy_job"]) == (GPU, "busy", RUNNING_JOB)
 
 
 def test_config_show_json_is_the_effective_settings(
@@ -892,7 +895,12 @@ def test_a_config_this_machine_has_not_caught_up_with_is_not_a_warning(
     entry = host_entry(
         name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"], pkg_commit="a" * 40
     )
-    view = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="a" * 40, owned=["0", "1"])
+    view = HostView(
+        entry=entry,
+        state=HostState.ANSWERED,
+        pkg_commit="a" * 40,
+        cards=[CardView("GPU-0"), CardView("GPU-1")],
+    )
     assert status_mod.host_warnings(view) == []
 
 
