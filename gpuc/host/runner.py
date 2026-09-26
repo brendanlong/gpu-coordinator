@@ -337,8 +337,17 @@ class JobRunner:
 
     def _record_util(self, util: float | None) -> None:
         sample = None if util is None else round(util, 1)
-        recent = [*jobs.read_state(self.job_id).util_recent, sample][-UTIL_SAMPLES_KEPT:]
-        jobs.update_state(self.job_id, util_recent=recent)
+        state = jobs.read_state(self.job_id)
+        recent = [*state.util_recent, sample][-UTIL_SAMPLES_KEPT:]
+        if sample is None:
+            jobs.update_state(self.job_id, util_recent=recent)
+            return
+        jobs.update_state(
+            self.job_id,
+            util_recent=recent,
+            util_sum=state.util_sum + sample,
+            util_samples=state.util_samples + 1,
+        )
 
     def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
         self.kill_reason = reason

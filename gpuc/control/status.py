@@ -99,6 +99,12 @@ class JobView:
     started_at: str | None = None
     ended_at: str | None = None
     util_recent: list[float] = field(default_factory=list)
+    util_sum: float = 0.0
+    util_samples: int = 0
+    """Every good `main`-phase sample of the attempt, summed and counted: what
+    says how busy a finished job kept its cards, long after `util_recent` has
+    rotated out. The count travels with the mean so 22% over 700 samples can
+    be told from 22% over 3."""
     progress_pct: float | None = None
     """How far along the job's own `progress_command` last said it was."""
     eta: str | None = None
@@ -160,6 +166,10 @@ class JobView:
     @property
     def last_util(self) -> float | None:
         return self.util_recent[-1] if self.util_recent else None
+
+    @property
+    def util_mean(self) -> float | None:
+        return self.util_sum / self.util_samples if self.util_samples > 0 else None
 
     @property
     def eta_seconds(self) -> float | None:
@@ -435,6 +445,8 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             util_recent=[
                 float(u) for u in entry.get("util_recent") or [] if isinstance(u, (int, float))
             ],
+            util_sum=_as_float(entry.get("util_sum")) or 0.0,
+            util_samples=_as_int(entry.get("util_samples")) or 0,
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
@@ -567,6 +579,18 @@ def _fmt_util(job: JobView, *, source: bool = False) -> str:
     """
     tag = " (host)" if source else ""
     return f"util --{tag}" if job.last_util is None else f"util {job.last_util:.0f}%{tag}"
+
+
+def _fmt_util_mean(job: JobView) -> str:
+    """`, avg util 22% on 1 gpu`: a measurement, not a verdict -- whether 22%
+    is low depends on what the job was meant to do, which only its owner
+    knows. Nothing for a job with no good sample (no card, or never reached
+    `main`)."""
+    mean = job.util_mean
+    if mean is None:
+        return ""
+    cards = len(job.gpus)
+    return f", avg util {mean:.0f}% on {cards} gpu{'' if cards == 1 else 's'}"
 
 
 def job_label(job: JobView) -> str:
@@ -843,7 +867,8 @@ def _finished_lines(view: HostView, *, recent: int, since_s: float | None) -> li
             flag = f"  kept on host: {', '.join(job.kept_outputs)}"
         lines.append(
             f"  done    {job_label(job)} {job.status}"
-            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
+            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}"
+            f"{_fmt_util_mean(job)}{flag}"
         )
     if since_s is not None and not finished and view.finished_total:
         lines.append(
@@ -1034,6 +1059,8 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "started_at": job.started_at,
         "elapsed_s": None if job.minutes is None else round(job.minutes * 60.0, 1),
         "util": job.last_util,
+        "util_mean": None if job.util_mean is None else round(job.util_mean, 1),
+        "util_samples": job.util_samples,
         "progress_pct": job.progress_pct,
         "eta": job.eta,
         "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),

@@ -241,15 +241,16 @@ already; it is running now`. `gpuc reorder` prints the same line.
 heartbeat, one line per owned card (`free` / `busy` / `UNAVAILABLE`) and per
 [shared](#shared-gpus) one, the queue, running jobs with phase, elapsed time,
 last util, the cards they hold (`gpu=2,3`) and any
-[end-time estimate](#job-length-estimates), and recent finished jobs. Every job
-is `name (job-id)`.
+[end-time estimate](#job-length-estimates), and recent finished jobs with the
+mean utilization of their cards over `main` (`avg util 22% on 1 gpu`; absent
+when no sample was taken). Every job is `name (job-id)`.
 
 ```
 host local [local]  gpus 0/1 free (driver 580.173.02)
   dispatcher 0s ago
   gpu     [0] busy NVIDIA GeForce RTX 3060 Ti 8 GB
   running lego-s4 (20260915-231241-f880d9) phase=main 27m util 100% gpu=0 eta 45m (37%)
-  done    hello (20260915-074344-1d4db4) succeeded 15h ago
+  done    hello (20260915-074344-1d4db4) succeeded 15h ago, avg util 41% on 1 gpu
 host spar [ssh]  gpus 0/2 free (driver 535.309.01)
   dispatcher 2s ago
   gpu     [2] busy NVIDIA A40 45 GB
@@ -695,6 +696,10 @@ Beyond what the example shows:
   spec's, as the host holds them) and `links`: one `{kind, path, target, url}`
   per place the results, W&B run or mirrored log can be opened, derived from
   what the job declared and never checked.
+- `util_mean` is the mean of every sample of the attempt's `main` phase, each
+  already the mean over the job's cards, and `util_samples` how many there
+  were (one per 30 s); `util_mean` is null at zero samples. Setup and failed
+  readings are in neither.
 - `util` is the job's last sample from the host's own nvidia-smi; a pod's
   `provider_util` is the provider's per-GPU reading for the whole pod, null
   elsewhere.

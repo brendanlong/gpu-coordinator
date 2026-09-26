@@ -162,7 +162,8 @@ destinations. Adding another of either changes nothing else in this document.
 - Everything about hosts and jobs is visible from the CLI: every host's
   cards and dispatcher; every queued job in dispatch order with its projected
   start; every running job with its phase, cards, utilization and estimate;
-  recent results; and each job's log.
+  recent results, each with its mean utilization over its main phase; and
+  each job's log.
 - **A user can copy a job's outputs from its host to their machine**, while
   it runs or after, for as long as its workdir is on the host.
 - **A user can wait for jobs to end**, in one command that reports what
@@ -217,7 +218,8 @@ destinations. Adding another of either changes nothing else in this document.
 - A guaranteed rental teardown. A rental ends itself when idle; one whose
   provisioning client died before terminating it, or whose dispatcher dies
   after handoff, bills until a person ends it.
-- Detecting whether a running job is using its GPU efficiently.
+- Judging whether a job used its GPU efficiently. Its utilization is reported;
+  what that number should have been is the user's call.
 - Spending limits across rentals.
 - Automatic re-placement of a job after it has started running: a failure at
   that point is more likely the job's than the host's.

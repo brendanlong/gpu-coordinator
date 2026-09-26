@@ -545,6 +545,8 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "phase",
         "elapsed_s",
         "util",
+        "util_mean",
+        "util_samples",
         "progress_pct",
         "eta",
         "eta_s",

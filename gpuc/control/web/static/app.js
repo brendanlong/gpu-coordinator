@@ -404,6 +404,8 @@ function finishedTable(host) {
     const detail = reason || (job.exit_code ? `exit ${job.exit_code}` : "");
     // How far a job had got when it ended is the useful part of a failure.
     const progress = job.progress_pct !== null && job.status !== "succeeded" ? ` (${Math.round(job.progress_pct)}%)` : "";
+    const cards = job.gpus.length;
+    const util = job.util_mean === null ? "" : `, avg util ${Math.round(job.util_mean)}% on ${cards} gpu${cards === 1 ? "" : "s"}`;
     let level = "good";
     if (job.status === "failed") level = "bad";
     else if (job.status === "cancelled") level = "warn";
@@ -413,7 +415,7 @@ function finishedTable(host) {
     else if ((job.kept_outputs || []).length) flag = badge("kept on host", "");
     return el("tr", {},
       el("td", {}, jobLabel(job)),
-      el("td", {}, badge(job.status, level), detail ? ` ${detail}` : "", progress),
+      el("td", {}, badge(job.status, level), detail ? ` ${detail}` : "", progress, util),
       el("td", {}, fmtAge(job.ended_at)),
       el("td", {}, flag, job.workdir_bytes ? el("span", { class: "muted" }, ` workdir ${fmtBytes(job.workdir_bytes)}`) : null),
       el("td", {}, links(job)),

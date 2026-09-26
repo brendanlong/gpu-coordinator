@@ -350,6 +350,8 @@ def test_job_state_coerces_the_types_it_acts_on() -> None:
             "attempt": "2",
             "gpus": ["GPU-1", 2],
             "util_recent": [1, "2.5", None, "junk"],
+            "util_sum": "180.5",
+            "util_samples": 2.0,
             "outputs_lost": 1,
             "reason": 5,
         }
@@ -360,6 +362,7 @@ def test_job_state_coerces_the_types_it_acts_on() -> None:
     assert state.status == "7" and state.reason == "5"
     assert state.gpus == ["GPU-1", "2"]
     assert state.util_recent == [1.0, 2.5, None, None]
+    assert (state.util_sum, state.util_samples) == (180.5, 2)
     assert state.outputs_lost is True
     assert JobState.from_dict({"pgid": "not a pid", "runner_pid": []}).pgid is None
 
