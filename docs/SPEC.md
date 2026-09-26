@@ -101,12 +101,13 @@ destinations. Adding another of either changes nothing else in this document.
   and nothing behind it may take them, even at the cost of idle cards. What is
   held is those cards, not the queue: a job behind that needs none of them
   goes ahead. A job waiting for a shared card
-  someone else is using is stepped over instead.
+  someone else is using is stepped over instead. A job that allows automatic
+  preemption may take free held cards, and is preempted once the job holding
+  them can start.
 - Priorities of queued jobs can be changed, and the queue reorders
   accordingly.
 - **A running job can be preempted** so that a job ahead of it in dispatch
-  order can run, by command or automatically for jobs that opt in -- and
-  automatically only for a strictly higher-priority job. Preemption restarts
+  order can run, by command or automatically for jobs that opt in. Preemption restarts
   the job from the beginning in its existing working tree; checkpointing is the
   job's business. A preempt is refused when nothing waiting for its cards
   would be dispatched ahead of the preempted job.
