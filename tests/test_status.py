@@ -510,7 +510,7 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     numbering -- so free/busy, and the per-card lines, come from its answer."""
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "7"])
     host_view = HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=2.0)
-    host_view.owned, host_view.indices = owned_gpus(
+    host_view.owned, host_view.indices, host_view.owned_usage = owned_gpus(
         payload(
             gpus=["0", "7"],
             gpus_resolved=[{"index": 0, "uuid": GPU}],
@@ -531,8 +531,27 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
 def test_only_the_hosts_resolved_table_names_owned_cards() -> None:
     """`config.gpus` may be indices, and the cache is nobody's evidence: a
     payload with no resolved table owns nothing until the host says."""
-    owned, indices = owned_gpus(payload())
-    assert (owned, indices) == ([], {})
+    assert owned_gpus(payload()) == ([], {}, {})
+
+
+def test_each_owned_card_shows_what_nvidia_smi_just_read_on_it() -> None:
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "1"])
+    host_view = HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=2.0)
+    host_view.owned, host_view.indices, host_view.owned_usage = owned_gpus(
+        payload(
+            gpus_resolved=[
+                {"index": 0, "uuid": GPU, "memory_mib": 21504.0, "utilization_pct": 97.0},
+                {"index": 1, "uuid": "GPU-other", "memory_mib": None, "utilization_pct": None},
+            ],
+        )
+    )
+    text = render(host_view)
+    assert "gpu     [0] free ? (21504 MiB, 97% util)" in text
+    # No reading is no reading, not a zero.
+    assert "[1] free ?\n" in text + "\n"
+    cards = host_json(host_view)["gpus"]
+    assert (cards[0]["memory_mib"], cards[0]["utilization_pct"]) == (21504.0, 97.0)
+    assert (cards[1]["memory_mib"], cards[1]["utilization_pct"]) == (None, None)
 
 
 def in_minutes(minutes: float) -> str:
