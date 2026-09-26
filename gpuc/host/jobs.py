@@ -431,13 +431,26 @@ class JobState:
     a new job id and starts at 1 again; see `JobSpec.requeued_from`."""
     priority: int = 50
     """The priority the job is (or was) ordered by. Starts as the spec's and
-    is what `gpuc reorder` and `gpuc preempt --priority` change; the queue is
+    is what `gpuc set --priority` and `gpuc preempt --priority` change; the queue is
     every `queued` state sorted by `(priority, job_id)`, so this is the one
     copy of it."""
     estimated_runtime_min: float | None = None
-    """The submitter's estimate, as `gpuc estimate` last left it. The spec is
-    never rewritten after enqueue, so the live value is here and the runner
-    re-reads it from here."""
+    """The submitter's estimate, as `gpuc set --estimate` last left it. The
+    spec is never rewritten after enqueue, so the live value is here and the
+    runner re-reads it from here. See `settable` for everything else `set`
+    changes."""
+    max_runtime_min: float | None = None
+    """The wall-clock limit in force, as `gpuc set --max-runtime` last left
+    it; the runner re-reads it like the estimate. Meant only when
+    `live_max_runtime` says so: see `max_runtime`."""
+    live_max_runtime: bool = False
+    """Whether `max_runtime_min` above is the limit, rather than the spec's.
+
+    False in a state an earlier build wrote, which never carried the limit:
+    there a null would read as "no limit" when the spec has one. It is also
+    how `gpuc set --max-runtime` tells whether a running job will see the
+    change: a runner from before the limit was live claimed the job with a
+    build that drops this key, and it enforces the limit it started with."""
     reason: str | None = None
     """What ended the job, one word: see usage.md's table."""
     problems: list[str] = field(default_factory=list)
@@ -546,6 +559,8 @@ class JobState:
             attempt=as_int(fields, "attempt", 1),
             priority=as_int(fields, "priority", 50),
             estimated_runtime_min=as_opt_float(fields, "estimated_runtime_min"),
+            max_runtime_min=as_opt_float(fields, "max_runtime_min"),
+            live_max_runtime=as_bool(fields, "live_max_runtime"),
             reason=as_opt_str(fields, "reason"),
             problems=as_str_list(fields, "problems"),
             exit_code=as_opt_int(fields, "exit_code"),
@@ -594,6 +609,12 @@ class JobState:
         mirror = self.mirror
         return mirror is not None and mirror.ok_at is not None and mirror.error is None
 
+    def max_runtime(self, spec: JobSpec | None) -> float | None:
+        """The wall-clock limit in minutes this job is held to, if any."""
+        if self.live_max_runtime:
+            return self.max_runtime_min
+        return None if spec is None else spec.max_runtime_min
+
     def output_uploads(self) -> list[Upload]:
         return [u for u in self.uploads if u.output is not None]
 
@@ -623,6 +644,8 @@ class JobState:
             status="queued",
             priority=spec.priority,
             estimated_runtime_min=spec.estimated_runtime_min,
+            max_runtime_min=spec.max_runtime_min,
+            live_max_runtime=True,
             ran=False,
         )
 
@@ -698,7 +721,7 @@ def finish(
         state.ran = state.ran or outcome.ran
         if forget_output_uploads:
             state.forget_output_uploads()
-        write_state(job_id, _apply(state, extra))
+        write_state(job_id, apply_fields(state, extra))
         return state
 
 
@@ -769,7 +792,7 @@ def locked(job_id: str) -> Iterator[None]:
         os.close(fd)
 
 
-def _apply(state: JobState, fields: Mapping[str, Any]) -> JobState:
+def apply_fields(state: JobState, fields: Mapping[str, Any]) -> JobState:
     for key, value in fields.items():
         if key not in JobState.__dataclass_fields__:
             raise KeyError(f"unknown JobState field: {key}")
@@ -779,7 +802,7 @@ def _apply(state: JobState, fields: Mapping[str, Any]) -> JobState:
 
 def update_state(job_id: str, **fields: Any) -> JobState:
     with locked(job_id):
-        state = _apply(read_state(job_id), fields)
+        state = apply_fields(read_state(job_id), fields)
         write_state(job_id, state)
         return state
 
@@ -801,7 +824,7 @@ def transition(
         state = read_state(job_id)
         if state.status not in wanted or (attempt is not None and state.attempt != attempt):
             return None
-        write_state(job_id, _apply(state, fields))
+        write_state(job_id, apply_fields(state, fields))
         return state
 
 

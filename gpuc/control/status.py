@@ -106,6 +106,8 @@ class JobView:
     where there is one, from the spec's `estimated_runtime_min` otherwise."""
     estimated_runtime_min: float | None = None
     """The submitter's own estimate, which is all a *queued* job has."""
+    max_runtime_min: float | None = None
+    """The wall-clock limit the job is killed as `timeout` at, if any."""
     starts_in_s: float | None = None
     """When the host expects this queued job's turn to come, by replaying its
     own dispatch rule over the running jobs' etas. Null when it cannot say."""
@@ -304,7 +306,7 @@ class HostView:
     pod: Pod | None = None
     session: HostSession | None = None
     """The session the answer came over, for a caller with a follow-up
-    question (`submit` and `reorder` ask where the job landed)."""
+    question (`submit` and `set --priority` ask where the job landed)."""
     mirror_prefix: str | None = None
     """The host's own `s3_prefix`, from the config the session read."""
     pkg_commit: str | None = None
@@ -438,6 +440,7 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
+            max_runtime_min=_as_float(entry.get("max_runtime_min")),
             starts_in_s=_as_float(entry.get("starts_in_s")),
             starts_unknown=_as_str(entry.get("starts_unknown")),
             auto_preempt=_as_bool(entry.get("auto_preempt")),
@@ -598,7 +601,7 @@ def _fmt_eta(job: JobView) -> str:
     A running job whose host published no `eta` falls back to the estimate the
     same host reports, rendered as a total rather than a remaining time. The
     runner re-reads the estimate every `ESTIMATE_REFRESH_S`, which bounds the
-    window after `gpuc estimate` but does not close it, and inside it `--json`
+    window after `gpuc set --estimate` but does not close it, and inside it `--json`
     carries an estimate the text would otherwise not show -- a scripted caller
     seeing what the operator cannot, which `tests/test_control_e2e.py` pins."""
     remaining = job.eta_seconds
@@ -653,7 +656,7 @@ def _fmt_estimate(job: JobView, *, total: bool = False) -> str:
 
 
 def queue_placement(view: HostView, job_id: str) -> dict[str, Any]:
-    """Where one job sits in its host's queue, for `submit` and `reorder` to
+    """Where one job sits in its host's queue, for `submit` and `set --priority` to
     print: the answer to "so when does it run".
 
     Every field is null when the host could not be asked, which is not the same
@@ -690,7 +693,7 @@ def placement_unknown() -> dict[str, Any]:
 
 
 def queue_note(placement: dict[str, Any]) -> str | None:
-    """The one line `submit` and `reorder` print about the queue, or nothing
+    """The one line `submit` and `set --priority` print about the queue, or nothing
     when the host could not be asked (their own output already says so)."""
     if placement.get("dispatched"):
         return "  queue: dispatched already; it is running now"
@@ -1038,6 +1041,7 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "eta": job.eta,
         "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),
         "estimated_runtime_min": job.estimated_runtime_min,
+        "max_runtime_min": job.max_runtime_min,
         "auto_preempt": job.auto_preempt,
         "progress_error": job.progress_error,
         "gpus": list(job.gpus),

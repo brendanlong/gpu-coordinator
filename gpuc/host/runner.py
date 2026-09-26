@@ -48,11 +48,13 @@ from gpuc.host.procs import KILL_GRACE_S, JobProcesses, boot_id, starttime
 
 SAMPLE_INTERVAL_S = 30.0
 ESTIMATE_REFRESH_S = 30.0
-"""How often the monitor re-reads the job's estimate while it runs.
+"""How often the monitor re-reads the job's estimate and wall-clock limit
+while it runs.
 
-`gpuc estimate` changes the state of a job that is already running, and the
-value loaded at job start would never see it -- which is the job that most
-needs an end time, since nobody can add one before it started."""
+`gpuc set --estimate` and `--max-runtime` change the state of a job that is
+already running, and the values loaded at job start would never see them --
+which is the job that most needs them: nobody can add an end time before it
+started, and a limit that turns out too tight is found out while it runs."""
 UTIL_SAMPLES_KEPT = 40  # 20 minutes at the default sample interval
 POLL_INTERVAL_S = 0.5
 TERMINATED_EXIT_CODE = 143  # 128 + SIGTERM, the shell convention
@@ -177,6 +179,8 @@ class JobRunner:
         """The estimate as the last re-read found it, which outlives the phase
         that read it: an estimate added during `setup` must not be undone by
         `main` starting from the value loaded at job start."""
+        self._max_runtime = self.state.max_runtime(self.spec)
+        """The wall-clock limit as the last re-read found it, like `_estimate`."""
         self._published_estimate: float | None = None
         """The `estimated_runtime_min` behind the eta now in the state file,
         null when that eta is not ours. Kept so the spec re-read only writes
@@ -228,12 +232,9 @@ class JobRunner:
         record_util = phase == "main" and bool(self.assigned)
         phase_start = deps.now()
         next_sample = phase_start + deps.sample_interval_s
-        max_runtime_s = (
-            None if self.spec.max_runtime_min is None else self.spec.max_runtime_min * 60.0
-        )
-        # The estimate is re-read on a timer, so one added after the job
-        # started still takes effect. It is the one thing a running job
-        # re-reads: the spec is never rewritten after enqueue.
+        # The estimate and the limit are re-read on a timer, so a change made
+        # after the job started still takes effect. They are the only things a
+        # running job re-reads: the spec is never rewritten after enqueue.
         next_estimate = phase_start + deps.estimate_refresh_s
         # The submitter's estimate, published from the first phase on: a job
         # still installing torch is exactly the one somebody wants an end time
@@ -252,13 +253,13 @@ class JobRunner:
             if requested:
                 self._kill(proc, requested, log)
                 break
-            if max_runtime_s is not None and (t - job_start) >= max_runtime_s:
-                self._kill(proc, "timeout", log)
-                break
             if t >= next_estimate:
                 next_estimate = t + deps.estimate_refresh_s
-                self._estimate = self._live_estimate()
+                self._reread_live_fields(log)
                 self._publish_estimated_eta(self._estimate, t - job_start)
+            if self._max_runtime is not None and (t - job_start) >= self._max_runtime * 60.0:
+                self._kill(proc, "timeout", log)
+                break
             if progress_command and t >= next_progress:
                 next_progress = t + self.spec.progress_interval_s
                 self._record_progress(progress_command, t - phase_start, log)
@@ -275,14 +276,20 @@ class JobRunner:
                 self._record_util(util)
         return proc.wait()
 
-    def _live_estimate(self) -> float | None:
-        """The estimate as the state holds it now, or the last one read if the
-        state cannot be read -- a file being replaced under us may not end a
-        running job."""
+    def _reread_live_fields(self, log: IO[bytes]) -> None:
+        """The estimate and the limit as the state holds them now. Both stay
+        as last read if the state cannot be read -- a file being replaced under
+        us may not end a running job."""
         try:
-            return jobs.read_state(self.job_id).estimated_runtime_min
+            state = jobs.read_state(self.job_id)
         except (RuntimeError, OSError, ValueError):
-            return self._estimate
+            return
+        self._estimate = state.estimated_runtime_min
+        limit = state.max_runtime(self.spec)
+        if limit != self._max_runtime:
+            said = "no limit" if limit is None else f"{limit:g} min"
+            self._log(log, f"max_runtime_min is now {said}")
+            self._max_runtime = limit
 
     def _publish_estimated_eta(self, estimate: float | None, elapsed_s: float) -> None:
         """The end time the submitter's estimate implies, while that is the
@@ -477,6 +484,7 @@ class JobRunner:
         return queue.claim(
             self.job_id,
             self.attempt,
+            self.spec,
             status="running",
             gpus=self.assigned,
             phase="setup",

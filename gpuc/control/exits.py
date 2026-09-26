@@ -37,7 +37,7 @@ HTTP_FOR_EXIT: dict[int, HTTPStatus] = {
     EXIT_NOT_FOUND: HTTPStatus.NOT_FOUND,
 }
 """The CLI's exit codes, on the wire. A command that exits 1 -- an unreachable
-host in a status, a refused reorder -- is a 500 carrying the same document the
+host in a status, a refused set -- is a 500 carrying the same document the
 CLI printed, so a consumer of either reads one rule."""
 
 

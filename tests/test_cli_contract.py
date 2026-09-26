@@ -421,6 +421,7 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
         started_at=started,
         util_recent=[90.0, 95.0],
         isolation="cgroup",
+        live_max_runtime=True,
     )
     accept_job(
         JobSpec.from_dict(
@@ -454,7 +455,7 @@ def real_local_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env
 def test_a_verb_on_an_id_the_host_does_not_have_is_exit_four_with_its_reason(
     real_local_host: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The host's own `no such job` answer, through `cancel` and `reorder`
+    """The host's own `no such job` answer, through `cancel` and `set`
     for real: exit 4, not "the host could not be asked" or a refusal."""
     assert main(["cancel", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == EXIT_NOT_FOUND
     document = json.loads(capsys.readouterr().out)
@@ -462,7 +463,7 @@ def test_a_verb_on_an_id_the_host_does_not_have_is_exit_four_with_its_reason(
     assert document["jobs"][0]["error"] == error
     assert "no such job" in error and "host local has no job" in error
     assert (
-        main(["reorder", "20260101-000000-aaaaaa", "--priority", "1", "--host", "local"])
+        main(["set", "20260101-000000-aaaaaa", "--priority", "1", "--host", "local"])
         == EXIT_NOT_FOUND
     )
     assert "no job 20260101-000000-aaaaaa on this host" in capsys.readouterr().err
@@ -482,10 +483,16 @@ def test_a_verb_on_several_ids_does_every_one_it_can_and_exits_for_the_rest(
     assert (finished["status"], finished["error"], finished["source"]) == ("failed", None, "host")
     assert "no job" in missing["error"] and document["errors"] == [missing["error"]]
 
-    argv = ["estimate", RUNNING_JOB, FINISHED_JOB, "--minutes", "5", "--host", "local"]
+    argv = ["set", RUNNING_JOB, FINISHED_JOB, "--estimate", "5", "--host", "local"]
     assert main(argv) == EXIT_ERROR
     captured = capsys.readouterr()
-    assert f"job {RUNNING_JOB} on host local now estimates 5 min" in captured.out
+    assert f"job {RUNNING_JOB} on host local: estimate 5 min" in captured.out
+    assert "already failed" in captured.err
+
+    argv = ["set", RUNNING_JOB, FINISHED_JOB, "--max-runtime", "600", "--host", "local"]
+    assert main(argv) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert f"job {RUNNING_JOB} on host local: max-runtime 600 min" in captured.out
     assert "already failed" in captured.err
 
 
@@ -512,9 +519,9 @@ def test_a_verb_the_host_refuses_for_a_job_it_has_is_exit_one(
     real_local_host: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The job is there and the host will not: that is a refusal, never 4."""
-    assert main(["reorder", RUNNING_JOB, "--priority", "1", "--host", "local"]) == EXIT_ERROR
-    assert "not queued (status running)" in capsys.readouterr().err
-    assert main(["estimate", FINISHED_JOB, "--minutes", "5", "--host", "local"]) == EXIT_ERROR
+    assert main(["set", RUNNING_JOB, "--priority", "1", "--host", "local"]) == EXIT_ERROR
+    assert "only on a queued job" in capsys.readouterr().err
+    assert main(["set", FINISHED_JOB, "--estimate", "5", "--host", "local"]) == EXIT_ERROR
     assert "already failed" in capsys.readouterr().err
 
 
@@ -549,6 +556,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
         "eta",
         "eta_s",
         "estimated_runtime_min",
+        "max_runtime_min",
         "auto_preempt",
         "progress_error",
         "gpus",
@@ -920,8 +928,7 @@ JSON_COMMANDS = [
     ["cancel"],
     ["fetch"],
     ["preempt"],
-    ["reorder"],
-    ["estimate"],
+    ["set"],
     ["pods"],
     ["version"],
     ["clean"],
@@ -998,7 +1005,7 @@ def test_a_command_line_argparse_rejects_still_prints_a_document(
 ) -> None:
     """argparse exits before any command runs; stdout must not be empty."""
     with pytest.raises(SystemExit) as exit_info:
-        main(["reorder", "20260101-000000-aaaaaa", "--priority", "soon", "--json"])
+        main(["set", "20260101-000000-aaaaaa", "--priority", "soon", "--json"])
     assert exit_info.value.code == EXIT_USAGE
     captured = capsys.readouterr()
     assert json.loads(captured.out)["exit_code"] == EXIT_USAGE

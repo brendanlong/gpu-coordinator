@@ -127,11 +127,16 @@ def test_status_sends_only_the_window_of_finished_jobs(
     assert sent("--since", str(3 * 3600)) == sorted([old, oldest, queued])
 
 
-def test_cancel_and_reorder(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cancel_and_set_priority(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     first = queue.enqueue(make_spec(priority=50))
     second = queue.enqueue(make_spec(priority=50))
-    code, payload = verb(capsys, "reorder", second, "--priority", "3")
-    assert code == 0 and payload == {"job_id": second, "status": "queued", "priority": 3}
+    code, payload = verb(capsys, "set", second, "--field", "priority=3")
+    assert code == 0 and payload == {
+        "job_id": second,
+        "status": "queued",
+        "priority": 3,
+        "warning": None,
+    }
     assert [e.job_id for e in queue.list_queued()] == [second, first]
 
     code, payload = verb(capsys, "cancel", first)
@@ -154,50 +159,51 @@ def test_a_verb_acts_on_every_job_it_is_given_and_refuses_each_it_cannot(
     assert queue.list_queued() == []
 
     third = queue.enqueue(make_spec())
-    code, payload = run(capsys, "reorder", third, first, "--priority", "7")
+    code, payload = run(capsys, "set", third, first, "--field", "priority=7")
     assert code == 1 and isinstance(payload, dict)
-    assert payload["jobs"][0] == {"job_id": third, "status": "queued", "priority": 7}
-    assert "not queued" in payload["jobs"][1]["error"]
+    assert payload["jobs"][0] == {
+        "job_id": third,
+        "status": "queued",
+        "priority": 7,
+        "warning": None,
+    }
+    assert "already cancelled" in payload["jobs"][1]["error"]
 
 
-def test_reorder_of_a_job_that_is_not_queued_is_a_refusal_not_a_traceback(
+def test_setting_the_priority_of_a_running_job_is_a_refusal_not_a_traceback(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec())
     jobs.update_state(job_id, status="running")
-    code, payload = verb(capsys, "reorder", job_id, "--priority", "1")
+    code, payload = verb(capsys, "set", job_id, "--field", "priority=1")
     assert code == 1
-    assert "not queued (status running)" in str(payload["error"])
+    assert "only on a queued job" in str(payload["error"])
 
 
-def test_reorder_of_an_unknown_job_is_a_refusal_not_a_traceback(
+def test_set_on_an_unknown_job_is_a_refusal_not_a_traceback(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The control side reads this command's stdout as JSON, so a typed job id
     has to come back as an error document and exit 1."""
-    code, payload = verb(capsys, "reorder", "no-such-job", "--priority", "1")
+    code, payload = verb(capsys, "set", "no-such-job", "--field", "priority=1")
     assert code == 1 and payload["missing"] is True
     assert "no job no-such-job on this host" in str(payload["error"])
     assert jobs.list_job_ids() == []
 
 
-def test_estimate_sets_a_queued_jobs_runtime(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_set_estimate_on_a_queued_job(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     job_id = queue.enqueue(make_spec())
-    code, payload = verb(capsys, "estimate", job_id, "--minutes", "150")
+    code, payload = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=150")
     assert code == 0
     assert payload["estimated_runtime_min"] == 150.0 and payload["status"] == "queued"
     assert jobs.read_state(job_id).estimated_runtime_min == 150.0
 
-    code, payload = verb(capsys, "estimate", job_id, "--clear")
+    code, payload = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=null")
     assert code == 0 and payload["estimated_runtime_min"] is None
     assert jobs.read_state(job_id).estimated_runtime_min is None
 
 
-def test_estimate_does_not_touch_the_spec(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_set_does_not_touch_the_spec(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """The live estimate lives in the state, so the spec stays byte for byte
     what was submitted -- including the fields a newer build wrote into it,
     which a round trip through `JobSpec` would drop."""
@@ -207,56 +213,170 @@ def test_estimate_does_not_touch_the_spec(
     paths.spec_file(job_id).write_text(json.dumps(document))
     before = paths.spec_file(job_id).read_text()
 
-    code, _ = verb(capsys, "estimate", job_id, "--minutes", "42")
+    code, _ = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=42")
 
     assert code == 0
     assert paths.spec_file(job_id).read_text() == before
     assert jobs.read_state(job_id).estimated_runtime_min == 42.0
 
 
-def test_estimate_refuses_a_finished_job_and_an_unknown_one(
+def test_set_estimate_refuses_a_finished_job_and_an_unknown_one(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec())
     jobs.update_state(job_id, status="succeeded")
-    code, payload = verb(capsys, "estimate", job_id, "--minutes", "10")
+    code, payload = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=10")
     assert code == 1 and "already succeeded" in payload["error"]
     assert jobs.read_state(job_id).estimated_runtime_min is None
 
-    code, payload = verb(capsys, "estimate", "no-such-job", "--minutes", "10")
-    assert code == 1 and "no job with that id" in payload["error"]
+    code, payload = verb(capsys, "set", "no-such-job", "--field", "estimated_runtime_min=10")
+    assert code == 1 and payload["missing"] is True
 
 
-@pytest.mark.parametrize("minutes", ["0", "-5", "nan", "inf", "1e10"])
-def test_estimate_refuses_a_number_that_is_not_a_runtime(
+@pytest.mark.parametrize("minutes", ["0", "-5", "NaN", "Infinity", "1e10"])
+def test_set_estimate_refuses_a_number_that_is_not_a_runtime(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], minutes: str
 ) -> None:
     """`inf`, and the `1e10` units typo, mean "no estimate" by the time they
     reach `utc_in` -- so recording one would report success for a job whose
     status then shows nothing at all."""
     job_id = queue.enqueue(make_spec())
-    code, payload = verb(capsys, "estimate", job_id, "--minutes", minutes)
+    code, payload = verb(capsys, "set", job_id, "--field", f"estimated_runtime_min={minutes}")
     assert code == 1 and payload["error"]
     assert jobs.read_state(job_id).estimated_runtime_min is None
 
 
-def test_estimate_needs_a_number_or_clear_and_not_both(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_set_needs_a_field_it_knows(gpuc_home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     job_id = queue.enqueue(make_spec(estimated_runtime_min=30.0))
-    for args in ((job_id,), (job_id, "--minutes", "60", "--clear")):
-        with pytest.raises(SystemExit) as exc:
-            cli.main(["estimate", *args])
-        assert exc.value.code == 2
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["set", job_id])
+    assert exc.value.code == 2
+    code, payload = verb(capsys, "set", job_id, "--field", 'command="rm -rf /"')
+    assert code == 1 and "not something `set` changes" in payload["error"]
+    code, payload = verb(capsys, "set", job_id, "--field", "priority=null")
+    assert code == 1 and "cannot be cleared" in payload["error"]
     assert jobs.read_state(job_id).estimated_runtime_min == 30.0
 
 
-def test_estimate_warns_when_the_job_will_be_killed_first(
+def test_set_changes_every_field_or_none(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Priority is for a queued job only, so on a running one the estimate
+    beside it is refused too: a half-applied change is hard to report."""
+    job_id = queue.enqueue(make_spec(priority=50))
+    code, payload = verb(
+        capsys, "set", job_id, "--field", "priority=5", "--field", "max_runtime_min=90"
+    )
+    assert code == 0 and (payload["priority"], payload["max_runtime_min"]) == (5, 90)
+
+    jobs.update_state(job_id, status="running")
+    code, payload = verb(
+        capsys, "set", job_id, "--field", "estimated_runtime_min=60", "--field", "priority=1"
+    )
+    assert code == 1 and "only on a queued job" in payload["error"]
+    state = jobs.read_state(job_id)
+    assert (state.estimated_runtime_min, state.priority) == (None, 5)
+
+
+def test_an_estimate_alone_leaves_an_earlier_builds_limit_alone(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Setting the estimate on a job an old runner is running must not make
+    its state claim a live limit that runner never reads."""
+    job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
+    jobs.write_state(job_id, jobs.JobState(status="running"))
+    code, _ = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=60")
+    assert code == 0 and not jobs.read_state(job_id).live_max_runtime
+
+
+def test_set_estimate_warns_when_the_job_will_be_killed_first(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec(max_runtime_min=60.0))
-    _, payload = verb(capsys, "estimate", job_id, "--minutes", "120")
+    _, payload = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=120")
     assert "max_runtime_min" in (payload["warning"] or "")
+
+
+def test_set_max_runtime_on_a_queued_job(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=60.0))
+    before = paths.spec_file(job_id).read_text()
+    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=480")
+    assert code == 0
+    assert payload["max_runtime_min"] == 480.0 and payload["status"] == "queued"
+    state = jobs.read_state(job_id)
+    assert state.max_runtime(jobs.read_spec(job_id)) == 480.0
+    assert paths.spec_file(job_id).read_text() == before
+
+    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=null")
+    assert code == 0 and payload["max_runtime_min"] is None
+    assert jobs.read_state(job_id).max_runtime(jobs.read_spec(job_id)) is None
+
+
+def test_set_max_runtime_raises_a_running_jobs_limit_and_status_reports_it(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=420.0, estimated_runtime_min=500.0))
+    started = (datetime.now(UTC) - timedelta(minutes=97)).isoformat()
+    jobs.update_state(job_id, status="running", started_at=started)
+    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=600")
+    assert code == 0 and payload["status"] == "running" and payload["warning"] is None
+    capsys.readouterr()
+    assert cli.main(["status"]) == 0
+    (entry,) = json.loads(capsys.readouterr().out)["jobs"]
+    assert entry["max_runtime_min"] == 600.0 and "live_max_runtime" not in entry
+
+    _, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=450")
+    assert "max_runtime_min" in (payload["warning"] or "")
+
+
+def test_set_max_runtime_refuses_a_limit_the_running_job_has_already_outlived(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
+    started = (datetime.now(UTC) - timedelta(minutes=97)).isoformat()
+    jobs.update_state(job_id, status="running", started_at=started)
+    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=90")
+    assert code == 1 and "would end it at once" in payload["error"]
+    assert jobs.read_state(job_id).max_runtime_min == 420.0
+
+
+def test_set_max_runtime_refuses_a_job_run_by_a_build_that_would_not_see_it(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A runner from before the limit lived in the state enforces the spec's,
+    so recording a new one would report success for nothing."""
+    job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
+    jobs.write_state(job_id, jobs.JobState(status="running"))
+    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=600")
+    assert code == 1 and "reads max_runtime_min only at start" in payload["error"]
+
+    queued = queue.enqueue(make_spec(max_runtime_min=420.0))
+    jobs.write_state(queued, jobs.JobState(status="queued"))
+    code, _ = verb(capsys, "set", queued, "--field", "max_runtime_min=600")
+    assert code == 0 and jobs.read_state(queued).max_runtime(jobs.read_spec(queued)) == 600.0
+
+
+@pytest.mark.parametrize("minutes", ["0", "-5", "NaN", "Infinity", '"60"'])
+def test_set_max_runtime_refuses_a_number_that_is_not_a_limit(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], minutes: str
+) -> None:
+    job_id = queue.enqueue(make_spec(max_runtime_min=60.0))
+    code, payload = verb(capsys, "set", job_id, "--field", f"max_runtime_min={minutes}")
+    assert code == 1 and payload["error"]
+    assert jobs.read_state(job_id).max_runtime_min == 60.0
+
+
+def test_set_max_runtime_refuses_a_finished_job_and_an_unknown_one(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job_id = queue.enqueue(make_spec())
+    jobs.update_state(job_id, status="failed")
+    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=10")
+    assert code == 1 and "already failed" in payload["error"]
+    code, payload = verb(capsys, "set", "no-such-job", "--field", "max_runtime_min=10")
+    assert code == 1 and payload["missing"] is True
 
 
 def test_dispatch_is_routed_to_the_dispatcher(
@@ -383,14 +503,14 @@ def test_status_reports_each_jobs_priority_and_card_count(
     assert (status["jobs"][0]["priority"], status["jobs"][0]["gpus_requested"]) == (12, 2)
 
 
-def test_reorder_records_the_new_priority_in_the_state(
+def test_set_priority_records_the_new_priority_in_the_state(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The state is the one copy of the live priority, and it outlives
     dispatch: otherwise `gpuc status` could only ever report a running job's
     priority as the one it was submitted with."""
     job_id = queue.enqueue(make_spec(priority=50))
-    run(capsys, "reorder", job_id, "--priority", "7")
+    run(capsys, "set", job_id, "--field", "priority=7")
     assert jobs.read_state(job_id).priority == 7
     assert jobs.read_spec(job_id).priority == 50
 
@@ -508,7 +628,7 @@ def test_status_publishes_when_each_queued_job_starts(
 def test_status_projects_from_the_live_estimate_not_the_spec(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`gpuc estimate` writes state.json; the projection has to read it there."""
+    """`gpuc set --estimate` writes state.json; the projection has to read it there."""
     use_smi(monkeypatch, FAKE_GPUS)
     start_running([FAKE_GPUS[1]], None)
     first = queue.enqueue(make_spec(priority=10))
@@ -518,7 +638,7 @@ def test_status_projects_from_the_live_estimate_not_the_spec(
         "the jobs holding the cards it needs gave no end time",
     )
 
-    assert run(capsys, "estimate", first, "--minutes", "30")[0] == 0
+    assert run(capsys, "set", first, "--field", "estimated_runtime_min=30")[0] == 0
     got = projection(capsys)
     assert got[first] == (0.0, None)
     starts, _ = got[second]

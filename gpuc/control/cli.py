@@ -37,9 +37,7 @@ from gpuc.control.actions import (
     NotFound,
     UsageError,
     cancel_jobs,
-    check_estimate,
     config_document,
-    estimate_jobs,
     exit_code_for,
     failure_message,
     forget_gone_rentals,
@@ -52,7 +50,7 @@ from gpuc.control.actions import (
     read_log,
     registry_answer,
     remove_host,
-    reorder_jobs,
+    set_jobs,
     shipped_note,
     status,
     version_document,
@@ -102,6 +100,7 @@ from gpuc.control.transport import (
     TransportError,
     tail_command,
 )
+from gpuc.host import settable as settable_mod
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
 __all__ = [
@@ -728,15 +727,6 @@ def cmd_fetch(args: argparse.Namespace) -> Answer:
     return _jobs_answer(done, fetch_line)
 
 
-def cmd_reorder(args: argparse.Namespace) -> Answer:
-    def line(job: Done) -> str:
-        moved = f"job {job.job_id} on host {job.host} moved to priority {args.priority}"
-        placed = status_mod.queue_note(job.fields)
-        return f"{moved}\n{placed}" if placed else moved
-
-    return _jobs_answer(reorder_jobs(args.job_ids, args.priority, args.host, load_settings()), line)
-
-
 def cmd_preempt(args: argparse.Namespace) -> Answer:
     """Stop running jobs and put them back in their hosts' queues.
 
@@ -757,23 +747,46 @@ def cmd_preempt(args: argparse.Namespace) -> Answer:
     return _jobs_answer(preempt_jobs(args.job_ids, args.priority, args.host, load_settings()), line)
 
 
-def cmd_estimate(args: argparse.Namespace) -> Answer:
-    """Add, change or clear jobs' `estimated_runtime_min` after submitting them.
+def _described(name: str, value: Any) -> str:
+    if value is None:
+        return f"{name} cleared"
+    if name == "priority":
+        return f"priority {value}"
+    return f"{name} {value:g} min"
 
-    It is the one spec field somebody else needs and only the submitter knows,
-    and the job that most needs one is the long job already running when the
-    next person arrives -- which is too late to edit a file before `submit`.
+
+def cmd_set(args: argparse.Namespace) -> Answer:
+    """Change queued or running jobs' settings after submitting them.
+
+    The fields are the ones whose live copy is the job's state
+    (`gpuc.host.settable`): the priority that orders the queue, the estimate
+    the next person decides by, and the limit that kills the job -- the one
+    most often found wrong only once the job is running and has measured
+    itself, when a preempt to change it would throw hours of work away.
     """
-    wanted = check_estimate(args.minutes, clear=args.clear)
+    patch: dict[str, Any] = {}
+    for settable in settable_mod.FIELDS:
+        dest = settable.option.replace("-", "_")
+        value = getattr(args, dest)
+        if value is not None:
+            patch[settable.field] = value
+        if settable.clearable and getattr(args, f"clear_{dest}"):
+            if value is not None:
+                raise UsageError(f"give --{settable.option} or --clear-{settable.option}, not both")
+            patch[settable.field] = None
+    if not patch:
+        raise UsageError(
+            "nothing to set: give "
+            + ", ".join(f"--{settable.option}" for settable in settable_mod.FIELDS)
+        )
 
     def line(job: Done) -> str:
-        recorded = job.fields["estimated_runtime_min"]
-        who = f"job {job.job_id} on host {job.host}"
-        if recorded is None:
-            return f"{who} no longer estimates a runtime"
-        return f"{who} now estimates {recorded:g} min"
+        what = ", ".join(_described(settable_mod.BY_FIELD[f].option, job.fields[f]) for f in patch)
+        said = f"job {job.job_id} on host {job.host}: {what}"
+        placed = status_mod.queue_note(job.fields) if "priority" in patch else None
+        return f"{said}\n{placed}" if placed else said
 
-    return _jobs_answer(estimate_jobs(args.job_ids, wanted, args.host, load_settings()), line)
+    return _jobs_answer(set_jobs(args.job_ids, patch, args.host, load_settings()), line)
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
@@ -1478,20 +1491,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(fetch)
     fetch.set_defaults(func=cmd_fetch)
 
-    reorder = sub.add_parser("reorder", help="change queued jobs' priority")
-    reorder.add_argument("job_ids", nargs="+", metavar="job_id")
-    reorder.add_argument(
-        "--priority",
-        type=int,
-        required=True,
-        help="0-99, for every job named; lower dispatches first (submit defaults to 50)",
-    )
-    reorder.add_argument(
-        "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
-    )
-    add_json_flag(reorder)
-    reorder.set_defaults(func=cmd_reorder)
-
     preempt = sub.add_parser(
         "preempt",
         help="stop a running job and queue it again, to run from the start",
@@ -1519,22 +1518,34 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(preempt)
     preempt.set_defaults(func=cmd_preempt)
 
-    estimate = sub.add_parser(
-        "estimate",
-        help="set (or clear) queued or running jobs' estimated_runtime_min",
-        description="Records how long the job expects to take, from the runner's start. "
-        "Nothing kills a job for running past it: it is what `gpuc status` shows the next "
-        "person deciding whether to queue behind this job. A running job's runner picks the "
-        "new estimate up within a minute; a finished job is refused.",
+    set_ = sub.add_parser(
+        "set",
+        help="change queued or running jobs' priority, estimate or max runtime",
+        description="Each job takes every change or none. A running job picks a new estimate "
+        "or limit up within a minute, without restarting; priority is for queued jobs only "
+        "(`gpuc preempt --priority` re-queues a running one). Times are minutes from the "
+        "runner's start. A finished job is refused, and so is a limit a running job has "
+        "already outlived.",
     )
-    estimate.add_argument("job_ids", nargs="+", metavar="job_id")
-    estimate.add_argument("--minutes", type=float, metavar="N", help="how long each job will take")
-    estimate.add_argument("--clear", action="store_true", help="remove the estimate instead")
-    estimate.add_argument(
+    set_.add_argument("job_ids", nargs="+", metavar="job_id")
+    for settable in settable_mod.FIELDS:
+        set_.add_argument(
+            f"--{settable.option}",
+            type=settable.kind,
+            metavar="N",
+            help=settable.help,
+        )
+        if settable.clearable:
+            set_.add_argument(
+                f"--clear-{settable.option}",
+                action="store_true",
+                help=f"remove the job's {settable.option.replace('-', ' ')}",
+            )
+    set_.add_argument(
         "--host", metavar="NAME", help="which host the jobs are on, if they cannot be found"
     )
-    add_json_flag(estimate)
-    estimate.set_defaults(func=cmd_estimate)
+    add_json_flag(set_)
+    set_.set_defaults(func=cmd_set)
 
     requeue = sub.add_parser("requeue", help="resubmit a job from its S3 spec")
     requeue.add_argument("job_id")
@@ -1578,8 +1589,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Every page and API call is behind the password `gpuc web set-password` "
         "records. The dashboard is a thin view over the same code the CLI runs: what it "
         "shows is `gpuc status --json`, `gpuc host list --json` and `gpuc config show "
-        "--json`, and what it can do is `gpuc cancel`, `gpuc preempt`, `gpuc reorder`, "
-        "`gpuc estimate` and `gpuc host remove`.",
+        "--json`, and what it can do is `gpuc cancel`, `gpuc preempt`, `gpuc set` "
+        "and `gpuc host remove`.",
     )
     serve.add_argument(
         "--bind",

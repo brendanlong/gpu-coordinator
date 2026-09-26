@@ -120,7 +120,10 @@ jobs/<jobid>/
                      #  "attempt": n,                          # launches of this id: 1, +1 per preempt
                      #  "priority": p,                         # the live priority; the queue is
                      #                                        # every `queued` state in (priority, id) order
-                     #  "estimated_runtime_min": null | m,     # the live estimate, as `gpuc estimate` left it
+                     #  "estimated_runtime_min": null | m,     # the live estimate, as `gpuc set` left it
+                     #  "max_runtime_min": null | m,           # the live wall-clock limit, as
+                     #  "live_max_runtime": bool,              # `gpuc set` left it; meant only
+                     #                                        # when live_max_runtime, else the spec's
                      #  "reason": str|null, "problems": [str, ...],  # what ended it, and what else went wrong
                      #  "exit_code": int|null, "gpus": [...],   # UUIDs, from the runner's claim
                      #  "started_at", "ended_at",
@@ -199,11 +202,12 @@ defaults.
                "hf_create": false}],   # create the repo if the sync preflight finds it missing
   "sync_interval_s": 180,
   "priority": 50,                       # copied into the state at enqueue; the state's copy is
-                                        # the live one (`gpuc reorder`, `gpuc preempt --priority`)
-  "max_runtime_min": null,
+                                        # the live one (`gpuc set`, `gpuc preempt --priority`)
+  "max_runtime_min": null,              # copied into the state at enqueue, where `gpuc set` edits
+                                        # it; a state an earlier build wrote gets it at the claim
   "estimated_runtime_min": null,        # the submitter's own guess, measured from the runner's
                                         # start exactly as max_runtime_min is. Informational only;
-                                        # copied into the state at enqueue, where `gpuc estimate` edits it
+                                        # copied into the state at enqueue, where `gpuc set` edits it
   "progress_command": null,             # run in workdir/ every progress_interval_s of phase main;
                                         # its last line of stdout is a percentage. See Estimates
   "progress_interval_s": 60,
@@ -289,9 +293,13 @@ The rules it holds to:
   `auto_preempt` jobs that together cover the gap, least important first, and
   only at a strictly higher priority number. Nothing is stopped on a host that
   is going away.
-- **Reorder** and **estimate** write the job's state and nothing else; the
-  spec is never rewritten after enqueue. The control side re-mirrors the spec
-  after both; a mirror it cannot write is a warning.
+- **Set** (`settable.apply`) writes the job's state and nothing else; the spec
+  is never rewritten after enqueue. One table (`settable.FIELDS`) names each
+  settable field, the statuses it may change in and its checks, and the CLI,
+  web app and host verb are all built from it. A job takes the whole patch or
+  none of it, checked and written under the job's lock. The control side
+  re-mirrors the spec's copy of every field it changed; a mirror it cannot
+  write is a warning.
 - **Idle terminate** (only with `config.provider` set): no running jobs and an
   empty queue for `idle_minutes` -> `draining`, retry unconfirmed outputs,
   mirror every job's state and log, then `terminate.self_terminate()`. Only a
@@ -372,8 +380,10 @@ submitter is [usage.md](usage.md#job-length-estimates).
 
 - `estimated_runtime_min` is published as `eta` from the first phase on. The
   monitor loop re-reads it from the job's state every `ESTIMATE_REFRESH_S`,
-  which is how `gpuc estimate` reaches a running job; it is the one thing a
-  running job re-reads.
+  which is how `gpuc set` reaches a running job. The wall-clock limit is
+  re-read with it, the same way; they are the only things a running job
+  re-reads. `gpuc set --max-runtime` refuses a running job whose state is not
+  `live_max_runtime`: its runner is from a build that does not re-read the limit.
 - `progress_command` runs in `workdir/` with the job's environment, during
   `main` only; `progress.parse` accepts a fraction with a decimal point or a
   percentage with a `%`, and nothing else. Above 0% the runner replaces `eta`
@@ -563,7 +573,7 @@ hold to, whatever the flags:
   spot, and what a session reads is recorded in the cache on the way past,
   except by a poll, which never writes the registry.
 - A host name is looked up locally; `status <ids>`, `logs`, `wait`, `cancel`,
-  `preempt`, `reorder`, `estimate`, `requeue` and `ssh` resolve job ids the
+  `preempt`, `set`, `requeue` and `ssh` resolve job ids the
   same way (`actions.locate_many`): the job index (`s3index.JobIndex`, the
   local index then the mirror's), then asking the hosts, each at most twice
   however many ids -- the one the index names, then every host about the ids
@@ -574,7 +584,7 @@ hold to, whatever the flags:
 - **Every command that takes job ids takes any number**, except `logs`,
   `requeue` and `ssh`, and answers for each: one id it cannot find or act on
   never stops the rest, is exit 4 if no host has it and exit 1 otherwise.
-  The verbs (`cancel`, `preempt`, `reorder`, `estimate`) run through
+  The verbs (`cancel`, `preempt`, `set`) run through
   `actions.job_verbs`: locate the jobs, send each host **one** call naming
   all of its jobs over the session the lookup opened, insist on a verdict
   for each, re-mirror a spec field it changed. The on-host verb takes the

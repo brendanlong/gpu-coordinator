@@ -121,13 +121,13 @@ def test_cancel_of_a_job_on_a_gone_host_says_how_it_ended(
     assert (job["host"], job["status"], job["source"]) == (POD, "failed", "mirror")
 
 
-def test_reorder_of_a_job_on_a_gone_host_is_refused_with_how_it_ended(
+def test_set_on_a_job_on_a_gone_host_is_refused_with_how_it_ended(
     control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mirror(monkeypatch, {JOB: succeeded(minutes=5)})
-    assert main(["reorder", JOB, "--priority", "3"]) == EXIT_ERROR
+    assert main(["set", JOB, "--priority", "3"]) == EXIT_ERROR
     err = capsys.readouterr().err
-    assert "cannot reorder" in err and "ended succeeded" in err and "is gone" in err
+    assert "cannot set" in err and "ended succeeded" in err and "is gone" in err
 
 
 # -- with no mirror, gone is lost -----------------------------------------------

@@ -36,9 +36,7 @@ from gpuc.control.actions import (
     Answer,
     UsageError,
     cancel_jobs,
-    check_estimate,
     config_document,
-    estimate_jobs,
     exit_code_for,
     failure_message,
     hosts_document,
@@ -47,7 +45,7 @@ from gpuc.control.actions import (
     read_log,
     registry_answer,
     remove_host,
-    reorder_jobs,
+    set_jobs,
     status,
     version_document,
 )
@@ -185,9 +183,8 @@ class Dashboard:
             ("GET", re.compile(r"^/api/version$"), Dashboard.api_version, True),
             ("GET", re.compile(r"^/api/jobs/([^/]+)/logs$"), Dashboard.api_logs, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/cancel$"), Dashboard.api_cancel, True),
-            ("POST", re.compile(r"^/api/jobs/([^/]+)/reorder$"), Dashboard.api_reorder, True),
             ("POST", re.compile(r"^/api/jobs/([^/]+)/preempt$"), Dashboard.api_preempt, True),
-            ("POST", re.compile(r"^/api/jobs/([^/]+)/estimate$"), Dashboard.api_estimate, True),
+            ("POST", re.compile(r"^/api/jobs/([^/]+)/set$"), Dashboard.api_set, True),
             ("POST", re.compile(r"^/api/hosts/([^/]+)/remove$"), Dashboard.api_host_remove, True),
         ]
 
@@ -317,16 +314,6 @@ class Dashboard:
             jobs_answer(cancel_jobs([job_id], host_of(body), self.load_settings()))
         )
 
-    def api_reorder(self, request: Request) -> Response:
-        job_id = job_id_of(request)
-        body = request.json()
-        priority = body.get("priority")
-        if isinstance(priority, bool) or not isinstance(priority, int):
-            raise UsageError("reorder needs an integer `priority` (0-99)")
-        return Response.answer(
-            jobs_answer(reorder_jobs([job_id], priority, host_of(body), self.load_settings()))
-        )
-
     def api_preempt(self, request: Request) -> Response:
         job_id = job_id_of(request)
         body = request.json()
@@ -337,19 +324,13 @@ class Dashboard:
             jobs_answer(preempt_jobs([job_id], priority, host_of(body), self.load_settings()))
         )
 
-    def api_estimate(self, request: Request) -> Response:
+    def api_set(self, request: Request) -> Response:
+        """`gpuc set`: the body names the fields to change, and a null clears one."""
         job_id = job_id_of(request)
         body = request.json()
-        minutes = body.get("minutes")
-        if minutes is not None and (
-            isinstance(minutes, bool) or not isinstance(minutes, (int, float))
-        ):
-            raise UsageError("estimate needs a number of `minutes`, or `clear: true`")
-        wanted = check_estimate(
-            None if minutes is None else float(minutes), clear=bool(body.get("clear"))
-        )
+        patch = {name: value for name, value in body.items() if name != "host"}
         return Response.answer(
-            jobs_answer(estimate_jobs([job_id], wanted, host_of(body), self.load_settings()))
+            jobs_answer(set_jobs([job_id], patch, host_of(body), self.load_settings()))
         )
 
 

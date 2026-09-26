@@ -140,8 +140,8 @@ def test_transition_writes_nothing_when_the_status_is_not_what_was_expected(
 
 
 def test_transition_takes_any_of_the_statuses_it_was_given(gpuc_home: Path) -> None:
-    """`estimate` is the caller with two: it may reach a job that is still
-    queued or one already running, and neither is a race it lost."""
+    """A caller may take a job that is still queued or one already running,
+    and neither is a race it lost."""
     jobs.write_state("j1", JobState(status="running"))
     for status in ("queued", "running"):
         jobs.update_state("j1", status=status)

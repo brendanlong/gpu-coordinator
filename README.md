@@ -52,7 +52,7 @@ gpuc web set-password && gpuc web serve   # the same, in a browser at http://127
 
 `gpuc web serve` puts every host behind one password: the cards and what each
 is doing, the queue in dispatch order, and the actions the CLI has — logs,
-estimate, reorder, preempt, cancel. It asks the hosts, so it shows what they
+set priority, estimate and limit, preempt, cancel. It asks the hosts, so it shows what they
 say and nothing a command could not tell you.
 
 ![The gpuc dashboard listing three hosts. desktop (local) has one RTX 4090

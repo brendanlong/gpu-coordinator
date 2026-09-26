@@ -136,36 +136,6 @@ def test_a_claim_is_for_one_attempt(gpuc_home: Path) -> None:
     assert queue.claim(job_id, 2, status="running")
 
 
-# -- reordering ---------------------------------------------------------------
-
-
-def test_reorder_moves_a_queued_job_and_records_the_new_priority(gpuc_home: Path) -> None:
-    """The state holds the live priority; the spec keeps what was submitted."""
-    first = queue.enqueue(make_spec(priority=50))
-    second = queue.enqueue(make_spec(priority=50))
-    assert queue.reorder(second, 1)
-    assert [e.job_id for e in queue.list_queued()] == [second, first]
-    assert jobs.read_state(second).priority == 1
-    assert jobs.read_spec(second).priority == 50
-    assert jobs.read_state(first).priority == 50
-
-
-def test_reorder_of_a_job_that_is_not_queued_is_refused(gpuc_home: Path) -> None:
-    """A running job's place in the queue is not a thing that exists; moving it
-    would only change the priority it reports."""
-    job_id = queue.enqueue(make_spec(priority=50))
-    jobs.update_state(job_id, status="running")
-    assert not queue.reorder(job_id, 1)
-    assert jobs.read_state(job_id).priority == 50
-
-
-def test_reorder_of_an_unknown_job_is_refused_rather_than_an_error(gpuc_home: Path) -> None:
-    """`gpuc reorder` on a typo is an error document and exit 1, so the queue
-    has to answer "no such job" as a False and leave nothing behind."""
-    assert not queue.reorder("no-such-job", 1)
-    assert jobs.list_job_ids() == []
-
-
 # -- cancelling ---------------------------------------------------------------
 
 
@@ -270,7 +240,7 @@ def test_preempt_can_lower_the_priority_it_comes_back_at(gpuc_home: Path) -> Non
 def test_a_queued_or_finished_job_cannot_be_preempted(gpuc_home: Path) -> None:
     waiting_job()
     queued = queue.enqueue(make_spec())
-    with pytest.raises(ValueError, match="reorder"):
+    with pytest.raises(ValueError, match="--priority N"):
         queue.preempt(queued)
     done = running_job()
     jobs.update_state(done, status="succeeded", ended_at=jobs.utc_now())

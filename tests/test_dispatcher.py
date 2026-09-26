@@ -13,7 +13,7 @@ from typing import Any, cast
 
 import pytest
 
-from gpuc.host import cleanup, destinations, jobs, paths, queue, runner, sync, terminate
+from gpuc.host import cleanup, destinations, jobs, paths, queue, runner, settable, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import procs as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
@@ -1848,7 +1848,7 @@ def test_a_job_the_host_could_run_is_never_dropped_from_the_queue(gpuc_home: Pat
     assert [e.job_id for e in queue.list_queued()] == [job_id]
 
     # Moving it later in the queue moves it; it does not end it.
-    queue.reorder(job_id, 99)
+    assert "error" not in settable.apply(job_id, {"priority": 99})
     dispatcher.run_once()
     assert jobs.read_state(job_id).status == "queued"
 
@@ -1936,7 +1936,7 @@ def test_auto_preempt_judges_a_job_by_the_priority_it_runs_at(gpuc_home: Path) -
     """Submitted at 10, moved to 60 while queued: it is a 60 job now, and a 30
     job waiting is strictly more important than it."""
     cheap = queue.enqueue(make_spec(gpus=2, priority=10, auto_preempt=True))
-    assert queue.reorder(cheap, 60)
+    assert "error" not in settable.apply(cheap, {"priority": 60})
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     assert jobs.read_state(cheap).status == "running"

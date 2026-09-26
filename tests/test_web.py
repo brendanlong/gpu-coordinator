@@ -491,39 +491,42 @@ def test_preempt_is_the_preempt_command(logged_in: Client, stub: StubSession) ->
     assert status == 400 and "0-99" in document["error"]
 
 
-def test_reorder_is_the_reorder_command_and_checks_the_range(
+def test_set_priority_is_the_set_command_and_checks_the_range(
     logged_in: Client, stub: StubSession
 ) -> None:
     stub.answers.append({"jobs": [{"job_id": RUNNING_JOB, "status": "queued", "priority": 7}]})
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 7}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "priority": 7}
     )
     assert status == 200 and document["jobs"][0]["priority"] == 7
-    assert stub.commands[0] == f"reorder {RUNNING_JOB} --priority 7"
+    assert stub.commands[0] == f"set {RUNNING_JOB} --field priority=7"
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 100}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "priority": 100}
     )
     assert status == 400 and "0-99" in document["error"]
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": "7"}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "priority": "7"}
     )
     assert status == 400
+    for body in ({"priority": float("nan")}, {"priority": float("inf")}, {"max_runtme": 5}):
+        status, _ = logged_in.post_json(f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", **body})
+        assert status == 400
 
 
-def test_a_refused_reorder_is_the_clis_refusal(logged_in: Client, stub: StubSession) -> None:
+def test_a_refused_set_is_the_clis_refusal(logged_in: Client, stub: StubSession) -> None:
     stub.answers.append(
-        {"jobs": [{"job_id": RUNNING_JOB, "error": "only a queued job can be reordered"}]}
+        {"jobs": [{"job_id": RUNNING_JOB, "error": "priority is changed only on a queued job"}]}
     )
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/reorder", {"host": "gpubox", "priority": 7}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "priority": 7}
     )
     assert status == 500
     (error,) = document["errors"]
-    assert "only a queued job can be reordered" in error
+    assert "priority is changed only on a queued job" in error
     assert document["jobs"][0]["error"] == error
 
 
-def test_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
+def test_set_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
     stub.answers.append(
         {
             "jobs": [
@@ -537,7 +540,7 @@ def test_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
         }
     )
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/estimate", {"host": "gpubox", "minutes": 90}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "estimated_runtime_min": 90}
     )
     assert status == 200 and document["jobs"][0]["estimated_runtime_min"] == 90.0
     stub.answers.append(
@@ -553,15 +556,47 @@ def test_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
         }
     )
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/estimate", {"host": "gpubox", "clear": True}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "estimated_runtime_min": None}
     )
     assert status == 200 and document["jobs"][0]["estimated_runtime_min"] is None
     assert stub.commands == [
-        f"estimate {RUNNING_JOB} --minutes 90.0",
-        f"estimate {RUNNING_JOB} --clear",
+        f"set {RUNNING_JOB} --field estimated_runtime_min=90",
+        f"set {RUNNING_JOB} --field estimated_runtime_min=null",
     ]
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/estimate", {"host": "gpubox", "minutes": -5}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "estimated_runtime_min": -5}
+    )
+    assert status == 400
+
+
+def test_set_max_runtime_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
+    for minutes in (600.0, None):
+        stub.answers.append(
+            {
+                "jobs": [
+                    {
+                        "job_id": RUNNING_JOB,
+                        "max_runtime_min": minutes,
+                        "status": "running",
+                        "warning": None,
+                    }
+                ]
+            }
+        )
+    status, document = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "max_runtime_min": 600}
+    )
+    assert status == 200 and document["jobs"][0]["max_runtime_min"] == 600.0
+    status, document = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "max_runtime_min": None}
+    )
+    assert status == 200 and document["jobs"][0]["max_runtime_min"] is None
+    assert stub.commands == [
+        f"set {RUNNING_JOB} --field max_runtime_min=600",
+        f"set {RUNNING_JOB} --field max_runtime_min=null",
+    ]
+    status, _ = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "max_runtime_min": 0}
     )
     assert status == 400
 

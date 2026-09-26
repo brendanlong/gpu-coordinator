@@ -167,7 +167,7 @@ def test_queued_jobs_reorder_and_cancel_while_the_card_is_busy(
     # second tie-break on their random suffix, not on submission order.
     assert {first, second} == set(queued_ids(capsys.readouterr().out))
 
-    assert main(["reorder", second, "--priority", "10"]) == 0
+    assert main(["set", second, "--priority", "10"]) == 0
     capsys.readouterr()
     assert main(["status", "--host", "local"]) == 0
     status = capsys.readouterr().out
