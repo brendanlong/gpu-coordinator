@@ -26,6 +26,7 @@ from .base import (
     ProviderError,
     SshEndpoint,
     cuda_key,
+    offer_satisfies,
 )
 
 LOG_READ_S = 10.0
@@ -143,7 +144,6 @@ class RunPodProvider(Provider):
         return json.loads(raw) if raw else None
 
     def offers(self, constraints: Constraints) -> list[Offer]:
-        wanted = {name.casefold() for name in constraints.gpu_names}
         found: list[Offer] = []
         for cloud in constraints.clouds:
             params: dict[str, Any] = {
@@ -154,7 +154,7 @@ class RunPodProvider(Provider):
                 "minCudaVersion": constraints.cuda_min,
             }
             payload = self._json("GET", "/catalog/gpus", params=params)
-            found.extend(self._offers_from_catalog(payload["gpus"], cloud, wanted, constraints))
+            found.extend(self._offers_from_catalog(payload["gpus"], cloud, constraints))
         found.sort(key=lambda offer: (offer.price_usd_hr, offer.gpu_id, offer.cloud))
         return found
 
@@ -162,28 +162,15 @@ class RunPodProvider(Provider):
     def _offers_from_catalog(
         gpus: list[dict[str, Any]],
         cloud: Cloud,
-        wanted: set[str],
         constraints: Constraints,
     ) -> list[Offer]:
         tier = cloud.lower()
         offers: list[Offer] = []
         for gpu in gpus:
-            if wanted and not wanted & {gpu["id"].casefold(), gpu["name"].casefold()}:
-                continue
             if gpu.get("availability", "NONE") == "NONE":
-                continue
-            if constraints.min_vram_gb is not None and gpu["memory"] < constraints.min_vram_gb:
                 continue
             price = gpu["price"].get(tier)
             if price is None or price <= 0:
-                continue
-            # --max-price caps the whole pod, so compare the pod's price, not
-            # one GPU's: at --gpu-count 4 the per-GPU figure is off by 4x.
-            total_price = price * constraints.gpu_count
-            if (
-                constraints.max_price_usd_hr is not None
-                and total_price > constraints.max_price_usd_hr
-            ):
                 continue
             if gpu["maxCount"].get(tier, 0) < constraints.gpu_count:
                 continue
@@ -195,14 +182,15 @@ class RunPodProvider(Provider):
                 gpu_id=gpu["id"],
                 name=gpu["name"],
                 vram_gb=gpu["memory"],
-                price_usd_hr=total_price,
+                # --max-price caps the whole pod, so the offer carries the
+                # pod's price, not one GPU's: at --gpu-count 4 that is 4x.
+                price_usd_hr=price * constraints.gpu_count,
                 cloud=cloud,
                 availability=gpu["availability"],
                 cuda_versions=cuda_versions,
             )
-            if not offer.cuda_versions or not offer.matches_cuda_floor(constraints.cuda_min):
-                continue
-            offers.append(offer)
+            if offer_satisfies(offer, constraints):
+                offers.append(offer)
         return offers
 
     def create(

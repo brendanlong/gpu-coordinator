@@ -17,7 +17,6 @@ import os
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from gpuc._version import user_agent
@@ -43,7 +42,7 @@ from gpuc.control.remote import (
     resolve_home,
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
-from gpuc.control.version import is_other_build, local_commit, package_root, short
+from gpuc.control.version import local_commit, package_root, short
 from gpuc.host import health, jobs, paths
 from gpuc.host.cleanup import human_bytes
 from gpuc.host.jobs import HostConfig, cache_beside
@@ -166,14 +165,14 @@ class BootstrapResult:
         }
 
 
-def package_files(root: Path | None = None) -> list[str]:
+def package_files() -> list[str]:
     """Paths under ``gpuc/`` to ship, relative to the repo root.
 
     git is the source of truth so that editor droppings, ``__pycache__`` and
     local experiments never reach a host; a non-git install falls back to the
     installed tree.
     """
-    root = root or package_root()
+    root = package_root()
     try:
         tracked = git_tracked_files(root)
     except TransportError:
@@ -237,13 +236,17 @@ def uv_installer_command() -> str:
     return f"curl -LsSf -A {shlex.quote(user_agent())} {UV_INSTALLER} | sh"
 
 
-def find_uv(transport: Transport) -> str | None:
+def _find_tool(transport: Transport, path: str, name: str) -> str | None:
+    """`path` if it is executable on the host, else `name` on its PATH."""
     result = transport.run(
-        'if [ -x "$HOME/.local/bin/uv" ]; then echo "$HOME/.local/bin/uv"; '
-        "else command -v uv 2>/dev/null; fi",
+        f'if [ -x "{path}" ]; then echo "{path}"; else command -v {name} 2>/dev/null; fi',
         check=False,
     )
     return _first_line(result.stdout) or None
+
+
+def find_uv(transport: Transport) -> str | None:
+    return _find_tool(transport, "$HOME/.local/bin/uv", "uv")
 
 
 def install_uv(transport: Transport) -> str:
@@ -314,48 +317,26 @@ def sync_package(transport: Transport, home: str, report: Reporter) -> int:
     return len(files)
 
 
-def host_build(session: HostSession) -> str | None:
-    """The build a host is running, by its own account: `pkg_commit` in the
-    config the session read. None is a host that never said."""
-    return session.config.pkg_commit
+def ensure_build(session: HostSession, report: Reporter, *, restart: bool = True) -> int:
+    """Ship this build's package to a host.
 
-
-def ensure_build(
-    session: HostSession, report: Reporter, *, always: bool = False, restart: bool = True
-) -> int | None:
-    """Ship this build's package to a host whose config names another one.
-
-    The one ship path. The commit comes from the host's own `config.json`
-    rather than from this registry, which only ever recorded what this
-    machine shipped: two control machines against one box -- a laptop and a
-    desktop -- each leave that record describing a host the other has since
-    re-bootstrapped. An unrecorded commit counts as another build, and so does
-    a dirty checkout on either side.
+    The one ship path; whether a host needs it is the caller's call
+    (`submitting` compares against the host's own `config.json`).
 
     Only the package and, with `restart`, the dispatcher: uv, the interpreter
     and health cannot have gone stale, and a job may be waiting. The commit
     just shipped is written to the host's config as the only key touched.
-    Returns how many files went, or None when nothing had to.
+    Returns how many files went.
     """
-    local = local_commit()
-    if not always and not is_other_build(host_build(session), local):
-        return None
     files = sync_package(session.transport, session.home, report)
-    session.write_config({"pkg_commit": local})
+    session.write_config({"pkg_commit": local_commit()})
     if restart:
         start_dispatcher(session)
     return files
 
 
 def find_aws_cli(transport: Transport) -> str | None:
-    install_dir = "$HOME/.local/aws-cli"
-    present = transport.run(
-        f'if [ -x "{install_dir}/v2/current/bin/aws" ]; then '
-        f'echo "{install_dir}/v2/current/bin/aws"; '
-        "else command -v aws 2>/dev/null; fi",
-        check=False,
-    )
-    return _first_line(present.stdout) or None
+    return _find_tool(transport, "$HOME/.local/aws-cli/v2/current/bin/aws", "aws")
 
 
 def ensure_aws_cli(transport: Transport, report: Reporter) -> str | None:
@@ -388,12 +369,7 @@ def ensure_aws_cli(transport: Transport, report: Reporter) -> str | None:
 def ensure_hf_cli(
     transport: Transport, uv: str, env: Mapping[str, str], report: Reporter
 ) -> str | None:
-    bin_dir = "$HOME/.local/bin"
-    present = transport.run(
-        f'if [ -x "{bin_dir}/hf" ]; then echo "{bin_dir}/hf"; else command -v hf 2>/dev/null; fi',
-        check=False,
-    )
-    if _first_line(present.stdout):
+    if _find_tool(transport, "$HOME/.local/bin/hf", "hf"):
         return None
     report("installing huggingface_hub as a uv tool")
     result = transport.run(
@@ -420,11 +396,8 @@ def uv_cache_placement(session: HostSession) -> dict[str, Any] | None:
         f'print(json.dumps(health.uv_cache_placement()))"'
     )
     result = session.run(command)
-    document = parse_last_json(result.stdout) if result.returncode == 0 else _NO_JSON
+    document = parse_last_json(result.stdout) if result.returncode == 0 else None
     return document if isinstance(document, dict) else None
-
-
-_NO_JSON = object()
 
 
 def resolve_cache_dir(session: HostSession, report: Reporter) -> str | None:
@@ -674,7 +647,7 @@ def bootstrap_host(
     if patch:
         session.write_config(patch)
         report(f"{home}/config.json: {', '.join(sorted(patch))} (the rest is the host's)")
-    files = ensure_build(session, report, always=True, restart=False) or 0
+    files = ensure_build(session, report, restart=False)
     ensure_layout(transport, config.env, home, python)
 
     # Before `uv tool install`, so that call already populates the cache this

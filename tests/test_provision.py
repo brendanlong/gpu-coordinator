@@ -24,11 +24,10 @@ from gpuc.control.config import (
     registry_transaction,
     utc_now,
 )
-from gpuc.control.providers.base import Constraints, Offer, Pod, ProviderError
+from gpuc.control.providers.base import Constraints, Offer, Pod, ProviderError, offer_satisfies
 from gpuc.control.provision import (
     ProvisionDeps,
     ProvisionError,
-    offer_satisfies,
     pick_reusable_host,
     pod_name,
     provision,

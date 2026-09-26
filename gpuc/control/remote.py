@@ -125,14 +125,12 @@ class HostConfigRead:
         return HostConfig.from_dict(self.document or {})
 
 
-def read_config(
-    transport: Transport, home: str, *, timeout: float = DEFAULT_TIMEOUT_S
-) -> HostConfigRead:
+def read_config(transport: Transport, home: str) -> HostConfigRead:
     """The host's own `config.json`, the one read every command works from."""
     path = config_file(home)
     command = f'if [ -f "{path}" ]; then cat "{path}"; else echo {NO_CONFIG}; fi'
     try:
-        result = transport.run(command, timeout=timeout, check=False)
+        result = transport.run(command, timeout=DEFAULT_TIMEOUT_S, check=False)
     except TransportError as exc:
         return HostConfigRead(unreadable=reason_of(exc))
     if result.returncode != 0:
@@ -329,15 +327,13 @@ def _tail(text: str, lines: int = 10) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
-def resolve_home(
-    transport: Transport, entry: HostEntry, *, timeout: float = DEFAULT_TIMEOUT_S
-) -> str:
+def resolve_home(transport: Transport, entry: HostEntry) -> str:
     """Expand ``$HOME/.gpuc`` on the host: rsync and tail need a real path."""
     template = entry.remote_home
     if "$" not in template and "~" not in template:
         return template.rstrip("/")
     try:
-        result = transport.run(f'printf %s "{template}"', timeout=timeout, check=True)
+        result = transport.run(f'printf %s "{template}"', timeout=DEFAULT_TIMEOUT_S, check=True)
     except TransportError as exc:
         raise RemoteError(
             entry.name,
@@ -385,8 +381,8 @@ def usable_python(text: str) -> str | None:
     return None
 
 
-def probe_python(transport: Transport, *, timeout: float = DEFAULT_TIMEOUT_S) -> str | None:
-    result = transport.run(PYTHON_PROBE, timeout=timeout, check=False)
+def probe_python(transport: Transport) -> str | None:
+    result = transport.run(PYTHON_PROBE, timeout=DEFAULT_TIMEOUT_S, check=False)
     return usable_python(result.stdout)
 
 

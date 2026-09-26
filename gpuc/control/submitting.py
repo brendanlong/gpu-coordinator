@@ -24,7 +24,7 @@ from gpuc.control.actions import (
     mirror_is_the_answer,
     placement_after,
 )
-from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build, host_build
+from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build
 from gpuc.control.config import HostEntry, Reporter, Settings, open_registry
 from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
 from gpuc.control.provision import runpod_host
@@ -120,12 +120,12 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
     if not bootstrap:
         return
     refuse_unreadable_config(session)
-    if session.config_read.missing or host_build(session) is None:
+    host_commit = session.config.pkg_commit
+    if session.config_read.missing or host_commit is None:
         raise CliError(
             f"host {session.entry.name} has no gpuc on it yet: its own config records no "
             f"bootstrap.\nRun: gpuc host bootstrap {session.entry.name}"
         )
-    host_commit = host_build(session)
     local = version_mod.local_commit()
     if not version_mod.is_other_build(host_commit, local):
         return
@@ -134,8 +134,7 @@ def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Rep
         f"machine has {version_mod.short(local)}: re-syncing the package and restarting the "
         f"dispatcher before enqueueing"
     )
-    # Decided above; `always` keeps `ensure_build` from asking the same question.
-    ensure_build(session, _quiet, always=True)
+    ensure_build(session, _quiet)
 
 
 def _quiet(_: str) -> None:

@@ -22,12 +22,12 @@ from __future__ import annotations
 import re
 import secrets
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 from gpuc.control import rented
 from gpuc.control.bootstrap import (
@@ -49,7 +49,7 @@ from gpuc.control.config import (
     transport_for,
     utc_now,
 )
-from gpuc.control.connect import Connection, connect_host
+from gpuc.control.connect import connect_host
 from gpuc.control.gpuinfo import summarize
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import (
@@ -59,6 +59,7 @@ from gpuc.control.providers.base import (
     Pod,
     Provider,
     ProviderError,
+    offer_satisfies,
 )
 from gpuc.control.remote import (
     Answered,
@@ -133,19 +134,6 @@ def verdict(exc: BaseException, *, polling: bool = False) -> Verdict:
     return Verdict.ABORT
 
 
-class ConnectFn(Protocol):
-    def __call__(
-        self,
-        address: HostEntry,
-        settings: Settings | None = ...,
-        *,
-        fields: Mapping[str, Any] | None = ...,
-        env_updates: Mapping[str, str | None] | None = ...,
-        transport: Transport | None = ...,
-        force: bool = ...,
-    ) -> Connection: ...
-
-
 class BootstrapFn(Protocol):
     def __call__(
         self,
@@ -165,11 +153,9 @@ class ProvisionDeps:
     sleep: Callable[[float], None] = time.sleep
     now: Callable[[], float] = time.monotonic
     bootstrap: BootstrapFn = bootstrap_host
-    connect: ConnectFn = connect_host
     transport_factory: Callable[[HostEntry, Settings], Transport] = transport_for
     poll_interval_s: float = POLL_INTERVAL_S
     log_check_interval_s: float = LOG_CHECK_INTERVAL_S
-    ceiling_minutes: float = CEILING_MINUTES
 
 
 class _Progress:
@@ -213,28 +199,6 @@ def pod_name(prefix: str, name_hint: str) -> str:
     return f"{prefix}{hint}-{secrets.token_hex(3)}"
 
 
-def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
-    wanted = {name.casefold() for name in constraints.gpu_names}
-    if wanted and not wanted & {offer.gpu_id.casefold(), offer.name.casefold()}:
-        return False
-    if constraints.min_vram_gb is not None and offer.vram_gb < constraints.min_vram_gb:
-        return False
-    cap = constraints.max_price_usd_hr
-    if cap is not None and offer.price_usd_hr > cap:
-        return False
-    if constraints.clouds and offer.cloud not in constraints.clouds:
-        return False
-    return offer.matches_cuda_floor(constraints.cuda_min)
-
-
-def address_for(name: str, pod: Pod, provider: Provider) -> HostEntry:
-    """How to reach this pod, and nothing about what it is."""
-    address = rented.address_for(name, pod, provider.name)
-    if address is None:
-        raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
-    return address
-
-
 def _label(offer: Offer) -> str:
     return f"{offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h"
 
@@ -267,10 +231,10 @@ def provision(
             f"Relax --max-price, add another --gpu, or try --cloud any; "
             f"availability moves hour to hour."
         )
-    deadline = deps.now() + deps.ceiling_minutes * 60.0
+    deadline = deps.now() + CEILING_MINUTES * 60.0
     progress(
         f"{len(offers)} offer(s): {', '.join(_label(o) for o in offers[:6])}; "
-        f"ceiling {deps.ceiling_minutes:.0f} min for the whole attempt"
+        f"ceiling {CEILING_MINUTES:.0f} min for the whole attempt"
     )
 
     failures: list[str] = []
@@ -376,7 +340,9 @@ def _try_offer(
             f"ssh.direct {pod.ssh_direct.username}@{pod.ssh_direct.host}:{pod.ssh_direct.port} "
             f"(cuda {pod.cuda_version or '?'}, ${pod.cost_usd_hr:.3f}/h)"
         )
-        address = address_for(name, pod, provider)
+        address = rented.address_for(name, pod, provider.name)
+        if address is None:
+            raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
         transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
         # The one look at the pod's cards, the same probe `gpuc host add`
@@ -400,7 +366,7 @@ def _try_offer(
         # on top -- the idle timer asked for, and the pod's own record of what
         # it was bought as (`rented.pod_record`), written to the pod so any
         # other machine reads it from there.
-        entry = deps.connect(
+        entry = connect_host(
             address,
             settings,
             fields={
@@ -481,7 +447,7 @@ def _poll_failure(exc: Exception, what: str, progress: _Progress) -> None:
 def _ceiling(deadline: float, what: str, deps: ProvisionDeps) -> None:
     if deps.now() >= deadline:
         raise Unprovisionable(
-            f"the {deps.ceiling_minutes:.0f} min ceiling passed while {what}; treating the "
+            f"the {CEILING_MINUTES:.0f} min ceiling passed while {what}; treating the "
             f"attempt as failed"
         )
 

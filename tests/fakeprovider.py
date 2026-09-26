@@ -25,8 +25,8 @@ from gpuc.control.providers.base import (
     Provider,
     ProviderError,
     SshEndpoint,
+    offer_satisfies,
 )
-from gpuc.control.provision import offer_satisfies
 
 CAPACITY_ERROR = "no capacity for this gpu type right now"
 BROKEN_LOG = "system: error: failed to create shim task: OCI runtime create failed"
