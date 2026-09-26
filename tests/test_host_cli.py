@@ -539,6 +539,24 @@ def test_status_says_why_a_queued_job_has_no_start(
     assert got[narrow] == (None, f"job {wide} is ahead of it and has no start time yet")
 
 
+def test_status_says_which_job_a_running_auto_preempt_job_yields_to(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the wide job's start does not wait on the filler, which will be
+    stopped for it, although the filler gave no end time."""
+    use_smi(monkeypatch, FAKE_GPUS)
+    start_running([FAKE_GPUS[0]], 30)
+    wide = queue.enqueue(make_spec(priority=10, gpus=2))
+    filler = start_running([FAKE_GPUS[1]], None, priority=90, auto_preempt=True)
+
+    _, status = run(capsys, "status")
+    assert isinstance(status, dict)
+    by_id = {j["job_id"]: j for j in status["jobs"]}
+    assert by_id[filler]["yields_to"] == wide
+    starts = by_id[wide]["starts_in_s"]
+    assert starts is not None and 29 * 60 < starts < 31 * 60
+
+
 def test_status_projects_nothing_on_a_draining_host(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

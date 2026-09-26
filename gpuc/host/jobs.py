@@ -328,8 +328,10 @@ class JobSpec:
     with a measured one. A failure is recorded and ignored; see `progress.py`."""
     progress_interval_s: float = progress.DEFAULT_INTERVAL_S
     auto_preempt: bool = False
-    """Let the dispatcher stop this job whenever that starts a more important
-    one right away, as often as it takes: see `dispatcher.preempt_for_waiting`.
+    """Let the dispatcher stop this job whenever that starts one ahead of it in
+    dispatch order right away, as often as it takes: see
+    `dispatcher.preempt_for_waiting`. In return it may take cards held for a
+    job ahead of it (`plan`).
 
     It costs everything the attempt has done, so it is opt-in and belongs to
     jobs that are cheap to re-run from the start.

@@ -121,6 +121,18 @@ def _seconds_until(stamp: str | None) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
+def _seconds_since(stamp: str | None) -> float:
+    if not stamp:
+        return 0.0
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return 0.0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - when).total_seconds()
+
+
 def projected_starts(
     config: jobs.HostConfig, table: dict[str, Any], states: dict[str, JobState]
 ) -> plan.Projection:
@@ -135,8 +147,12 @@ def projected_starts(
     holder = {uuid: s for s in running.values() for uuid in s.gpus}
 
     def release(uuid: str) -> float | None:
+        """Now for a card nobody holds or whose job is being stopped, as the
+        dispatcher counts it; its holder's eta otherwise."""
         state = holder.get(uuid)
-        return 0.0 if state is None else _seconds_until(state.eta)
+        if state is None or state.intent is not None:
+            return 0.0
+        return _seconds_until(state.eta)
 
     cards = [plan.Card(row["uuid"], False, release(row["uuid"])) for row in table["gpus_resolved"]]
     theirs = 0
@@ -153,20 +169,45 @@ def projected_starts(
         for job_id, state in states.items()
         if state.status == "queued"
     )
+
+    def request(job_id: str, spec: JobSpec, state: JobState) -> plan.Request:
+        estimate = state.estimated_runtime_min
+        return plan.Request(
+            job_id,
+            spec.gpus,
+            config.may_borrow(spec),
+            None if estimate is None else estimate * 60.0,
+            priority=state.priority,
+            fills=spec.auto_preempt,
+        )
+
     requests: list[plan.Request] = []
     for entry in queued:
         spec = _spec(entry.job_id)
-        state = states[entry.job_id]
         if spec is None:
             # A spec the dispatcher is about to fail: the next call will say.
             continue
-        estimate = state.estimated_runtime_min
-        requests.append(
-            plan.Request(
-                entry.job_id,
-                spec.gpus,
-                config.may_borrow(spec),
-                None if estimate is None else estimate * 60.0,
+        requests.append(request(entry.job_id, spec, states[entry.job_id]))
+    # The jobs automatic preemption may stop, as the dispatcher counts them.
+    owned = {row["uuid"] for row in table["gpus_resolved"]}
+    shared = {row["uuid"] for row in table["shared_gpus_resolved"]}
+    stoppable: list[tuple[plan.Preemptable, plan.Request]] = []
+    for job_id, state in sorted(running.items()):
+        spec = _spec(job_id)
+        if spec is None or not spec.auto_preempt or state.intent is not None:
+            continue
+        since = _seconds_since(state.started_at)
+        stoppable.append(
+            (
+                plan.Preemptable(
+                    job_id,
+                    state.priority,
+                    list(state.gpus),
+                    -since,
+                    sum(1 for uuid in state.gpus if uuid in owned),
+                    sum(1 for uuid in state.gpus if uuid in shared),
+                ),
+                request(job_id, spec, state),
             )
         )
     return plan.project(
@@ -176,6 +217,7 @@ def projected_starts(
         owned_missing=table["gpus_unavailable"],
         shared_configured=table["shared_configured"],
         theirs=theirs,
+        running=stoppable,
         draining=paths.draining_file().exists(),
     )
 
@@ -233,6 +275,9 @@ def _job_entry(
     # said. Null on anything that is not queued.
     entry["starts_in_s"] = projection.starts_in_s.get(job_id)
     entry["starts_unknown"] = projection.unknown.get(job_id)
+    # For a running auto_preempt job, the queued job it is stopped for once
+    # that job can start: why a priority-90 job runs while one at 10 waits.
+    entry["yields_to"] = projection.yields_to.get(job_id)
     # Whether this job gives its cards up to anything more important. It
     # changes what "running" promises, and only the spec knows.
     entry["auto_preempt"] = spec.auto_preempt if spec else None

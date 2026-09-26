@@ -181,7 +181,10 @@ function jobLabel(job) {
     // Only while it is queued or running: on a finished job it would read as
     // something that happened to it rather than something it allows.
     job.auto_preempt && (job.status === "queued" || job.status === "running")
-      ? el("span", { class: "muted", title: "stopped and queued again whenever that lets a more important job start" }, " auto-preempt")
+      ? el("span", { class: "muted", title: "stopped and queued again whenever that lets a job ahead of it start" }, " auto-preempt")
+      : null,
+    job.yields_to && job.status === "running"
+      ? el("span", { class: "muted", title: "stopped as soon as that job can start" }, `, yields to ${job.yields_to}`)
       : null,
   );
 }
