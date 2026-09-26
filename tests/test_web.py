@@ -508,6 +508,9 @@ def test_set_priority_is_the_set_command_and_checks_the_range(
         f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "priority": "7"}
     )
     assert status == 400
+    for body in ({"priority": float("nan")}, {"priority": float("inf")}, {"max_runtme": 5}):
+        status, _ = logged_in.post_json(f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", **body})
+        assert status == 400
 
 
 def test_a_refused_set_is_the_clis_refusal(logged_in: Client, stub: StubSession) -> None:

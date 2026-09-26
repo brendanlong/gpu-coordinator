@@ -1300,7 +1300,7 @@ def mirror_spec_fields(job_id: str, fields: Mapping[str, Any], settings: Setting
     except (S3IndexError, S3ObjectMissing, ValueError) as exc:
         return (
             f"the host has the new {', '.join(fields)}, but its mirrored spec still has the "
-            f"old, "
+            f"old values, "
             f"so `gpuc requeue {job_id}` would not carry it: {str(exc).splitlines()[0]}"
         )
     return None

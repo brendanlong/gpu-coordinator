@@ -45,7 +45,8 @@ class Settable:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return f"{self.field} must be a number, got {value!r}"
         if self.kind is int:
-            if value != int(value) or not 0 <= value <= 99:
+            # The range first: `int()` of a NaN or an infinity raises.
+            if not 0 <= value <= 99 or value != int(value):
                 return f"{self.field} must be 0-99 (lower dispatches first), got {value!r}"
             return None
         if not 0.0 < value < math.inf:

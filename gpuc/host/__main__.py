@@ -433,7 +433,7 @@ def _patch(fields: Sequence[str]) -> dict[str, Any]:
             raise SystemExit(f"--field {name}: {raw!r} is not JSON: {exc}") from exc
         settable = settable_mod.BY_FIELD.get(name)
         if settable is not None and settable.kind is int and isinstance(value, float):
-            value = int(value) if value == int(value) else value
+            value = int(value) if value.is_integer() else value
         patch[name] = value
     return patch
 

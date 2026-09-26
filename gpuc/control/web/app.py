@@ -52,7 +52,6 @@ from gpuc.control.actions import (
 from gpuc.control.config import Settings, load_settings, read_registry, utc_now
 from gpuc.control.exits import http_status
 from gpuc.control.web.auth import SESSION_COOKIE, SESSION_TTL_S, Sessions, read_password_hash
-from gpuc.host import settable as settable_mod
 from gpuc.host.jobs import SCHEMA_VERSION
 
 DEFAULT_BIND = "127.0.0.1"
@@ -329,7 +328,7 @@ class Dashboard:
         """`gpuc set`: the body names the fields to change, and a null clears one."""
         job_id = job_id_of(request)
         body = request.json()
-        patch = {name: body[name] for name in settable_mod.BY_FIELD if name in body}
+        patch = {name: value for name, value in body.items() if name != "host"}
         return Response.answer(
             jobs_answer(set_jobs([job_id], patch, host_of(body), self.load_settings()))
         )
