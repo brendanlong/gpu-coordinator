@@ -455,6 +455,38 @@ def test_a_finished_job_lists_its_problems_after_its_reason() -> None:
     assert "done    bulky (j-stopped) failed (preempted, sync)" in text
 
 
+def test_a_finished_job_reports_its_mean_utilization() -> None:
+    """The one number that says whether a finished job used the cards it
+    held; `util_recent` has long rotated out by the time anyone asks."""
+    document = payload()
+    document["jobs"] += [
+        {
+            "job_id": "j-sweep",
+            "name": "sweep",
+            "status": "succeeded",
+            "gpus": [GPU],
+            "util_recent": [90.0],
+            "util_sum": 15400.0,
+            "util_samples": 700,
+            "ended_at": minutes_ago(120),
+        },
+        {
+            "job_id": "j-cpu",
+            "name": "cpu",
+            "status": "succeeded",
+            "gpus": [],
+            "ended_at": minutes_ago(60),
+        },
+    ]
+    host_view = view(jobs=document["jobs"])
+    text = render(host_view)
+    assert "done    sweep (j-sweep) succeeded 2h ago, avg util 22% on 1 gpu" in text
+    assert "cpu (j-cpu) succeeded 1h ago\n" in text + "\n"
+    finished = {job["job_id"]: job for job in host_json(host_view)["finished"]}
+    assert (finished["j-sweep"]["util_mean"], finished["j-sweep"]["util_samples"]) == (22.0, 700)
+    assert (finished["j-cpu"]["util_mean"], finished["j-cpu"]["util_samples"]) == (None, 0)
+
+
 def test_problems_and_upload_errors_reach_the_json() -> None:
     document = payload()
     document["jobs"].append(
