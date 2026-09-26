@@ -2569,3 +2569,48 @@ def test_a_filler_is_not_auto_preempted_for_the_job_it_is_filling_for(gpuc_home:
         dispatcher.run_once()
     state = jobs.read_state(filler)
     assert (state.status, state.intent) == ("running", None)
+
+
+def test_two_fillers_cannot_take_turns_on_a_wide_jobs_cards(gpuc_home: Path) -> None:
+    """A stopped filler's runner outlives its last write -- the mirror upload,
+    its secrets -- and for those passes its card has to stay on its way back to
+    the wide job, or the other filler takes the card the wide job already had
+    and the two alternate for ever, each attempt climbing."""
+    dispatcher, spawned = make_dispatcher()
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=20))
+    fillers = [queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True)) for _ in range(2)]
+    dispatcher.run_once()
+    spawned[busy].finish()
+    dispatcher.run_once()
+    (stopping,) = [j for j in fillers if jobs.read_state(j).intent == jobs.PREEMPT]
+
+    assert queue.next_attempt(stopping, ran=True) is not None  # its last write...
+    dispatcher.run_once()  # ...while the runner is still alive
+    assert all(jobs.read_state(j).status == "queued" for j in fillers)
+    spawned[stopping].returncode = runner.TERMINATED_EXIT_CODE
+    dispatcher.run_once()
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+    assert [jobs.read_state(j).attempt for j in fillers] == [
+        2 if j == stopping else 1 for j in fillers
+    ]
+
+
+def test_a_filler_is_not_launched_onto_a_card_an_auto_preempt_is_about_to_complete(
+    gpuc_home: Path,
+) -> None:
+    """Preemption decides first, so the cards it stops are already on their way
+    to the wide job when the pass looks for fillers: exactly the jobs covering
+    the gap are stopped, and nothing is started only to be reclaimed."""
+    cards = [f"GPU-00000000-0000-0000-0000-00000000000{i}" for i in range(1, 5)]
+    jobs.write_config(HostConfig(host="test-host", gpus=cards))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi(cards)
+    cheap = [queue.enqueue(make_spec(gpus=1, priority=50, auto_preempt=True)) for _ in range(3)]
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=3, priority=0))
+    filler = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    dispatcher.run_once()
+    assert sum(jobs.read_state(j).intent is not None for j in cheap) == 2
+    assert jobs.read_state(filler).status == "queued"

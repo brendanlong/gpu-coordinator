@@ -180,9 +180,10 @@ it waits for the rest, an `auto_preempt` job that fits in those cards is
 started on them, whatever its priority. The cards stay held. As soon as a job
 ahead of the filler could start with them, the filler is stopped and queued
 again behind it, like any preempt; if it finishes first, the cards go back to
-being held. The job it filled for starts a pass plus the 15 s stop grace later
-than it would have. Only free cards are filled, and a card a stop in flight is
-handing back stays with the job it is coming back to.
+being held. The job it filled for starts later than it would have by however
+long the filler takes to stop: a pass, then the filler's own final upload (or
+the 15 s grace, if it ignores the stop). Only free cards are filled, and a card
+a stop in flight is handing back stays with the job it is coming back to.
 
 `gpuc status` shows `auto-preempt` on those jobs, and `on a card held for
 <job>` on a filler. The dispatcher log and the job's own log name the job each

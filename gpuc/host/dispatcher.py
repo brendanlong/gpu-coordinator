@@ -543,6 +543,9 @@ class _Running:
     runner_pid: int | None = None
     runner_boot_id: str | None = None
     runner_starttime: str | None = None
+    filler: bool = False
+    """Launched onto held cards. Known here from the spawn, before the runner's
+    claim puts it on disk, so an unclaimed filler is still one in the walk."""
 
     @staticmethod
     def adopted(job_id: str, state: jobs.JobState) -> _Running:
@@ -553,6 +556,7 @@ class _Running:
             runner_pid=state.runner_pid,
             runner_boot_id=state.runner_boot_id,
             runner_starttime=state.runner_starttime,
+            filler=state.filler,
         )
 
     def alive(self) -> bool:
@@ -1036,7 +1040,7 @@ class Dispatcher:
         for job_id, running in self.running.items():
             state = self._state_or_empty(job_id)
             cards = tuple(uuid for uuid in running.gpus if uuid in visible)
-            if state.status != "running" or not state.filler or state.intent or not cards:
+            if self._standing(running, state) != "filling" or not cards:
                 continue
             requests.append(
                 (
@@ -1045,6 +1049,30 @@ class Dispatcher:
                 )
             )
         return sorted(requests, key=lambda pair: pair[0])
+
+    @staticmethod
+    def _standing(entry: _Running, state: jobs.JobState) -> str:
+        """What a runner's cards are to the walk: `filling`, `leaving` or `busy`.
+
+        Read from the state and the attempt, not the intent alone. A runner
+        that has written its last state -- `queued` at a later attempt, or
+        finished -- is still alive for its mirror upload and its secrets, and
+        its cards are busy until it is reaped; counted as neither leaving nor
+        a filler's, they vanished from the walk, the job waiting on them fell
+        back to holding, and the next filler took the free card it held. Two
+        fillers could then take turns on a wide job's cards for ever. The same
+        goes for a filler spawned but not yet claimed, whose state still says
+        `queued` at the attempt it was launched for.
+        """
+        claimed = state.status == "running"
+        unclaimed = state.status == "queued" and state.attempt == entry.attempt
+        if claimed and state.intent is not None:
+            return "leaving"
+        if (claimed and state.filler) or (unclaimed and entry.filler):
+            return "filling"
+        if claimed or unclaimed:
+            return "busy"
+        return "leaving"
 
     def _pool(self) -> plan.Pool:
         """This pass's cards, with the ones a stop in flight will hand back
@@ -1061,7 +1089,7 @@ class Dispatcher:
             coming=[
                 uuid
                 for job_id, entry in self.running.items()
-                if self._stopping(job_id)
+                if self._standing(entry, self._state_or_empty(job_id)) == "leaving"
                 for uuid in entry.gpus
                 if uuid in visible
             ],
@@ -1098,6 +1126,8 @@ class Dispatcher:
                     self._reclaim_from(filler, job_id)
 
     def _reclaim_from(self, filler: str, waiting: str) -> None:
+        if self._state_or_empty(filler).status != "running":
+            return  # not claimed yet; the first pass after the claim stops it
         try:
             queue.preempt(filler)
         except (ValueError, RuntimeError, OSError) as exc:
@@ -1148,7 +1178,9 @@ class Dispatcher:
             self.log(f"job {job_id}: could not spawn a runner ({exc})")
             self._fail_queued(job_id, "spawn-failed")
             return
-        self.running[job_id] = _Running(job_id, list(assigned), attempt, popen=proc)
+        self.running[job_id] = _Running(
+            job_id, list(assigned), attempt, popen=proc, filler=bool(held_for)
+        )
         shared = set(self.shared_gpus())
         borrowed = [uuid for uuid in assigned if uuid in shared]
         note = f", borrowing {','.join(borrowed)}" if borrowed else ""
@@ -1166,9 +1198,12 @@ class Dispatcher:
     def preempt_for_waiting(self) -> None:
         """Stop `auto_preempt` jobs when that starts a more important one now.
 
-        After `launch_ready`, so everything still queued is something the free
-        cards could not take, and the only question left is whether stopping a
-        job that said it may be stopped would let one of them run.
+        Before `launch_ready`, on the same walk: a job the free cards can take
+        is `Assigned` there and asks nothing here, and the only question left
+        is whether stopping a job that said it may be stopped would let one
+        that holds run. Before rather than after so that the cards it stops
+        are already `coming` when `launch_ready` walks: after, a filler was
+        launched onto the held card first, only to be reclaimed a pass later.
 
         **Exactly one queued job is asked that question**: the first one the
         queue is actually stuck on. Anything behind it is not a reason to stop
@@ -1537,8 +1572,8 @@ class Dispatcher:
         self._draining = None
         self.reap()
         self.escalate_stops()
-        self.launch_ready()
         self.preempt_for_waiting()
+        self.launch_ready()
         # The listing is shared by the two walks above and by nothing after
         # them: a reclaim can take seconds, and a job accepted during it must
         # be seen by the idle clock.

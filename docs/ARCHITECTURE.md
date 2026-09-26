@@ -262,9 +262,11 @@ The rules it holds to:
   intent stands in the walk at its own `(priority, job_id)`; its cards are on
   offer to every job ahead of it, and one that needs them to fit
   (`plan.Reclaims`) holds them and has the filler preempted. Cards of a job
-  already stopping are on offer the same way (`Pool.coming`), with nobody to
-  stop, so no second filler takes a card the job ahead is waiting on. A
-  filler is never an automatic-preemption candidate.
+  on its way out are on offer the same way (`Pool.coming`), with nobody to
+  stop, so no second filler takes a card the job ahead is waiting on: a
+  stop intent, or a last state written (queued again, or finished) by a
+  runner not yet reaped. A filler spawned but not yet claimed stands in the
+  walk already. A filler is never an automatic-preemption candidate.
 - **Acceptance is a rename.** `gpuc submit` builds the job dir under
   `incoming/`; the host's `enqueue` writes the spec and initial state there
   and renames the dir into `jobs/`. A dir left under `incoming/` an hour after
@@ -296,7 +298,7 @@ The rules it holds to:
   finished in between. An attempt that ended on its own first, or was
   cancelled while stopping, ends that way instead. A draining host refuses
   one.
-- **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
+- **Automatic preemption** (`preempt_for_waiting`, before `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
   `auto_preempt` jobs that together cover the gap, least important first, and
   only at a strictly higher priority number. Nothing is stopped on a host that
