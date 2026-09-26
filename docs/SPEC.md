@@ -25,7 +25,9 @@ down when its work is done and nobody watching.
 - **Owned GPU**: a card the host may use unconditionally. **Shared GPU**: a
   card the host may borrow under the conditions in *Queueing*. Both are named
   by nvidia-smi index or by UUID. Any other card on the machine is never used,
-  and is reported only where the user is choosing cards or debugging.
+  and is reported only where the user is choosing cards or debugging. What a
+  host owns or shares is the cards nvidia-smi reports among those it is
+  configured with; the configuration is a ceiling, not a promise.
 - **Job**: one spec (command, GPU count, priority, options) submitted to one
   host, identified by an id that is unique across all hosts.
 - **Backup destination**: a remote store a job's outputs are copied to.
@@ -63,9 +65,9 @@ destinations. Adding another of either changes nothing else in this document.
 - **The client owns provisioning until the host proves healthy.** Any failure
   before that point is the client's to clean up; for a rental that means
   terminating it, then trying the next offer within a time ceiling.
-- **Health is checked before any job runs on a host**: the driver, every
-  owned and shared GPU resolves to a present card and none is in both lists,
-  free disk, and a basic network throughput test.
+- **Health is checked before any job runs on a host**: the driver, no card in
+  both lists, free disk, and a basic network throughput test. A configured
+  card nvidia-smi does not report is reported, not refused.
 - **After that the host owns itself**: its queue, its job state, its logs, its
   configuration and, for a rental, its own shutdown. A rental terminates
   itself once its queue has been empty for a configured idle period, after
@@ -80,7 +82,8 @@ destinations. Adding another of either changes nothing else in this document.
   decides something asks the host; output from the cache is labelled with its
   age.
 - Connecting selects which cards are owned and which are shared. By default
-  a host owns every card it has.
+  a host owns every card it has that is not shared, including cards that
+  appear later.
 - An existing matching rental is reused before a new one is created. Rentals
   that are not ours are never touched.
 
@@ -93,9 +96,9 @@ destinations. Adding another of either changes nothing else in this document.
   acceptance leaves nothing the host will run, and what it staged is
   removed.
 - A job states its requirements as a number of GPUs, which may be none. A job
-  asking for more cards than the host is configured with, counting shared
-  cards only if the job opted into them, is refused at submit and fails at
-  dispatch if the configuration shrinks afterwards.
+  asking for more cards than the host has, counting shared cards only if the
+  job opted into them, is refused at submit, and fails at dispatch if the host
+  has fewer afterwards.
 - **Priority is numeric, lower first, and strict.** The queue is taken in
   order: a job that does not yet fit holds the free cards it is waiting for,
   and nothing behind it may take them, even at the cost of idle cards. What is

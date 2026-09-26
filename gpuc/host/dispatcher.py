@@ -54,6 +54,12 @@ Once at startup and then hourly: deleting day-old venvs is not urgent, and
 on a non-ephemeral host the dispatcher only lives while there is work, so the
 startup pass is the one that usually fires.
 """
+SMI_PATIENCE_S = 300.0
+"""How long nvidia-smi may fail to answer before the host is taken to have no
+cards and the jobs that need some are failed. A pass it times out on says
+nothing about the cards, and one slow call should not empty the queue; one
+that never answers is a broken driver, and holding jobs for it is a rental that
+never idles out (#69)."""
 OUTPUT_RETRY_ATTEMPTS = 3
 OUTPUT_RETRY_INTERVAL_S = 60.0
 OUTPUT_RETRY_BUDGET_S = 300.0
@@ -625,10 +631,14 @@ class Dispatcher:
     _cards: gpus.Resolution | None = None
     """This pass's one resolution of `config.gpus` and `config.shared_gpus`
     against nvidia-smi. Reset every pass; see `owned_gpus`."""
+    _owned: tuple[str, ...] | None = None
+    """The owned cards the last readable pass found, to log when they change."""
     _unavailable: tuple[str, ...] = ()
     _shared_unavailable: tuple[str, ...] = ()
     _duplicates: tuple[str, ...] = ()
     _table_error: str | None = None
+    _unreadable_since: float | None = None
+    """When nvidia-smi started failing to answer, if it is failing now."""
     _borrowable: tuple[list[str], int] | None = None
     """This pass's one reading of the shared cards: the ones nobody else was
     on, and how many they were on. Reset every pass; see `borrowable_gpus`."""
@@ -895,8 +905,8 @@ class Dispatcher:
     def _resolution(self) -> gpus.Resolution:
         """One nvidia-smi read per pass, both lists against it; every change
         in what could not be resolved is logged once, not every two seconds.
-        A driver that will not answer costs the pass its cards and nothing
-        more: jobs wait for the next pass, they do not fail."""
+        A driver that will not answer costs the pass its cards; jobs wait,
+        for `SMI_PATIENCE_S` at most."""
         if self._cards is None:
             try:
                 table = gpus.list_gpus(self.deps.smi)
@@ -909,6 +919,11 @@ class Dispatcher:
                     self.log(f"nvidia-smi could not be read, so no card is handed out: {error}")
             self._cards = gpus.resolve(self.config.gpus, table, self.config.shared_gpus)
             described = gpus.describe_table(table)
+            owned = tuple(self._cards.owned)
+            if error is None and owned != self._owned:
+                if self._owned is not None:
+                    self.log(f"owned GPUs are now {', '.join(owned) or 'none'} ({described})")
+                self._owned = owned
             for what, missing, seen in (
                 ("config.gpus", self._cards.missing, "_unavailable"),
                 ("config.shared_gpus", self._cards.shared_missing, "_shared_unavailable"),
@@ -1029,9 +1044,10 @@ class Dispatcher:
         back, which `preempt_for_waiting` counts as free."""
         return plan.Pool(
             owned_free=[*self.free_gpus(), *extra_owned],
-            owned_configured=len(self.config.gpus),
-            shared_configured=len(self.shared_gpus()) + len(self._shared_unavailable),
+            owned_present=len(self.owned_gpus()),
             shared_visible=len(self.shared_gpus()),
+            owned_absent=self._unavailable,
+            shared_absent=self._shared_unavailable,
             sample=self.borrowable_gpus,
             shared_extra=list(extra_shared),
         )
@@ -1039,20 +1055,29 @@ class Dispatcher:
     def launch_ready(self) -> None:
         """Act on `plan`: start what fits, fail what never will, hold the rest.
 
-        A job waiting for an owned card that has dropped off nvidia-smi holds
-        like any other: `config.gpus` says the host has that card, so the host
-        is misconfigured or broken, and idling the queue behind the job is how
-        that gets noticed rather than quietly worked around.
+        A job wider than the cards nvidia-smi reports fails on the first pass
+        that sees it; while nvidia-smi is not answering, only once that has
+        gone on for `SMI_PATIENCE_S`.
         """
         if self.going_away is not None:
             return
         requests = self._requests()
         attempts = {entry.job_id: entry.attempt for entry, _ in requests}
-        decisions = plan.plan([request for _, request in requests], self._pool())
+        pool = self._pool()
+        now = self.deps.monotonic()
+        if self._table_error is None:
+            self._unreadable_since = None
+        elif self._unreadable_since is None:
+            self._unreadable_since = now
+        patient = (
+            self._unreadable_since is not None and now - self._unreadable_since < SMI_PATIENCE_S
+        )
+        decisions = plan.plan([request for _, request in requests], pool)
         for decision in decisions:
             job_id = decision.job_id
             if isinstance(decision, plan.Fails):
-                self._fail_queued(job_id, decision.reason)
+                if not patient:
+                    self._fail_queued(job_id, decision.reason)
                 continue
             if not isinstance(decision, plan.Assigned):
                 continue

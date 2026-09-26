@@ -33,7 +33,7 @@ from gpuc.control.transport import (
     git_tracked_files,
     uncommitted_patch,
 )
-from gpuc.host import jobs, plan, progress
+from gpuc.host import gpus, jobs, plan, progress
 from gpuc.host.jobs import HostConfig, JobSpec
 
 
@@ -510,24 +510,45 @@ def refuse_unreadable_config(session: HostSession) -> None:
         )
 
 
-def wont_fit(spec: JobSpec, config: HostConfig, host: str) -> str | None:
-    """Why this host could never run this job, or None if it could.
+def read_cards(session: HostSession) -> list[gpus.Gpu] | None:
+    """The host's cards as nvidia-smi reports them now, or None if it would not say."""
+    command = f"nvidia-smi --query-gpu={','.join(gpus.TABLE_FIELDS)} --format=csv,noheader"
+    try:
+        result = session.run(command)
+    except TransportError:
+        return None
+    return gpus.parse_table(result.stdout) if result.returncode == 0 else None
 
-    The dispatcher's own rule (`plan.capacity_failure`), run here against the
-    config the host itself answered with a moment ago, so the answer arrives
-    before the code is shipped rather than as a failed job -- with the way
-    out added, since this is the moment somebody is looking. A card listed
-    as both owned and shared counts once: the dispatcher resolves both lists
-    against the live card table and health refuses the overlap, but a submit
-    has no table, so spelled-identically is the best it can do here.
+
+def wont_fit(
+    spec: JobSpec, config: HostConfig, table: list[gpus.Gpu] | None, host: str
+) -> str | None:
+    """Why this host could not run this job on the cards it has, or None if it could.
+
+    The dispatcher's own rule (`plan.capacity_failure`) over the same
+    resolution of the config against nvidia-smi, so the answer arrives before
+    the code is shipped rather than as a failed job -- with the way out added,
+    since this is the moment somebody is looking. With no table only an
+    explicit list can be counted, and a host that owns every card is left for
+    dispatch to judge.
     """
-    owned = list(config.gpus)
-    shared = [card for card in config.shared_gpus if card not in owned]
+    borrows = config.may_borrow(spec)
+    if table is not None:
+        cards = gpus.resolve(config.gpus, table, config.shared_gpus)
+        owned, shared = len(cards.owned), len(cards.shared)
+        absent = [*cards.missing, *(cards.shared_missing if borrows else [])]
+    elif config.gpus is not None:
+        owned = len(config.gpus)
+        shared = len([card for card in config.shared_gpus if card not in config.gpus])
+        absent = []
+    else:
+        return None
     failure = plan.capacity_failure(
         spec.gpus,
-        len(owned),
-        len(shared),
-        borrows=config.may_borrow(spec),
+        owned,
+        shared,
+        borrows=borrows,
+        absent=absent,
     )
     if failure is None:
         return None
@@ -570,7 +591,7 @@ def submit_spec(
             f"host {entry.name} has no config.json, so nothing says which cards it owns.\n"
             f"Run: gpuc host bootstrap {entry.name}"
         )
-    too_big = wont_fit(spec, session.config, entry.name)
+    too_big = wont_fit(spec, session.config, read_cards(session), entry.name)
     if too_big:
         raise SubmitError(too_big)
     check_kept_allowed(spec, f"host {entry.name}", ephemeral=session.config.ephemeral)

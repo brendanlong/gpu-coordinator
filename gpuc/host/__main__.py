@@ -71,7 +71,7 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     borrowable is a fact about this second that only nvidia-smi here can answer
     -- and when it is not, the numbers are how somebody sees why. The same
     `gpus.resolve` the dispatcher decides with, over one reading; a driver
-    that will not answer reads as every entry unavailable, as it does there.
+    that will not answer reads as no cards, as it does there.
     """
     try:
         table = gpus.list_gpus()
@@ -98,7 +98,6 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
             for uuid in cards.shared
         ],
         "shared_gpus_unavailable": cards.shared_missing,
-        "shared_configured": len(cards.shared) + len(cards.shared_missing),
     }
 
 
@@ -172,9 +171,8 @@ def projected_starts(
     return plan.project(
         requests,
         cards,
-        owned_configured=len(config.gpus),
         owned_missing=table["gpus_unavailable"],
-        shared_configured=table["shared_configured"],
+        shared_missing=table["shared_gpus_unavailable"],
         theirs=theirs,
         draining=paths.draining_file().exists(),
     )

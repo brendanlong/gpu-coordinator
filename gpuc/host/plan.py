@@ -18,9 +18,11 @@ borrower onto a shared card the holder may not use. The one exemption is a job t
 not fit even once every job of ours ends: it is short of a shared card
 somebody else is using, which comes free when *their* job ends, and that is
 not ours to wait on. It is stepped
-over, not failed, since the configured host is big enough for it. A job that
-asks for more than the host is configured with, counting shared cards only if
-it may borrow, can never run and is failed.
+over, not failed, since the host is big enough for it. A job that asks for
+more cards than the host has now, counting shared cards only if it may borrow,
+is failed. What the host has is what nvidia-smi reports, not what its config
+lists: a card that has died does not come back, and a job held for it would
+hold the queue for ever -- on a rental, a pod that never goes idle (#69).
 """
 
 from __future__ import annotations
@@ -49,21 +51,17 @@ class Request:
 
 @dataclass
 class Pool:
-    """What one pass has to hand out.
-
-    Counts of *configured* cards are what "could this job ever fit" is judged
-    against: a card missing from nvidia-smi this minute makes a job wait, it
-    does not fail one the host is set up to run.
-    """
+    """What one pass has to hand out."""
 
     owned_free: list[str]
     """Owned cards nothing of ours holds, as UUIDs, visible now."""
-    owned_configured: int
-    """`len(config.gpus)`, missing cards included."""
-    shared_configured: int
-    """Shared entries not also owned, for capacity."""
+    owned_present: int
+    """Owned cards nvidia-smi reports, busy or not."""
     shared_visible: int
-    """Shared cards nvidia-smi reports, for whether a short job holds."""
+    """Shared cards nvidia-smi reports, ours and somebody else's."""
+    owned_absent: Sequence[str] = ()
+    """Listed entries nvidia-smi does not report, for a failure's reason."""
+    shared_absent: Sequence[str] = ()
     sample: Sample | None = None
     """How to read the shared cards, if a job needs them."""
     shared_extra: list[str] = field(default_factory=list)
@@ -116,20 +114,25 @@ class Fails:
 Decision = Assigned | Holds | SteppedOver | Fails
 
 
-def capacity_failure(gpus: int, owned: int, shared: int, *, borrows: bool) -> str | None:
-    """Why a job asking for `gpus` cards can *never* run on this host, or None.
+def capacity_failure(
+    gpus: int, owned: int, shared: int, *, borrows: bool, absent: Sequence[str] = ()
+) -> str | None:
+    """Why a job asking for `gpus` cards cannot run on this host's cards, or None.
 
-    Everything read here is fixed for the life of a queued job -- the
-    configured counts and the spec's `use_shared` -- because the answer
-    deletes the job from the queue.
+    `absent` are listed entries nvidia-smi does not report, named when they
+    would have let it run, so the reason says a card has gone rather than that
+    the host is small.
     """
-    if gpus <= owned + (shared if borrows else 0):
+    have_n = owned + (shared if borrows else 0)
+    if gpus <= have_n:
         return None
     have = f"host owns {owned}"
     if borrows:
         have += f" and may borrow {shared} shared"
     elif shared:
         have += f" and shares {shared} this job did not ask for (`use_shared: true` would let it)"
+    if absent and gpus <= have_n + len(absent):
+        have += f" that nvidia-smi reports ({', '.join(absent)} listed but missing)"
     return f"needs {gpus} GPUs, {have}"
 
 
@@ -144,7 +147,11 @@ def plan(requests: Sequence[Request], pool: Pool) -> list[Decision]:
     held = held_shared = 0
     for request in requests:
         failure = capacity_failure(
-            request.gpus, pool.owned_configured, pool.shared_configured, borrows=request.borrows
+            request.gpus,
+            pool.owned_present,
+            pool.shared_visible,
+            borrows=request.borrows,
+            absent=[*pool.owned_absent, *(pool.shared_absent if request.borrows else ())],
         )
         if failure is not None:
             decisions.append(Fails(request.job_id, failure))
@@ -157,7 +164,7 @@ def plan(requests: Sequence[Request], pool: Pool) -> list[Decision]:
             shared_part = free_shared[: min(short, max(0, len(free_shared) - held_shared))]
             short -= len(shared_part)
         if short:
-            ours = pool.owned_configured
+            ours = pool.owned_present
             if request.borrows:
                 ours += pool.shared_visible - pool.theirs
             if request.gpus <= ours:
@@ -201,9 +208,8 @@ def project(
     requests: Sequence[Request],
     cards: Sequence[Card],
     *,
-    owned_configured: int,
-    owned_missing: Sequence[str],
-    shared_configured: int,
+    owned_missing: Sequence[str] = (),
+    shared_missing: Sequence[str] = (),
     theirs: int,
     draining: bool = False,
 ) -> Projection:
@@ -223,6 +229,7 @@ def project(
         return Projection({}, {r.job_id: why for r in requests})
     releases: dict[str, float | None] = {card.uuid: card.release_s for card in cards}
     is_shared = {card.uuid: card.shared for card in cards}
+    owned_present = sum(1 for card in cards if not card.shared)
     shared_visible = sum(1 for card in cards if card.shared) + theirs
     pending = list(requests)
     starts: dict[str, float] = {}
@@ -232,9 +239,10 @@ def project(
         free = [uuid for uuid, at in releases.items() if at is not None and at <= clock]
         pool = Pool(
             owned_free=[u for u in free if not is_shared[u]],
-            owned_configured=owned_configured,
-            shared_configured=shared_configured,
+            owned_present=owned_present,
             shared_visible=shared_visible,
+            owned_absent=owned_missing,
+            shared_absent=shared_missing,
             shared_free=[u for u in free if is_shared[u]],
             theirs=theirs,
         )
@@ -253,26 +261,18 @@ def project(
         if not later:
             break
         clock = min(later)
-    return Projection(starts, _unknown_reasons(decisions, pending, owned_configured, owned_missing))
+    return Projection(starts, _unknown_reasons(decisions, pending))
 
 
-def _unknown_reasons(
-    decisions: Sequence[Decision],
-    pending: Sequence[Request],
-    owned_configured: int,
-    owned_missing: Sequence[str],
-) -> dict[str, str]:
+def _unknown_reasons(decisions: Sequence[Decision], pending: Sequence[Request]) -> dict[str, str]:
     """From the last pass that could start nothing, why each job is still waiting.
 
     The reasons are not interchangeable: a job the host steps over is waiting
-    on somebody else, a job behind a held one is waiting on the queue, and a
-    job held for a card nvidia-smi cannot see is waiting on the host being
-    fixed, which the submitter should hear.
+    on somebody else, and a job behind a held one is waiting on the queue.
     """
     by_id = {r.job_id: r for r in pending}
     reasons: dict[str, str] = {}
     first_holder: str | None = None
-    owned_visible = owned_configured - len(owned_missing)
     for decision in decisions:
         if decision.job_id not in by_id:
             continue
@@ -288,12 +288,6 @@ def _unknown_reasons(
             if first_holder is not None:
                 reasons[request.job_id] = (
                     f"job {first_holder} is ahead of it and has no start time yet"
-                )
-            elif owned_visible < request.gpus <= owned_configured:
-                reasons[request.job_id] = (
-                    f"it needs {request.gpus} card(s) and only {owned_visible} of the "
-                    f"{owned_configured} this host owns answer to nvidia-smi "
-                    f"({', '.join(owned_missing)} missing), so it is held until they do"
                 )
             else:
                 reasons[request.job_id] = "the jobs holding the cards it needs gave no end time"

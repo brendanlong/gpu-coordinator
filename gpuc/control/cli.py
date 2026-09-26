@@ -81,8 +81,8 @@ from gpuc.control.config import (
     update_cache,
 )
 from gpuc.control.fetch import fetch_jobs, fetch_line
+from gpuc.control.gpuinfo import owned_entries, summarize
 from gpuc.control.gpuinfo import rows as gpu_rows
-from gpuc.control.gpuinfo import summarize
 from gpuc.control.hosts import add_host, bootstrap_and_record, bootstrap_every_host, set_host
 from gpuc.control.jsonout import note, warn
 from gpuc.control.probe import probe_host
@@ -122,8 +122,10 @@ NO_HOSTS = "no hosts registered. Add one: gpuc host add local"
 
 GPUS_HELP = (
     "GPU UUIDs or nvidia-smi indices this host may use, comma-separated "
-    "(`--gpus 2,3` or `--gpus GPU-8064...,3`); indices are resolved to UUIDs on "
-    "the host at every dispatch pass, so jobs are always pinned by UUID"
+    "(`--gpus 2,3` or `--gpus GPU-8064...,3`), or `all` for every card that is not "
+    "shared, including ones added later. It is a ceiling: only the listed cards "
+    "nvidia-smi reports are used, resolved to UUIDs on the host at every dispatch "
+    "pass, so jobs are always pinned by UUID"
 )
 
 SHARED_GPUS_HELP = (
@@ -179,7 +181,7 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
     """
     fields: dict[str, Any] = {}
     if args.gpus is not None:
-        fields["gpus"] = _gpu_list(args.gpus)
+        fields["gpus"] = None if args.gpus.strip() == "all" else _gpu_list(args.gpus)
     if args.shared_gpus is not None:
         fields["shared_gpus"] = _gpu_list(args.shared_gpus, "--shared-gpus")
     if args.env is not None:
@@ -325,7 +327,10 @@ def cmd_host_list(args: argparse.Namespace) -> Answer:
         lines.append(NO_HOSTS)
     for entry in registry.hosts.values():
         config = entry.config
-        summary = summarize(config.gpus, entry.gpu_info) if config.gpus else "no GPUs"
+        owned = owned_entries(config.gpus, config.shared_gpus, entry.gpu_info)
+        summary = summarize(owned, entry.gpu_info) if owned else "no GPUs"
+        if config.gpus is None:
+            summary = f"all: {summary}"
         driver = f", driver {entry.driver_version}" if entry.driver_version else ""
         # One block per host, shaped like `gpuc status`: what the host is, then
         # its cards, then the bootstrap facts. The interpreter path is in
@@ -333,12 +338,12 @@ def cmd_host_list(args: argparse.Namespace) -> Answer:
         # than everything else on the line put together.
         lines.append(
             f"host {entry.name} [{entry.kind}] {entry.ssh or 'this machine'}  "
-            f"gpus {len(config.gpus)} ({summary}{driver})"
+            f"gpus {len(owned)} ({summary}{driver})"
         )
         stale = shipped_note(entry)
         if stale:
             lines.append(f"  NOTE {stale}")
-        for index, name, vram, uuid in gpu_rows(config.gpus, entry.gpu_info):
+        for index, name, vram, uuid in gpu_rows(owned, entry.gpu_info):
             lines.append(f"  gpu     [{index}] {name:<28} {vram:<7} {uuid}")
         for index, name, vram, uuid in gpu_rows(config.shared_gpus, entry.gpu_info):
             lines.append(f"  shared  [{index}] {name:<28} {vram:<7} {uuid}")
@@ -1080,9 +1085,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add.add_argument(
         "--gpus",
-        help=f"a host with no config of its own owns every card nvidia-smi reports unless "
-        f"this narrows it ('' for none); on a host that has one this reassigns its cards, "
-        f"and a list that overlaps the host's is refused. {GPUS_HELP}",
+        help=f"a host with no config of its own owns `all` unless this narrows it ('' for "
+        f"none); on a host that has one this reassigns its cards, and a list that overlaps "
+        f"the host's is refused. {GPUS_HELP}",
     )
     add.add_argument("--shared-gpus", help=SHARED_GPUS_HELP)
     add.add_argument("--gpuc-home", help="override ~/.gpuc on the host")
@@ -1138,7 +1143,8 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("name")
     edit.add_argument(
         "--gpus",
-        help=f"replace what this host owns, on the host itself; pass '' for none. {GPUS_HELP}",
+        help=f"replace what this host owns, on the host itself; pass '' for none, `all` for "
+        f"every card. {GPUS_HELP}",
     )
     edit.add_argument(
         "--shared-gpus",

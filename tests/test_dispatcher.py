@@ -13,7 +13,7 @@ from typing import Any, cast
 
 import pytest
 
-from gpuc.host import cleanup, destinations, jobs, paths, queue, runner, sync, terminate
+from gpuc.host import cleanup, destinations, gpus, jobs, paths, queue, runner, sync, terminate
 from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import procs as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
@@ -1511,33 +1511,128 @@ def test_an_owned_index_the_host_cannot_see_is_not_handed_out(gpuc_home: Path) -
     dispatcher.run_once()
 
     assert jobs.read_state(first).gpus == [FAKE_GPUS[0]]
-    # Still queued, not failed: the host is configured for two cards and one of
-    # them may well come back; only a spec bigger than the whole host fails.
+    # One card is still enough for it: it waits for the one that is there.
     assert jobs.read_state(waiting).status == "queued"
     assert "does not report" in paths.dispatcher_log().read_text()
 
 
-def test_a_job_waiting_for_a_missing_owned_card_holds_like_any_other(gpuc_home: Path) -> None:
-    """`config.gpus` says the host has the card, so a host that cannot see it
-    is misconfigured or broken. The job holds the card it can see and the
-    queue behind it waits, which is how that gets noticed; it is not failed,
-    since the configured host is big enough, and it runs once the card is
-    back."""
+def test_a_job_needing_a_missing_owned_card_fails_at_once_and_holds_nothing(
+    gpuc_home: Path,
+) -> None:
+    """What the host has is what nvidia-smi reports: held for a card that may
+    never come back, it would hold the queue for ever -- on a rental, a pod
+    that never goes idle (#69)."""
     configure_indices(["0", "1"])
     dispatcher, _ = make_dispatcher()
     dispatcher.deps.smi = fake_smi([FAKE_GPUS[0]])  # index 1 has dropped off
     wide = queue.enqueue(make_spec(gpus=2, priority=10))
     behind = queue.enqueue(make_spec(gpus=1, priority=50))
     dispatcher.run_once()
-    assert jobs.read_state(wide).status == "queued"
-    assert jobs.read_state(behind).status == "queued"
-    assert "does not report" in paths.dispatcher_log().read_text()
+
+    state = jobs.read_state(wide)
+    assert state.status == "failed"
+    assert state.reason == (
+        "needs 2 GPUs, host owns 1 that nvidia-smi reports (1 listed but missing)"
+    )
+    assert jobs.read_state(behind).status == "running"
+    assert jobs.read_state(behind).gpus == [FAKE_GPUS[0]]
+
+
+def test_a_job_wider_than_every_configured_card_fails_at_once(gpuc_home: Path) -> None:
+    configure_indices(["0", "1"])
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi([FAKE_GPUS[0]])
+    huge = queue.enqueue(make_spec(gpus=3))
+    dispatcher.run_once()
+    state = jobs.read_state(huge)
+    assert state.status == "failed"
+    assert "missing" not in (state.reason or "")
+
+
+def unreadable(args: list[str]) -> str:
+    raise gpus.GpuError("nvidia-smi timed out")
+
+
+def test_an_unreadable_nvidia_smi_fails_nothing_until_its_patience_is_up(gpuc_home: Path) -> None:
+    """A pass nvidia-smi does not answer says nothing about the cards; one that
+    never answers is a broken driver, and holding jobs for it is #69 again."""
+    configure_indices(["0", "1"])
+    clock = FakeClock()
+    dispatcher, _ = make_dispatcher(clock)
+    dispatcher.deps.smi = unreadable
+    job = queue.enqueue(make_spec(gpus=2))
+    dispatcher.run_once()
+    assert jobs.read_state(job).status == "queued"
+
+    clock.advance(host_dispatcher.SMI_PATIENCE_S - 1)
+    dispatcher.run_once()
+    assert jobs.read_state(job).status == "queued"
+
+    clock.advance(1)
+    dispatcher.run_once()
+    state = jobs.read_state(job)
+    assert state.status == "failed"
+    assert state.reason == (
+        "needs 2 GPUs, host owns 0 that nvidia-smi reports (0, 1 listed but missing)"
+    )
+
+
+def test_nvidia_smi_answering_again_within_its_patience_runs_the_job(gpuc_home: Path) -> None:
+    configure_indices(["0", "1"])
+    clock = FakeClock()
+    dispatcher, _ = make_dispatcher(clock)
+    dispatcher.deps.smi = unreadable
+    job = queue.enqueue(make_spec(gpus=2))
+    dispatcher.run_once()
+    clock.advance(host_dispatcher.SMI_PATIENCE_S - 1)
+    dispatcher.deps.smi = fake_smi()
+    dispatcher.run_once()
+    assert jobs.read_state(job).status == "running"
+
+
+def test_the_first_readable_pass_judges_a_job_nvidia_smi_was_hiding(gpuc_home: Path) -> None:
+    configure_indices(["0", "1"])
+    clock = FakeClock()
+    dispatcher, _ = make_dispatcher(clock)
+    dispatcher.deps.smi = unreadable
+    job = queue.enqueue(make_spec(gpus=3))  # wider than the host even when readable
+    dispatcher.run_once()
+    clock.advance(host_dispatcher.SMI_PATIENCE_S - 1)
+    dispatcher.run_once()
+    assert jobs.read_state(job).status == "queued"
+    # One readable pass is enough to judge it.
+    dispatcher.deps.smi = fake_smi()
+    dispatcher.run_once()
+    assert jobs.read_state(job).status == "failed"
+
+
+def test_a_card_added_to_a_host_that_owns_every_card_is_used(gpuc_home: Path) -> None:
+    """None is every card nvidia-smi reports, so a card that turns up later is
+    owned without anyone reconfiguring the host -- and said so in the log."""
+    jobs.write_config(HostConfig(host="test-host", gpus=None))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi([FAKE_GPUS[0]])
+    first = queue.enqueue(make_spec(gpus=1, priority=10))
+    second = queue.enqueue(make_spec(gpus=1, priority=20))
+    dispatcher.run_once()
+    assert jobs.read_state(first).gpus == [FAKE_GPUS[0]]
+    assert jobs.read_state(second).status == "queued"
 
     dispatcher.deps.smi = fake_smi()
     dispatcher.run_once()
-    assert jobs.read_state(wide).status == "running"
-    assert jobs.read_state(wide).gpus == FAKE_GPUS
-    assert jobs.read_state(behind).status == "queued"
+    assert jobs.read_state(second).gpus == [FAKE_GPUS[1]]
+    assert dispatcher.owned_gpus() == FAKE_GPUS
+    assert f"owned GPUs are now {FAKE_GPUS[0]}, {FAKE_GPUS[1]}" in (
+        paths.dispatcher_log().read_text()
+    )
+
+
+def test_a_host_that_owns_every_card_never_owns_a_shared_one(gpuc_home: Path) -> None:
+    jobs.write_config(HostConfig(host="test-host", gpus=None, shared_gpus=["1"]))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi()
+    dispatcher.run_once()
+    assert dispatcher.owned_gpus() == [FAKE_GPUS[0]]
 
 
 def test_a_preempted_job_goes_back_in_the_queue_when_its_runner_stops(gpuc_home: Path) -> None:

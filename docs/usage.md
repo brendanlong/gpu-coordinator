@@ -17,7 +17,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `name` | `""` | a label for `status`; not an identifier |
 | `setup` | none | run first, as phase `setup` |
 | `python` | `uv run --no-sync python` | how the GPU check before `main` runs Python inside the job's environment; a repo that is not a uv project names its own (`.venv/bin/python`) |
-| `gpus` | `1` | GPUs to assign; more than the host can ever provide is refused at submit. `0` runs with none (below) |
+| `gpus` | `1` | GPUs to assign; more than the host has (the cards `nvidia-smi` reports there now) is refused at submit. `0` runs with none (below) |
 | `use_shared` | `false` | may also use the host's [shared GPUs](#shared-gpus); `gpuc submit --use-shared` sets it |
 | `env` | `{}` | plain environment, applied after the host's `--env` |
 | `secrets` | `[]` | names read from your shell at submit and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600); one missing from your shell is refused |
@@ -88,9 +88,11 @@ otherwise a job like any other, except that `gpuc preempt` refuses it. A
 running one keeps a rental from going idle.
 
 A job waiting for a [shared card](#shared-gpus) somebody else is using does not
-hold: the queue behind it runs. A job short of an *owned* card holds even when
-that card has dropped off `nvidia-smi`; `gpuc status` marks the card
-`UNAVAILABLE` and the job's `starts_unknown` names it.
+hold: the queue behind it runs. A job that needs more cards than `nvidia-smi`
+reports for the host is failed, on the first pass that sees it: a card that has
+dropped off the driver is not waited for. A listed card that is missing is
+named in the reason and marked `UNAVAILABLE` by `gpuc status`. While
+`nvidia-smi` cannot be read at all, nothing is failed for 5 minutes.
 
 ## Shared GPUs
 
@@ -580,7 +582,7 @@ Every `failed: <reason>`:
 | `sync` | the final upload failed; a job already over for a reason of its own keeps that reason and lists `sync` in `problems` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout; listed in `problems` the same way. Never reported for a job whose `main` never started |
 | `bad-spec` | the queued spec could not be read |
-| `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued; shared cards count only if the job asked for them |
+| `needs N GPUs, host owns M` | the host has fewer cards than when the job was queued: its config shrank, or a card dropped off `nvidia-smi` (for a listed card the reason ends `that nvidia-smi reports (<entries> listed but missing)`); shared cards count only if the job asked for them |
 | `spawn-failed` | the dispatcher could not start a runner process |
 | `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind |
 
@@ -766,7 +768,7 @@ stopped for.
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}`, each host `{name, pkg_commit, seen_at, current}`. `pkg_commit` is the commit the host was running when this machine last read it. Exit 1 for an entry that could not be parsed, 3 if the whole registry is unreadable |
 | `config show` | `{config_file, config_file_exists, state_dir, settings{}, notes[]}`: the effective settings, file or not |
 | `host list` | `{hosts[], errors[]}`, each entry the address (`name`, `kind`, `ssh`, `port`, `gpuc_home`, `persistent_root`, `rental` as `{provider, pod_id}` or null, and `pod_id` beside it), the host's own config as last read (`gpus`, `s3_prefix`, `env`, `cache_dir`, `idle_minutes`, `retention_days`, `pkg_commit`) flattened beside it with `config_seen_at`, the raw `cache`, `remote_home`, `ephemeral` and `warnings[]`. Nothing here asks the host. `env` is reported by name only (`{"HF_TOKEN": "<set>"}`). A skipped entry is an `errors` string and exit 1; exit 3 if the whole registry is unreadable |
-| `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], shared_gpus[], shared_missing[], home_fs_type, home_is_overlay, persistent_root, notes[]}`. `gpus` is every card the host has whatever `--all-gpus` said, each `{uuid, name, vram_mib, index, assigned, shared}`; `assigned_gpus` is `--gpus` as registered and `assigned_missing` the entries no card answered to; `shared_gpus` and `shared_missing` the same for `--shared-gpus`; `sections` the probe script's raw output |
+| `host probe` | `{host, sections{}, driver_version, has_nvidia_smi, gpus[], assigned_gpus[], assigned_missing[], shared_gpus[], shared_missing[], home_fs_type, home_is_overlay, persistent_root, notes[]}`. `gpus` is every card the host has whatever `--all-gpus` said, each `{uuid, name, vram_mib, index, assigned, shared}`; `assigned_gpus` is `--gpus` as registered (null for `all`) and `assigned_missing` the entries no card answered to; `shared_gpus` and `shared_missing` the same for `--shared-gpus`; `sections` the probe script's raw output |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], purge_skipped[], incoming_removed[], verified[], notes[], errors[]}`. Job objects are `{job_id, status, bytes, age_days, mirrored_at, mirror}`, plus `why` on the skipped ones and `forced` on a purged job that had no confirmed backup; `incoming_removed` names job dirs a submit never finished |
 | `host add`, `host set` | one `host list` entry as the registry holds it once the command is done, plus `adopted` (the host already had a config), `config_path` (that config on the host), `changes[]` (one line per config field written through to the host) and `warnings[]`. `host set` adds `address{}`: the fields it changed here rather than on the host (`persistent_root`, `gpuc_home`) |
 | `host remove` | `{host, kind, pod_id, notes[]}`: what was forgotten here. A rental is **not** terminated, and `notes` says so |

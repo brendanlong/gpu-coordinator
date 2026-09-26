@@ -38,6 +38,7 @@ from gpuc.control.config import (
     update_cache,
 )
 from gpuc.control.connect import Connection, connect_host, push_config
+from gpuc.control.gpuinfo import owned_entries
 from gpuc.control.jsonout import warn
 from gpuc.control.probe import ProbeReport, probe_host
 from gpuc.control.remote import Gone, RemoteError, rental_state
@@ -148,7 +149,7 @@ def add_host(
             )
         registry.put(entry)
     warnings: list[str] = []
-    if not connection.adopted and not entry.config.gpus:
+    if not connection.adopted and not _owned(entry):
         warnings.append(_owns_nothing_warning(entry, fields, report))
     if pod_id and not connection.adopted:
         # A pod nobody has set up has no dispatcher, so nothing will ever idle
@@ -160,6 +161,10 @@ def add_host(
     lines = [_added_line(entry, connection, name)]
     lines += [f"  {warning}" for warning in warnings]
     return HostChange(connection_document(entry, connection, warnings=warnings), lines)
+
+
+def _owned(entry: HostEntry) -> list[str]:
+    return owned_entries(entry.config.gpus, entry.config.shared_gpus, entry.gpu_info)
 
 
 def _owns_nothing_warning(entry: HostEntry, fields: dict[str, Any], report: ProbeReport) -> str:
@@ -210,7 +215,7 @@ def _refuse_a_taken_name(current: HostEntry | None, entry: HostEntry, asked_for:
 def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str:
     lines = [
         f"added host {entry.name} [{entry.kind}] "
-        f"{entry.ssh or 'this machine'} with {len(entry.config.gpus)} GPU(s)"
+        f"{entry.ssh or 'this machine'} with {len(_owned(entry))} GPU(s)"
     ]
     if connection.adopted:
         lines.append(f"adopted the config on the host ({connection.home}/config.json)")

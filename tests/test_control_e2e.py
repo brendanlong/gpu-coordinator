@@ -197,10 +197,11 @@ def test_bootstrap_installs_the_package_and_records_the_interpreter(
     assert (home / "pkg/gpuc/host/dispatcher.py").exists()
     config = json.loads((home / "config.json").read_text())
     assert config["host"] == "local"
-    # `host add` was given no `--gpus`: the card the probe's nvidia-smi listed.
-    assert config["gpus"] == [FAKE_GPUS[0]]
+    # `host add` was given no `--gpus`: every card, written as null.
+    assert "gpus" in config and config["gpus"] is None
     assert (home / "secrets").stat().st_mode & 0o777 == 0o700
     entry = load_registry().require("local")
+    assert FAKE_GPUS[0] in entry.gpu_info
     assert entry.python and Path(entry.python).exists()
     assert entry.bootstrapped_at
 

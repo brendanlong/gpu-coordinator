@@ -91,7 +91,7 @@ def test_state_file_survives_partial_unknown_keys(gpuc_home: Path) -> None:
 def test_config_defaults_when_missing(gpuc_home: Path) -> None:
     os.remove(paths.config_file())
     config = jobs.read_config()
-    assert config.gpus == []
+    assert config.gpus is None
     assert not config.ephemeral
     jobs.write_config(HostConfig(host="pod", provider={"kind": "runpod", "pod_id": "p"}))
     assert jobs.read_config().ephemeral

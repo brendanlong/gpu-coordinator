@@ -150,7 +150,9 @@ class Resolution:
     duplicates: list[str]
 
 
-def resolve(owned: Sequence[str], table: Sequence[Gpu], shared: Sequence[str] = ()) -> Resolution:
+def resolve(
+    owned: Sequence[str] | None, table: Sequence[Gpu], shared: Sequence[str] = ()
+) -> Resolution:
     """Entries -- nvidia-smi indices, UUIDs, or a mix -- against `table`.
 
     Pure, and the one rule: the dispatcher and the runner apply it to what
@@ -159,6 +161,9 @@ def resolve(owned: Sequence[str], table: Sequence[Gpu], shared: Sequence[str] = 
     missing here exactly as an absent index is; nothing passes an entry
     through unresolved, so a card the driver stopped reporting is never
     handed out to fail inside a job.
+
+    `owned` None owns every card in `table` that no shared entry names, so
+    nothing it owns is ever missing.
     """
     by_index = {str(gpu.index): gpu.uuid for gpu in table if gpu.index is not None}
     present = {gpu.uuid for gpu in table}
@@ -173,6 +178,9 @@ def resolve(owned: Sequence[str], table: Sequence[Gpu], shared: Sequence[str] = 
     missing: list[str] = []
     shared_missing: list[str] = []
     duplicates: list[str] = []
+    if owned is None:
+        named = {lookup(entry) for entry in shared}
+        owned = [gpu.uuid for gpu in table if gpu.uuid not in named]
     for entry in owned:
         uuid = lookup(entry)
         if uuid is None:

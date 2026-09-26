@@ -21,12 +21,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from gpuc.control.gpuinfo import GpuInfo, table_of
+from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.jsonout import warn
 from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX
 from gpuc.control.tolerant import TolerantModel
 from gpuc.control.transport import Transport, make_transport
-from gpuc.host import gpus
 from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
@@ -388,19 +387,17 @@ def first_config(
 
     Used by `gpuc host add` on a box nobody has set up, by provisioning for a
     pod just bought, and by bootstrap restoring a wiped home (with the last
-    config seen as `overrides`). By default the host owns every card the probe
-    saw (`entry.gpu_info`) less any it was asked to share, sweeps workdirs
+    config seen as `overrides`). By default the host owns every card it has, now
+    or later, less any it was asked to share, sweeps workdirs
     after `DEFAULT_WORKDIR_DAYS`, and mirrors under `default_s3_prefix` when
     there is a bucket -- the same defaults whatever kind of host it is, so
     the machine that connects first has no say the next one cannot see in the
     file.
     """
     overrides = dict(overrides or {})
-    shared_entries = [str(item) for item in overrides.get("shared_gpus") or []]
-    shared = set(gpus.resolve(shared_entries, table_of(entry.gpu_info)).owned)
     document: dict[str, Any] = {
         "host": entry.name,
-        "gpus": [uuid for uuid in entry.gpu_info if uuid not in shared],
+        "gpus": None,
         "workdir_days": DEFAULT_WORKDIR_DAYS,
         "s3_prefix": default_s3_prefix(settings, entry.name),
         "created_at": utc_now(),
@@ -415,9 +412,9 @@ commit (which moves on every re-ship, and is reported on its own), and when
 whoever first registered the host did so."""
 
 
-def _show(value: Any) -> str:
+def _show(value: Any, key: str = "") -> str:
     if value is None:
-        return "none"
+        return "all" if key == "gpus" else "none"
     if isinstance(value, list):
         return ",".join(str(item) for item in value) or "none"
     if isinstance(value, dict):
@@ -466,7 +463,7 @@ def config_drift(
             if names:
                 drift.append(f"env differs in {', '.join(names)}")
         else:
-            drift.append(f"{key} {_show(theirs)} -> {_show(ours)}")
+            drift.append(f"{key} {_show(theirs, key)} -> {_show(ours, key)}")
     return drift
 
 

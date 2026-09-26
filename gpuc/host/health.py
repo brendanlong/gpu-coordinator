@@ -58,34 +58,39 @@ def check_driver(smi: SmiRunner = gpus.run_nvidia_smi) -> Check:
 
 
 def check_gpu_uuids(
-    owned: Sequence[str], smi: SmiRunner = gpus.run_nvidia_smi, *, shared: Sequence[str] = ()
+    owned: Sequence[str] | None,
+    smi: SmiRunner = gpus.run_nvidia_smi,
+    *,
+    shared: Sequence[str] = (),
 ) -> Check:
-    """Every entry in `config.gpus` and `config.shared_gpus` -- index or UUID --
-    names a card that is here, and no card is named twice.
+    """No card is named twice, and every entry in `config.gpus` and
+    `config.shared_gpus` -- index or UUID -- names a card that is here.
 
-    An index that does not resolve is the failure this exists to catch early: a
-    shared box renumbered, or the agreement moved, and the host would otherwise
-    just quietly have fewer cards to hand out than anyone thinks. A card named
-    twice is the other way round: as an index and its own UUID it is a promise
-    of two cards, and in both lists it would be handed out as ours *and* have
-    its usage second-guessed as somebody else's. `gpus.resolve` is the rule,
-    the same one the dispatcher hands cards out by.
+    A card named twice fails: as an index and its own UUID it is a promise of
+    two cards, and in both lists it would be handed out as ours *and* have its
+    usage second-guessed as somebody else's. An entry that does not resolve
+    only warns. The lists are a ceiling, and a card that has died is not a
+    reason to refuse the ones still working; but a typo or a renumbered shared
+    box would otherwise quietly leave the host with fewer cards than anyone
+    thinks. `gpus.resolve` is the rule, the same one the dispatcher hands
+    cards out by.
     """
-    if not owned and not shared:
+    if owned is not None and not owned and not shared:
         return Check("gpu_uuids", True, "no GPUs owned by this host", 0)
     try:
         table = gpus.list_gpus(smi)
     except gpus.GpuError as exc:
         return Check("gpu_uuids", False, str(exc))
     cards = gpus.resolve(owned, table, shared)
-    problems: list[str] = []
+    absent: list[str] = []
     if cards.missing:
-        problems.append(f"config.gpus entries not present on this host: {', '.join(cards.missing)}")
+        absent.append(f"config.gpus entries not present on this host: {', '.join(cards.missing)}")
     if cards.shared_missing:
-        problems.append(
+        absent.append(
             f"config.shared_gpus entries not present on this host: "
             f"{', '.join(cards.shared_missing)}"
         )
+    problems: list[str] = []
     if cards.duplicates:
         problems.append(
             f"entries naming a card already named: {', '.join(cards.duplicates)}. An index "
@@ -101,7 +106,9 @@ def check_gpu_uuids(
     detail = f"{len(cards.owned)} owned GPU(s) present"
     if cards.shared:
         detail += f", {len(cards.shared)} shared"
-    return Check("gpu_uuids", True, detail, len(cards.owned))
+    if absent:
+        detail += f"; {'; '.join(absent)}; nvidia-smi reports: {gpus.describe_table(table)}"
+    return Check("gpu_uuids", True, detail, len(cards.owned), warn=bool(absent))
 
 
 def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:
@@ -308,7 +315,7 @@ def run_checks(
     downloader = downloader or http_download
     checks = [
         check_driver(smi)
-        if (config.gpus or config.shared_gpus)
+        if (config.gpus is None or config.gpus or config.shared_gpus)
         else Check("driver", True, "no GPUs owned", None),
         check_gpu_uuids(config.gpus, smi, shared=config.shared_gpus),
         check_disk(min_free_gb),
