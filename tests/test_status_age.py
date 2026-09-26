@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from gpuc.control.status import (
+    CardView,
     HostState,
     HostView,
     JobView,
@@ -38,7 +39,7 @@ def view(*jobs: JobView) -> HostView:
         entry=host_entry(name="h", gpus=["GPU-a"]),
         state=HostState.ANSWERED,
         heartbeat_age_s=1.0,
-        owned=["GPU-a"],
+        cards=[CardView("GPU-a")],
         finished=list(jobs),
     )
 

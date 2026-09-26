@@ -69,9 +69,9 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     The control side cannot work this out: both may name cards by index, and
     only the host knows what its driver is calling them today. Every card
     carries its current memory and utilization, as the live answer to how hard
-    it is working; a shared card adds `unused`, because whether one is
-    borrowable is a fact about this second that only nvidia-smi here can answer
-    -- and when it is not, its reading is how somebody sees why.
+    it is working, and `unused`, because whether a shared one is borrowable is
+    a fact about this second that only nvidia-smi here can answer -- and when
+    it is not, its reading is how somebody sees why.
     The same `gpus.resolve` the dispatcher decides with, over one reading; a
     driver that will not answer reads as no cards, as it does there.
     """
@@ -83,24 +83,21 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     indices = {gpu.uuid: gpu.index for gpu in table}
     cards = gpus.resolve(config.gpus, table, config.shared_gpus)
 
-    def card(uuid: str) -> dict[str, Any]:
+    def card(uuid: str, shared: bool) -> dict[str, Any]:
         reading = usage.get(uuid)
         return {
             "index": indices.get(uuid),
             "uuid": uuid,
+            "shared": shared,
             "memory_mib": reading.memory_mib if reading else None,
             "utilization_pct": reading.utilization_pct if reading else None,
+            "unused": reading is not None and reading.unused,
         }
 
     return {
-        "gpus": config.gpus,
-        "gpus_resolved": [card(uuid) for uuid in cards.owned],
-        "gpus_unavailable": cards.missing,
-        "shared_gpus": config.shared_gpus,
-        "shared_gpus_resolved": [
-            {**card(uuid), "unused": uuid in usage and usage[uuid].unused} for uuid in cards.shared
-        ],
-        "shared_gpus_unavailable": cards.shared_missing,
+        "cards": [card(u, False) for u in cards.owned] + [card(u, True) for u in cards.shared],
+        "cards_missing": [{"entry": e, "shared": False} for e in cards.missing]
+        + [{"entry": e, "shared": True} for e in cards.shared_missing],
         "gpus_error": error,
     }
 
@@ -157,11 +154,11 @@ def projected_starts(
             return 0.0
         return _seconds_until(state.eta)
 
-    cards = [plan.Card(row["uuid"], False, release(row["uuid"])) for row in table["gpus_resolved"]]
+    cards: list[plan.Card] = []
     theirs = 0
-    for row in table["shared_gpus_resolved"]:
-        if row["uuid"] in holder or row["unused"]:
-            cards.append(plan.Card(row["uuid"], True, release(row["uuid"])))
+    for row in table["cards"]:
+        if not row["shared"] or row["uuid"] in holder or row["unused"]:
+            cards.append(plan.Card(row["uuid"], row["shared"], release(row["uuid"])))
         else:
             theirs += 1
     # The queue from the same snapshot as everything else in this document:
@@ -192,8 +189,8 @@ def projected_starts(
             continue
         requests.append(request(entry.job_id, spec, states[entry.job_id]))
     # The jobs automatic preemption may stop, as the dispatcher counts them.
-    owned = {row["uuid"] for row in table["gpus_resolved"]}
-    shared = {row["uuid"] for row in table["shared_gpus_resolved"]}
+    owned = {row["uuid"] for row in table["cards"] if not row["shared"]}
+    shared = {row["uuid"] for row in table["cards"] if row["shared"]}
     stoppable: list[tuple[plan.Preemptable, plan.Request]] = []
     for job_id, state in sorted(running.items()):
         spec = _spec(job_id)
@@ -223,8 +220,8 @@ def projected_starts(
     projection = plan.project(
         requests,
         cards,
-        owned_missing=table["gpus_unavailable"],
-        shared_missing=table["shared_gpus_unavailable"],
+        owned_missing=[m["entry"] for m in table["cards_missing"] if not m["shared"]],
+        shared_missing=[m["entry"] for m in table["cards_missing"] if m["shared"]],
         theirs=theirs,
         running=stoppable,
         draining=paths.draining_file().exists(),

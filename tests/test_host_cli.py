@@ -421,14 +421,20 @@ def test_status_resolves_the_owned_gpus(
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
-    assert status["gpus"] == ["3", "9"]
-    assert status["gpus_resolved"] == [
-        {"index": 3, "uuid": FAKE_GPUS[0], "memory_mib": 512.0, "utilization_pct": 40.0}
+    assert status["cards"] == [
+        {
+            "index": 3,
+            "uuid": FAKE_GPUS[0],
+            "shared": False,
+            "memory_mib": 512.0,
+            "utilization_pct": 40.0,
+            "unused": False,
+        }
     ]
-    assert status["gpus_unavailable"] == ["9"]
+    assert status["cards_missing"] == [{"entry": "9", "shared": False}]
 
 
-def test_status_reads_shared_cards_like_owned_ones_plus_whether_they_are_unused(
+def test_status_reads_shared_cards_like_owned_ones(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -446,10 +452,11 @@ def test_status_reads_shared_cards_like_owned_ones_plus_whether_they_are_unused(
 
     _, status = run(capsys, "status")
     assert isinstance(status, dict)
-    assert status["shared_gpus_resolved"] == [
+    assert [card for card in status["cards"] if card["shared"]] == [
         {
             "index": 1,
             "uuid": FAKE_GPUS[1],
+            "shared": True,
             "memory_mib": 0.0,
             "utilization_pct": 0.0,
             "unused": True,
@@ -805,6 +812,18 @@ def test_status_steps_over_a_borrower_short_of_somebody_elses_card(
         "it needs 1 shared card(s) somebody else is using, and when they stop "
         "is not something this host can predict"
     )
+
+
+def test_status_dispatches_to_an_owned_card_somebody_else_is_on(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owned cards are trusted to have no other users: the host reports the
+    card not unused, and the projection starts the job on it anyway."""
+    use_smi(monkeypatch, [FAKE_GPUS[0]], utilization={FAKE_GPUS[0]: 98.0})
+    jobs.write_config(HostConfig(host="test-host", gpus=[FAKE_GPUS[0]]))
+    job = queue.enqueue(make_spec())
+
+    assert projection(capsys)[job] == (0.0, None)
 
 
 def test_cancel_of_a_job_whose_state_cannot_be_read_is_a_refusal_not_a_traceback(

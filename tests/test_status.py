@@ -8,16 +8,17 @@ import pytest
 from gpuc.control.config import HostEntry
 from gpuc.control.providers.base import Pod, PodStatus
 from gpuc.control.status import (
+    CardView,
     HostState,
     HostView,
     JobView,
+    MissingCard,
     gather,
-    gpu_usage,
+    host_cards,
     host_json,
     host_warnings,
     job_json,
     job_views,
-    owned_gpus,
     queue_note,
     queue_placement,
     render,
@@ -77,7 +78,10 @@ def payload(**overrides: Any) -> dict[str, Any]:
 def view(**overrides: Any) -> HostView:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
     host_view = HostView(
-        entry=entry, state=HostState.ANSWERED, owned=[GPU, "GPU-b"], heartbeat_age_s=2.0
+        entry=entry,
+        state=HostState.ANSWERED,
+        cards=[CardView(GPU), CardView("GPU-b")],
+        heartbeat_age_s=2.0,
     )
     host_view.queue, host_view.running, host_view.finished = job_views(payload(**overrides))
     return host_view
@@ -154,7 +158,7 @@ def test_render_shows_the_host_line_queue_running_and_recent() -> None:
 def test_a_running_job_names_the_cards_it_holds_by_index() -> None:
     """The other direction from the gpu lines: they say busy, the job says which."""
     host_view = busy(running_job(gpus=[GPU, "GPU-b"]))
-    host_view.indices = {GPU: 2, "GPU-b": 3}
+    host_view.cards = [CardView(GPU, 2), CardView("GPU-b", 3)]
     text = render(host_view)
     assert "gpu=2,3" in text
     assert "  gpu     [2] busy" in text and "  gpu     [3] busy" in text
@@ -512,14 +516,12 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     numbering -- so free/busy, and the per-card lines, come from its answer."""
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "7"])
     host_view = HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=2.0)
-    host_view.owned, host_view.indices = owned_gpus(
+    host_view.cards, host_view.missing = host_cards(
         payload(
-            gpus=["0", "7"],
-            gpus_resolved=[{"index": 0, "uuid": GPU}],
-            gpus_unavailable=["7"],
+            cards=[{"index": 0, "uuid": GPU, "shared": False}],
+            cards_missing=[{"entry": "7", "shared": False}],
         )
     )
-    host_view.unavailable = ["7"]
     host_view.queue, host_view.running, host_view.finished = job_views(payload())
 
     assert host_view.owned == [GPU]
@@ -527,26 +529,27 @@ def test_the_host_resolved_gpu_table_is_what_status_shows() -> None:
     text = render(host_view)
     assert "gpu     [0] busy ?" in text
     assert "gpu     [7] UNAVAILABLE" in text
-    assert host_json(host_view)["gpus"][-1] == {"owned_as": "7", "available": False}
+    missing = host_json(host_view)["gpus"][-1]
+    assert (missing["entry"], missing["shared"], missing["state"]) == ("7", False, "unavailable")
 
 
 def test_only_the_hosts_resolved_table_names_owned_cards() -> None:
     """`config.gpus` may be indices, and the cache is nobody's evidence: a
     payload with no resolved table owns nothing until the host says."""
-    assert owned_gpus(payload()) == ([], {})
+    assert host_cards(payload()) == ([], [])
 
 
 def test_each_owned_card_shows_what_nvidia_smi_just_read_on_it() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["0", "1"])
     host_view = HostView(entry=entry, state=HostState.ANSWERED, heartbeat_age_s=2.0)
-    document = payload(
-        gpus_resolved=[
-            {"index": 0, "uuid": GPU, "memory_mib": 21504.0, "utilization_pct": 97.0},
-            {"index": 1, "uuid": "GPU-other", "memory_mib": None, "utilization_pct": None},
-        ],
+    host_view.cards, _ = host_cards(
+        payload(
+            cards=[
+                {"index": 0, "uuid": GPU, "memory_mib": 21504.0, "utilization_pct": 97.0},
+                {"index": 1, "uuid": "GPU-other", "memory_mib": None, "utilization_pct": None},
+            ],
+        )
     )
-    host_view.owned, host_view.indices = owned_gpus(document)
-    host_view.usage = gpu_usage(document)
     text = render(host_view)
     assert "gpu     [0] free ? (21504 MiB, 97% util)" in text
     # No reading is no reading, not a zero.
@@ -576,7 +579,10 @@ def running_job(**overrides: Any) -> JobView:
 def busy(*jobs: JobView, queued: list[JobView] | None = None) -> HostView:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU, "GPU-b"])
     host_view = HostView(
-        entry=entry, state=HostState.ANSWERED, owned=[GPU, "GPU-b"], heartbeat_age_s=2.0
+        entry=entry,
+        state=HostState.ANSWERED,
+        cards=[CardView(GPU), CardView("GPU-b")],
+        heartbeat_age_s=2.0,
     )
     host_view.running = list(jobs)
     host_view.queue = list(queued or [])
@@ -789,7 +795,7 @@ def test_gather_takes_the_build_and_the_config_from_the_hosts_own_answer() -> No
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU], pkg_commit="a" * 40)
     resolved = [{"index": 0, "uuid": "GPU-x"}, {"index": 1, "uuid": "GPU-y"}]
     session = _ScriptedSession(
-        payload(pkg_commit="c" * 40, gpus_resolved=resolved), {"s3_prefix": "s3://live/p"}
+        payload(pkg_commit="c" * 40, cards=resolved), {"s3_prefix": "s3://live/p"}
     )
     got = gather(entry, session=cast(Any, session))
     assert got.pkg_commit == "c" * 40
@@ -944,8 +950,8 @@ def test_a_missing_owned_card_is_called_out() -> None:
             ),
         ],
     )
-    view.owned = [GPU]
-    view.unavailable = ["7"]
+    view.cards = [CardView(GPU)]
+    view.missing = [MissingCard("7")]
     rendered = render(view)
     assert "gpu     [7] UNAVAILABLE" in rendered
     assert "does not report this card on the host, so nothing is dispatched to it" in rendered
@@ -1055,20 +1061,21 @@ SHARED = "GPU-shared"
 
 def shared_payload(**overrides: Any) -> dict[str, Any]:
     document = payload(**overrides)
-    document.setdefault(
-        "shared_gpus_resolved",
-        [
-            {
-                "index": 4,
-                "uuid": SHARED,
-                "memory_mib": 0.0,
-                "utilization_pct": 0.0,
-                "unused": True,
-            }
-        ],
-    )
-    document.setdefault("shared_gpus_unavailable", [])
+    document.setdefault("cards", [shared_card()])
+    document.setdefault("cards_missing", [])
     return document
+
+
+def shared_card(**overrides: Any) -> dict[str, Any]:
+    card = {
+        "index": 4,
+        "uuid": SHARED,
+        "shared": True,
+        "memory_mib": 0.0,
+        "utilization_pct": 0.0,
+        "unused": True,
+    }
+    return {**card, **overrides}
 
 
 def shared_view(**overrides: Any) -> HostView:
@@ -1088,17 +1095,7 @@ def test_gather_reads_the_shared_cards_and_what_is_on_them() -> None:
 def test_a_shared_card_somebody_else_is_on_is_rendered_with_their_numbers() -> None:
     """The question this block gets asked is "there is a card there, why is my
     job queued", and the answer is whose it is right now."""
-    got = shared_view(
-        shared_gpus_resolved=[
-            {
-                "index": 4,
-                "uuid": SHARED,
-                "memory_mib": 21504.0,
-                "utilization_pct": 98.0,
-                "unused": False,
-            }
-        ]
-    )
+    got = shared_view(cards=[shared_card(memory_mib=21504.0, utilization_pct=98.0, unused=False)])
     rendered = render(got)
     assert "shared  [4] IN USE ? (21504 MiB, 98% util)" in rendered
     assert got.borrowable == []
@@ -1116,18 +1113,10 @@ def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_with_its_reading() -
                 "started_at": minutes_ago(5),
             }
         ],
-        shared_gpus_resolved=[
-            {
-                "index": 4,
-                "uuid": SHARED,
-                "memory_mib": 8192.0,
-                "utilization_pct": 90.0,
-                "unused": False,
-            }
-        ],
+        cards=[shared_card(memory_mib=8192.0, utilization_pct=90.0, unused=False)],
     )
     assert "shared  [4] busy ? (8192 MiB, 90% util)" in render(got)
-    card = host_json(got)["shared_gpus"][0]
+    card = host_json(got)["gpus"][0]
     assert (card["memory_mib"], card["utilization_pct"]) == (8192.0, 90.0)
     assert got.borrowable == []
 
@@ -1135,27 +1124,64 @@ def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_with_its_reading() -
 def test_a_shared_card_nvidia_smi_could_not_read_says_so() -> None:
     """The host reports an unreadable card not unused, so it reads `IN USE`;
     the question marks are the only thing saying why."""
-    got = shared_view(
-        shared_gpus_resolved=[
-            {
-                "index": 4,
-                "uuid": SHARED,
-                "memory_mib": None,
-                "utilization_pct": None,
-                "unused": False,
-            }
-        ]
-    )
+    got = shared_view(cards=[shared_card(memory_mib=None, utilization_pct=None, unused=False)])
     assert "shared  [4] IN USE ? (? MiB, ?% util)" in render(got)
 
 
+def test_every_card_state_and_its_place_in_the_list() -> None:
+    """One order for the text view and `--json`: each kind's cards, then its
+    configured entries nvidia-smi does not report. An owned card is free when
+    nobody of ours holds it, whatever `unused` says: it is trusted."""
+    view = busy(running_job(gpus=["GPU-owned-busy", "GPU-shared-busy"]))
+    view.cards, view.missing = host_cards(
+        payload(
+            cards=[
+                {"index": 0, "uuid": "GPU-owned-free", "unused": False},
+                {"index": 1, "uuid": "GPU-owned-busy"},
+                {"index": 4, "uuid": "GPU-shared-busy", "shared": True},
+                {"index": 5, "uuid": "GPU-shared-theirs", "shared": True, "unused": False},
+                {"index": 6, "uuid": "GPU-shared-free", "shared": True, "unused": True},
+            ],
+            cards_missing=[{"entry": "9", "shared": True}, {"entry": "7", "shared": False}],
+        )
+    )
+    lines = [line for line in render(view).splitlines() if line.startswith(("  gpu ", "  shared "))]
+    expected = [
+        "  gpu     [0] free ",
+        "  gpu     [1] busy ",
+        "  gpu     [7] UNAVAILABLE ",
+        "  shared  [4] busy ",
+        "  shared  [5] IN USE ",
+        "  shared  [6] free ",
+        "  shared  [9] UNAVAILABLE ",
+    ]
+    assert len(lines) == len(expected)
+    assert all(line.startswith(prefix) for line, prefix in zip(lines, expected, strict=True))
+    rows = host_json(view)["gpus"]
+    assert [
+        (r["index"] if r["entry"] is None else r["entry"], r["shared"], r["state"]) for r in rows
+    ] == [
+        (0, False, "free"),
+        (1, False, "busy"),
+        ("7", False, "unavailable"),
+        (4, True, "busy"),
+        (5, True, "in_use"),
+        (6, True, "free"),
+        ("9", True, "unavailable"),
+    ]
+    assert rows[3]["busy_job"] == "j-running"
+    assert view.free == ["GPU-owned-free"]
+    assert [c.uuid for c in view.borrowable] == ["GPU-shared-free"]
+
+
 def test_a_shared_entry_the_host_cannot_see_says_so() -> None:
-    got = shared_view(shared_gpus_resolved=[], shared_gpus_unavailable=["7"])
+    got = shared_view(cards=[], cards_missing=[{"entry": "7", "shared": True}])
     assert "shared  [7] UNAVAILABLE" in render(got)
-    assert got.shared_unavailable == ["7"]
+    assert got.missing == [MissingCard("7", shared=True)]
+    assert host_json(got)["gpus"][0]["shared"] is True
 
 
-def test_a_host_on_an_older_build_simply_has_no_shared_cards() -> None:
+def test_a_host_with_no_shared_cards_prints_no_shared_lines() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=[GPU])
     got = gather(entry, session=cast(Any, _ScriptedSession(payload())))
     assert got.shared == []
@@ -1164,22 +1190,24 @@ def test_a_host_on_an_older_build_simply_has_no_shared_cards() -> None:
 
 def test_the_json_carries_the_shared_cards_and_their_verdict() -> None:
     document = host_json(shared_view())
-    assert document["shared_gpus"] == [
+    assert document["gpus"] == [
         {
             "index": 4,
             "uuid": SHARED,
+            "entry": None,
+            "shared": True,
+            "state": "free",
             "name": "",
             "vram_mib": None,
             "busy_job": None,
             "memory_mib": 0.0,
             "utilization_pct": 0.0,
-            "unused": True,
         }
     ]
 
 
 def test_the_json_says_which_jobs_may_have_a_shared_card() -> None:
-    """`shared_gpus` says which cards the host may borrow and this says which
+    """A card's `shared` says which ones the host may borrow and this says which
     jobs may have them; without it the document shows an idle shared card
     beside two queued jobs and cannot say why only one of them starts.
 
@@ -1216,7 +1244,7 @@ def test_a_host_too_old_to_report_use_shared_says_null_not_false() -> None:
 
 def test_a_host_that_only_borrows_does_not_read_as_having_no_gpus() -> None:
     got = shared_view()
-    got.owned = []
+    assert got.owned == []
     assert "shared 1/1 free, none owned" in render(got)
 
 

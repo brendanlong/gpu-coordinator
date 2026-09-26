@@ -10,7 +10,7 @@ import pytest
 from gpuc.control import pods as pods_mod
 from gpuc.control.cli import EXIT_OK, main
 from gpuc.control.config import Settings, registry_transaction
-from gpuc.control.status import HostState, HostView, render
+from gpuc.control.status import CardView, HostState, HostView, render
 from tests.conftest import host_entry, load_registry
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
@@ -101,7 +101,7 @@ def test_status_shows_the_pod_for_an_ephemeral_host() -> None:
         entry=entry,
         state=HostState.ANSWERED,
         heartbeat_age_s=3.0,
-        owned=["GPU-1"],
+        cards=[CardView("GPU-1")],
         pod=running_pod("gpuc-e2e-aaa", "pod1", age_minutes=20),
     )
     text = render(view)

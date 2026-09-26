@@ -1856,7 +1856,7 @@ def test_host_add_and_set_refuse_a_gpus_value_that_is_neither(
 def one_document(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
     document = json.loads(capsys.readouterr().out)
     assert isinstance(document, dict)
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     return document
 
 
@@ -1893,7 +1893,7 @@ def test_submit_json_is_the_queued_job_and_its_notes(
     captured = capsys.readouterr()
     document = json.loads(captured.out)
     assert document == {
-        "schema_version": 1,
+        "schema_version": 2,
         "job_id": "20260915-120000-abc123",
         "host": "local",
         "requeued_from": None,

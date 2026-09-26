@@ -23,7 +23,7 @@ from gpuc.control import web
 from gpuc.control.cli import EXIT_USAGE, main
 from gpuc.control.config import HostEntry, Settings, hosts_file
 from gpuc.control.remote import HostSession, RemoteError
-from gpuc.control.status import HostState, HostView
+from gpuc.control.status import CardView, HostState, HostView
 from gpuc.control.web.app import Dashboard, ServerThread
 from gpuc.control.web.auth import (
     SESSION_COOKIE,
@@ -133,7 +133,9 @@ def minutes_ago(minutes: float) -> str:
 
 
 def fake_host_view(entry: HostEntry, *a: object, **k: object) -> HostView:
-    view = HostView(entry=entry, state=HostState.ANSWERED, owned=[GPU], heartbeat_age_s=2.0)
+    view = HostView(
+        entry=entry, state=HostState.ANSWERED, cards=[CardView(GPU)], heartbeat_age_s=2.0
+    )
     view.queue, view.running, view.finished = status_mod.job_views(
         {
             "queue": [{"priority": 50, "job_id": "20260915-130000-aaaaaa"}],
@@ -246,7 +248,7 @@ def test_the_api_refuses_without_a_session_rather_than_redirecting(client: Clien
     status, document = client.get_json("/api/status")
     assert status == 401
     assert document["error"] == "not logged in"
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
 
 
 def test_a_wrong_password_is_told_so_and_gets_no_cookie(client: Client) -> None:
@@ -328,7 +330,7 @@ def test_a_post_from_another_origin_is_refused(logged_in: Client) -> None:
 def test_status_is_the_status_json_document(logged_in: Client, one_host: None) -> None:
     status, document = logged_in.get_json("/api/status")
     assert status == 200
-    assert document["schema_version"] == 1 and document["errors"] == []
+    assert document["schema_version"] == 2 and document["errors"] == []
     assert document["gathered_at"]
     (host,) = document["hosts"]
     assert (host["name"], host["kind"], host["target"], host["reachable"]) == (
@@ -462,7 +464,7 @@ def test_cancel_is_the_cancel_command(logged_in: Client, stub: StubSession) -> N
     status, document = logged_in.post_json(f"/api/jobs/{RUNNING_JOB}/cancel", {"host": "gpubox"})
     assert status == 200
     assert document == {
-        "schema_version": 1,
+        "schema_version": 2,
         "jobs": [
             {
                 "job_id": RUNNING_JOB,

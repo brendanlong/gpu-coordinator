@@ -37,7 +37,7 @@ from gpuc.control.config import (
     read_registry,
 )
 from gpuc.control.s3index import S3IndexError
-from gpuc.control.status import HostState, HostView
+from gpuc.control.status import CardView, HostState, HostView
 from tests.conftest import (
     FAKE_GPUS,
     accept_job,
@@ -530,7 +530,7 @@ def test_status_json_is_one_document_with_the_promised_shape(
 ) -> None:
     assert main(["status", "--json"]) == EXIT_OK
     document = status_json(capsys)
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     assert document["errors"] == []
     host = document["hosts"][0]
     assert host["name"] == "local"
@@ -612,20 +612,23 @@ def test_status_json_is_one_document_with_the_promised_shape(
     # One row for the owned card. Which shape it takes says whether nvidia-smi
     # on *this* machine could resolve it, which is not what this test is about.
     (row,) = host["gpus"]
-    if row.get("available") is False:
-        assert row == {"owned_as": GPU, "available": False}
+    assert set(row) == {
+        "index",
+        "uuid",
+        "entry",
+        "shared",
+        "state",
+        "name",
+        "vram_mib",
+        "busy_job",
+        "memory_mib",
+        "utilization_pct",
+    }
+    assert row["shared"] is False
+    if row["state"] == "unavailable":
+        assert (row["entry"], row["uuid"]) == (GPU, None)
     else:
-        assert set(row) == {
-            "index",
-            "uuid",
-            "name",
-            "vram_mib",
-            "busy_job",
-            "memory_mib",
-            "utilization_pct",
-        }
-        assert row["uuid"] == GPU
-        assert row["busy_job"] == RUNNING_JOB
+        assert (row["uuid"], row["state"], row["busy_job"]) == (GPU, "busy", RUNNING_JOB)
 
 
 def test_config_show_json_is_the_effective_settings(
@@ -634,7 +637,7 @@ def test_config_show_json_is_the_effective_settings(
     config_file().write_text('s3_bucket = "bucket"\ndisk_gb = 5\n')
     assert main(["config", "show", "--json"]) == EXIT_OK
     document = status_json(capsys)
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     assert document["config_file"] == str(config_file())
     assert document["config_file_exists"] is True
     assert document["settings"]["s3_bucket"] == "bucket"
@@ -892,7 +895,12 @@ def test_a_config_this_machine_has_not_caught_up_with_is_not_a_warning(
     entry = host_entry(
         name="gpubox", kind="ssh", ssh="me@box", gpus=["2", "3"], pkg_commit="a" * 40
     )
-    view = HostView(entry=entry, state=HostState.ANSWERED, pkg_commit="a" * 40, owned=["0", "1"])
+    view = HostView(
+        entry=entry,
+        state=HostState.ANSWERED,
+        pkg_commit="a" * 40,
+        cards=[CardView("GPU-0"), CardView("GPU-1")],
+    )
     assert status_mod.host_warnings(view) == []
 
 
@@ -926,7 +934,7 @@ def document_of(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
     """stdout must be exactly one JSON object, whatever else the command said."""
     document = json.loads(capsys.readouterr().out)
     assert isinstance(document, dict)
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     return document
 
 
@@ -1186,7 +1194,7 @@ def test_host_bootstrap_json_is_what_the_bootstrap_left_on_the_host(
     captured = capsys.readouterr()
     document = json.loads(captured.out)
     assert document == {
-        "schema_version": 1,
+        "schema_version": 2,
         "host": "local",
         "home": "/root/.gpuc",
         "files": 20,
@@ -1217,7 +1225,7 @@ def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
     assert main(["host", "bootstrap", "--all", "--json"]) == 1
     captured = capsys.readouterr()
     tally = json.loads(captured.out)
-    assert tally["schema_version"] == 1
+    assert tally["schema_version"] == 2
     assert (tally["total"], tally["bootstrapped"], tally["failed"]) == (2, ["gpubox"], ["pod"])
     assert tally["unreadable"] == ["bad"]
     assert tally["interrupted"] is False
@@ -1307,7 +1315,7 @@ def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
     assert main(["host", "clean", "local", "--uv-cache", "--json"]) == EXIT_OK
     document = document_of(capsys)
     assert document == {
-        "schema_version": 1,
+        "schema_version": 2,
         "host": "local",
         "uv_cache": {
             "cache_dir": "/home/u/.cache/uv",
@@ -1335,7 +1343,7 @@ def test_config_init_json_is_the_path_and_whether_it_was_there(
 ) -> None:
     assert main(["config", "init", "--json"]) == EXIT_OK
     document = document_of(capsys)
-    assert document == {"schema_version": 1, "config_file": str(config_file()), "existed": False}
+    assert document == {"schema_version": 2, "config_file": str(config_file()), "existed": False}
     assert config_file().exists()
     # Refusing to clobber is exit 1 in both forms, with the reason as `error`.
     assert main(["config", "init"]) == 1

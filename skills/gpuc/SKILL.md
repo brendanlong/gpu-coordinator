@@ -251,7 +251,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 
 The document is `{schema_version, hosts: [...], unhosted: [...], errors: [...]}`.
 Each host has `name, kind, state, reachable, pkg_commit,
-dispatcher{alive, heartbeat_age_s}, provider_util, gpus, shared_gpus, queued,
+dispatcher{alive, heartbeat_age_s}, provider_util, gpus, queued,
 running, finished, errors, warnings`; `state` is `answered`, `unaskable` (a
 failure, with the reason in `errors`; it may still hold its jobs) or `gone`
 (the rental ended: not a failure). Each job in the three lists has `job_id,
@@ -263,8 +263,8 @@ starts_in_s, starts_at, starts_unknown, iso, ended_at, outputs_pending`
 jobs only the index knows, each `{job_id, name, host, host_state, status,
 requeue, requeued_from, submitted_at, s3_prefix, outputs_lost}`. **Requeue one only if
 `requeue` is true**: an `unaskable` host may still be running that job, and a
-second copy is not recovery. Every card in `gpus` and `shared_gpus` carries
-`memory_mib` and `utilization_pct`; each shared one adds `unused`.
+second copy is not recovery. Each card in `gpus` has `shared`, `state` (`free`,
+`busy`, `in_use` or `unavailable`), `busy_job`, `memory_mib` and `utilization_pct`.
 
 `priority` (0-99, **lower runs first**) is the field that explains queue order,
 and `queued` is already in dispatch order. `starts_in_s` is when that job's

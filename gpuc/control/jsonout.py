@@ -24,11 +24,15 @@ import json
 import sys
 from typing import Any
 
-from gpuc.host.jobs import SCHEMA_VERSION
+OUTPUT_SCHEMA_VERSION = 2
+"""The shape of the documents `--json` and the web API return, bumped when one
+changes incompatibly rather than only gaining keys. Separate from the files'
+`jobs.SCHEMA_VERSION`: a document reshaped on its way out says nothing about
+what is on disk. 2 folded `shared_gpus` into `gpus`, each card with a `state`."""
 
 
 def emit(payload: dict[str, Any]) -> None:
-    print(json.dumps({"schema_version": SCHEMA_VERSION, **payload}, indent=2))
+    print(json.dumps({"schema_version": OUTPUT_SCHEMA_VERSION, **payload}, indent=2))
 
 
 def emit_error(message: str, exit_code: int, **extra: Any) -> None:

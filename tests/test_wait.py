@@ -208,7 +208,7 @@ def test_wait_json_is_one_document_of_final_states(
     assert main(["wait", JOB, "--json"]) == EXIT_ERROR
     captured = capsys.readouterr()
     document = json.loads(captured.out)
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     assert document["errors"] == []
     job = document["jobs"][0]
     assert (job["job_id"], job["host"], job["status"]) == (JOB, "local", "failed")
