@@ -216,8 +216,9 @@ submits each Snakemake job whose rule sets `gpu=1` or more as a gpuc job and
 runs rules without a `gpu` on the controller. `uv run --with
 "gpu-coordinator @ git+https://github.com/brendanlong/gpu-coordinator"
 snakemake ...` loads the plugin without adding it to the project. Run that
-controller inside tmux, not as a background shell job: it has no persistence of its own, and one that dies
-leaves its gpuc jobs running and submits them again when restarted. Outputs
+controller inside tmux or a supervisor, not as a background shell job. One
+that dies leaves its gpuc jobs running; restart it with `--unlock`, then with
+`--rerun-incomplete`, and it adopts them instead of submitting them again. Outputs
 must be in a directory the controller can see, or in object storage;
 `docs/snakemake.md` in the repo has both layouts.
 

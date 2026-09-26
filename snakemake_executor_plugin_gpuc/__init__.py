@@ -16,6 +16,10 @@ started from, taken when the job is submitted. That copy is what the job's
 relative to it rather than as the controller's absolute path. Where outputs
 go is the workflow's business: see docs/snakemake.md for the two layouts that
 work.
+
+A controller that restarts adopts the gpuc jobs it had submitted: Snakemake
+keeps each job's gpuc id in the incomplete markers on its outputs, and
+`run_jobs` asks gpuc about those before submitting anything again.
 """
 
 import json
@@ -121,6 +125,7 @@ class Executor(RemoteExecutor):
             )
         self.run_cpu_rules_locally()
         self.unaskable_shown: dict[str, str] = {}
+        self.earlier: dict[str, dict[str, Any]] = {}
         # Every job submitted and not yet over. Snakemake's own `active_jobs`
         # is emptied for the length of each poll, and a poll here is an ssh
         # round trip to every host: a Ctrl-C landing in one would cancel
@@ -165,6 +170,75 @@ class Executor(RemoteExecutor):
     def get_python_executable(self) -> str:
         return self.settings.python
 
+    def run_jobs(self, jobs: list[JobExecutorInterface]) -> None:
+        self.earlier = self.earlier_jobs(jobs)
+        super().run_jobs(jobs)
+
+    def earlier_jobs(self, jobs: list[JobExecutorInterface]) -> dict[str, dict[str, Any]]:
+        """What gpuc says now about every job id Snakemake's incomplete
+        markers hold for these jobs' outputs, in one `gpuc status`.
+
+        A marker is written when a job is submitted and removed when it ends,
+        so one still there is a gpuc job a previous controller submitted and
+        never saw end. `external_jobids` is Snakemake's persistence, beyond
+        the executor interface; the interface's `incomplete_external_jobid`
+        answers nothing under `--rerun-incomplete`, which a restart needs."""
+        persistence: Any = self.workflow.persistence
+        ids = sorted(
+            {
+                job_id
+                for job in jobs
+                if not job.is_group()
+                for job_id in persistence.external_jobids(job)
+            }
+        )
+        if not ids:
+            return {}
+        try:
+            document = self.gpuc(["status", "--json", *ids], ok_codes=(0, 1, 4))
+        except GpucError as exc:
+            # Not knowing is not "there is no such job": submitting again
+            # could run the job twice, and polling one that turns out to be
+            # gone fails only that job.
+            self.logger.info(f"gpuc status failed, adopting the earlier jobs unseen: {exc}")
+            return {job_id: {"error": str(exc), "host_state": "unaskable"} for job_id in ids}
+        answers = {job.get("job_id"): job for job in document.get("jobs") or []}
+        return {job_id: answers.get(job_id) or {"error": "not mentioned"} for job_id in ids}
+
+    def adopt(self, job: JobExecutorInterface, job_info: SubmittedJobInfo) -> bool:
+        """Take over the gpuc job an earlier controller submitted for this
+        job, if one is still worth having: report a succeeded one's success,
+        or poll a queued or running one. A failed, cancelled or vanished one
+        is left, and the job is submitted again."""
+        persistence: Any = self.workflow.persistence
+        earlier = [
+            (job_id, self.earlier.get(job_id) or {"error": "not asked"})
+            for job_id in sorted(persistence.external_jobids(job))
+        ]
+        chosen = next(
+            (
+                (wanted, job_id, answer)
+                for wanted in ("succeeded", "live", "unaskable")
+                for job_id, answer in earlier
+                if outcome(answer) == wanted
+            ),
+            None,
+        )
+        if chosen is None:
+            return False
+        wanted, job_id, answer = chosen
+        job_info.external_jobid = job_id
+        job_info.aux = {"host": answer.get("host")}
+        if wanted == "succeeded":
+            self.logger.info(f"Job {job.jobid} is gpuc job {job_id}, which already succeeded.")
+            self.report_job_success(job_info)
+            return True
+        with self.in_flight_lock:
+            self.in_flight[job_id] = job_info
+        self.report_job_submission(job_info)
+        self.logger.info(f"Adopted gpuc job {job_id} on {answer.get('host')} for job {job.jobid}.")
+        return True
+
     def run_job(self, job: JobExecutorInterface) -> None:
         job_info = SubmittedJobInfo(job, aux={})
         if job.is_group():
@@ -173,6 +247,8 @@ class Executor(RemoteExecutor):
                 msg="gpuc runs one Snakemake job per gpuc job; drop the rule's `group:`, since "
                 "a group's summed resources would become its priority and runtime limit\n",
             )
+            return
+        if self.adopt(job, job_info):
             return
         try:
             spec, argv = self.submission(job)
@@ -262,16 +338,17 @@ class Executor(RemoteExecutor):
         for info, job_id in zip(active_jobs, ids, strict=True):
             job = answers.get(job_id) or {"error": "gpuc status did not mention it"}
             error, status = job.get("error"), job.get("status")
-            if error is not None and job.get("host_state") == "unaskable":
+            state = outcome(job)
+            if state == "unaskable":
                 if self.unaskable_shown.get(job_id) != error:
                     self.logger.info(f"gpuc job {job_id}: {error}")
-                self.unaskable_shown[job_id] = error
+                self.unaskable_shown[job_id] = str(error)
                 yield info
             elif error is not None:
                 self.report_job_error(info, msg=f"gpuc job {job_id}: {error}\n")
-            elif status == "succeeded":
+            elif state == "succeeded":
                 self.report_job_success(info)
-            elif status in FAILED:
+            elif state == "failed":
                 reason = job.get("reason")
                 why = f"{status}: {reason}" if reason and reason != status else status
                 self.report_job_error(info, msg=f"gpuc job {job_id} {why}; `gpuc logs {job_id}`.\n")
@@ -344,6 +421,18 @@ class Executor(RemoteExecutor):
         if proc.returncode not in ok_codes:
             raise GpucError(f"exit {proc.returncode}: {proc.stderr.strip()}")
         return document
+
+
+def outcome(job: Mapping[str, Any]) -> str:
+    """One job of `gpuc status --json`: `unaskable` while its host could not
+    be asked, `gone` for any other `error` (no host has it, or its host is
+    gone with no end mirrored), else `succeeded`, `failed` or `live`."""
+    if job.get("error") is not None:
+        return "unaskable" if job.get("host_state") == "unaskable" else "gone"
+    status = job.get("status")
+    if status == "succeeded":
+        return "succeeded"
+    return "failed" if status in FAILED else "live"
 
 
 def job_name(job: JobExecutorInterface) -> str:

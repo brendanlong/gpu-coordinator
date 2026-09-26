@@ -612,6 +612,11 @@ ships in the same wheel and gpuc does not depend on Snakemake.
   fails rather than getting a card.
 - One `gpuc status --json` per poll covers every job in flight. It is never
   one per job.
+- A job whose outputs carry Snakemake's incomplete marker is not submitted
+  while the gpuc job the marker names is queued, running or on a host that
+  could not be asked; that job is polled instead, and one that succeeded is
+  the Snakemake job's success. Asking is one `gpuc status --json` per batch of
+  ready jobs.
 - Snakemake's `--envvars` and its storage plugins' credentials reach the job
   as gpuc `secrets`, never as exports in the job's command.
 - A job runs in its own gpuc workdir. The Snakefile is passed relative to that

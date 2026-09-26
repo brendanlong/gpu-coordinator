@@ -42,9 +42,9 @@ uv run snakemake --executor gpuc --gpuc-host spar --jobs 20
 
 (with `--with` as above if gpuc is not in the project).
 
-**Run it in tmux** (or another session that outlives your terminal). The
-controller is an ordinary foreground process: nothing in gpuc keeps it alive,
-and a controller that dies leaves its jobs behind (see [a killed
+**Run it in tmux**, or under something that restarts it. The controller is an
+ordinary foreground process: nothing in gpuc keeps it alive, and a controller
+that dies leaves its jobs running for the next one to adopt (see [a killed
 controller](#a-killed-controller) below).
 
 `--jobs` is how many gpuc jobs are queued or running at once. The host's
@@ -103,9 +103,37 @@ mirror.
 
 <a name="a-killed-controller"></a>
 **A killed controller.** Ctrl-C cancels the workflow's gpuc jobs, but a
-controller that is killed outright leaves them queued and running. Started
-again, it submits them again. Cancel the old ones first; `gpuc status` lists
-them by rule name.
+controller that is killed outright leaves them queued and running, and leaves
+its lock and Snakemake's "incomplete" markers in `.snakemake/`. Each marker
+names the gpuc job writing that output. Start it again the same way, first
+with `--unlock` and then with `--rerun-incomplete`:
+
+```sh
+uv run snakemake --executor gpuc --gpuc-host spar --unlock
+uv run snakemake --executor gpuc --gpuc-host spar --jobs 20 --rerun-incomplete
+```
+
+A job with a marker is then settled against the gpuc job it names, in one
+`gpuc status` for every job ready to run, instead of being submitted again:
+
+| that gpuc job | the restarted controller |
+| --- | --- |
+| queued or running | polls it as if it had submitted it |
+| succeeded | reports the Snakemake job done, keeping its outputs |
+| its host could not be asked | polls it until the host answers |
+| failed, cancelled, or no host has it | submits the job again |
+
+`--rerun-incomplete` deletes nothing on the controller: under this executor
+an incomplete job's outputs are removed only by the job that is submitted to
+replace them. Without it Snakemake refuses to start, and without `--unlock`
+it refuses the lock the killed controller held.
+
+So a supervisor (a restart loop, a systemd user unit) can restart the
+controller unattended. Bound its restarts: a job that fails on its own fails
+the controller too, and each restart submits it again. One gap remains: a
+controller killed while a `gpuc submit` is still running writes no marker for
+that job, so if the submit completes the job runs twice. `gpuc status` lists
+both by rule name.
 
 ## Where files live
 
@@ -168,6 +196,4 @@ moving every checkpoint through the bucket.
   and runs `setup`.
 - Job groups (`group:`) are refused, CPU rules included: Snakemake never runs
   a grouped rule on the controller. Each Snakemake job is its own gpuc job.
-- The controller runs wherever you start it, and a controller that dies
-  leaves its jobs behind. gpuc runs only jobs that need a GPU, so it cannot
-  host the controller.
+- The controller runs wherever you start it, and nothing in gpuc restarts it.
