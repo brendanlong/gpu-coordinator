@@ -7,7 +7,7 @@
 # .gitignore is obeyed; `--no-git` syncs a non-repo directory instead).
 
 name: lego-s4                                   # a label, not an identifier
-command: uv run --no-sync python -m experiments.lego.train --k-max 6
+command: uv run --no-sync python -m experiments.lego.train --k-max 6   # more than a line: `bash run.sh`
 setup: uv sync --frozen                         # optional; runs first, phase=setup
 gpus: 1                                         # 0..N of the host's owned GPUs
 

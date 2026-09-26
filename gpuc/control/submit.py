@@ -295,6 +295,7 @@ def prepare(
     secret or a non-git workdir found here costs nothing, where the same
     failure discovered by a pod that is already billing costs a pod.
     """
+    check_shell_syntax(model)
     spec = expand_job_id(model.to_spec(job_id or jobs.new_job_id()))
     secrets_body = gather_secrets(spec.secrets, environ)
     if use_git:
@@ -304,6 +305,41 @@ def prepare(
             raise _not_a_repo(workdir, exc) from exc
     warnings = [*preexisting_output_warnings(spec, workdir), *timeout_warnings(spec)]
     return Prepared(model, spec, secrets_body, requeued_from, warnings)
+
+
+def check_shell_syntax(model: JobSpecModel) -> None:
+    """`bash -n` each script the host will run, refusing on an error or a warning.
+
+    A multi-line script in a YAML block scalar is where specs go wrong: the
+    block strips one common indent, so a heredoc terminator YAML left indented
+    is no terminator, and the job fails minutes later on the host -- or runs
+    the rest of the script as the heredoc's body. bash reports that only as a
+    warning ("here-document delimited by end-of-file"), hence refusing on any
+    stderr. This is the client's bash, not the host's; a client with none
+    skips the check.
+    """
+    scripts = {
+        "setup": model.setup,
+        "command": model.command,
+        "progress_command": model.progress_command,
+    }
+    for key, script in scripts.items():
+        if script is None:
+            continue
+        try:
+            result = subprocess.run(
+                ["bash", "-n", "-c", script], capture_output=True, text=True, timeout=30
+            )
+        except FileNotFoundError:
+            return
+        if result.returncode != 0 or result.stderr.strip():
+            listing = "\n".join(f"  | {line}" for line in script.rstrip("\n").splitlines())
+            raise SubmitError(
+                f"`{key}` is not a valid bash script:\n{result.stderr.rstrip()}\n"
+                f"bash was given, after YAML parsing:\n{listing}\n"
+                "Put anything longer than a line or two in a script in the repo and run "
+                "that: `command: bash run.sh`."
+            )
 
 
 def check_gpu_count(model: JobSpecModel, gpu_count: int | None) -> None:
