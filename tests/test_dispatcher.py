@@ -1946,20 +1946,44 @@ def test_auto_preempt_judges_a_job_by_the_priority_it_runs_at(gpuc_home: Path) -
     assert queue.is_preempted(cheap)
 
 
-@pytest.mark.parametrize("priority", [80, 50])
-def test_an_auto_preempt_job_keeps_its_cards_when_nothing_better_is_waiting(
-    gpuc_home: Path, priority: int
+@pytest.mark.parametrize(
+    ("priority", "waiting_id"),
+    [(80, "20260101-000000-000000"), (50, "20990101-000000-000000")],
+)
+def test_an_auto_preempt_job_keeps_its_cards_when_nothing_ahead_of_it_is_waiting(
+    gpuc_home: Path, priority: int, waiting_id: str
 ) -> None:
-    """Equal priority counts as "not better": the stopped job's id is the older
-    one, so it would win the tie, take its own cards straight back, and be
-    preempted again for ever without either job getting anywhere."""
-    cheap = queue.enqueue(make_spec(gpus=2, priority=50, auto_preempt=True))
+    """A job behind it in dispatch order is not better, even at equal priority:
+    the stopped job would sort ahead of it, take its own cards straight back,
+    and be preempted again for ever without either job getting anywhere."""
+    cheap = queue.enqueue(
+        make_spec(gpus=2, priority=50, auto_preempt=True, job_id="20500101-000000-000000")
+    )
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
-    queue.enqueue(make_spec(gpus=2, priority=priority))
+    queue.enqueue(make_spec(gpus=2, priority=priority, job_id=waiting_id))
     dispatcher.run_once()
     assert not queue.is_preempted(cheap)
     assert queue.stop_requested(cheap) is None
+
+
+def test_an_auto_preempt_job_gives_way_at_equal_priority_to_a_job_ahead_of_it(
+    gpuc_home: Path,
+) -> None:
+    """Stopped, it is queued again behind the job it made room for, so it
+    cannot take the cards back."""
+    cheap = queue.enqueue(
+        make_spec(gpus=2, priority=50, auto_preempt=True, job_id="20500101-000000-000000")
+    )
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    ahead = queue.enqueue(make_spec(gpus=2, priority=50, job_id="20260101-000000-000000"))
+    dispatcher.run_once()
+    assert queue.is_preempted(cheap)
+    spawned[cheap].requeue()
+    dispatcher.run_once()
+    assert jobs.read_state(ahead).status == "running"
+    assert jobs.read_state(cheap).status == "queued"
 
 
 def test_a_job_that_never_asked_for_it_is_not_preempted(gpuc_home: Path) -> None:
@@ -2465,3 +2489,101 @@ def test_a_card_claimed_between_the_plan_and_the_launch_is_not_handed_out(
     assert other not in dispatcher.running
     assert jobs.read_state(other).gpus == foreign[0].gpus
     assert "claimed by a runner since this pass began" in paths.dispatcher_log().read_text()
+
+
+def test_an_auto_preempt_job_fills_a_card_held_for_a_wide_one_and_gives_it_back(
+    gpuc_home: Path,
+) -> None:
+    dispatcher, spawned = make_dispatcher()
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=20))
+    plain = queue.enqueue(make_spec(gpus=1, priority=80))
+    filler = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    dispatcher.run_once()
+
+    assert (jobs.read_state(filler).status, jobs.read_state(filler).gpus) == (
+        "running",
+        [FAKE_GPUS[1]],
+    )
+    assert jobs.read_state(plain).status == "queued", "only an auto_preempt job may fill"
+    assert f"card(s) held for job {wide}" in paths.log_file(filler).read_text()
+
+    spawned[busy].finish()
+    dispatcher.run_once()
+    assert queue.is_preempted(filler)
+    # While it stops, the card that came free stays with the wide job.
+    dispatcher.run_once()
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(plain).status == "queued"
+
+    spawned[filler].requeue()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+    for _ in range(3):
+        dispatcher.run_once()
+    # The livelock signature is an attempt counter that climbs once a pass.
+    assert (jobs.read_state(filler).status, jobs.read_state(filler).attempt) == ("queued", 2)
+
+
+def test_a_filler_that_ends_on_its_own_hands_the_card_back_to_the_wide_job(
+    gpuc_home: Path,
+) -> None:
+    dispatcher, spawned = make_dispatcher()
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=20))
+    filler = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    dispatcher.run_once()
+    spawned[filler].finish()
+    plain = queue.enqueue(make_spec(gpus=1, priority=80))
+    dispatcher.run_once()
+    assert jobs.read_state(plain).status == "queued"
+
+    spawned[busy].finish()
+    dispatcher.run_once()
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+
+
+def test_two_fillers_cannot_take_turns_on_a_wide_jobs_cards(gpuc_home: Path) -> None:
+    """A stopped filler's runner outlives its last write -- the mirror upload,
+    its secrets -- and for those passes its card has to stay on its way back to
+    the wide job, or the other filler takes the card the wide job already had
+    and the two alternate for ever, each attempt climbing."""
+    dispatcher, spawned = make_dispatcher()
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=2, priority=20))
+    fillers = [queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True)) for _ in range(2)]
+    dispatcher.run_once()
+    spawned[busy].finish()
+    dispatcher.run_once()
+    (stopping,) = [j for j in fillers if queue.is_preempted(j)]
+
+    assert queue.next_attempt(stopping, ran=True) is not None  # its last write...
+    dispatcher.run_once()  # ...while the runner is still alive
+    assert all(jobs.read_state(j).status == "queued" for j in fillers)
+    spawned[stopping].returncode = runner.TERMINATED_EXIT_CODE
+    dispatcher.run_once()
+    assert jobs.read_state(wide).gpus == FAKE_GPUS
+    assert [jobs.read_state(j).attempt for j in fillers] == [
+        2 if j == stopping else 1 for j in fillers
+    ]
+
+
+def test_a_filler_is_not_started_on_a_card_an_auto_preempt_will_complete(
+    gpuc_home: Path,
+) -> None:
+    """The wide job is covered by the jobs it will stop, so exactly those are
+    stopped, and nothing is started only to be stopped a pass later."""
+    cards = [f"GPU-00000000-0000-0000-0000-00000000000{i}" for i in range(1, 5)]
+    jobs.write_config(HostConfig(host="test-host", gpus=cards))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.smi = fake_smi(cards)
+    cheap = [queue.enqueue(make_spec(gpus=1, priority=50, auto_preempt=True)) for _ in range(3)]
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=3, priority=0))
+    filler = queue.enqueue(make_spec(gpus=1, priority=90, auto_preempt=True))
+    dispatcher.run_once()
+    assert sum(queue.is_preempted(j) for j in cheap) == 2
+    assert jobs.read_state(filler).status == "queued"
