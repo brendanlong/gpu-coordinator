@@ -82,8 +82,9 @@ estimated_runtime_min: 480         # optional; what `gpuc status` shows the next
 progress_command: "tail -1 results/progress.txt"   # optional; last stdout line is a percentage
 progress_interval_s: 60            # prints `0.42` or `42%`; a bare `42` is refused; min 5
 auto_preempt: false                # true: the host stops this job whenever that lets a job
-                                   # queued at a LOWER priority number start now, and queues it
-                                   # again. It RE-RUNS FROM THE START, any number of times
+                                   # queued AHEAD of it start now, and queues it again. It
+                                   # RE-RUNS FROM THE START, any number of times. In return it
+                                   # may run on cards HELD for a job ahead, until that job can start
 cleanup: on_success                # workdir deleted after a successful run
 ```
 

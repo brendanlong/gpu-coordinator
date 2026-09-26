@@ -1150,3 +1150,24 @@ def test_none_in_the_window_counts_the_finished_jobs_the_host_did_not_send() -> 
     host_view = view(jobs=[])
     host_view.finished_count = 12
     assert "none in the last 60 min (12 older)" in render(host_view, since_s=3600.0)
+
+
+def test_a_running_auto_preempt_job_says_which_job_it_yields_to() -> None:
+    """A job at priority 90 running while one at 10 waits, then dying, is not a
+    bug, and the line has to say so."""
+    queued, running, _ = job_views(
+        payload(
+            jobs=[
+                {
+                    "job_id": "j-fill",
+                    "status": "running",
+                    "gpus": [GPU],
+                    "auto_preempt": True,
+                    "yields_to": "j-wide",
+                },
+                {"job_id": "j-wide", "status": "queued", "yields_to": None},
+            ]
+        )
+    )
+    assert running[0].yields_to == "j-wide" and queued[0].yields_to is None
+    assert "auto-preempt, yields to j-wide" in render(busy(running[0]))
