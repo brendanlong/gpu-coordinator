@@ -20,10 +20,11 @@ from gpuc.control.submit import (
     load_document,
     prepare,
     validate,
+    wont_fit,
 )
 from gpuc.control.submit import submit_spec as submit_prepared
 from gpuc.control.transport import CommandResult
-from gpuc.host import jobs
+from gpuc.host import gpus, jobs
 from tests.conftest import host_entry
 from tests.fakes3 import FakeS3Client
 
@@ -37,10 +38,26 @@ class FakeHost:
     puts: dict[str, tuple[str, int]] = field(default_factory=dict)
     rsyncs: list[tuple[Path, str, list[str] | None]] = field(default_factory=list)
     excludes: list[str] = field(default_factory=list)
+    cards: list[str] | None = None
+    """The UUIDs nvidia-smi reports, in index order; None for every card the
+    session's config names, as on a host whose nvidia-smi agrees with it."""
+    smi_answers: bool = True
+    session: HostSession | None = None
+
+    def reported(self) -> list[str]:
+        if self.cards is not None:
+            return self.cards
+        config = self.session.config if self.session else jobs.HostConfig()
+        return list(dict.fromkeys([*(config.gpus or []), *config.shared_gpus]))
 
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
         self.commands.append(command)
         out = ""
+        if command.startswith("nvidia-smi --query-gpu="):
+            if not self.smi_answers:
+                return CommandResult(self.host, ["sh", "-c", command], 127, "", "not found")
+            rows = enumerate(self.reported())
+            out = "".join(f"{index}, {uuid}, NVIDIA A40, 46068 MiB\n" for index, uuid in rows)
         if "gpuc.host enqueue" in command:
             out = json.dumps({"job_id": "unused", "dispatcher_pid": 99})
         return CommandResult(self.host, ["sh", "-c", command], 0, out, "")
@@ -77,7 +94,9 @@ def session(host: FakeHost) -> HostSession:
     entry = host_entry(
         name="gpubox", kind="ssh", ssh="me@box", gpus=["GPU-a"], python="/usr/bin/py"
     )
-    return HostSession(entry, host, REMOTE_HOME, "/usr/bin/py", HostConfigRead(entry.cache.config))
+    live = HostSession(entry, host, REMOTE_HOME, "/usr/bin/py", HostConfigRead(entry.cache.config))
+    host.session = live
+    return live
 
 
 def submit_spec(
@@ -632,14 +651,76 @@ def test_a_job_that_did_not_ask_is_not_given_the_shared_cards_as_capacity(
 def test_a_card_listed_as_both_owned_and_shared_is_counted_once(
     control_env: Path, repo: Path
 ) -> None:
-    """The dispatcher resolves both lists against the live card table and
-    health refuses the overlap; a submit has no table, so the same spelling
-    on both sides is the one overlap it can see, and it must not count it as
-    capacity twice."""
+    """Health refuses the overlap, but a submit must not count one card as
+    capacity twice -- whether nvidia-smi answered (the same resolution the
+    dispatcher uses) or not (the spelling is the one overlap it can see)."""
     entry = host_entry(name="gpubox", gpus=["GPU-a"], shared_gpus=["GPU-a"])
+    document = job_document(gpus=2, use_shared=True)
+    for answers in (True, False):
+        with pytest.raises(SubmitError) as exc:
+            submit_to(entry, repo, document, FakeHost(smi_answers=answers))
+        assert "host owns 1 and may borrow 0 shared" in str(exc.value), answers
+
+
+def test_a_listed_card_nvidia_smi_does_not_report_is_named_in_the_refusal(
+    control_env: Path, repo: Path
+) -> None:
+    """The dispatcher would fail it on its first pass; saying so here, with the
+    card that went missing, is before the code is shipped."""
+    host = FakeHost(cards=["GPU-a"])
+    entry = host_entry(name="gpubox", gpus=["GPU-a", "GPU-b"])
     with pytest.raises(SubmitError) as exc:
-        submit_to(entry, repo, job_document(gpus=2, use_shared=True))
-    assert "host owns 1 and may borrow 0 shared" in str(exc.value)
+        submit_to(entry, repo, job_document(gpus=2), host)
+    assert "needs 2 GPUs, host owns 1 that nvidia-smi reports (GPU-b listed but missing)" in str(
+        exc.value
+    )
+    assert host.rsyncs == []
+
+
+def test_a_host_that_owns_every_card_is_judged_by_what_nvidia_smi_reports(
+    control_env: Path, repo: Path
+) -> None:
+    entry = host_entry(name="gpubox", gpus=None, shared_gpus=["GPU-c"])
+    three = FakeHost(cards=["GPU-a", "GPU-b", "GPU-c"])
+    assert submit_to(entry, repo, job_document(gpus=2), three).job_id
+    with pytest.raises(SubmitError, match="needs 3 GPUs, host owns 2 and shares 1"):
+        submit_to(entry, repo, job_document(gpus=3), FakeHost(cards=["GPU-a", "GPU-b", "GPU-c"]))
+
+
+def test_with_nvidia_smi_silent_a_list_is_counted_and_every_card_is_left_to_dispatch(
+    control_env: Path, repo: Path
+) -> None:
+    listed = host_entry(name="gpubox", gpus=["GPU-a"])
+    with pytest.raises(SubmitError, match="needs 2 GPUs, host owns 1"):
+        submit_to(listed, repo, job_document(gpus=2), FakeHost(smi_answers=False))
+    everything = host_entry(name="gpubox", gpus=None)
+    assert submit_to(everything, repo, job_document(gpus=8), FakeHost(smi_answers=False)).job_id
+
+
+def test_wont_fit_resolves_the_config_against_the_table() -> None:
+    table = [gpus.Gpu(0, "GPU-a", "A40", 46068), gpus.Gpu(1, "GPU-s", "A40", 46068)]
+    spec = jobs.JobSpec(job_id="j", command="true", gpus=2)
+    listed = jobs.HostConfig(gpus=["0", "7"], shared_gpus=["1"])
+    reason = wont_fit(spec, listed, table, "gpubox")
+    assert reason is not None
+    assert "host owns 1 and shares 1 this job did not ask for" in reason
+    assert "(7 listed but missing)" in reason
+    borrowing = jobs.JobSpec(job_id="j", command="true", gpus=2, use_shared=True)
+    assert wont_fit(borrowing, listed, table, "gpubox") is None
+    assert wont_fit(spec, jobs.HostConfig(gpus=None), table, "gpubox") is None
+    three = jobs.JobSpec(job_id="j", command="true", gpus=3)
+    too_wide = wont_fit(three, jobs.HostConfig(gpus=None), table, "gpubox")
+    assert too_wide is not None and "needs 3 GPUs, host owns 2" in too_wide
+    assert "missing" not in too_wide
+
+
+def test_wont_fit_without_a_table_counts_a_list_and_skips_every_card() -> None:
+    spec = jobs.JobSpec(job_id="j", command="true", gpus=2)
+    reason = wont_fit(spec, jobs.HostConfig(gpus=["0"]), None, "gpubox")
+    assert reason is not None and "needs 2 GPUs, host owns 1" in reason
+    assert wont_fit(spec, jobs.HostConfig(gpus=["0", "1"]), None, "gpubox") is None
+    assert wont_fit(spec, jobs.HostConfig(gpus=None), None, "gpubox") is None
+    assert wont_fit(spec, jobs.HostConfig(gpus=[]), None, "gpubox") is not None
 
 
 def test_a_job_bigger_than_owned_and_shared_together_is_still_refused(

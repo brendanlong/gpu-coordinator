@@ -230,7 +230,7 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
             assert pod is not None
             log(
                 f"pod {pod.id} {pod.name}: {pod.gpu_name} cuda {pod.cuda_version} "
-                f"${pod.cost_usd_hr:.3f}/h, {len(entry.config.gpus)} GPU(s) {entry.config.gpus}"
+                f"${pod.cost_usd_hr:.3f}/h, {len(entry.gpu_info)} GPU(s) {list(entry.gpu_info)}"
             )
             assert main(["status"]) == 0
             assert main(["pods"]) == 0

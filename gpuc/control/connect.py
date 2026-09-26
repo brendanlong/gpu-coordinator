@@ -27,7 +27,7 @@ from gpuc.control.config import (
     load_settings,
     transport_for,
 )
-from gpuc.control.gpuinfo import table_of
+from gpuc.control.gpuinfo import describe_owned, owned_entries, table_of
 from gpuc.control.remote import HostConfigRead, read_config, resolve_home, write_config
 from gpuc.control.transport import Transport
 from gpuc.host import gpus, jobs
@@ -66,8 +66,7 @@ def connect_host(
     given: on a host that already has a config each one is an explicit
     override, written through to the host and reported field by field; on a
     host that has none they are overrides of `first_config`, whose default
-    `gpus` is every card the probe saw (`address.gpu_info`), less any it was
-    asked to share.
+    `gpus` is null: every card the host has that is not shared.
 
     `before_write` is judged once the host's own name is known and before
     anything is written to it, so a caller that refuses the result refuses it
@@ -92,10 +91,10 @@ def connect_host(
         # somebody's host.
         before_write(entry)
     else:
-        if "gpus" not in patch and "shared_gpus" not in patch and not address.gpu_info:
-            # An empty default is a driver that is still coming up, or an
-            # nvidia-smi that is missing, as often as a box with no cards.
-            # Writing "owns nothing" as the host's first config would stick.
+        if not isinstance(patch.get("gpus"), list) and not address.gpu_info:
+            # No cards is a driver that is still coming up, or an nvidia-smi
+            # that is missing, as often as a box with none; owning all of
+            # them there fails the health check's driver probe at bootstrap.
             raise ConnectError(
                 f"{address.name} reports no GPUs (nvidia-smi is missing there, or found no "
                 f"cards), so there is nothing for it to own by default. Pass --gpus '' to "
@@ -219,20 +218,30 @@ def _refuse_overlapping_gpus(
     2,3` and `--gpus GPU-a,GPU-b` can name the same two cards -- and an index
     is the spelling somebody copies off the probe's own output.
     """
-    wanted = patch.get("gpus")
-    if not isinstance(wanted, list) or force:
+    if "gpus" not in patch or force:
         return
+    wanted = patch["gpus"]
     table = table_of(address.gpu_info)
+    held = HostConfig.from_dict(existing)
+    if wanted is None:
+        # `all` is the cards the probe saw less the shared ones, and claims
+        # them as surely as listing them would.
+        after = HostConfig.from_dict({**existing, **patch})
+        wanted = owned_entries(None, after.shared_gpus, address.gpu_info)
+        named = "all"
+    elif isinstance(wanted, list):
+        named = ",".join(sorted(str(item) for item in wanted))
+    else:
+        return
     mine = _cards([str(item) for item in wanted], table)
-    theirs = HostConfig.from_dict(existing).gpus
+    theirs = owned_entries(held.gpus, held.shared_gpus, address.gpu_info)
     # Named as the *host* spells them, which is how the sentence below reads.
     shared = [item for item in theirs if _cards([item], table) & mine]
     if not shared or _cards(theirs, table) == mine:
         return
-    named = sorted(str(item) for item in wanted)
     raise ConnectError(
-        f"host {address.name} is already configured with GPUs {', '.join(theirs)}, and "
-        f"--gpus {','.join(named)} shares {', '.join(shared)} with that list without "
+        f"host {address.name} is already configured with GPUs {describe_owned(held.gpus)}, and "
+        f"--gpus {named} shares {', '.join(shared)} with that list without "
         f"matching it.\n"
         f"That is the one difference that can hand one card to two jobs, so it is refused "
         f"rather than warned about: drop --gpus to adopt what the host has, name a disjoint "
@@ -243,8 +252,8 @@ def _refuse_overlapping_gpus(
 def _cards(entries: list[str], table: list[gpus.Gpu]) -> set[str]:
     """The cards `entries` name, through the cards the probe saw; an entry the
     probe did not see is left as typed -- a typo or a card this container was
-    not given, which the health check refuses at bootstrap, not something to
-    guess at here."""
+    not given, which the health check warns about at bootstrap, not something
+    to guess at here."""
     cards = gpus.resolve(entries, table)
     return set(cards.owned) | set(cards.missing)
 
@@ -277,5 +286,5 @@ def _refuse_shared_overlap(
         f"host {entry.name} would have {', '.join(both)} named twice, in both --gpus and "
         f"--shared-gpus or as an index and its own UUID, and a card is either ours to hand "
         f"out or somebody else's to borrow, and one card once.\n"
-        f"Owned: {', '.join(config.gpus) or 'none'}. Shared: {', '.join(config.shared_gpus)}."
+        f"Owned: {describe_owned(config.gpus)}. Shared: {', '.join(config.shared_gpus)}."
     )

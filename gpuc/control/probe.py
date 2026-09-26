@@ -76,9 +76,9 @@ class ProbeReport:
     sections: dict[str, str]
     persistent_root: str | None = None
     """The root this host is *already* registered with, if any."""
-    owned: list[str] = field(default_factory=list)
+    owned: list[str] | None = None
     """This host's `--gpus`, exactly as the registry stores them: nvidia-smi
-    indices, UUIDs, or a mix.
+    indices, UUIDs, or a mix; None for every card that is not shared.
 
     nvidia-smi lists every card in the box, and on a shared box most of them
     are somebody else's. A probe that does not say which is which invites
@@ -188,7 +188,7 @@ class ProbeReport:
         hidden = " (--all-gpus lists the rest)" if partly and not everything else ""
         borrowed = f", {len(ours) - len(owned)} shared" if len(ours) > len(owned) else ""
         header = f"  gpus: {len(owned)} of {len(rows)} assigned to {self.host}{borrowed}{hidden}"
-        lines = [header if self.owned or self.shared else "  gpus:"]
+        lines = [header if self.owned != [] or self.shared else "  gpus:"]
         for gpu in rows if everything else ours:
             memory = f"  {gpu.memory_mib} MiB" if gpu.memory_mib is not None else ""
             if self.owns(gpu):
@@ -226,7 +226,7 @@ class ProbeReport:
         """Which cards in this box are ours, and what to do about the answer."""
         rows, owned = self.table, self.owned_rows
         notes: list[str] = []
-        if rows and not self.owned:
+        if rows and not owned:
             notes.append(
                 f"no GPUs are assigned to {self.host}, so only jobs asking for none can "
                 f"run on it;\n"
@@ -244,15 +244,15 @@ class ProbeReport:
             )
         if self.shared_missing:
             notes.append(
-                f"shared but not present on this host: {', '.join(self.shared_missing)}.\n"
-                f"        `gpuc host bootstrap {self.host}` fails its gpu_uuids check on this "
-                f"too: `gpuc host set {self.host} --shared-gpus <list>`"
+                f"shared but not present on this host: {', '.join(self.shared_missing)}, so "
+                f"never borrowed\n        while it stays missing: a typo or a renumbered box "
+                f"is fixed with `gpuc host set {self.host} --shared-gpus <list>`"
             )
         if self.owned_missing:
             notes.append(
-                f"assigned but not present on this host: {', '.join(self.owned_missing)}.\n"
-                f"        `gpuc host bootstrap {self.host}` fails its gpu_uuids check on this, so "
-                f"fix the\n        list first: `gpuc host set {self.host} --gpus <list>`"
+                f"assigned but not present on this host: {', '.join(self.owned_missing)}, so "
+                f"never used\n        while it stays missing: a typo or a renumbered box is "
+                f"fixed with `gpuc host set {self.host} --gpus <list>`"
             )
         doubled = self.cards.duplicates if self.has_nvidia_smi else []
         if doubled:
@@ -286,7 +286,7 @@ class ProbeReport:
                 }
                 for uuid, info in self.gpu_info.items()
             ],
-            "assigned_gpus": list(self.owned),
+            "assigned_gpus": self.owned,
             "assigned_missing": self.owned_missing,
             "shared_gpus": list(self.shared),
             "shared_missing": self.shared_missing,
@@ -320,7 +320,7 @@ def parse_probe(
         host=host,
         sections=sections,
         persistent_root=persistent_root,
-        owned=list(owned or []),
+        owned=None if owned is None else list(owned),
         shared=list(shared or []),
     )
 

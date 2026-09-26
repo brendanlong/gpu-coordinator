@@ -10,7 +10,7 @@ import json
 import sys
 import time
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -73,13 +73,13 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
     -- and when it is not, the numbers are how somebody sees why. Owned cards
     carry the same readings, as the live answer to how hard each is working.
     The same `gpus.resolve` the dispatcher decides with, over one reading; a
-    driver that will not answer reads as every entry unavailable, as it does
-    there.
+    driver that will not answer reads as no cards, as it does there.
     """
+    error: str | None = None
     try:
         table, usage = gpus.snapshot()
-    except gpus.GpuError:
-        table, usage = [], {}
+    except gpus.GpuError as exc:
+        table, usage, error = [], {}, str(exc)
     indices = {gpu.uuid: gpu.index for gpu in table}
     cards = gpus.resolve(config.gpus, table, config.shared_gpus)
     return {
@@ -106,7 +106,7 @@ def _gpu_table(config: jobs.HostConfig) -> dict[str, Any]:
             for uuid in cards.shared
         ],
         "shared_gpus_unavailable": cards.shared_missing,
-        "shared_configured": len(cards.shared) + len(cards.shared_missing),
+        "gpus_error": error,
     }
 
 
@@ -218,16 +218,23 @@ def projected_starts(
                 request(job_id, spec, state),
             )
         )
-    return plan.project(
+    unknown: dict[str, str] = {}
+    if table["gpus_error"]:
+        # The dispatcher holds these for `SMI_PATIENCE_S` rather than failing
+        # them on a reading that says nothing about the cards.
+        why = f"nvidia-smi could not be read on the host ({table['gpus_error']})"
+        unknown = {r.job_id: why for r in requests if r.gpus}
+        requests = [r for r in requests if not r.gpus]
+    projection = plan.project(
         requests,
         cards,
-        owned_configured=len(config.gpus),
         owned_missing=table["gpus_unavailable"],
-        shared_configured=table["shared_configured"],
+        shared_missing=table["shared_gpus_unavailable"],
         theirs=theirs,
         running=stoppable,
         draining=paths.draining_file().exists(),
     )
+    return replace(projection, unknown={**unknown, **projection.unknown})
 
 
 def _ended_within(ended_at: str | None, since_s: float, now: datetime) -> bool:
