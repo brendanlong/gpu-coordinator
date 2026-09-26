@@ -42,7 +42,6 @@ from gpuc.control.submit import (
     validate,
     with_overrides,
 )
-from gpuc.host import jobs
 
 DEFAULT_IDLE_MINUTES = 15.0
 """How long a rental sits with an empty queue before it ends itself, unless
@@ -82,7 +81,11 @@ class RentalOptions:
         )
 
 
-def rent_host(rental: RentalOptions, settings: Settings, report: Reporter) -> HostEntry:
+def rent_host(
+    rental: RentalOptions, prepared: Prepared, settings: Settings, report: Reporter
+) -> HostEntry:
+    check_gpu_count(prepared.model, rental.gpu_count)
+    check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
     return runpod_host(
         rental.constraints(),
         settings,
@@ -186,11 +189,9 @@ def submit_job(
         raise UsageError("submit needs --host <name> (see `gpuc host list`)")
     document = with_overrides(load_document(job_file), **(overrides or {}))
     model = validate(document, str(job_file))
-    prepared = prepare(model, workdir, job_id=jobs.new_job_id(), use_git=use_git)
+    prepared = prepare(model, workdir, use_git=use_git)
     if rental is not None:
-        check_gpu_count(model, rental.gpu_count)
-        check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
-        entry = rent_host(rental, settings, report)
+        entry = rent_host(rental, prepared, settings, report)
     else:
         entry = open_registry().require(host or "")
     return enqueue(
@@ -235,14 +236,10 @@ def requeue_job(
             f"set can be requeued."
         ) from exc
     model = validate(document, f"spec for {job_id}", tolerant=True)
-    prepared = prepare(
-        model, workdir, job_id=jobs.new_job_id(), requeued_from=job_id, use_git=use_git
-    )
+    prepared = prepare(model, workdir, requeued_from=job_id, use_git=use_git)
     session: HostSession | None = None
     if rental is not None:
-        check_gpu_count(model, rental.gpu_count)
-        check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
-        entry = rent_host(rental, settings, report)
+        entry = rent_host(rental, prepared, settings, report)
     else:
         # `--host` is where it goes, so it has to be one this machine has.
         # Otherwise where the job ran, by the same lookup every other job

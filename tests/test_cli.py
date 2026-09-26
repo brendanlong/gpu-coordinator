@@ -876,7 +876,7 @@ def test_verified_mirrors_are_the_ids_with_a_log_under_the_hosts_prefix(
         },
         page_size=2,
     )
-    assert verified_mirrors(mirrored_host().config.s3_prefix, Settings(), client=client) == [
+    assert verified_mirrors(mirrored_host().config.s3_prefix, client=client) == [
         "a",
         "b",
     ]
@@ -888,7 +888,7 @@ def test_verified_mirrors_of_a_host_with_no_prefix_is_nothing(control_env: Path)
     from gpuc.control.clean import verified_mirrors
 
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/a/log.txt": b""})
-    assert verified_mirrors(None, Settings(), client=client) == []
+    assert verified_mirrors(None, client=client) == []
     assert client.list_calls == []
 
 
@@ -900,7 +900,7 @@ def test_verified_mirrors_raises_when_the_listing_fails(control_env: Path) -> No
             raise RuntimeError("AccessDenied")
 
     with pytest.raises(CleanError, match=r"s3://bucket/gpuc/gpubox/jobs/.*AccessDenied"):
-        verified_mirrors(mirrored_host().config.s3_prefix, Settings(), client=Refusing())
+        verified_mirrors(mirrored_host().config.s3_prefix, client=Refusing())
 
 
 # -- locate ----------------------------------------------------------------------
@@ -1227,7 +1227,6 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
         session=as_session(session),
         purge=True,
         all_finished=True,
-        yes=True,
     )
     assert "--older-than 0.0" in session.calls[0]
     assert "purging every finished job (horizon 0)" in report.render()

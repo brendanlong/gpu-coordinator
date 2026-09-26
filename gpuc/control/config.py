@@ -14,7 +14,7 @@ import shutil
 import time
 import tomllib
 from collections.abc import Callable, Collection, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -537,14 +537,12 @@ def backup_path(path: Path) -> Path:
     return path.with_name(path.name + ".bak")
 
 
-def _take_backup(path: Path) -> Path | None:
-    """Copy a file we cannot parse aside, before anything here rewrites it."""
-    target = backup_path(path)
-    try:
-        shutil.copy2(path, target)
-    except OSError:
-        return None
-    return target
+def _unreadable(path: Path, why: str, fix: str = "") -> RegistryRead:
+    """Copy a registry we cannot parse aside, before anything here rewrites it."""
+    with suppress(OSError):
+        shutil.copy2(path, backup_path(path))
+    kept = f"  a copy is kept at {backup_path(path)} before anything rewrites it"
+    return RegistryRead(unreadable=True, errors=[f"{path} {why}\n{kept}{fix}"])
 
 
 def read_registry() -> RegistryRead:
@@ -561,34 +559,16 @@ def read_registry() -> RegistryRead:
     try:
         document = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        saved = _take_backup(path)
-        return RegistryRead(
-            unreadable=True,
-            errors=[
-                f"{path} is not a readable host registry: {exc}\n"
-                f"  a copy is kept at {saved or backup_path(path)} before anything rewrites it\n"
-                f"  fix it by hand, or remove it and re-add your hosts with `gpuc host add`"
-            ],
+        return _unreadable(
+            path,
+            f"is not a readable host registry: {exc}",
+            "\n  fix it by hand, or remove it and re-add your hosts with `gpuc host add`",
         )
     if not isinstance(document, dict):
-        saved = _take_backup(path)
-        return RegistryRead(
-            unreadable=True,
-            errors=[
-                f"{path} holds {type(document).__name__}, not a host registry object\n"
-                f"  a copy is kept at {saved or backup_path(path)} before anything rewrites it"
-            ],
-        )
+        return _unreadable(path, f"holds {type(document).__name__}, not a host registry object")
     hosts = document.get("hosts")
     if not isinstance(hosts, dict):
-        saved = _take_backup(path)
-        return RegistryRead(
-            unreadable=True,
-            errors=[
-                f"{path} has no `hosts` object, so no host is known\n"
-                f"  a copy is kept at {saved or backup_path(path)} before anything rewrites it"
-            ],
-        )
+        return _unreadable(path, "has no `hosts` object, so no host is known")
     registry = Registry.model_validate({**document, "hosts": {}})
     errors: list[str] = []
     skipped: dict[str, Any] = {}

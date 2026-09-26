@@ -201,10 +201,7 @@ class S3Index:
 
     def get_index(self, job_id: str) -> IndexEntry | None:
         """This job's index entry, or None if the mirror has none (or it is unreadable)."""
-        try:
-            return IndexEntry.model_validate_json(self._get(index_key(job_id)))
-        except (S3IndexError, ValidationError):
-            return None
+        return self._index_at(index_key(job_id))
 
     def list_keys(self, prefix: str, limit: int) -> list[str]:
         """Every key under `prefix`, following continuation tokens.

@@ -22,18 +22,13 @@ from gpuc.control.providers.base import Pod, Provider
 from gpuc.control.remote import Asked, Gone, HostSession, Unaskable, ask
 from gpuc.control.s3index import IndexEntry, job_uri
 from gpuc.host.cleanup import human_bytes
+from gpuc.host.gpus import Usage
 
 HEARTBEAT_STALE_S = 30.0
 RECENT_FINISHED = 5
 LEFTOVER_FLOOR_BYTES = 1 << 30
 """Only mention finished jobs' workdirs once they add up to something worth a
 command. A job dir under a gigabyte is noise next to a 6.5 GB torch venv."""
-
-
-def describe_usage(memory_mib: float | None, utilization_pct: float | None) -> str:
-    memory = "?" if memory_mib is None else f"{memory_mib:.0f}"
-    util = "?" if utilization_pct is None else f"{utilization_pct:.0f}"
-    return f"{memory} MiB, {util}% util"
 
 
 class CardState(Enum):
@@ -856,7 +851,7 @@ def _gpu_lines(view: HostView) -> list[str]:
         info = view.entry.gpu_info.get(item.uuid) or GpuInfo()
         index = view.index_of(item.uuid)
         state = CARD_WORDS[view.card_state(item)]
-        usage = describe_usage(item.memory_mib, item.utilization_pct)
+        usage = Usage(item.uuid, item.memory_mib, item.utilization_pct).describe()
         lines.append(
             f"  {kind:<7} [{'?' if index is None else index}] {state} {info.label()} ({usage})"
         )

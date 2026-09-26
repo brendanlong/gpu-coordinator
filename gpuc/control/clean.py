@@ -14,10 +14,10 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuc.control.config import HostEntry, Settings, load_settings
+from gpuc.control.config import HostEntry, Settings
 from gpuc.control.exits import EXIT_USAGE
 from gpuc.control.remote import HostSession, env_prefix, open_session
-from gpuc.control.s3index import S3Index, job_uri, make_s3_client, split_uri
+from gpuc.control.s3index import job_uri, make_s3_client, split_uri
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS, human_bytes
 
 
@@ -61,7 +61,7 @@ class CleanReport:
             head += "  (dry run, nothing was deleted)"
         lines = [head]
         for job in self.purged:
-            lines.append(_purged_line(job, dry_run=self.dry_run))
+            lines.append(_job_line(job, "WOULD PURGE " if self.dry_run else "PURGED  "))
             if job.get("forced"):
                 lines.append(
                     "          ^ FORCED: this job had no confirmed backup and its record "
@@ -73,13 +73,7 @@ class CleanReport:
             lines.append(f"  SKIPPED {job['job_id']}  {job.get('why', '')}")
         for note in self.notes:
             lines.append(f"  note: {note}")
-        for job in self.removed:
-            age = job.get("age_days")
-            when = f"{age:.1f}d old" if isinstance(age, (int, float)) else "age unknown"
-            lines.append(
-                f"  {job['job_id']}  {job.get('status', '?'):<9} "
-                f"{human_bytes(int(job.get('bytes') or 0)):>9}  {when}"
-            )
+        lines += [_job_line(job) for job in self.removed]
         for job in self.skipped:
             # "no selection given" is every job the flags simply did not ask
             # for; saying so once per job would bury the ones that matter.
@@ -119,12 +113,11 @@ class CleanReport:
         }
 
 
-def _purged_line(job: dict[str, Any], *, dry_run: bool) -> str:
+def _job_line(job: dict[str, Any], verb: str = "") -> str:
     age = job.get("age_days")
     when = f"{age:.1f}d old" if isinstance(age, (int, float)) else "age unknown"
-    verb = "WOULD PURGE" if dry_run else "PURGED "
     return (
-        f"  {verb} {job['job_id']}  {job.get('status', '?'):<9} "
+        f"  {verb}{job['job_id']}  {job.get('status', '?'):<9} "
         f"{human_bytes(int(job.get('bytes') or 0)):>9}  {when}"
     )
 
@@ -210,20 +203,9 @@ def clean_host(
     purge: bool = False,
     force: bool = False,
     verify: bool = False,
-    yes: bool = False,
     only: list[str] | None = None,
     s3_client: Any | None = None,
 ) -> CleanReport:
-    check_flags(
-        all_finished=all_finished,
-        older_than_days=older_than_days,
-        dry_run=dry_run,
-        purge=purge,
-        force=force,
-        verify=verify,
-        yes=yes,
-        only=only,
-    )
     session = session or open_session(entry, settings)
     if purge:
         report = purge_host(
@@ -335,9 +317,7 @@ def purge_host(
         if all_finished or only is not None
         else (DEFAULT_RETENTION_DAYS if older_than_days is None else older_than_days)
     )
-    verified = (
-        verified_mirrors(session.config.s3_prefix, settings, client=s3_client) if verify else None
-    )
+    verified = verified_mirrors(session.config.s3_prefix, client=s3_client) if verify else None
     args = _purge_args(days, dry_run=dry_run, force=force, only=only)
     if verified is not None:
         args += f" {_verified_arg(session, verified)}"
@@ -348,17 +328,7 @@ def purge_host(
     return report
 
 
-def _s3_client(settings: Settings) -> Any:
-    """A client for the listing, from `s3_bucket` when there is one."""
-    index = S3Index.from_settings(settings)
-    if index is not None:
-        return index.client
-    return make_s3_client()
-
-
-def verified_mirrors(
-    s3_prefix: str | None, settings: Settings | None = None, *, client: Any | None = None
-) -> list[str]:
+def verified_mirrors(s3_prefix: str | None, *, client: Any | None = None) -> list[str]:
     """The job ids whose mirrored `log.txt` exists under the host's prefix.
 
     One listing rather than one HEAD per candidate, and before the host is
@@ -369,7 +339,7 @@ def verified_mirrors(
     """
     if not s3_prefix:
         return []
-    s3 = client if client is not None else _s3_client(settings or load_settings())
+    s3 = client if client is not None else make_s3_client()
     bucket, key = split_uri(job_uri(s3_prefix, ""))
     prefix = key.rstrip("/") + "/"
     ids: list[str] = []
