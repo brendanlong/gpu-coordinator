@@ -7,17 +7,13 @@ from gpuc.control.rented import address_for, offer_of, pod_record
 from tests.fakeprovider import make_offer, running_pod
 
 
-def test_the_provider_block_a_pod_is_given_holds_its_own_record() -> None:
+def test_a_pod_holds_its_own_record_and_its_offer_reads_back_off_it() -> None:
     address = HostEntry(name="gpuc-a-111", rental=Rental(pod_id="pod1"))
     record = pod_record(address, make_offer(), "2026-09-15T12:00:00+00:00")
     assert record["kind"] == "runpod" and record["pod_id"] == "pod1"
     assert record["offer"]["name"] == "A40"
     assert record["created_at"] == "2026-09-15T12:00:00+00:00"
-
-
-def test_the_offer_is_read_back_off_the_pods_own_record() -> None:
-    address = HostEntry(name="gpuc-a-111", rental=Rental(pod_id="pod1"))
-    offer = offer_of(pod_record(address, make_offer(), "2026-09-15T12:00:00+00:00"))
+    offer = offer_of(record)
     assert offer is not None
     assert offer.name == "A40" and offer.price_usd_hr == 0.49
 

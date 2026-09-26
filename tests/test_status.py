@@ -173,14 +173,6 @@ def test_a_running_job_the_host_names_no_cards_for_still_renders() -> None:
     assert "gpu=none" in render(busy(running_job(gpus=[])))
 
 
-def test_an_unaskable_host_says_what_to_run_next() -> None:
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box")
-    text = render(gather(entry, session=cast(Any, _RefusingSession()), provider=None))
-    assert "UNASKABLE" in text
-    assert "ERROR ssh: connect to 1.2.3.4 port 22: No route to host" in text
-    assert "gpuc host probe gpubox" in text
-
-
 def test_a_stale_heartbeat_reads_as_a_dead_dispatcher() -> None:
     stale = view()
     stale.heartbeat_age_s = 400.0
@@ -282,10 +274,15 @@ class _RefusingSession:
         raise TransportError(message="ssh: connect to 1.2.3.4 port 22: No route to host")
 
 
-def test_a_host_that_could_not_be_read_is_a_failure() -> None:
-    view = gather(_runpod_entry(), session=cast(Any, _RefusingSession()), provider=None)
+def test_an_unaskable_host_is_a_failure_and_says_what_to_run_next() -> None:
+    entry = host_entry(name="gpubox", kind="ssh", ssh="me@box")
+    view = gather(entry, session=cast(Any, _RefusingSession()), provider=None)
     assert not view.reachable
     assert view.failure == "ssh: connect to 1.2.3.4 port 22: No route to host"
+    text = render(view)
+    assert "UNASKABLE" in text
+    assert "ERROR ssh: connect to 1.2.3.4 port 22: No route to host" in text
+    assert "gpuc host probe gpubox" in text
 
 
 # -- leftover workdirs --------------------------------------------------------

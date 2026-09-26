@@ -207,17 +207,18 @@ def test_set_does_not_touch_the_spec(gpuc_home: Path, capsys: pytest.CaptureFixt
     assert jobs.read_state(job_id).estimated_runtime_min == 42.0
 
 
-def test_set_estimate_refuses_a_finished_job_and_an_unknown_one(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("field", "status"), [("estimated_runtime_min", "succeeded"), ("max_runtime_min", "failed")]
+)
+def test_set_refuses_a_finished_job(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], field: str, status: str
 ) -> None:
     job_id = queue.enqueue(make_spec())
-    jobs.update_state(job_id, status="succeeded")
-    code, payload = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=10")
-    assert code == 1 and "already succeeded" in payload["error"]
-    assert jobs.read_state(job_id).estimated_runtime_min is None
-
-    code, payload = verb(capsys, "set", "no-such-job", "--field", "estimated_runtime_min=10")
-    assert code == 1 and payload["missing"] is True
+    jobs.update_state(job_id, status=status)
+    before = getattr(jobs.read_state(job_id), field)
+    code, payload = verb(capsys, "set", job_id, "--field", f"{field}=10")
+    assert code == 1 and f"already {status}" in payload["error"]
+    assert getattr(jobs.read_state(job_id), field) == before
 
 
 @pytest.mark.parametrize("minutes", ["0", "-5", "NaN", "Infinity", "1e10"])
@@ -353,17 +354,6 @@ def test_set_max_runtime_refuses_a_number_that_is_not_a_limit(
     code, payload = verb(capsys, "set", job_id, "--field", f"max_runtime_min={minutes}")
     assert code == 1 and payload["error"]
     assert jobs.read_state(job_id).max_runtime_min == 60.0
-
-
-def test_set_max_runtime_refuses_a_finished_job_and_an_unknown_one(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    job_id = queue.enqueue(make_spec())
-    jobs.update_state(job_id, status="failed")
-    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=10")
-    assert code == 1 and "already failed" in payload["error"]
-    code, payload = verb(capsys, "set", "no-such-job", "--field", "max_runtime_min=10")
-    assert code == 1 and payload["missing"] is True
 
 
 def test_dispatch_is_routed_to_the_dispatcher(

@@ -1113,17 +1113,6 @@ def test_the_workdir_horizon_needs_no_mirror(gpuc_home: Path) -> None:
     assert paths.state_file(job_id).exists()
 
 
-def test_the_workdir_horizon_never_touches_a_running_job(gpuc_home: Path) -> None:
-    configure_retention(None, 0.0)
-    job_id = queue.enqueue(make_spec(gpus=1))
-    dispatcher, _ = make_dispatcher()
-    dispatcher.run_once()
-    assert jobs.read_state(job_id).status == "running"
-    dispatcher._last_reclaim_at = None
-    dispatcher.run_once()
-    assert paths.workdir(job_id).is_dir()
-
-
 def test_the_two_horizons_run_together_without_double_counting(gpuc_home: Path) -> None:
     configure_retention(7.0, 1.0)
     ancient = finished_job(days_old=30.0)
@@ -1171,22 +1160,6 @@ def test_the_workdir_horizon_leaves_a_job_that_asked_to_keep_its_workdir(
     assert paths.workdir(job_id).is_dir()
 
 
-def test_the_workdir_horizon_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
-    configure_retention(None, 1.0)
-    clock = FakeClock()
-    dispatcher, _ = make_dispatcher(clock=clock)
-    dispatcher.run_once()
-
-    later = finished_job(days_old=2.0)
-    clock.advance(59 * 60)
-    dispatcher.run_once()
-    assert paths.workdir(later).is_dir(), "swept again inside the hour"
-
-    clock.advance(2 * 60)
-    dispatcher.run_once()
-    assert not paths.workdir(later).exists()
-
-
 def test_retention_purges_at_startup(gpuc_home: Path) -> None:
     configure_retention(7.0)
     old = finished_job(days_old=30.0)
@@ -1198,8 +1171,26 @@ def test_retention_purges_at_startup(gpuc_home: Path) -> None:
     assert "retention (7 days): purged 1 job dir" in paths.dispatcher_log().read_text()
 
 
-def test_retention_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
-    configure_retention(7.0)
+# Each horizon, with the path it reclaims: the purge takes the whole job dir,
+# the workdir sweep only the checkout.
+HORIZONS = pytest.mark.parametrize(
+    ("horizon", "reclaimed"),
+    [("retention", paths.job_dir), ("workdir", paths.workdir)],
+)
+
+
+def configure_horizon(horizon: str, days: float) -> None:
+    if horizon == "retention":
+        configure_retention(days)
+    else:
+        configure_retention(None, days)
+
+
+@HORIZONS
+def test_a_horizon_runs_at_most_once_an_hour(
+    gpuc_home: Path, horizon: str, reclaimed: Callable[[str], Path]
+) -> None:
+    configure_horizon(horizon, 1.0)
     clock = FakeClock()
     dispatcher, _ = make_dispatcher(clock=clock)
     dispatcher.run_once()
@@ -1207,11 +1198,12 @@ def test_retention_runs_at_most_once_an_hour(gpuc_home: Path) -> None:
     later = finished_job(days_old=30.0)
     clock.advance(59 * 60)
     dispatcher.run_once()
-    assert paths.state_file(later).exists(), "purged again inside the hour"
+    assert reclaimed(later).is_dir(), "reclaimed again inside the hour"
+    assert paths.state_file(later).exists()
 
     clock.advance(2 * 60)
     dispatcher.run_once()
-    assert not paths.job_dir(later).exists()
+    assert not reclaimed(later).exists()
 
 
 def test_retention_never_forces(gpuc_home: Path) -> None:
@@ -1224,15 +1216,18 @@ def test_retention_never_forces(gpuc_home: Path) -> None:
     assert not paths.workdir(unmirrored).exists()
 
 
-def test_retention_never_touches_a_running_job(gpuc_home: Path) -> None:
-    configure_retention(0.0)
+@HORIZONS
+def test_a_horizon_never_touches_a_running_job(
+    gpuc_home: Path, horizon: str, reclaimed: Callable[[str], Path]
+) -> None:
+    configure_horizon(horizon, 0.0)
     job_id = queue.enqueue(make_spec(gpus=1))
     dispatcher, _ = make_dispatcher()
     dispatcher.run_once()
     assert jobs.read_state(job_id).status == "running"
     dispatcher._last_reclaim_at = None
     dispatcher.run_once()
-    assert paths.job_dir(job_id).is_dir()
+    assert reclaimed(job_id).is_dir()
 
 
 # -- the drain's last go at unconfirmed outputs -------------------------------

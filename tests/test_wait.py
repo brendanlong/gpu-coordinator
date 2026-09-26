@@ -643,8 +643,10 @@ def test_follow_forever_is_still_there_for_anyone_who_wants_it(
 def test_follow_under_json_is_still_refused(
     host_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """`-f` has no end, and a document has to be complete."""
     put_job(host_home)
     assert main(["logs", JOB, "--json", "-f"]) == EXIT_USAGE
+    assert "cannot follow" in json.loads(capsys.readouterr().out)["error"]
     assert main(["logs", JOB, "--json", "--follow-forever"]) == EXIT_USAGE
 
 

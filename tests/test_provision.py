@@ -315,8 +315,20 @@ def test_ssh_never_answers_terminates(
     assert load_registry().hosts == {}
 
 
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "/home/me/.ssh/config: line 3: Bad configuration option: prxycommand",
+        "Warning: Identity file /home/me/.ssh/id_ed25519 not accessible: No such file",
+    ],
+    ids=["bad-config-option", "unreadable-identity-file"],
+)
 def test_a_local_ssh_misconfiguration_ends_the_attempt_at_the_first_pod(
-    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+    control_env: Path,
+    ssh_key: Path,
+    host: FakeHost,
+    offline_health: HealthOptions,
+    refusal: str,
 ) -> None:
     """No offer fixes a broken local ssh config: every pod would be bought,
     waited on and terminated identically. So the first one is terminated and
@@ -325,9 +337,9 @@ def test_a_local_ssh_misconfiguration_ends_the_attempt_at_the_first_pod(
         [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")]
     )
     host.refuse = 99
-    host.refusal = "/home/me/.ssh/config: line 3: Bad configuration option: prxycommand"
+    host.refusal = refusal
     with pytest.raises(ProvisionError) as error:
-        run(provider, host, offline_health)
+        run(provider, host, offline_health, now=ticking())
     message = str(error.value)
     assert "cannot work as configured" in message
     assert "no other offer could fix this" in message
@@ -363,18 +375,6 @@ def test_a_tool_missing_on_this_machine_ends_the_attempt_at_the_first_pod(
     assert len(provider.created) == 1
     assert provider.terminated == ["pod1"]
     assert load_registry().hosts == {}
-
-
-def test_an_unreadable_identity_file_ends_the_attempt_too(
-    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
-) -> None:
-    provider = FakeProvider([make_offer(price=0.20, gpu_id="first"), make_offer(gpu_id="second")])
-    host.refuse = 99
-    host.refusal = "Warning: Identity file /home/me/.ssh/id_ed25519 not accessible: No such file"
-    with pytest.raises(ProvisionError) as error:
-        run(provider, host, offline_health, now=ticking())
-    assert "no other offer could fix this" in str(error.value)
-    assert len(provider.created) == 1 and provider.terminated == ["pod1"]
 
 
 def test_health_failure_terminates_and_forgets(

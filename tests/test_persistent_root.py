@@ -235,12 +235,9 @@ def test_bootstrap_creates_the_root_before_anything_else(control_env: Path) -> N
     setup = host.events[0]
     assert setup.startswith(f"set -e; root={ROOT};")
     assert 'if [ ! -d "$root" ]; then mkdir -p "$root"; chmod 700 "$root"; fi' in setup
-
-
-def test_bootstrap_does_not_touch_an_existing_roots_mode(control_env: Path) -> None:
-    host, _ = bootstrapped()
-    # The only chmod is inside the "it did not exist" branch.
-    assert host.events[0].count("chmod 700") == 1
+    # An existing root's mode is left alone: the only chmod is inside the "it
+    # did not exist" branch.
+    assert setup.count("chmod 700") == 1
 
 
 def test_a_host_without_a_root_gets_no_root_step(control_env: Path) -> None:
@@ -380,20 +377,16 @@ def test_host_set_edits_one_field_and_leaves_the_rest(
     assert entry.ssh == "gpubox"
 
 
+@pytest.mark.parametrize(
+    ("flag", "gpus"), [("GPU-b,GPU-c", ["GPU-b", "GPU-c"]), ("", [])], ids=["some", "none"]
+)
 def test_host_set_writes_the_gpu_list_through_to_the_host(
-    control_env: Path, fake_host: FakeHost
+    control_env: Path, fake_host: FakeHost, flag: str, gpus: list[str]
 ) -> None:
     add()
-    assert main(["host", "set", "gpubox", "--gpus", "GPU-b,GPU-c"]) == 0
-    assert fake_host.config is not None and fake_host.config["gpus"] == ["GPU-b", "GPU-c"]
-    assert load_registry().require("gpubox").config.gpus == ["GPU-b", "GPU-c"]
-
-
-def test_host_set_can_hand_every_gpu_back(control_env: Path, fake_host: FakeHost) -> None:
-    add()
-    assert main(["host", "set", "gpubox", "--gpus", ""]) == 0
-    assert load_registry().require("gpubox").config.gpus == []
-    assert fake_host.config is not None and fake_host.config["gpus"] == []
+    assert main(["host", "set", "gpubox", "--gpus", flag]) == 0
+    assert fake_host.config is not None and fake_host.config["gpus"] == gpus
+    assert load_registry().require("gpubox").config.gpus == gpus
 
 
 def test_host_set_can_clear_the_root(control_env: Path, fake_host: FakeHost) -> None:

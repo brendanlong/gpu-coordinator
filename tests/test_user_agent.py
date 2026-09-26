@@ -24,11 +24,8 @@ def test_version_matches_pyproject() -> None:
     assert document["project"]["version"] == __version__
 
 
-def test_user_agent_is_exactly_the_documented_string() -> None:
+def test_every_caller_uses_exactly_the_documented_string() -> None:
     assert user_agent() == EXPECTED
-
-
-def test_every_caller_uses_the_same_string() -> None:
     assert USER_AGENT == EXPECTED
     assert runpod.USER_AGENT == EXPECTED
 

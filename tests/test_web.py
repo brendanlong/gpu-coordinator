@@ -528,77 +528,31 @@ def test_a_refused_set_is_the_clis_refusal(logged_in: Client, stub: StubSession)
     assert document["jobs"][0]["error"] == error
 
 
-def test_set_estimate_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
-    stub.answers.append(
-        {
-            "jobs": [
-                {
-                    "job_id": RUNNING_JOB,
-                    "estimated_runtime_min": 90.0,
-                    "status": "running",
-                    "warning": None,
-                }
-            ]
-        }
-    )
-    status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "estimated_runtime_min": 90}
-    )
-    assert status == 200 and document["jobs"][0]["estimated_runtime_min"] == 90.0
-    stub.answers.append(
-        {
-            "jobs": [
-                {
-                    "job_id": RUNNING_JOB,
-                    "estimated_runtime_min": None,
-                    "status": "running",
-                    "warning": None,
-                }
-            ]
-        }
-    )
-    status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "estimated_runtime_min": None}
-    )
-    assert status == 200 and document["jobs"][0]["estimated_runtime_min"] is None
-    assert stub.commands == [
-        f"set {RUNNING_JOB} --field estimated_runtime_min=90",
-        f"set {RUNNING_JOB} --field estimated_runtime_min=null",
-    ]
-    status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "estimated_runtime_min": -5}
-    )
-    assert status == 400
-
-
-def test_set_max_runtime_sets_and_clears(logged_in: Client, stub: StubSession) -> None:
-    for minutes in (600.0, None):
+@pytest.mark.parametrize(
+    ("field", "minutes", "invalid"),
+    [("estimated_runtime_min", 90, -5), ("max_runtime_min", 600, 0)],
+)
+def test_set_a_runtime_sets_and_clears(
+    logged_in: Client, stub: StubSession, field: str, minutes: int, invalid: int
+) -> None:
+    for answer in (float(minutes), None):
         stub.answers.append(
-            {
-                "jobs": [
-                    {
-                        "job_id": RUNNING_JOB,
-                        "max_runtime_min": minutes,
-                        "status": "running",
-                        "warning": None,
-                    }
-                ]
-            }
+            {"jobs": [{"job_id": RUNNING_JOB, field: answer, "status": "running", "warning": None}]}
         )
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "max_runtime_min": 600}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", field: minutes}
     )
-    assert status == 200 and document["jobs"][0]["max_runtime_min"] == 600.0
+    assert status == 200 and document["jobs"][0][field] == float(minutes)
     status, document = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "max_runtime_min": None}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", field: None}
     )
-    assert status == 200 and document["jobs"][0]["max_runtime_min"] is None
+    assert status == 200 and document["jobs"][0][field] is None
     assert stub.commands == [
-        f"set {RUNNING_JOB} --field max_runtime_min=600",
-        f"set {RUNNING_JOB} --field max_runtime_min=null",
+        f"set {RUNNING_JOB} --field {field}={minutes}",
+        f"set {RUNNING_JOB} --field {field}=null",
     ]
     status, _ = logged_in.post_json(
-        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", "max_runtime_min": 0}
+        f"/api/jobs/{RUNNING_JOB}/set", {"host": "gpubox", field: invalid}
     )
     assert status == 400
 

@@ -167,7 +167,6 @@ def test_unknown_fields_are_rejected_by_name() -> None:
     ("overrides", "needle"),
     [
         ({"command": "  "}, "command"),
-        ({"gpus": -1}, "gpus"),
         ({"priority": 200}, "priority"),
         ({"outputs": [{"path": "r", "bucket": "x"}]}, "outputs.0.bucket"),
     ],

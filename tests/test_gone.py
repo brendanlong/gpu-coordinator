@@ -89,17 +89,16 @@ def test_logs_of_a_job_on_a_forgotten_host_read_the_mirror(
     assert (document["source"], document["lines"]) == ("s3", ["loss 0.1"])
 
 
-@pytest.mark.parametrize("named", [False, True])
 def test_wait_on_a_job_on_a_forgotten_host_reads_the_mirror(
     control_env: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     no_sleep: None,
-    named: bool,
 ) -> None:
+    """Named only: without `--host` it is test_wait's
+    test_wait_reads_the_mirror_at_once_for_a_host_this_machine_has_forgotten."""
     mirror(monkeypatch, {JOB: succeeded(minutes=5)})
-    host = ["--host", POD] if named else []
-    assert main(["wait", JOB, *host]) == EXIT_OK
+    assert main(["wait", JOB, "--host", POD]) == EXIT_OK
     assert "from the S3 mirror" in capsys.readouterr().out
 
 

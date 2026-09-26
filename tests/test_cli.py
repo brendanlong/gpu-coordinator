@@ -428,13 +428,6 @@ def test_an_invalid_spec_never_touches_the_host(
     assert main(["submit", str(job), "--host", "gpubox"]) == EXIT_ERROR
 
 
-def test_status_with_no_hosts_is_not_an_error(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["status"]) == 0
-    assert "no hosts registered" in capsys.readouterr().out
-
-
 def test_cancel_for_an_unknown_job_tells_you_where_to_look(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1384,13 +1377,18 @@ def test_retention_days_is_stored_and_cleared(control_env: Path, fake_host: Fake
     assert fake_host.config["retention_days"] is None
 
 
-def test_a_bad_retention_value_is_rejected(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--retention-days", "soon", "wants a number of days"),
+        ("--workdir-days", "-1", "--workdir-days cannot be negative"),
+    ],
+)
+def test_a_bad_horizon_is_rejected(
+    control_env: Path, capsys: pytest.CaptureFixture[str], flag: str, value: str, message: str
 ) -> None:
-    assert (
-        main(["host", "add", "gpubox", "--ssh", "me@box", "--retention-days", "soon"]) == EXIT_USAGE
-    )
-    assert "wants a number of days" in capsys.readouterr().err
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", flag, value]) == EXIT_USAGE
+    assert message in capsys.readouterr().err
 
 
 def test_a_host_getting_its_first_config_sweeps_workdirs_after_a_day(
@@ -1426,13 +1424,6 @@ def test_workdir_days_is_stored_and_cleared(control_env: Path, fake_host: FakeHo
     assert main(["host", "set", "gpubox", "--workdir-days", ""]) == 0
     assert fake_host.config["workdir_days"] is None
     assert load_registry().require("gpubox").config.workdir_days is None
-
-
-def test_a_bad_workdir_days_value_is_rejected(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--workdir-days", "-1"]) == EXIT_USAGE
-    assert "--workdir-days cannot be negative" in capsys.readouterr().err
 
 
 def test_the_index_listing_flags_jobs_whose_outputs_were_lost(control_env: Path) -> None:

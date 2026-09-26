@@ -172,10 +172,13 @@ def test_a_job_command_on_an_unreadable_registry_is_unknown_not_missing(
     assert "not a readable host registry" in capsys.readouterr().err
 
 
-def test_a_missing_registry_is_simply_no_hosts(control_env: Path) -> None:
+def test_a_missing_registry_is_simply_no_hosts(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     assert read_registry().unreadable is False
     assert load_registry().hosts == {}
     assert main(["status"]) == EXIT_OK
+    assert "no hosts registered" in capsys.readouterr().out
 
 
 # -- exit codes ---------------------------------------------------------------
@@ -1413,14 +1416,6 @@ def test_logs_json_carries_the_lines_and_where_they_came_from(
     assert document["location"] == str(log)
     assert document["lines"] == ["first", "second"]
     assert document["notes"] == []
-
-
-def test_logs_json_refuses_to_follow(
-    real_local_host: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """`-f` has no end, and a document has to be complete."""
-    assert main(["logs", RUNNING_JOB, "--json", "-f"]) == EXIT_USAGE
-    assert "cannot follow" in json.loads(capsys.readouterr().out)["error"]
 
 
 def test_logs_json_says_when_it_fell_back_to_the_mirror(

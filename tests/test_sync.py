@@ -98,22 +98,21 @@ def test_sync_error_carries_command_and_output(tmp_path: Path, fake_aws: str) ->
     assert "exited 1" in message
 
 
-def test_missing_aws_binary_is_a_clear_sync_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("destination", "tool"),
+    [(S3("s3://bucket/p"), "aws"), (HuggingFace("org/repo", "p"), "hf")],
+    ids=["s3", "huggingface"],
+)
+def test_a_missing_upload_binary_is_a_clear_sync_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination: S3 | HuggingFace,
+    tool: str,
 ) -> None:
     monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: None)
     with pytest.raises(sync.SyncError) as excinfo:
-        S3("s3://bucket/p").upload_dir(tmp_path, runner=RecordingRunner())
-    assert "`aws` CLI not found" in str(excinfo.value)
-
-
-def test_missing_hf_binary_is_a_clear_sync_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: None)
-    with pytest.raises(sync.SyncError) as excinfo:
-        HuggingFace("org/repo", "p").upload_dir(tmp_path, runner=RecordingRunner())
-    assert "`hf` CLI not found" in str(excinfo.value)
+        destination.upload_dir(tmp_path, runner=RecordingRunner())
+    assert f"`{tool}` CLI not found" in str(excinfo.value)
 
 
 def test_job_id_is_expanded_in_destinations(gpuc_home: Path, fake_aws: str) -> None:

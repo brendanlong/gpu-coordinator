@@ -93,6 +93,9 @@ def test_disk_check_measures_the_gpuc_volume(gpuc_home: Path) -> None:
     failing = health.check_disk(min_free_gb=1e9)
     assert not failing.ok
     assert str(gpuc_home) in failing.detail
+    # The refusal says what to do about it.
+    assert "floor 1000000000.0 GB" in failing.detail
+    assert "--min-free-gb" in failing.detail
 
 
 def test_download_check_reports_mbps_and_enforces_the_floor() -> None:
@@ -131,13 +134,6 @@ def test_zero_bytes_is_still_fatal(gpuc_home: Path) -> None:
         smi=fake_smi(), downloader=dead_downloader, min_free_gb=0.0, url="http://x"
     )
     assert not report["ok"]
-
-
-def test_the_disk_floor_message_says_what_to_do(gpuc_home: Path) -> None:
-    check = health.check_disk(min_free_gb=1e9)
-    assert not check.ok
-    assert "floor 1000000000.0 GB" in check.detail
-    assert "--min-free-gb" in check.detail
 
 
 def test_run_checks_emits_json_with_every_check(gpuc_home: Path) -> None:
