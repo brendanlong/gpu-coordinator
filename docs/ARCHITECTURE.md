@@ -187,7 +187,7 @@ defaults.
   "command": "uv run python -m experiments.lego.train --k-max 6",
   "setup": "uv sync --frozen",          # optional; runs before command, phase=setup
   "python": "uv run --no-sync python",  # how the GPU check runs Python in the job's own env
-  "gpus": 1,                            # at least 1
+  "gpus": 1,                            # 0 runs with no card
   "use_shared": false,                  # may this job also be dispatched to `shared_gpus`?
                                         # see Shared GPUs
   "env": {"REQUIRE_CUDA": "1"},

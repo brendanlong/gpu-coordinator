@@ -13,8 +13,8 @@ the cards it could take, owned and borrowed alike, and nothing behind it may
 have them -- any other rule makes priority advisory the moment the job at the
 front is wider than the free pool, and it is what made automatic preemption
 livelock. What is held is cards, not the queue: a job behind that needs none
-of them goes ahead, which today means a job asking for no cards, dispatched
-on its first pass whatever is waiting. The one exemption is a job that could
+of them goes ahead -- a job asking for no cards on its first pass, or a
+borrower onto a shared card the holder may not use. The one exemption is a job that could
 not fit even once every job of ours ends: it is short of a shared card
 somebody else is using, which comes free when *their* job ends, and that is
 not ours to wait on. It is stepped

@@ -84,8 +84,8 @@ it.
 What a waiting job holds is cards, so a job asking for **`gpus: 0`** is never
 held: it starts on the next pass whatever is queued ahead of it. It gets an
 empty `CUDA_VISIBLE_DEVICES`, skips the GPU check (so needs no torch), and is
-otherwise a job like any other: it keeps a rental from going idle, and
-`gpuc preempt` refuses it, since stopping it frees nothing.
+otherwise a job like any other, except that `gpuc preempt` refuses it. A
+running one keeps a rental from going idle.
 
 A job waiting for a [shared card](#shared-gpus) somebody else is using does not
 hold: the queue behind it runs. A job short of an *owned* card holds even when

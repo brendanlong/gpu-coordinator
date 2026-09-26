@@ -99,8 +99,8 @@ destinations. Adding another of either changes nothing else in this document.
 - **Priority is numeric, lower first, and strict.** The queue is taken in
   order: a job that does not yet fit holds the free cards it is waiting for,
   and nothing behind it may take them, even at the cost of idle cards. What is
-  held is those cards, not the queue: a job behind that needs none of them,
-  such as one asking for no GPU, goes ahead. A job waiting for a shared card
+  held is those cards, not the queue: a job behind that needs none of them
+  goes ahead. A job waiting for a shared card
   someone else is using is stepped over instead.
 - Priorities of queued jobs can be changed, and the queue reorders
   accordingly.

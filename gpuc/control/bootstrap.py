@@ -649,7 +649,7 @@ def bootstrap_host(
         if not read.config.gpus:
             warnings.append(
                 f"host {entry.name} has no config of its own and this machine has no cards "
-                f"recorded for it, so it will run nothing until "
+                f"recorded for it, so it will run no GPU job until "
                 f"`gpuc host set {entry.name} --gpus <list>`"
             )
             report(f"WARNING: {warnings[-1]}")

@@ -173,7 +173,7 @@ def _owns_nothing_warning(entry: HostEntry, fields: dict[str, Any], report: Prob
     else:
         why = "nvidia-smi found no cards on it"
     return (
-        f"it owns no GPUs ({why}), so nothing can be submitted to it: "
+        f"it owns no GPUs ({why}), so only jobs asking for none can run on it: "
         f"`gpuc host set {entry.name} --gpus <list>` assigns some"
     )
 

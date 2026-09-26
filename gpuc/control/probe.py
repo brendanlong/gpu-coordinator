@@ -228,7 +228,8 @@ class ProbeReport:
         notes: list[str] = []
         if rows and not self.owned:
             notes.append(
-                f"no GPUs are assigned to {self.host}, so nothing can be submitted to it;\n"
+                f"no GPUs are assigned to {self.host}, so only jobs asking for none can "
+                f"run on it;\n"
                 f"        assign some with `gpuc host set {self.host} --gpus <list>`, "
                 f"from the indices or UUIDs above"
             )
