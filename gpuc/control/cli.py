@@ -1500,8 +1500,8 @@ def build_parser() -> argparse.ArgumentParser:
         "queues it again under the same job id as its next attempt. It re-runs from the "
         "start, in the workdir the stopped attempt left behind -- nothing is re-synced from "
         "here -- so preempt a job that tolerates being re-run over its own leftovers. "
-        "Queue the job you want to run FIRST: this is refused unless something already "
-        "waiting would be dispatched ahead of the preempted job, since otherwise it would "
+        "Queue the job you want to run FIRST: this is refused unless a job already waiting for "
+        "GPUs would be dispatched ahead of the preempted job, since otherwise it would "
         "only stop it and start it again. Use `gpuc requeue` to re-run a finished job, or "
         "to run one on another host.",
     )

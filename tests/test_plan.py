@@ -155,6 +155,18 @@ def test_a_job_that_does_not_fit_holds_and_nothing_behind_it_takes_those_cards()
     ]
 
 
+def test_a_job_that_needs_no_cards_goes_ahead_of_the_ones_holding_them() -> None:
+    """What is held is cards: a job behind that needs none of them is not
+    held up by them, however much else is waiting."""
+    p, calls = pool(["a"], owned_configured=2, shared_free=["s"])
+    assert plan.plan([req("wide", 2), req("narrow"), req("cpu", 0, borrows=True)], p) == [
+        Holds("wide", 1, 0, 1),
+        Holds("narrow", 0, 0, 1),
+        Assigned("cpu", []),
+    ]
+    assert calls == []
+
+
 def test_a_held_shared_card_is_not_on_offer_behind_the_holder() -> None:
     p, _ = pool([], owned_configured=2, shared_free=["s"])
     assert plan.plan([req("wide", 2, borrows=True), req("small", borrows=True)], p) == [
@@ -327,6 +339,13 @@ STARTS: list[tuple[str, list[Request], list[Card], dict[str, object], dict[str, 
         [*owned(360, 360), *shared(0)],
         {},
         {"first": 0.0, "second": 360.0},
+    ),
+    (
+        "a job needing no cards starts now, whatever holds them",
+        [req("wide", 2), req("cpu", 0)],
+        owned(None, 30),
+        {},
+        {"cpu": 0.0},
     ),
     (
         "a borrowed card comes back at the borrower's estimate",

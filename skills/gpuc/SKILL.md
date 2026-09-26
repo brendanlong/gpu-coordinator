@@ -60,7 +60,7 @@ setup: uv sync --frozen            # phase "setup"; venv is cached across jobs o
 command: uv run --no-sync python -m experiments.lego.train --k-max 6 --device cuda
 # python: .venv/bin/python        # only for a repo that is not a uv project: how the
                                   # GPU check before `main` runs Python in the job's env
-gpus: 1                            # at least 1
+gpus: 1                            # 0 for a CPU-only job: never waits, sees no card
 use_shared: false                  # also use cards the host borrows rather than owns
 env:
   REQUIRE_CUDA: "1"
@@ -76,7 +76,7 @@ outputs:
 sync_interval_s: 180               # upload cadence while running, and at the end; minimum 10
 priority: 50                       # 0 first, 99 last. The queue is taken strictly in this
                                    # order: a job that does not fit HOLDS the free cards it is
-                                   # waiting for
+                                   # waiting for (a `gpus: 0` job needs none, so goes ahead)
 max_runtime_min: 720               # optional wall-clock cap
 estimated_runtime_min: 480         # optional; what `gpuc status` shows the next person
 progress_command: "tail -1 results/progress.txt"   # optional; last stdout line is a percentage
@@ -155,7 +155,7 @@ gpuc reorder <jobid> --priority 10          # queued jobs only; prints the new p
 gpuc preempt <jobid> --priority 60          # running jobs only: stop it and queue it again
                                  # under the same id. It RE-RUNS FROM THE START in the same
                                  # workdir. QUEUE THE OTHER JOB FIRST: this is refused (exit 1)
-                                 # unless something waiting would be dispatched ahead of the
+                                 # unless a job waiting for cards would be dispatched ahead of the
                                  # preempted job, and at the SAME priority the preempted job
                                  # wins the tie, so --priority is how you put it behind
 gpuc estimate <jobid> --minutes 150

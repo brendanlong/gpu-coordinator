@@ -17,7 +17,7 @@ commented example; `-` as the file name reads the spec from stdin.
 | `name` | `""` | a label for `status`; not an identifier |
 | `setup` | none | run first, as phase `setup` |
 | `python` | `uv run --no-sync python` | how the GPU check before `main` runs Python inside the job's environment; a repo that is not a uv project names its own (`.venv/bin/python`) |
-| `gpus` | `1` | GPUs to assign, at least 1; more than the host can ever provide is refused at submit |
+| `gpus` | `1` | GPUs to assign; more than the host can ever provide is refused at submit. `0` runs with none (below) |
 | `use_shared` | `false` | may also use the host's [shared GPUs](#shared-gpus); `gpuc submit --use-shared` sets it |
 | `env` | `{}` | plain environment, applied after the host's `--env` |
 | `secrets` | `[]` | names read from your shell at submit and delivered to the host as `~/.gpuc/secrets/<job-id>.env` (0600); one missing from your shell is refused |
@@ -80,6 +80,12 @@ queue **in order**: a job that cannot start yet holds the free cards it is
 waiting for, and nothing behind it may take them. Queue a big job at a
 **higher** number if you would rather it waited than have a card sit idle for
 it.
+
+What a waiting job holds is cards, so a job asking for **`gpus: 0`** is never
+held: it starts on the next pass whatever is queued ahead of it. It gets an
+empty `CUDA_VISIBLE_DEVICES`, skips the GPU check (so needs no torch), and is
+otherwise a job like any other: it keeps a rental from going idle, and
+`gpuc preempt` refuses it, since stopping it frees nothing.
 
 A job waiting for a [shared card](#shared-gpus) somebody else is using does not
 hold: the queue behind it runs. A job short of an *owned* card holds even when
@@ -565,7 +571,7 @@ Every `failed: <reason>`:
 | --- | --- |
 | `exit <N>` | `command` exited non-zero |
 | `setup` | the `setup` phase exited non-zero |
-| `gpu-assert` | an assigned GPU is not in the host's `nvidia-smi`, or no GPU was assigned |
+| `gpu-assert` | an assigned GPU is not in the host's `nvidia-smi`, or a job that asked for GPUs was assigned none |
 | `gpu-preflight` | a GPU op inside the job's environment failed, or `device_count()` did not match `gpus:` |
 | `sync-preflight` | a destination cannot be written: no `aws`/`hf`, a missing secret, an unwritable bucket or repo |
 | `timeout` | `max_runtime_min` elapsed |
@@ -573,7 +579,7 @@ Every `failed: <reason>`:
 | `terminated` | the runner itself was signalled |
 | `sync` | the final upload failed; a job already over for a reason of its own keeps that reason and lists `sync` in `problems` |
 | `no-outputs` | an `outputs:` path was never written, or holds only files that came with the checkout; listed in `problems` the same way. Never reported for a job whose `main` never started |
-| `bad-spec` | the queued spec could not be read, or asks for no GPU |
+| `bad-spec` | the queued spec could not be read |
 | `needs N GPUs, host owns M` | the host's ownership shrank after the job was queued; shared cards count only if the job asked for them |
 | `spawn-failed` | the dispatcher could not start a runner process |
 | `runner-died` | the runner vanished without writing final state; the dispatcher kills anything it left behind |

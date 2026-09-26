@@ -338,6 +338,25 @@ def test_a_job_queued_ahead_of_it_is_what_makes_a_preempt_worth_it(gpuc_home: Pa
     assert queue.preempt(job_id) == "preempting"
 
 
+def test_a_job_needing_no_gpu_does_not_count_as_something_waiting(gpuc_home: Path) -> None:
+    """It is dispatched whatever is running, so the cards freed are nothing to it."""
+    job_id = running_job(priority=50)
+    queue.enqueue(make_spec(gpus=0, priority=10))
+    with pytest.raises(ValueError, match="nothing else is queued on this host for a GPU"):
+        queue.preempt(job_id)
+    later = queue.enqueue(make_spec(priority=20))
+    assert queue.queued_ahead_of(job_id, 50) == queue.QueueEntry(20, later)
+
+
+def test_preempt_refuses_a_job_holding_no_gpu(gpuc_home: Path) -> None:
+    waiting_job()
+    job_id = queue.enqueue(make_spec(gpus=0))
+    jobs.update_state(job_id, status="running", gpus=[], started_at=jobs.utc_now())
+    with pytest.raises(ValueError, match="holds no GPUs"):
+        queue.preempt(job_id)
+    assert not queue.is_preempted(job_id)
+
+
 def test_a_cancelled_job_does_not_count_as_something_waiting(gpuc_home: Path) -> None:
     job_id = running_job(priority=50)
     doomed = queue.enqueue(make_spec(priority=10))

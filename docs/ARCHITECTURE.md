@@ -277,8 +277,8 @@ The rules it holds to:
   then the runner, then the runner's group. A runner in phase `sync` gets
   `SYNC_STOP_PATIENCE_S` first. A queued job is cancelled on the spot, with no
   intent. A cancel overrides a preempt.
-- **Preempt** (`queue.preempt`) is for a running job, and only when something
-  else could run instead. The runner's last write is a fresh `queued` state at
+- **Preempt** (`queue.preempt`) is for a running job that holds cards, and
+  only when a queued job that wants cards would be dispatched ahead of it. The runner's last write is a fresh `queued` state at
   `attempt+1` (`queue.next_attempt`), keeping the live priority and estimate,
   the workdir, the secrets file and the outputs baseline; nothing sees the job
   finished in between. An attempt that ended on its own first, or was
@@ -309,10 +309,11 @@ The order is the contract; each step is in `runner.py`.
    id and start time. A claim that fails is a job that is no longer ours; the
    runner exits 0 and writes nothing.
 1. Verify the assignment (UUIDs) against `nvidia-smi --query-gpu=index,uuid`;
-   fail `gpu-assert` if it is empty or names a card that is not here. Export
-   `CUDA_VISIBLE_DEVICES` as the cards' nvidia-smi **indices** with
-   `CUDA_DEVICE_ORDER=PCI_BUS_ID`, as UUIDs only if the index table could not
-   be read. Then the secrets file and the spec `env`; the host's `env` and PATH
+   fail `gpu-assert` if it names a card that is not here, or is empty for a
+   job that asked for cards. Export `CUDA_VISIBLE_DEVICES` as the cards'
+   nvidia-smi **indices** with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, as UUIDs only if
+   the index table could not be read, and empty -- never unset -- for a job
+   with no cards. Then the secrets file and the spec `env`; the host's `env` and PATH
    are the runner's own, from the dispatcher.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json`,
    **before `setup`** and once per job (a later attempt keeps the first
@@ -323,6 +324,7 @@ The order is the contract; each step is in `runner.py`.
 3. `phase=preflight`: the GPU check inside the job's environment, the spec's
    `python` over a probe (`is_available()`, a tensor add and `.item()`,
    `device_count()` equal to `gpus`). Failure -> `failed: gpu-preflight`.
+   Skipped for a job with no cards, which then needs no torch.
 3b. Sync preflight, still before `main`: every `Destination` the job will
    upload to, the host's `jobs/<id>/` mirror included, proves a `.preflight`
    write works with the job's own environment. Failure ->

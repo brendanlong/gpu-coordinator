@@ -179,20 +179,40 @@ def test_a_wide_job_is_not_starved_by_a_stream_of_narrow_ones(gpuc_home: Path) -
     assert jobs.read_state(wide).gpus == FAKE_GPUS
 
 
-def test_a_job_asking_for_no_gpus_fails_at_dispatch(gpuc_home: Path) -> None:
-    """`gpuc submit` refuses `gpus: 0`, so a spec that has it was written by
-    hand. The reader refuses it too, which makes it `bad-spec` like any other
-    spec that cannot be read -- and it holds nothing up on its way out."""
-    none = queue.enqueue(make_spec(gpus=1, priority=10))
-    document = json.loads(paths.spec_file(none).read_text())
-    document["gpus"] = 0
-    paths.spec_file(none).write_text(json.dumps(document))
+def test_a_job_asking_for_no_gpus_goes_ahead_of_a_job_holding_every_card(
+    gpuc_home: Path,
+) -> None:
+    """Strict order holds cards, not the queue: the wide job ahead is waiting
+    for cards, and the job behind it wants none of them."""
+    busy = queue.enqueue(make_spec(gpus=1, priority=10))
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.run_once()
+    wide = queue.enqueue(make_spec(gpus=len(FAKE_GPUS), priority=20))
+    narrow = queue.enqueue(make_spec(gpus=1, priority=30))
+    cpu = queue.enqueue(make_spec(gpus=0, priority=40))
+    dispatcher.run_once()
+    assert jobs.read_state(busy).status == "running"
+    assert jobs.read_state(wide).status == "queued"
+    assert jobs.read_state(narrow).status == "queued"
+    state = jobs.read_state(cpu)
+    assert (state.status, state.gpus) == ("running", [])
+    assert spawned[cpu].gpus == []
+
+
+def test_a_job_asking_for_a_negative_gpu_count_fails_at_dispatch(gpuc_home: Path) -> None:
+    """`gpuc submit` refuses it, so a spec that has it was written by hand.
+    The reader refuses it too, which makes it `bad-spec` like any other spec
+    that cannot be read -- and it holds nothing up on its way out."""
+    bad = queue.enqueue(make_spec(gpus=1, priority=10))
+    document = json.loads(paths.spec_file(bad).read_text())
+    document["gpus"] = -1
+    paths.spec_file(bad).write_text(json.dumps(document))
     runnable = queue.enqueue(make_spec(gpus=1, priority=20))
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
-    state = jobs.read_state(none)
+    state = jobs.read_state(bad)
     assert (state.status, state.reason, state.exit_code) == ("failed", "bad-spec", 1)
-    assert none not in spawned
+    assert bad not in spawned
     assert jobs.read_state(runnable).status == "running"
 
 

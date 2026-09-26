@@ -346,16 +346,15 @@ class JobSpec:
     @staticmethod
     def from_dict(d: Any) -> JobSpec:
         """Unknown keys are ignored and a null means the default -- except for
-        `command` and `gpus`, which have no default that could be right: a
-        spec with nothing to run, or nothing to run it on, is a mistake to
-        report, not one to paper over."""
+        `command`, which has no default that could be right: a spec with
+        nothing to run is a mistake to report, not one to paper over."""
         fields = fields_of(d)
         command = as_str(fields, "command")
         if not command:
             raise ValueError("a job spec needs a `command`")
         gpus = as_int(fields, "gpus", 1)
-        if gpus < 1:
-            raise ValueError(f"a job spec needs at least one GPU, got `gpus: {gpus}`")
+        if gpus < 0:
+            raise ValueError(f"a job spec cannot ask for fewer than no GPUs, got `gpus: {gpus}`")
         outputs = fields.get("outputs")
         return JobSpec(
             job_id=as_str(fields, "job_id") or new_job_id(),
