@@ -21,8 +21,8 @@ from types import SimpleNamespace
 import pytest
 
 from snakemake_executor_plugin_gpuc import GpucError, job_name, truthy
-from tests.conftest import install_fake_torch
-from tests.test_control_e2e import bootstrapped_home, state_of, wait_until
+from tests.conftest import install_fake_torch, wait_until
+from tests.test_control_e2e import bootstrapped_home, state_of
 
 __all__ = ["bootstrapped_home"]
 

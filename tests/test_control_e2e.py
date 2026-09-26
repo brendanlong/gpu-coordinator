@@ -15,7 +15,7 @@ import json
 import os
 import subprocess
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -24,18 +24,15 @@ from gpuc.control.cli import main
 from gpuc.control.s3index import LocalIndex
 from gpuc.host import scope
 from gpuc.host.dispatcher import LockBody
-from tests.conftest import FAKE_GPUS, install_fake_nvidia_smi, install_fake_torch, load_registry
+from tests.conftest import (
+    FAKE_GPUS,
+    install_fake_nvidia_smi,
+    install_fake_torch,
+    load_registry,
+    wait_until,
+)
 
 HEALTH_ARGS = "--min-mbps 0.05 --min-free-gb 1"
-
-
-def wait_until(predicate: Callable[[], bool], timeout: float, what: str) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return
-        time.sleep(0.2)
-    raise AssertionError(f"timed out after {timeout}s waiting for {what}")
 
 
 def state_of(home: Path, job_id: str) -> dict[str, object]:
@@ -316,7 +313,7 @@ def test_a_kept_output_outlives_the_sweep_and_status_and_fetch_find_it(
 def test_wait_blocks_on_a_real_job_and_exits_with_its_outcome(
     bootstrapped_home: Path, workdir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`gpuc wait` is the `wait_until` loop above, made a command.
+    """`gpuc wait` is the `wait_until` loop these tests use, made a command.
 
     Against the real dispatcher, because what it has to read correctly is the
     state file another process writes as the job ends.

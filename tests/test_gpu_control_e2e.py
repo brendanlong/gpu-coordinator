@@ -15,7 +15,7 @@ import pytest
 
 from gpuc.control.cli import main
 from gpuc.host import gpus
-from tests.conftest import LOCAL_GPU_UUID, requires_gpu
+from tests.conftest import LOCAL_GPU_UUID, requires_gpu, wait_until
 from tests.test_control_e2e import (
     HEALTH_ARGS,
     SHARED_UV_CACHE,
@@ -25,7 +25,6 @@ from tests.test_control_e2e import (
     state_of,
     submit,
     wait_for_main_phase,
-    wait_until,
 )
 
 pytestmark = [pytest.mark.gpu, requires_gpu]

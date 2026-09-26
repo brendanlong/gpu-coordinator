@@ -11,7 +11,6 @@ import http.client
 import io
 import json
 import sys
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlencode, urlsplit
@@ -34,7 +33,7 @@ from gpuc.control.web.auth import (
     verify,
 )
 from gpuc.host.jobs import HostConfig
-from tests.conftest import host_entry, register_host
+from tests.conftest import ago, host_entry, register_host
 
 PASSWORD = "correct horse battery"
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -128,10 +127,6 @@ def logged_in(client: Client) -> Client:
     return client
 
 
-def minutes_ago(minutes: float) -> str:
-    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
-
-
 def fake_host_view(entry: HostEntry, *a: object, **k: object) -> HostView:
     view = HostView(
         entry=entry, state=HostState.ANSWERED, cards=[CardView(GPU)], heartbeat_age_s=2.0
@@ -153,7 +148,7 @@ def fake_host_view(entry: HostEntry, *a: object, **k: object) -> HostView:
                     "status": "running",
                     "phase": "main",
                     "gpus": [GPU],
-                    "started_at": minutes_ago(30),
+                    "started_at": ago(minutes=30),
                     "util_recent": [90.0],
                     "outputs": [{"path": "results", "s3": f"s3://bucket/lego/{RUNNING_JOB}"}],
                     "wandb": {"entity": "me", "project": "lego", "run_id": "r1"},
@@ -163,7 +158,7 @@ def fake_host_view(entry: HostEntry, *a: object, **k: object) -> HostView:
                     "name": "probe",
                     "status": "failed",
                     "reason": "timeout",
-                    "ended_at": minutes_ago(60),
+                    "ended_at": ago(minutes=60),
                 },
             ],
         }

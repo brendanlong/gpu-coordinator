@@ -9,7 +9,6 @@ the mirror's answer -- or, with no mirror, says the job is lost.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,17 +19,13 @@ from gpuc.control.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
 from gpuc.control.config import config_file, registry_transaction
 from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
-from tests.conftest import host_entry, load_registry
+from tests.conftest import ago, host_entry, load_registry
 from tests.fakeprovider import FakeProvider
-from tests.fakes3 import FakeS3Client
+from tests.fakes3 import fake_s3
 
 JOB = "20260915-120000-abc123"
 POD = "gpuc-pod"
 PREFIX = f"s3://bucket/gpuc/{POD}"
-
-
-def ago(**delta: float) -> str:
-    return (datetime.now(UTC) - timedelta(**delta)).isoformat()
 
 
 def mirror(
@@ -52,8 +47,7 @@ def mirror(
             for job_id, text in (logs or {}).items()
         }
     )
-    client = FakeS3Client(objects=objects)
-    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    fake_s3(monkeypatch, objects=objects)
     config_file().write_text('s3_bucket = "bucket"\n')
     for job_id in jobs:
         LocalIndex().record(

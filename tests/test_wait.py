@@ -43,6 +43,7 @@ from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
 from tests.conftest import accept_job, host_entry
 from tests.fakeprovider import FakeProvider
+from tests.fakes3 import fake_s3
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
 JOB = "20260915-120000-abc123"
@@ -311,6 +312,17 @@ def test_an_interrupt_before_the_first_poll_is_reported_too(
     assert JOB in document["error"]
 
 
+def mirror(monkeypatch: pytest.MonkeyPatch, host: str, **state: Any) -> str:
+    """An S3 mirror holding JOB's state.json, succeeded unless `state` says
+    otherwise, under `host`'s prefix; returns that prefix."""
+    prefix = f"s3://bucket/gpuc/{host}"
+    document = {"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0, **state}
+    key = f"bucket/gpuc/{host}/jobs/{JOB}/state.json"
+    fake_s3(monkeypatch, objects={key: json.dumps(document).encode()})
+    config_file().write_text('s3_bucket = "bucket"\n')
+    return prefix
+
+
 def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
     host_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -320,17 +332,8 @@ def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
     about the one thing the user was waiting for, and the mirror is where the
     spec says to look once a host is gone.
     """
-    from tests.fakes3 import FakeS3Client
-
     put_job(host_home)
-    prefix = "s3://bucket/gpuc/local"
-    key = f"bucket/gpuc/local/jobs/{JOB}/state.json"
-    state = json.dumps({"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0})
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client",
-        property(lambda self: FakeS3Client(objects={key: state.encode()})),
-    )
-    config_file().write_text('s3_bucket = "bucket"\n')
+    prefix = mirror(monkeypatch, "local")
     # The index `gpuc submit` writes here: the mirrored state.json has no name
     # (that lives in the spec), so this is where the line's label comes from.
     LocalIndex().record(IndexEntry(job_id=JOB, host="local", name="lego-s4", s3_prefix=prefix))
@@ -361,16 +364,7 @@ def test_wait_reads_a_terminated_rental_from_the_mirror_without_waiting_out_the_
     """A pod the provider says has ended will never answer again, so the
     five-minute grace for an ssh blip would only be five minutes of nothing:
     the mirror is read on the first poll that fails."""
-    from tests.fakes3 import FakeS3Client
-
-    prefix = "s3://bucket/gpuc/gpuc-pod"
-    key = f"bucket/gpuc/gpuc-pod/jobs/{JOB}/state.json"
-    state = json.dumps({"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0})
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client",
-        property(lambda self: FakeS3Client(objects={key: state.encode()})),
-    )
-    config_file().write_text('s3_bucket = "bucket"\n')
+    prefix = mirror(monkeypatch, "gpuc-pod")
     with registry_transaction() as registry:
         registry.put(
             host_entry(
@@ -407,18 +401,8 @@ def test_the_mirror_still_shouts_when_a_dead_host_lost_the_outputs(
     `outputs_pending` is the host's own check against the spec and is not in
     the mirrored state, so a mirrored `outputs_lost` has to stand on its own.
     """
-    from tests.fakes3 import FakeS3Client
-
     put_job(host_home)
-    key = f"bucket/gpuc/local/jobs/{JOB}/state.json"
-    state = json.dumps(
-        {"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0, "outputs_lost": True}
-    )
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client",
-        property(lambda self: FakeS3Client(objects={key: state.encode()})),
-    )
-    config_file().write_text('s3_bucket = "bucket"\n')
+    prefix = mirror(monkeypatch, "local", outputs_lost=True)
     with registry_transaction() as registry:
         registry.put(
             host_entry(
@@ -427,7 +411,7 @@ def test_the_mirror_still_shouts_when_a_dead_host_lost_the_outputs(
                 gpus=[GPU],
                 gpuc_home=str(host_home),
                 python="/no/such",
-                s3_prefix="s3://bucket/gpuc/local",
+                s3_prefix=prefix,
             )
         )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
@@ -513,16 +497,7 @@ def test_wait_reads_the_mirror_at_once_for_a_host_this_machine_has_forgotten(
     """The ordinary end of a rental: the pod idled out, `status` forgot the
     entry, and the index still names it. Nothing can be asked, so the mirror
     is the answer -- not exit 4, and not five minutes of asking nobody."""
-    from tests.fakes3 import FakeS3Client
-
-    prefix = "s3://bucket/gpuc/gpuc-pod"
-    key = f"bucket/gpuc/gpuc-pod/jobs/{JOB}/state.json"
-    state = json.dumps({"status": "succeeded", "ended_at": jobs.utc_now(), "exit_code": 0})
-    monkeypatch.setattr(
-        "gpuc.control.s3index.S3Index.client",
-        property(lambda self: FakeS3Client(objects={key: state.encode()})),
-    )
-    config_file().write_text('s3_bucket = "bucket"\n')
+    prefix = mirror(monkeypatch, "gpuc-pod")
     LocalIndex().record(IndexEntry(job_id=JOB, host="gpuc-pod", name="lego-s4", s3_prefix=prefix))
     sleeps = [0]
     monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: sleeps.__setitem__(0, sleeps[0] + 1))

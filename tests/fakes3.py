@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 
 class _Body:
     def __init__(self, data: bytes) -> None:
@@ -26,12 +28,6 @@ class FakeS3Client:
             raise RuntimeError("AccessDenied")
         self.objects[f"{Bucket}/{Key}"] = Body
         return {}
-
-    def head_object(self, *, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:
-        try:
-            return {"ContentLength": len(self.objects[f"{Bucket}/{Key}"])}
-        except KeyError as exc:
-            raise RuntimeError("404") from exc
 
     def get_object(self, *, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:
         try:
@@ -62,3 +58,10 @@ class FakeS3Client:
             response["IsTruncated"] = True
             response["NextContinuationToken"] = rest[0]
         return response
+
+
+def fake_s3(monkeypatch: pytest.MonkeyPatch, **kw: Any) -> FakeS3Client:
+    """A `FakeS3Client(**kw)` that every `S3Index` gets as its client."""
+    client = FakeS3Client(**kw)
+    monkeypatch.setattr("gpuc.control.s3index.S3Index.client", property(lambda self: client))
+    return client

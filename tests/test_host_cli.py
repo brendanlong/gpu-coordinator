@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import json
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +10,7 @@ import pytest
 from gpuc.host import __main__ as cli
 from gpuc.host import dispatcher, jobs, paths, queue
 from gpuc.host.jobs import HostConfig
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import FAKE_GPUS, ago, fake_smi, make_spec
 
 
 def run(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, object]:
@@ -95,7 +94,7 @@ def test_status_of_several_jobs_is_exactly_those_that_are_here(
 
 
 def _finish(job_id: str, hours_ago: float, *, workdir: bool = False) -> None:
-    ended = (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat()
+    ended = ago(hours=hours_ago)
     jobs.update_state(job_id, status="succeeded", ended_at=ended)
     if not workdir:
         paths.workdir(job_id).rmdir()
@@ -306,7 +305,7 @@ def test_set_max_runtime_raises_a_running_jobs_limit_and_status_reports_it(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec(max_runtime_min=420.0, estimated_runtime_min=500.0))
-    started = (datetime.now(UTC) - timedelta(minutes=97)).isoformat()
+    started = ago(minutes=97)
     jobs.update_state(job_id, status="running", started_at=started)
     code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=600")
     assert code == 0 and payload["status"] == "running" and payload["warning"] is None
@@ -323,7 +322,7 @@ def test_set_max_runtime_refuses_a_limit_the_running_job_has_already_outlived(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
-    started = (datetime.now(UTC) - timedelta(minutes=97)).isoformat()
+    started = ago(minutes=97)
     jobs.update_state(job_id, status="running", started_at=started)
     code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=90")
     assert code == 1 and "would end it at once" in payload["error"]
@@ -613,13 +612,9 @@ def use_smi(
             monkeypatch.setattr(value, "__defaults__", patched)
 
 
-def in_minutes(minutes: float) -> str:
-    return (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()
-
-
 def start_running(gpus: list[str], eta_minutes: float | None, **spec: object) -> str:
     job_id = queue.enqueue(make_spec(**spec))
-    eta = None if eta_minutes is None else in_minutes(eta_minutes)
+    eta = None if eta_minutes is None else ago(minutes=-eta_minutes)
     jobs.update_state(job_id, status="running", gpus=gpus, phase="main", eta=eta)
     return job_id
 

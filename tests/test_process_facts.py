@@ -11,6 +11,7 @@ import pytest
 from gpuc.host import procs as procinfo
 from gpuc.host.jobs import JobState
 from gpuc.host.procs import JobProcesses
+from tests.conftest import wait_until
 
 # comm is parenthesised and unsanitised, so a process can name itself anything.
 NASTY_STAT = "4242 (evil ) (name) S " + " ".join(str(n) for n in range(1, 19)) + " 987654 20 21"
@@ -144,22 +145,13 @@ def test_escalate_with_no_job_group_still_reaches_the_runner(
     assert signals == [("pid", RUNNER, signal.SIGTERM), ("group", RUNNER, signal.SIGKILL)]
 
 
-def _wait_until(predicate, timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.02)
-    raise AssertionError("timed out")
-
-
 def test_stop_escalates_to_sigkill_after_the_grace_period(tmp_path: Path) -> None:
     ready = tmp_path / "ready"
     proc = subprocess.Popen(
         ["bash", "-c", f"trap '' TERM; touch {ready}; sleep 60"], start_new_session=True
     )
     try:
-        _wait_until(ready.exists)
+        wait_until(ready.exists)
         start = time.monotonic()
         JobProcesses(job_pgid=proc.pid).stop("test", grace_s=1.0, reap=proc.poll)
         assert proc.wait(timeout=10) == -9

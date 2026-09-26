@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -25,14 +25,10 @@ from gpuc.control.status import (
 )
 from gpuc.control.transport import TransportError
 from gpuc.host.jobs import HostConfig
-from tests.conftest import host_entry
+from tests.conftest import ago, host_entry
 from tests.fakeprovider import FakeProvider
 
 GPU = "GPU-a"
-
-
-def minutes_ago(minutes: float) -> str:
-    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
 
 
 def payload(**overrides: Any) -> dict[str, Any]:
@@ -57,7 +53,7 @@ def payload(**overrides: Any) -> dict[str, Any]:
                 "status": "running",
                 "phase": "main",
                 "gpus": [GPU],
-                "started_at": minutes_ago(30),
+                "started_at": ago(minutes=30),
                 "util_recent": [90.0] * 20,
                 "attempt": 2,
             },
@@ -67,7 +63,7 @@ def payload(**overrides: Any) -> dict[str, Any]:
                 "status": "failed",
                 "reason": "exit 17",
                 "exit_code": 17,
-                "ended_at": minutes_ago(60),
+                "ended_at": ago(minutes=60),
             },
         ],
     }
@@ -295,7 +291,7 @@ def with_workdir_bytes(*sizes: int) -> HostView:
         {
             "job_id": f"j-done-{i}",
             "status": "succeeded",
-            "ended_at": minutes_ago(60 + i),
+            "ended_at": ago(minutes=60 + i),
             "workdir_bytes": size,
         }
         for i, size in enumerate(sizes)
@@ -317,7 +313,7 @@ def test_a_small_leftover_is_not_worth_a_line() -> None:
 def test_a_finished_job_the_host_said_nothing_about_holds_no_disk() -> None:
     """The host answers for every finished job, so a null is not a hidden pile:
     it is a build too old to answer, which the build warning covers."""
-    quiet = view(jobs=[{"job_id": "j-unsized", "status": "succeeded", "ended_at": minutes_ago(60)}])
+    quiet = view(jobs=[{"job_id": "j-unsized", "status": "succeeded", "ended_at": ago(minutes=60)}])
     assert quiet.leftover_bytes == 0
     assert "gpuc clean" not in render(quiet)
 
@@ -330,7 +326,7 @@ def test_a_running_job_never_counts_towards_leftover_disk() -> None:
                 "status": "running",
                 "phase": "main",
                 "gpus": [GPU],
-                "started_at": minutes_ago(5),
+                "started_at": ago(minutes=5),
                 "workdir_bytes": 40 * GIB,
             }
         ]
@@ -347,7 +343,7 @@ def test_finished_jobs_with_unconfirmed_outputs_are_flagged() -> None:
             "name": "bulky",
             "status": "failed",
             "reason": "sync",
-            "ended_at": minutes_ago(5),
+            "ended_at": ago(minutes=5),
             "outputs_pending": True,
         }
     )
@@ -367,7 +363,7 @@ def test_a_lost_output_says_so_louder() -> None:
             "job_id": "j-lost",
             "name": "bulky",
             "status": "succeeded",
-            "ended_at": minutes_ago(5),
+            "ended_at": ago(minutes=5),
             "outputs_pending": True,
             "outputs_lost": True,
         }
@@ -383,7 +379,7 @@ def test_a_running_job_whose_upload_is_failing_says_so_on_its_line() -> None:
     document = payload()
     running = next(j for j in document["jobs"] if j["job_id"] == "j-running")
     running["uploads"] = [
-        {"to": "s3://bucket/j-running", "output": "results", "ok_at": minutes_ago(10)},
+        {"to": "s3://bucket/j-running", "output": "results", "ok_at": ago(minutes=10)},
         {
             "to": "hf://me/repo",
             "output": "results",
@@ -413,7 +409,7 @@ def test_a_finished_job_lists_its_problems_after_its_reason() -> None:
             "reason": "preempted",
             "problems": ["sync"],
             "exit_code": 1,
-            "ended_at": minutes_ago(5),
+            "ended_at": ago(minutes=5),
         }
     )
     text = render(view(jobs=document["jobs"]))
@@ -433,14 +429,14 @@ def test_a_finished_job_reports_its_mean_utilization() -> None:
             "util_recent": [90.0],
             "util_sum": 15400.0,
             "util_samples": 700,
-            "ended_at": minutes_ago(120),
+            "ended_at": ago(minutes=120),
         },
         {
             "job_id": "j-cpu",
             "name": "cpu",
             "status": "succeeded",
             "gpus": [],
-            "ended_at": minutes_ago(60),
+            "ended_at": ago(minutes=60),
         },
     ]
     host_view = view(jobs=document["jobs"])
@@ -519,10 +515,6 @@ def test_each_owned_card_shows_what_nvidia_smi_just_read_on_it() -> None:
     assert (cards[1]["memory_mib"], cards[1]["utilization_pct"]) == (None, None)
 
 
-def in_minutes(minutes: float) -> str:
-    return (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()
-
-
 def running_job(**overrides: Any) -> JobView:
     document: dict[str, Any] = {
         "job_id": "j-running",
@@ -530,7 +522,7 @@ def running_job(**overrides: Any) -> JobView:
         "status": "running",
         "phase": "main",
         "gpus": [GPU, "GPU-b"],
-        "started_at": minutes_ago(30),
+        "started_at": ago(minutes=30),
     }
     document.update(overrides)
     return JobView(**document)
@@ -550,17 +542,17 @@ def busy(*jobs: JobView, queued: list[JobView] | None = None) -> HostView:
 
 
 def test_a_measured_eta_is_labelled_with_the_percentage_it_came_from() -> None:
-    text = render(busy(running_job(eta=in_minutes(130), progress_pct=42.0)))
+    text = render(busy(running_job(eta=ago(minutes=-130), progress_pct=42.0)))
     assert "eta 2h10m (42%)" in text
 
 
 def test_an_eta_with_no_measurement_behind_it_says_so() -> None:
-    text = render(busy(running_job(eta=in_minutes(45), estimated_runtime_min=90.0)))
+    text = render(busy(running_job(eta=ago(minutes=-45), estimated_runtime_min=90.0)))
     assert "eta 45m (est)" in text
 
 
 def test_a_job_past_its_own_eta_is_overdue_not_negative() -> None:
-    text = render(busy(running_job(eta=minutes_ago(20), progress_pct=80.0)))
+    text = render(busy(running_job(eta=ago(minutes=20), progress_pct=80.0)))
     assert "eta overdue (80%)" in text
 
 
@@ -572,7 +564,7 @@ def test_a_job_with_no_estimate_at_all_gets_no_eta_column() -> None:
 def test_zero_percent_is_labelled_as_the_guess_it_still_is() -> None:
     """The runner does not replace the eta at 0%, so the eta on show is the
     submitter's estimate; tagging it `(0%)` would claim evidence."""
-    text = render(busy(running_job(eta=in_minutes(90), progress_pct=0.0)))
+    text = render(busy(running_job(eta=ago(minutes=-90), progress_pct=0.0)))
     assert "eta 1h30m (est)" in text
 
 
@@ -617,8 +609,8 @@ def test_a_queued_job_shows_the_submitters_estimate() -> None:
 def test_a_fully_busy_host_says_when_the_next_card_frees_up() -> None:
     text = render(
         busy(
-            running_job(job_id="j-long", gpus=[GPU], eta=in_minutes(200), progress_pct=30.0),
-            running_job(job_id="j-short", gpus=["GPU-b"], eta=in_minutes(20), progress_pct=90.0),
+            running_job(job_id="j-long", gpus=[GPU], eta=ago(minutes=-200), progress_pct=30.0),
+            running_job(job_id="j-short", gpus=["GPU-b"], eta=ago(minutes=-20), progress_pct=90.0),
         )
     )
     assert "free    next card in ~20m (j-short)" in text
@@ -627,7 +619,7 @@ def test_a_fully_busy_host_says_when_the_next_card_frees_up() -> None:
 def test_the_next_free_line_owns_up_to_the_jobs_it_could_not_estimate() -> None:
     text = render(
         busy(
-            running_job(job_id="j-known", gpus=[GPU], eta=in_minutes(200)),
+            running_job(job_id="j-known", gpus=[GPU], eta=ago(minutes=-200)),
             running_job(job_id="j-silent", gpus=["GPU-b"]),
         )
     )
@@ -640,12 +632,12 @@ def test_a_busy_host_where_nothing_estimated_anything_stays_quiet() -> None:
 
 
 def test_a_host_with_a_free_card_does_not_guess_about_the_next_one() -> None:
-    text = render(busy(running_job(gpus=[GPU], eta=in_minutes(200))))
+    text = render(busy(running_job(gpus=[GPU], eta=ago(minutes=-200))))
     assert "free    " not in text
 
 
 def test_the_json_carries_the_estimate_and_what_it_was_based_on() -> None:
-    host_view = busy(running_job(eta=in_minutes(60), progress_pct=50.0))
+    host_view = busy(running_job(eta=ago(minutes=-60), progress_pct=50.0))
     job = host_json(host_view)["running"][0]
     assert job["progress_pct"] == 50.0
     assert 3400 < job["eta_s"] < 3700
@@ -660,7 +652,7 @@ def test_job_views_read_the_estimate_fields_off_the_hosts_payload() -> None:
                     "status": "running",
                     "phase": "main",
                     "progress_pct": 12.5,
-                    "eta": in_minutes(10),
+                    "eta": ago(minutes=-10),
                     "estimated_runtime_min": 60,
                 }
             ]
@@ -851,8 +843,8 @@ def test_a_queued_job_the_host_says_starts_now_renders_that() -> None:
 
 def test_a_queued_job_the_host_dates_renders_when() -> None:
     view = busy(
-        running_job(gpus=[GPU], eta=in_minutes(20)),
-        running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(130)),
+        running_job(gpus=[GPU], eta=ago(minutes=-20)),
+        running_job(job_id="j-other", gpus=["GPU-b"], eta=ago(minutes=-130)),
         queued=[
             waiting("j-next", estimated_runtime_min=60.0, starts_in_s=20 * 60.0),
             waiting("j-after", estimated_runtime_min=60.0, starts_in_s=130 * 60.0 + 30),
@@ -866,8 +858,8 @@ def test_a_queued_job_the_host_dates_renders_when() -> None:
 def test_a_queued_job_with_no_start_renders_no_start() -> None:
     """Absent is absent: the text never makes one up, whatever the reason."""
     view = busy(
-        running_job(gpus=[GPU], eta=in_minutes(45)),
-        running_job(job_id="j-other", gpus=["GPU-b"], eta=in_minutes(90)),
+        running_job(gpus=[GPU], eta=ago(minutes=-45)),
+        running_job(job_id="j-other", gpus=["GPU-b"], eta=ago(minutes=-90)),
         queued=[
             waiting("j-wide", gpus_requested=2, starts_in_s=90 * 60.0),
             waiting(
@@ -887,7 +879,7 @@ def test_a_queued_job_with_no_start_renders_no_start() -> None:
 
 def test_a_missing_owned_card_is_called_out() -> None:
     view = busy(
-        running_job(gpus=[GPU], eta=in_minutes(45)),
+        running_job(gpus=[GPU], eta=ago(minutes=-45)),
         queued=[
             waiting(
                 "j-wide",
@@ -925,7 +917,7 @@ def test_the_json_carries_the_queue_order_and_when_each_job_starts() -> None:
     the only thing that says whether your job runs next."""
     reason = "the jobs holding the cards it needs gave no end time"
     view = busy(
-        running_job(gpus=[GPU], eta=in_minutes(20)),
+        running_job(gpus=[GPU], eta=ago(minutes=-20)),
         queued=[
             waiting("j-next", priority=10, gpus_requested=2, starts_in_s=20 * 60.0),
             waiting("j-later", priority=90, estimated_runtime_min=10.0, starts_unknown=reason),
@@ -953,7 +945,7 @@ def test_the_json_carries_the_queue_order_and_when_each_job_starts() -> None:
 
 def test_the_placement_of_a_job_in_its_hosts_queue() -> None:
     view = busy(
-        running_job(gpus=[GPU], eta=in_minutes(20)),
+        running_job(gpus=[GPU], eta=ago(minutes=-20)),
         queued=[waiting("j-first", starts_in_s=0.0), waiting("j-second", starts_in_s=20 * 60.0)],
     )
     placement = queue_placement(view, "j-second")
@@ -1056,7 +1048,7 @@ def test_a_shared_card_one_of_our_own_jobs_holds_reads_busy_with_its_reading() -
                 "status": "running",
                 "phase": "main",
                 "gpus": [SHARED],
-                "started_at": minutes_ago(5),
+                "started_at": ago(minutes=5),
             }
         ],
         cards=[shared_card(memory_mib=8192.0, utilization_pct=90.0, unused=False)],

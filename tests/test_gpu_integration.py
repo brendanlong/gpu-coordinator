@@ -8,15 +8,13 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
-import time
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from gpuc.host import dispatcher, gpus, jobs, paths, queue
 from gpuc.host.jobs import HostConfig, JobSpec
-from tests.conftest import LOCAL_GPU_UUID, requires_gpu
+from tests.conftest import LOCAL_GPU_UUID, requires_gpu, wait_until
 
 pytestmark = [pytest.mark.gpu, requires_gpu]
 
@@ -37,15 +35,6 @@ def gpu_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     paths.ensure_layout()
     jobs.write_config(HostConfig(host="local-gpu-test", gpus=[LOCAL_GPU_UUID]))
     return home
-
-
-def wait_until(predicate: Callable[[], bool], timeout: float, what: str) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return
-        time.sleep(0.2)
-    raise AssertionError(f"timed out after {timeout}s waiting for {what}")
 
 
 def finished(job_id: str) -> bool:
