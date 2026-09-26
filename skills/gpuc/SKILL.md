@@ -356,8 +356,11 @@ Rules, and they are not optional:
 - `gpuc host clean <host> --uv-cache --hf-cache` prunes the host's caches
   without losing anything a job would need again. `--data <name>` deletes
   from its data directory, which nothing else ever does.
-- A host that restarted with its `$HOME` wiped (`dispatcher DOWN`, or ssh
-  failing outright) has a runbook in `docs/setup.md`.
+- After a host restarts with its `$HOME` wiped (`dispatcher DOWN`, or ssh
+  failing outright): re-copy the SSH key if needed, then `gpuc host bootstrap
+  <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` whatever
+  was in flight. A host with a `--persistent-root` keeps its queue, so only
+  jobs that were running need resubmitting.
 
 Full reference in the repo: `README.md`, `docs/setup.md` (install, hosts,
 credentials), `docs/usage.md` (every command and failure mode),

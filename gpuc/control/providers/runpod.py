@@ -165,8 +165,13 @@ class RunPodProvider(Provider):
         constraints: Constraints,
     ) -> list[Offer]:
         tier = cloud.lower()
+        wanted = {name.casefold() for name in constraints.gpu_names}
         offers: list[Offer] = []
         for gpu in gpus:
+            # Before parsing, so a malformed row for a GPU nobody asked for
+            # cannot fail the search.
+            if wanted and not wanted & {gpu["id"].casefold(), gpu["name"].casefold()}:
+                continue
             if gpu.get("availability", "NONE") == "NONE":
                 continue
             price = gpu["price"].get(tier)
