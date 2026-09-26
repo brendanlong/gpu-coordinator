@@ -133,6 +133,7 @@ jobs/<jobid>/
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
                      #  "runner_starttime": str|null,          # the runner, from its own claim
                      #  "util_recent": [float|null, ...],
+                     #  "util_sum": float, "util_samples": int,
                      #  "progress_pct": float|null, "progress_error": str|null, "eta": str|null,
                      #  "uploads": [{"to": uri, "output": path|null, "ok_at": str|null, "error": str|null}],
                      #                              # one record per destination, `output` null for
@@ -148,7 +149,9 @@ jobs/<jobid>/
                      #  "checkout_removed_at": str|null}  # the checkout went from a workdir/
                      #                              # that still holds kept outputs
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
-                     # failed and must not be read as 0%. eta is null unless the job is running.
+                     # failed and must not be read as 0%. util_sum / util_samples
+                     # accumulate every non-null sample of the attempt and survive
+                     # the job. eta is null unless the job is running.
                      # progress_pct survives the job.
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
@@ -338,7 +341,8 @@ The order is the contract; each step is in `runner.py`.
    Uploads run with the job's environment, secrets included.
 5. `phase=main`: `spec.command`, stdout and stderr appended to `log.txt`, in its
    own scope or process group (see Process isolation). Sample the assigned GPUs
-   every 30 s into `util_recent`; nothing acts on it. Enforce `max_runtime_min`
+   every 30 s into `util_recent` and the running `util_sum`/`util_samples`;
+   nothing acts on it. Enforce `max_runtime_min`
    (SIGTERM the group, SIGKILL at 15 s, `failed: timeout`), and run
    `spec.progress_command` every `progress_interval_s`.
 6. Capture the exit code before any cleanup, set `phase=sync`, stop the sync

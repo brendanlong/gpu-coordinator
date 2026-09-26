@@ -244,22 +244,24 @@ is queued either way. A job the dispatcher got to first prints `dispatched
 already; it is running now`. `gpuc reorder` prints the same line.
 
 **`gpuc status`** — per host: kind, reachability, free cards, dispatcher
-heartbeat, one line per owned card (`free` / `busy` / `UNAVAILABLE`) and per
+heartbeat, one line per owned card (`free` / `busy` / `UNAVAILABLE`, with the
+memory and utilization nvidia-smi reads on it now, whoever is using it) and per
 [shared](#shared-gpus) one, the queue, running jobs with phase, elapsed time,
 last util, the cards they hold (`gpu=2,3`) and any
-[end-time estimate](#job-length-estimates), and recent finished jobs. Every job
-is `name (job-id)`.
+[end-time estimate](#job-length-estimates), and recent finished jobs with the
+mean utilization of their cards over `main` (`avg util 22% on 1 gpu`; absent
+when there is no sample to average). Every job is `name (job-id)`.
 
 ```
 host local [local]  gpus 0/1 free (driver 580.173.02)
   dispatcher 0s ago
-  gpu     [0] busy NVIDIA GeForce RTX 3060 Ti 8 GB
+  gpu     [0] busy NVIDIA GeForce RTX 3060 Ti 8 GB (6120 MiB, 100% util)
   running lego-s4 (20260915-231241-f880d9) phase=main 27m util 100% gpu=0 eta 45m (37%)
-  done    hello (20260915-074344-1d4db4) succeeded 15h ago
+  done    hello (20260915-074344-1d4db4) succeeded 15h ago, avg util 41% on 1 gpu
 host spar [ssh]  gpus 0/2 free (driver 535.309.01)
   dispatcher 2s ago
-  gpu     [2] busy NVIDIA A40 45 GB
-  gpu     [3] busy NVIDIA A40 45 GB
+  gpu     [2] busy NVIDIA A40 45 GB (38912 MiB, 100% util)
+  gpu     [3] busy NVIDIA A40 45 GB (38400 MiB, 99% util)
   shared  [4] free NVIDIA A40 45 GB
   shared  [5] IN USE NVIDIA A40 45 GB (somebody else: 21504 MiB, 98% util)
   running paper-diff (20260915-222409-7a2b60) phase=main 1h16m util 100% gpu=2
@@ -648,7 +650,7 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
       "provider_util": null,
       "gpus": [
         { "index": 0, "uuid": "GPU-8064...", "name": "NVIDIA A40", "vram_mib": 46068,
-          "busy_job": "20260915-120000-abc123" }
+          "busy_job": "20260915-120000-abc123", "memory_mib": 38912.0, "utilization_pct": 100.0 }
       ],
       "shared_gpus": [
         { "index": 4, "uuid": "GPU-aaaa...", "name": "NVIDIA A40", "vram_mib": 46068,
@@ -703,6 +705,11 @@ Beyond what the example shows:
   spec's, as the host holds them) and `links`: one `{kind, path, target, url}`
   per place the results, W&B run or mirrored log can be opened, derived from
   what the job declared and never checked.
+- `util_mean` is the mean of every sample of the attempt's `main` phase, each
+  already the mean over the job's cards, and `util_samples` how many there
+  were (one per 30 s); `util_mean` is null at zero samples, and both are null
+  from a host whose build does not record them. Setup and failed readings are
+  in neither.
 - `util` is the job's last sample from the host's own nvidia-smi; a pod's
   `provider_util` is the provider's per-GPU reading for the whole pod, null
   elsewhere.
@@ -713,7 +720,8 @@ above; `errors[]` carries the reason and decides the exit code, `warnings[]`
 carries the build mismatch and does not), `pod` (the provider's view of a
 rental's pod), `pkg_commit` (the host's own answer for the build it runs; `null`
 means it did not say). A card the host cannot see appears in `gpus` as
-`{"owned_as": "3", "available": false}`; `shared_gpus` has the same shape plus
+`{"owned_as": "3", "available": false}`, and `memory_mib` / `utilization_pct` on
+a card are null when nvidia-smi gave no reading; `shared_gpus` has the same shape plus
 `unused` (no memory held, no work running) and `busy_job` (one of *our* jobs
 has it), and a missing one is `{"shared_as": "5", "available": false}`.
 `--recent` and `--since` apply to `--json`; `--all` fills `unhosted[]` with the

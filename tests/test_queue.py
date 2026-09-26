@@ -258,6 +258,18 @@ def test_preempt_asks_the_runner_to_stop_and_leaves_the_job_running(gpuc_home: P
     assert [e.job_id for e in queue.list_queued()] == [waiting]
 
 
+def test_the_next_attempt_measures_its_own_utilization(gpuc_home: Path) -> None:
+    """It runs from the start, so a mean carried over would describe a run
+    that was thrown away."""
+    waiting_job()
+    job_id = running_job()
+    jobs.update_state(job_id, util_recent=[80.0], util_sum=800.0, util_samples=10)
+    assert queue.preempt(job_id) == "preempting"
+    assert queue.next_attempt(job_id, ran=True) == 2
+    state = jobs.read_state(job_id)
+    assert (state.util_recent, state.util_sum, state.util_samples) == ([], 0.0, 0)
+
+
 def test_preempt_can_lower_the_priority_it_comes_back_at(gpuc_home: Path) -> None:
     waiting_job(priority=40)
     job_id = running_job(priority=50)

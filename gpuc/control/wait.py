@@ -148,7 +148,7 @@ class Watched:
         whence = " (from the S3 mirror)" if self.source == "mirror" else ""
         return (
             f"{status_mod.job_label(job)} on {self.host}: {job.status}"
-            f"{f' ({detail})' if detail else ''}{took}{flag}{whence}"
+            f"{f' ({detail})' if detail else ''}{took}{status_mod.fmt_util_mean(job)}{flag}{whence}"
         )
 
     def document(self) -> dict[str, Any]:

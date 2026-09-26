@@ -184,3 +184,29 @@ def test_a_reading_that_cannot_be_read_counts_as_in_use() -> None:
 
 def test_asking_about_no_cards_is_not_an_error() -> None:
     assert gpus.unused_gpus([], fake_smi()) == ([], {})
+
+
+def test_a_snapshot_lists_every_card_with_its_reading_in_one_call() -> None:
+    calls: list[list[str]] = []
+    inner = fake_smi(utilization={FAKE_GPUS[0]: 97.0}, memory_used={FAKE_GPUS[0]: 21504.0})
+
+    def smi(args: list[str]) -> str:
+        calls.append(args)
+        return inner(args)
+
+    table, usage = gpus.snapshot(smi)
+    assert len(calls) == 1
+    assert table == gpus.list_gpus(fake_smi())
+    assert usage[FAKE_GPUS[0]] == gpus.Usage(FAKE_GPUS[0], 21504.0, 97.0)
+    assert usage[FAKE_GPUS[1]].unused
+
+
+def test_a_snapshot_row_that_will_not_parse_costs_only_its_own_card() -> None:
+    def odd(args: list[str]) -> str:
+        return f"0, {FAKE_GPUS[0]}, A40, 46068, [N/A], 12\n1, {FAKE_GPUS[1]}, A40, 46068, 3\n"
+
+    table, usage = gpus.snapshot(odd)
+    assert [gpu.uuid for gpu in table] == FAKE_GPUS
+    assert usage == {FAKE_GPUS[0]: gpus.Usage(FAKE_GPUS[0], None, 12.0)}
+    with pytest.raises(gpus.GpuError, match="no card rows"):
+        gpus.snapshot(lambda args: "No devices were found\n")

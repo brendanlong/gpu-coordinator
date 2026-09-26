@@ -251,7 +251,7 @@ running, finished, errors, warnings`; `state` is `answered`, `unaskable` (a
 failure, with the reason in `errors`; it may still hold its jobs) or `gone`
 (the rental ended: not a failure). Each job in the three lists has `job_id,
 name, status, reason, problems, upload_errors, phase, priority, attempt,
-requeued_from, elapsed_s, util, progress_pct, eta, eta_s,
+requeued_from, elapsed_s, util, util_mean, util_samples, progress_pct, eta, eta_s,
 estimated_runtime_min, progress_error, gpus, gpus_requested, use_shared,
 starts_in_s, starts_at, starts_unknown, iso, ended_at, outputs_pending`
 (`starts_*` are null unless the job is queued). `unhosted` is `--all`'s list of
@@ -302,7 +302,10 @@ Rules, and they are not optional:
   exit_code}`. `error` (singular) means it did not do what you asked; `errors`
   (plural) is trouble it survived.
 - A job's `util` is the host's own nvidia-smi sampler; a pod's `provider_util`
-  is RunPod's reading for the whole pod. Do not compare them.
+  is RunPod's reading for the whole pod. Do not compare them. `util_mean` is
+  the average over the whole of `main` (over `util_samples` 30 s samples), and
+  survives the job: `gpuc status --recent 20` prints it per finished job,
+  which is the evidence for whether a job would use a second card.
 - Ignore keys you do not recognise; more will be added.
 
 ## RunPod specifics

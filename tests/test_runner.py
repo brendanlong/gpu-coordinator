@@ -342,6 +342,7 @@ def test_utilization_is_sampled_in_main_only(gpuc_home: Path) -> None:
     # The first sample of main found an empty history: setup recorded nothing.
     assert seen[0][1] == 0
     assert state.util_recent and set(state.util_recent) == {0.0}
+    assert (state.util_sum, state.util_samples) == (0.0, len(state.util_recent))
 
 
 def test_an_idle_gpu_is_reported_and_never_a_reason_to_kill(gpuc_home: Path) -> None:
@@ -623,8 +624,12 @@ def test_a_failed_utilization_sample_is_recorded_as_unknown_not_as_idle(
 
     job_id = prepare(gpus=[FAKE_GPUS[0]], command="sleep 0.6")
     assert run(job_id, deps(sampler=flaky)) == 0
-    recent = jobs.read_state(job_id).util_recent
+    state = jobs.read_state(job_id)
+    recent = state.util_recent
     assert recent and recent[0] is None
+    # The mean is over the readings that exist: the failure is not a 0%.
+    assert state.util_samples == len(recent) - 1 >= 1
+    assert state.util_sum == 90.0 * state.util_samples
     assert "utilization sample failed" in log_of(job_id)
 
 

@@ -31,6 +31,12 @@ LEFTOVER_FLOOR_BYTES = 1 << 30
 command. A job dir under a gigabyte is noise next to a 6.5 GB torch venv."""
 
 
+def describe_usage(memory_mib: float | None, utilization_pct: float | None) -> str:
+    memory = "?" if memory_mib is None else f"{memory_mib:.0f}"
+    util = "?" if utilization_pct is None else f"{utilization_pct:.0f}"
+    return f"{memory} MiB, {util}% util"
+
+
 @dataclass
 class SharedGpu:
     """One card this host may borrow, and what the host last saw on it.
@@ -50,9 +56,7 @@ class SharedGpu:
     reports it unused=false, which is what keeps a failed read off the card."""
 
     def describe(self) -> str:
-        memory = "?" if self.memory_mib is None else f"{self.memory_mib:.0f}"
-        util = "?" if self.utilization_pct is None else f"{self.utilization_pct:.0f}"
-        return f"{memory} MiB, {util}% util"
+        return describe_usage(self.memory_mib, self.utilization_pct)
 
     @staticmethod
     def from_payload(raw: Any) -> SharedGpu | None:
@@ -99,6 +103,13 @@ class JobView:
     started_at: str | None = None
     ended_at: str | None = None
     util_recent: list[float] = field(default_factory=list)
+    util_sum: float = 0.0
+    util_samples: int | None = None
+    """Every good `main`-phase sample of the attempt, summed and counted: what
+    says how busy a finished job kept its cards, long after `util_recent` has
+    rotated out. The count travels with the mean so 22% over 700 samples can
+    be told from 22% over 3. None from a host whose build does not count, which
+    is not the same answer as a job that was never sampled."""
     progress_pct: float | None = None
     """How far along the job's own `progress_command` last said it was."""
     eta: str | None = None
@@ -160,6 +171,10 @@ class JobView:
     @property
     def last_util(self) -> float | None:
         return self.util_recent[-1] if self.util_recent else None
+
+    @property
+    def util_mean(self) -> float | None:
+        return self.util_sum / self.util_samples if self.util_samples else None
 
     @property
     def eta_seconds(self) -> float | None:
@@ -295,6 +310,9 @@ class HostView:
     numbering. Everything here -- free, busy, the per-card lines -- is UUIDs."""
     indices: dict[str, int] = field(default_factory=dict)
     """uuid -> the index the host is calling that card right now."""
+    owned_usage: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    """uuid -> (memory MiB, util %) on each owned card as the host just read
+    it, whoever is using it. Absent for a card the host sent no reading for."""
     unavailable: list[str] = field(default_factory=list)
     """Owned entries the host could not resolve to a card it can see."""
     shared: list[SharedGpu] = field(default_factory=list)
@@ -435,6 +453,8 @@ def job_views(payload: dict[str, Any]) -> tuple[list[JobView], list[JobView], li
             util_recent=[
                 float(u) for u in entry.get("util_recent") or [] if isinstance(u, (int, float))
             ],
+            util_sum=_as_float(entry.get("util_sum")) or 0.0,
+            util_samples=_as_int(entry.get("util_samples")),
             progress_pct=_as_float(entry.get("progress_pct")),
             eta=_as_str(entry.get("eta")),
             estimated_runtime_min=_as_float(entry.get("estimated_runtime_min")),
@@ -514,7 +534,7 @@ def parse_status(entry: HostEntry, asked: Asked) -> HostView:
     payload = asked.payload or {}
     view.pkg_commit = _as_str(payload.get("pkg_commit"))
     view.dispatcher_pkg_commit = _as_str(payload.get("dispatcher_pkg_commit"))
-    view.owned, view.indices = owned_gpus(payload)
+    view.owned, view.indices, view.owned_usage = owned_gpus(payload)
     view.unavailable = [g for g in payload.get("gpus_unavailable") or [] if isinstance(g, str)]
     view.shared = [
         card
@@ -567,6 +587,18 @@ def _fmt_util(job: JobView, *, source: bool = False) -> str:
     """
     tag = " (host)" if source else ""
     return f"util --{tag}" if job.last_util is None else f"util {job.last_util:.0f}%{tag}"
+
+
+def fmt_util_mean(job: JobView) -> str:
+    """`, avg util 22% on 1 gpu`: a measurement, not a verdict -- whether 22%
+    is low depends on what the job was meant to do, which only its owner
+    knows. Nothing for a job with no good sample (no card, or never reached
+    `main`). Shared with `gpuc wait`, where a user learns how a job ended."""
+    mean = job.util_mean
+    if mean is None:
+        return ""
+    cards = len(job.gpus)
+    return f", avg util {mean:.0f}% on {cards} gpu{'' if cards == 1 else 's'}"
 
 
 def job_label(job: JobView) -> str:
@@ -750,10 +782,14 @@ def next_free_line(view: HostView) -> str | None:
     return f"  free    next card {when} ({job.job_id}){note}"
 
 
-def owned_gpus(payload: dict[str, Any]) -> tuple[list[str], dict[str, int]]:
-    """The host's owned cards as it resolved them this pass, and their indices."""
+def owned_gpus(
+    payload: dict[str, Any],
+) -> tuple[list[str], dict[str, int], dict[str, tuple[float | None, float | None]]]:
+    """The host's owned cards as it resolved them this pass, their indices,
+    and the memory and utilization it read on each."""
     owned: list[str] = []
     indices: dict[str, int] = {}
+    usage: dict[str, tuple[float | None, float | None]] = {}
     for row in payload.get("gpus_resolved") or []:
         if not isinstance(row, dict) or not isinstance(row.get("uuid"), str):
             continue
@@ -762,7 +798,10 @@ def owned_gpus(payload: dict[str, Any]) -> tuple[list[str], dict[str, int]]:
         index = _as_int(row.get("index"))
         if index is not None:
             indices[uuid] = index
-    return owned, indices
+        reading = (_as_float(row.get("memory_mib")), _as_float(row.get("utilization_pct")))
+        if reading != (None, None):
+            usage[uuid] = reading
+    return owned, indices, usage
 
 
 def _gpu_lines(view: HostView) -> list[str]:
@@ -775,7 +814,9 @@ def _gpu_lines(view: HostView) -> list[str]:
     lines: list[str] = []
     for index, name, vram, uuid in gpu_rows(view.owned, view.entry.gpu_info, view.indices):
         state = "busy" if view.gpu_holder(uuid) else "free"
-        lines.append(f"  gpu     [{index}] {state} {name} {vram}".rstrip())
+        reading = view.owned_usage.get(uuid)
+        usage = f" ({describe_usage(*reading)})" if reading else ""
+        lines.append(f"  gpu     [{index}] {state} {name} {vram}".rstrip() + usage)
     for missing in view.unavailable:
         lines.append(
             f"  gpu     [{missing}] UNAVAILABLE  nvidia-smi does not report this card on the "
@@ -843,7 +884,8 @@ def _finished_lines(view: HostView, *, recent: int, since_s: float | None) -> li
             flag = f"  kept on host: {', '.join(job.kept_outputs)}"
         lines.append(
             f"  done    {job_label(job)} {job.status}"
-            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}{flag}"
+            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}"
+            f"{fmt_util_mean(job)}{flag}"
         )
     if since_s is not None and not finished and view.finished_total:
         lines.append(
@@ -1034,6 +1076,8 @@ def job_json(job: JobView, mirror_prefix: str | None = None) -> dict[str, Any]:
         "started_at": job.started_at,
         "elapsed_s": None if job.minutes is None else round(job.minutes * 60.0, 1),
         "util": job.last_util,
+        "util_mean": None if job.util_mean is None else round(job.util_mean, 1),
+        "util_samples": job.util_samples,
         "progress_pct": job.progress_pct,
         "eta": job.eta,
         "eta_s": None if job.eta_seconds is None else round(job.eta_seconds, 1),
@@ -1133,6 +1177,8 @@ def gpu_json(view: HostView) -> list[dict[str, Any]]:
                 "name": info.name,
                 "vram_mib": info.vram_mib,
                 "busy_job": view.gpu_holder(uuid),
+                "memory_mib": view.owned_usage.get(uuid, (None, None))[0],
+                "utilization_pct": view.owned_usage.get(uuid, (None, None))[1],
             }
         )
     out += [{"owned_as": item, "available": False} for item in view.unavailable]

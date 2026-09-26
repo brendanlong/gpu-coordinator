@@ -310,13 +310,18 @@ function reading(v) {
   return v === null || v === undefined ? "?" : Math.round(v);
 }
 
+function ownedReading(gpu) {
+  if (gpu.utilization_pct == null && gpu.memory_mib == null) return null;
+  return el("span", { class: "muted" }, ` ${reading(gpu.memory_mib)} MiB, ${reading(gpu.utilization_pct)}% util`);
+}
+
 function gpuTable(host) {
   const shared = host.shared_gpus || [];
   if (!host.gpus.length && !shared.length) return el("p", { class: "empty" }, "no GPUs");
   // No holder column: the running table below names each job's cards.
   const rows = host.gpus.map((gpu) => (gpu.available === false
     ? missingRow(gpu, "owned_as", "dispatched to")
-    : gpuRow(gpu.index, gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), model(gpu))));
+    : gpuRow(gpu.index, [gpu.busy_job ? badge("busy", "warn") : badge("free", "good"), ownedReading(gpu)], model(gpu))));
   // Shared cards are somebody else's, and `IN USE` is theirs, not ours: the
   // numbers beside it are why a job that asked for one is still queued.
   for (const gpu of shared) {
@@ -404,6 +409,8 @@ function finishedTable(host) {
     const detail = reason || (job.exit_code ? `exit ${job.exit_code}` : "");
     // How far a job had got when it ended is the useful part of a failure.
     const progress = job.progress_pct !== null && job.status !== "succeeded" ? ` (${Math.round(job.progress_pct)}%)` : "";
+    const cards = job.gpus.length;
+    const util = job.util_mean === null ? "" : `, avg util ${Math.round(job.util_mean)}% on ${cards} gpu${cards === 1 ? "" : "s"}`;
     let level = "good";
     if (job.status === "failed") level = "bad";
     else if (job.status === "cancelled") level = "warn";
@@ -413,7 +420,7 @@ function finishedTable(host) {
     else if ((job.kept_outputs || []).length) flag = badge("kept on host", "");
     return el("tr", {},
       el("td", {}, jobLabel(job)),
-      el("td", {}, badge(job.status, level), detail ? ` ${detail}` : "", progress),
+      el("td", {}, badge(job.status, level), detail ? ` ${detail}` : "", progress, util),
       el("td", {}, fmtAge(job.ended_at)),
       el("td", {}, flag, job.workdir_bytes ? el("span", { class: "muted" }, ` workdir ${fmtBytes(job.workdir_bytes)}`) : null),
       el("td", {}, links(job)),

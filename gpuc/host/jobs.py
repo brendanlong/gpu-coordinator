@@ -471,6 +471,12 @@ class JobState:
     runner_boot_id: str | None = None
     runner_starttime: str | None = None
     util_recent: list[float | None] = field(default_factory=list)
+    util_sum: float = 0.0
+    util_samples: int = 0
+    """Every successful `main`-phase sample of this attempt, summed and
+    counted, so a finished job can still say how busy its cards were after
+    `util_recent` has long rotated out. A failed sample counts in neither: a
+    missing reading is not 0%."""
     progress_pct: float | None = None
     """The last percentage the spec's `progress_command` reported, 0-100. Null
     on a job that has no progress command, or has not answered yet."""
@@ -560,6 +566,8 @@ class JobState:
             runner_boot_id=as_opt_str(fields, "runner_boot_id"),
             runner_starttime=as_opt_str(fields, "runner_starttime"),
             util_recent=as_opt_float_list(fields, "util_recent"),
+            util_sum=as_float(fields, "util_sum", 0.0),
+            util_samples=as_int(fields, "util_samples", 0),
             progress_pct=as_opt_float(fields, "progress_pct"),
             progress_error=as_opt_str(fields, "progress_error"),
             eta=as_opt_str(fields, "eta"),
