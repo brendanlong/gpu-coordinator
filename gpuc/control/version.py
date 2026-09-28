@@ -150,7 +150,7 @@ def shipped_commit_note(name: str, recorded: str | None, local: str | None) -> s
     machine may have re-bootstrapped the host since, so it is reported as what
     it is -- last seen -- and `gpuc status` is where the live answer lives. A
     host that never named a commit gets no note: the listing already prints
-    `pkg unknown`, and `gpuc host add` already says to bootstrap next.
+    `pkg unknown`, and `gpuc host add` bootstraps it or says to.
     """
     if recorded is None or not is_other_build(recorded, local):
         return None

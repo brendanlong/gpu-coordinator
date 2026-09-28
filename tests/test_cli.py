@@ -48,7 +48,7 @@ def test_host_add_writes_the_first_config_of_a_host_that_has_none(
 ) -> None:
     """The host owns its config, so `add` is where a host that has none gets
     one -- and the only place this machine decides what a host is."""
-    assert main(["host", "add", "local", "--gpus", GPU]) == 0
+    assert main(["host", "add", "local", "--gpus", GPU, "--no-bootstrap"]) == 0
     entry = load_registry().require("local")
     assert (entry.kind, entry.config.gpus, entry.ssh) == ("local", [GPU], None)
     assert fake_host.config is not None
@@ -57,6 +57,42 @@ def test_host_add_writes_the_first_config_of_a_host_that_has_none(
     out = capsys.readouterr().out
     assert "wrote its first config" in out
     assert "gpuc host bootstrap local" in out
+
+
+def test_host_add_bootstraps_a_host_with_no_gpuc_on_it(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "local", "--gpus", GPU, "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["bootstrap"]["pkg_commit"] == version_mod.local_commit()
+    assert fake_host.config is not None
+    assert fake_host.config["pkg_commit"] == version_mod.local_commit()
+    assert load_registry().require("local").bootstrapped_at
+
+
+def test_host_add_leaves_a_host_on_this_build_alone(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    current = {"host": "gpubox", "gpus": ["0"], "pkg_commit": version_mod.local_commit()}
+    fake_host.put_file(json.dumps(current), fake_host.config_path)
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["bootstrap"] is None
+    assert fake_host.config == current
+
+
+def test_host_add_keeps_a_host_whose_bootstrap_failed(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The address is right and the fix is on the host, so registering it
+    again should not be part of the way on."""
+    fake_host.put_file(
+        '{"host": "gpubox", "gpus": ["0"], "shared_gpus": ["0"]}', fake_host.config_path
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == EXIT_ERROR
+    assert "gpubox" in load_registry().hosts
+    err = capsys.readouterr().err
+    assert "is registered, but bootstrapping it failed" in err
+    assert "gpuc host bootstrap gpubox" in err
 
 
 def test_host_add_adopts_the_config_a_host_already_has(
@@ -72,7 +108,7 @@ def test_host_add_adopts_the_config_a_host_already_has(
         "env": {"HF_HOME": "/big"},
     }
     fake_host.put_file(json.dumps(theirs), fake_host.config_path)
-    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--no-bootstrap"]) == 0
     entry = load_registry().require("gpubox")
     assert entry.config.gpus == ["2", "3"]
     assert entry.config.s3_prefix == "s3://theirs/gpuc/gpubox"
@@ -2868,7 +2904,10 @@ def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
     monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
 
-    assert main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111"]) == 0
+    assert (
+        main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111", "--no-bootstrap"])
+        == 0
+    )
 
     out = capsys.readouterr().out
     assert "wrote its first config" in out
@@ -2934,7 +2973,7 @@ def test_an_existing_gpu_overlap_is_refused_until_it_is_fixed(
         '{"host": "gpubox", "gpus": ["0"], "shared_gpus": ["0", "1"]}',
         fake_host.config_path,
     )
-    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == 0
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--no-bootstrap"]) == 0
     assert main(["host", "set", "gpubox", "--idle-min", "30"]) == EXIT_ERROR
     assert "both --gpus and --shared-gpus" in capsys.readouterr().err
     assert main(["host", "set", "gpubox", "--idle-min", "30", "--shared-gpus", "1"]) == 0

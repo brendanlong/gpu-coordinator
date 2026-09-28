@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuc.control import rented
+from gpuc.control import rented, version
 from gpuc.control.actions import (
     Answer,
     CliError,
@@ -56,6 +56,7 @@ class HostChange:
     document: dict[str, Any]
     lines: list[str]
     warnings: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
 
     def render(self) -> str:
         return "\n".join(self.lines)
@@ -97,13 +98,22 @@ def add_host(
     fields: dict[str, Any],
     env_updates: dict[str, str | None],
     force: bool = False,
+    health: HealthOptions | None = None,
+    report: Reporter = print,
 ) -> HostChange:
-    """Register a host by asking it what it is.
+    """Register a host by asking it what it is, then bootstrap it if it needs it.
 
     The registry holds the address; the host holds its config. So this probes,
     and a host that already has a `config.json` is adopted as it stands --
     which is what makes a second machine driving a box somebody else set up the
     ordinary path. Flags are explicit overrides of it, and say so.
+
+    `health` None skips the bootstrap. Otherwise a host whose config names no
+    build, or another build than this one, is bootstrapped: a registered host
+    nothing can be submitted to is a step every user had to be told about, and
+    one that ran it anyway on a host already current would be waiting through a
+    health check for nothing. A bootstrap that fails leaves the host
+    registered, since the address is right and the fix is on the host.
     """
     settings = load_settings()
     if pod_id and ssh:
@@ -120,11 +130,11 @@ def add_host(
     )
     if pod_id:
         address = _pod_address(address, pod_id, settings)
-    report = probe_host(address, settings)
+    probed = probe_host(address, settings)
     address = address.with_cache(
-        gpu_info=report.gpu_info,
-        driver_version=report.driver_version,
-        python=report.host_python,
+        gpu_info=probed.gpu_info,
+        driver_version=probed.driver_version,
+        python=probed.host_python,
     )
     connection = connect_host(
         address,
@@ -150,8 +160,9 @@ def add_host(
         registry.put(entry)
     warnings: list[str] = []
     if not connection.adopted and not _owned(entry):
-        warnings.append(_owns_nothing_warning(entry, fields, report))
-    if pod_id and not connection.adopted:
+        warnings.append(_owns_nothing_warning(entry, fields, probed))
+    stale = version.is_other_build(entry.config.pkg_commit, version.local_commit())
+    if pod_id and stale and health is None:
         # A pod nobody has set up has no dispatcher, so nothing will ever idle
         # it out: it bills until bootstrap gives it one or a person ends it.
         warnings.append(
@@ -160,7 +171,24 @@ def add_host(
         )
     lines = [_added_line(entry, connection, name)]
     lines += [f"  {warning}" for warning in warnings]
-    return HostChange(connection_document(entry, connection, warnings=warnings), lines)
+    if stale and health is None:
+        lines.append(f"next: gpuc host bootstrap {entry.name}")
+    # Said before the bootstrap starts, so its progress reads as the next step.
+    report("\n".join(lines))
+    document = connection_document(entry, connection, warnings=warnings)
+    document["bootstrap"] = document["bootstrap_error"] = None
+    failures: list[str] = []
+    if health is not None and stale:
+        try:
+            result = bootstrap_and_record(entry, settings, health, report)
+            document["bootstrap"] = result.document()
+        except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
+            failures.append(
+                f"host {entry.name} is registered, but bootstrapping it failed: {exc}\n"
+                f"Fix that, then run: gpuc host bootstrap {entry.name}"
+            )
+            document["bootstrap_error"] = str(exc)
+    return HostChange(document, [], failures=failures)
 
 
 def _owned(entry: HostEntry) -> list[str]:
@@ -232,7 +260,6 @@ def _added_line(entry: HostEntry, connection: Connection, asked_for: str) -> str
     home = _home_line(entry)
     if home:
         lines.append(home)
-    lines.append(f"next: gpuc host bootstrap {entry.name}")
     return "\n".join(lines)
 
 
