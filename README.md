@@ -12,7 +12,7 @@ eval-checkpoints behind it; gpuc status prints the card, the running job with
 its estimated finish, the queued job with its priority and projected start, and
 the job that finished before them; gpuc logs -f streams the training output as
 it is written; and a last gpuc status has the running job at 100% utilization
-and 30% done.](docs/media/cli.gif)
+and 28% done.](docs/media/cli.gif)
 
 The same recording as text, to copy from:
 [asciinema.org/a/fu8jgOVnwDi6dlYd](https://asciinema.org/a/fu8jgOVnwDi6dlYd).
