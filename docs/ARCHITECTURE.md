@@ -961,7 +961,7 @@ Status is gathered across hosts in parallel (`actions.gather_all`).
 
 ## Status output
 
-What `status` prints, and every flag, is usage.md. The invariants:
+What `status` prints is usage.md, and every flag is `gpuc status --help`. The invariants:
 
 - **A host's `status` sends what was asked for, and what it costs grows with
   what the host holds now, not with its history.** Given ids it sends exactly

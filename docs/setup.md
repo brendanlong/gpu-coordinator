@@ -41,7 +41,9 @@ installs uv, Python and gpuc under your home directory there and checks the
 driver, disk and network. Bootstrap is needed once per new host (and again
 after an [upgrade](#upgrading), which `gpuc submit` does for you). Registering a
 host that was already set up from another of your machines adopts it as it is,
-and it needs no bootstrap.
+and it needs no bootstrap; give the same `--persistent-root` or `--gpuc-home`
+the first machine used, if any (`gpuc host list --json` there), or you will get
+a second, empty queue.
 
 gpuc does not read `~/.ssh/config`: give the real `user@hostname`, `--port`
 if it is not 22, and `ssh_key` in the [config file](#configuration) if your
@@ -153,10 +155,11 @@ Container-based hosts (a Kubernetes pod, most cloud notebooks) often wipe
 a persistent volume, keep gpuc's state there:
 
 ```sh
-gpuc host add gpubox --ssh gpubox --persistent-root /mnt/data/$USER
+gpuc host add gpubox --ssh me@gpubox --persistent-root /mnt/data/$USER
 ```
 
 After a restart, `gpuc host bootstrap <host>` reinstalls gpuc. With a
 persistent root, queued jobs then carry on and only the jobs that were running
 need resubmitting. Without one, `gpuc status --host <host> --all` lists what
-was there and `gpuc requeue <job-id>` resubmits each (this needs `s3_bucket`).
+was there and, run from the project's directory, `gpuc requeue <job-id>`
+resubmits each (this needs `s3_bucket`).

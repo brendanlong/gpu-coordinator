@@ -23,7 +23,7 @@ gpuc submit job.yaml --host gpubox    # prints the job id and its place in the q
 gpuc status                           # every host: cards, queue, running and recent jobs
 gpuc logs <job-id> -f                 # follow the log until the job ends
 gpuc wait <job-id> ...                # block until the jobs end; exits 0 only if all succeeded
-gpuc fetch <job-id>                   # copy its outputs to ./<job-id>/
+gpuc fetch <job-id>                   # copy its outputs to ./<job-id>/ while it is still on the host
 ```
 
 The job runs in a copy of the directory you submit from: every file git
@@ -118,7 +118,7 @@ A shared card (`gpuc host set <host> --shared-gpus 4,5`) is one gpuc may borrow
 but does not own. Only jobs with `use_shared: true` (or `gpuc submit
 --use-shared`) use one, only after every owned card is busy, and only while
 nvidia-smi shows nobody else on it. Once borrowed it is held until the job
-ends, even if its owner comes back; `gpuc preempt` hands it back.
+ends, even if its owner comes back.
 
 ## Progress and estimates
 
@@ -148,8 +148,8 @@ gpuc requeue <job-id>                        # submit a finished job again, from
 gpuc ssh <job-id>                            # a shell in the job's directory
 ```
 
-Commands that take job ids take any number of them, and `--host` is only
-needed when gpuc cannot find the job itself.
+`cancel`, `preempt`, `set`, `wait`, `fetch` and `status` take any number of job
+ids. `--host` is only needed when gpuc cannot find a job itself.
 
 **How a job is stopped.** Cancel, preempt and `max_runtime_min` send the job
 SIGTERM, then SIGKILL 15 seconds later; trap SIGTERM if you want to save
@@ -181,12 +181,13 @@ stay running. A rental's disk goes with it, so give every output an `s3` or
 
 ```sh
 gpuc pods                            # every gpuc pod on the account, with its cost
-gpuc host terminate <name>           # end one now; refuses while jobs are running (--force)
+gpuc host terminate <name>           # end one now; refuses unless it is idle (--force)
 gpuc host set <name> --idle-min 0    # or: let it finish its queue, then stop
 ```
 
 A pod whose setup was interrupted, or whose gpuc died, will not stop itself.
-`gpuc pods` flags these; end them with `gpuc host terminate`.
+`gpuc pods` shows them with no heartbeat; end them with `gpuc host terminate
+<pod-id> --force`.
 
 ## Disk cleanup
 
@@ -194,7 +195,7 @@ A finished job's directory holds its checkout and whatever it built there
 (usually a virtualenv). Its log and state are kept; the rest is deleted:
 
 - when the job succeeds (`cleanup: on_success`, the default),
-- or a day after it ends, whatever happened (`gpuc host set <host>
+- or a day after it ends, whatever happened (unless `cleanup: never`) (`gpuc host set <host>
   --workdir-days N` to change that),
 
 but never while outputs are waiting to upload, and never outputs that are kept
@@ -236,6 +237,7 @@ gpuc wait "$id" || echo "failed"
 | reason | meaning |
 | --- | --- |
 | `exit N` / `setup` | your command, or `setup`, exited non-zero |
+| `gpu-assert` | a card assigned to the job has disappeared from nvidia-smi |
 | `gpu-preflight` | torch in the job's environment could not use its GPUs; check the torch build against the host's driver |
 | `sync-preflight` | an output destination is not writable: usually a missing secret or a typo in the bucket |
 | `sync` | the final upload failed; `gpuc fetch <job-id>` gets the outputs from the host |
