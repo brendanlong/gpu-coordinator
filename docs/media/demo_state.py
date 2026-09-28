@@ -29,6 +29,10 @@ def at(**delta: float) -> str:
     return (NOW + timedelta(**delta)).isoformat()
 
 
+def job_id(suffix: str, **submitted: float) -> str:
+    return f"{(NOW + timedelta(**submitted)):%Y%m%d-%H%M%S}-{suffix}"
+
+
 def uuid(n: int) -> str:
     return f"GPU-0000000{n}-0000-0000-0000-00000000000{n}"
 
@@ -83,7 +87,7 @@ def views() -> list[HostView]:
         cards=[CardView(uuid(1), 0, memory_mib=19870.0, utilization_pct=96.0)],
         running=[
             JobView(
-                job_id="20260918-142201-9f31ac",
+                job_id=job_id("9f31ac", hours=-1, minutes=-53),
                 name="sft-qwen3-4b",
                 status="running",
                 phase="main",
@@ -99,12 +103,12 @@ def views() -> list[HostView]:
         ],
         finished=[
             JobView(
-                job_id="20260918-104512-3ac8e1",
+                job_id=job_id("3ac8e1", hours=-7, minutes=-2),
                 name="sft-qwen3-4b-lr1e5",
                 status="succeeded",
                 started_at=at(hours=-7),
                 ended_at=at(hours=-4, minutes=-6),
-                outputs=[{"s3": "s3://my-bucket/runs/20260918-104512-3ac8e1"}],
+                outputs=[{"s3": f"s3://my-bucket/runs/{job_id('3ac8e1', hours=-7, minutes=-2)}"}],
             )
         ],
     )
@@ -130,7 +134,7 @@ def views() -> list[HostView]:
         ],
         running=[
             JobView(
-                job_id="20260918-131055-7b02de",
+                job_id=job_id("7b02de", hours=-3, minutes=-12),
                 name="grid-lr3e4-wd01",
                 status="running",
                 phase="main",
@@ -144,7 +148,7 @@ def views() -> list[HostView]:
                 estimated_runtime_min=270.0,
             ),
             JobView(
-                job_id="20260918-131103-1d44f0",
+                job_id=job_id("1d44f0", hours=-3, minutes=-12),
                 name="grid-lr1e4-wd01",
                 status="running",
                 phase="main",
@@ -160,16 +164,17 @@ def views() -> list[HostView]:
         ],
         queue=[
             JobView(
-                job_id="20260918-134402-55c9ab",
+                job_id=job_id("55c9ab", hours=-2, minutes=-38),
                 name="grid-lr3e5-wd01",
                 status="queued",
                 priority=40,
                 gpus_requested=1,
                 use_shared=False,
                 estimated_runtime_min=270.0,
+                starts_in_s=77 * 60.0,
             ),
             JobView(
-                job_id="20260918-151217-c07b93",
+                job_id=job_id("c07b93", hours=-1, minutes=-10),
                 name="eval-checkpoints",
                 status="queued",
                 priority=70,
@@ -177,11 +182,12 @@ def views() -> list[HostView]:
                 use_shared=True,
                 auto_preempt=True,
                 estimated_runtime_min=45.0,
+                starts_in_s=93 * 60.0,
             ),
         ],
         finished=[
             JobView(
-                job_id="20260918-092230-4e1b77",
+                job_id=job_id("4e1b77", hours=-9, minutes=-4),
                 name="grid-lr1e3-wd01",
                 status="failed",
                 reason="job",
@@ -223,7 +229,7 @@ def views() -> list[HostView]:
         ),
         running=[
             JobView(
-                job_id="20260918-145812-b6e330",
+                job_id=job_id("b6e330", minutes=-44),
                 name="pretrain-ablation",
                 status="running",
                 phase="main",
@@ -242,16 +248,17 @@ def views() -> list[HostView]:
     return [desktop, lab, rented]
 
 
-LOG = """\
+SFT = job_id("9f31ac", hours=-1, minutes=-53)
+LOG = f"""\
 [setup] uv sync --frozen: 214 packages in 6.31s
 [check] gpu preflight ok: torch 2.11.0 cuda 12.8 devices 1 NVIDIA GeForce RTX 4090
-[check] s3://my-bucket/runs/20260918-142201-9f31ac writable
+[check] s3://my-bucket/runs/{SFT} writable
 [main] loading Qwen/Qwen3-4B in bf16
 [main] train tokens/s 18412 | step 2400/3800 | loss 1.284 | lr 1.83e-05
 [main] train tokens/s 18390 | step 2450/3800 | loss 1.271 | lr 1.79e-05
 [main] eval  step 2450 | loss 1.302 | ppl 3.68
 [main] train tokens/s 18437 | step 2500/3800 | loss 1.266 | lr 1.75e-05
-[sync] uploaded checkpoints/step2500 (2.1 GiB) to s3://my-bucket/runs/20260918-142201-9f31ac
+[sync] uploaded checkpoints/step2500 (2.1 GiB) to s3://my-bucket/runs/{SFT}
 [main] train tokens/s 18405 | step 2550/3800 | loss 1.259 | lr 1.71e-05
 """
 
