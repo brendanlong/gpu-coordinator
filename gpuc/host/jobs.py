@@ -475,7 +475,7 @@ class JobState:
     change: a runner from before the limit was live claimed the job with a
     build that drops this key, and it enforces the limit it started with."""
     reason: str | None = None
-    """What ended the job, one word: see usage.md's table."""
+    """What ended the job, one word: `exit N`, `timeout`, `sync-preflight` and so on."""
     problems: list[str] = field(default_factory=list)
     """What else went wrong on the way out -- `sync`, `no-outputs` -- for a
     job that already had a reason. A succeeded job with a failed upload is
@@ -685,7 +685,7 @@ class JobState:
 class Outcome:
     """How a job ended, in the one shape every terminal write takes.
 
-    `reason` is one of the words usage.md's table lists, and `ran` says whether
+    `reason` is one short word (`timeout`, `gpu-assert`, ...), and `ran` says whether
     `main` started. Outputs are what `main` produces: a job that never got
     there -- a card that is not here, a setup that failed, a sync preflight
     that refused, a cancel before the first phase, a spec the dispatcher could

@@ -47,13 +47,13 @@ estimated_runtime_min: 480
 # Optional, and better than the guess above: run during phase `main`, its last
 # stdout line is how far along the job is -- `0.42` or `42%`, never a bare
 # integer. It can never fail the job. Commented out because it only works if
-# the job really writes that file. See docs/usage.md "Job length estimates".
+# the job really writes that file. See docs/usage.md "Progress and estimates".
 # progress_command: "tail -1 results/progress.txt"
 # progress_interval_s: 60                       # minimum 5
 
 # Let the host stop this job whenever that lets a more important queued job
 # start, and queue it again to re-run from the start. For work that is cheap
-# to repeat; see docs/usage.md "Automatic preemption".
+# to repeat; see docs/usage.md "Preemption".
 auto_preempt: false
 
 requires:

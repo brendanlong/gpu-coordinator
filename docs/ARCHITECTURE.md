@@ -389,7 +389,7 @@ exception above.
 
 Nothing infers how long a job will take. Two optional spec fields are purely
 informational and may never change a job's outcome; what they mean to a
-submitter is [usage.md](usage.md#job-length-estimates).
+submitter is [usage.md](usage.md#progress-and-estimates).
 
 - `estimated_runtime_min` is published as `eta` from the first phase on. The
   monitor loop re-reads it from the job's state every `ESTIMATE_REFRESH_S`,
@@ -449,9 +449,8 @@ a daemonised grandchild escapes: a documented hole, not a fixed one.
 ## Workdir cleanup, retention and purge
 
 `workdir/` is the only part of a job dir gpuc deletes; `spec.json`,
-`state.json` and `log.txt` always stay. The policy, the two horizons and every
-refusal are [usage.md](usage.md#cleanup-and-retention); the contract behind
-them:
+`state.json` and `log.txt` always stay. What a user sees of it is
+[usage.md](usage.md#disk-cleanup); the contract behind it:
 
 - No policy touches a job that is not finished. The runner applies its policy
   after the final output sync and before the write that ends the attempt,
@@ -615,7 +614,7 @@ Local state: `~/.local/share/gpu-coordinator/` with `hosts.json`, `jobs/`
 (the local job index), `known_hosts` plus `known_hosts.d/<pod>`, and
 `state.lock`, which serialises every registry read-modify-write across
 concurrent sessions. `Settings` (`~/.config/gpu-coordinator/config.toml`) is
-all optional and every key is in [setup.md](setup.md#settings).
+all optional and every key is in [setup.md](setup.md#configuration).
 
 ## Snakemake executor plugin
 
@@ -716,7 +715,7 @@ long|unix_listener` raises immediately even under `check=False`.
 
 Code sync is `rsync` of `git -c core.quotePath=false ls-files -z --cached
 --others --exclude-standard` (what that includes is
-[usage.md](usage.md#what-gets-synced-to-the-host)); `uncommitted.patch` is
+[usage.md](usage.md#quick-start)); `uncommitted.patch` is
 `transport.uncommitted_patch`, a `git diff HEAD -- .` against a throwaway
 index so it carries untracked files and never touches the user's staging.
 `put_file` writes 0600 content via stdin; secrets never touch argv.
@@ -962,7 +961,7 @@ Status is gathered across hosts in parallel (`actions.gather_all`).
 
 ## Status output
 
-What `status` prints, and every flag, is usage.md. The invariants:
+What `status` prints is usage.md, and every flag is `gpuc status --help`. The invariants:
 
 - **A host's `status` sends what was asked for, and what it costs grows with
   what the host holds now, not with its history.** Given ids it sends exactly

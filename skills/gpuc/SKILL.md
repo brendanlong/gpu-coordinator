@@ -363,5 +363,5 @@ Rules, and they are not optional:
   jobs that were running need resubmitting.
 
 Full reference in the repo: `README.md`, `docs/setup.md` (install, hosts,
-credentials), `docs/usage.md` (every command and failure mode),
+credentials), `docs/usage.md` (jobs, rentals, failure reasons),
 `docs/snakemake.md` (workflows), `docs/ARCHITECTURE.md` (the contract).
