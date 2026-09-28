@@ -12,10 +12,10 @@ eval-checkpoints behind it; gpuc status prints the card, the running job with
 its estimated finish, the queued job with its priority and projected start, and
 the job that finished before them; gpuc logs -f streams the training output as
 it is written; and a last gpuc status has the running job at 100% utilization
-and 29% done.](docs/media/cli.gif)
+and 28% done.](docs/media/cli.gif)
 
 The same recording as text, to copy from:
-[asciinema.org/a/fu8jgOVnwDi6dlYd](https://asciinema.org/a/fu8jgOVnwDi6dlYd).
+[asciinema.org/a/8PP1oe2TtjHESE0I](https://asciinema.org/a/8PP1oe2TtjHESE0I).
 
 ## The model
 
@@ -59,9 +59,9 @@ say and nothing a command could not tell you.
 running a fine-tune at 96% utilization. lab (ssh) has two A40s running a grid
 search, a third card marked shared and in use by somebody else, two jobs queued
 with their priorities and projected starts, and one that failed. a100-burst
-(runpod) is a rented pod billing $1.64 an hour for a job across both of its
-A100s. A running job's row carries Logs, Estimate, Preempt and Cancel; a queued
-one carries its priority, Reorder, and no Preempt.](docs/media/web-dashboard.png)
+(rental) is a RunPod pod billing $1.64 an hour for a job across both of its
+A100s. A running job's row carries Logs, Estimate, Limit, Preempt and Cancel; a
+queued one carries its priority and Set priority, and no Preempt.](docs/media/web-dashboard.png)
 
 A job's log opens in a panel over the list, and with `follow` ticked the page
 re-fetches its tail as the host writes it:
