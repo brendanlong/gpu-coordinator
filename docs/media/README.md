@@ -6,16 +6,18 @@ A real session against a real host: this machine, with a GPU. From a clean
 checkout (commit first; see `record_cli.sh` for why):
 
 ```sh
-docs/media/setup_demo.sh     # builds $DEMO, default ~/gpuc-demo, and seeds one finished job
+docs/media/setup_demo.sh     # builds $GPUC_DEMO, default ~/gpuc-demo, and seeds one finished job
 docs/media/record_cli.sh     # records demo.sh, renders the gif, cancels what it left running
 ```
 
-`setup_demo.sh` keeps everything in `$DEMO` — its own registry
+`setup_demo.sh` keeps everything in `$GPUC_DEMO` — its own registry
 (`GPUC_CONFIG_DIR`, `XDG_DATA_HOME`), a host added with its own `--gpuc-home`,
 and the project the specs run from — so nothing touches the registry you
 actually use. Keep that path short: `gpuc submit` prints where it synced to,
-and a long one wraps at 100 columns. To start over, run it again once the last
-recording's jobs are cancelled.
+and a long one wraps at 100 columns. The demo host owns one card,
+`$GPUC_DEMO_GPU` (default 0), and no other dispatcher knows it is there, so pick
+one nobody is using. Running the script again cancels the last run's jobs and
+starts over.
 
 `demo.sh` is the session itself: it types each command a character at a time
 and pauses after it. It needs `asciinema` and `agg`, the asciinema project's

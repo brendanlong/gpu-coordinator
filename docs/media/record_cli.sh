@@ -12,21 +12,30 @@
 # from a clean tree for the same reason.
 set -euo pipefail
 cd "$(dirname "$0")"
-DEMO=${DEMO:-$HOME/gpuc-demo}
+GPUC_DEMO=${GPUC_DEMO:-$HOME/gpuc-demo}
 export TERM=xterm-256color
 
-asciinema rec --overwrite --cols 100 --rows 32 -i 1.5 \
-  --title 'gpuc: submit a job, watch the queue' -c ./demo.sh "$DEMO/cli.cast"
-cp "$DEMO/cli.cast" cli.cast
-agg --theme github-dark --font-size 15 --fps-cap 12 --speed 1.15 \
-  --idle-time-limit 1.2 --last-frame-duration 4 cli.cast cli.gif
-
-# The recording ends with both jobs unfinished; free the card.
+for tool in asciinema agg; do
+  command -v "$tool" >/dev/null || { echo "$tool is not on PATH" >&2; exit 1; }
+done
 # shellcheck disable=SC1091
-source "$DEMO/env.sh"
-gpuc status --host workstation --json | python3 -c '
+source "$GPUC_DEMO/env.sh"
+
+# The recording ends with both jobs unfinished, and an aborted one may too.
+cancel_jobs() {
+  gpuc status --host workstation --json | python3 -c '
 import json, sys
 for h in json.load(sys.stdin)["hosts"]:
     for j in h["running"] + h["queued"]:
         print(j["job_id"])
 ' | xargs -r gpuc cancel
+}
+trap cancel_jobs EXIT
+
+asciinema rec --overwrite --cols 100 --rows 32 -i 1.5 \
+  --title 'gpuc: submit a job, watch the queue' -c ./demo.sh "$GPUC_DEMO/cli.cast"
+cancel_jobs
+trap - EXIT
+cp "$GPUC_DEMO/cli.cast" cli.cast
+agg --theme github-dark --font-size 15 --fps-cap 12 --speed 1.15 \
+  --idle-time-limit 1.2 --last-frame-duration 4 cli.cast cli.gif

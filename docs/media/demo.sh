@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The session `cli.gif` records: `record_cli.sh` runs it under asciinema, in
-# the $DEMO that `setup_demo.sh` built.
+# the $GPUC_DEMO that `setup_demo.sh` built.
 set -u
 
-DEMO=${DEMO:-$HOME/gpuc-demo}
+GPUC_DEMO=${GPUC_DEMO:-$HOME/gpuc-demo}
 # shellcheck disable=SC1091
-source "$DEMO/env.sh"
-cd "$DEMO/project" || exit 1
+source "$GPUC_DEMO/env.sh"
+cd "$GPUC_DEMO/project" || exit 1
 
 PROMPT='\033[1;32m$\033[0m '
 

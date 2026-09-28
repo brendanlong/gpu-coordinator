@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
-# Builds $DEMO for `record_cli.sh`: a scratch registry, a local host with its
+# Builds $GPUC_DEMO for `record_cli.sh`: a scratch registry, a local host with its
 # own gpuc home, a project with the two specs `demo.sh` submits, and one
 # finished job so `gpuc status` has a `done` line. Needs a local GPU.
 #
 # The gpuc it puts on PATH is this checkout's, so the recording shows the code
-# in the tree and bootstrap ships it. Rerunning starts over, so do it once
-# `record_cli.sh` has cancelled the jobs it left and the dispatcher has idled out.
+# in the tree and bootstrap ships it. Rerunning cancels the last run's jobs
+# and starts over.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-DEMO=${DEMO:-$HOME/gpuc-demo}
+DEMO=${GPUC_DEMO:-$HOME/gpuc-demo}
 
-rm -rf "$DEMO"
+if [ -e "$DEMO" ]; then
+  if [ ! -f "$DEMO/env.sh" ]; then
+    echo "$DEMO exists and is not a demo this script built; set GPUC_DEMO elsewhere" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  source "$DEMO/env.sh"
+  gpuc status --host workstation --json 2>/dev/null | python3 -c '
+import json, sys
+for h in json.load(sys.stdin)["hosts"]:
+    for j in h["running"] + h["queued"]:
+        print(j["job_id"])
+' | xargs -r gpuc cancel || true
+  rm -rf "$DEMO"
+fi
 mkdir -p "$DEMO/project"
 (cd "$REPO" && uv sync --frozen -q)
 
 cat >"$DEMO/env.sh" <<EOF
-export GPUC_CONFIG_DIR=$DEMO/config
-export XDG_DATA_HOME=$DEMO/data
-export PATH=$REPO/.venv/bin:\$PATH
+export GPUC_CONFIG_DIR="$DEMO/config"
+export XDG_DATA_HOME="$DEMO/data"
+export PATH="$REPO/.venv/bin:\$PATH"
 EOF
 # shellcheck disable=SC1091
 source "$DEMO/env.sh"
@@ -67,8 +81,6 @@ progress_interval_s: 5
 EOF
 }
 spec sft-qwen3-4b 300 sft 50 2 >job.yaml
-# A higher priority than job.yaml, so it queues behind the running job rather
-# than starting beside it on a free card.
 spec eval-checkpoints 60 eval 30 1 >eval.yaml
 spec sft-qwen3-4b-lr1e5 20 sft 50 1 >seed.yaml
 printf 'results/\n.venv/\n' >.gitignore
@@ -78,7 +90,10 @@ git add -A
 git commit -qm demo
 
 gpuc config init >/dev/null
-gpuc host add workstation --gpuc-home "$DEMO/gpuc-home"
+# One card, so the second job queues behind the first instead of starting
+# beside it. Its dispatcher knows nothing of any other on this machine, so pick
+# a card nobody else is using: GPUC_DEMO_GPU, default 0.
+gpuc host add workstation --gpuc-home "$DEMO/gpuc-home" --gpus "${GPUC_DEMO_GPU:-0}"
 gpuc host bootstrap workstation
 seed=$(gpuc submit seed.yaml --host workstation --json | python3 -c 'import json, sys; print(json.load(sys.stdin)["job_id"])')
 gpuc wait "$seed"
