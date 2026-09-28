@@ -8,7 +8,7 @@
 | --- | --- |
 | [docs/SPEC.md](docs/SPEC.md) | goals and non-goals. Every change is checked against it; where it and anything else disagree, the spec wins. Included below |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the contract the code keeps: on-host state, dispatcher and runner rules, transport, testing rules, code conventions |
-| [docs/setup.md](docs/setup.md), [docs/usage.md](docs/usage.md) | user-facing behaviour: install, hosts, the job spec, every command, failure reasons, `--json` schemas |
+| [docs/setup.md](docs/setup.md), [docs/usage.md](docs/usage.md) | the user's guide: install, adding hosts, writing and running jobs, failure reasons. Short on purpose |
 | [skills/gpuc/SKILL.md](skills/gpuc/SKILL.md) | the agent guide, shipped in the wheel; `gpuc skill` prints it |
 | [README.md](README.md) | the short public overview |
 | [docs/media/README.md](docs/media/README.md) | the README's recording and screenshots, and how to make them again when the CLI's output or the dashboard changes |
@@ -33,8 +33,11 @@ Each doc has an altitude, and a fact belongs at exactly one of them:
   the exceptions it has grown.
 - **ARCHITECTURE.md** -- the invariant a second implementation would have to
   hold to, not a walkthrough of the code that holds it.
-- **usage.md**, **setup.md** -- what a user does and what the tool does back:
-  flags, refusals, exit codes, schemas. Not why it works that way.
+- **usage.md**, **setup.md** -- what a user needs to set up and run jobs, at
+  the level of a task: which commands, what they do, what to do when they
+  fail. Not how it works inside, and not every flag.
+- **`--help`** -- every flag and its default. The `--json` documents are
+  described by the code that builds them.
 - **docstrings** -- the *why*. Every "because", the incident that motivated a
   rule, the option that was rejected.
 
