@@ -15,7 +15,7 @@ it is written; and a last gpuc status has the running job at 100% utilization
 and 28% done.](docs/media/cli.gif)
 
 The same recording as text, to copy from:
-[asciinema.org/a/fu8jgOVnwDi6dlYd](https://asciinema.org/a/fu8jgOVnwDi6dlYd).
+[asciinema.org/a/8PP1oe2TtjHESE0I](https://asciinema.org/a/8PP1oe2TtjHESE0I).
 
 ## The model
 
