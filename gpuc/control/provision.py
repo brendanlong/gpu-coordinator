@@ -334,7 +334,18 @@ def _try_offer(
     except CreateRefused:
         raise
     except BaseException as exc:
-        _sweep_failed_create(provider, name, progress, deps, _first_line(exc), billing)
+        try:
+            settled = _sweep_failed_create(
+                provider, name, progress, deps, _first_line(exc), billing
+            )
+        except KeyboardInterrupt:
+            progress(f"WARNING: interrupted while looking for {name}; it may be billing")
+            billing.append(f"{name} (id unknown)")
+            raise
+        if not settled and isinstance(exc, Exception):
+            raise Unprovisionable(
+                f"{name} may still be billing, so no other pod is bought: {_first_line(exc)}"
+            ) from exc
         raise
     created_at = utc_now()
     progress(
@@ -452,13 +463,14 @@ def _sweep_failed_create(
     deps: ProvisionDeps,
     reason: str,
     billing: list[str],
-) -> None:
+) -> bool:
     """A create that failed without the provider refusing it -- a timeout, a
     5xx, a response that did not parse, a Ctrl-C -- may have bought a pod
     anyway, and moving on to the next offer would bill for both. The name is
     unique to this attempt, so any pod listed under it is this create's. It
     is looked for a little while, since a create still in flight when the
-    connection dropped can land after the error."""
+    connection dropped can land after the error. False if a pod may still
+    be billing, and buying another would double it."""
     progress(f"create of {name} failed ({reason}); checking whether a pod was made anyway")
     listed = False
     for poll in range(CREATE_SWEEP_POLLS):
@@ -475,12 +487,13 @@ def _sweep_failed_create(
             if not _abandon(provider, name, pod.id, progress, deps, "its create failed"):
                 billing.append(pod.id)
         if found:
-            return
+            return not any(pod.id in billing for pod in found)
     if listed:
         progress(f"no pod named {name} appeared; the create made nothing")
-    else:
-        progress(f"WARNING: could not ask whether {name} was created; it may be billing")
-        billing.append(f"{name} (id unknown)")
+        return True
+    progress(f"WARNING: could not ask whether {name} was created; it may be billing")
+    billing.append(f"{name} (id unknown)")
+    return False
 
 
 def _poll_failure(exc: Exception, what: str, progress: _Progress) -> None:

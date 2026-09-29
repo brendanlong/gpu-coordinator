@@ -918,7 +918,8 @@ name to its class. Adding a provider is one class and one table entry.
    to the next offer. Any other failure, a timeout, a 5xx, an unparseable
    answer or a Ctrl-C, looks for a pod under the attempt's unique name for
    a short while, and terminates what it finds before anything else is
-   bought. A pod it cannot look for is reported as possibly billing.
+   bought. One it cannot look for, or cannot terminate, is reported as
+   possibly billing and ends the attempt.
 5. From bootstrap on, the only things that end the pod are the pod itself,
    through that pod-scoped key, and a client running `gpuc host terminate`.
 

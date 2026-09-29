@@ -7,6 +7,7 @@ for real; only the provider and `nvidia-smi` are stood in for.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import re
@@ -911,13 +912,59 @@ def test_a_create_that_made_nothing_goes_on_to_the_next_offer(
 def test_a_lost_create_that_cannot_be_looked_for_is_reported_as_billing(
     control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
+    """And no other pod is bought while it might be."""
     provider = FakeProvider(
-        [make_offer()], scripts=[PodScript(lost_create=ProviderError("timed out"))]
+        [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")],
+        scripts=[PodScript(lost_create=ProviderError("timed out")), PodScript()],
     )
     provider.list_error = ProviderError("HTTP 503")
     with pytest.raises(ProvisionError) as error:
         run(provider, host, offline_health)
     assert "(id unknown) could NOT be terminated" in str(error.value)
+    assert len(provider.created) == 1
+
+
+def test_a_lost_create_that_cannot_be_terminated_stops_the_attempt(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    class Unkillable(FakeProvider):
+        def terminate(self, pod_id: str) -> None:
+            raise ProviderError("HTTP 503")
+
+    provider = Unkillable(
+        [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")],
+        scripts=[PodScript(lost_create=ProviderError("timed out")), PodScript()],
+    )
+    with pytest.raises(ProvisionError) as error:
+        run(provider, host, offline_health)
+    assert "pod1 could NOT be terminated" in str(error.value)
+    assert len(provider.created) == 1
+
+
+def test_a_second_interrupt_while_looking_still_reports_the_pod(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    provider = FakeProvider(
+        [make_offer()],
+        scripts=[PodScript(lost_create=KeyboardInterrupt(), hidden_for_lists=5)],
+    )
+    interrupts = iter([KeyboardInterrupt()])
+
+    def sleep(_: float) -> None:
+        raise next(interrupts)
+
+    reports: list[str] = []
+    with pytest.raises(KeyboardInterrupt):
+        provision(
+            CONSTRAINTS,
+            Settings(),
+            provider=provider,
+            name_hint="e2e",
+            report=reports.append,
+            health_options=offline_health,
+            deps=dataclasses.replace(deps(host), sleep=sleep),
+        )
+    assert any("interrupted while looking" in line for line in reports)
 
 
 def test_an_interrupted_create_terminates_the_pod_it_made(

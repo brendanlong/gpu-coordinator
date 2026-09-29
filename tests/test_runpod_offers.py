@@ -212,3 +212,21 @@ def test_only_a_4xx_create_is_a_refusal(status: int, refused: bool) -> None:
     with pytest.raises(ProviderError) as error:
         provider.create(offer, "gpuc-x")
     assert isinstance(error.value, CreateRefused) is refused
+
+
+@pytest.mark.parametrize("answer", [{"unexpected": 1}, ["not", "a", "pod"]])
+def test_an_unreadable_create_answer_is_a_provider_error(answer: Any) -> None:
+    """The pod may exist, so provisioning must see a failure it can sweep up
+    after and move past, not a crash."""
+
+    class Garbled(RecordedRunPod):
+        def _json(self, method: str, path: str, **kwargs: Any) -> Any:
+            if method == "POST" and path == "/pods":
+                return answer
+            return super()._json(method, path, **kwargs)
+
+    provider = Garbled()
+    offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
+    with pytest.raises(ProviderError) as error:
+        provider.create(offer, "gpuc-x")
+    assert not isinstance(error.value, CreateRefused)

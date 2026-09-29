@@ -229,7 +229,12 @@ class RunPodProvider(Provider):
             if 400 <= error.status < 500:
                 raise CreateRefused(str(error)) from error
             raise
-        return _pod_from_api(created)
+        except ValueError as error:
+            raise ProviderError(f"POST /pods: unreadable answer: {error}") from error
+        try:
+            return _pod_from_api(created)
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise ProviderError(f"POST /pods: unexpected answer: {error!r}") from error
 
     def get(self, pod_id: str) -> Pod | None:
         try:
