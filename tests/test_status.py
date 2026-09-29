@@ -1213,3 +1213,16 @@ def test_a_running_auto_preempt_job_says_which_job_it_yields_to() -> None:
     )
     assert running[0].yields_to == "j-wide" and queued[0].yields_to is None
     assert "auto-preempt, yields to j-wide" in render(busy(running[0]))
+
+
+def test_a_queue_another_machine_serves_is_the_one_warning() -> None:
+    view = HostView(
+        entry=host_entry(name="gpubox", kind="ssh", ssh="me@box"),
+        state=HostState.ANSWERED,
+        served_by="other-boot/123",
+    )
+    assert host_warnings(view) == [
+        "another machine (other-boot/123) serves this host's queue, so no dispatcher "
+        "started here will; see its dispatcher.log"
+    ]
+    assert "WARNING another machine" in render(view)

@@ -179,9 +179,9 @@ dispatcher.lock      # fd flock held by the running dispatcher
 dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
 draining             # present while the host is shutting itself down
-owner.json           # {"instance": "<hostname>/<boot id>", "since": str}: the machine serving
-                     # this queue; its mtime is renewed by that dispatcher's heartbeat.
-                     # See Dispatcher
+owner.json           # {"instance": "<boot id>/<pid 1 start>", "host": str, "since": str}:
+                     # the machine serving this queue; its mtime is renewed by that
+                     # dispatcher's heartbeat. See Dispatcher
 ```
 
 A job's `state.json` is the one record of what it is doing and what has been
@@ -264,20 +264,23 @@ The rules it holds to:
   A holder whose heartbeat is stale (30 s) is killed by the pgid in the lock
   body and taken over.
 - **One machine serves a queue** (`owner.py`). A dispatcher claims
-  `owner.json` before adopting anything, once whoever it names has not
-  renewed it for `owner.STALE_S`, waiting `owner.CLAIM_WAIT_S` for that and
-  exiting without touching the queue if it stays fresh. Its heartbeat renews
-  the claim, never another's. The instance is taken once per process and
-  handed to runners in `GPUC_OWNER_INSTANCE`, so a hostname that changes
-  under a running host is not a takeover. Anything of a machine that finds
-  another instance there writes nothing more: the dispatcher stops at the
-  start of a pass, before a spawn and before a terminate; each runner
-  SIGKILLs its phase and exits at once (`JobRunner._stand_down_if_replaced`,
-  every `owner.CHECK_S` and before the writes that end an attempt). The new
-  owner queues their jobs again, at adoption and every `REQUEUE_SCAN_S` for a
-  claim the old machine made after it. Detection, not prevention: where
-  `flock` works across machines the lock above keeps a second dispatcher out
-  anyway.
+  `owner.json` before adopting anything, once whoever it names has gone
+  quiet: its mtime unchanged for `owner.STALE_S` on the newcomer's own clock
+  (the mtime was set by another machine's, or a file server's), watched for
+  up to `owner.CLAIM_WAIT_S`; one older than `owner.LONG_GONE_S` is claimed at
+  once. Still renewed, it exits without touching the queue, and the host's
+  `status` says who serves it (`served_by`). Its heartbeat renews the claim,
+  never another's. The instance is the boot (kernel boot id and pid 1's
+  start), so a hostname change is not a takeover and a container restart is.
+  Anything of a machine that finds another instance there writes nothing
+  more: the dispatcher stops before a pass, a spawn, a terminate or a write
+  for a dead runner; each runner SIGKILLs its phase and exits at once
+  (`JobRunner._stand_down_if_replaced`, every `owner.CHECK_S` and before the
+  writes that end an attempt). The new owner queues their jobs again, at
+  adoption and, for `REQUEUE_WINDOW_S` after a takeover, every
+  `REQUEUE_SCAN_S` for a claim the old machine made late. Detection, not
+  prevention: where `flock` works across machines the lock above keeps a
+  second dispatcher out anyway.
 - **A dispatcher started from the package on disk replaces one that is not.**
   The lock body records the `pkg_commit` its holder started from; a holder
   whose commit *differs* (`_is_another_build`: different, not older; an

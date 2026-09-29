@@ -23,6 +23,7 @@ from gpuc.host import (
     gpus,
     health,
     jobs,
+    owner,
     paths,
     plan,
     queue,
@@ -349,6 +350,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),
                 "dispatcher_heartbeat_age_s": None if heartbeat is None else round(heartbeat, 1),
+                # Another machine's claim on this queue, which keeps any
+                # dispatcher started here from serving it.
+                "served_by": owner.replaced_by(owner.instance()),
                 "queue": [
                     {"priority": state.priority, "job_id": job_id}
                     for job_id, state in sorted(

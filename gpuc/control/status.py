@@ -323,6 +323,8 @@ class HostView:
     lost_reason: str | None = None
     """Why those jobs went with the host."""
     heartbeat_age_s: float | None = None
+    served_by: str | None = None
+    """Another machine the host's queue says is serving it; see `owner`."""
     draining: bool = False
     cards: list[CardView] = field(default_factory=list)
     """The cards this host owns, then those it may borrow, as the host itself
@@ -577,6 +579,7 @@ def parse_status(entry: HostEntry, asked: Asked) -> HostView:
     # a string here, and formatting it would take out the whole `gpuc status`,
     # not just this host's line.
     view.heartbeat_age_s = _as_float(payload.get("dispatcher_heartbeat_age_s"))
+    view.served_by = _as_str(payload.get("served_by"))
     view.draining = bool(payload.get("draining"))
     view.queue, view.running, view.finished = job_views(payload)
     view.finished_count = _as_int(payload.get("finished_count"))
@@ -1021,10 +1024,11 @@ def render(
 def host_warnings(view: HostView) -> list[str]:
     """What the host says about itself that this machine has not caught up with.
 
-    Only the build: the host owns its config, so a config here that differs
-    from the host's is a stale cache and not a disagreement -- everything that
-    acts on a host reads `config.json` first, and this block already prints the
-    host's own answer for the cards. What the host cannot fix by itself is the
+    Another machine serving the queue, then the build: the host owns its
+    config, so a config here that differs from the host's is a stale cache and
+    not a disagreement -- everything that acts on a host reads `config.json`
+    first, and this block already prints the host's own answer for the cards.
+    What the host cannot fix by itself is the
     package: whichever machine bootstrapped it last is what it runs, and that
     may be a laptop on a newer build as easily as this machine on an older one.
 
@@ -1033,6 +1037,12 @@ def host_warnings(view: HostView) -> list[str]:
     """
     if not view.reachable:
         return []
+    if view.served_by:
+        # Before the build: no dispatcher here serves anything while it holds.
+        return [
+            f"another machine ({view.served_by}) serves this host's queue, so no dispatcher "
+            f"started here will; see its dispatcher.log"
+        ]
     stale = version.host_build_warning(view.entry.name, view.pkg_commit, version.local_commit())
     if stale:
         # One problem, one fix. A host whose *package* is behind is already
@@ -1237,6 +1247,7 @@ def host_json(
             "alive": view.dispatcher_alive,
             "heartbeat_age_s": view.heartbeat_age_s,
             "pkg_commit": view.dispatcher_pkg_commit,
+            "served_by": view.served_by,
         },
         "provider_util": list(view.pod.gpu_utils) if view.pod is not None else None,
         "pod": pod_json(view),

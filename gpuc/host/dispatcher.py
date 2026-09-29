@@ -53,6 +53,10 @@ from gpuc.host.terminate import TerminateCall
 
 HEARTBEAT_INTERVAL_S = 5.0
 REQUEUE_SCAN_S = 30.0
+REQUEUE_WINDOW_S = 600.0
+"""How long after a takeover to keep looking for jobs the old machine
+claimed late: its runners check the owner record every few seconds and
+before every claim, so anything it could still claim is long settled."""
 HEARTBEAT_STALE_S = 30.0
 LOOP_INTERVAL_S = 2.0
 SYNC_STOP_PATIENCE_S = 1800.0
@@ -585,6 +589,7 @@ class Dispatcher:
     replaced: str | None = None
     """The instance that took this queue over, once one has."""
     _last_requeue_scan: float | None = None
+    _requeue_until: float | None = None
     _stop_sent: dict[str, float] = field(default_factory=dict)
     """When this dispatcher first saw each running job's stop intent, so the
     ladder in `escalate_stops` has a clock even for a request another process
@@ -655,6 +660,8 @@ class Dispatcher:
         return "draining" if self._draining else None
 
     def _fail_queued(self, job_id: str, reason: str) -> None:
+        if self._stand_down_if_replaced():
+            return
         """End a queued job without a runner: a spec that cannot be read, a
         request this host can never meet, a runner that could not be spawned.
         The listing forgets the job with it, and its secrets go: the runner
@@ -712,6 +719,8 @@ class Dispatcher:
                 self._mark_runner_died(job_id, expect="running")
 
     def _requeue_after_restart(self, job_id: str) -> None:
+        if self._stand_down_if_replaced():
+            return
         """Queue again, or end, a job whose runner the last boot took with it;
         an ended one's secrets go as for any job ended without its runner."""
         try:
@@ -736,6 +745,10 @@ class Dispatcher:
         self._settle_secrets(job_id, written)
 
     def _mark_runner_died(self, job_id: str, *, expect: str) -> None:
+        if self._stand_down_if_replaced():
+            # A runner that stood down for the new owner exited without a
+            # word; it did not die, and its job is not ours to fail.
+            return
         """Fail the job whose runner is gone, after making sure nothing of it
         is left on the GPUs.
 
@@ -1583,10 +1596,13 @@ class Dispatcher:
 
         At startup `adopt_orphans` does it; this catches the one a runner on
         the machine this one took over from claimed after that, before it saw
-        the takeover and stood down without a word. Every `REQUEUE_SCAN_S`,
-        since it reads every job's state.
+        the takeover and stood down without a word. Only for
+        `REQUEUE_WINDOW_S` after a takeover, every `REQUEUE_SCAN_S`, since it
+        reads every job's state.
         """
         now = self.deps.monotonic()
+        if self._requeue_until is None or now > self._requeue_until:
+            return
         if self._last_requeue_scan is not None and now - self._last_requeue_scan < REQUEUE_SCAN_S:
             return
         self._last_requeue_scan = now
@@ -1615,8 +1631,8 @@ class Dispatcher:
                 return 0
             if previous is not None:
                 self.log(f"taking this queue over from {previous}")
+                self._requeue_until = self.deps.monotonic() + REQUEUE_WINDOW_S
             lock.owner = self.instance
-            os.environ[owner.INSTANCE_ENV] = self.instance
             self._guard(self.adopt_orphans)
             while not self.should_exit:
                 lock.beat()

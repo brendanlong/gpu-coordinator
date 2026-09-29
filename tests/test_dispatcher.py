@@ -2752,15 +2752,16 @@ def ticking_clock(dispatcher: Dispatcher) -> FakeClock:
     return clock
 
 
-def test_a_dispatcher_takes_over_a_queue_whose_owner_stopped_renewing(gpuc_home: Path) -> None:
+def test_a_dispatcher_takes_over_a_queue_whose_owner_went_quiet(gpuc_home: Path) -> None:
     from gpuc.host.dispatcher import DispatcherLock
 
-    another_machine_owns_the_queue(renewed_s_ago=owner.STALE_S + 1)
+    another_machine_owns_the_queue()
     dispatcher, _ = make_dispatcher()
-    ticking_clock(dispatcher)
+    clock = ticking_clock(dispatcher)
     lock = DispatcherLock()
     assert lock.acquire()
     assert dispatcher.run(lock) == 0
+    assert owner.STALE_S <= clock.t - 1000.0 <= owner.CLAIM_WAIT_S
     record = owner.current()
     assert record is not None and record[0] == dispatcher.instance
     assert "taking this queue over from another-pod/another-boot" in (
@@ -2779,7 +2780,7 @@ def test_a_dispatcher_leaves_a_queue_its_owner_is_still_renewing(gpuc_home: Path
 
     def renewing(seconds: float) -> None:
         clock.advance(seconds)
-        another_machine_owns_the_queue()
+        another_machine_owns_the_queue(renewed_s_ago=-(clock.t - 1000.0))
 
     dispatcher.deps.sleep = renewing
     another_machine_owns_the_queue()
@@ -2793,21 +2794,22 @@ def test_a_dispatcher_leaves_a_queue_its_owner_is_still_renewing(gpuc_home: Path
     )
 
 
-def test_a_newcomer_waits_for_a_claim_that_has_just_stopped_being_renewed(
+def test_quiet_is_judged_on_this_machines_clock_not_the_records_mtime(
     gpuc_home: Path,
 ) -> None:
-    another_machine_owns_the_queue()
+    """A record stamped far in the future by a skewed clock still goes quiet,
+    and one stamped a little in the past is still watched."""
+    another_machine_owns_the_queue(renewed_s_ago=-3600)
     clock = FakeClock()
-    renewed = time.time()
+    assert owner.claim("me/boot", sleep=clock.advance, now=clock) == ("another-pod/another-boot")
+    assert clock.t - 1000.0 >= owner.STALE_S
 
-    def the_other_is_silent(seconds: float) -> None:
-        clock.advance(seconds)
-        stamp = renewed - (clock.t - 1000.0)
-        os.utime(paths.owner_file(), (stamp, stamp))
 
-    previous = owner.claim("me/boot", sleep=the_other_is_silent, now=clock)
-    assert previous == "another-pod/another-boot"
-    assert owner.STALE_S <= clock.t - 1000.0 <= owner.CLAIM_WAIT_S
+def test_a_record_long_gone_is_claimed_without_waiting(gpuc_home: Path) -> None:
+    another_machine_owns_the_queue(renewed_s_ago=owner.LONG_GONE_S + 60)
+    clock = FakeClock()
+    assert owner.claim("me/boot", sleep=clock.advance, now=clock) == ("another-pod/another-boot")
+    assert clock.t == 1000.0
 
 
 def test_a_beat_renews_only_its_own_claim(gpuc_home: Path) -> None:
@@ -2820,12 +2822,12 @@ def test_a_beat_renews_only_its_own_claim(gpuc_home: Path) -> None:
     os.utime(paths.owner_file(), (stale, stale))
     lock.beat(force=True)
     record = owner.current()
-    assert record is not None and record[1] < 5
+    assert record is not None and record[1] > stale + 50
     another_machine_owns_the_queue(renewed_s_ago=100)
     lock.beat(force=True)
     record = owner.current()
     assert record is not None and record[0] == "another-pod/another-boot"
-    assert record[1] > 50
+    assert record[1] < time.time() - 50
 
 
 def test_a_replaced_dispatcher_writes_nothing_and_exits(gpuc_home: Path) -> None:
@@ -2877,11 +2879,23 @@ def test_a_job_claimed_after_the_takeover_by_the_old_machine_is_queued_again(
     dispatcher.run_once()
     job_id = queue.enqueue(make_spec(gpus=1))
     ran_before_a_restart(job_id)
-    dispatcher.deps.monotonic.advance(host_dispatcher.REQUEUE_SCAN_S + 1)  # type: ignore[attr-defined]
+    dispatcher._requeue_until = dispatcher.deps.monotonic() + host_dispatcher.REQUEUE_WINDOW_S
     dispatcher.run_once()
     state = jobs.read_state(job_id)
     assert state.attempt == 2
     assert state.status in {"queued", "running"}
+
+
+def test_a_runner_that_stood_down_is_not_failed_as_dead(gpuc_home: Path) -> None:
+    """It exited without claiming because another machine took the queue in
+    this very pass; the job is the new owner's to run."""
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher(claim=False)
+    dispatcher.run_once()
+    another_machine_owns_the_queue()
+    spawned[job_id].returncode = 0
+    dispatcher.reap()
+    assert jobs.read_state(job_id).status == "queued"
 
 
 def test_a_queue_nobody_has_claimed_is_ours(gpuc_home: Path) -> None:

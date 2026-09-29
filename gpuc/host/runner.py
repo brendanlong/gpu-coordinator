@@ -196,7 +196,7 @@ class JobRunner:
         """Whether `main` has begun, which is what `Outcome.ran` reports: the
         final upload and the no-outputs check are for a job that produced
         something, and only `main` does."""
-        self.instance = owner.inherited()
+        self.instance = owner.instance()
         self._next_owner_check = 0.0
         self._ending = False
         """Set once the attempt is on its way out: by the signal handler as it
