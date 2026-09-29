@@ -2,7 +2,8 @@
 
 A host owns its `config.json` -- its cards, its mirror, its env, its timers --
 so `gpuc host add` is a *connect*: read that file, and if it is there, adopt
-it. A second control machine meeting a host the first one set up is therefore
+it (and `add` then bootstraps a host that is not on this build). A second
+control machine meeting a host the first one set up is therefore
 the ordinary path and not a special one, and nothing about the machine that
 bootstrapped a host first matters afterwards. Only a host that has no config at
 all is configured from the flags that registered it (`config.first_config`),

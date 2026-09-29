@@ -161,14 +161,23 @@ def add_host(
     warnings: list[str] = []
     if not connection.adopted and not _owned(entry):
         warnings.append(_owns_nothing_warning(entry, fields, probed))
-    stale = version.is_other_build(entry.config.pkg_commit, version.local_commit())
-    if pod_id and stale and health is None:
-        # A pod nobody has set up has no dispatcher, so nothing will ever idle
-        # it out: it bills until bootstrap gives it one or a person ends it.
-        warnings.append(
-            f"nothing has bootstrapped this pod, so nothing on it will ever terminate it: "
-            f"`gpuc host bootstrap {entry.name}` gives it a dispatcher that does"
-        )
+    never_bootstrapped = not entry.config.pkg_commit
+    # A config naming this build over a home that lost uv is a persistent root
+    # whose `$HOME` was wiped: current on paper, and nothing can run there.
+    stale = (
+        never_bootstrapped
+        or version.is_other_build(entry.config.pkg_commit, version.local_commit())
+        or probed.sections.get("uv") == "not installed"
+    )
+    # A pod nobody has set up has no dispatcher, so nothing will ever idle it
+    # out: it bills until bootstrap gives it one or a person ends it.
+    unowned_pod = (
+        f"nothing has bootstrapped this pod, so nothing on it will ever terminate it: "
+        f"`gpuc host bootstrap {entry.name}` gives it a dispatcher that does, and "
+        f"`gpuc host terminate {entry.name}` ends it"
+    )
+    if pod_id and never_bootstrapped and health is None:
+        warnings.append(unowned_pod)
     lines = [_added_line(entry, connection, name)]
     lines += [f"  {warning}" for warning in warnings]
     if stale and health is None:
@@ -179,14 +188,20 @@ def add_host(
     document["bootstrap"] = document["bootstrap_error"] = None
     failures: list[str] = []
     if health is not None and stale:
+        registered = f"host {entry.name} is registered, but"
+        retry = f"run: gpuc host bootstrap {entry.name}"
+        if pod_id and never_bootstrapped:
+            retry += f"\n{unowned_pod}"
         try:
             result = bootstrap_and_record(entry, settings, health, report)
             document["bootstrap"] = result.document()
+        except KeyboardInterrupt:
+            document["bootstrap_error"] = "interrupted"
+            raise Interrupted(
+                f"{registered} its bootstrap was interrupted; {retry}", document
+            ) from None
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
-            failures.append(
-                f"host {entry.name} is registered, but bootstrapping it failed: {exc}\n"
-                f"Fix that, then run: gpuc host bootstrap {entry.name}"
-            )
+            failures.append(f"{registered} bootstrapping it failed: {exc}\nFix that, then {retry}")
             document["bootstrap_error"] = str(exc)
     return HostChange(document, [], failures=failures)
 

@@ -8,7 +8,7 @@ from typing import Any, cast
 import pytest
 
 from gpuc.control import version as version_mod
-from gpuc.control.bootstrap import BootstrapResult, HealthOptions
+from gpuc.control.bootstrap import BootstrapError, BootstrapResult, HealthOptions
 from gpuc.control.clean import purge_host
 from gpuc.control.cli import (
     EXIT_ERROR,
@@ -93,6 +93,52 @@ def test_host_add_keeps_a_host_whose_bootstrap_failed(
     err = capsys.readouterr().err
     assert "is registered, but bootstrapping it failed" in err
     assert "gpuc host bootstrap gpubox" in err
+
+
+def test_host_add_failed_bootstrap_is_one_json_document(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_host.put_file(
+        '{"host": "gpubox", "gpus": ["0"], "shared_gpus": ["0"]}', fake_host.config_path
+    )
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--json"]) == EXIT_ERROR
+    document = json.loads(capsys.readouterr().out)
+    assert document["name"] == "gpubox"
+    assert document["bootstrap"] is None and document["bootstrap_error"]
+
+
+def test_host_add_bootstraps_a_fresh_host_even_when_this_build_has_no_commit(
+    control_env: Path,
+    fake_host: FakeHost,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wheel with no git metadata knows no commit, which makes every build
+    compare equal; a host with none on it still has nothing installed."""
+    monkeypatch.setattr("gpuc.control.hosts.version.local_commit", lambda: None)
+    called: list[str] = []
+    monkeypatch.setattr(
+        "gpuc.control.hosts.bootstrap_and_record",
+        lambda entry, *a, **k: called.append(entry.name) or BootstrapResult("local", "~", 0, 1),
+    )
+    assert main(["host", "add", "local", "--gpus", GPU]) == 0
+    assert called == ["local"]
+
+
+def test_host_add_says_where_it_stands_when_ctrl_c_lands_in_the_bootstrap(
+    control_env: Path,
+    fake_host: FakeHost,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt(*_: Any, **__: Any) -> BootstrapResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("gpuc.control.hosts.bootstrap_and_record", interrupt)
+    assert main(["host", "add", "local", "--gpus", GPU]) == 130
+    assert "local" in load_registry().hosts
+    err = capsys.readouterr().err
+    assert "its bootstrap was interrupted" in err and "gpuc host bootstrap local" in err
 
 
 def test_host_add_adopts_the_config_a_host_already_has(
@@ -1718,7 +1764,7 @@ def test_submit_refuses_a_host_nobody_has_ever_bootstrapped(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`host add` writes a config; it does not install anything. Re-shipping
+    """`host add --no-bootstrap` writes a config and installs nothing. Re-shipping
     the package to such a host would start a dispatcher with no uv under it,
     and the job would fail there instead of here."""
     job = tmp_path / "job.yaml"
@@ -2889,6 +2935,27 @@ def test_host_add_pod_and_ssh_are_the_same_question_twice(
 ) -> None:
     adoptable(monkeypatch, fake_host)
     assert main(["host", "add", "rented", "--pod", "pod1", "--ssh", "me@box"]) == EXIT_USAGE
+
+
+def test_a_pod_whose_bootstrap_failed_says_it_will_not_end_itself(
+    control_env: Path,
+    fake_host: FakeHost,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    provider = FakeProvider()
+    provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
+
+    def fail(*_: Any, **__: Any) -> BootstrapResult:
+        raise BootstrapError("host health failed")
+
+    monkeypatch.setattr("gpuc.control.hosts.bootstrap_and_record", fail)
+    assert main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "nothing on it will ever terminate it" in err
+    assert "gpuc host terminate rented" in err
 
 
 def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(

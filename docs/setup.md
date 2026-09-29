@@ -40,8 +40,8 @@ driver, disk and network. A host already on this build is not bootstrapped
 again. If the bootstrap fails the host stays registered; fix what it names and
 run `gpuc host bootstrap gpubox`.
 
-Adding a host that was already set up from another of your machines adopts it
-as it is. Give the same `--persistent-root` or `--gpuc-home` the first machine
+Adding a host that was already set up from another of your machines adopts its
+config and queue as they are, and brings it to this machine's gpuc build. Give the same `--persistent-root` or `--gpuc-home` the first machine
 used, if any (`gpuc host list --json` there), or you will get a second, empty
 queue.
 

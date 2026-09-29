@@ -157,8 +157,9 @@ Run the controller on the GPU host, with that host registered there as
 `local`, and give every input and output an absolute path outside the job
 workdirs. Registering it on itself is safe on a host another machine already
 drives: `gpuc host add local` is a [connect](setup.md#add-a-host), so
-it adopts the same config and queue. Rules without a GPU run there too, next
-to the outputs.
+it adopts the same config and queue (and, if this machine's gpuc is a
+different build, re-ships it without disturbing running jobs). Rules without a
+GPU run there too, next to the outputs.
 
 ```python
 R = "/home/me/myproject-results"
