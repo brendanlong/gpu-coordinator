@@ -233,9 +233,6 @@ gpuc wait "$id" || echo "failed"
 ## When a job fails
 
 `gpuc status <job-id>` gives the reason and `gpuc logs <job-id>` the detail.
-A job that was running when its host restarted is not failed: it is queued
-again and starts over once gpuc runs there again (after `gpuc host bootstrap`,
-if the restart took gpuc with it).
 
 | reason | meaning |
 | --- | --- |
