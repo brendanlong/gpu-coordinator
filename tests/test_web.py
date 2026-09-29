@@ -418,7 +418,7 @@ def test_an_unreadable_registry_is_503_with_the_reason(logged_in: Client) -> Non
 
 
 class StubSession:
-    """A `HostSession` that answers `host_json`/`host_cli`/`tail` from a script."""
+    """A `HostSession` that answers `host_json`/`host_cli`/`run` from a script."""
 
     def __init__(self, answers: list[dict[str, Any]], *, log: str = "line 1\nline 2\n") -> None:
         self.answers = answers
@@ -440,8 +440,8 @@ class StubSession:
     def job_dir(self, job_id: str) -> str:
         return f"/home/me/.gpuc/jobs/{job_id}"
 
-    def tail(self, remote: str, *, lines: int) -> Any:
-        self.commands.append(f"tail -n {lines} {remote}")
+    def run(self, command: str, **_: Any) -> Any:
+        self.commands.append(command)
         return type("Result", (), {"returncode": 0, "stdout": self.log, "output": self.log})()
 
 

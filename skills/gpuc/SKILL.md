@@ -184,12 +184,12 @@ host), `no-outputs` (the output path was never written), `terminated`,
 upload keeps its reason and lists `sync` or `no-outputs` under `problems`. A
 preempted job goes straight back to `queued`.
 
-`gpuc status` also flags jobs: `UPLOAD FAILING` on a running job means an
-output is not reaching its destination (usually an `outputs:` path that does
-not exist yet; check before the job runs for hours); `outputs not uploaded`
-means a finished job's results are still only on that host; `OUTPUTS LOST`
-means an ephemeral host gave up on them before terminating, and only
-re-running the job brings them back.
+`gpuc status` (and `gpuc wait`, once a job ends) also flags jobs: `UPLOAD
+FAILING` on a running job means an output is not reaching its destination
+(usually an `outputs:` path that does not exist yet; check before the job runs
+for hours); `outputs not uploaded` means a finished job's results are still
+only on that host; `OUTPUTS LOST` means an ephemeral host gave up on them
+before terminating, and only re-running the job brings them back.
 
 Never fire-and-forget. After submitting, confirm the job reaches phase `main`
 and that its first log lines look right, then check back on a timer. Do not kill

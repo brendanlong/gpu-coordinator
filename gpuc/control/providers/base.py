@@ -37,7 +37,6 @@ class CreateRefused(ProviderError):
 
 class Constraints(BaseModel):
     gpu_names: list[str] = Field(default_factory=list)
-    min_vram_gb: int | None = None
     max_price_usd_hr: float | None = None
     clouds: list[Cloud] = Field(default_factory=lambda: ["SECURE"])
     cuda_min: str = DEFAULT_CUDA_MIN
@@ -52,7 +51,6 @@ class Offer(TolerantModel):
 
     gpu_id: str = ""
     name: str = ""
-    vram_gb: int = 0
     price_usd_hr: float = 0.0
     cloud: Cloud = "SECURE"
     availability: Availability = "NONE"
@@ -66,8 +64,6 @@ class Offer(TolerantModel):
 def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
     wanted = {name.casefold() for name in constraints.gpu_names}
     if wanted and not wanted & {offer.gpu_id.casefold(), offer.name.casefold()}:
-        return False
-    if constraints.min_vram_gb is not None and offer.vram_gb < constraints.min_vram_gb:
         return False
     cap = constraints.max_price_usd_hr
     if cap is not None and offer.price_usd_hr > cap:
@@ -208,7 +204,6 @@ class Provider(ABC):
         *,
         image: str = DEFAULT_IMAGE,
         disk_gb: int = 20,
-        env: dict[str, str] | None = None,
         cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod: ...

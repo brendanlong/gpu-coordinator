@@ -56,9 +56,6 @@ estimated_runtime_min: 480
 # to repeat; see docs/usage.md "Preemption".
 auto_preempt: false
 
-requires:
-  cuda_min: "12.8"                              # informs provisioning only
-
 # When the runner deletes workdir/ (the code *and* the venv it builds there --
 # a torch venv is ~6.5 GB). Applied after the final sync, so `outputs` are
 # already uploaded; spec.json, state.json and log.txt always stay.

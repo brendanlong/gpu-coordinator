@@ -38,7 +38,6 @@ from gpuc.control.transport import (
     TransportError,
     pull_argv,
     rsync_argv,
-    tail_command,
 )
 from gpuc.host import scope
 from gpuc.host.dispatcher import LockBody
@@ -252,9 +251,6 @@ class FakeHost:
         if result.returncode != 0:
             raise TransportError(result)
         return result
-
-    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        return self.run(tail_command(remote_path, lines, follow), check=False)
 
 
 def _shim(path: Path, text: str) -> None:

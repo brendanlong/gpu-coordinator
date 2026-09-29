@@ -192,12 +192,12 @@ def test_local_rsync_copies_only_the_listed_files(tmp_path: Path) -> None:
 def test_local_tail_returns_the_last_lines(tmp_path: Path) -> None:
     log = tmp_path / "log.txt"
     log.write_text("\n".join(str(i) for i in range(100)) + "\n")
-    result = LocalTransport().tail(str(log), lines=3)
+    result = LocalTransport().run(transport.tail_command(str(log), 3), check=False)
     assert result.stdout.split() == ["97", "98", "99"]
 
 
 def test_tail_of_a_missing_file_does_not_raise(tmp_path: Path) -> None:
-    result = LocalTransport().tail(str(tmp_path / "nope"), lines=5)
+    result = LocalTransport().run(transport.tail_command(str(tmp_path / "nope"), 5), check=False)
     assert result.returncode != 0
 
 

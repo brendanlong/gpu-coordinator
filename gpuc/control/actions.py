@@ -36,7 +36,6 @@ from gpuc.control.config import (
     config_file,
     forget_host,
     hosts_file,
-    load_settings,
     open_registry,
     state_dir,
     write_config_template,
@@ -78,7 +77,7 @@ from gpuc.control.s3index import (
 from gpuc.control.skill import SkillError
 from gpuc.control.submit import SubmitError
 from gpuc.control.teardown import TerminateError
-from gpuc.control.transport import TransportError
+from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, settable
 from gpuc.host.jobs import FINISHED_STATUSES
 
@@ -413,6 +412,13 @@ class IndexRead:
 
     def on(self, host: str) -> list[IndexEntry]:
         return [entry for entry in self.all()[0].values() if entry.host == host]
+
+
+def since_seconds(value: str | None, name: str) -> float | None:
+    try:
+        return status_mod.parse_duration(value) if value else None
+    except ValueError as exc:
+        raise UsageError(f"{name}: {exc}") from exc
 
 
 def status(
@@ -809,15 +815,12 @@ def locate(
     job_id: str,
     registry: Registry,
     explicit: str | None,
-    settings: Settings | None = None,
+    settings: Settings,
     *,
-    provider: Provider | None = None,
     skipped: Collection[str] = (),
 ) -> Location:
     """Where one job is, by `locate_many`'s rule, raising what it could not say."""
-    placed = locate_many(
-        [job_id], registry, explicit, settings, provider=provider, skipped=skipped
-    )[job_id]
+    placed = locate_many([job_id], registry, explicit, settings, skipped=skipped)[job_id]
     if isinstance(placed, Unlocated):
         raise placed.exception()
     return placed
@@ -827,7 +830,7 @@ def locate_many(
     job_ids: Sequence[str],
     registry: Registry,
     explicit: str | None,
-    settings: Settings | None = None,
+    settings: Settings,
     *,
     provider: Provider | None = None,
     skipped: Collection[str] = (),
@@ -859,7 +862,6 @@ def locate_many(
     id still unplaced. A sweep of hundreds costs a round trip per host, not
     one per job.
     """
-    settings = settings if settings is not None else load_settings()
     ids = list(dict.fromkeys(job_ids))
     local = LocalIndex()
     index = JobIndex(settings)
@@ -1395,7 +1397,7 @@ def read_log(
         session = reached.session
         remote = f"{session.job_dir(job_id)}/log.txt"
         try:
-            result = session.transport.tail(remote, lines=lines)
+            result = session.transport.run(tail_command(remote, lines), check=False)
             if result.returncode == 0:
                 return location.host, LogText("host", remote, result.stdout)
             purged = job_dir_gone(session, job_id)

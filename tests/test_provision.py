@@ -32,7 +32,6 @@ from gpuc.control.provision import (
     pick_reusable_host,
     pod_name,
     provision,
-    runpod_host,
 )
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, load_registry
@@ -169,7 +168,6 @@ def test_create_uses_the_spec_defaults(
     assert created["image"] == "runpod/pytorch:test"
     assert created["disk_gb"] == 20
     assert created["cuda_min"] == "12.8"
-    assert created["env"] is None  # the provider fills its own default
     assert created["name"].startswith("gpuc-")
 
 
@@ -579,7 +577,6 @@ def test_offer_satisfies_checks_every_constraint() -> None:
     offer = make_offer()
     assert offer_satisfies(offer, CONSTRAINTS)
     assert not offer_satisfies(offer, Constraints(gpu_names=["RTX4090"]))
-    assert not offer_satisfies(offer, Constraints(min_vram_gb=80))
     assert not offer_satisfies(offer, Constraints(max_price_usd_hr=0.20))
     assert not offer_satisfies(offer, Constraints(clouds=["COMMUNITY"]))
     assert not offer_satisfies(offer, Constraints(cuda_min="13.0"))
@@ -636,8 +633,13 @@ def test_reuse_picks_a_live_matching_host_by_asking_it(
     _beating(host)
 
     reports: list[str] = []
-    chosen = runpod_host(
-        CONSTRAINTS, Settings(), provider=provider, report=reports.append, deps=deps(host)
+    chosen = provision(
+        CONSTRAINTS,
+        Settings(),
+        provider=provider,
+        reuse=True,
+        report=reports.append,
+        deps=deps(host),
     )
     assert chosen.name == entry.name
     assert provider.created == []
@@ -729,11 +731,10 @@ def test_no_reuse_always_provisions(
     _register_reusable(pod, host)
     _beating(host)
     host.wipe()  # the new pod's home is empty, as a fresh pod's is
-    chosen = runpod_host(
+    chosen = provision(
         CONSTRAINTS,
         Settings(),
         provider=provider,
-        reuse=False,
         report=lambda _: None,
         health_options=offline_health,
         deps=deps(host),
@@ -839,10 +840,11 @@ def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
     provider = FakeProvider([make_offer()])
     _register_reusable(pod, host)
     host.wipe()
-    entry = runpod_host(
+    entry = provision(
         CONSTRAINTS,
         Settings(),
         provider=provider,
+        reuse=True,
         report=lambda _: None,
         health_options=offline_health,
         deps=deps(host),

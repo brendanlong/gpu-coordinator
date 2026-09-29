@@ -132,9 +132,6 @@ class ScriptedHost:
     def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
         return CommandResult(self.host, ["rsync"], 0, "", "")
 
-    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        return CommandResult(self.host, ["tail"], 0, "", "")
-
     def argv(self, command: str) -> list[str]:
         return ["sh", "-c", command]
 

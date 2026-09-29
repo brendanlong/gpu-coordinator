@@ -64,9 +64,6 @@ class ScriptedTransport:
     def pull(self, remote_root: str, local_root: Path, files: object) -> CommandResult:
         raise AssertionError("not used")
 
-    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        raise AssertionError("not used")
-
 
 class Recorder(ScriptedTransport):
     """A transport that remembers what was written to it, not just what was run."""

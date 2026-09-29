@@ -508,9 +508,7 @@ def ask(
     *,
     provider: Provider | None = None,
     session: HostSession | None = None,
-    timeout: float = 60.0,
     check: bool = True,
-    record: bool = False,
 ) -> Asked:
     """Ask a host `verb` (an on-host subcommand, or None for the session alone).
 
@@ -525,8 +523,8 @@ def ask(
         return state
     pod, pod_error = state
     try:
-        session = session or open_session(entry, settings, record=record)
-        payload = session.host_json(verb, timeout=timeout, check=check) if verb else None
+        session = session or open_session(entry, settings, record=False)
+        payload = session.host_json(verb, timeout=60.0, check=check) if verb else None
     except (RemoteError, TransportError, ConfigError, OSError) as exc:
         return Unaskable(_with_pod_error(reason_of(exc), pod_error), pod)
     if verb is not None and not isinstance(payload, dict):

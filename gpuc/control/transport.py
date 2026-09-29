@@ -134,8 +134,6 @@ class Transport(Protocol):
         relative paths under `local_root` here."""
         ...
 
-    def tail(self, remote_path: str, lines: int = ..., follow: bool = ...) -> CommandResult: ...
-
     def argv(self, command: str) -> list[str]:
         """The argv that runs `command` on the host, for a caller that streams
         or prints it rather than waiting on `run`."""
@@ -234,9 +232,6 @@ class LocalTransport:
         return _execute(
             self.host, argv, timeout=PULL_TIMEOUT_S, check=True, stdin=_files_stdin(files)
         )
-
-    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        return self.run(tail_command(remote_path, lines, follow), check=False)
 
 
 @dataclass
@@ -366,11 +361,6 @@ class SshTransport:
         argv = pull_argv(f"{self.target}:{remote_root}", local_root, self.rsync_ssh_command())
         return _execute(
             self.host, argv, timeout=PULL_TIMEOUT_S, check=True, stdin=_files_stdin(files)
-        )
-
-    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        return self.run(
-            tail_command(remote_path, lines, follow), timeout=DEFAULT_TIMEOUT_S, check=False
         )
 
 

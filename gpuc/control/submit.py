@@ -90,7 +90,6 @@ class JobSpecModel(BaseModel):
     """Let the host stop this job, as often as it takes, whenever that lets a
     job queued at a lower `priority` number start right away. It re-runs from
     the start, so it belongs to work that is cheap to repeat."""
-    requires: dict[str, Any] = Field(default_factory=dict)
     cleanup: Literal["on_success", "always", "never"] = jobs.DEFAULT_CLEANUP
     """When the runner deletes the job's `workdir/`. The default keeps a failed
     or cancelled one so it can be inspected."""
@@ -387,9 +386,6 @@ class SubmitResult:
     host: str
     requeued_from: str | None = None
     notes: list[str] = field(default_factory=list)
-    session: HostSession | None = field(default=None, repr=False)
-    """The connection the enqueue was made over, kept so that looking up where
-    the job landed in the queue does not open a second one."""
     placement: dict[str, Any] = field(default_factory=placement_unknown)
     """Where the job landed in the host's queue, looked up after the enqueue:
     see `status.queue_placement`. The default is the "we could not ask" shape,
@@ -693,7 +689,6 @@ def submit_spec(
         host=entry.name,
         requeued_from=prepared.requeued_from,
         notes=notes,
-        session=session,
     )
 
 

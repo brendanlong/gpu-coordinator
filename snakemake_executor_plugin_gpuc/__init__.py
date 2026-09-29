@@ -409,8 +409,6 @@ class Executor(RemoteExecutor):
         argv = ["submit", "-"]
         if runpod:
             argv += ["--runpod", "--gpu", str(runpod), "--gpu-count", str(gpus)]
-            if resources.get("vram_gb") is not None:
-                argv += ["--min-vram", str(resources["vram_gb"])]
         else:
             argv += ["--host", str(host)]
         return spec, argv

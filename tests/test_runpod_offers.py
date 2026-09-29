@@ -58,7 +58,6 @@ def test_name_list_matches_short_name_and_catalog_id() -> None:
     assert [o.gpu_id for o in by_short] == ["NVIDIA A40"]
     assert [o.gpu_id for o in by_id] == ["NVIDIA A40"]
     assert by_short[0].price_usd_hr == 0.49
-    assert by_short[0].vram_gb == 48
 
 
 def test_unavailable_tier_is_dropped_and_tiers_are_queried_separately() -> None:
@@ -78,12 +77,8 @@ def test_offers_sorted_by_price_across_tiers() -> None:
     assert (offers[0].gpu_id, offers[0].cloud) == ("NVIDIA GeForce RTX 3090", "COMMUNITY")
 
 
-def test_min_vram_and_max_price_filters() -> None:
+def test_max_price_filters() -> None:
     provider = RecordedRunPod()
-    assert all(o.vram_gb >= 48 for o in provider.offers(Constraints(min_vram_gb=48)))
-    assert [o.gpu_id for o in provider.offers(Constraints(min_vram_gb=80))] == [
-        "NVIDIA A100 80GB PCIe"
-    ]
     assert all(
         o.price_usd_hr <= 0.60
         for o in provider.offers(Constraints(max_price_usd_hr=0.60, clouds=["SECURE"]))
@@ -146,10 +141,8 @@ def test_create_requires_our_prefix() -> None:
 def test_an_offer_with_a_null_field_parses_with_the_default() -> None:
     """A pod's config records the offer it was rented on, written by whichever
     build rented it; a null there may not make the pod unreadable."""
-    offer = Offer.model_validate(
-        {"gpu_id": "NVIDIA A40", "vram_gb": None, "price_usd_hr": None, "future": 1}
-    )
-    assert (offer.gpu_id, offer.vram_gb, offer.price_usd_hr) == ("NVIDIA A40", 0, 0.0)
+    offer = Offer.model_validate({"gpu_id": "NVIDIA A40", "price_usd_hr": None, "future": 1})
+    assert (offer.gpu_id, offer.price_usd_hr) == ("NVIDIA A40", 0.0)
 
 
 def test_an_unknown_provider_kind_is_a_provider_error() -> None:
@@ -178,7 +171,6 @@ def test_live_a40_secure_offers() -> None:
     assert len(offers) == 1
     offer = offers[0]
     assert offer.gpu_id == "NVIDIA A40"
-    assert offer.vram_gb == 48
     assert offer.cloud == "SECURE"
     assert 0.1 < offer.price_usd_hr <= 0.60
     assert offer.availability != "NONE"

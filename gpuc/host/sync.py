@@ -218,7 +218,6 @@ def mirror_meta(
     s3_prefix: str | None,
     *,
     runner: CommandRunner = run_command,
-    timeout: float | None = 300.0,
     env: Env = None,
 ) -> destinations.S3 | None:
     """Mirror a job's log and state, then record that it happened.
@@ -234,7 +233,7 @@ def mirror_meta(
     if mirror is None:
         return None
     try:
-        sync_job_meta(job_id, s3_prefix, runner=runner, timeout=timeout, env=env)
+        sync_job_meta(job_id, s3_prefix, runner=runner, env=env)
     except SyncError as exc:
         jobs.record_upload(job_id, mirror.uri, None, error=str(exc))
         raise
@@ -247,7 +246,6 @@ def put_state(
     mirror: destinations.S3,
     *,
     runner: CommandRunner = run_command,
-    timeout: float | None = 300.0,
     env: Env = None,
 ) -> str | None:
     """Upload `state.json` once more, so the mirror's copy carries what was
@@ -261,7 +259,7 @@ def put_state(
     state = paths.state_file(job_id)
     try:
         if state.exists():
-            mirror.put_file(state, state.name, runner=runner, timeout=timeout, env=env)
+            mirror.put_file(state, state.name, runner=runner, env=env)
     except SyncError as exc:
         return f"the mirrored state.json is one revision behind (re-upload failed): {exc}"
     return None
@@ -272,15 +270,14 @@ def final_meta_sync(
     s3_prefix: str | None,
     *,
     runner: CommandRunner = run_command,
-    timeout: float | None = 300.0,
     env: Env = None,
 ) -> str | None:
     """`mirror_meta` then `put_state`, for a job that is already over: the
     drain's last mirror of every job on a host about to go away."""
-    mirror = mirror_meta(job_id, s3_prefix, runner=runner, timeout=timeout, env=env)
+    mirror = mirror_meta(job_id, s3_prefix, runner=runner, env=env)
     if mirror is None:
         return None
-    return put_state(job_id, mirror, runner=runner, timeout=timeout, env=env)
+    return put_state(job_id, mirror, runner=runner, env=env)
 
 
 class SyncLoop:
@@ -298,14 +295,12 @@ class SyncLoop:
         s3_prefix: str | None,
         *,
         runner: CommandRunner = run_command,
-        min_age_s: float = MIN_AGE_S,
         env: Env = None,
     ) -> None:
         self._spec = spec
         self._workdir = workdir
         self._s3_prefix = s3_prefix
         self._runner = runner
-        self._min_age_s = min_age_s
         # The job's environment, secrets included: uploads authenticate as the
         # job, not as whatever the dispatcher happened to inherit.
         self._env = env
@@ -352,7 +347,7 @@ class SyncLoop:
         interval = max(1, self._spec.sync_interval_s)
         while not self._stop.wait(interval):
             try:
-                self._tick(self._min_age_s, record_missing=self._missing_ticks >= MISSING_TICKS)
+                self._tick(MIN_AGE_S, record_missing=self._missing_ticks >= MISSING_TICKS)
             except MissingOutput as exc:
                 # Not an error yet: the job may simply not have written the
                 # path. Once it has stayed missing for `MISSING_TICKS` it goes

@@ -549,7 +549,7 @@ def test_submit_runpod_passes_the_flags_through(
 
     seen: dict[str, object] = {}
 
-    def fake_runpod_host(constraints: Constraints, settings: Settings, **kwargs: object):
+    def fake_provision(constraints: Constraints, settings: Settings, **kwargs: object):
         seen.update(kwargs)
         seen["constraints"] = constraints
         seen["mirrored_before_provisioning"] = sorted(s3.objects)
@@ -560,7 +560,7 @@ def test_submit_runpod_passes_the_flags_through(
         seen["job_id"] = prepared.spec.job_id
         return SubmitResult(job_id=prepared.spec.job_id, host=entry.name)
 
-    monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
+    monkeypatch.setattr("gpuc.control.submitting.provision", fake_provision)
     monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
 
     assert (
@@ -571,8 +571,6 @@ def test_submit_runpod_passes_the_flags_through(
                 "--runpod",
                 "--gpu",
                 "A40,RTX4090",
-                "--min-vram",
-                "24",
                 "--max-price",
                 "0.60",
                 "--cloud",
@@ -593,7 +591,7 @@ def test_submit_runpod_passes_the_flags_through(
     constraints = seen["constraints"]
     assert isinstance(constraints, Constraints)
     assert constraints.gpu_names == ["A40", "RTX4090"]
-    assert (constraints.min_vram_gb, constraints.max_price_usd_hr) == (24, 0.60)
+    assert constraints.max_price_usd_hr == 0.60
     assert constraints.clouds == ["SECURE", "COMMUNITY"]
     assert (seen["idle_minutes"], seen["disk_gb"]) == (2.0, 20)
     assert (seen["reuse"], seen["name_hint"]) == (False, "e2e")
@@ -626,7 +624,7 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
     ).encode()
     seen: dict[str, object] = {}
 
-    def fake_runpod_host(constraints: Constraints, settings: Settings, **kwargs: object):
+    def fake_provision(constraints: Constraints, settings: Settings, **kwargs: object):
         seen["gpu_names"] = constraints.gpu_names
         return host_entry(name="gpuc-e2e-1", kind="rental", gpus=["GPU-1"])
 
@@ -634,7 +632,7 @@ def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
         seen["requeued_from"] = prepared.requeued_from
         return SubmitResult(job_id="new", host=entry.name, requeued_from=prepared.requeued_from)
 
-    monkeypatch.setattr("gpuc.control.submitting.runpod_host", fake_runpod_host)
+    monkeypatch.setattr("gpuc.control.submitting.provision", fake_provision)
     monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 0
@@ -731,7 +729,7 @@ def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     created: list[object] = []
     monkeypatch.setattr(
-        "gpuc.control.submitting.runpod_host",
+        "gpuc.control.submitting.provision",
         lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
     )
 
@@ -750,7 +748,7 @@ def test_submit_runpod_refuses_a_pod_with_no_gpu_even_for_a_job_that_needs_none(
     job.write_text('command: "true"\ngpus: 0\n')
     created: list[object] = []
     monkeypatch.setattr(
-        "gpuc.control.submitting.runpod_host",
+        "gpuc.control.submitting.provision",
         lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
     )
     with pytest.raises(SystemExit) as exited:
@@ -772,7 +770,7 @@ def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
     created: list[object] = []
     monkeypatch.delenv("GPUC_DEFINITELY_UNSET", raising=False)
     monkeypatch.setattr(
-        "gpuc.control.submitting.runpod_host",
+        "gpuc.control.submitting.provision",
         lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
     )
 
@@ -1417,20 +1415,11 @@ def test_only_with_verify_names_the_jobs_and_what_the_mirror_vouches_for(
 def test_only_cannot_be_combined_with_an_age_horizon(
     control_env: Path, capsys: pytest.CaptureFixture[str], extra: list[str]
 ) -> None:
-    """argparse rejects the command line; `check_flags` judges it for callers."""
-    from gpuc.control.clean import CleanUsageError, check_flags
-
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     with pytest.raises(SystemExit) as caught:
         main(["clean", "--host", "gpubox", "--only", "a", *extra])
     assert caught.value.code == EXIT_USAGE
     assert "not allowed with argument --only" in capsys.readouterr().err
-    with pytest.raises(CleanUsageError, match="cannot be combined"):
-        check_flags(
-            only=["a"],
-            all_finished="--all-finished" in extra,
-            older_than_days=None if "--all-finished" in extra else 7.0,
-        )
 
 
 def test_an_empty_only_is_a_usage_error_not_a_silent_no_op(
@@ -2101,7 +2090,7 @@ def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning
         }
     ).encode()
     monkeypatch.setattr(
-        "gpuc.control.submitting.runpod_host",
+        "gpuc.control.submitting.provision",
         lambda *a, **k: pytest.fail("no pod may be bought for a spec that is refused"),
     )
     assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 1

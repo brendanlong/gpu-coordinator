@@ -357,7 +357,6 @@ class JobSpec:
     It costs everything the attempt has done, so it is opt-in and belongs to
     jobs that are cheap to re-run from the start.
     """
-    requires: dict[str, Any] = field(default_factory=dict)
     cleanup: str = DEFAULT_CLEANUP
     """`on_success` | `always` | `never`: when the runner deletes `workdir/`.
 
@@ -403,9 +402,6 @@ class JobSpec:
             progress_command=as_opt_str(fields, "progress_command"),
             progress_interval_s=_polling_interval(fields),
             auto_preempt=as_bool(fields, "auto_preempt"),
-            requires=dict(fields.get("requires") or {})
-            if isinstance(fields.get("requires"), dict)
-            else {},
             cleanup=normalize_cleanup(fields.get("cleanup")),
             requeued_from=as_opt_str(fields, "requeued_from"),
         )
@@ -708,7 +704,7 @@ def finish(
     job_id: str,
     outcome: Outcome,
     *,
-    expect: str | tuple[str, ...] = "running",
+    expect: str = "running",
     forget_output_uploads: bool = False,
     **extra: Any,
 ) -> JobState | None:
@@ -735,10 +731,9 @@ def finish(
     dispatcher failing a job whose runner died after claiming it reports
     `ran` rather than knowing, which is the fail-closed answer.
     """
-    wanted = (expect,) if isinstance(expect, str) else expect
     with locked(job_id):
         state = read_state(job_id)
-        if state.status not in wanted:
+        if state.status != expect:
             return None
         state.status = outcome.status
         state.reason = outcome.reason

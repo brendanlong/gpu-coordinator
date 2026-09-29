@@ -37,7 +37,6 @@ def make_offer(
     name: str = "A40",
     price: float = 0.49,
     cloud: Cloud = "SECURE",
-    vram_gb: int = 48,
     cuda_versions: tuple[str, ...] = ("12.8",),
     gpu_id: str | None = None,
 ) -> Offer:
@@ -45,7 +44,6 @@ def make_offer(
     return Offer(
         gpu_id=gpu_id or ("NVIDIA A40" if name == "A40" else name),
         name=name,
-        vram_gb=vram_gb,
         price_usd_hr=price,
         cloud=cloud,
         availability="HIGH",
@@ -126,7 +124,6 @@ class FakeProvider(Provider):
         *,
         image: str = DEFAULT_IMAGE,
         disk_gb: int = 20,
-        env: dict[str, str] | None = None,
         cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod:
@@ -139,7 +136,6 @@ class FakeProvider(Provider):
                 "offer": offer,
                 "image": image,
                 "disk_gb": disk_gb,
-                "env": env,
                 "cuda_min": cuda_min,
                 "gpu_count": gpu_count,
             }

@@ -220,7 +220,6 @@ defaults.
   "auto_preempt": false,                # let the dispatcher stop this job, as often as it
                                         # takes, whenever that starts a queued one ahead
                                         # of it right away; it may take held cards
-  "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
   "requeued_from": null                 # the job `gpuc requeue` resubmitted this one from;
                                         # written by the control side, carried by the host
@@ -694,9 +693,9 @@ asked with its reason at once and never from the mirror.
   trouble, not a missing id.
 - `logs -f` runs `tail -F` as a child writing straight to stdout while the loop
   polls, started on the first poll the host answers, and gives the stream
-  `FLUSH_GRACE_S` to catch up before stopping it. `Transport.tail()` keeps
-  `-f`, whose non-zero exit on a missing log is what routes `gpuc logs` to the
-  mirror.
+  `FLUSH_GRACE_S` to catch up before stopping it. A plain read's `tail` never
+  retries, and its non-zero exit on a missing log is what routes `gpuc logs` to
+  the mirror.
 
 ## Transport
 
@@ -871,7 +870,7 @@ name to its class. Adding a provider is one class and one table entry.
 
 - `offers(constraints)`: `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=<tier>&minCudaVersion=<x>`
   once per requested tier, `<x>` being the one CUDA floor the create also gets
-  (`DEFAULT_CUDA_MIN` unless `--cuda-min`); filter by name list / min VRAM / max price /
+  (`DEFAULT_CUDA_MIN` unless `--cuda-min`); filter by name list / max price /
   availability != NONE and at least one `cudaVersions[].available`; sort by
   price. Pass GPU ids exactly as the catalog returns them.
 - `create(offer)`: `POST /pods` with `name="gpuc-<host>"`, `image`, `gpu.id`,

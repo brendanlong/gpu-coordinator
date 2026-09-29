@@ -25,7 +25,7 @@ def test_a_record_with_no_offer_or_an_unreadable_one_costs_a_reuse_not_a_crash()
     with no constraints would match."""
     assert offer_of(None) is None
     assert offer_of({"kind": "runpod", "pod_id": "pod1"}) is None
-    assert offer_of({"offer": {"vram_gb": "lots"}}) is None
+    assert offer_of({"offer": {"price_usd_hr": "lots"}}) is None
 
 
 def test_an_address_is_only_what_the_provider_says() -> None:

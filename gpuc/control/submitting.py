@@ -27,7 +27,7 @@ from gpuc.control.actions import (
 from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build
 from gpuc.control.config import HostEntry, Reporter, Settings, open_registry
 from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
-from gpuc.control.provision import runpod_host
+from gpuc.control.provision import provision
 from gpuc.control.remote import HostSession, open_session
 from gpuc.control.s3index import S3Index, S3ObjectMissing
 from gpuc.control.submit import (
@@ -53,7 +53,6 @@ class RentalOptions:
     """`--runpod` and its flags: what to rent, and how, when the job names no host."""
 
     gpu_names: list[str]
-    min_vram_gb: int | None = None
     max_price_usd_hr: float | None = None
     clouds: list[Cloud] = field(default_factory=lambda: list[Cloud](["SECURE"]))
     cuda_min: str = DEFAULT_CUDA_MIN
@@ -73,7 +72,6 @@ class RentalOptions:
             )
         return Constraints(
             gpu_names=self.gpu_names,
-            min_vram_gb=self.min_vram_gb,
             max_price_usd_hr=self.max_price_usd_hr,
             clouds=self.clouds,
             cuda_min=self.cuda_min,
@@ -86,7 +84,7 @@ def rent_host(
 ) -> HostEntry:
     check_gpu_count(prepared.model, rental.gpu_count)
     check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
-    return runpod_host(
+    return provision(
         rental.constraints(),
         settings,
         provider=make_provider(settings),

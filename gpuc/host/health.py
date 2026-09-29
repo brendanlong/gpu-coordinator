@@ -90,18 +90,14 @@ def check_gpu_uuids(
             f"config.shared_gpus entries not present on this host: "
             f"{', '.join(cards.shared_missing)}"
         )
-    problems: list[str] = []
     if cards.duplicates:
-        problems.append(
-            f"entries naming a card already named: {', '.join(cards.duplicates)}. An index "
-            f"and its own UUID are one card, and a card is either ours to hand out or "
-            f"somebody else's to borrow, not both"
-        )
-    if problems:
         return Check(
             "gpu_uuids",
             False,
-            f"{'; '.join(problems)}; nvidia-smi reports: {gpus.describe_table(table)}",
+            f"entries naming a card already named: {', '.join(cards.duplicates)}. An index "
+            f"and its own UUID are one card, and a card is either ours to hand out or "
+            f"somebody else's to borrow, not both; nvidia-smi reports: "
+            f"{gpus.describe_table(table)}",
         )
     detail = f"{len(cards.owned)} owned GPU(s) present"
     if cards.shared:
