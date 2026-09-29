@@ -186,3 +186,26 @@ def test_members_are_the_group_and_the_scope_whatever_their_comm(tmp_path: Path)
     assert JobProcesses(None, 10).members(tmp_path) == [10, 11]
     assert JobProcesses("job.scope", None).members(tmp_path) == [10, 12, 14]
     assert JobProcesses().members(tmp_path) == []
+
+
+def test_a_restarted_container_on_the_same_kernel_is_another_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernel's boot id is the whole machine's; pid 1 is the container's."""
+    monkeypatch.setattr(procinfo, "starttime", lambda pid: "4000" if pid == 1 else None)
+    kernel = procinfo.boot_id()
+    assert procinfo.from_another_boot(kernel, "3000")
+    assert not procinfo.from_another_boot(kernel, "4000")
+    assert procinfo.from_another_boot("an-earlier-kernel", "4000")
+
+
+def test_a_record_without_pid_1_is_judged_on_the_kernels_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state an earlier build wrote must not make an upgrade requeue every
+    running job; nor must a /proc that hides pid 1."""
+    kernel = procinfo.boot_id()
+    monkeypatch.setattr(procinfo, "starttime", lambda pid: "4000" if pid == 1 else None)
+    assert not procinfo.from_another_boot(kernel)
+    monkeypatch.setattr(procinfo, "starttime", lambda pid: None)
+    assert not procinfo.from_another_boot(kernel, "3000")

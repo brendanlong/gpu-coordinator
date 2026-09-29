@@ -44,7 +44,7 @@ from gpuc.host import (
 )
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.jobs import JobSpec, Outcome
-from gpuc.host.procs import KILL_GRACE_S, JobProcesses, boot_id, starttime
+from gpuc.host.procs import KILL_GRACE_S, JobProcesses, boot_id, init_start, starttime
 
 SAMPLE_INTERVAL_S = 30.0
 ESTIMATE_REFRESH_S = 30.0
@@ -501,6 +501,7 @@ class JobRunner:
             isolation=self.isolation,
             runner_pid=pid,
             runner_boot_id=boot_id(),
+            runner_init_start=init_start(),
             runner_starttime=starttime(pid),
         )
 

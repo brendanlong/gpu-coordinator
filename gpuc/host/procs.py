@@ -30,10 +30,25 @@ BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 
 def boot_id() -> str | None:
+    """The kernel's boot id. Half of what makes a boot: see `init_start`."""
     try:
         return BOOT_ID_PATH.read_text().strip() or None
     except OSError:
         return None
+
+
+def init_start() -> str | None:
+    """The start time of pid 1, the other half of a boot.
+
+    Every container on a machine shares the kernel's boot id, and one that
+    restarts starts a new pid namespace in which the pids an earlier one
+    recorded belong to other processes: a pod's restart is a reboot as far as
+    a recorded pid is concerned. Pid 1 starts afresh with each container and
+    never moves on a machine's own init. Recorded beside the boot id, not
+    folded into it, because an earlier build compares boot ids exactly and
+    ignores a field it does not know. None where /proc hides pid 1.
+    """
+    return starttime(1)
 
 
 def parse_starttime(stat: str) -> str | None:
@@ -82,14 +97,30 @@ def is_gpuc_process(pid: int) -> bool:
     return "gpuc.host" in cmdline(pid)
 
 
+def from_another_boot(recorded_boot_id: str | None, recorded_init_start: str | None = None) -> bool:
+    """Was this recorded in another boot, of the machine or of the container
+    (see `init_start`)? Only a value recorded *and* readable now *and*
+    different says so: not knowing is not evidence of a reboot, so a record
+    from a build that kept no `init_start` is judged on the kernel's id."""
+    current = boot_id()
+    if not recorded_boot_id or not current:
+        return False
+    if recorded_boot_id != current:
+        return True
+    now = init_start()
+    return bool(recorded_init_start and now and recorded_init_start != now)
+
+
 def recorded_process_alive(
-    pid: int | None, recorded_boot_id: str | None = None, recorded_starttime: str | None = None
+    pid: int | None,
+    recorded_boot_id: str | None = None,
+    recorded_starttime: str | None = None,
+    recorded_init_start: str | None = None,
 ) -> bool:
     """Is the *same* process we recorded still running?"""
     if not pid or not pid_alive(pid):
         return False
-    current_boot = boot_id()
-    if recorded_boot_id and current_boot and recorded_boot_id != current_boot:
+    if from_another_boot(recorded_boot_id, recorded_init_start):
         return False
     current_start = starttime(pid)
     return not (recorded_starttime and current_start and recorded_starttime != current_start)
@@ -140,11 +171,9 @@ class JobProcesses:
         with that boot, its scopes with them, and the kernel has been issuing
         pids from 1 again since -- so a `pgid` from it is whatever happens to
         hold that number now, and adoption after a reboot SIGKILLed exactly
-        that. The same identity rule as `recorded_process_alive`: only a boot
-        id recorded *and* readable *and* different says so.
+        that. The same identity rule as `recorded_process_alive`.
         """
-        current = boot_id()
-        if state.runner_boot_id and current and state.runner_boot_id != current:
+        if from_another_boot(state.runner_boot_id, state.runner_init_start):
             return JobProcesses()
         return JobProcesses(state.cgroup_unit, state.pgid or None, state.runner_pid)
 

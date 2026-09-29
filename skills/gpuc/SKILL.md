@@ -180,9 +180,11 @@ gpuc pods                        # RunPod: every pod we own, cost, age, util, ho
 the venv), `sync-preflight` (aws/hf or credentials missing), `timeout`
 (`max_runtime_min`), `sync` (final upload failed; results exist only on the
 host), `no-outputs` (the output path was never written), `terminated`,
-`runner-died`. A job that ended for a reason of its own and *also* lost its
-upload keeps its reason and lists `sync` or `no-outputs` under `problems`. A
-preempted job goes straight back to `queued`.
+`runner-died`, `host-restarted` (its host kept restarting under it). A job
+that ended for a reason of its own and *also* lost its upload keeps its reason
+and lists `sync` or `no-outputs` under `problems`. A preempted job goes
+straight back to `queued`, and so does a running job whose host restarts,
+once gpuc is running there again.
 
 `gpuc status` (and `gpuc wait`, once a job ends) also flags jobs: `UPLOAD
 FAILING` on a running job means an output is not reaching its destination
@@ -359,8 +361,8 @@ Rules, and they are not optional:
 - After a host restarts with its `$HOME` wiped (`dispatcher DOWN`, or ssh
   failing outright): re-copy the SSH key if needed, then `gpuc host bootstrap
   <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` whatever
-  was in flight. A host with a `--persistent-root` keeps its queue, so only
-  jobs that were running need resubmitting.
+  was in flight. A host with a `--persistent-root` keeps its queue, and
+  queues the jobs that were running again itself.
 
 Full reference in the repo: `README.md`, `docs/setup.md` (install, hosts,
 credentials), `docs/usage.md` (jobs, rentals, failure reasons),

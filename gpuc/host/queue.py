@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from gpuc.host import cleanup, jobs, paths
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
+from gpuc.host.procs import from_another_boot
 
 PREEMPTED = "preempted"
 """The reason of an attempt stopped so that something else can have its GPUs.
@@ -268,25 +269,88 @@ def next_attempt(job_id: str, *, ran: bool) -> int | None:
         state = jobs.read_state(job_id)
         if state.status != "running" or state.intent != PREEMPT:
             return None
-        attempt = state.attempt + 1
-        jobs.write_state(
-            job_id,
-            JobState(
-                status="queued",
-                attempt=attempt,
-                priority=state.priority,
-                estimated_runtime_min=state.estimated_runtime_min,
-                max_runtime_min=state.max_runtime_min,
-                live_max_runtime=state.live_max_runtime,
-                ran=state.ran or ran,
-            ),
-        )
+        attempt = _write_queued_again(job_id, state, ran=state.ran or ran)
     note(
         job_id,
         f"preempted; queued again as attempt {attempt} at priority {state.priority}, "
         f"to run from the start in this same workdir",
     )
     return attempt
+
+
+def _write_queued_again(
+    job_id: str, state: JobState, *, ran: bool, restarts: int | None = None
+) -> int:
+    """The fresh `queued` state of the next attempt, written under the lock
+    the caller holds. See `next_attempt` for what survives and why."""
+    attempt = state.attempt + 1
+    jobs.write_state(
+        job_id,
+        JobState(
+            status="queued",
+            attempt=attempt,
+            priority=state.priority,
+            estimated_runtime_min=state.estimated_runtime_min,
+            max_runtime_min=state.max_runtime_min,
+            live_max_runtime=state.live_max_runtime,
+            ran=ran,
+            restarts=state.restarts if restarts is None else restarts,
+        ),
+    )
+    return attempt
+
+
+MAX_RESTARTS = 3
+"""How many times a job is queued again because its host restarted under it
+before it is failed `host-restarted` instead. A job that takes its host down
+with it (a kernel panic, an OOM that wedges the box) would otherwise restart
+it forever."""
+
+
+def requeue_after_restart(job_id: str) -> JobState | None:
+    """Queue again a job whose runner ran in an earlier boot of this host.
+
+    The machine restarted under it, so its runner and every process of it are
+    gone, and nothing of the attempt can be trusted: it runs again from the
+    start in the same workdir, as after a preempt. Unlike a runner that died
+    while the host stayed up, this is not the job's doing or gpuc's, so it is
+    not a failure -- until `MAX_RESTARTS`, when it is `failed: host-restarted`.
+    A job somebody was cancelling is cancelled, and one somebody was
+    preempting is queued again without counting against the limit, since
+    queued again is what was asked for.
+
+    The dispatcher's one write of a transition the runner owns, because the
+    runner that owned it died with the boot. The state written, or None when
+    the job is no longer a `running` one from another boot: whoever moved it
+    on decided for it.
+    """
+    with jobs.locked(job_id):
+        state = jobs.read_state(job_id)
+        if state.status != "running" or not from_another_boot(
+            state.runner_boot_id, state.runner_init_start
+        ):
+            return None
+        preempting = state.intent == PREEMPT
+        attempt = None
+        if preempting:
+            attempt = _write_queued_again(job_id, state, ran=state.ran)
+        elif state.intent != CANCEL and state.restarts < MAX_RESTARTS:
+            attempt = _write_queued_again(job_id, state, ran=state.ran, restarts=state.restarts + 1)
+        written = jobs.read_state(job_id) if attempt is not None else None
+    if written is None:
+        outcome = (
+            jobs.Outcome("cancelled", "cancelled", ran=False)
+            if state.intent == CANCEL
+            else jobs.Outcome("failed", "host-restarted", ran=False)
+        )
+        return jobs.finish(job_id, outcome, expect="running", forget_output_uploads=True)
+    counted = "" if preempting else f" (restart {written.restarts} of at most {MAX_RESTARTS})"
+    note(
+        job_id,
+        f"the host restarted while this job was running; queued again as attempt {attempt}"
+        f"{counted}, to run from the start in this same workdir",
+    )
+    return written
 
 
 def note(job_id: str, message: str) -> None:
