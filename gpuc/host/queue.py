@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import shutil
 from dataclasses import dataclass, field
 
 from gpuc.host import checkout, cleanup, jobs, paths
@@ -51,8 +50,10 @@ def enqueue(spec: JobSpec) -> str:
     `cleanup.stale_incoming` sweeps what it left. There is no order of writes
     inside the dir to get right, because nothing reads it until it has moved.
 
-    On a host with scratch the workdir does not move with it: it is archived
-    into the job dir and removed, and the runner unpacks it onto scratch.
+    On a host with scratch the workdir does not move with it: `gpuc submit`
+    has it archived first (`checkout.archive_staged`), and the runner
+    unpacks it onto scratch. A client from before scratch did not ask, so it
+    is archived here.
     """
     paths.ensure_layout()
     job_id = spec.job_id
@@ -61,14 +62,14 @@ def enqueue(spec: JobSpec) -> str:
         raise FileExistsError(f"job {job_id} already exists on this host")
     staged = paths.incoming_job_dir(job_id)
     staged.mkdir(parents=True, exist_ok=True)
-    (staged / "workdir").mkdir(exist_ok=True)
+    if not (staged / checkout.ARCHIVE_NAME).exists():
+        (staged / "workdir").mkdir(exist_ok=True)
     (staged / "outputs").mkdir(exist_ok=True)
     jobs.atomic_write_json(staged / "spec.json", spec.to_dict())
     jobs.atomic_write_json(staged / "state.json", JobState.initial(spec).to_dict())
     (staged / "log.txt").touch()
     if paths.scratch_dir() is not None:
-        checkout.archive(staged / "workdir", staged / paths.checkout_archive(job_id).name)
-        shutil.rmtree(staged / "workdir")
+        checkout.archive_staged(job_id)
     os.rename(staged, accepted)
     return job_id
 

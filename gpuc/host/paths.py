@@ -58,6 +58,22 @@ def scratch_dir(environ: Mapping[str, str] | None = None) -> Path | None:
     return Path(override).expanduser() if override else None
 
 
+def follow_scratch(host_env: Mapping[str, str]) -> None:
+    """Make this process's scratch the host config's.
+
+    Every process gpuc starts on a host gets the config's `env`, and reads
+    scratch from its own environment. The dispatcher alone lives across a
+    `gpuc host set --scratch-dir`: a rental's never exits while it is idle,
+    and it sweeps workdirs and drains outputs, so it re-reads the config every
+    pass and follows it here.
+    """
+    value = host_env.get("GPUC_SCRATCH_DIR")
+    if value:
+        os.environ["GPUC_SCRATCH_DIR"] = value
+    else:
+        os.environ.pop("GPUC_SCRATCH_DIR", None)
+
+
 def workdirs_root(environ: Mapping[str, str] | None = None) -> Path:
     """Where jobs' workdirs, and so their venvs, are written."""
     return scratch_dir(environ) or home()
@@ -158,6 +174,11 @@ def workdir(job_id: str) -> Path:
 def checkout_archive(job_id: str) -> Path:
     """The checkout as submitted, kept only on a host with scratch."""
     return job_dir(job_id) / "checkout.tar.gz"
+
+
+def partial_workdir(job_id: str) -> Path:
+    """Where a checkout is unpacked before it is renamed into `workdir`."""
+    return workdir(job_id).with_name(f".{job_id}.partial")
 
 
 def outputs_dir(job_id: str) -> Path:

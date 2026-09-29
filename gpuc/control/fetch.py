@@ -1,6 +1,6 @@
 """`gpuc fetch`: copy what jobs produced from their workdirs to this machine.
 
-Every job's files come from one place, `jobs/<id>/workdir/<path>` on its host,
+Every job's files come from one place, its workdir on its host,
 whether the job is running, failed or finished. The host says which files (it
 alone can tell a result from a file that came with the checkout); this side
 copies them into `<to>/<job_id>/`, so two jobs never land on each other.

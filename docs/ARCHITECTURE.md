@@ -163,13 +163,15 @@ jobs/<jobid>/
                      # accumulate every non-null sample of the attempt and survive
                      # the job. eta is null unless the job is running.
                      # progress_pct survives the job.
-  checkout.tar.gz    # the checkout as submitted, on a host with scratch only; see Scratch
+  checkout.tar.gz    # the checkout as submitted, on a host with scratch only;
+                     # see Scratch
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
   workdir/           # rsynced code (git-tracked + untracked, .gitignore obeyed); removed per `cleanup:`,
                      # except the job's kept outputs, which stay where it wrote them.
-                     # `<scratch>/<jobid>/` instead on a host with scratch (`paths.workdir`)
+                     # `<scratch>/<jobid>/` instead on a host with scratch
+                     # (`paths.workdir`)
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir
 dispatcher.lock      # fd flock held by the running dispatcher
@@ -886,17 +888,28 @@ host that came back empty is in setup.md.
 `MANAGED_ENV` key) moves every workdir to `<scratch>/<jobid>/` and nothing
 else. The rules that make a scratch a restart may wipe safe:
 
-- `enqueue` archives the staged workdir into `checkout.tar.gz` in the job dir
-  and removes it, so the job dir that is renamed into `jobs/` holds the only
-  copy of the code, beside the queue.
-- The runner unpacks it after the claim whenever the workdir is missing, into
-  a temporary directory renamed into place, so a restore cut short is never
-  taken for a checkout. A workdir that is there is used as it is, as after a
-  preempt on any host.
+- `gpuc submit` has the staged workdir archived into `checkout.tar.gz` and
+  removed (`python -m gpuc.host archive-checkout`, a call of its own with a
+  long timeout) before the enqueue, which stays a rename. The job dir renamed
+  into `jobs/` holds the only copy of the code, beside the queue. An enqueue
+  from a client that did not ask archives it itself.
+- The runner unpacks it after the claim, under its signal handlers, whenever
+  the workdir is missing, into a temporary directory renamed into place, so
+  a restore cut short is never taken for a checkout. A workdir that is there
+  is used as it is, as after a preempt on any host. Anything that stops the
+  restore fails the job `checkout-lost`.
+- Scratch is made 0700 and must belong to the user (`checkout.ensure_scratch`),
+  as gpuc home is: it holds every checkout, and a workdir somebody else could
+  create is code they could have a job run.
 - `paths.workdir` answers `jobs/<id>/workdir` whenever that exists, so jobs
-  from before scratch was set are found where they are.
-- A purge removes the workdir on scratch with the job dir. The health check
-  measures the disk floor on scratch too (`scratch_disk`).
+  from before scratch was set are found where they are. Every process reads
+  scratch from its environment, which the host's `env` sets; the dispatcher,
+  which outlives a `host set`, re-reads it from the config every pass
+  (`paths.follow_scratch`).
+- The checkout's disk is the workdir's and the archive's together; with the
+  workdir gone it is the archive's alone, whatever was recorded. A purge
+  removes the workdir on scratch with the job dir. The health check measures
+  the disk floor on scratch too (`scratch_disk`).
 - Kept outputs are refused at submit, like on a rental.
 
 ## Providers

@@ -676,7 +676,14 @@ def ssh_target(args: argparse.Namespace, settings: Settings) -> tuple[HostEntry,
         else locate(args.target, registry, None, settings, skipped=read.skipped).require_entry()
     )
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
-    return entry, f"{job_dir}/workdir", job_dir
+    # Where the registry last saw the host keep workdirs. `~` is the one
+    # expansion the double-quoted `cd` would not do.
+    scratch = entry.config.env.get("GPUC_SCRATCH_DIR")
+    if not scratch:
+        return entry, f"{job_dir}/workdir", job_dir
+    if scratch.startswith("~/"):
+        scratch = f"$HOME/{scratch[2:]}"
+    return entry, f"{scratch}/{args.target}", job_dir
 
 
 def cmd_ssh(args: argparse.Namespace) -> Answer:
@@ -1472,8 +1479,8 @@ def build_parser() -> argparse.ArgumentParser:
         "ssh",
         help="a shell on a host, or in a job's workdir; or one command there",
         description="A host name lands in that host's gpuc home. A job id lands in that "
-        "job's workdir/, falling back to the job dir itself when the workdir has been "
-        "cleaned away (the log and state are still there).",
+        "job's workdir (on scratch, for a host with one), falling back to the job dir "
+        "itself when the workdir has been cleaned away (the log and state are still there).",
     )
     ssh.add_argument("target", help="a registered host name, or a job id")
     ssh.add_argument("--host", help="which host a job id is on, if it is ambiguous")

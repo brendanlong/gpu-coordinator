@@ -113,8 +113,11 @@ def check_disk(
     """Free space where the queue lives, or under `root`: the scratch that
     holds workdirs needs the room for checkouts, venvs and outputs too."""
     root = root or paths.home()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    free_gb = shutil.disk_usage(root).free / 1e9
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        free_gb = shutil.disk_usage(root).free / 1e9
+    except OSError as exc:
+        return Check(name, False, f"cannot use {root}: {exc}", None)
     ok = free_gb >= min_free_gb
     detail = f"{free_gb:.1f} GB free on the {root} volume (floor {min_free_gb:.1f} GB)"
     if not ok:

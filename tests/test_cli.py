@@ -325,9 +325,7 @@ def test_host_set_keeps_the_cache_dir_a_new_env_did_not_mention(
     assert fake_host.config["env"] == {"HF_HOME": "/big"}
 
 
-def test_host_set_scratch_dir_is_one_sticky_env_key(
-    control_env: Path, fake_host: FakeHost
-) -> None:
+def test_host_set_scratch_dir_is_one_sticky_env_key(control_env: Path, fake_host: FakeHost) -> None:
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--gpus", "0"]) == 0
     assert main(["host", "set", "gpubox", "--scratch-dir", "~/scratch"]) == 0
     assert fake_host.config is not None

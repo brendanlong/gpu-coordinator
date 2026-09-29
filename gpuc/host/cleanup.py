@@ -334,10 +334,11 @@ def workdir_size(job_id: str) -> int | None:
     kept outputs it would leave. None if there is no checkout left."""
     if not has_checkout(job_id):
         return None
+    archived = _file_bytes(paths.checkout_archive(job_id))
     if not paths.workdir(job_id).is_dir():
-        return _file_bytes(paths.checkout_archive(job_id))
+        return archived
     root, keep = kept_paths(job_id)
-    return max(reclaimable_bytes(root) - kept_bytes(root, keep), 0)
+    return max(reclaimable_bytes(root) - kept_bytes(root, keep), 0) + archived
 
 
 def kept_paths(job_id: str) -> tuple[Path, set[Path]]:
@@ -490,6 +491,11 @@ def reported_workdir_bytes(
     """
     if not has_checkout(job_id, state):
         return 0
+    if not paths.workdir(job_id).is_dir():
+        # Scratch was wiped under a finished job: what is left is the
+        # archive, and the figure recorded for the whole workdir would
+        # advertise disk no clean can free.
+        return _file_bytes(paths.checkout_archive(job_id))
     recorded = state.workdir_bytes
     if recorded is not None:
         return recorded
@@ -499,8 +505,8 @@ def reported_workdir_bytes(
 
 
 def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
-    """Delete the checkout in `jobs/<id>/workdir`, and nothing else. Returns
-    the bytes freed.
+    """Delete the checkout -- the workdir and, on a host with scratch, the
+    archive beside the spec -- and nothing else. Returns the bytes freed.
 
     The whole workdir when the job keeps no outputs. Otherwise everything but
     the kept output paths, which stay exactly where the job wrote them, so a
@@ -520,7 +526,9 @@ def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
         return archived_bytes
     root, keep = kept_paths(job_id)
     held = kept_bytes(root, keep) if keep else 0
-    size = max(reclaimable_bytes(root) - held, 0) if measured is None else measured
+    if measured is None:
+        measured = max(reclaimable_bytes(root) - held, 0) + archived_bytes
+    size = measured
     if not keep:
         shutil.rmtree(paths.workdir(job_id))
         return size
@@ -983,9 +991,9 @@ def job_dir_bytes(job_id: str) -> int:
 def remove_job_dir(job_id: str) -> None:
     """Delete `jobs/<id>/` and every stray trace of the job, its workdir on
     scratch included."""
-    workdir = paths.workdir(job_id)
-    if workdir.is_dir():
-        shutil.rmtree(workdir)
+    for leftover in (paths.workdir(job_id), paths.partial_workdir(job_id)):
+        if leftover.is_dir():
+            shutil.rmtree(leftover)
     directory = paths.job_dir(job_id)
     if directory.is_dir():
         shutil.rmtree(directory)

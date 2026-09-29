@@ -477,6 +477,10 @@ def timeout_warnings(spec: JobSpec) -> list[str]:
     ]
 
 
+ARCHIVE_TIMEOUT_S = 1800.0
+"""A `--no-git` checkout of many gigabytes, read off a network volume."""
+
+
 def push_workdir(
     session: HostSession,
     job_id: str,
@@ -644,11 +648,9 @@ def submit_spec(
     too_big = wont_fit(spec, session.config, table, entry.name)
     if too_big:
         raise SubmitError(too_big)
+    scratch = bool(session.config.env.get("GPUC_SCRATCH_DIR"))
     check_kept_allowed(
-        spec,
-        f"host {entry.name}",
-        ephemeral=session.config.ephemeral,
-        scratch=bool(session.config.env.get("GPUC_SCRATCH_DIR")),
+        spec, f"host {entry.name}", ephemeral=session.config.ephemeral, scratch=scratch
     )
 
     for warning in prepared.warnings:
@@ -657,6 +659,9 @@ def submit_spec(
 
     push_workdir(session, spec.job_id, workdir, use_git=use_git, report=report)
     report(f"synced to {session.staging_dir(spec.job_id)}/workdir")
+    if scratch:
+        session.host_json(f"archive-checkout {spec.job_id}", timeout=ARCHIVE_TIMEOUT_S)
+        report("archived the checkout beside the queue; workdirs here are on scratch")
 
     if prepared.secrets_body:
         session.transport.put_file(

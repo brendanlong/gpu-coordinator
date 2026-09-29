@@ -169,12 +169,17 @@ A persistent root holds the jobs' workdirs too: each checkout and the venv
 keep workdirs on the local disk instead:
 
 ```sh
-gpuc host set gpubox --scratch-dir '~/gpuc-scratch' && gpuc host bootstrap gpubox
+gpuc host set gpubox --scratch-dir '~/gpuc-scratch' --cache-dir '' && gpuc host bootstrap gpubox
 ```
+
+`--cache-dir ''` lets bootstrap move uv's cache next to scratch, where venvs
+can link out of it; a cache pinned on the slow volume would be copied into
+every venv. Scratch must be a directory of your own, and is made private.
 
 The queue, logs and data directory stay on the persistent root. Each job's
 checkout is archived there at submit and unpacked onto scratch when it runs,
 so a restart that wipes scratch costs a job its workdir, not its code. Jobs
 with kept outputs (an `outputs:` path with no `s3` or `hf`) are refused on such
 a host, since a restart would take them. Change `--scratch-dir` only while
-nothing is queued or running.
+nothing is queued or running, and after `gpuc clean --host <host>
+--all-finished`: the workdirs left under the old one are no longer found.

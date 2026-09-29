@@ -147,3 +147,72 @@ def test_kept_outputs_are_refused_on_a_host_with_scratch() -> None:
     with pytest.raises(SubmitError, match="scratch"):
         check_kept_allowed(spec, "host h", ephemeral=False, scratch=True)
     check_kept_allowed(spec, "host h", ephemeral=False, scratch=False)
+
+
+def test_submit_archives_before_the_enqueue_and_the_enqueue_keeps_it(scratch: Path) -> None:
+    spec = make_spec()
+    staged = paths.incoming_job_dir(spec.job_id) / "workdir"
+    staged.mkdir(parents=True)
+    (staged / "train.py").write_text("print('trained')\n")
+    archived = checkout.archive_staged(spec.job_id)
+    assert archived.is_file() and not staged.exists()
+    assert checkout.archive_staged(spec.job_id) == archived
+    queue.enqueue(spec)
+    assert paths.checkout_archive(spec.job_id).is_file()
+    assert not (paths.job_dir(spec.job_id) / "workdir").exists()
+
+
+def test_a_scratch_that_cannot_be_made_fails_the_job_not_the_runner(
+    gpuc_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = submitted()
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("GPUC_SCRATCH_DIR", str(blocker / "scratch"))
+    shutil.rmtree(paths.job_dir(job_id) / "workdir")
+    assert run(job_id) != 0
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "checkout-lost")
+
+
+def test_scratch_is_made_private(scratch: Path) -> None:
+    scratch.mkdir(mode=0o755)
+    scratch.chmod(0o755)
+    job_id = submitted()
+    assert checkout.restore(job_id) is None
+    assert scratch.stat().st_mode & 0o777 == 0o700
+
+
+def test_a_scratch_health_cannot_use_is_a_failed_check(gpuc_home: Path, tmp_path: Path) -> None:
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    check = health.check_disk(0.0, blocker / "scratch", "scratch_disk")
+    assert not check.ok and "cannot use" in check.detail
+
+
+def test_the_dispatcher_follows_a_scratch_set_while_it_runs(
+    gpuc_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_dispatcher import make_dispatcher
+
+    monkeypatch.delenv("GPUC_SCRATCH_DIR", raising=False)
+    dispatcher, _ = make_dispatcher()
+    config = jobs.read_config()
+    config.env["GPUC_SCRATCH_DIR"] = str(tmp_path / "scratch")
+    jobs.write_config(config)
+    dispatcher.run_once()
+    assert paths.scratch_dir() == tmp_path / "scratch"
+    config.env.pop("GPUC_SCRATCH_DIR")
+    jobs.write_config(config)
+    dispatcher.run_once()
+    assert paths.scratch_dir() is None
+
+
+def test_a_wiped_workdir_reports_only_the_archive_it_left(scratch: Path) -> None:
+    job_id = submitted(cleanup="never")
+    assert run(job_id) == 0
+    state = jobs.read_state(job_id)
+    shutil.rmtree(scratch)
+    archived = cleanup.reported_workdir_bytes(job_id, state)
+    assert archived == cleanup.workdir_size(job_id)
+    assert archived is not None and archived > 0

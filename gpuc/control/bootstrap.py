@@ -434,8 +434,8 @@ def resolve_cache_dir(session: HostSession, report: Reporter) -> str | None:
     target = cache_beside(home, "uv")
     report(
         f"uv cache: {cache} is on a different filesystem from the workdirs under {home}, "
-        f"so uv would "
-        f"copy every wheel into every venv. Setting UV_CACHE_DIR={target} for this host."
+        f"so uv would copy every wheel into every venv. Setting UV_CACHE_DIR={target} for "
+        f"this host."
     )
     return target
 
