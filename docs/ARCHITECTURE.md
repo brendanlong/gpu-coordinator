@@ -220,7 +220,6 @@ defaults.
   "auto_preempt": false,                # let the dispatcher stop this job, as often as it
                                         # takes, whenever that starts a queued one ahead
                                         # of it right away; it may take held cards
-  "requires": {"cuda_min": "12.8"},     # informs provisioning only
   "cleanup": "on_success",              # on_success | always | never; see Workdir cleanup
   "requeued_from": null                 # the job `gpuc requeue` resubmitted this one from;
                                         # written by the control side, carried by the host

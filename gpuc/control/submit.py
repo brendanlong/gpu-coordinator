@@ -90,7 +90,6 @@ class JobSpecModel(BaseModel):
     """Let the host stop this job, as often as it takes, whenever that lets a
     job queued at a lower `priority` number start right away. It re-runs from
     the start, so it belongs to work that is cheap to repeat."""
-    requires: dict[str, Any] = Field(default_factory=dict)
     cleanup: Literal["on_success", "always", "never"] = jobs.DEFAULT_CLEANUP
     """When the runner deletes the job's `workdir/`. The default keeps a failed
     or cancelled one so it can be inspected."""
