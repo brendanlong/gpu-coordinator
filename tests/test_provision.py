@@ -868,3 +868,63 @@ def test_the_pod_is_given_its_own_record_of_what_it_was_bought_as(
     assert provider_block["offer"]["name"] == "A40"
     assert provider_block["created_at"] == entry.config.created_at
     assert entry.config.provider == provider_block
+
+
+def test_a_lost_create_is_terminated_before_the_next_offer(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    """A create whose answer never arrived may still have bought a pod: it is
+    found by its name and ended, or the next offer bills alongside it."""
+    provider = FakeProvider(
+        [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")],
+        scripts=[
+            PodScript(lost_create=ProviderError("POST /pods: timed out"), hidden_for_lists=2),
+            PodScript(),
+        ],
+    )
+    reports: list[str] = []
+    entry = run(provider, host, offline_health, reports=reports)
+    assert provider.terminated == ["pod1"]
+    assert entry.pod_id == "pod2"
+    assert any("checking whether a pod was made anyway" in line for line in reports)
+
+
+def test_a_create_that_made_nothing_goes_on_to_the_next_offer(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    class NothingMade(FakeProvider):
+        def create(self, offer: Offer, name: str, **kwargs: object) -> Pod:
+            if offer.gpu_id == "first":
+                raise ProviderError("POST /pods -> HTTP 502")
+            return super().create(offer, name, **kwargs)  # type: ignore[arg-type]
+
+    provider = NothingMade(
+        [make_offer(price=0.20, gpu_id="first"), make_offer(price=0.40, gpu_id="second")]
+    )
+    reports: list[str] = []
+    entry = run(provider, host, offline_health, reports=reports)
+    assert provider.terminated == []
+    assert entry.pod_id == "pod1"
+    assert any("the create made nothing" in line for line in reports)
+
+
+def test_a_lost_create_that_cannot_be_looked_for_is_reported_as_billing(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    provider = FakeProvider(
+        [make_offer()], scripts=[PodScript(lost_create=ProviderError("timed out"))]
+    )
+    provider.list_error = ProviderError("HTTP 503")
+    with pytest.raises(ProvisionError) as error:
+        run(provider, host, offline_health)
+    assert "(id unknown) could NOT be terminated" in str(error.value)
+
+
+def test_an_interrupted_create_terminates_the_pod_it_made(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    provider = FakeProvider([make_offer()], scripts=[PodScript(lost_create=KeyboardInterrupt())])
+    with pytest.raises(KeyboardInterrupt):
+        run(provider, host, offline_health)
+    assert provider.terminated == ["pod1"]
+    assert load_registry().hosts == {}

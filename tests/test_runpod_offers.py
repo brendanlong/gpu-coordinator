@@ -11,13 +11,14 @@ from gpuc.control.actions import make_provider
 from gpuc.control.config import Settings
 from gpuc.control.providers.base import (
     Constraints,
+    CreateRefused,
     Offer,
     Pod,
     PodStatus,
     ProviderError,
     owned_pods,
 )
-from gpuc.control.providers.runpod import RunPodProvider
+from gpuc.control.providers.runpod import RunPodError, RunPodProvider
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -194,3 +195,20 @@ def test_max_price_caps_the_whole_pod_not_one_gpu() -> None:
         RecordedRunPod().offers(Constraints(gpu_names=["A40"], gpu_count=2, max_price_usd_hr=0.60))
         == []
     )
+
+
+@pytest.mark.parametrize(("status", "refused"), [(400, True), (429, True), (500, False)])
+def test_only_a_4xx_create_is_a_refusal(status: int, refused: bool) -> None:
+    """A 5xx may come back after the pod was made; only a 4xx says it was not."""
+
+    class Failing(RecordedRunPod):
+        def _json(self, method: str, path: str, **kwargs: Any) -> Any:
+            if method == "POST" and path == "/pods":
+                raise RunPodError(method, path, status, "no")
+            return super()._json(method, path, **kwargs)
+
+    provider = Failing()
+    offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
+    with pytest.raises(ProviderError) as error:
+        provider.create(offer, "gpuc-x")
+    assert isinstance(error.value, CreateRefused) is refused

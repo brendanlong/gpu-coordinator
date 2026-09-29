@@ -20,6 +20,7 @@ from .base import (
     DEFAULT_PREFIX,
     Cloud,
     Constraints,
+    CreateRefused,
     Offer,
     Pod,
     Provider,
@@ -222,7 +223,13 @@ class RunPodProvider(Provider):
             "startSsh": True,
             "env": env or DEFAULT_POD_ENV,
         }
-        return _pod_from_api(self._json("POST", "/pods", body=body))
+        try:
+            created = self._json("POST", "/pods", body=body)
+        except RunPodError as error:
+            if 400 <= error.status < 500:
+                raise CreateRefused(str(error)) from error
+            raise
+        return _pod_from_api(created)
 
     def get(self, pod_id: str) -> Pod | None:
         try:

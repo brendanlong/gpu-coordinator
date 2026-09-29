@@ -30,6 +30,11 @@ class ProviderError(RuntimeError):
     pass
 
 
+class CreateRefused(ProviderError):
+    """The provider answered a create, and the answer was no: nothing was
+    created. Any other way a create fails may have left a pod behind."""
+
+
 class Constraints(BaseModel):
     gpu_names: list[str] = Field(default_factory=list)
     min_vram_gb: int | None = None
