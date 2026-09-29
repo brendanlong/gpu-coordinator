@@ -362,7 +362,8 @@ Rules, and they are not optional:
   failing outright): re-copy the SSH key if needed, then `gpuc host bootstrap
   <host>`, then `gpuc status --host <host> --all` and `gpuc requeue` whatever
   was in flight. A host with a `--persistent-root` keeps its queue, and
-  queues the jobs that were running again itself.
+  queues the jobs that were running again itself. `--scratch-dir` keeps
+  workdirs off a slow persistent root; such a host refuses kept outputs.
 
 Full reference in the repo: `README.md`, `docs/setup.md` (install, hosts,
 credentials), `docs/usage.md` (jobs, rentals, failure reasons),

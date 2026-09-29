@@ -29,6 +29,7 @@ gpuc/
     destinations.py # where files go: one Destination per store (S3, Hugging Face); upload, put_file, preflight
     preflight.py   # sync preflight: prove every destination can be written before the job runs
     baseline.py    # what was already under `outputs:` before the job started
+    checkout.py    # a host with scratch: archive the checkout at enqueue, unpack it before a run
     cleanup.py     # `cleanup:` policy, workdir sizing, the `clean`/`purge` sweeps
     gpus.py        # the one nvidia-smi table parser and the one index/UUID resolver (`resolve`); utilization sampling
     progress.py    # the optional `progress_command`: run it, read a percentage off it
@@ -162,11 +163,13 @@ jobs/<jobid>/
                      # accumulate every non-null sample of the attempt and survive
                      # the job. eta is null unless the job is running.
                      # progress_pct survives the job.
+  checkout.tar.gz    # the checkout as submitted, on a host with scratch only; see Scratch
   outputs_baseline.json # per `outputs:` path, the {relpath: [size, mtime_ns]} the
                      # checkout arrived with; those files are never uploaded as this
                      # job's results and never satisfy `outputs:`
   workdir/           # rsynced code (git-tracked + untracked, .gitignore obeyed); removed per `cleanup:`,
-                     # except the job's kept outputs, which stay where it wrote them
+                     # except the job's kept outputs, which stay where it wrote them.
+                     # `<scratch>/<jobid>/` instead on a host with scratch (`paths.workdir`)
   log.txt            # combined stdout/stderr of setup + command, line-buffered
   outputs/           # default output root; JobSpec.outputs paths are relative to workdir
 dispatcher.lock      # fd flock held by the running dispatcher
@@ -341,7 +344,9 @@ The order is the contract; each step is in `runner.py`.
 0. Claim the job: one compare-and-set from `queued` to `running` carrying the
    assignment, `started_at`, the isolation mode and the runner's own pid, boot
    id and start time. A claim that fails is a job that is no longer ours; the
-   runner exits 0 and writes nothing.
+   runner exits 0 and writes nothing. Then, on a host with scratch, unpack the
+   archived checkout if the workdir is missing (`checkout.restore`); with
+   neither, fail `checkout-lost` before anything runs.
 1. Verify the assignment (UUIDs) against `nvidia-smi --query-gpu=index,uuid`;
    fail `gpu-assert` if it names a card that is not here, or is empty for a
    job that asked for cards. Export `CUDA_VISIBLE_DEVICES` as the cards'
@@ -462,8 +467,10 @@ a daemonised grandchild escapes: a documented hole, not a fixed one.
 
 ## Workdir cleanup, retention and purge
 
-`workdir/` is the only part of a job dir gpuc deletes; `spec.json`,
-`state.json` and `log.txt` always stay. What a user sees of it is
+`workdir/`, with `checkout.tar.gz` where there is one, is the only part of a
+job gpuc deletes short of a purge; `spec.json`, `state.json` and `log.txt`
+always stay. The checkout is the workdir or the archive, whichever is left, and
+removing it removes both (`cleanup.has_checkout`, `cleanup.remove_workdir`). What a user sees of it is
 [usage.md](usage.md#disk-cleanup); the contract behind it:
 
 - No policy touches a job that is not finished. The runner applies its policy
@@ -530,25 +537,27 @@ Two rules follow:
 
 - Nothing in the job path sets `UV_LINK_MODE`, and neither the dispatcher nor
   the runner sets `UV_CACHE_DIR` unless `HostConfig.env` does.
-- `gpuc host bootstrap` compares the filesystem of gpuc home with that of `uv
-  cache dir` (`health.uv_cache_placement`, asked of the host's own code once
-  the package is there). If they differ it sets `UV_CACHE_DIR` in the host's
-  own config to `<parent of gpuc home>/.cache/uv`, beside gpuc home rather
-  than inside it. A cache the host's config already names is never
+- `gpuc host bootstrap` compares the filesystem the workdirs are on (gpuc
+  home, or scratch) with that of `uv cache dir` (`health.uv_cache_placement`,
+  asked of the host's own code once the package is there). If they differ it
+  sets `UV_CACHE_DIR` in the host's own config to `<parent of that
+  directory>/.cache/uv`, beside it rather than inside it. A cache the host's config already names is never
   overridden, and an unreadable comparison changes nothing.
 
 `HostConfig.env` is otherwise opaque, and the keys the tool has an opinion
 about are one table, `jobs.MANAGED_ENV`: `UV_CACHE_DIR` and `HF_HOME` are
 *sticky* (an `--env` that does not name them keeps them) and *derived* by
-bootstrap beside gpuc home when the host names nothing (the uv cache wherever
-gpuc home and `$HOME` are on different filesystems, `HF_HOME` only under a
-persistent root); `UV_INSTALL_DIR` and `UV_TOOL_BIN_DIR` are its PATH keys.
+bootstrap when the host names nothing (the uv cache beside the workdirs
+wherever they and the cache are on different filesystems, `HF_HOME` beside
+gpuc home only under a persistent root); `GPUC_DATA_DIR` and
+`GPUC_SCRATCH_DIR` are sticky and never derived; `UV_INSTALL_DIR` and `UV_TOOL_BIN_DIR` are its PATH keys.
 `gpuc host clean <host> --uv-cache` runs `uv cache prune`, never `clean`, and
 `--hf-cache` runs `hf cache prune`.
 
 ## Fetching a job's files
 
-`gpuc fetch` reads only `jobs/<id>/workdir/`, whatever state the job is in.
+`gpuc fetch` reads only the job's workdir (`paths.workdir`), whatever state
+the job is in.
 The host lists the files (`python -m gpuc.host fetch`), so a job's results are
 told from its checkout by the same outputs baseline uploads use, and never by
 the client; the client then pulls exactly that list, into `<to>/<job id>/`.
@@ -870,6 +879,25 @@ runner, and to every `HostSession` invocation of the on-host package.
 conclusion from it. The health check's disk floor is measured on
 `paths.home()`, so it is `R`'s volume when a root is set. The runbook for a
 host that came back empty is in setup.md.
+
+### Scratch
+
+`GPUC_SCRATCH_DIR` in the host's `env` (`--scratch-dir`, a sticky
+`MANAGED_ENV` key) moves every workdir to `<scratch>/<jobid>/` and nothing
+else. The rules that make a scratch a restart may wipe safe:
+
+- `enqueue` archives the staged workdir into `checkout.tar.gz` in the job dir
+  and removes it, so the job dir that is renamed into `jobs/` holds the only
+  copy of the code, beside the queue.
+- The runner unpacks it after the claim whenever the workdir is missing, into
+  a temporary directory renamed into place, so a restore cut short is never
+  taken for a checkout. A workdir that is there is used as it is, as after a
+  preempt on any host.
+- `paths.workdir` answers `jobs/<id>/workdir` whenever that exists, so jobs
+  from before scratch was set are found where they are.
+- A purge removes the workdir on scratch with the job dir. The health check
+  measures the disk floor on scratch too (`scratch_disk`).
+- Kept outputs are refused at submit, like on a rental.
 
 ## Providers
 

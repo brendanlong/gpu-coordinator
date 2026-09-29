@@ -107,9 +107,13 @@ def check_gpu_uuids(
     return Check("gpu_uuids", True, detail, len(cards.owned), warn=bool(absent))
 
 
-def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:
-    root = paths.home()
-    root.mkdir(parents=True, exist_ok=True)
+def check_disk(
+    min_free_gb: float = DEFAULT_MIN_FREE_GB, root: Path | None = None, name: str = "disk"
+) -> Check:
+    """Free space where the queue lives, or under `root`: the scratch that
+    holds workdirs needs the room for checkouts, venvs and outputs too."""
+    root = root or paths.home()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     free_gb = shutil.disk_usage(root).free / 1e9
     ok = free_gb >= min_free_gb
     detail = f"{free_gb:.1f} GB free on the {root} volume (floor {min_free_gb:.1f} GB)"
@@ -118,7 +122,7 @@ def check_disk(min_free_gb: float = DEFAULT_MIN_FREE_GB) -> Check:
             "; jobs sync outputs through this volume, so free space here or raise "
             "--min-free-gb if you know the job is small"
         )
-    return Check("disk", ok, detail, round(free_gb, 1))
+    return Check(name, ok, detail, round(free_gb, 1))
 
 
 def uv_cache_dir(config: jobs.HostConfig | None = None) -> Path:
@@ -159,11 +163,15 @@ def same_filesystem(left: Path, right: Path) -> bool | None:
 
 
 def uv_cache_placement(config: jobs.HostConfig | None = None) -> dict[str, Any]:
-    """The uv cache's location, size, and whether it shares gpuc home's
-    filesystem (None when that could not be read). What `check_uv_cache`
-    reports and what bootstrap decides `UV_CACHE_DIR` on, so both agree."""
+    """The uv cache's location, size, and whether it shares the filesystem
+    jobs' venvs are built on (None when that could not be read). What
+    `check_uv_cache` reports and what bootstrap decides `UV_CACHE_DIR` on, so
+    both agree.
+
+    That is gpuc home, or scratch on a host with one. The keys still say
+    `gpuc_home`, because a client from before scratch reads them."""
     cache = uv_cache_dir(config)
-    home = paths.home()
+    home = paths.workdirs_root(job_environ(config))
     return {
         "dir": str(cache),
         "gpuc_home": str(home),
@@ -181,7 +189,7 @@ def check_uv_cache(config: jobs.HostConfig | None = None) -> Check:
     """
     placement = uv_cache_placement(config)
     cache = Path(placement["dir"])
-    home = paths.home()
+    home = Path(placement["gpuc_home"])
     shared = placement["shares_gpuc_home_fs"]
     size = placement["size_bytes"]
     where = f"{cache} holds {cleanup.human_bytes(size)}" if cache.is_dir() else f"{cache} is empty"
@@ -194,9 +202,9 @@ def check_uv_cache(config: jobs.HostConfig | None = None) -> Check:
     return Check(
         "uv_cache",
         True,
-        f"{where}, on a DIFFERENT filesystem from gpuc home {home}, so uv cannot "
-        f"hardlink or reflink into a job's venv and copies every wheel instead. "
-        f"Set a cache on gpuc home's volume: "
+        f"{where}, on a DIFFERENT filesystem from the workdirs under {home}, so uv "
+        f"cannot hardlink or reflink into a job's venv and copies every wheel instead. "
+        f"Set a cache on that volume: "
         f"gpuc host set {config.host if config else '<host>'} "
         f"--cache-dir {home.parent}/.cache/uv && gpuc host bootstrap ...",
         size,
@@ -307,6 +315,7 @@ def run_checks(
     download_timeout: float = DEFAULT_DOWNLOAD_TIMEOUT_S,
 ) -> dict[str, Any]:
     config = jobs.read_config()
+    scratch = paths.scratch_dir(job_environ(config))
     smi = smi or gpus.run_nvidia_smi
     downloader = downloader or http_download
     checks = [
@@ -315,6 +324,7 @@ def run_checks(
         else Check("driver", True, "no GPUs owned", None),
         check_gpu_uuids(config.gpus, smi, shared=config.shared_gpus),
         check_disk(min_free_gb),
+        *([check_disk(min_free_gb, scratch, "scratch_disk")] if scratch else []),
         check_uv_cache(config),
         check_size("hf_cache", hf_hub_cache_dir(config)),
         check_size("data_dir", paths.data_dir(job_environ(config))),

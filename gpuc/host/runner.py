@@ -31,6 +31,7 @@ from typing import IO
 from gpuc._version import user_agent
 from gpuc.host import (
     baseline,
+    checkout,
     cleanup,
     destinations,
     gpus,
@@ -455,6 +456,7 @@ class JobRunner:
         touch."""
         if not self._claim():
             return 0
+        checkout_error = checkout.restore(self.job_id)
         paths.ensure_job_layout(self.job_id)
         job_start = self.deps.now()
         gpu_error = self._verify_assigned()
@@ -476,6 +478,10 @@ class JobRunner:
         )
         with paths.log_file(self.job_id).open("ab") as log, self._term_handlers():
             try:
+                if checkout_error:
+                    self._log(log, f"checkout lost: {checkout_error}")
+                    outcome = Outcome("failed", "checkout-lost", 1, ran=False)
+                    return self._finalize(outcome, sync_loop, log)
                 return self._run_phases(env, sync_loop, log, job_start, gpu_error)
             except _Terminated as exc:
                 return self._finalize_terminated(exc, sync_loop, log)

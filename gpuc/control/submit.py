@@ -204,16 +204,25 @@ def check_kept_path(path: str) -> None:
         )
 
 
-def check_kept_allowed(spec: JobSpec, where: str, *, ephemeral: bool) -> None:
-    """Refuse kept outputs on a rental: the pod terminates on its own once it
-    is idle, and outputs with no destination would go with it, unannounced."""
+def check_kept_allowed(
+    spec: JobSpec, where: str, *, ephemeral: bool, scratch: bool = False
+) -> None:
+    """Refuse kept outputs where they would not keep: on a rental, which
+    terminates on its own once it is idle, and in a workdir on scratch, which
+    a restart may wipe. Either way they would go unannounced."""
     kept = [output.path for output in spec.outputs if output.kept]
-    if ephemeral and kept:
-        raise SubmitError(
-            f"{where} is a rental, which terminates itself once idle, and these outputs "
-            f"have no `s3` or `hf` to go to, so they would be lost with it: {', '.join(kept)}.\n"
-            f"Give each one a destination, or submit to a host that persists."
-        )
+    if not kept or not (ephemeral or scratch):
+        return
+    why = (
+        "is a rental, which terminates itself once idle"
+        if ephemeral
+        else "keeps workdirs on scratch (GPUC_SCRATCH_DIR), which a restart may wipe"
+    )
+    raise SubmitError(
+        f"{where} {why}, and these outputs have no `s3` or `hf` to go to, so they "
+        f"would be lost with it: {', '.join(kept)}.\n"
+        f"Give each one a destination, or submit to a host that keeps them."
+    )
 
 
 def _expand(output: jobs.Output, key: str, template: str | None, job_id: str) -> str | None:
@@ -635,7 +644,12 @@ def submit_spec(
     too_big = wont_fit(spec, session.config, table, entry.name)
     if too_big:
         raise SubmitError(too_big)
-    check_kept_allowed(spec, f"host {entry.name}", ephemeral=session.config.ephemeral)
+    check_kept_allowed(
+        spec,
+        f"host {entry.name}",
+        ephemeral=session.config.ephemeral,
+        scratch=bool(session.config.env.get("GPUC_SCRATCH_DIR")),
+    )
 
     for warning in prepared.warnings:
         report(f"WARNING: {warning}")

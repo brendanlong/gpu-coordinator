@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 from dataclasses import dataclass, field
 
-from gpuc.host import cleanup, jobs, paths
+from gpuc.host import checkout, cleanup, jobs, paths
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
 from gpuc.host.procs import from_another_boot
 
@@ -49,6 +50,9 @@ def enqueue(spec: JobSpec) -> str:
     dies at any point before this leaves nothing under `jobs/` at all, and
     `cleanup.stale_incoming` sweeps what it left. There is no order of writes
     inside the dir to get right, because nothing reads it until it has moved.
+
+    On a host with scratch the workdir does not move with it: it is archived
+    into the job dir and removed, and the runner unpacks it onto scratch.
     """
     paths.ensure_layout()
     job_id = spec.job_id
@@ -62,6 +66,9 @@ def enqueue(spec: JobSpec) -> str:
     jobs.atomic_write_json(staged / "spec.json", spec.to_dict())
     jobs.atomic_write_json(staged / "state.json", JobState.initial(spec).to_dict())
     (staged / "log.txt").touch()
+    if paths.scratch_dir() is not None:
+        checkout.archive(staged / "workdir", staged / paths.checkout_archive(job_id).name)
+        shutil.rmtree(staged / "workdir")
     os.rename(staged, accepted)
     return job_id
 
