@@ -660,12 +660,12 @@ class Dispatcher:
         return "draining" if self._draining else None
 
     def _fail_queued(self, job_id: str, reason: str) -> None:
-        if self._stand_down_if_replaced():
-            return
         """End a queued job without a runner: a spec that cannot be read, a
         request this host can never meet, a runner that could not be spawned.
         The listing forgets the job with it, and its secrets go: the runner
         that would have deleted them will never exist."""
+        if self._stand_down_if_replaced():
+            return
         try:
             written = jobs.finish(job_id, Outcome("failed", reason, ran=False), expect="queued")
         except RuntimeError as exc:
@@ -719,10 +719,10 @@ class Dispatcher:
                 self._mark_runner_died(job_id, expect="running")
 
     def _requeue_after_restart(self, job_id: str) -> None:
-        if self._stand_down_if_replaced():
-            return
         """Queue again, or end, a job whose runner the last boot took with it;
         an ended one's secrets go as for any job ended without its runner."""
+        if self._stand_down_if_replaced():
+            return
         try:
             written = queue.requeue_after_restart(job_id)
         except RuntimeError as exc:
@@ -745,10 +745,6 @@ class Dispatcher:
         self._settle_secrets(job_id, written)
 
     def _mark_runner_died(self, job_id: str, *, expect: str) -> None:
-        if self._stand_down_if_replaced():
-            # A runner that stood down for the new owner exited without a
-            # word; it did not die, and its job is not ours to fail.
-            return
         """Fail the job whose runner is gone, after making sure nothing of it
         is left on the GPUs.
 
@@ -759,6 +755,10 @@ class Dispatcher:
         needs its runner to queue the job again, and a runner that is gone
         queued nothing.
         """
+        if self._stand_down_if_replaced():
+            # A runner that stood down for the new owner exited without a
+            # word; it did not die, and its job is not ours to fail.
+            return
         try:
             state = jobs.read_state(job_id)
         except RuntimeError as exc:
@@ -795,7 +795,7 @@ class Dispatcher:
         for job_id, entry in list(self.running.items()):
             if entry.alive():
                 continue
-            del self.running[job_id]
+            self.running.pop(job_id, None)
             self._stop_sent.pop(job_id, None)
             self._stop_escalated.discard(job_id)
             self._settle(job_id, entry)
@@ -1561,6 +1561,8 @@ class Dispatcher:
         self._claimed = None
         self._draining = None
         self.reap()
+        if self.replaced is not None:
+            return
         self.escalate_stops()
         self.launch_ready()
         self.preempt_for_waiting()
@@ -1611,7 +1613,9 @@ class Dispatcher:
                 continue
             with contextlib.suppress(RuntimeError):
                 state = jobs.read_state(job_id)
-                if state.status == "running" and from_another_boot(state.runner_boot_id):
+                if state.status == "running" and from_another_boot(
+                    state.runner_boot_id, state.runner_init_start
+                ):
                     self._requeue_after_restart(job_id)
 
     def idle_and_not_ephemeral(self) -> bool:

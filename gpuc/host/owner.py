@@ -117,6 +117,21 @@ def renew(me: str) -> None:
             os.utime(paths.owner_file())
 
 
+def serving_elsewhere(me: str) -> str | None:
+    """The host of another machine still renewing this queue's claim, for
+    `status`; None for a claim that has gone quiet, which is most often this
+    machine's own before a restart."""
+    path = paths.owner_file()
+    record = current()
+    if record is None or record[0] == me or time.time() - record[1] > STALE_S:
+        return None
+    try:
+        host = jobs.as_opt_str(jobs.fields_of(jobs.read_json(path, attempts=2)), "host")
+    except RuntimeError:
+        host = None
+    return host or record[0]
+
+
 def replaced_by(me: str) -> str | None:
     """The instance that took this queue over from `me`, or None."""
     record = current()
