@@ -24,7 +24,7 @@ import shutil
 import stat
 import struct
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -401,19 +401,22 @@ def kept_outputs(
         return []
     if not state.ran:
         return []
+    return [key for key in _written_outputs(job_id, spec, kept=True) if key is not None]
+
+
+def _written_outputs(job_id: str, spec: JobSpec, *, kept: bool) -> Iterator[str | None]:
     workdir = paths.workdir(job_id)
     entries = baseline.read(job_id)
-    kept: list[str] = []
     for output in spec.outputs:
-        if not output.kept:
+        if output.kept != kept:
             continue
         try:
             key = baseline.output_key(output, job_id)
         except (KeyError, IndexError, ValueError):
+            yield None
             continue
         if baseline.has_new_content(workdir / key, entries.get(key, {})):
-            kept.append(key)
-    return kept
+            yield key
 
 
 def record_workdir_size(job_id: str) -> int:
@@ -894,25 +897,10 @@ def outputs_pending(job_id: str, spec: JobSpec, state: JobState) -> str | None:
         return None
     if not paths.workdir(job_id).is_dir():
         return None
-    if not _produced_outputs(job_id, spec):
+    if not any(True for _ in _written_outputs(job_id, spec, kept=False)):
         return None
     detail = " (the drain gave up: outputs_lost)" if state.outputs_lost else ""
     return f"outputs not confirmed uploaded{detail}"
-
-
-def _produced_outputs(job_id: str, spec: JobSpec) -> bool:
-    workdir = paths.workdir(job_id)
-    entries = baseline.read(job_id)
-    for output in spec.outputs:
-        if output.kept:
-            continue
-        try:
-            key = baseline.output_key(output, job_id)
-        except (KeyError, IndexError, ValueError):
-            return True
-        if baseline.has_new_content(workdir / key, entries.get(key, {})):
-            return True
-    return False
 
 
 def _not_backed_up(prefix: str | None) -> str:
@@ -973,14 +961,12 @@ def purge_candidates(
     return picked, skipped
 
 
-def remove_job_dir(job_id: str) -> int:
-    """Delete `jobs/<id>/` and every stray trace of the job. Bytes freed."""
+def remove_job_dir(job_id: str) -> None:
+    """Delete `jobs/<id>/` and every stray trace of the job."""
     directory = paths.job_dir(job_id)
-    size = reclaimable_bytes(directory) if directory.is_dir() else 0
     if directory.is_dir():
         shutil.rmtree(directory)
     remove_secrets(job_id)
-    return size
 
 
 def purge_job_dirs(
