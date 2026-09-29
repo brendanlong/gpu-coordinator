@@ -47,9 +47,6 @@ class RecordingTransport:
     def pull(self, remote_root: str, local_root: Path, files: object) -> CommandResult:
         raise AssertionError("not used")
 
-    def tail(self, remote_path: str, lines: int = 200, follow: bool = False) -> CommandResult:
-        raise AssertionError("not used")
-
     def argv(self, command: str) -> list[str]:
         return ["ssh", "gpubox", command]
 
