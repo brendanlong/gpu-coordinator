@@ -509,6 +509,11 @@ class JobRunner:
                     secrets = sealed.job_secrets(self.job_id)
                 except sealed.SealedError as exc:
                     self._log(log, f"could not open the job's secrets: {exc}")
+                    # The mirror still gets the spec's plain env (a region,
+                    # an endpoint), as every other failure's does.
+                    self.env = sync_loop.env = build_env(
+                        self.spec, self.assigned, self._indices, {}
+                    )
                     outcome = Outcome("failed", "secrets", 1, ran=False)
                     return self._finalize(outcome, sync_loop, log)
                 env = build_env(self.spec, self.assigned, self._indices, secrets)

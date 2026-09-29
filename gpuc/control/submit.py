@@ -555,13 +555,12 @@ def host_recipient(session: HostSession) -> str:
     return recipient
 
 
-def deliver_secrets(session: HostSession, job_id: str, body: str) -> None:
+def deliver_secrets(session: HostSession, job_id: str, body: str, recipient: str) -> None:
     """Encrypt the job's secrets to the host's own key and put them there.
 
     Encrypted here, so the plaintext exists only in this process and, when
     the job runs, in the pipe the host opens them through (`sealed`).
     """
-    recipient = host_recipient(session)
     try:
         sealed = pyrage.encrypt(
             body.encode(), [pyrage.x25519.Recipient.from_str(recipient)], armored=True
@@ -696,6 +695,10 @@ def submit_spec(
         spec, f"host {entry.name}", ephemeral=session.config.ephemeral, scratch=scratch
     )
 
+    # Before anything is uploaded: a host that cannot make its key refuses
+    # the job now, not after the checkout has gone up.
+    recipient = host_recipient(session) if prepared.secrets_body else None
+
     for warning in prepared.warnings:
         report(f"WARNING: {warning}")
         notes.append(warning)
@@ -706,8 +709,8 @@ def submit_spec(
         session.host_json(f"archive-checkout {spec.job_id}", timeout=ARCHIVE_TIMEOUT_S)
         report("archived the checkout beside the queue; workdirs here are on scratch")
 
-    if prepared.secrets_body:
-        deliver_secrets(session, spec.job_id, prepared.secrets_body)
+    if prepared.secrets_body and recipient:
+        deliver_secrets(session, spec.job_id, prepared.secrets_body, recipient)
         report(f"delivered {len(spec.secrets)} secret(s), encrypted to the host's key")
 
     response = enqueue_spec(session, prepared)
