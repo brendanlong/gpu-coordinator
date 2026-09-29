@@ -31,6 +31,7 @@ from gpuc.host.procs import (
     JobProcesses,
     boot_id,
     cmdline,
+    from_another_boot,
     is_gpuc_process,
     recorded_process_alive,
     starttime,
@@ -652,8 +653,8 @@ class Dispatcher:
 
         A `running` state names the runner that claimed it, with the boot id
         and start time that make a pid an identity, so the question is only
-        whether that process is still there: adopted if so, `runner-died` if
-        not. Nothing else is inferred, and nothing is written back. A runner
+        whether that process is still there: adopted if so, with nothing
+        written, and `runner-died` if not. Nothing else is inferred. A runner
         from an earlier boot died with the machine, not on its own, so its job
         is queued again instead (`queue.requeue_after_restart`).
         """
@@ -665,7 +666,7 @@ class Dispatcher:
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
-            if queue.from_another_boot(state):
+            if from_another_boot(state.runner_boot_id):
                 self._requeue_after_restart(job_id)
                 continue
             if recorded_process_alive(
@@ -677,6 +678,8 @@ class Dispatcher:
                 self._mark_runner_died(job_id, expect="running")
 
     def _requeue_after_restart(self, job_id: str) -> None:
+        """Queue again, or end, a job whose runner the last boot took with it;
+        an ended one's secrets go as for any job ended without its runner."""
         try:
             written = queue.requeue_after_restart(job_id)
         except RuntimeError as exc:

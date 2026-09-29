@@ -233,6 +233,9 @@ gpuc wait "$id" || echo "failed"
 ## When a job fails
 
 `gpuc status <job-id>` gives the reason and `gpuc logs <job-id>` the detail.
+A job that was running when its host restarted is not failed: it is queued
+again and starts over once gpuc runs there again (after `gpuc host bootstrap`,
+if the restart took gpuc with it).
 
 | reason | meaning |
 | --- | --- |
@@ -245,7 +248,7 @@ gpuc wait "$id" || echo "failed"
 | `timeout` | it ran past `max_runtime_min` |
 | `needs N GPUs, host owns M` | the host lost cards after the job was queued |
 | `runner-died`, `spawn-failed`, `terminated` | gpuc itself was killed or crashed on the host |
-| `host-restarted` | the host restarted under the job three times; each earlier restart queued it again from the start |
+| `host-restarted` | the host kept restarting under the job; each earlier restart queued it again from the start |
 
 Other things that go wrong:
 

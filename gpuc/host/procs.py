@@ -82,14 +82,21 @@ def is_gpuc_process(pid: int) -> bool:
     return "gpuc.host" in cmdline(pid)
 
 
+def from_another_boot(recorded_boot_id: str | None) -> bool:
+    """Was this recorded in an earlier boot of this machine? Only a boot id
+    recorded *and* readable now *and* different says so: not knowing is not
+    evidence of a reboot."""
+    current = boot_id()
+    return bool(recorded_boot_id and current and recorded_boot_id != current)
+
+
 def recorded_process_alive(
     pid: int | None, recorded_boot_id: str | None = None, recorded_starttime: str | None = None
 ) -> bool:
     """Is the *same* process we recorded still running?"""
     if not pid or not pid_alive(pid):
         return False
-    current_boot = boot_id()
-    if recorded_boot_id and current_boot and recorded_boot_id != current_boot:
+    if from_another_boot(recorded_boot_id):
         return False
     current_start = starttime(pid)
     return not (recorded_starttime and current_start and recorded_starttime != current_start)
@@ -140,11 +147,9 @@ class JobProcesses:
         with that boot, its scopes with them, and the kernel has been issuing
         pids from 1 again since -- so a `pgid` from it is whatever happens to
         hold that number now, and adoption after a reboot SIGKILLed exactly
-        that. The same identity rule as `recorded_process_alive`: only a boot
-        id recorded *and* readable *and* different says so.
+        that. The same identity rule as `recorded_process_alive`.
         """
-        current = boot_id()
-        if state.runner_boot_id and current and state.runner_boot_id != current:
+        if from_another_boot(state.runner_boot_id):
             return JobProcesses()
         return JobProcesses(state.cgroup_unit, state.pgid or None, state.runner_pid)
 

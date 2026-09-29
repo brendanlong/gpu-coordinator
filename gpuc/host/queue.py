@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 from gpuc.host import cleanup, jobs, paths
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
-from gpuc.host.procs import boot_id
+from gpuc.host.procs import from_another_boot
 
 PREEMPTED = "preempted"
 """The reason of an attempt stopped so that something else can have its GPUs.
@@ -315,40 +315,40 @@ def requeue_after_restart(job_id: str) -> JobState | None:
     start in the same workdir, as after a preempt. Unlike a runner that died
     while the host stayed up, this is not the job's doing or gpuc's, so it is
     not a failure -- until `MAX_RESTARTS`, when it is `failed: host-restarted`.
-    A job somebody was cancelling is cancelled.
+    A job somebody was cancelling is cancelled, and one somebody was
+    preempting is queued again without counting against the limit, since
+    queued again is what was asked for.
 
-    The state written, or None when the job is no longer a `running` one from
-    another boot: whoever moved it on decided for it.
+    The dispatcher's one write of a transition the runner owns, because the
+    runner that owned it died with the boot. The state written, or None when
+    the job is no longer a `running` one from another boot: whoever moved it
+    on decided for it.
     """
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
-        if state.status != "running" or not from_another_boot(state):
+        if state.status != "running" or not from_another_boot(state.runner_boot_id):
             return None
+        preempting = state.intent == PREEMPT
         attempt = None
-        if state.intent != CANCEL and state.restarts < MAX_RESTARTS:
+        if preempting:
+            attempt = _write_queued_again(job_id, state, ran=state.ran)
+        elif state.intent != CANCEL and state.restarts < MAX_RESTARTS:
             attempt = _write_queued_again(job_id, state, ran=state.ran, restarts=state.restarts + 1)
-    if attempt is None:
+        written = jobs.read_state(job_id) if attempt is not None else None
+    if written is None:
         outcome = (
             jobs.Outcome("cancelled", "cancelled", ran=False)
             if state.intent == CANCEL
             else jobs.Outcome("failed", "host-restarted", ran=False)
         )
         return jobs.finish(job_id, outcome, expect="running", forget_output_uploads=True)
+    counted = "" if preempting else f" (restart {written.restarts} of at most {MAX_RESTARTS})"
     note(
         job_id,
-        f"the host restarted while this job was running; queued again as attempt {attempt} "
-        f"(restart {state.restarts + 1} of at most {MAX_RESTARTS}), to run from the start "
-        f"in this same workdir",
+        f"the host restarted while this job was running; queued again as attempt {attempt}"
+        f"{counted}, to run from the start in this same workdir",
     )
-    return jobs.read_state(job_id)
-
-
-def from_another_boot(state: JobState) -> bool:
-    """Did this state's runner run in an earlier boot of this machine? Only a
-    boot id recorded *and* readable now *and* different says so, as in
-    `procs.recorded_process_alive`."""
-    current = boot_id()
-    return bool(state.runner_boot_id and current and state.runner_boot_id != current)
+    return written
 
 
 def note(job_id: str, message: str) -> None:

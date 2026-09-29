@@ -19,7 +19,7 @@ gpuc/
     __main__.py    # the on-host CLI the control side drives over ssh
     paths.py       # the ~/.gpuc layout
     jobs.py        # job ids, HostConfig/JobSpec/JobState, the per-job lock, tolerant readers, atomic writes
-    queue.py       # accept a job, list the queue, claim, cancel, preempt, the next attempt of a preempted job
+    queue.py       # accept a job, list the queue, claim, cancel, preempt, the next attempt of a preempted or restarted job
     plan.py        # the dispatch rule, pure: what a pass does with each queued job, and when each will start
     settable.py    # `gpuc set`: the one table of settable fields, their checks, and applying a patch
     dispatcher.py  # lock+heartbeat, act on the plan, launch runners, escalate stops, idle terminate
@@ -119,7 +119,8 @@ jobs/<jobid>/
   state.json         # {"status": queued|running|succeeded|failed|cancelled,
                      #  "intent": null | "cancel" | "preempt",   # what somebody asked of a running job;
                      #                                        # cleared by the write that ends it
-                     #  "attempt": n,                          # launches of this id: 1, +1 per preempt
+                     #  "attempt": n,                          # launches of this id: 1, +1 per
+                     #                                        # preempt or host restart
                      #  "priority": p,                         # the live priority, which orders
                      #                                        # the queue of `queued` states
                      #  "estimated_runtime_min": null | m,     # the live estimate, as `gpuc set` left it
@@ -184,7 +185,9 @@ preempt). **The runner owns every transition of its job** from the claim
 (`queued` -> `running`, naming itself) to the write that ends the attempt (a
 terminal status through `jobs.finish`, or `queued` again at the next attempt
 for a preempt), so a `running` state always names a runner that existed, and a
-job is finished exactly when its runner is gone. Every terminal write goes
+job is finished exactly when its runner is gone. The one exception is a runner
+from an earlier boot, which cannot write anything: the dispatcher ends its
+attempt for it (`queue.requeue_after_restart`, under *Dispatcher*). Every terminal write goes
 through `jobs.finish(job_id, Outcome)`, the dispatcher's own failures
 included; it clears the intent, the phase and the processes of the attempt.
 An unreadable state is logged and left alone, never written over with
@@ -286,11 +289,12 @@ The rules it holds to:
   recorded runner (`runner_pid` with the boot id and start time beside it) is
   alive is adopted; otherwise it is failed `runner-died`, its leftovers killed
   (`cgroup_unit`, then `pgid`) before its cards go back in the pool. Nothing
-  is inferred from the process table and nothing is written back. A runner
-  recorded in another boot died with the machine: its job is queued again at
-  `attempt+1` as a preempt leaves it, with `restarts` one higher and nothing
-  killed (`queue.requeue_after_restart`), cancelled if a cancel stood, and
-  failed `host-restarted` once `restarts` reaches `queue.MAX_RESTARTS`.
+  is inferred from the process table, and an adopted job's state is not
+  written. A runner recorded in another boot died with the machine: its job
+  is queued again at `attempt+1` as a preempt leaves it, with `restarts` one
+  higher and nothing killed (`queue.requeue_after_restart`), cancelled if a
+  cancel stood, and failed `host-restarted` once `restarts` reaches
+  `queue.MAX_RESTARTS`. A standing preempt is queued again uncounted.
 - **A stop is an intent** in the job's state: `cancel` or `preempt`. The
   runner owns the kill and ends the attempt with its last write; the
   dispatcher escalates only once the grace period has passed
