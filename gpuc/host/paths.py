@@ -206,6 +206,10 @@ def draining_file() -> Path:
     return home() / "draining"
 
 
+def owner_file() -> Path:
+    return home() / "owner.json"
+
+
 def ensure_layout() -> None:
     home().mkdir(parents=True, exist_ok=True)
     incoming_dir().mkdir(parents=True, exist_ok=True)

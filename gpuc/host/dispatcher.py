@@ -23,7 +23,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from gpuc._version import is_other_build
-from gpuc.host import baseline, cleanup, gpus, jobs, paths, plan, queue, scope, sync, terminate
+from gpuc.host import (
+    baseline,
+    cleanup,
+    gpus,
+    jobs,
+    owner,
+    paths,
+    plan,
+    queue,
+    scope,
+    sync,
+    terminate,
+)
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.jobs import Outcome
 from gpuc.host.procs import (
@@ -1119,6 +1131,8 @@ class Dispatcher:
                 f"pass began; not launching it on those"
             )
             return
+        if self._stand_down_if_replaced():
+            return
         try:
             proc = self.deps.spawn_runner(job_id, assigned, attempt)
         except OSError as exc:
@@ -1504,6 +1518,8 @@ class Dispatcher:
 
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
+        if self._stand_down_if_replaced():
+            return
         self._config = jobs.read_config()
         paths.follow_scratch(self._config.env)
         self._cards = None
@@ -1523,12 +1539,47 @@ class Dispatcher:
         self.sweep_stale_incoming()
         self.maybe_terminate()
 
+    def _stand_down_if_replaced(self) -> bool:
+        """Stop serving a queue another machine has taken over (see `owner`).
+
+        Every runner of ours and every job process goes, with SIGKILL and no
+        final write: the state files are the new owner's now, and it has
+        already queued these jobs again, since their runners were recorded on
+        a machine it is not. Whatever this host had not uploaded is lost with
+        the attempt, as it would have been had the machine died, which is
+        what the new owner took it for.
+        """
+        if self.should_exit:
+            return True
+        other = owner.replaced_by()
+        if other is None:
+            return False
+        self.log(
+            f"STANDING DOWN: {other} has taken over this queue; killing "
+            f"{len(self.running)} running job(s) here and writing nothing more"
+        )
+        for job_id, entry in self.running.items():
+            with contextlib.suppress(RuntimeError, OSError):
+                JobProcesses.of(jobs.read_state(job_id)).kill(
+                    lambda m, job_id=job_id: self.log(f"job {job_id}: {m}")
+                )
+            pid = entry.popen.pid if entry.popen is not None else entry.runner_pid
+            if pid and entry.alive():
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+        self.running.clear()
+        self.should_exit = True
+        return True
+
     def idle_and_not_ephemeral(self) -> bool:
         return not self.running and not self.queued() and not self.config.ephemeral
 
     def run(self, lock: DispatcherLock) -> int:
         lock.start_heartbeat()
         self.log(f"dispatcher started (pid {os.getpid()}, pgid {os.getpgid(0)})")
+        replaced = owner.claim()
+        if replaced is not None:
+            self.log(f"taking this queue over from {replaced}")
         code = 0
         try:
             self._guard(self.adopt_orphans)

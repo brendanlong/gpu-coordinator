@@ -38,6 +38,7 @@ gpuc/
     storage.py     # the data directory and the HF cache: `host clean --data` and `--hf-cache`
     fetch.py       # which workdir files `gpuc fetch` copies
     terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
+    owner.py       # owner.json: which machine serves this queue, and noticing it was replaced
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
     actions.py     # one function per command returning its Answer (document + text + what failed); the CLI and the web call these
@@ -178,6 +179,8 @@ dispatcher.lock      # fd flock held by the running dispatcher
 dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
 draining             # present while the host is shutting itself down
+owner.json           # {"instance": "<hostname>/<boot id>", "since": str}: the machine serving
+                     # this queue, written by each dispatcher as it starts; see Dispatcher
 ```
 
 A job's `state.json` is the one record of what it is doing and what has been
@@ -259,6 +262,15 @@ The rules it holds to:
 - **One dispatcher per host**, by `flock` on `dispatcher.lock` plus a heartbeat.
   A holder whose heartbeat is stale (30 s) is killed by the pgid in the lock
   body and taken over.
+- **One machine serves a queue**, the last whose dispatcher started: it
+  writes itself into `owner.json` before adopting anything (`owner.claim`),
+  without waiting to learn whether the machine before it is dead. A
+  dispatcher that finds another instance there, at the start of every pass
+  and before every spawn, stands down (`_stand_down_if_replaced`): SIGKILL to
+  its runners and their jobs, no state written, exit. The new owner has
+  already queued those jobs again, their runners being from another boot.
+  Detection, not prevention: where `flock` works across machines the lock
+  above keeps a second dispatcher out anyway.
 - **A dispatcher started from the package on disk replaces one that is not.**
   The lock body records the `pkg_commit` its holder started from; a holder
   whose commit *differs* (`_is_another_build`: different, not older; an
