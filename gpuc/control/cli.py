@@ -511,7 +511,6 @@ def rental_options(args: argparse.Namespace) -> RentalOptions | None:
         return None
     options = RentalOptions(
         gpu_names=_comma_list(args.gpu),
-        min_vram_gb=args.min_vram,
         max_price_usd_hr=args.max_price,
         clouds=CLOUDS[args.cloud],
         cuda_min=args.cuda_min,
@@ -1698,9 +1697,6 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
         default=1,
         metavar="N",
         help="GPUs on the pod (default 1); the spec's `gpus:` must fit in it",
-    )
-    parser.add_argument(
-        "--min-vram", type=int, metavar="GB", help="skip offers with less VRAM per GPU"
     )
     parser.add_argument("--max-price", type=float, help="USD per hour, for the whole pod")
     parser.add_argument(

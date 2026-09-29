@@ -10,7 +10,6 @@ Run it with:  uv run pytest -m runpod -s
 from __future__ import annotations
 
 import configparser
-import json
 import os
 import shutil
 import subprocess
@@ -74,8 +73,6 @@ outputs:
     s3: s3://{BUCKET}/{OUTPUT_PREFIX}/{{job_id}}/results
 sync_interval_s: 60
 max_runtime_min: 20
-requires:
-  cuda_min: "12.8"
 """
 
 
@@ -274,7 +271,6 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
             # `submit` reuse pass -- and by hand with `host remove`.
             assert main(["host", "remove", entry.name]) == 0
             assert load_registry().hosts == {}
-            log(f"billing: {json.dumps(provider.billing(pod.id))[:400]}")
             log(f"total wall time {time.monotonic() - started:.0f}s")
     finally:
         with capsys.disabled():

@@ -34,6 +34,7 @@ LOG_READ_S = 10.0
 DEFAULT_POD_ENV = {"HF_HUB_ENABLE_HF_TRANSFER": "0"}
 """hf_transfer is not installed in the image, and `hf` fails loudly when told to use it."""
 BASE_URL = "https://api.runpod.io/v2"
+REQUEST_TIMEOUT_S = 30.0
 # Cloudflare in front of api.runpod.io rejects the default urllib User-Agent with a 1010.
 USER_AGENT = user_agent()
 MAX_RATE_LIMIT_SLEEP_S = 60.0
@@ -70,16 +71,13 @@ class RunPodProvider(Provider):
         api_key: str | None = None,
         *,
         prefix: str = DEFAULT_PREFIX,
-        timeout_s: float = 30.0,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         key = api_key or os.environ.get("RUNPOD_API_KEY")
         if not key:
             raise ProviderError("RUNPOD_API_KEY is not set")
         self._api_key = key
-        self._base_url = BASE_URL.rstrip("/")
         self.prefix = prefix
-        self._timeout_s = timeout_s
         self._sleep = sleep
 
     def _open(
@@ -90,9 +88,9 @@ class RunPodProvider(Provider):
         params: dict[str, Any] | None = None,
         body: Any = None,
         accept: str = "application/json",
-        timeout_s: float | None = None,
+        timeout_s: float = REQUEST_TIMEOUT_S,
     ) -> HTTPResponse:
-        url = self._base_url + path
+        url = BASE_URL + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
         data = json.dumps(body).encode() if body is not None else None
@@ -107,7 +105,7 @@ class RunPodProvider(Provider):
         for attempt in range(5):
             request = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
-                return urllib.request.urlopen(request, timeout=timeout_s or self._timeout_s)
+                return urllib.request.urlopen(request, timeout=timeout_s)
             except urllib.error.HTTPError as error:
                 text = error.read().decode(errors="replace")
                 if error.code == 429 and attempt < 4:
@@ -186,7 +184,6 @@ class RunPodProvider(Provider):
             offer = Offer(
                 gpu_id=gpu["id"],
                 name=gpu["name"],
-                vram_gb=gpu["memory"],
                 # --max-price caps the whole pod, so the offer carries the
                 # pod's price, not one GPU's: at --gpu-count 4 that is 4x.
                 price_usd_hr=price * constraints.gpu_count,
@@ -205,7 +202,6 @@ class RunPodProvider(Provider):
         *,
         image: str = DEFAULT_IMAGE,
         disk_gb: int = 20,
-        env: dict[str, str] | None = None,
         cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod:
@@ -220,7 +216,7 @@ class RunPodProvider(Provider):
             "disk": disk_gb,
             "ports": ["22/tcp"],
             "startSsh": True,
-            "env": env or DEFAULT_POD_ENV,
+            "env": DEFAULT_POD_ENV,
         }
         return _pod_from_api(self._json("POST", "/pods", body=body))
 
@@ -276,11 +272,6 @@ class RunPodProvider(Provider):
             return False
         self._json("PUT", "/account/ssh-keys", body={"keys": [*registered, entry]})
         return True
-
-    def billing(self, pod_id: str) -> dict[str, Any]:
-        return self._json(
-            "GET", "/billing/pods", params={"podId": pod_id, "bucketSize": "hour", "lastN": 24}
-        )
 
 
 def _pod_from_api(payload: dict[str, Any]) -> Pod:

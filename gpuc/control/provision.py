@@ -207,6 +207,7 @@ def provision(
     constraints: Constraints,
     settings: Settings,
     *,
+    reuse: bool = False,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
     disk_gb: int = DEFAULT_DISK_GB,
@@ -216,7 +217,12 @@ def provision(
     health_options: HealthOptions = DEFAULT_HEALTH,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
-    """Create, wait for, bootstrap and register one pod. Returns its registry entry."""
+    """Create, wait for, bootstrap and register one pod, or with `reuse` return a
+    live one that already matches. Returns its registry entry."""
+    if reuse:
+        existing = pick_reusable_host(constraints, settings, provider=provider, report=report)
+        if existing is not None:
+            return existing
     deps = deps or ProvisionDeps()
     progress = _Progress(report, deps.now)
 
@@ -288,8 +294,6 @@ def _cleanup(billing: list[str]) -> str:
 
 def _describe(constraints: Constraints) -> str:
     parts = [f"gpu={','.join(constraints.gpu_names) or 'any'}"]
-    if constraints.min_vram_gb is not None:
-        parts.append(f"min-vram={constraints.min_vram_gb}GB")
     if constraints.max_price_usd_hr is not None:
         parts.append(f"max-price=${constraints.max_price_usd_hr:.2f}/h")
     parts.append(f"cloud={'+'.join(c.lower() for c in constraints.clouds)}")
@@ -612,35 +616,3 @@ def _unreusable(
         # It is terminating itself; a job enqueued now dies with the pod.
         return "it is draining (terminating itself)"
     return None
-
-
-def runpod_host(
-    constraints: Constraints,
-    settings: Settings,
-    *,
-    provider: Provider,
-    reuse: bool = True,
-    name_hint: str = "job",
-    idle_minutes: float = 15.0,
-    disk_gb: int = DEFAULT_DISK_GB,
-    image: str = DEFAULT_IMAGE,
-    report: Reporter = print,
-    health_options: HealthOptions = DEFAULT_HEALTH,
-    deps: ProvisionDeps | None = None,
-) -> HostEntry:
-    if reuse:
-        existing = pick_reusable_host(constraints, settings, provider=provider, report=report)
-        if existing is not None:
-            return existing
-    return provision(
-        constraints,
-        settings,
-        provider=provider,
-        name_hint=name_hint,
-        idle_minutes=idle_minutes,
-        disk_gb=disk_gb,
-        image=image,
-        report=report,
-        health_options=health_options,
-        deps=deps,
-    )

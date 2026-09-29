@@ -72,7 +72,6 @@ The resources of a GPU rule become job spec fields:
 | `gpu` | `gpus` |
 | `host` | `--host`, overriding `--gpuc-host` |
 | `runpod` | `gpuc submit --runpod --gpu <value> --gpu-count <gpu>` |
-| `vram_gb` | `--min-vram`, with `runpod` |
 | `priority` | `priority` |
 | `max_runtime_min` | `max_runtime_min` |
 | `use_shared`, `auto_preempt` | the spec fields; `1`, `true`, `yes` and `on` are true |

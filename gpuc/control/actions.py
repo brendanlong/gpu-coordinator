@@ -78,7 +78,7 @@ from gpuc.control.s3index import (
 from gpuc.control.skill import SkillError
 from gpuc.control.submit import SubmitError
 from gpuc.control.teardown import TerminateError
-from gpuc.control.transport import TransportError
+from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, settable
 from gpuc.host.jobs import FINISHED_STATUSES
 
@@ -1395,7 +1395,7 @@ def read_log(
         session = reached.session
         remote = f"{session.job_dir(job_id)}/log.txt"
         try:
-            result = session.transport.tail(remote, lines=lines)
+            result = session.transport.run(tail_command(remote, lines), check=False)
             if result.returncode == 0:
                 return location.host, LogText("host", remote, result.stdout)
             purged = job_dir_gone(session, job_id)
