@@ -704,7 +704,7 @@ def finish(
     job_id: str,
     outcome: Outcome,
     *,
-    expect: str | tuple[str, ...] = "running",
+    expect: str = "running",
     forget_output_uploads: bool = False,
     **extra: Any,
 ) -> JobState | None:
@@ -731,10 +731,9 @@ def finish(
     dispatcher failing a job whose runner died after claiming it reports
     `ran` rather than knowing, which is the fail-closed answer.
     """
-    wanted = (expect,) if isinstance(expect, str) else expect
     with locked(job_id):
         state = read_state(job_id)
-        if state.status not in wanted:
+        if state.status != expect:
             return None
         state.status = outcome.status
         state.reason = outcome.reason

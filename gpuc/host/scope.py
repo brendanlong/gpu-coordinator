@@ -28,6 +28,8 @@ STOP_TIMEOUT_S = 15.0
 """`TimeoutStopSec`: SIGTERM, then SIGKILL after this. systemd's own default is
 90 s, which is 90 s of a held GPU."""
 
+PROBE_TIMEOUT_S = 20.0
+
 PROBE_ARGV = ["systemd-run", "--user", "--scope", "--collect", "--quiet", "--", "true"]
 LINGER_ARGV = ["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"]
 
@@ -54,12 +56,12 @@ def _output(argv: list[str], timeout: float) -> tuple[int, str]:
     return done.returncode, done.stdout.strip()
 
 
-def lingering(*, timeout: float = 20.0) -> bool:
+def lingering() -> bool:
     """Does this user's systemd instance outlive their last login?
 
     systemd before 230 has no `--value` and prints `Linger=yes`.
     """
-    code, out = _output(LINGER_ARGV, timeout)
+    code, out = _output(LINGER_ARGV, PROBE_TIMEOUT_S)
     return code == 0 and out.removeprefix("Linger=") == "yes"
 
 
@@ -72,7 +74,7 @@ def under_user_manager(cgroup_file: Path = Path("/proc/self/cgroup")) -> bool:
     return f"/user@{os.getuid()}.service/" in text
 
 
-def scopes_outlive_caller(*, timeout: float = 20.0) -> bool:
+def scopes_outlive_caller() -> bool:
     """Would a user scope outlive the process asking?
 
     The user's systemd instance, without linger, stops a few seconds after the
@@ -85,10 +87,10 @@ def scopes_outlive_caller(*, timeout: float = 20.0) -> bool:
     process group would also die whenever the caller's own scope is stopped,
     which is how a job forty minutes in was ended by nobody (#95).
     """
-    return under_user_manager() or lingering(timeout=timeout)
+    return under_user_manager() or lingering()
 
 
-def probe(*, timeout: float = 20.0, use_cache: bool = True) -> bool:
+def probe(*, use_cache: bool = True) -> bool:
     """Can this user create transient scopes worth running in? Cached for the
     process's life.
 
@@ -98,13 +100,13 @@ def probe(*, timeout: float = 20.0, use_cache: bool = True) -> bool:
     global _probed
     if use_cache and _probed is not None:
         return _probed
-    result = scopes_outlive_caller(timeout=timeout) and _run(PROBE_ARGV, timeout) == 0
+    result = scopes_outlive_caller() and _run(PROBE_ARGV, PROBE_TIMEOUT_S) == 0
     if use_cache:
         _probed = result
     return result
 
 
-def isolation(*, timeout: float = 20.0) -> str:
+def isolation() -> str:
     """`cgroup` or `pgid`: what was announced, else what one probe finds.
 
     Decided once per process. The dispatcher announces its answer to every
@@ -114,7 +116,7 @@ def isolation(*, timeout: float = 20.0) -> str:
     announced = os.environ.get(ISOLATION_ENV)
     if announced in (CGROUP, PGID):
         return announced
-    return CGROUP if probe(timeout=timeout) else PGID
+    return CGROUP if probe() else PGID
 
 
 def unit_name(job_id: str, phase: str) -> str:
