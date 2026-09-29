@@ -245,6 +245,7 @@ gpuc wait "$id" || echo "failed"
 | `timeout` | it ran past `max_runtime_min` |
 | `needs N GPUs, host owns M` | the host lost cards after the job was queued |
 | `runner-died`, `spawn-failed`, `terminated` | gpuc itself was killed or crashed on the host |
+| `secrets` | the host could not open the job's secrets; usually a host whose key was deleted after the job was submitted |
 | `checkout-lost` | the host keeps workdirs on scratch, and the job's code could not be put back there: the archive is gone, or scratch is full or not writable |
 | `host-restarted` | the host kept restarting under the job; each earlier restart queued it again from the start |
 

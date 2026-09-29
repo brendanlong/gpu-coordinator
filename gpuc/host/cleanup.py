@@ -59,14 +59,16 @@ one that stopped. An hour is far past any ssh round trip.
 
 
 def remove_secrets(job_id: str) -> None:
-    """Delete the job's secrets file, if any. The one place that does.
+    """Delete the job's secrets file, sealed or plain, if any. The one place
+    that does.
 
     Through `settle_secrets` from everything that ends a job, and directly
     from the sweeps for a job whose dir is going or whose submit never
     finished.
     """
-    with contextlib.suppress(OSError):
-        paths.job_env_file(job_id).unlink(missing_ok=True)
+    for path in (paths.sealed_env_file(job_id), paths.job_env_file(job_id)):
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 def settle_secrets(job_id: str, state: JobState) -> str | None:

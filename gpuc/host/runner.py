@@ -42,6 +42,7 @@ from gpuc.host import (
     progress,
     queue,
     scope,
+    sealed,
     sync,
 )
 from gpuc.host.gpus import SmiRunner
@@ -119,7 +120,10 @@ class RunnerDeps:
 
 
 def build_env(
-    spec: JobSpec, assigned: Sequence[str], indices: Mapping[str, int] | None = None
+    spec: JobSpec,
+    assigned: Sequence[str],
+    indices: Mapping[str, int] | None = None,
+    secrets: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """The job's environment: the runner's own, the secrets file, the spec's,
     then the cards -- last, so a spec `env` typo cannot hand the job the wrong
@@ -134,7 +138,7 @@ def build_env(
     UUIDs go through as they are, which every torch accepts.
     """
     env = dict(os.environ)
-    env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
+    env.update(sealed.job_secrets(spec.job_id) if secrets is None else secrets)
     env.update(spec.env)
     if indices is not None and assigned and all(uuid in indices for uuid in assigned):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(indices[uuid]) for uuid in assigned)
@@ -490,7 +494,12 @@ class JobRunner:
             return 0
         job_start = self.deps.now()
         gpu_error = self._verify_assigned()
-        env = build_env(self.spec, self.assigned, self._indices)
+        secrets_error: str | None = None
+        try:
+            secrets = sealed.job_secrets(self.job_id)
+        except sealed.SealedError as exc:
+            secrets, secrets_error = {}, str(exc)
+        env = build_env(self.spec, self.assigned, self._indices, secrets)
         # A directory the job cannot create is the job's error to hit, in its
         # own log, when it first writes there; the runner has a job to finish.
         with contextlib.suppress(OSError):
@@ -510,6 +519,10 @@ class JobRunner:
             try:
                 # Inside the handlers: unpacking a large checkout takes a
                 # while, and a cancel meanwhile is a cancel, not a dead runner.
+                if secrets_error:
+                    self._log(log, f"could not open the job's secrets: {secrets_error}")
+                    outcome = Outcome("failed", "secrets", 1, ran=False)
+                    return self._finalize(outcome, sync_loop, log)
                 checkout_error = checkout.restore(self.job_id)
                 if checkout_error:
                     self._log(log, f"checkout lost: {checkout_error}")

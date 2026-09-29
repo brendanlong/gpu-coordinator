@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pyrage
 import pytest
 
 from gpuc.control.config import HostEntry, Settings
@@ -43,6 +44,8 @@ class FakeHost:
     session's config names, as on a host whose nvidia-smi agrees with it."""
     smi_answers: bool = True
     session: HostSession | None = None
+    identity: pyrage.x25519.Identity = field(default_factory=pyrage.x25519.Identity.generate)
+    """The host's key, which `secrets-recipient` hands out the public half of."""
 
     def reported(self) -> list[str]:
         if self.cards is not None:
@@ -60,6 +63,8 @@ class FakeHost:
             out = "".join(f"{index}, {uuid}, NVIDIA A40, 46068 MiB\n" for index, uuid in rows)
         if "gpuc.host enqueue" in command:
             out = json.dumps({"job_id": "unused", "dispatcher_pid": 99})
+        if "gpuc.host secrets-recipient" in command:
+            out = json.dumps({"recipient": str(self.identity.to_public())})
         return CommandResult(self.host, ["sh", "-c", command], 0, out, "")
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
@@ -476,8 +481,9 @@ def test_submit_delivers_secrets_0600_and_never_on_argv(control_env: Path, repo:
         environ={"HF_TOKEN": "hf_secret_value"},
         report=lambda _: None,
     )
-    body, mode = host.puts[f"{REMOTE_HOME}/secrets/{result.job_id}.env"]
-    assert body == "HF_TOKEN=hf_secret_value\n"
+    body, mode = host.puts[f"{REMOTE_HOME}/secrets/{result.job_id}.env.age"]
+    assert "hf_secret_value" not in body
+    assert pyrage.decrypt(body.encode(), [host.identity]) == b"HF_TOKEN=hf_secret_value\n"
     assert mode == 0o600
     assert not any("hf_secret_value" in command for command in host.commands)
 

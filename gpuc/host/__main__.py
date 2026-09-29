@@ -28,6 +28,7 @@ from gpuc.host import (
     plan,
     queue,
     runner,
+    sealed,
     storage,
 )
 from gpuc.host import settable as settable_mod
@@ -45,6 +46,11 @@ def _read_json_object(source: str, what: str) -> dict[str, Any]:
 def cmd_archive_checkout(args: argparse.Namespace) -> int:
     archived = checkout.archive_staged(args.job_id)
     print(json.dumps({"job_id": args.job_id, "archive": str(archived)}))
+    return 0
+
+
+def cmd_secrets_recipient(_: argparse.Namespace) -> int:
+    print(json.dumps({"recipient": sealed.recipient()}))
     return 0
 
 
@@ -574,6 +580,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     archive.add_argument("job_id")
     archive.set_defaults(func=cmd_archive_checkout)
+    sub.add_parser(
+        "secrets-recipient", help="this host's public key for job secrets, made on first use"
+    ).set_defaults(func=cmd_secrets_recipient)
     enqueue = sub.add_parser("enqueue", help="enqueue a JSON JobSpec and start the dispatcher")
     enqueue.add_argument("spec", help="path to a JSON spec, or - for stdin")
     enqueue.set_defaults(func=cmd_enqueue)

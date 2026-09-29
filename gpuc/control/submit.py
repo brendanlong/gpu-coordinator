@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+import pyrage
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -530,6 +531,34 @@ def _push_without_git(
     return {"submitted_from": str(workdir), "submitted_at": utc_now(), "git": None}
 
 
+def deliver_secrets(session: HostSession, job_id: str, body: str) -> None:
+    """Encrypt the job's secrets to the host's own key and put them there.
+
+    Encrypted here, so the plaintext exists only in this process and, when
+    the job runs, in the pipe the host opens them through (`sealed`). The
+    host makes its key on first use, which may mean uv fetching pyrage.
+    """
+    answer = session.host_json("secrets-recipient", timeout=RECIPIENT_TIMEOUT_S)
+    recipient = answer.get("recipient") if isinstance(answer, dict) else None
+    if not isinstance(recipient, str) or not recipient.startswith("age1"):
+        raise SubmitError(
+            f"host {session.entry.name} gave no key to encrypt secrets to: {answer!r}"
+        )
+    try:
+        sealed = pyrage.encrypt(
+            body.encode(), [pyrage.x25519.Recipient.from_str(recipient)], armored=True
+        )
+    except (pyrage.RecipientError, pyrage.EncryptError) as exc:
+        raise SubmitError(
+            f"could not encrypt secrets to {session.entry.name}'s key: {exc}"
+        ) from exc
+    session.transport.put_file(sealed.decode(), f"{session.home}/secrets/{job_id}.env.age", 0o600)
+
+
+RECIPIENT_TIMEOUT_S = 180.0
+"""The host's `sealed.TIMEOUT_S` for fetching pyrage, and a round trip."""
+
+
 def enqueue_spec(session: HostSession, prepared: Prepared) -> dict[str, Any]:
     """Put the spec in the staged job dir and ask the host to accept it.
 
@@ -664,10 +693,8 @@ def submit_spec(
         report("archived the checkout beside the queue; workdirs here are on scratch")
 
     if prepared.secrets_body:
-        session.transport.put_file(
-            prepared.secrets_body, f"{session.home}/secrets/{spec.job_id}.env", 0o600
-        )
-        report(f"delivered {len(spec.secrets)} secret(s) as {spec.job_id}.env (0600)")
+        deliver_secrets(session, spec.job_id, prepared.secrets_body)
+        report(f"delivered {len(spec.secrets)} secret(s), encrypted to the host's key")
 
     response = enqueue_spec(session, prepared)
 

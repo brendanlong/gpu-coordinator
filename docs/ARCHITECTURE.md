@@ -38,6 +38,7 @@ gpuc/
     storage.py     # the data directory and the HF cache: `host clean --data` and `--hf-cache`
     fetch.py       # which workdir files `gpuc fetch` copies
     terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
+    sealed.py      # job secrets encrypted to the host's key: the key, and opening them
     owner.py       # owner.json: which machine serves this queue, and noticing it was replaced
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
@@ -112,6 +113,8 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": null | ["
                      #  "pkg_commit": null | "<sha>", # the commit bootstrap shipped to this host
                      #  "env": {"HF_HOME": ...}}      # host-wide; see Persistent root
 secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
+secrets/<jobid>.env.age  # a job's secrets, encrypted to host.age; see Job secrets
+secrets/host.age     # this host's private key, 0600, made on first use; host.age.pub its public half
 data/                # GPUC_DATA_DIR unless the host's env names another; see The data directory
 incoming/<jobid>/    # a job `gpuc submit` is still building: the rsynced workdir, then the spec.
                      # `enqueue` renames the whole dir into jobs/, which is the acceptance
@@ -216,8 +219,9 @@ defaults.
                                         # see Shared GPUs
   "env": {"REQUIRE_CUDA": "1"},
   "secrets": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "HF_TOKEN", "WANDB_API_KEY"],
-                                        # read from the submitter's env, delivered as ~/.gpuc/secrets/<jobid>.env (0600),
-                                        # sourced into the job's environment by the runner
+                                        # read from the submitter's env, delivered encrypted as
+                                        # secrets/<jobid>.env.age (0600), opened into the job's
+                                        # environment by the runner; see Job secrets
   "outputs": [{"path": "results", "s3": "s3://bucket/exp/{job_id}/results"},
               {"path": "checkpoints", "hf": "org/repo", "hf_path": "{job_id}",
                "hf_create": false}],   # create the repo if the sync preflight finds it missing
@@ -376,8 +380,9 @@ The order is the contract; each step is in `runner.py`.
    job that asked for cards. Export `CUDA_VISIBLE_DEVICES` as the cards'
    nvidia-smi **indices** with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, as UUIDs only if
    the index table could not be read, and empty -- never unset -- for a job
-   with no cards. Then the secrets file and the spec `env`; the host's `env` and PATH
-   are the runner's own, from the dispatcher.
+   with no cards. Then the job's secrets (`sealed.job_secrets`; any it cannot
+   open fail the job `secrets` before anything runs) and the spec `env`; the
+   host's `env` and PATH are the runner's own, from the dispatcher.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json`,
    **before `setup`** and once per job (a later attempt keeps the first
    baseline). Every upload excludes files that still match, and a path holding
@@ -427,6 +432,22 @@ The secrets file goes with **every** terminal write, not only the runner's: a
 queued job cancelled, a job the dispatcher failed or marked `runner-died`
 loses it in the same act (`cleanup.settle_secrets`), with the one drain
 exception above.
+
+## Job secrets
+
+- `gpuc submit` asks the host for its public key (`python -m gpuc.host
+  secrets-recipient`), encrypts the `KEY=value` lines to it with pyrage, and
+  puts the armored result as `secrets/<jobid>.env.age` (0600). The plaintext
+  never leaves the submitting process as a file.
+- The host's key is made on first ask (`sealed.recipient`): the private half
+  written 0600 by an exclusive create, so two first asks agree, and the public
+  half kept beside it so asking again needs no pyrage.
+- The host package stays stdlib-only: making the key and opening secrets run
+  pyrage under `uv run --no-project --with pyrage==<pin>`, plaintext on a
+  pipe. uv fetches it once into its cache.
+- A plain `secrets/<jobid>.env` from a client of an earlier build is still
+  read. Every removal of a job's secrets removes both
+  (`cleanup.remove_secrets`), and the drain opens them as the runner does.
 
 ## Job length estimates
 
