@@ -42,6 +42,7 @@ from gpuc.host import (
     progress,
     queue,
     scope,
+    sealed,
     sync,
 )
 from gpuc.host.gpus import SmiRunner
@@ -119,7 +120,10 @@ class RunnerDeps:
 
 
 def build_env(
-    spec: JobSpec, assigned: Sequence[str], indices: Mapping[str, int] | None = None
+    spec: JobSpec,
+    assigned: Sequence[str],
+    indices: Mapping[str, int] | None = None,
+    secrets: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """The job's environment: the runner's own, the secrets file, the spec's,
     then the cards -- last, so a spec `env` typo cannot hand the job the wrong
@@ -134,7 +138,7 @@ def build_env(
     UUIDs go through as they are, which every torch accepts.
     """
     env = dict(os.environ)
-    env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
+    env.update(sealed.job_secrets(spec.job_id) if secrets is None else secrets)
     env.update(spec.env)
     if indices is not None and assigned and all(uuid in indices for uuid in assigned):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(indices[uuid]) for uuid in assigned)
@@ -490,26 +494,37 @@ class JobRunner:
             return 0
         job_start = self.deps.now()
         gpu_error = self._verify_assigned()
-        env = build_env(self.spec, self.assigned, self._indices)
-        # A directory the job cannot create is the job's error to hit, in its
-        # own log, when it first writes there; the runner has a job to finish.
-        with contextlib.suppress(OSError):
-            Path(env["GPUC_DATA_DIR"]).mkdir(mode=0o700, parents=True, exist_ok=True)
-        # The sync loop uploads as the *job*: its `secrets:` are in `env`, so
-        # `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an output needs, with no
-        # credential file anywhere on the host.
-        self.env = env
         sync_loop = sync.SyncLoop(
             self.spec,
             paths.workdir(self.job_id),
             self.config.s3_prefix,
             runner=self.deps.command_runner,
-            env=env,
         )
         with paths.log_file(self.job_id).open("ab") as log, self._term_handlers():
             try:
-                # Inside the handlers: unpacking a large checkout takes a
-                # while, and a cancel meanwhile is a cancel, not a dead runner.
+                # Inside the handlers, like the restore below: opening the
+                # secrets may mean uv fetching pyrage, and a cancel meanwhile
+                # is a cancel, not a dead runner.
+                try:
+                    secrets = sealed.job_secrets(self.job_id)
+                except sealed.SealedError as exc:
+                    self._log(log, f"could not open the job's secrets: {exc}")
+                    # The mirror still gets the spec's plain env (a region,
+                    # an endpoint), as every other failure's does.
+                    self.env = sync_loop.env = build_env(
+                        self.spec, self.assigned, self._indices, {}
+                    )
+                    outcome = Outcome("failed", "secrets", 1, ran=False)
+                    return self._finalize(outcome, sync_loop, log)
+                env = build_env(self.spec, self.assigned, self._indices, secrets)
+                # A directory the job cannot create is the job's error to hit,
+                # in its own log, when it first writes there.
+                with contextlib.suppress(OSError):
+                    Path(env["GPUC_DATA_DIR"]).mkdir(mode=0o700, parents=True, exist_ok=True)
+                # The sync loop uploads as the *job*: its `secrets:` are in
+                # `env`, so `secrets: [AWS_ACCESS_KEY_ID, ...]` is all an
+                # output needs, with no credential file anywhere on the host.
+                self.env = sync_loop.env = env
                 checkout_error = checkout.restore(self.job_id)
                 if checkout_error:
                     self._log(log, f"checkout lost: {checkout_error}")

@@ -112,7 +112,24 @@ def secrets_file(name: str) -> Path:
 
 
 def job_env_file(job_id: str) -> Path:
+    """A job's secrets in plain text, as a client from before encryption
+    delivers them; see `sealed`."""
     return secrets_dir() / f"{job_id}.env"
+
+
+def sealed_env_file(job_id: str) -> Path:
+    """A job's secrets encrypted to this host's key; see `sealed`."""
+    return secrets_dir() / f"{job_id}.env.age"
+
+
+def host_identity_file() -> Path:
+    """This host's private key, which opens every `sealed_env_file`."""
+    return secrets_dir() / "host.age"
+
+
+def host_recipient_file() -> Path:
+    """The public half of `host_identity_file`, which clients encrypt to."""
+    return secrets_dir() / "host.age.pub"
 
 
 def incoming_dir() -> Path:

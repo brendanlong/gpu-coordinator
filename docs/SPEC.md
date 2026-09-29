@@ -53,8 +53,8 @@ destinations. Adding another of either changes nothing else in this document.
 - A host needs ssh, rsync, outbound HTTPS, and the NVIDIA driver with
   `nvidia-smi` for any GPU it will run jobs on. Bootstrap installs everything
   else, including uv and a Python (3.11 or newer) if none is present. The
-  on-host component itself needs nothing but that interpreter: no packages,
-  no virtual environment.
+  on-host component itself needs that interpreter and uv, and installs
+  nothing into the interpreter: no packages, no virtual environment.
 - A client needs Python 3.11 or newer and the system `ssh` and `rsync`.
 - The tool is built around Python but does not dictate what a job runs, with
   one exception: the GPU check at job start runs inside the job's own
@@ -164,6 +164,8 @@ destinations. Adding another of either changes nothing else in this document.
 ## Backups and secrets
 
 - Backups need credentials the job carries as named environment variables.
+- **A job's secrets are encrypted to its host's own key** before they leave
+  the submitter's machine.
 - **Secrets travel only in files with restrictive permissions**: never in
   command lines, never in a provider's pod environment, never in logs, and
   never in anything synced to a backup destination. A job's secrets are

@@ -262,11 +262,15 @@ def as_str_dict(d: Any, key: str) -> dict[str, str]:
 def parse_env_file(path: Path) -> dict[str, str]:
     """Parse `KEY=value` / `export KEY=value` lines (secrets files, RunPod's
     /etc/rp_environment). Not a shell: no expansion, no continuations."""
-    out: dict[str, str] = {}
     try:
-        text = path.read_text()
+        return parse_env_text(path.read_text())
     except OSError:
-        return out
+        return {}
+
+
+def parse_env_text(text: str) -> dict[str, str]:
+    """`parse_env_file` for text already read."""
+    out: dict[str, str] = {}
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
