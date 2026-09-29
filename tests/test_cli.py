@@ -1415,20 +1415,11 @@ def test_only_with_verify_names_the_jobs_and_what_the_mirror_vouches_for(
 def test_only_cannot_be_combined_with_an_age_horizon(
     control_env: Path, capsys: pytest.CaptureFixture[str], extra: list[str]
 ) -> None:
-    """argparse rejects the command line; `check_flags` judges it for callers."""
-    from gpuc.control.clean import CleanUsageError, check_flags
-
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     with pytest.raises(SystemExit) as caught:
         main(["clean", "--host", "gpubox", "--only", "a", *extra])
     assert caught.value.code == EXIT_USAGE
     assert "not allowed with argument --only" in capsys.readouterr().err
-    with pytest.raises(CleanUsageError, match="cannot be combined"):
-        check_flags(
-            only=["a"],
-            all_finished="--all-finished" in extra,
-            older_than_days=None if "--all-finished" in extra else 7.0,
-        )
 
 
 def test_an_empty_only_is_a_usage_error_not_a_silent_no_op(

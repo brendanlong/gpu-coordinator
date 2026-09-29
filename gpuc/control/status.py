@@ -330,9 +330,6 @@ class HostView:
     host knows today's numbering."""
     missing: list[MissingCard] = field(default_factory=list)
     pod: Pod | None = None
-    session: HostSession | None = None
-    """The session the answer came over, for a caller with a follow-up
-    question (`submit` and `set --priority` ask where the job landed)."""
     mirror_prefix: str | None = None
     """The host's own `s3_prefix`, from the config the session read."""
     pkg_commit: str | None = None
@@ -568,7 +565,6 @@ def parse_status(entry: HostEntry, asked: Asked) -> HostView:
         view.error = asked.reason
         return view
     view.state = HostState.ANSWERED
-    view.session = asked.session
     view.mirror_prefix = asked.session.config.s3_prefix
     # The provider could not be asked about the pod: the host answered, and
     # this is still the command's exit code.

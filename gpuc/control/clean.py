@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import os
 import shlex
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings
 from gpuc.control.exits import EXIT_USAGE
 from gpuc.control.remote import HostSession, env_prefix, open_session
-from gpuc.control.s3index import job_uri, make_s3_client, split_uri
+from gpuc.control.s3index import S3Index, S3IndexError, job_uri, split_uri
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS, human_bytes
 
 
@@ -168,13 +169,6 @@ def check_flags(
     """
     if (force or verify) and not purge:
         raise CleanUsageError("--force and --verify only mean something with --purge")
-    if only is not None and (all_finished or older_than_days is not None):
-        raise CleanUsageError(
-            "--only names the jobs itself, so it cannot be combined with --all-finished "
-            "or --older-than"
-        )
-    if only is not None and not only:
-        raise CleanUsageError("--only needs at least one job id")
     if not purge and only is None and not all_finished and older_than_days is None:
         raise CleanUsageError(
             f"clean needs --all-finished, --older-than DAYS, --only ID[,ID...], or --purge "
@@ -339,27 +333,18 @@ def verified_mirrors(s3_prefix: str | None, *, client: Any | None = None) -> lis
     """
     if not s3_prefix:
         return []
-    s3 = client if client is not None else make_s3_client()
     bucket, key = split_uri(job_uri(s3_prefix, ""))
     prefix = key.rstrip("/") + "/"
-    ids: list[str] = []
-    token: str | None = None
-    while True:
-        request: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
-        if token:
-            request["ContinuationToken"] = token
-        try:
-            response = s3.list_objects_v2(**request)
-        except Exception as exc:  # botocore raises its own per-operation classes
-            raise CleanError(f"could not list the mirror at s3://{bucket}/{prefix}: {exc}") from exc
-        for item in response.get("Contents", []):
-            rest = str(item.get("Key", ""))[len(prefix) :]
-            job_id, _, name = rest.partition("/")
-            if name == "log.txt":
-                ids.append(job_id)
-        token = response.get("NextContinuationToken")
-        if not response.get("IsTruncated") or not token:
-            return sorted(ids)
+    try:
+        keys = S3Index(bucket, client).list_keys(prefix, sys.maxsize)
+    except S3IndexError as exc:
+        raise CleanError(str(exc)) from exc
+    ids = []
+    for listed in keys:
+        job_id, _, name = listed[len(prefix) :].partition("/")
+        if name == "log.txt":
+            ids.append(job_id)
+    return sorted(ids)
 
 
 UV_CACHE_PRUNE = """\

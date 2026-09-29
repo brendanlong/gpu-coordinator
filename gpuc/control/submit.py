@@ -386,9 +386,6 @@ class SubmitResult:
     host: str
     requeued_from: str | None = None
     notes: list[str] = field(default_factory=list)
-    session: HostSession | None = field(default=None, repr=False)
-    """The connection the enqueue was made over, kept so that looking up where
-    the job landed in the queue does not open a second one."""
     placement: dict[str, Any] = field(default_factory=placement_unknown)
     """Where the job landed in the host's queue, looked up after the enqueue:
     see `status.queue_placement`. The default is the "we could not ask" shape,
@@ -692,7 +689,6 @@ def submit_spec(
         host=entry.name,
         requeued_from=prepared.requeued_from,
         notes=notes,
-        session=session,
     )
 
 
