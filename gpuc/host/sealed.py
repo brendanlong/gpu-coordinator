@@ -2,10 +2,11 @@
 
 `gpuc submit` encrypts a job's secrets with this host's public key before
 they leave the submitter's machine, so what sits in `secrets/<id>.env.age`
-is useless to anyone without `secrets/host.age`. On a host whose disk is its
-own that changes little; it is for the volumes a queue is kept on so it can
-outlive its machine, which are shared with other machines, other people, or
-a cloud provider's backups.
+is useless to anyone without `secrets/host.age`. While both live in gpuc
+home that protects nothing a reader of gpuc home could not undo: it is the
+one way secrets travel on every host, ready for a queue kept somewhere the
+key is not -- an S3 store, with the key given to the host by its provider
+(#141).
 
 The standard library has no public-key cryptography, so the key is made and
 used by pyrage under `uv run --with`: uv fetches it once into its cache, and
@@ -92,8 +93,11 @@ def recipient() -> str:
     derives it from the private key the winner made.
     """
     public = paths.host_recipient_file()
-    if public.is_file():
+    if public.is_file() and paths.host_identity_file().is_file():
         return public.read_text().strip()
+    # A public half without its private one would have every submit encrypt
+    # to a key nobody holds, found out only when each job is dispatched.
+    public.unlink(missing_ok=True)
     paths.ensure_layout()
     identity = str(paths.host_identity_file())
     try:

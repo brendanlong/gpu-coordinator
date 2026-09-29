@@ -76,3 +76,40 @@ def test_a_key_whose_public_half_was_never_written_is_derived_again(gpuc_home: P
     first = sealed.recipient()
     paths.host_recipient_file().unlink()
     assert sealed.recipient() == first
+
+
+def test_a_public_key_whose_private_half_is_gone_is_made_again(gpuc_home: Path) -> None:
+    first = sealed.recipient()
+    paths.host_identity_file().unlink()
+    second = sealed.recipient()
+    assert second != first
+    assert paths.host_identity_file().is_file()
+
+
+def test_the_drain_uploads_with_the_jobs_sealed_secrets(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.host import destinations, queue, sync
+    from tests.conftest import make_spec
+    from tests.test_dispatcher import make_dispatcher
+
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+    spec = make_spec(
+        secrets=["AWS_ACCESS_KEY_ID"],
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+    )
+    spec.outputs[0].s3 = f"s3://bucket/{spec.job_id}"
+    job_id = queue.enqueue(spec)
+    (paths.workdir(job_id) / "results").mkdir()
+    (paths.workdir(job_id) / "results" / "out.txt").write_text("done\n")
+    seal(job_id, "AWS_ACCESS_KEY_ID=AKIA_SEALED\n")
+    seen: list[str | None] = []
+
+    def upload(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        seen.append((env or {}).get("AWS_ACCESS_KEY_ID"))
+        return sync.CommandResult(argv, 0, "")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.command_runner = upload
+    dispatcher._upload_outputs(job_id, jobs.read_config(), timeout=10)
+    assert seen and set(seen) == {"AKIA_SEALED"}

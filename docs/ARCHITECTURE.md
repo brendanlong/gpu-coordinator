@@ -439,15 +439,22 @@ exception above.
   secrets-recipient`), encrypts the `KEY=value` lines to it with pyrage, and
   puts the armored result as `secrets/<jobid>.env.age` (0600). The plaintext
   never leaves the submitting process as a file.
-- The host's key is made on first ask (`sealed.recipient`): the private half
-  written 0600 by an exclusive create, so two first asks agree, and the public
-  half kept beside it so asking again needs no pyrage.
+- The host's key is made on first ask (`sealed.recipient`), and bootstrap
+  asks, so a host that cannot fetch pyrage is a warning there rather than a
+  failed job later. The private half is written 0600 by an exclusive create,
+  so two first asks agree; the public half is kept beside it so asking again
+  needs no pyrage, and is trusted only while the private half is there.
+- The key lives in gpuc home beside what it opens, so on a filesystem it
+  protects nothing a reader of gpuc home could not undo. It is the one way
+  secrets travel on every host, for a store the key is not in (#141).
 - The host package stays stdlib-only: making the key and opening secrets run
   pyrage under `uv run --no-project --with pyrage==<pin>`, plaintext on a
   pipe. uv fetches it once into its cache.
 - A plain `secrets/<jobid>.env` from a client of an earlier build is still
   read. Every removal of a job's secrets removes both
   (`cleanup.remove_secrets`), and the drain opens them as the runner does.
+  A host without `secrets-recipient` (an earlier build, `--no-bootstrap`) is
+  refused at submit, never sent plaintext.
 
 ## Job length estimates
 
@@ -842,7 +849,8 @@ and nowhere else, so one box driven from two machines has one configuration.
    just shipped, and the managed env keys the host names none of. The one
    exception is a host with **no** config at all, which gets `first_config`
    with the last config this machine read off it on top.
-4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
+4. Run `python -m gpuc.host health` and fail bootstrap on a failed check;
+   then have the host make its key for job secrets, warning if it cannot.
 5. Start the dispatcher. The shipping is `bootstrap.ensure_build`, the one
    ship path (see *Which build is a host running*). Bootstrap is never blocked
    by running jobs: the package is replaced, and whichever dispatcher takes

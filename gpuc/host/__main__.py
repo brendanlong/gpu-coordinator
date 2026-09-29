@@ -50,7 +50,11 @@ def cmd_archive_checkout(args: argparse.Namespace) -> int:
 
 
 def cmd_secrets_recipient(_: argparse.Namespace) -> int:
-    print(json.dumps({"recipient": sealed.recipient()}))
+    try:
+        print(json.dumps({"recipient": sealed.recipient()}))
+    except sealed.SealedError as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
     return 0
 
 

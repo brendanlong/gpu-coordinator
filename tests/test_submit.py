@@ -46,6 +46,8 @@ class FakeHost:
     session: HostSession | None = None
     identity: pyrage.x25519.Identity = field(default_factory=pyrage.x25519.Identity.generate)
     """The host's key, which `secrets-recipient` hands out the public half of."""
+    older_build: bool = False
+    """A host from before encrypted secrets, which has no `secrets-recipient`."""
 
     def reported(self) -> list[str]:
         if self.cards is not None:
@@ -64,6 +66,14 @@ class FakeHost:
         if "gpuc.host enqueue" in command:
             out = json.dumps({"job_id": "unused", "dispatcher_pid": 99})
         if "gpuc.host secrets-recipient" in command:
+            if self.older_build:
+                return CommandResult(
+                    self.host,
+                    ["sh", "-c", command],
+                    2,
+                    "",
+                    "__main__.py: error: argument cmd: invalid choice: 'secrets-recipient'",
+                )
             out = json.dumps({"recipient": str(self.identity.to_public())})
         return CommandResult(self.host, ["sh", "-c", command], 0, out, "")
 
@@ -486,6 +496,24 @@ def test_submit_delivers_secrets_0600_and_never_on_argv(control_env: Path, repo:
     assert pyrage.decrypt(body.encode(), [host.identity]) == b"HF_TOKEN=hf_secret_value\n"
     assert mode == 0o600
     assert not any("hf_secret_value" in command for command in host.commands)
+
+
+def test_a_host_on_a_build_before_encrypted_secrets_is_refused_plainly(
+    control_env: Path, repo: Path
+) -> None:
+    """Never a fallback to sending them in plain text."""
+    host = FakeHost(older_build=True)
+    with pytest.raises(SubmitError, match="before encrypted secrets"):
+        submit_spec(
+            host_entry(name="gpubox", gpus=["GPU-a"]),
+            validate(job_document(secrets=["HF_TOKEN"])),
+            Settings(),
+            workdir=repo,
+            session=session(host),
+            environ={"HF_TOKEN": "hf_secret_value"},
+            report=lambda _: None,
+        )
+    assert not any("secrets/" in path for path in host.puts)
 
 
 def test_submit_enqueues_over_stdin_and_records_the_index(control_env: Path, repo: Path) -> None:
