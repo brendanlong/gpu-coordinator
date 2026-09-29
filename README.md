@@ -6,6 +6,11 @@ One submit path (`gpuc submit`) for three kinds of GPU host:
 - **ssh** — a shared box you have no sudo on, using a subset of its GPUs,
 - **rental** — a RunPod pod, provisioned for the job and torn down after it.
 
+A project by [Brendan Long](https://www.brendanlong.com/pages/about-me.html).
+The announcement post is
+[on his blog](https://www.brendanlong.com/gpuc-a-single-user-gpu-queue-that-doesnt-require-sudo.html)
+and [on LessWrong](https://www.lesswrong.com/posts/PPzBbskPM2Baz7CL8/gpuc-a-single-user-gpu-queue-that-doesn-t-require-sudo).
+
 ![A terminal session: cat job.yaml shows a five-line spec; gpuc submit sends it
 to the host workstation, which starts it at once; a second submit queues
 eval-checkpoints behind it; gpuc status prints the card, the running job with
