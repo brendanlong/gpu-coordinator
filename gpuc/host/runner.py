@@ -26,7 +26,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO
+from typing import IO, NoReturn
 
 from gpuc._version import user_agent
 from gpuc.host import (
@@ -36,6 +36,7 @@ from gpuc.host import (
     destinations,
     gpus,
     jobs,
+    owner,
     paths,
     preflight,
     progress,
@@ -107,6 +108,9 @@ class RunnerDeps:
     preflight: bool = True
     preflight_command: Callable[[JobSpec], str] = preflight_command
     sync_preflight: bool = True
+    hard_exit: Callable[[int], NoReturn] = os._exit
+    """How a runner whose queue was taken over leaves: at once, so nothing
+    of it -- no `finally`, no sync thread -- writes another byte."""
 
     def util_sampler(self) -> UtilSampler:
         if self.sampler is not None:
@@ -192,6 +196,8 @@ class JobRunner:
         """Whether `main` has begun, which is what `Outcome.ran` reports: the
         final upload and the no-outputs check are for a job that produced
         something, and only `main` does."""
+        self.instance = owner.inherited()
+        self._next_owner_check = 0.0
         self._ending = False
         """Set once the attempt is on its way out: by the signal handler as it
         raises `_Terminated`, and by `_finalize` as it starts. A signal after
@@ -250,6 +256,7 @@ class JobRunner:
         while proc.poll() is None:
             deps.sleep(deps.poll_interval_s)
             t = deps.now()
+            self._stand_down_if_replaced(log, proc)
             requested = queue.stop_requested(self.job_id)
             if requested:
                 self._kill(proc, requested, log)
@@ -357,6 +364,31 @@ class JobRunner:
             util_samples=state.util_samples + 1,
         )
 
+    def _stand_down_if_replaced(
+        self, log: IO[bytes], proc: subprocess.Popen[bytes] | None = None, *, force: bool = False
+    ) -> None:
+        """Leave, killing the job and writing nothing, once another machine
+        has taken this queue over (see `owner`).
+
+        The new owner has queued this job again and may be running it, so
+        every write from here -- a final sync of this attempt's outputs, the
+        state that ends it -- would land on the new attempt's. Looked at every
+        `owner.CHECK_S` while a phase runs, and always before the writes that
+        end the attempt.
+        """
+        now = self.deps.now()
+        if not force and now < self._next_owner_check:
+            return
+        self._next_owner_check = now + owner.CHECK_S
+        other = owner.replaced_by(self.instance)
+        if other is None:
+            return
+        if proc is not None:
+            JobProcesses(self._current_unit, proc.pid).kill()
+        with contextlib.suppress(OSError):
+            self._log(log, f"STANDING DOWN: {other} has taken this queue over; stopping here")
+        self.deps.hard_exit(TERMINATED_EXIT_CODE)
+
     def _kill(self, proc: subprocess.Popen[bytes], reason: str, log: IO[bytes]) -> None:
         self.kill_reason = reason
         JobProcesses(self._current_unit, proc.pid).stop(
@@ -454,7 +486,7 @@ class JobRunner:
         process starting, another runner got here first, or the attempt this
         runner was started for is over, and either way it is not ours to
         touch."""
-        if not self._claim():
+        if owner.replaced_by(self.instance) is not None or not self._claim():
             return 0
         job_start = self.deps.now()
         gpu_error = self._verify_assigned()
@@ -705,6 +737,7 @@ class JobRunner:
         uploaded twice, since nothing below writes to it that a reader of the
         mirror needs.
         """
+        self._stand_down_if_replaced(log, force=True)
         self._ending = True
         jobs.update_state(self.job_id, phase="sync")
         problems: list[str] = []
@@ -815,6 +848,7 @@ class JobRunner:
         the state was no longer `running` at all, which is nothing this
         process can repair and is logged rather than written over.
         """
+        self._stand_down_if_replaced(log, force=True)
         if coming_back and queue.next_attempt(self.job_id, ran=outcome.ran) is not None:
             return "queued"
         if outcome.reason == queue.PREEMPTED and queue.stop_requested(self.job_id) == "cancelled":

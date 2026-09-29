@@ -180,7 +180,8 @@ dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
 draining             # present while the host is shutting itself down
 owner.json           # {"instance": "<hostname>/<boot id>", "since": str}: the machine serving
-                     # this queue, written by each dispatcher as it starts; see Dispatcher
+                     # this queue; its mtime is renewed by that dispatcher's heartbeat.
+                     # See Dispatcher
 ```
 
 A job's `state.json` is the one record of what it is doing and what has been
@@ -262,15 +263,21 @@ The rules it holds to:
 - **One dispatcher per host**, by `flock` on `dispatcher.lock` plus a heartbeat.
   A holder whose heartbeat is stale (30 s) is killed by the pgid in the lock
   body and taken over.
-- **One machine serves a queue**, the last whose dispatcher started: it
-  writes itself into `owner.json` before adopting anything (`owner.claim`),
-  without waiting to learn whether the machine before it is dead. A
-  dispatcher that finds another instance there, at the start of every pass
-  and before every spawn, stands down (`_stand_down_if_replaced`): SIGKILL to
-  its runners and their jobs, no state written, exit. The new owner has
-  already queued those jobs again, their runners being from another boot.
-  Detection, not prevention: where `flock` works across machines the lock
-  above keeps a second dispatcher out anyway.
+- **One machine serves a queue** (`owner.py`). A dispatcher claims
+  `owner.json` before adopting anything, once whoever it names has not
+  renewed it for `owner.STALE_S`, waiting `owner.CLAIM_WAIT_S` for that and
+  exiting without touching the queue if it stays fresh. Its heartbeat renews
+  the claim, never another's. The instance is taken once per process and
+  handed to runners in `GPUC_OWNER_INSTANCE`, so a hostname that changes
+  under a running host is not a takeover. Anything of a machine that finds
+  another instance there writes nothing more: the dispatcher stops at the
+  start of a pass, before a spawn and before a terminate; each runner
+  SIGKILLs its phase and exits at once (`JobRunner._stand_down_if_replaced`,
+  every `owner.CHECK_S` and before the writes that end an attempt). The new
+  owner queues their jobs again, at adoption and every `REQUEUE_SCAN_S` for a
+  claim the old machine made after it. Detection, not prevention: where
+  `flock` works across machines the lock above keeps a second dispatcher out
+  anyway.
 - **A dispatcher started from the package on disk replaces one that is not.**
   The lock body records the `pkg_commit` its holder started from; a holder
   whose commit *differs* (`_is_another_build`: different, not older; an

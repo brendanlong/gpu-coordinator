@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -2738,57 +2739,152 @@ def test_a_filler_is_not_started_on_a_card_an_auto_preempt_will_complete(
     assert jobs.read_state(filler).status == "queued"
 
 
-def replaced_by_another_machine() -> None:
+def another_machine_owns_the_queue(*, renewed_s_ago: float = 0.0) -> None:
     jobs.atomic_write_json(paths.owner_file(), {"instance": "another-pod/another-boot"})
+    stamp = time.time() - renewed_s_ago
+    os.utime(paths.owner_file(), (stamp, stamp))
 
 
-def test_a_dispatcher_records_itself_as_the_owner_and_says_whom_it_replaced(
-    gpuc_home: Path,
-) -> None:
+def ticking_clock(dispatcher: Dispatcher) -> FakeClock:
+    clock = FakeClock()
+    dispatcher.deps.monotonic = clock
+    dispatcher.deps.sleep = clock.advance
+    return clock
+
+
+def test_a_dispatcher_takes_over_a_queue_whose_owner_stopped_renewing(gpuc_home: Path) -> None:
     from gpuc.host.dispatcher import DispatcherLock
 
-    replaced_by_another_machine()
+    another_machine_owns_the_queue(renewed_s_ago=owner.STALE_S + 1)
     dispatcher, _ = make_dispatcher()
+    ticking_clock(dispatcher)
     lock = DispatcherLock()
     assert lock.acquire()
     assert dispatcher.run(lock) == 0
-    assert owner.current() == owner.instance()
+    record = owner.current()
+    assert record is not None and record[0] == dispatcher.instance
     assert "taking this queue over from another-pod/another-boot" in (
         paths.dispatcher_log().read_text()
     )
 
 
-def test_a_replaced_dispatcher_kills_its_jobs_writes_nothing_and_exits(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_dispatcher_leaves_a_queue_its_owner_is_still_renewing(gpuc_home: Path) -> None:
+    """The other machine is alive: taking over would only have the two kill
+    each other's jobs in turn."""
+    from gpuc.host.dispatcher import DispatcherLock
+
+    job_id = queue.enqueue(make_spec(gpus=1))
+    dispatcher, spawned = make_dispatcher()
+    clock = ticking_clock(dispatcher)
+
+    def renewing(seconds: float) -> None:
+        clock.advance(seconds)
+        another_machine_owns_the_queue()
+
+    dispatcher.deps.sleep = renewing
+    another_machine_owns_the_queue()
+    lock = DispatcherLock()
+    assert lock.acquire()
+    assert dispatcher.run(lock) == 0
+    assert spawned == {}
+    assert jobs.read_state(job_id).status == "queued"
+    assert "not starting: another-pod/another-boot is serving" in (
+        paths.dispatcher_log().read_text()
+    )
+
+
+def test_a_newcomer_waits_for_a_claim_that_has_just_stopped_being_renewed(
+    gpuc_home: Path,
 ) -> None:
+    another_machine_owns_the_queue()
+    clock = FakeClock()
+    renewed = time.time()
+
+    def the_other_is_silent(seconds: float) -> None:
+        clock.advance(seconds)
+        stamp = renewed - (clock.t - 1000.0)
+        os.utime(paths.owner_file(), (stamp, stamp))
+
+    previous = owner.claim("me/boot", sleep=the_other_is_silent, now=clock)
+    assert previous == "another-pod/another-boot"
+    assert owner.STALE_S <= clock.t - 1000.0 <= owner.CLAIM_WAIT_S
+
+
+def test_a_beat_renews_only_its_own_claim(gpuc_home: Path) -> None:
+    from gpuc.host.dispatcher import DispatcherLock
+
+    lock = DispatcherLock()
+    lock.owner = "me/boot"
+    owner.claim("me/boot")
+    stale = time.time() - 100
+    os.utime(paths.owner_file(), (stale, stale))
+    lock.beat(force=True)
+    record = owner.current()
+    assert record is not None and record[1] < 5
+    another_machine_owns_the_queue(renewed_s_ago=100)
+    lock.beat(force=True)
+    record = owner.current()
+    assert record is not None and record[0] == "another-pod/another-boot"
+    assert record[1] > 50
+
+
+def test_a_replaced_dispatcher_writes_nothing_and_exits(gpuc_home: Path) -> None:
+    """Its runners stand down themselves, each killing its own job."""
     running = queue.enqueue(make_spec(gpus=1))
     waiting = queue.enqueue(make_spec(gpus=1))
-    dispatcher, spawned = make_dispatcher()
-    owner.claim()
+    dispatcher, _ = make_dispatcher()
+    owner.claim(dispatcher.instance)
     dispatcher.run_once()
     assert running in dispatcher.running
-    jobs.update_state(running, pgid=424242)
     before = {job_id: jobs.read_state(job_id) for job_id in (running, waiting)}
-    signals = record_signals(monkeypatch)
-    replaced_by_another_machine()
+    another_machine_owns_the_queue()
     dispatcher.run_once()
     assert dispatcher.should_exit and dispatcher.running == {}
-    assert (424242, signal.SIGKILL) in signals
-    assert (spawned[running].pid, signal.SIGKILL) in signals
+    assert dispatcher.replaced == "another-pod/another-boot"
     assert {job_id: jobs.read_state(job_id) for job_id in (running, waiting)} == before
     assert "STANDING DOWN" in paths.dispatcher_log().read_text()
 
 
 def test_a_replaced_dispatcher_launches_nothing(gpuc_home: Path) -> None:
     job_id = queue.enqueue(make_spec(gpus=1))
-    replaced_by_another_machine()
+    another_machine_owns_the_queue()
     dispatcher, spawned = make_dispatcher()
     dispatcher.run_once()
     assert spawned == {}
     assert jobs.read_state(job_id).status == "queued"
+    dispatcher.replaced = None
+    dispatcher._launch(job_id, [FAKE_GPUS[0]], 1)
+    assert spawned == {}
+
+
+def test_a_replaced_rental_does_not_terminate_or_leave_the_queue_draining(
+    gpuc_home: Path,
+) -> None:
+    calls: list[str] = []
+    dispatcher, _ = make_dispatcher(terminate_call=lambda pod, key: calls.append(pod) or "{}")
+    another_machine_owns_the_queue()
+    assert not dispatcher.drain_and_terminate("idle")
+    assert calls == []
+    assert not paths.draining_file().exists()
+
+
+def test_a_job_claimed_after_the_takeover_by_the_old_machine_is_queued_again(
+    gpuc_home: Path,
+) -> None:
+    """Its runner saw no takeover before its claim, then stood down without a
+    word: nothing else would ever move the job on."""
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    job_id = queue.enqueue(make_spec(gpus=1))
+    ran_before_a_restart(job_id)
+    dispatcher.deps.monotonic.advance(host_dispatcher.REQUEUE_SCAN_S + 1)  # type: ignore[attr-defined]
+    dispatcher.run_once()
+    state = jobs.read_state(job_id)
+    assert state.attempt == 2
+    assert state.status in {"queued", "running"}
 
 
 def test_a_queue_nobody_has_claimed_is_ours(gpuc_home: Path) -> None:
-    assert owner.replaced_by() is None
+    assert owner.replaced_by("me/boot") is None
     paths.owner_file().write_text("not json")
-    assert owner.replaced_by() is None
+    assert owner.replaced_by("me/boot") is None
