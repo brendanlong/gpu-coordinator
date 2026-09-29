@@ -864,30 +864,36 @@ def within(job: JobView, since_s: float | None, now: datetime | None = None) -> 
     return ((now or datetime.now(UTC)) - ended).total_seconds() <= since_s
 
 
+def finished_detail(job: JobView) -> str:
+    # `cancelled (cancelled)` says nothing twice: only a reason that adds
+    # to the status is worth the parenthesis.
+    reason = job.reason if job.reason != job.status else None
+    detail = reason or (f"exit {job.exit_code}" if job.exit_code else "")
+    if job.problems:
+        detail = ", ".join(filter(None, [detail, *job.problems]))
+    return f" ({detail})" if detail else ""
+
+
+def outputs_flag(job: JobView) -> str:
+    if job.outputs_lost and job.outputs_pending:
+        # `outputs_lost` is written once and never cleared, so it outlives
+        # the thing it describes: a job the host now reports as holding
+        # nothing is not a lost result, whatever a past drain concluded.
+        return "  OUTPUTS LOST"
+    if job.outputs_pending:
+        return "  outputs not uploaded"
+    if job.kept_outputs:
+        return f"  kept on host: {', '.join(job.kept_outputs)}"
+    return ""
+
+
 def _finished_lines(view: HostView, *, recent: int, since_s: float | None) -> list[str]:
     lines: list[str] = []
     finished = [job for job in view.finished if within(job, since_s)]
     for job in finished[:recent]:
-        # `cancelled (cancelled)` says nothing twice: only a reason that adds
-        # to the status is worth the parenthesis.
-        reason = job.reason if job.reason != job.status else None
-        detail = reason or (f"exit {job.exit_code}" if job.exit_code else "")
-        if job.problems:
-            detail = ", ".join(filter(None, [detail, *job.problems]))
-        flag = ""
-        if job.outputs_lost and job.outputs_pending:
-            # `outputs_lost` is written once and never cleared, so it outlives
-            # the thing it describes: a job the host now reports as holding
-            # nothing is not a lost result, whatever a past drain concluded.
-            flag = "  OUTPUTS LOST"
-        elif job.outputs_pending:
-            flag = "  outputs not uploaded"
-        elif job.kept_outputs:
-            flag = f"  kept on host: {', '.join(job.kept_outputs)}"
         lines.append(
-            f"  done    {job_label(job)} {job.status}"
-            f"{f' ({detail})' if detail else ''} {format_age(job.ended_at)}"
-            f"{fmt_util_mean(job)}{flag}"
+            f"  done    {job_label(job)} {job.status}{finished_detail(job)} "
+            f"{format_age(job.ended_at)}{fmt_util_mean(job)}{outputs_flag(job)}"
         )
     if since_s is not None and not finished and view.finished_total:
         lines.append(

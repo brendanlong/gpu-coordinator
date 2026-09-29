@@ -53,6 +53,7 @@ from gpuc.control.actions import (
     remove_host,
     set_jobs,
     shipped_note,
+    since_seconds,
     status,
     version_document,
 )
@@ -611,10 +612,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
         return wait_mod.look(args.job_ids, args.host, settings)
     recent = status_mod.RECENT_FINISHED if args.recent is None else args.recent
     read = open_registry()
-    try:
-        since_s = status_mod.parse_duration(args.since) if args.since else None
-    except ValueError as exc:
-        raise UsageError(f"--since: {exc}") from exc
+    since_s = since_seconds(args.since, "--since")
     # Each host as it answers, so a slow one does not hold the others' blocks.
     show = (
         None if args.json else lambda v: print(status_mod.render(v, recent=recent, since_s=since_s))
@@ -645,7 +643,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
     return result.answer(recent=recent, since_s=since_s, text="\n".join(lines) or None)
 
 
-def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
+def ssh_target(args: argparse.Namespace, settings: Settings) -> tuple[HostEntry, str, str | None]:
     """`(host, directory, fallback)` for a host name or a job id.
 
     A registered host name wins over a job id: host names are ours and job ids
@@ -662,7 +660,7 @@ def ssh_target(args: argparse.Namespace) -> tuple[HostEntry, str, str | None]:
     entry = (
         registry.require(args.host)
         if args.host
-        else locate(args.target, registry, None, skipped=read.skipped).require_entry()
+        else locate(args.target, registry, None, settings, skipped=read.skipped).require_entry()
     )
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
     return entry, f"{job_dir}/workdir", job_dir
@@ -677,8 +675,9 @@ def cmd_ssh(args: argparse.Namespace) -> Answer:
         args.print_only, command = True, command[1:]
     if command and command[0] == "--":
         command = command[1:]
-    entry, directory, fallback = ssh_target(args)
-    transport = transport_for(entry, load_settings())
+    settings = load_settings()
+    entry, directory, fallback = ssh_target(args, settings)
+    transport = transport_for(entry, settings)
     if command:
         # Joined with spaces and handed to a shell, which is what `ssh host CMD`
         # has always done and what anyone typing `-- 'ls | wc -l'` expects.

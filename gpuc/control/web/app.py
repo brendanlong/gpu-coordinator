@@ -46,6 +46,7 @@ from gpuc.control.actions import (
     registry_answer,
     remove_host,
     set_jobs,
+    since_seconds,
     status,
     version_document,
 )
@@ -269,11 +270,7 @@ class Dashboard:
         settings = self.load_settings()
         read = read_registry()
         recent = int_param(request, "recent", status_mod.RECENT_FINISHED)
-        since = request.param("since")
-        try:
-            since_s = status_mod.parse_duration(since) if since else None
-        except ValueError as exc:
-            raise UsageError(f"since: {exc}") from exc
+        since_s = since_seconds(request.param("since"), "since")
         result = status(
             read,
             settings,

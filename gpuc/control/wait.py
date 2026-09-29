@@ -132,23 +132,19 @@ class Watched:
                 else ""
             )
             return f"{status_mod.job_label(job)} on {self.host}: {job.status}{phase}{took}"
-        # `cancelled (cancelled)` says nothing twice, as in `gpuc status`.
-        detail = job.reason if job.reason and job.reason != job.status else ""
-        if not detail and job.exit_code:
-            detail = f"exit {job.exit_code}"
         took = (
             ""
             if job.minutes is None
             else f" after {status_mod.format_duration(job.minutes * 60.0)}"
         )
-        flag = "  OUTPUTS LOST" if job.outputs_lost and job.outputs_pending else ""
         # Said, because it changes what the answer is worth: the mirror holds
         # what the host uploaded last, and a host that died mid-upload uploaded
         # nothing after that.
         whence = " (from the S3 mirror)" if self.source == "mirror" else ""
         return (
             f"{status_mod.job_label(job)} on {self.host}: {job.status}"
-            f"{f' ({detail})' if detail else ''}{took}{status_mod.fmt_util_mean(job)}{flag}{whence}"
+            f"{status_mod.finished_detail(job)}{took}{status_mod.fmt_util_mean(job)}"
+            f"{status_mod.outputs_flag(job)}{whence}"
         )
 
     def document(self) -> dict[str, Any]:
