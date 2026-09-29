@@ -20,8 +20,8 @@ gpuc status      # registered hosts, their queues, and what is running
 is running another build; `gpuc submit` and `gpuc requeue` re-ship the package
 and restart that host's dispatcher before enqueueing (`--no-bootstrap` skips
 it), so nothing is needed from you. A host whose config names no build was
-never bootstrapped, and `submit` refuses it until `gpuc host bootstrap <host>`
-has run.
+never bootstrapped (added with `--no-bootstrap`, or its bootstrap failed), and
+`submit` refuses it until `gpuc host bootstrap <host>` has run.
 
 `gpuc skill` prints this file. If `gpuc` is not on PATH, run it as `uv run
 gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
@@ -40,7 +40,7 @@ gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
 
 Prefer a host you already have over a pod you pay for; a busy host queues your
 job behind the running one, which is usually fine. If nothing is registered,
-`gpuc host add local` then `gpuc host bootstrap local` gives you this machine
+`gpuc host add local` gives you this machine
 with every card nvidia-smi reports, including cards added later.
 
 ## Write a job spec

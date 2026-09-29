@@ -220,8 +220,12 @@ def cmd_host_add(args: argparse.Namespace) -> Answer:
         fields=fields,
         env_updates=env_updates,
         force=args.force,
+        health=None if args.no_bootstrap else health_options(args),
+        report=progress(args),
     )
-    return Answer(change.document, change.render())
+    for failure in change.failures:
+        print(f"error: {failure}", file=sys.stderr)
+    return Answer(change.document, None, failures=change.failures)
 
 
 def _days(raw: str | None, flag: str) -> float | None:
@@ -1144,7 +1148,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow a --gpus that claims some but not all of the cards the host is already "
         "configured with",
     )
-    add_json_flag(add, "the host as `host list --json` reports it, plus what this wrote to it")
+    add.add_argument(
+        "--no-bootstrap",
+        action="store_true",
+        help="only register the host; without it, a host with no gpuc on it, or another "
+        "build than this machine's, is bootstrapped next",
+    )
+    add.add_argument(
+        "--health-args", default="", help="extra flags for `gpuc.host health`, e.g. --min-mbps 0.1"
+    )
+    add_json_flag(
+        add,
+        "the host as `host list --json` reports it, plus what this wrote to it and, under "
+        "`bootstrap`, what `host bootstrap --json` would say (null when none ran; "
+        "`bootstrap_error` says why when one failed)",
+    )
     add.set_defaults(func=cmd_host_add)
 
     edit = host.add_parser(

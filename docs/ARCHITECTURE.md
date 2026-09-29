@@ -1011,6 +1011,9 @@ every bootstrap and reported back by `python -m gpuc.host status`
   nothing about a host it could not reach. A host that *answered* and named no
   commit is warned about rather than passed as current. `status --json`'s
   `pkg_commit` is the host's answer, so `null` means "the host did not say".
+- `gpuc host add` bootstraps a host whose `config.json` names no commit or
+  another one (`--no-bootstrap` skips it); a failed bootstrap leaves the host
+  registered and exits 1.
 - `gpuc submit` and `gpuc requeue` read the host's `config.json` before they
   enqueue and re-ship the package (`ensure_build`) when it does not match this
   build. One comparison, `version.is_other_build`, and it is strict: a host

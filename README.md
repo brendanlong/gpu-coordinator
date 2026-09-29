@@ -38,9 +38,8 @@ outright.
 
 ```sh
 uv tool install "git+https://github.com/brendanlong/gpu-coordinator@main"
-gpuc host add local                          # every card nvidia-smi reports; --gpus 0
-                                             # (an index or GPU-… UUID) narrows it
-gpuc host bootstrap local                    # installs uv, the package, the dispatcher
+gpuc host add local                          # installs gpuc there; every card nvidia-smi
+                                             # reports, or --gpus 0 (index or GPU-… UUID)
 gpuc submit job.example.yaml --host local    # or --runpod --gpu A40 --max-price 0.60
 gpuc status                                  # queues, running jobs, recent results
 gpuc logs <job-id> -f                        # streams until the job ends, then exits with it
