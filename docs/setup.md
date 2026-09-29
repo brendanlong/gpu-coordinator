@@ -164,22 +164,12 @@ queued again and restart from the beginning. Without one, `gpuc status --host
 <host> --all` lists what was there and, run from the project's directory,
 `gpuc requeue <job-id>` resubmits each (this needs `s3_bucket`).
 
-A persistent root holds the jobs' workdirs too: each checkout and the venv
-`setup` builds in it. If the volume is slow (a network filesystem) or small,
-keep workdirs on the local disk instead:
+If the persistent volume is slow or small, keep jobs' workdirs (checkouts and
+venvs) on local disk instead; the queue stays on the persistent root:
 
 ```sh
 gpuc host set gpubox --scratch-dir '~/gpuc-scratch' --cache-dir '' && gpuc host bootstrap gpubox
 ```
 
-`--cache-dir ''` lets bootstrap move uv's cache next to scratch, where venvs
-can link out of it; a cache pinned on the slow volume would be copied into
-every venv. Scratch must be a directory of your own, and is made private.
-
-The queue, logs and data directory stay on the persistent root. Each job's
-checkout is archived there at submit and unpacked onto scratch when it runs,
-so a restart that wipes scratch costs a job its workdir, not its code. Jobs
-with kept outputs (an `outputs:` path with no `s3` or `hf`) are refused on such
-a host, since a restart would take them. Change `--scratch-dir` only while
-nothing is queued or running, and after `gpuc clean --host <host>
---all-finished`: the workdirs left under the old one are no longer found.
+Such a host refuses outputs with no `s3` or `hf` destination, since a restart
+may wipe them.
