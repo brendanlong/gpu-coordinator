@@ -102,8 +102,6 @@ class LockBody:
             document = json.loads(text)
         except json.JSONDecodeError:
             return LockBody()
-        if not isinstance(document, dict):
-            return LockBody()
         # Tolerant on purpose: this file is written by whichever build of gpuc
         # last took the lock, and a pid we cannot read means "no known holder"
         # -- which the caller already handles -- not a crash on the way to
@@ -177,14 +175,10 @@ class DispatcherLock:
         self._last_beat = 0.0
         self._beat_stop = threading.Event()
         self._beat_thread: threading.Thread | None = None
-        self.takeover_pgid: int | None = None
         self.pkg_commit = running_pkg_commit()
 
-    def heartbeat_age(self) -> float | None:
-        return heartbeat_age(self._now)
-
     def holder_is_fresh(self) -> bool:
-        age = self.heartbeat_age()
+        age = heartbeat_age(self._now)
         return age is not None and age < HEARTBEAT_STALE_S
 
     def acquire(self, takeover_wait_s: float = 10.0, handoff_wait_s: float = 30.0) -> bool:
@@ -285,7 +279,6 @@ class DispatcherLock:
         pgid = self._signalable_pgid(body)
         if pgid is None:
             return False
-        self.takeover_pgid = pgid
         log_line(f"{signal.Signals(sig).name}ing dispatcher process group {pgid}: {why}")
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, sig)
@@ -1199,13 +1192,13 @@ class Dispatcher:
         owned = set(self.owned_gpus())
         shared = set(self.shared_gpus())
         for job_id, entry in self.running.items():
-            if self._stopping(job_id):
+            state = self._state_or_empty(job_id)
+            if state.intent is not None:
                 continue
             try:
                 spec = jobs.read_spec(job_id)
             except (RuntimeError, ValueError):
                 continue
-            state = self._state_or_empty(job_id)
             if not spec.auto_preempt or state.status != "running":
                 continue
             found.append(
@@ -1219,10 +1212,6 @@ class Dispatcher:
                 )
             )
         return found
-
-    def _stopping(self, job_id: str) -> bool:
-        """Already asked to stop, so its cards are on their way back anyway."""
-        return self._state_or_empty(job_id).intent is not None
 
     def _preempt_for(self, candidate: plan.Preemptable, waiting: queue.QueueEntry) -> bool:
         """Stop one auto-preemptable job, saying in both logs who took its place.

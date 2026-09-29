@@ -89,7 +89,7 @@ def test_acquire_records_pid_pgid_starttime_and_boot_id(gpuc_home: Path) -> None
         assert body.starttime == procinfo.starttime(os.getpid())
         assert body.boot_id == procinfo.boot_id()
         assert body.pgid in (os.getpid(), None)
-        age = lock.heartbeat_age()
+        age = dispatcher.heartbeat_age()
         assert age is not None and age < 5
     finally:
         lock.release()
@@ -135,7 +135,7 @@ def test_the_heartbeat_thread_beats_while_the_main_loop_is_busy(gpuc_home: Path)
         # holds the GIL, not that it manages it inside any particular second.
         deadline = time.time() + 30
         while time.time() < deadline:
-            age = lock.heartbeat_age()
+            age = dispatcher.heartbeat_age()
             if age is not None and age < 1.0:
                 break
             time.sleep(0.05)
@@ -163,7 +163,7 @@ def test_takeover_kills_a_wedged_holder_with_a_stale_heartbeat(gpuc_home: Path) 
     try:
         lock = DispatcherLock()
         assert lock.acquire(takeover_wait_s=20.0)
-        assert lock.takeover_pgid == holder_pgid
+        assert f"process group {holder_pgid}" in paths.dispatcher_log().read_text()
         assert holder.wait(timeout=10) != 0
         deadline = time.time() + 10
         while time.time() < deadline:
@@ -175,7 +175,7 @@ def test_takeover_kills_a_wedged_holder_with_a_stale_heartbeat(gpuc_home: Path) 
         else:
             pytest.fail("the wedged holder's process group survived takeover")
         assert LockBody.parse(paths.lock_file().read_text()).pid == os.getpid()
-        age = lock.heartbeat_age()
+        age = dispatcher.heartbeat_age()
         assert age is not None and age < 5
         lock.release()
     finally:
@@ -199,7 +199,7 @@ def test_a_stale_beat_never_kills_a_process_that_is_not_a_gpuc_dispatcher(
         )
         lock = DispatcherLock()
         lock._evict_stale_holder()
-        assert lock.takeover_pgid is None
+        assert "ing dispatcher process group" not in paths.dispatcher_log().read_text()
         assert innocent.poll() is None
         assert "is not a gpuc dispatcher" in paths.dispatcher_log().read_text()
     finally:
@@ -214,7 +214,7 @@ def test_a_stale_beat_never_kills_a_group_that_is_not_the_holders_own_pid(
     write_lock_body(pid=os.getpid(), pgid=os.getpid() + 1, boot_id=procinfo.boot_id())
     lock = DispatcherLock()
     lock._evict_stale_holder()
-    assert lock.takeover_pgid is None
+    assert "ing dispatcher process group" not in paths.dispatcher_log().read_text()
     assert "only a process group led by the dispatcher itself" in paths.dispatcher_log().read_text()
 
 
@@ -222,7 +222,7 @@ def test_a_holder_recorded_under_a_different_boot_id_is_simply_gone(gpuc_home: P
     write_lock_body(pid=os.getpid(), pgid=os.getpid(), boot_id="0000-from-a-previous-boot")
     lock = DispatcherLock()
     lock._evict_stale_holder()
-    assert lock.takeover_pgid is None
+    assert "ing dispatcher process group" not in paths.dispatcher_log().read_text()
     assert "is gone" in paths.dispatcher_log().read_text()
 
 
@@ -231,7 +231,7 @@ def test_a_missing_heartbeat_counts_as_stale(gpuc_home: Path) -> None:
     try:
         paths.heartbeat_file().unlink()
         lock = DispatcherLock()
-        assert lock.heartbeat_age() is None
+        assert dispatcher.heartbeat_age() is None
         assert not lock.holder_is_fresh()
         assert lock.acquire(takeover_wait_s=20.0)
         lock.release()

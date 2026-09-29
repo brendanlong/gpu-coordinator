@@ -155,14 +155,8 @@ class BootstrapResult:
     @classmethod
     def no_document(cls) -> dict[str, Any]:
         """The same keys as `document()`, for a host that was never bootstrapped."""
-        return {
-            "host": None,
-            "home": None,
-            "files": None,
-            "pkg_commit": None,
-            "dispatcher_pid": None,
-            "warnings": [],
-        }
+        blank = cls(host="", home="", files=0, dispatcher_pid=0).document()
+        return {key: [] if isinstance(value, list) else None for key, value in blank.items()}
 
 
 def package_files() -> list[str]:
