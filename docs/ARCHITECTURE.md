@@ -151,8 +151,10 @@ jobs/<jobid>/
                      #  "ran": bool,                # has `main` started, in any attempt; false
                      #                              # from enqueue, set as `main` begins, never
                      #                              # cleared
-                     #  "checkout_removed_at": str|null}  # the checkout went from a workdir/
+                     #  "checkout_removed_at": str|null,  # the checkout went from a workdir/
                      #                              # that still holds kept outputs
+                     #  "restarts": n}              # times queued again because the host
+                     #                              # restarted under it; see Adoption
                      # util_recent is the last 40 main-phase samples; null means nvidia-smi
                      # failed and must not be read as 0%. util_sum / util_samples
                      # accumulate every non-null sample of the attempt and survive
@@ -284,7 +286,11 @@ The rules it holds to:
   recorded runner (`runner_pid` with the boot id and start time beside it) is
   alive is adopted; otherwise it is failed `runner-died`, its leftovers killed
   (`cgroup_unit`, then `pgid`) before its cards go back in the pool. Nothing
-  is inferred from the process table and nothing is written back.
+  is inferred from the process table and nothing is written back. A runner
+  recorded in another boot died with the machine: its job is queued again at
+  `attempt+1` as a preempt leaves it, with `restarts` one higher and nothing
+  killed (`queue.requeue_after_restart`), cancelled if a cancel stood, and
+  failed `host-restarted` once `restarts` reaches `queue.MAX_RESTARTS`.
 - **A stop is an intent** in the job's state: `cancel` or `preempt`. The
   runner owns the kill and ends the attempt with its last write; the
   dispatcher escalates only once the grace period has passed

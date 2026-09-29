@@ -144,6 +144,8 @@ destinations. Adding another of either changes nothing else in this document.
   overrides that period, and one that has retried its uploads and still cannot
   deliver them terminates anyway. A job whose outputs are not confirmed backed
   up is never deleted automatically on a host that persists.
+- A job running when its host restarts is queued again, and restarts from
+  the beginning as a preempted one does, a bounded number of times.
 - A job may set a wall-clock limit and will be terminated if it exceeds that
   time. The limit can be changed after submit, and on a running job without
   restarting it.

@@ -653,7 +653,9 @@ class Dispatcher:
         A `running` state names the runner that claimed it, with the boot id
         and start time that make a pid an identity, so the question is only
         whether that process is still there: adopted if so, `runner-died` if
-        not. Nothing else is inferred, and nothing is written back.
+        not. Nothing else is inferred, and nothing is written back. A runner
+        from an earlier boot died with the machine, not on its own, so its job
+        is queued again instead (`queue.requeue_after_restart`).
         """
         for job_id in jobs.list_job_ids():
             try:
@@ -663,6 +665,9 @@ class Dispatcher:
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
+            if queue.from_another_boot(state):
+                self._requeue_after_restart(job_id)
+                continue
             if recorded_process_alive(
                 state.runner_pid, state.runner_boot_id, state.runner_starttime
             ):
@@ -670,6 +675,28 @@ class Dispatcher:
                 self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
             else:
                 self._mark_runner_died(job_id, expect="running")
+
+    def _requeue_after_restart(self, job_id: str) -> None:
+        try:
+            written = queue.requeue_after_restart(job_id)
+        except RuntimeError as exc:
+            self.log(
+                f"job {job_id}: ran before this host restarted, and could not be queued "
+                f"again ({exc}); left alone"
+            )
+            return
+        if written is None:
+            return
+        if written.status == "queued":
+            self.log(
+                f"job {job_id} ran before this host restarted; queued again as "
+                f"attempt {written.attempt}"
+            )
+            return
+        self.log(
+            f"job {job_id} ran before this host restarted: {written.status} ({written.reason})"
+        )
+        self._settle_secrets(job_id, written)
 
     def _mark_runner_died(self, job_id: str, *, expect: str) -> None:
         """Fail the job whose runner is gone, after making sure nothing of it

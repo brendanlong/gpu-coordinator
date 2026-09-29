@@ -564,6 +564,10 @@ class JobState:
     kept_bytes: int | None = None
     """What those kept outputs hold, measured as the checkout went: disk no
     sweep will ever free, which `status` reports so it is not forgotten."""
+    restarts: int = 0
+    """How many times this job was queued again because its host restarted
+    while it ran (`queue.requeue_after_restart`); carried by every attempt so
+    a job that keeps taking its host down stops at `queue.MAX_RESTARTS`."""
 
     @staticmethod
     def from_dict(d: Any) -> JobState:
@@ -615,6 +619,7 @@ class JobState:
             ran=as_bool(fields, "ran", True),
             checkout_removed_at=as_opt_str(fields, "checkout_removed_at"),
             kept_bytes=as_opt_int(fields, "kept_bytes"),
+            restarts=as_int(fields, "restarts", 0),
         )
 
     def to_dict(self) -> dict[str, Any]:

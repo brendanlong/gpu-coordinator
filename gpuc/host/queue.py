@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from gpuc.host import cleanup, jobs, paths
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
+from gpuc.host.procs import boot_id
 
 PREEMPTED = "preempted"
 """The reason of an attempt stopped so that something else can have its GPUs.
@@ -268,25 +269,86 @@ def next_attempt(job_id: str, *, ran: bool) -> int | None:
         state = jobs.read_state(job_id)
         if state.status != "running" or state.intent != PREEMPT:
             return None
-        attempt = state.attempt + 1
-        jobs.write_state(
-            job_id,
-            JobState(
-                status="queued",
-                attempt=attempt,
-                priority=state.priority,
-                estimated_runtime_min=state.estimated_runtime_min,
-                max_runtime_min=state.max_runtime_min,
-                live_max_runtime=state.live_max_runtime,
-                ran=state.ran or ran,
-            ),
-        )
+        attempt = _write_queued_again(job_id, state, ran=state.ran or ran)
     note(
         job_id,
         f"preempted; queued again as attempt {attempt} at priority {state.priority}, "
         f"to run from the start in this same workdir",
     )
     return attempt
+
+
+def _write_queued_again(
+    job_id: str, state: JobState, *, ran: bool, restarts: int | None = None
+) -> int:
+    """The fresh `queued` state of the next attempt, written under the lock
+    the caller holds. See `next_attempt` for what survives and why."""
+    attempt = state.attempt + 1
+    jobs.write_state(
+        job_id,
+        JobState(
+            status="queued",
+            attempt=attempt,
+            priority=state.priority,
+            estimated_runtime_min=state.estimated_runtime_min,
+            max_runtime_min=state.max_runtime_min,
+            live_max_runtime=state.live_max_runtime,
+            ran=ran,
+            restarts=state.restarts if restarts is None else restarts,
+        ),
+    )
+    return attempt
+
+
+MAX_RESTARTS = 3
+"""How many times a job is queued again because its host restarted under it
+before it is failed `host-restarted` instead. A job that takes its host down
+with it (a kernel panic, an OOM that wedges the box) would otherwise restart
+it forever."""
+
+
+def requeue_after_restart(job_id: str) -> JobState | None:
+    """Queue again a job whose runner ran in an earlier boot of this host.
+
+    The machine restarted under it, so its runner and every process of it are
+    gone, and nothing of the attempt can be trusted: it runs again from the
+    start in the same workdir, as after a preempt. Unlike a runner that died
+    while the host stayed up, this is not the job's doing or gpuc's, so it is
+    not a failure -- until `MAX_RESTARTS`, when it is `failed: host-restarted`.
+    A job somebody was cancelling is cancelled.
+
+    The state written, or None when the job is no longer a `running` one from
+    another boot: whoever moved it on decided for it.
+    """
+    with jobs.locked(job_id):
+        state = jobs.read_state(job_id)
+        if state.status != "running" or not from_another_boot(state):
+            return None
+        attempt = None
+        if state.intent != CANCEL and state.restarts < MAX_RESTARTS:
+            attempt = _write_queued_again(job_id, state, ran=state.ran, restarts=state.restarts + 1)
+    if attempt is None:
+        outcome = (
+            jobs.Outcome("cancelled", "cancelled", ran=False)
+            if state.intent == CANCEL
+            else jobs.Outcome("failed", "host-restarted", ran=False)
+        )
+        return jobs.finish(job_id, outcome, expect="running", forget_output_uploads=True)
+    note(
+        job_id,
+        f"the host restarted while this job was running; queued again as attempt {attempt} "
+        f"(restart {state.restarts + 1} of at most {MAX_RESTARTS}), to run from the start "
+        f"in this same workdir",
+    )
+    return jobs.read_state(job_id)
+
+
+def from_another_boot(state: JobState) -> bool:
+    """Did this state's runner run in an earlier boot of this machine? Only a
+    boot id recorded *and* readable now *and* different says so, as in
+    `procs.recorded_process_alive`."""
+    current = boot_id()
+    return bool(state.runner_boot_id and current and state.runner_boot_id != current)
 
 
 def note(job_id: str, message: str) -> None:

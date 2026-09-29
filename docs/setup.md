@@ -159,7 +159,7 @@ gpuc host add gpubox --ssh me@gpubox --persistent-root /mnt/data/$USER
 ```
 
 After a restart, `gpuc host bootstrap <host>` reinstalls gpuc. With a
-persistent root, queued jobs then carry on and only the jobs that were running
-need resubmitting. Without one, `gpuc status --host <host> --all` lists what
+persistent root the queue then carries on, and the jobs that were running are
+queued again and restart from the beginning. Without one, `gpuc status --host <host> --all` lists what
 was there and, run from the project's directory, `gpuc requeue <job-id>`
 resubmits each (this needs `s3_bucket`).

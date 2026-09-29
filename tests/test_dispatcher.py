@@ -700,12 +700,7 @@ def test_an_occasional_failure_does_not_stop_the_loop(gpuc_home: Path) -> None:
     assert dispatcher.consecutive_failures == 0
 
 
-def test_an_orphan_from_a_previous_boot_is_not_adopted_and_nothing_of_it_is_killed(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Failed `runner-died`, and its recorded group left alone: after a
-    reboot that number belongs to whatever the kernel gave it to next."""
-    job_id = queue.enqueue(make_spec(gpus=1))
+def ran_before_a_restart(job_id: str, **fields: object) -> None:
     jobs.update_state(
         job_id,
         status="running",
@@ -713,13 +708,74 @@ def test_an_orphan_from_a_previous_boot_is_not_adopted_and_nothing_of_it_is_kill
         runner_pid=os.getpid(),
         runner_boot_id="0000-a-previous-boot",
         pgid=os.getpid(),
+        phase="main",
+        **fields,
     )
+
+
+def test_an_orphan_from_a_previous_boot_is_queued_again_and_nothing_of_it_is_killed(
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its recorded group is left alone: after a reboot that number belongs to
+    whatever the kernel gave it to next."""
+    job_id = queue.enqueue(make_spec(gpus=1, priority=7))
+    secrets = paths.job_env_file(job_id)
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text("TOKEN=x\n")
+    ran_before_a_restart(job_id, ran=True)
     signals = record_signals(monkeypatch)
     dispatcher, _ = make_dispatcher()
     dispatcher.adopt_orphans()
-    assert jobs.read_state(job_id).reason == "runner-died"
+    state = jobs.read_state(job_id)
+    assert (state.status, state.attempt, state.restarts) == ("queued", 2, 1)
+    assert (state.priority, state.ran, state.runner_pid, state.gpus) == (7, True, None, [])
+    assert secrets.exists()
     assert signals == []
     assert dispatcher.free_gpus() == FAKE_GPUS
+    assert "the host restarted while this job was running" in paths.log_file(job_id).read_text()
+
+
+def test_a_job_queued_again_after_a_restart_is_launched_at_its_new_attempt(
+    gpuc_home: Path,
+) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    ran_before_a_restart(job_id)
+    dispatcher, spawned = make_dispatcher()
+    dispatcher.adopt_orphans()
+    dispatcher.launch_ready()
+    assert spawned[job_id].attempt == 2
+    assert jobs.read_state(job_id).status == "running"
+
+
+def test_a_job_that_keeps_restarting_its_host_is_failed_and_its_secrets_go(
+    gpuc_home: Path,
+) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    secrets = paths.job_env_file(job_id)
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text("TOKEN=x\n")
+    ran_before_a_restart(job_id, restarts=queue.MAX_RESTARTS, ran=False)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason) == ("failed", "host-restarted")
+    assert not secrets.exists()
+
+
+def test_a_job_being_cancelled_when_its_host_restarted_is_cancelled(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    ran_before_a_restart(job_id, intent=jobs.CANCEL)
+    dispatcher, _ = make_dispatcher()
+    dispatcher.adopt_orphans()
+    state = jobs.read_state(job_id)
+    assert (state.status, state.reason, state.intent) == ("cancelled", "cancelled", None)
+
+
+def test_restarts_survive_a_preempt(gpuc_home: Path) -> None:
+    job_id = queue.enqueue(make_spec(gpus=1))
+    jobs.update_state(job_id, status="running", intent=jobs.PREEMPT, restarts=2)
+    assert queue.next_attempt(job_id, ran=True) == 2
+    assert jobs.read_state(job_id).restarts == 2
 
 
 def test_an_orphan_whose_pid_was_reused_is_not_adopted(gpuc_home: Path) -> None:
