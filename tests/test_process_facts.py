@@ -193,20 +193,19 @@ def test_a_restarted_container_on_the_same_kernel_is_another_boot(
 ) -> None:
     """The kernel's boot id is the whole machine's; pid 1 is the container's."""
     monkeypatch.setattr(procinfo, "starttime", lambda pid: "4000" if pid == 1 else None)
-    kernel = procinfo.BOOT_ID_PATH.read_text().strip()
-    assert procinfo.boot_id() == f"{kernel}/4000"
-    assert procinfo.from_another_boot(f"{kernel}/3000")
-    assert not procinfo.from_another_boot(f"{kernel}/4000")
+    kernel = procinfo.boot_id()
+    assert procinfo.from_another_boot(kernel, "3000")
+    assert not procinfo.from_another_boot(kernel, "4000")
+    assert procinfo.from_another_boot("an-earlier-kernel", "4000")
 
 
-def test_a_boot_id_without_pid_1_compares_the_kernels_alone(
+def test_a_record_without_pid_1_is_judged_on_the_kernels_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A state from before pid 1 was part of it must not make an upgrade
-    requeue every running job; nor must a /proc that hides pid 1."""
-    kernel = procinfo.BOOT_ID_PATH.read_text().strip()
+    """A state an earlier build wrote must not make an upgrade requeue every
+    running job; nor must a /proc that hides pid 1."""
+    kernel = procinfo.boot_id()
     monkeypatch.setattr(procinfo, "starttime", lambda pid: "4000" if pid == 1 else None)
     assert not procinfo.from_another_boot(kernel)
-    assert procinfo.from_another_boot("an-earlier-kernel")
     monkeypatch.setattr(procinfo, "starttime", lambda pid: None)
-    assert not procinfo.from_another_boot(f"{kernel}/3000")
+    assert not procinfo.from_another_boot(kernel, "3000")

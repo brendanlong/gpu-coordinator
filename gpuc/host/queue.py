@@ -326,7 +326,9 @@ def requeue_after_restart(job_id: str) -> JobState | None:
     """
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
-        if state.status != "running" or not from_another_boot(state.runner_boot_id):
+        if state.status != "running" or not from_another_boot(
+            state.runner_boot_id, state.runner_init_start
+        ):
             return None
         preempting = state.intent == PREEMPT
         attempt = None

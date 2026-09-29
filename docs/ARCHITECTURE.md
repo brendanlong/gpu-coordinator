@@ -137,6 +137,7 @@ jobs/<jobid>/
                      #                                        # cleared when the phase ends
                      #  "isolation": "cgroup"|"pgid", "cgroup_unit": str|null,
                      #  "runner_pid": int|null, "runner_boot_id": str|null,
+                     #  "runner_init_start": str|null,         # pid 1's start time
                      #  "runner_starttime": str|null,          # the runner, from its own claim
                      #  "util_recent": [float|null, ...],
                      #  "util_sum": float, "util_samples": int,
@@ -290,9 +291,11 @@ The rules it holds to:
   alive is adopted; otherwise it is failed `runner-died`, its leftovers killed
   (`cgroup_unit`, then `pgid`) before its cards go back in the pool. Nothing
   is inferred from the process table, and an adopted job's state is not
-  written. A boot (`procs.boot_id`) is the kernel's boot id with the start
-  time of pid 1, so a container restarted on the same machine is another
-  one. A runner recorded in another boot died with the machine: its job
+  written. A boot is the kernel's boot id and the start time of pid 1
+  (`runner_init_start`, `procs.init_start`), so a container restarted on the
+  same machine is another one; the second is a field of its own, which an
+  earlier build ignores, and a record without it is judged on the first.
+  A runner recorded in another boot died with the machine: its job
   is queued again at `attempt+1` as a preempt leaves it, with `restarts` one
   higher and nothing killed (`queue.requeue_after_restart`), cancelled if a
   cancel stood, and failed `host-restarted` once `restarts` reaches

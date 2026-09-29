@@ -32,6 +32,7 @@ from gpuc.host.procs import (
     boot_id,
     cmdline,
     from_another_boot,
+    init_start,
     is_gpuc_process,
     recorded_process_alive,
     starttime,
@@ -85,6 +86,7 @@ class LockBody:
     pgid: int | None = None
     starttime: str | None = None
     boot_id: str | None = None
+    init_start: str | None = None
     pkg_commit: str | None = None
     """`config.pkg_commit` as it read when this dispatcher took the lock.
 
@@ -112,6 +114,7 @@ class LockBody:
             pgid=jobs.as_opt_int(document, "pgid"),
             starttime=jobs.as_opt_str(document, "starttime") or None,
             boot_id=jobs.as_opt_str(document, "boot_id") or None,
+            init_start=jobs.as_opt_str(document, "init_start") or None,
             pkg_commit=jobs.as_opt_str(document, "pkg_commit") or None,
         )
 
@@ -297,7 +300,7 @@ class DispatcherLock:
         if body.pid is None:
             log_line("lock is held by a dispatcher that records no pid; signalling nothing")
             return None
-        if not recorded_process_alive(body.pid, body.boot_id, body.starttime):
+        if not recorded_process_alive(body.pid, body.boot_id, body.starttime, body.init_start):
             log_line(f"lock holder pid {body.pid} is gone; taking over")
             return None
         if not is_gpuc_process(body.pid):
@@ -355,6 +358,7 @@ class DispatcherLock:
             pgid=pgid if pgid == pid else None,
             starttime=starttime(pid),
             boot_id=boot_id(),
+            init_start=init_start(),
             pkg_commit=self.pkg_commit,
         )
         os.ftruncate(fd, 0)
@@ -525,6 +529,7 @@ class _Running:
     runner_pid: int | None = None
     runner_boot_id: str | None = None
     runner_starttime: str | None = None
+    runner_init_start: str | None = None
 
     @staticmethod
     def adopted(job_id: str, state: jobs.JobState) -> _Running:
@@ -535,6 +540,7 @@ class _Running:
             runner_pid=state.runner_pid,
             runner_boot_id=state.runner_boot_id,
             runner_starttime=state.runner_starttime,
+            runner_init_start=state.runner_init_start,
         )
 
     def alive(self) -> bool:
@@ -543,7 +549,9 @@ class _Running:
         reused within a boot and from 1 again after one."""
         if self.popen is not None:
             return self.popen.poll() is None
-        return recorded_process_alive(self.runner_pid, self.runner_boot_id, self.runner_starttime)
+        return recorded_process_alive(
+            self.runner_pid, self.runner_boot_id, self.runner_starttime, self.runner_init_start
+        )
 
 
 @dataclass
@@ -666,11 +674,14 @@ class Dispatcher:
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
-            if from_another_boot(state.runner_boot_id):
+            if from_another_boot(state.runner_boot_id, state.runner_init_start):
                 self._requeue_after_restart(job_id)
                 continue
             if recorded_process_alive(
-                state.runner_pid, state.runner_boot_id, state.runner_starttime
+                state.runner_pid,
+                state.runner_boot_id,
+                state.runner_starttime,
+                state.runner_init_start,
             ):
                 self.running[job_id] = _Running.adopted(job_id, state)
                 self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
@@ -786,7 +797,7 @@ class Dispatcher:
             return
         ours = entry.popen.pid if entry.popen is not None else entry.runner_pid
         if state.runner_pid != ours and recorded_process_alive(
-            state.runner_pid, state.runner_boot_id, state.runner_starttime
+            state.runner_pid, state.runner_boot_id, state.runner_starttime, state.runner_init_start
         ):
             self.running[job_id] = _Running.adopted(job_id, state)
             self.log(f"job {job_id} is running under runner pid {state.runner_pid}; adopted")

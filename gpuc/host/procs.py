@@ -30,21 +30,25 @@ BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 
 def boot_id() -> str | None:
-    """This boot, as `<kernel boot id>/<start time of pid 1>`.
-
-    The kernel's id alone is shared by every container on a machine, and a
-    container that restarts starts a new pid namespace in which the pids an
-    earlier one recorded belong to other processes -- a pod's restart is a
-    reboot as far as any recorded pid is concerned. Pid 1 starts afresh with
-    each container and never moves on a machine's own init. The kernel's id
-    alone where pid 1 cannot be read (a `hidepid` /proc).
-    """
+    """The kernel's boot id. Half of what makes a boot: see `init_start`."""
     try:
-        kernel = BOOT_ID_PATH.read_text().strip() or None
+        return BOOT_ID_PATH.read_text().strip() or None
     except OSError:
         return None
-    init = starttime(1)
-    return f"{kernel}/{init}" if kernel and init else kernel
+
+
+def init_start() -> str | None:
+    """The start time of pid 1, the other half of a boot.
+
+    Every container on a machine shares the kernel's boot id, and one that
+    restarts starts a new pid namespace in which the pids an earlier one
+    recorded belong to other processes: a pod's restart is a reboot as far as
+    a recorded pid is concerned. Pid 1 starts afresh with each container and
+    never moves on a machine's own init. Recorded beside the boot id, not
+    folded into it, because an earlier build compares boot ids exactly and
+    ignores a field it does not know. None where /proc hides pid 1.
+    """
+    return starttime(1)
 
 
 def parse_starttime(stat: str) -> str | None:
@@ -93,27 +97,30 @@ def is_gpuc_process(pid: int) -> bool:
     return "gpuc.host" in cmdline(pid)
 
 
-def from_another_boot(recorded_boot_id: str | None) -> bool:
-    """Was this recorded in another boot (see `boot_id`)? Only a boot id
-    recorded *and* readable now *and* different says so: not knowing is not
-    evidence of a reboot. Where either side is the kernel's id alone -- a
-    record from before pid 1 was part of it, or a /proc that hides pid 1 --
-    the kernel's ids are compared, so an upgrade adopts the jobs it finds."""
+def from_another_boot(recorded_boot_id: str | None, recorded_init_start: str | None = None) -> bool:
+    """Was this recorded in another boot, of the machine or of the container
+    (see `init_start`)? Only a value recorded *and* readable now *and*
+    different says so: not knowing is not evidence of a reboot, so a record
+    from a build that kept no `init_start` is judged on the kernel's id."""
     current = boot_id()
     if not recorded_boot_id or not current:
         return False
-    if "/" not in recorded_boot_id or "/" not in current:
-        return recorded_boot_id.split("/")[0] != current.split("/")[0]
-    return recorded_boot_id != current
+    if recorded_boot_id != current:
+        return True
+    now = init_start()
+    return bool(recorded_init_start and now and recorded_init_start != now)
 
 
 def recorded_process_alive(
-    pid: int | None, recorded_boot_id: str | None = None, recorded_starttime: str | None = None
+    pid: int | None,
+    recorded_boot_id: str | None = None,
+    recorded_starttime: str | None = None,
+    recorded_init_start: str | None = None,
 ) -> bool:
     """Is the *same* process we recorded still running?"""
     if not pid or not pid_alive(pid):
         return False
-    if from_another_boot(recorded_boot_id):
+    if from_another_boot(recorded_boot_id, recorded_init_start):
         return False
     current_start = starttime(pid)
     return not (recorded_starttime and current_start and recorded_starttime != current_start)
@@ -166,7 +173,7 @@ class JobProcesses:
         hold that number now, and adoption after a reboot SIGKILLed exactly
         that. The same identity rule as `recorded_process_alive`.
         """
-        if from_another_boot(state.runner_boot_id):
+        if from_another_boot(state.runner_boot_id, state.runner_init_start):
             return JobProcesses()
         return JobProcesses(state.cgroup_unit, state.pgid or None, state.runner_pid)
 

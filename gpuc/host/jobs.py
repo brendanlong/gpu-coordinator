@@ -501,6 +501,8 @@ class JobState:
     compare-and-set that takes the job out of the queue, so a `running` state
     always names a runner that existed."""
     runner_boot_id: str | None = None
+    runner_init_start: str | None = None
+    """See `procs.init_start`: with the boot id, which container's boot."""
     runner_starttime: str | None = None
     util_recent: list[float | None] = field(default_factory=list)
     util_sum: float = 0.0
@@ -602,6 +604,7 @@ class JobState:
             cgroup_unit=as_opt_str(fields, "cgroup_unit"),
             runner_pid=as_opt_int(fields, "runner_pid"),
             runner_boot_id=as_opt_str(fields, "runner_boot_id"),
+            runner_init_start=as_opt_str(fields, "runner_init_start"),
             runner_starttime=as_opt_str(fields, "runner_starttime"),
             util_recent=as_opt_float_list(fields, "util_recent"),
             util_sum=as_float(fields, "util_sum", 0.0),
