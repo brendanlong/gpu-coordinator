@@ -55,6 +55,7 @@ from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import (
     DEFAULT_IMAGE,
     Constraints,
+    CreateRefused,
     Offer,
     Pod,
     Provider,
@@ -77,6 +78,7 @@ CEILING_MINUTES = 15.0
 host, every offer it tries included. Per attempt, not per offer: with N
 offers a per-offer ceiling was N x 15 minutes of somebody's evening."""
 POLL_INTERVAL_S = 5.0
+CREATE_SWEEP_POLLS = 6
 SSH_MAX_INTERVAL_S = 15.0
 LOG_CHECK_INTERVAL_S = 30.0
 SSH_REPORT_INTERVAL_S = 60.0
@@ -320,14 +322,31 @@ def _try_offer(
         f"creating {name}: {_label(offer)} x{constraints.gpu_count}, disk {disk_gb}GB, "
         f"cuda>={constraints.cuda_min}, image {image}"
     )
-    pod = provider.create(
-        offer,
-        name,
-        image=image,
-        disk_gb=disk_gb,
-        cuda_min=constraints.cuda_min,
-        gpu_count=constraints.gpu_count,
-    )
+    try:
+        pod = provider.create(
+            offer,
+            name,
+            image=image,
+            disk_gb=disk_gb,
+            cuda_min=constraints.cuda_min,
+            gpu_count=constraints.gpu_count,
+        )
+    except CreateRefused:
+        raise
+    except BaseException as exc:
+        try:
+            settled = _sweep_failed_create(
+                provider, name, progress, deps, _first_line(exc), billing
+            )
+        except KeyboardInterrupt:
+            progress(f"WARNING: interrupted while looking for {name}; it may be billing")
+            billing.append(f"{name} (id unknown)")
+            raise
+        if not settled and isinstance(exc, Exception):
+            raise Unprovisionable(
+                f"{name} may still be billing, so no other pod is bought: {_first_line(exc)}"
+            ) from exc
+        raise
     created_at = utc_now()
     progress(
         f"pod {pod.id} created ({pod.status}); {_left(deadline, deps):.0f}s of the ceiling left"
@@ -435,6 +454,46 @@ def _abandon(
     progress(f"{name} terminated and confirmed gone")
     forget_host(name, pod_id, progress)
     return True
+
+
+def _sweep_failed_create(
+    provider: Provider,
+    name: str,
+    progress: _Progress,
+    deps: ProvisionDeps,
+    reason: str,
+    billing: list[str],
+) -> bool:
+    """A create that failed without the provider refusing it -- a timeout, a
+    5xx, a response that did not parse, a Ctrl-C -- may have bought a pod
+    anyway, and moving on to the next offer would bill for both. The name is
+    unique to this attempt, so any pod listed under it is this create's. It
+    is looked for a little while, since a create still in flight when the
+    connection dropped can land after the error. False if a pod may still
+    be billing, and buying another would double it."""
+    progress(f"create of {name} failed ({reason}); checking whether a pod was made anyway")
+    listed = False
+    for poll in range(CREATE_SWEEP_POLLS):
+        if poll:
+            deps.sleep(deps.poll_interval_s)
+        try:
+            pods = provider.list_ours()
+        except ProviderError as exc:
+            progress(f"could not list pods to look for {name}: {_first_line(exc)}")
+            continue
+        listed = True
+        found = [pod for pod in pods if pod.name == name and not provider.is_gone(pod)]
+        for pod in found:
+            if not _abandon(provider, name, pod.id, progress, deps, "its create failed"):
+                billing.append(pod.id)
+        if found:
+            return not any(pod.id in billing for pod in found)
+    if listed:
+        progress(f"no pod named {name} appeared; the create made nothing")
+        return True
+    progress(f"WARNING: could not ask whether {name} was created; it may be billing")
+    billing.append(f"{name} (id unknown)")
+    return False
 
 
 def _poll_failure(exc: Exception, what: str, progress: _Progress) -> None:

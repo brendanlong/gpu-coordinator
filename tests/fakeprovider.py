@@ -19,6 +19,7 @@ from gpuc.control.providers.base import (
     DEFAULT_PREFIX,
     Cloud,
     Constraints,
+    CreateRefused,
     Offer,
     Pod,
     PodStatus,
@@ -59,6 +60,10 @@ class PodScript:
     ssh_after_polls: int = 1
     log_text: str = ""
     create_error: str | None = None
+    lost_create: BaseException | None = None
+    """Raised by `create` after the pod was made: an answer lost on the way back."""
+    hidden_for_lists: int = 0
+    """How many `list` calls miss a pod whose create was lost."""
     status_after_polls: dict[int, PodStatus] = field(default_factory=dict)
     cuda_version: str = "12.8"
 
@@ -89,6 +94,8 @@ class FakeProvider(Provider):
         self._ids = itertools.count(1)
         self._pods: dict[str, _FakePod] = {}
         self.foreign = list(existing or [])
+        self._hidden: dict[str, int] = {}
+        self.list_error: ProviderError | None = None
         self.created: list[dict[str, Any]] = []
         self.terminated: list[str] = []
         self.registered_keys: list[str] = []
@@ -138,7 +145,7 @@ class FakeProvider(Provider):
             }
         )
         if script.create_error:
-            raise ProviderError(f"{script.create_error} ({offer.gpu_id})")
+            raise CreateRefused(f"{script.create_error} ({offer.gpu_id})")
         pod = Pod(
             id=f"pod{next(self._ids)}",
             name=name,
@@ -150,6 +157,9 @@ class FakeProvider(Provider):
             created_at=datetime.now(UTC),
         )
         self._pods[pod.id] = _FakePod(pod=pod, script=script)
+        if script.lost_create is not None:
+            self._hidden[pod.id] = script.hidden_for_lists
+            raise script.lost_create
         return pod
 
     def get(self, pod_id: str) -> Pod | None:
@@ -186,7 +196,12 @@ class FakeProvider(Provider):
         entry.pod = entry.pod.model_copy(update={"status": "TERMINATED"})
 
     def list(self) -> list[Pod]:
-        return [entry.pod for entry in self._pods.values()] + list(self.foreign)
+        if self.list_error is not None:
+            raise self.list_error
+        visible = [e.pod for e in self._pods.values() if self._hidden.get(e.pod.id, 0) <= 0]
+        for pod_id in self._hidden:
+            self._hidden[pod_id] -= 1
+        return visible + list(self.foreign)
 
     def ensure_ssh_key(self, public_key: str) -> bool:
         if public_key in self.registered_keys:
