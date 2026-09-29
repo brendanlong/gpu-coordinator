@@ -30,10 +30,21 @@ BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 
 def boot_id() -> str | None:
+    """This boot, as `<kernel boot id>/<start time of pid 1>`.
+
+    The kernel's id alone is shared by every container on a machine, and a
+    container that restarts starts a new pid namespace in which the pids an
+    earlier one recorded belong to other processes -- a pod's restart is a
+    reboot as far as any recorded pid is concerned. Pid 1 starts afresh with
+    each container and never moves on a machine's own init. The kernel's id
+    alone where pid 1 cannot be read (a `hidepid` /proc).
+    """
     try:
-        return BOOT_ID_PATH.read_text().strip() or None
+        kernel = BOOT_ID_PATH.read_text().strip() or None
     except OSError:
         return None
+    init = starttime(1)
+    return f"{kernel}/{init}" if kernel and init else kernel
 
 
 def parse_starttime(stat: str) -> str | None:
@@ -83,11 +94,17 @@ def is_gpuc_process(pid: int) -> bool:
 
 
 def from_another_boot(recorded_boot_id: str | None) -> bool:
-    """Was this recorded in an earlier boot of this machine? Only a boot id
+    """Was this recorded in another boot (see `boot_id`)? Only a boot id
     recorded *and* readable now *and* different says so: not knowing is not
-    evidence of a reboot."""
+    evidence of a reboot. Where either side is the kernel's id alone -- a
+    record from before pid 1 was part of it, or a /proc that hides pid 1 --
+    the kernel's ids are compared, so an upgrade adopts the jobs it finds."""
     current = boot_id()
-    return bool(recorded_boot_id and current and recorded_boot_id != current)
+    if not recorded_boot_id or not current:
+        return False
+    if "/" not in recorded_boot_id or "/" not in current:
+        return recorded_boot_id.split("/")[0] != current.split("/")[0]
+    return recorded_boot_id != current
 
 
 def recorded_process_alive(

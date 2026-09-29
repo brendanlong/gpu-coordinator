@@ -290,7 +290,9 @@ The rules it holds to:
   alive is adopted; otherwise it is failed `runner-died`, its leftovers killed
   (`cgroup_unit`, then `pgid`) before its cards go back in the pool. Nothing
   is inferred from the process table, and an adopted job's state is not
-  written. A runner recorded in another boot died with the machine: its job
+  written. A boot (`procs.boot_id`) is the kernel's boot id with the start
+  time of pid 1, so a container restarted on the same machine is another
+  one. A runner recorded in another boot died with the machine: its job
   is queued again at `attempt+1` as a preempt leaves it, with `restarts` one
   higher and nothing killed (`queue.requeue_after_restart`), cancelled if a
   cancel stood, and failed `host-restarted` once `restarts` reaches
