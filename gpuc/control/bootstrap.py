@@ -404,8 +404,9 @@ def resolve_cache_dir(session: HostSession, report: Reporter) -> str | None:
     /workspace/...`) that costs the full size of every venv -- ~6.5 GB for
     torch -- written to the slowest disk the host has, on every single job.
 
-    The rule is one comparison and nothing cleverer: if gpuc home and uv's
-    cache are on different filesystems, move the cache next to gpuc home. A
+    The rule is one comparison and nothing cleverer: if the workdirs (gpuc
+    home, or scratch on a host with one) and uv's cache are on different
+    filesystems, move the cache next to them. A
     cache the host's config already names is never overridden, however it got
     there (`--cache-dir`, `--env UV_CACHE_DIR=...`, or an earlier bootstrap):
     this is the one key bootstrap fills in itself, and only when it is empty.
@@ -422,7 +423,8 @@ def resolve_cache_dir(session: HostSession, report: Reporter) -> str | None:
         )
         return None
     cache, shared = placement.get("dir"), placement.get("shares_gpuc_home_fs")
-    home = session.home
+    # Where the venvs are built: gpuc home, or scratch on a host with one.
+    home = placement.get("gpuc_home") or session.home
     if not cache or shared is None:
         report(f"uv cache: {cache or 'unknown'} (could not compare filesystems; left alone)")
         return None
@@ -431,8 +433,9 @@ def resolve_cache_dir(session: HostSession, report: Reporter) -> str | None:
         return None
     target = cache_beside(home, "uv")
     report(
-        f"uv cache: {cache} is on a different filesystem from gpuc home {home}, so uv would "
-        f"copy every wheel into every venv. Setting UV_CACHE_DIR={target} for this host."
+        f"uv cache: {cache} is on a different filesystem from the workdirs under {home}, "
+        f"so uv would copy every wheel into every venv. Setting UV_CACHE_DIR={target} for "
+        f"this host."
     )
     return target
 

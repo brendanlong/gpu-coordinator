@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from gpuc.host import (
+    checkout,
     cleanup,
     dispatcher,
     fetch,
@@ -38,6 +39,12 @@ def _read_json_object(source: str, what: str) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise SystemExit(f"{what} must be a JSON object")
     return document
+
+
+def cmd_archive_checkout(args: argparse.Namespace) -> int:
+    archived = checkout.archive_staged(args.job_id)
+    print(json.dumps({"job_id": args.job_id, "archive": str(archived)}))
+    return 0
 
 
 def cmd_enqueue(args: argparse.Namespace) -> int:
@@ -558,6 +565,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m gpuc.host")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    archive = sub.add_parser(
+        "archive-checkout", help="archive a staged job's workdir for a host with scratch"
+    )
+    archive.add_argument("job_id")
+    archive.set_defaults(func=cmd_archive_checkout)
     enqueue = sub.add_parser("enqueue", help="enqueue a JSON JobSpec and start the dispatcher")
     enqueue.add_argument("spec", help="path to a JSON spec, or - for stdin")
     enqueue.set_defaults(func=cmd_enqueue)

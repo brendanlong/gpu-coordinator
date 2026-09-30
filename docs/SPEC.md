@@ -125,6 +125,9 @@ destinations. Adding another of either changes nothing else in this document.
   untracked and uncommitted changes. The checkout is code, not data: a job
   fetches datasets itself, and may keep them in the host's data directory for
   the jobs after it. Nothing empties the data directory except a person.
+- A host may keep workdirs on scratch that a restart can wipe, apart from
+  its queue. A job's checkout as submitted is kept with the queue, so the job
+  still runs after scratch is wiped.
 - **Checks happen as early as they can.** At submit: the spec is valid, every
   secret it names is present, and its GPU count fits the host. At job start,
   before the main phase: its GPUs work inside the job's own environment, and
@@ -136,8 +139,8 @@ destinations. Adding another of either changes nothing else in this document.
   run, not only at the end, and so are logs. Files that were already in the
   checkout are never uploaded as results. Every output location includes the
   job id, so runs never overwrite each other.
-- **Kept outputs stay on their host until a person removes them.** A rental
-  refuses them at submit.
+- **Kept outputs stay on their host until a person removes them.** A rental,
+  and a host that keeps workdirs on scratch, refuse them at submit.
 - On success, uploads finish and the checkout is deleted; kept outputs stay
   where the job wrote them. On failure or cancellation the checkout is kept
   for a configurable period. A rental's shutdown

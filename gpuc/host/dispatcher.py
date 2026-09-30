@@ -1505,6 +1505,7 @@ class Dispatcher:
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
         self._config = jobs.read_config()
+        paths.follow_scratch(self._config.env)
         self._cards = None
         self._borrowable = None
         self._queued = None

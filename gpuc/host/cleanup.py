@@ -334,8 +334,11 @@ def workdir_size(job_id: str) -> int | None:
     kept outputs it would leave. None if there is no checkout left."""
     if not has_checkout(job_id):
         return None
+    archived = _file_bytes(paths.checkout_archive(job_id))
+    if not paths.workdir(job_id).is_dir():
+        return archived
     root, keep = kept_paths(job_id)
-    return max(reclaimable_bytes(root) - kept_bytes(root, keep), 0)
+    return max(reclaimable_bytes(root) - kept_bytes(root, keep), 0) + archived
 
 
 def kept_paths(job_id: str) -> tuple[Path, set[Path]]:
@@ -373,9 +376,11 @@ def has_checkout(job_id: str, state: JobState | None = None) -> bool:
     """Is there still a checkout in this job's workdir for a sweep to take?
 
     Not the same as the workdir existing: one that holds kept outputs outlives
-    the sweep that took the checkout around them."""
+    the sweep that took the checkout around them, and on a host with scratch
+    the archived checkout is the checkout until the sweep takes it too, even
+    once a restart has taken the workdir."""
     if not paths.workdir(job_id).is_dir():
-        return False
+        return paths.checkout_archive(job_id).is_file()
     if state is None:
         try:
             state = jobs.read_state(job_id)
@@ -486,6 +491,11 @@ def reported_workdir_bytes(
     """
     if not has_checkout(job_id, state):
         return 0
+    if not paths.workdir(job_id).is_dir():
+        # Scratch was wiped under a finished job: what is left is the
+        # archive, and the figure recorded for the whole workdir would
+        # advertise disk no clean can free.
+        return _file_bytes(paths.checkout_archive(job_id))
     recorded = state.workdir_bytes
     if recorded is not None:
         return recorded
@@ -495,8 +505,8 @@ def reported_workdir_bytes(
 
 
 def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
-    """Delete the checkout in `jobs/<id>/workdir`, and nothing else. Returns
-    the bytes freed.
+    """Delete the checkout -- the workdir and, on a host with scratch, the
+    archive beside the spec -- and nothing else. Returns the bytes freed.
 
     The whole workdir when the job keeps no outputs. Otherwise everything but
     the kept output paths, which stay exactly where the job wrote them, so a
@@ -509,9 +519,16 @@ def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
     """
     if not has_checkout(job_id):
         return 0
+    archived = paths.checkout_archive(job_id)
+    archived_bytes = _file_bytes(archived)
+    archived.unlink(missing_ok=True)
+    if not paths.workdir(job_id).is_dir():
+        return archived_bytes
     root, keep = kept_paths(job_id)
     held = kept_bytes(root, keep) if keep else 0
-    size = max(reclaimable_bytes(root) - held, 0) if measured is None else measured
+    if measured is None:
+        measured = max(reclaimable_bytes(root) - held, 0) + archived_bytes
+    size = measured
     if not keep:
         shutil.rmtree(paths.workdir(job_id))
         return size
@@ -953,7 +970,7 @@ def purge_candidates(
             Candidate.of(
                 state,
                 job_id=job_id,
-                bytes=reclaimable_bytes(paths.job_dir(job_id)),
+                bytes=job_dir_bytes(job_id),
                 age_days=age_days,
                 forced=forced,
             )
@@ -961,8 +978,22 @@ def purge_candidates(
     return picked, skipped
 
 
+def job_dir_bytes(job_id: str) -> int:
+    """What purging the job frees: its dir, and its workdir when that is on
+    scratch rather than inside it."""
+    total = reclaimable_bytes(paths.job_dir(job_id))
+    workdir = paths.workdir(job_id)
+    if workdir.is_dir() and not workdir.is_relative_to(paths.job_dir(job_id)):
+        total += reclaimable_bytes(workdir)
+    return total
+
+
 def remove_job_dir(job_id: str) -> None:
-    """Delete `jobs/<id>/` and every stray trace of the job."""
+    """Delete `jobs/<id>/` and every stray trace of the job, its workdir on
+    scratch included."""
+    for leftover in (paths.workdir(job_id), paths.partial_workdir(job_id)):
+        if leftover.is_dir():
+            shutil.rmtree(leftover)
     directory = paths.job_dir(job_id)
     if directory.is_dir():
         shutil.rmtree(directory)

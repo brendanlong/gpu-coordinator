@@ -201,3 +201,16 @@ def test_an_unknown_target_is_exit_four(
 ) -> None:
     assert main(["ssh", "nope"]) == EXIT_NOT_FOUND
     assert "no registered host knows job" in capsys.readouterr().err
+
+
+def test_a_job_on_a_host_with_scratch_lands_in_its_workdir_there(
+    control_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    register_host(
+        name="gpubox", kind="ssh", ssh="me@box", gpus=GPU, env={"GPUC_SCRATCH_DIR": "~/scratch"}
+    )
+    capsys.readouterr()
+    assert main(["ssh", "--host", "gpubox", JOB, "--print"]) == EXIT_OK
+    line = capsys.readouterr().out
+    assert f"$HOME/scratch/{JOB}" in line
+    assert f"jobs/{JOB}" in line

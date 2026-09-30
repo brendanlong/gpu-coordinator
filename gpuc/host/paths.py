@@ -44,6 +44,41 @@ def data_dir(environ: Mapping[str, str] | None = None) -> Path:
     return Path(override).expanduser() if override else home() / "data"
 
 
+def scratch_dir(environ: Mapping[str, str] | None = None) -> Path | None:
+    """Where workdirs live, if not in each job dir: `GPUC_SCRATCH_DIR` from
+    the host's `env`.
+
+    For a host whose gpuc home is on a volume that survives restarts but is
+    too slow, or too small, for checkouts and their venvs. The queue stays on
+    gpuc home; a restart that wipes scratch costs each job its workdir, which
+    `checkout.restore` unpacks again from the job's archive.
+    """
+    environ = os.environ if environ is None else environ
+    override = environ.get("GPUC_SCRATCH_DIR")
+    return Path(override).expanduser() if override else None
+
+
+def follow_scratch(host_env: Mapping[str, str]) -> None:
+    """Make this process's scratch the host config's.
+
+    Every process gpuc starts on a host gets the config's `env`, and reads
+    scratch from its own environment. The dispatcher alone lives across a
+    `gpuc host set --scratch-dir`: a rental's never exits while it is idle,
+    and it sweeps workdirs and drains outputs, so it re-reads the config every
+    pass and follows it here.
+    """
+    value = host_env.get("GPUC_SCRATCH_DIR")
+    if value:
+        os.environ["GPUC_SCRATCH_DIR"] = value
+    else:
+        os.environ.pop("GPUC_SCRATCH_DIR", None)
+
+
+def workdirs_root(environ: Mapping[str, str] | None = None) -> Path:
+    """Where jobs' workdirs, and so their venvs, are written."""
+    return scratch_dir(environ) or home()
+
+
 def path_with_user_bins(environ: Mapping[str, str] | None = None, extra: Sequence[str] = ()) -> str:
     """``PATH`` with ``extra`` then the $HOME tool dirs in front, no duplicates.
 
@@ -124,7 +159,26 @@ def log_file(job_id: str) -> Path:
 
 
 def workdir(job_id: str) -> Path:
-    return job_dir(job_id) / "workdir"
+    """`jobs/<id>/workdir`, or `<scratch>/<id>` on a host with scratch.
+
+    A workdir already in the job dir stays the answer after scratch is
+    configured, so the jobs from before it are still found where they are.
+    """
+    in_job_dir = job_dir(job_id) / "workdir"
+    scratch = scratch_dir()
+    if scratch is None or in_job_dir.exists():
+        return in_job_dir
+    return scratch / job_id
+
+
+def checkout_archive(job_id: str) -> Path:
+    """The checkout as submitted, kept only on a host with scratch."""
+    return job_dir(job_id) / "checkout.tar.gz"
+
+
+def partial_workdir(job_id: str) -> Path:
+    """Where a checkout is unpacked before it is renamed into `workdir`."""
+    return workdir(job_id).with_name(f".{job_id}.partial")
 
 
 def outputs_dir(job_id: str) -> Path:

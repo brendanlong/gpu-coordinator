@@ -200,11 +200,23 @@ def _config_fields(args: argparse.Namespace) -> dict[str, Any]:
     return fields
 
 
+SCRATCH_DIR_HELP = (
+    "keep jobs' workdirs (checkout and venv) here instead of in gpuc home "
+    "(GPUC_SCRATCH_DIR): for a persistent root too slow or small for them. A restart "
+    "may wipe it; each job's checkout is archived in gpuc home and unpacked again. "
+    "Refuses jobs with kept outputs"
+)
+
+
 def _env_updates(args: argparse.Namespace) -> dict[str, str | None]:
-    """`--cache-dir`: one variable of the host's env, resolved against the host."""
-    if args.cache_dir is None:
-        return {}
-    return {"UV_CACHE_DIR": args.cache_dir or None}
+    """`--cache-dir` and `--scratch-dir`: one variable of the host's env each,
+    resolved against the host."""
+    updates: dict[str, str | None] = {}
+    if args.cache_dir is not None:
+        updates["UV_CACHE_DIR"] = args.cache_dir or None
+    if args.scratch_dir is not None:
+        updates["GPUC_SCRATCH_DIR"] = args.scratch_dir or None
+    return updates
 
 
 def cmd_host_add(args: argparse.Namespace) -> Answer:
@@ -263,6 +275,7 @@ _SET_FIELDS = (
     "gpuc_home",
     "env",
     "cache_dir",
+    "scratch_dir",
     "s3_prefix",
     "retention_days",
     "workdir_days",
@@ -663,7 +676,14 @@ def ssh_target(args: argparse.Namespace, settings: Settings) -> tuple[HostEntry,
         else locate(args.target, registry, None, settings, skipped=read.skipped).require_entry()
     )
     job_dir = f"{entry.remote_home}/jobs/{args.target}"
-    return entry, f"{job_dir}/workdir", job_dir
+    # Where the registry last saw the host keep workdirs. `~` is the one
+    # expansion the double-quoted `cd` would not do.
+    scratch = entry.config.env.get("GPUC_SCRATCH_DIR")
+    if not scratch:
+        return entry, f"{job_dir}/workdir", job_dir
+    if scratch.startswith("~/"):
+        scratch = f"$HOME/{scratch[2:]}"
+    return entry, f"{scratch}/{args.target}", job_dir
 
 
 def cmd_ssh(args: argparse.Namespace) -> Answer:
@@ -1117,9 +1137,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add.add_argument(
         "--cache-dir",
-        help="uv cache for this host (UV_CACHE_DIR); bootstrap picks one on gpuc home's "
+        help="uv cache for this host (UV_CACHE_DIR); bootstrap picks one on the workdirs' "
         "filesystem when they differ",
     )
+    add.add_argument("--scratch-dir", help=SCRATCH_DIR_HELP)
     add.add_argument("--s3-prefix", help="s3://bucket/prefix for log and state mirroring")
     add.add_argument(
         "--retention-days",
@@ -1186,6 +1207,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     edit.add_argument(
         "--cache-dir", help="pin UV_CACHE_DIR in the host's env; pass '' to let bootstrap decide"
+    )
+    edit.add_argument(
+        "--scratch-dir",
+        help=f"{SCRATCH_DIR_HELP}; pass '' to put workdirs back in each job dir. Change it "
+        f"only while nothing is queued or running",
     )
     edit.add_argument("--s3-prefix", help="pass '' to stop mirroring")
     edit.add_argument(
@@ -1453,8 +1479,8 @@ def build_parser() -> argparse.ArgumentParser:
         "ssh",
         help="a shell on a host, or in a job's workdir; or one command there",
         description="A host name lands in that host's gpuc home. A job id lands in that "
-        "job's workdir/, falling back to the job dir itself when the workdir has been "
-        "cleaned away (the log and state are still there).",
+        "job's workdir (on scratch, for a host with one), falling back to the job dir "
+        "itself when the workdir has been cleaned away (the log and state are still there).",
     )
     ssh.add_argument("target", help="a registered host name, or a job id")
     ssh.add_argument("--host", help="which host a job id is on, if it is ambiguous")

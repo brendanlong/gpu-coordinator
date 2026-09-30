@@ -163,3 +163,13 @@ persistent root the queue then carries on, and the jobs that were running are
 queued again and restart from the beginning. Without one, `gpuc status --host
 <host> --all` lists what was there and, run from the project's directory,
 `gpuc requeue <job-id>` resubmits each (this needs `s3_bucket`).
+
+If the persistent volume is slow or small, keep jobs' workdirs (checkouts and
+venvs) on local disk instead; the queue stays on the persistent root:
+
+```sh
+gpuc host set gpubox --scratch-dir '~/gpuc-scratch' --cache-dir '' && gpuc host bootstrap gpubox
+```
+
+Such a host refuses outputs with no `s3` or `hf` destination, since a restart
+may wipe them.
