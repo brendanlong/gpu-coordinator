@@ -809,3 +809,18 @@ def test_cancel_of_a_job_whose_state_cannot_be_read_is_a_refusal_not_a_traceback
     code, payload = verb(capsys, "cancel", job_id)
     assert code == 1
     assert payload["job_id"] == job_id and "error" in payload and "missing" not in payload
+
+
+def test_status_names_another_machine_only_while_it_renews(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import os
+    import time
+
+    jobs.atomic_write_json(paths.owner_file(), {"instance": "x/1", "host": "other-pod"})
+    _, payload = run(capsys, "status")
+    assert isinstance(payload, dict) and payload["served_by"] == "other-pod"
+    stale = time.time() - 120
+    os.utime(paths.owner_file(), (stale, stale))
+    _, payload = run(capsys, "status")
+    assert isinstance(payload, dict) and payload["served_by"] is None

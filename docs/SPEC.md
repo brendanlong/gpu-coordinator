@@ -78,6 +78,9 @@ destinations. Adding another of either changes nothing else in this document.
 - **Any client whose SSH key reaches a host can drive it, without conflict**,
   and sees the same queue, jobs and configuration. Nothing about the client that set the host up
   matters afterwards, including for a rental another machine rented.
+- A queue that outlives its machine is served by one machine at a time.
+  Another takes it over only once that one has gone quiet, and a machine
+  that finds its queue taken over stops, killing what it was running.
 - The client's record of a host is an address plus a cache. Anything that
   decides something asks the host; output from the cache is labelled with its
   age.

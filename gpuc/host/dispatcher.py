@@ -23,7 +23,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from gpuc._version import is_other_build
-from gpuc.host import baseline, cleanup, gpus, jobs, paths, plan, queue, scope, sync, terminate
+from gpuc.host import (
+    baseline,
+    cleanup,
+    gpus,
+    jobs,
+    owner,
+    paths,
+    plan,
+    queue,
+    scope,
+    sync,
+    terminate,
+)
 from gpuc.host.gpus import SmiRunner
 from gpuc.host.jobs import Outcome
 from gpuc.host.procs import (
@@ -40,6 +52,11 @@ from gpuc.host.procs import (
 from gpuc.host.terminate import TerminateCall
 
 HEARTBEAT_INTERVAL_S = 5.0
+REQUEUE_SCAN_S = 30.0
+REQUEUE_WINDOW_S = 600.0
+"""How long after a takeover to keep looking for jobs the old machine
+claimed late: its runners check the owner record every few seconds and
+before every claim, so anything it could still claim is long settled."""
 HEARTBEAT_STALE_S = 30.0
 LOOP_INTERVAL_S = 2.0
 SYNC_STOP_PATIENCE_S = 1800.0
@@ -180,6 +197,9 @@ class DispatcherLock:
         self._beat_stop = threading.Event()
         self._beat_thread: threading.Thread | None = None
         self.pkg_commit = running_pkg_commit()
+        self.owner: str | None = None
+        """The instance whose `owner.json` claim each beat renews, once the
+        dispatcher has made one."""
 
     def holder_is_fresh(self) -> bool:
         age = heartbeat_age(self._now)
@@ -375,6 +395,8 @@ class DispatcherLock:
         beat.parent.mkdir(parents=True, exist_ok=True)
         beat.touch()
         os.utime(beat, (now, now))
+        if self.owner is not None:
+            owner.renew(self.owner)
 
     def start_heartbeat(self) -> None:
         """Beat from a thread, so a long drain or final sync in the main loop
@@ -562,6 +584,12 @@ class Dispatcher:
     _terminate_retry_at: float | None = None
     _last_reclaim_at: float | None = None
     _last_incoming_sweep_at: float | None = None
+    instance: str = field(default_factory=owner.instance)
+    """This machine as `owner.json` names it, taken once: see `owner.instance`."""
+    replaced: str | None = None
+    """The instance that took this queue over, once one has."""
+    _last_requeue_scan: float | None = None
+    _requeue_until: float | None = None
     _stop_sent: dict[str, float] = field(default_factory=dict)
     """When this dispatcher first saw each running job's stop intent, so the
     ladder in `escalate_stops` has a clock even for a request another process
@@ -636,6 +664,8 @@ class Dispatcher:
         request this host can never meet, a runner that could not be spawned.
         The listing forgets the job with it, and its secrets go: the runner
         that would have deleted them will never exist."""
+        if self._stand_down_if_replaced():
+            return
         try:
             written = jobs.finish(job_id, Outcome("failed", reason, ran=False), expect="queued")
         except RuntimeError as exc:
@@ -691,6 +721,8 @@ class Dispatcher:
     def _requeue_after_restart(self, job_id: str) -> None:
         """Queue again, or end, a job whose runner the last boot took with it;
         an ended one's secrets go as for any job ended without its runner."""
+        if self._stand_down_if_replaced():
+            return
         try:
             written = queue.requeue_after_restart(job_id)
         except RuntimeError as exc:
@@ -723,6 +755,10 @@ class Dispatcher:
         needs its runner to queue the job again, and a runner that is gone
         queued nothing.
         """
+        if self._stand_down_if_replaced():
+            # A runner that stood down for the new owner exited without a
+            # word; it did not die, and its job is not ours to fail.
+            return
         try:
             state = jobs.read_state(job_id)
         except RuntimeError as exc:
@@ -759,7 +795,7 @@ class Dispatcher:
         for job_id, entry in list(self.running.items()):
             if entry.alive():
                 continue
-            del self.running[job_id]
+            self.running.pop(job_id, None)
             self._stop_sent.pop(job_id, None)
             self._stop_escalated.discard(job_id)
             self._settle(job_id, entry)
@@ -1119,6 +1155,8 @@ class Dispatcher:
                 f"pass began; not launching it on those"
             )
             return
+        if self._stand_down_if_replaced():
+            return
         try:
             proc = self.deps.spawn_runner(job_id, assigned, attempt)
         except OSError as exc:
@@ -1302,6 +1340,8 @@ class Dispatcher:
             self.drain_and_terminate(f"idle for {idle_s / 60.0:.1f} min")
 
     def drain_and_terminate(self, why: str) -> bool:
+        if self._stand_down_if_replaced():
+            return False
         config = self.config
         self.log(f"draining: {why}")
         jobs.atomic_write_text(paths.draining_file(), f"{why}\n")
@@ -1312,6 +1352,12 @@ class Dispatcher:
         # with a fresh heartbeat -- for as long as the credentials stayed
         # broken, which is forever.
         self._guard(lambda: self._final_sync_all(config), "drain: final state mirror")
+        if self._stand_down_if_replaced():
+            # The config may name the pod that replaced this one, and the
+            # marker would stop it dispatching.
+            paths.draining_file().unlink(missing_ok=True)
+            self.log("not terminating: this queue has another owner now")
+            return False
         try:
             terminate.self_terminate(config, terminate_call=self.deps.terminate_call)
         except terminate.TerminateError as exc:
@@ -1504,14 +1550,19 @@ class Dispatcher:
 
     # -- main ------------------------------------------------------------
     def run_once(self) -> None:
+        if self._stand_down_if_replaced():
+            return
         self._config = jobs.read_config()
         paths.follow_scratch(self._config.env)
+        self._requeue_other_boots()
         self._cards = None
         self._borrowable = None
         self._queued = None
         self._claimed = None
         self._draining = None
         self.reap()
+        if self.replaced is not None:
+            return
         self.escalate_stops()
         self.launch_ready()
         self.preempt_for_waiting()
@@ -1523,6 +1574,50 @@ class Dispatcher:
         self.sweep_stale_incoming()
         self.maybe_terminate()
 
+    def _stand_down_if_replaced(self) -> bool:
+        """Stop serving a queue another machine has taken over (see `owner`),
+        writing nothing more.
+
+        The runners are left to stand down themselves: each checks the same
+        record, and it alone knows exactly which processes its job is running
+        now. The new owner has already queued their jobs again, their runners
+        being from another boot.
+        """
+        if self.replaced is not None:
+            return True
+        self.replaced = owner.replaced_by(self.instance)
+        if self.replaced is None:
+            return False
+        self.log(f"STANDING DOWN: {self.replaced} has taken over this queue; writing nothing more")
+        self.running.clear()
+        self.should_exit = True
+        return True
+
+    def _requeue_other_boots(self) -> None:
+        """Queue again every running job whose runner is from another boot.
+
+        At startup `adopt_orphans` does it; this catches the one a runner on
+        the machine this one took over from claimed after that, before it saw
+        the takeover and stood down without a word. Only for
+        `REQUEUE_WINDOW_S` after a takeover, every `REQUEUE_SCAN_S`, since it
+        reads every job's state.
+        """
+        now = self.deps.monotonic()
+        if self._requeue_until is None or now > self._requeue_until:
+            return
+        if self._last_requeue_scan is not None and now - self._last_requeue_scan < REQUEUE_SCAN_S:
+            return
+        self._last_requeue_scan = now
+        for job_id in jobs.list_job_ids():
+            if job_id in self.running:
+                continue
+            with contextlib.suppress(RuntimeError):
+                state = jobs.read_state(job_id)
+                if state.status == "running" and from_another_boot(
+                    state.runner_boot_id, state.runner_init_start
+                ):
+                    self._requeue_after_restart(job_id)
+
     def idle_and_not_ephemeral(self) -> bool:
         return not self.running and not self.queued() and not self.config.ephemeral
 
@@ -1531,6 +1626,17 @@ class Dispatcher:
         self.log(f"dispatcher started (pid {os.getpid()}, pgid {os.getpgid(0)})")
         code = 0
         try:
+            try:
+                previous = owner.claim(
+                    self.instance, sleep=self.deps.sleep, now=self.deps.monotonic
+                )
+            except owner.Busy as busy:
+                self.log(f"not starting: {busy}")
+                return 0
+            if previous is not None:
+                self.log(f"taking this queue over from {previous}")
+                self._requeue_until = self.deps.monotonic() + REQUEUE_WINDOW_S
+            lock.owner = self.instance
             self._guard(self.adopt_orphans)
             while not self.should_exit:
                 lock.beat()

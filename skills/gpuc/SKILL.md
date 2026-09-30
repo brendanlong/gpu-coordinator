@@ -364,6 +364,8 @@ Rules, and they are not optional:
   was in flight. A host with a `--persistent-root` keeps its queue, and
   queues the jobs that were running again itself. `--scratch-dir` keeps
   workdirs off a slow persistent root; such a host refuses kept outputs.
+  `STANDING DOWN` in a dispatcher log or a job's log means another machine
+  took that queue over and requeued the job there.
 
 Full reference in the repo: `README.md`, `docs/setup.md` (install, hosts,
 credentials), `docs/usage.md` (jobs, rentals, failure reasons),
