@@ -17,7 +17,7 @@ import json
 import shlex
 import sys
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -237,21 +237,23 @@ MAX_PARALLEL_HOSTS = 8
 def gather_all(
     entries: Sequence[HostEntry], settings: Settings, provider: Provider | None, request: str
 ) -> Iterator[status_mod.HostView]:
-    """Every host's status, asked for at once and yielded in registry order.
+    """Every host's status, asked for at once and yielded as each answers.
 
     One ssh round trip per host, and a wedged host takes its whole timeout to
     say so; asked one after another that is a dashboard that takes a minute to
-    draw when one box is down. Yielded rather than collected so the text
-    `gpuc status` still prints each host as soon as it, and every host before
-    it, has answered.
+    draw when one box is down. Yielded in the order they answer rather than
+    registry order, so the text `gpuc status` prints every host that is up
+    while a dead one is still timing out, wherever it sits in the registry.
     """
     if not entries:
         return
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(entries))) as pool:
-        yield from pool.map(
-            lambda entry: status_mod.gather(entry, settings, request=request, provider=provider),
-            entries,
-        )
+        futures = [
+            pool.submit(status_mod.gather, entry, settings, request=request, provider=provider)
+            for entry in entries
+        ]
+        for future in as_completed(futures):
+            yield future.result()
 
 
 @dataclass
@@ -436,8 +438,10 @@ def status(
     The registry's own errors ride along, and an unreadable registry is an
     empty `hosts` *with* an error saying so -- exit 3 or HTTP 503 come from
     the same `Answer`. `on_view` is called with each host as it answers, so
-    the text form can print each block without waiting for the slowest.
-    Nothing here writes the registry: forgetting a rental that has ended is
+    the text form can print each block without waiting for the slowest;
+    `views` is put back in registry order afterwards, so `--json` and the
+    dashboard do not depend on which host answered first. Nothing here
+    writes the registry: forgetting a rental that has ended is
     `forget_gone_rentals`, which only a typed command calls.
 
     A gone host's jobs are the mirror's (`fill_from_mirror`). A gone host is
@@ -478,6 +482,8 @@ def status(
         if view.gone:
             fill_from_mirror(view, index.index, index.on(view.entry.name))
         shown(view)
+    order = {entry.name: position for position, entry in enumerate(entries)}
+    result.views.sort(key=lambda view: order.get(view.entry.name, -1))
     result.index_error = index.error
     if all_jobs:
         result.unhosted, result.mirrored, short = unhosted_jobs(index, result.seen, host)

@@ -257,5 +257,5 @@ Other things that go wrong:
 | `uv sync` re-downloads everything on each job | `gpuc host bootstrap <host>` puts uv's cache somewhere it can be reused |
 | a host is out of disk | `gpuc clean --host <host> --all-finished` |
 | a host shows `GONE` | the rental ended; with `s3_bucket` set, its jobs' logs can still be read and the jobs requeued |
-| a host shows `UNASKABLE` | gpuc could not reach it; if it is a rental, it may still be billing |
+| a host shows `UNASKABLE` | gpuc could not reach it: `gpuc host probe <host>` says why. If it is gone for good, `gpuc host remove <host>`, or every `status` waits out its connect timeout. If it is a rental, it may still be billing |
 | a rental's outputs show `OUTPUTS LOST` | it could not upload them before shutting down; fix the credentials and `gpuc requeue` |

@@ -1041,7 +1041,10 @@ POST carrying an `Origin` must match `Host`. Wrong passwords are throttled
 1 MiB is refused before it is read, and a bug in a handler is a 500 with a
 traceback in the server log. No TLS: localhost, a VPN, or behind a proxy.
 
-Status is gathered across hosts in parallel (`actions.gather_all`).
+Status is gathered across hosts in parallel (`actions.gather_all`), and a
+host that cannot be reached delays only its own answer: the text form prints
+each host as it answers, and the dashboard asks for each host in its own
+request and draws it when that lands.
 
 ## Status output
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -203,6 +204,41 @@ def test_status_reports_an_unaskable_host_and_exits_one(
     out = capsys.readouterr().out
     assert "UNASKABLE" in out and "ERROR ssh: could not resolve hostname" in out
     assert "host local" in out
+
+
+def test_status_prints_each_host_as_it_answers_and_json_keeps_registry_order(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host listed first that takes its connect timeout to fail must not
+    hold back the block of one listed after it that answered at once."""
+    register_host(name="dead", kind="ssh", ssh="me@nowhere.invalid", gpus=GPU)
+    register_host(name="local", gpus=GPU)
+    local_printed = threading.Event()
+
+    def gather(entry: HostEntry, *args: object, **kwargs: object) -> HostView:
+        if entry.name == "local":
+            return HostView(entry=entry, state=HostState.ANSWERED)
+        assert local_printed.wait(5), "the dead host's turn came before local was printed"
+        return HostView(entry=entry, state=HostState.UNASKABLE, error="ssh: timed out")
+
+    render = status_mod.render
+
+    def render_then_mark(view: HostView, **kwargs: Any) -> str:
+        text = render(view, **kwargs)
+        if view.entry.name == "local":
+            local_printed.set()
+        return text
+
+    monkeypatch.setattr(status_mod, "gather", gather)
+    monkeypatch.setattr(status_mod, "render", render_then_mark)
+    assert main(["status"]) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert out.index("host local") < out.index("host dead")
+    assert "gpuc host remove dead" in out
+
+    local_printed.set()
+    assert main(["status", "--json"]) == EXIT_ERROR
+    assert [host["name"] for host in status_json(capsys)["hosts"]] == ["dead", "local"]
 
 
 def test_status_reports_a_bad_entry_per_host_and_exits_one(
