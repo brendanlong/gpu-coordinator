@@ -490,7 +490,9 @@ function hostCard(host, entry) {
   for (const error of host.errors) card.append(el("div", { class: "notice bad" }, error));
   for (const warning of host.warnings || []) card.append(el("div", { class: "notice warn" }, warning));
   if (!host.reachable) {
-    if (host.state === "unaskable" && !host.pod) card.append(el("p", { class: "muted" }, `try: gpuc host probe ${host.name}`));
+    if (host.state === "unaskable" && !host.pod) {
+      card.append(el("p", { class: "muted" }, `try: gpuc host probe ${host.name}; if it is gone for good, forget it here`));
+    }
     card.append(podLine(host) || []);
     card.append(el("p", {}, forgetButton(host)));
     return card;
@@ -508,17 +510,26 @@ function hostCard(host, entry) {
   return card;
 }
 
-function renderHosts(status, hosts) {
-  const list = document.getElementById("host-list");
-  const entries = new Map((hosts.hosts || []).map((h) => [h.name, h]));
+function renderErrors(errors) {
   // Registry trouble persists until it is fixed, so it is drawn in place and
   // redrawn on every refresh rather than toasted again each time.
-  replace(document.getElementById("errors"), status.errors.map((error) => el("div", { class: "notice bad" }, error)));
-  if (!status.hosts.length) {
-    replace(list, el("p", { class: "empty" }, "no hosts registered. Add one: gpuc host add local"));
-    return;
-  }
-  replace(list, status.hosts.map((host) => hostCard(host, entries.get(host.name))));
+  replace(document.getElementById("errors"), [...new Set(errors)].map((error) => el("div", { class: "notice bad" }, error)));
+}
+
+// One slot per registered host, in registry order. A slot keeps its last card
+// until its host answers again, so a refresh never blanks a host that is up.
+function hostSlots(names) {
+  const list = document.getElementById("host-list");
+  const slots = new Map([...list.querySelectorAll(":scope > [data-host]")].map((slot) => [slot.dataset.host, slot]));
+  replace(list, names.map((name) => slots.get(name)
+    || el("div", { "data-host": name }, el("article", { class: "host" }, el("header", {}, el("h3", {}, name), badge("asking…", "kind"))))));
+  return new Map([...list.children].map((slot) => [slot.dataset.host, slot]));
+}
+
+function renderSlot(slot, cards) {
+  // A refresh must not pull a half-typed priority out from under someone.
+  if (slot.contains(document.activeElement) && document.activeElement instanceof HTMLInputElement) return;
+  replace(slot, cards);
 }
 
 function renderConfig(config, version) {
@@ -540,30 +551,58 @@ function renderConfig(config, version) {
 
 // -- loading ------------------------------------------------------------------
 
+// Each host is its own request, drawn as it lands: a host that is down takes
+// its whole ssh connect timeout to say so, and the others must not wait for it.
 async function load() {
   if (state.loading) return;
   state.loading = true;
   const updated = document.getElementById("updated");
   updated.textContent = "refreshing…";
   try {
-    const [status, hosts, config, version] = await Promise.all([
-      api("/api/status"), api("/api/hosts"), api("/api/config"), api("/api/version"),
+    const [hosts, config, version] = await Promise.all([
+      api("/api/hosts"), api("/api/config"), api("/api/version"),
     ]);
-    // A refresh must not pull a half-typed priority out from under someone.
-    if (!editingInHosts()) renderHosts(status, hosts);
     renderConfig(config, version);
-    state.gatheredAt = status.gathered_at;
+    const names = hosts.hosts.map((h) => h.name);
+    if (!names.length) {
+      // No host to ask, and the unscoped status is what says why: none
+      // registered, or a registry that could not be read.
+      const status = await api("/api/status");
+      renderErrors(status.errors);
+      replace(document.getElementById("host-list"), el("p", { class: "empty" },
+        status.errors.length ? "no hosts known" : "no hosts registered. Add one: gpuc host add local"));
+      state.gatheredAt = status.gathered_at;
+      tickUpdated();
+      return;
+    }
+    const entries = new Map(hosts.hosts.map((h) => [h.name, h]));
+    const slots = hostSlots(names);
+    const errors = [...hosts.errors];
+    const stamps = [];
+    let answered = 0;
+    await Promise.all(names.map(async (name) => {
+      try {
+        const status = await api(`/api/status?host=${encodeURIComponent(name)}`);
+        renderSlot(slots.get(name), status.hosts.map((host) => hostCard(host, entries.get(host.name))));
+        errors.push(...status.errors);
+        stamps.push(status.gathered_at);
+      } catch (err) {
+        renderSlot(slots.get(name), el("article", { class: "host" },
+          el("header", {}, el("h3", {}, name)), el("div", { class: "notice bad" }, `could not ask: ${err.message}`)));
+      }
+      answered += 1;
+      if (answered < names.length) updated.textContent = `refreshing… ${answered} of ${names.length} hosts answered`;
+    }));
+    renderErrors(errors);
+    // The page is as old as its oldest answer.
+    state.gatheredAt = stamps.sort()[0] || null;
+    if (state.gatheredAt === null) updated.textContent = "no host could be asked";
     tickUpdated();
   } catch (err) {
     updated.textContent = `refresh failed: ${err.message}`;
   } finally {
     state.loading = false;
   }
-}
-
-function editingInHosts() {
-  const active = document.activeElement;
-  return active instanceof HTMLInputElement && active.closest("#host-list") !== null;
 }
 
 function tickUpdated() {

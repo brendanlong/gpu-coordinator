@@ -922,10 +922,16 @@ def render(
         if pod:
             lines.append(pod)
         elif not view.gone and view.registered:
-            # No provider's word to read next, so the probe is the next step;
-            # a pod line is what to read when there is one, and a stopped
-            # pod's reason already names the commands that end or forget it.
-            lines.append(f"  try: gpuc host probe {entry.name}")
+            # No provider's word to read next, so the probe is the next step,
+            # and removing it the one after: nothing here can tell a box that
+            # is down from one decommissioned, and an entry left behind costs
+            # every status its connect timeout. A pod line is what to read
+            # when there is one, and a stopped pod's reason already names the
+            # commands that end or forget it.
+            lines.append(
+                f"  try: gpuc host probe {entry.name}; if it is gone for good, "
+                f"gpuc host remove {entry.name}"
+            )
         if view.gone:
             finished = _finished_lines(view, recent=recent, since_s=since_s)
             if finished:
