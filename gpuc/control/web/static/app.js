@@ -520,9 +520,14 @@ function renderErrors(errors) {
 // until its host answers again, so a refresh never blanks a host that is up.
 function hostSlots(names) {
   const list = document.getElementById("host-list");
-  const slots = new Map([...list.querySelectorAll(":scope > [data-host]")].map((slot) => [slot.dataset.host, slot]));
-  replace(list, names.map((name) => slots.get(name)
-    || el("div", { "data-host": name }, el("article", { class: "host" }, el("header", {}, el("h3", {}, name), badge("asking…", "kind"))))));
+  const current = [...list.querySelectorAll(":scope > [data-host]")];
+  const slots = new Map(current.map((slot) => [slot.dataset.host, slot]));
+  // Re-inserting a slot, even into the same place, blurs a focused input in
+  // it, so the list is only rebuilt when the hosts themselves changed.
+  if (current.length !== list.children.length || current.map((slot) => slot.dataset.host).join("\n") !== names.join("\n")) {
+    replace(list, names.map((name) => slots.get(name)
+      || el("div", { "data-host": name }, el("article", { class: "host" }, el("header", {}, el("h3", {}, name), badge("asking…", "kind"))))));
+  }
   return new Map([...list.children].map((slot) => [slot.dataset.host, slot]));
 }
 
@@ -572,7 +577,6 @@ async function load() {
       replace(document.getElementById("host-list"), el("p", { class: "empty" },
         status.errors.length ? "no hosts known" : "no hosts registered. Add one: gpuc host add local"));
       state.gatheredAt = status.gathered_at;
-      tickUpdated();
       return;
     }
     const entries = new Map(hosts.hosts.map((h) => [h.name, h]));
@@ -597,16 +601,17 @@ async function load() {
     // The page is as old as its oldest answer.
     state.gatheredAt = stamps.sort()[0] || null;
     if (state.gatheredAt === null) updated.textContent = "no host could be asked";
-    tickUpdated();
   } catch (err) {
+    state.gatheredAt = null;
     updated.textContent = `refresh failed: ${err.message}`;
   } finally {
     state.loading = false;
+    tickUpdated();
   }
 }
 
 function tickUpdated() {
-  if (state.gatheredAt === null) return;
+  if (state.gatheredAt === null || state.loading) return;
   document.getElementById("updated").textContent = `updated ${fmtAge(state.gatheredAt)}`;
 }
 
