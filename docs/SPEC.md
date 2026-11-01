@@ -57,8 +57,9 @@ destinations. Adding another of either changes nothing else in this document.
   no virtual environment.
 - A client needs Python 3.11 or newer and the system `ssh` and `rsync`.
 - The tool is built around Python but does not dictate what a job runs, with
-  one exception: the GPU check at job start runs inside the job's own
-  environment and expects a uv project with torch.
+  one exception: the GPU check at job start runs under the job's own Python,
+  a uv project's unless the job names another. It asks the CUDA driver, and
+  torch too only if the job's environment has it.
 
 ## Hosts and provisioning
 

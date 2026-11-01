@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import shlex
 import shutil
@@ -9,7 +10,7 @@ import sys
 import tempfile
 import textwrap
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -212,16 +213,83 @@ def install_fake_nvidia_smi(bin_dir: Path, uuids: list[str] | None = None) -> No
     wrapper.chmod(0o755)
 
 
-FAKE_TORCH = """\
-# A torch that passes the runner's GPU preflight on a machine with no card. It
-# sees as many devices as CUDA_VISIBLE_DEVICES names, as the real one does.
+FAKE_LIBCUDA_SOURCE = r"""
+/* The few CUDA driver calls the runner's GPU preflight makes, over a driver
+   that sees as many devices as CUDA_VISIBLE_DEVICES names, as the real one
+   does. */
+#include <stdlib.h>
+#include <string.h>
+
+#define NO_DEVICE 100
+
+static int visible(void) {
+    const char *list = getenv("CUDA_VISIBLE_DEVICES");
+    int count = 0;
+    if (list == NULL || *list == '\0') return 0;
+    for (count = 1; *list; list++) count += *list == ',';
+    return count;
+}
+
+int cuInit(unsigned flags) { return visible() ? 0 : NO_DEVICE; }
+int cuGetErrorName(int status, const char **name) {
+    *name = status == NO_DEVICE ? "CUDA_ERROR_NO_DEVICE" : NULL;
+    return 0;
+}
+int cuDeviceGetCount(int *count) { *count = visible(); return 0; }
+int cuDeviceGet(int *device, int index) { *device = index; return 0; }
+int cuDeviceGetName(char *name, int size, int device) {
+    strncpy(name, "Fake A40", size);
+    return 0;
+}
+int cuDevicePrimaryCtxRetain(void **context, int device) { *context = context; return 0; }
+int cuDevicePrimaryCtxRelease_v2(int device) { return 0; }
+"""
+
+
+def fake_libcuda_dir() -> Path:
+    """A directory holding a fake `libcuda.so.1`, for `LD_LIBRARY_PATH`:
+    searched before the system's, so it stands in for a real driver too.
+    Built once per source and uid; a machine without `cc` skips the test."""
+    digest = hashlib.sha256(FAKE_LIBCUDA_SOURCE.encode()).hexdigest()[:12]
+    lib_dir = Path(tempfile.gettempdir()) / f"gpuc-test-libcuda-{os.getuid()}-{digest}"
+    lib = lib_dir / "libcuda.so.1"
+    if lib.exists():
+        return lib_dir
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("no C compiler to build a fake libcuda")
+    lib_dir.mkdir(exist_ok=True)
+    source = lib_dir / f"libcuda-{os.getpid()}.c"
+    source.write_text(FAKE_LIBCUDA_SOURCE)
+    built = lib_dir / f"libcuda-{os.getpid()}.so"
+    subprocess.run(
+        [compiler, "-shared", "-fPIC", "-o", str(built), str(source)],
+        check=True,
+        capture_output=True,
+    )
+    built.replace(lib)
+    source.unlink()
+    return lib_dir
+
+
+def fake_cuda_env(env: Mapping[str, str]) -> dict[str, str]:
+    """`env` with the fake driver ahead of any real one."""
+    rest = env.get("LD_LIBRARY_PATH")
+    path = str(fake_libcuda_dir()) + (os.pathsep + rest if rest else "")
+    return {**env, "LD_LIBRARY_PATH": path}
+
+
+def fake_torch(cuda: bool = True) -> str:
+    """A `torch.py` for the preflight's optional torch step: a CUDA build
+    that sees what the fake driver sees, or a CPU-only one."""
+    return f"""\
 import os
 
 __version__ = "0.0-fake"
 
 
 class version:
-    cuda = "0.0"
+    cuda = {"'0.0'" if cuda else None}
 
 
 class _Tensor:
@@ -242,21 +310,12 @@ def zeros(n, device=None):
 class cuda:
     @staticmethod
     def is_available():
-        return True
+        return {cuda}
 
     @staticmethod
     def device_count():
         return len([d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d])
-
-    @staticmethod
-    def get_device_name(index):
-        return "Fake A40"
 """
-
-
-def install_fake_torch(workdir: Path) -> None:
-    """A `torch.py` the preflight's `python -c` finds first, being run from `workdir`."""
-    (workdir / "torch.py").write_text(FAKE_TORCH)
 
 
 def fake_smi(

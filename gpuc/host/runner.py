@@ -65,18 +65,55 @@ UtilSampler = Callable[[Sequence[str]], float]
 ProgressPoller = Callable[[str, Path, dict[str, str]], float]
 
 PREFLIGHT_SOURCE = """
-import os, sys, torch
+import ctypes, importlib.util, os, sys
 expected = int(os.environ["GPUC_EXPECTED_GPUS"])
+try:
+    cuda = ctypes.CDLL("libcuda.so.1")
+except OSError as e:
+    sys.exit(f"cannot load the CUDA driver: {e}")
+
+def check(call, *args):
+    status = getattr(cuda, call)(*args)
+    if status != 0:
+        name = ctypes.c_char_p()
+        cuda.cuGetErrorName(status, ctypes.byref(name))
+        sys.exit(f"{call} failed: {(name.value or b'').decode() or status}")
+
+check("cuInit", 0)
+count = ctypes.c_int()
+check("cuDeviceGetCount", ctypes.byref(count))
+if count.value != expected:
+    sys.exit(f"the CUDA driver sees {count.value} devices, expected {expected}")
+names = []
+for index in range(count.value):
+    device = ctypes.c_int()
+    check("cuDeviceGet", ctypes.byref(device), index)
+    name = ctypes.create_string_buffer(256)
+    check("cuDeviceGetName", name, len(name), device)
+    context = ctypes.c_void_p()
+    check("cuDevicePrimaryCtxRetain", ctypes.byref(context), device)
+    check("cuDevicePrimaryCtxRelease_v2", device)
+    names.append(name.value.decode())
+print(f"gpu preflight ok: driver sees {count.value} devices: {', '.join(names)}")
+
+if importlib.util.find_spec("torch") is None:
+    sys.exit(0)
+import torch
 if not torch.cuda.is_available():
-    sys.exit(f"CUDA not available (torch {torch.__version__}, build {torch.version.cuda})")
+    sys.exit(f"torch {torch.__version__} cannot use CUDA (build {torch.version.cuda})")
 probe = torch.zeros(8, device="cuda")
 _ = (probe + 1.0).sum().item()
 count = torch.cuda.device_count()
 if count != expected:
-    sys.exit(f"device_count()=={count}, expected {expected}")
-print(f"gpu preflight ok: torch {torch.__version__} cuda {torch.version.cuda} "
-      f"devices {count} {torch.cuda.get_device_name(0)}")
+    sys.exit(f"torch sees {count} devices, expected {expected}")
+print(f"gpu preflight ok: torch {torch.__version__} cuda {torch.version.cuda}")
 """
+"""Asks the CUDA driver directly, so a job on any framework -- or none -- gets
+the check, and then torch only if the job's environment has one. The torch
+step exists for one failure the driver cannot see: a CPU-only torch build,
+which would otherwise run the job on the CPU for hours. Asking every framework
+the same question was rejected: there is no end to them, and the driver
+check already catches what is wrong with the host rather than the job."""
 
 
 class _Terminated(BaseException):

@@ -118,9 +118,12 @@ Rules that avoid the classic failures:
   `nohup` daemon escapes this and keeps its GPU, so do not leave one.
 - Write results incrementally and atomically (temp name, then rename), so the
   periodic sync never uploads a half-written checkpoint.
-- Pass `--device cuda` explicitly and keep `REQUIRE_CUDA=1`. A real GPU op runs
-  inside the job's venv before `main`; a CPU-only torch fails the job as
-  `gpu-preflight` rather than crawling for hours.
+- Pass `--device cuda` explicitly and keep `REQUIRE_CUDA=1`. Before `main`,
+  the job's Python asks the CUDA driver for its cards, so any framework (or
+  none) works; if the venv has torch, a real torch GPU op runs too, and a
+  CPU-only torch fails the job as `gpu-preflight` rather than crawling for
+  hours. Other frameworks (ONNX Runtime, JAX) can still fall back to the CPU
+  silently: assert the GPU provider at the top of your own script.
 - Match the torch build to the host's driver, which `gpuc host probe <host>`
   prints. cu128 is the safe default; a `--runpod` pod is filtered to CUDA >=
   12.8 (`--cuda-min` to change it).

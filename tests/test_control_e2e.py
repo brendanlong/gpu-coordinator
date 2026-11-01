@@ -1,8 +1,8 @@
 """The whole control side against this machine as a `local` host, no GPU needed.
 
 Every job needs a card, so the host is given one: a fake `nvidia-smi` on PATH
-answers for it, and a stand-in `torch.py` in the checkout passes the runner's
-GPU preflight. Everything else is redirected too: GPUC_CONFIG_DIR,
+answers for it, and a stand-in `libcuda.so.1` on LD_LIBRARY_PATH passes the
+runner's GPU preflight. Everything else is redirected too: GPUC_CONFIG_DIR,
 GPUC_STATE_DIR and the host's GPUC_HOME, so the real ~/.gpuc and the real
 registry are never touched.
 """
@@ -26,8 +26,8 @@ from gpuc.host import scope
 from gpuc.host.dispatcher import LockBody
 from tests.conftest import (
     FAKE_GPUS,
+    fake_cuda_env,
     install_fake_nvidia_smi,
-    install_fake_torch,
     load_registry,
     wait_until,
 )
@@ -70,7 +70,6 @@ def workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     (root / "hello.txt").write_text("hello\n")
-    install_fake_torch(root)
     for argv in (
         ["git", "init", "-q"],
         ["git", "config", "user.email", "t@example.com"],
@@ -108,12 +107,15 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     root = tmp_path_factory.mktemp("control-e2e")
     fake_home = root / "home"
     (fake_home / ".local" / "bin").mkdir(parents=True)
+    # Before `patch`: building the fake driver can skip, and nothing would undo it.
+    ld_library_path = fake_cuda_env(os.environ)["LD_LIBRARY_PATH"]
     patch = pytest.MonkeyPatch()
     patch.setenv("HOME", str(fake_home))
     # The host's one card, which `host add` owns by default. This machine's
     # own, if it has any, are not this suite's to use.
     install_fake_nvidia_smi(fake_home / ".local" / "bin", [FAKE_GPUS[0]])
     patch.setenv("PATH", f"{fake_home / '.local' / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    patch.setenv("LD_LIBRARY_PATH", ld_library_path)
     patch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
     patch.setenv("XDG_DATA_HOME", str(fake_home / ".local" / "share"))
     patch.setenv("XDG_CACHE_HOME", str(fake_home / ".cache"))

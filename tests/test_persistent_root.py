@@ -28,10 +28,10 @@ from gpuc.host import dispatcher, health, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig, JobState
 from tests.conftest import (
     FAKE_GPUS,
+    fake_cuda_env,
     fake_smi,
     host_entry,
     install_fake_nvidia_smi,
-    install_fake_torch,
     load_registry,
     make_spec,
     register_host,
@@ -179,8 +179,8 @@ def test_a_dispatched_job_sees_it_too(
     )
     install_fake_nvidia_smi(tmp_path / "bin")
     monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("LD_LIBRARY_PATH", fake_cuda_env(os.environ)["LD_LIBRARY_PATH"])
     job_id = queue.enqueue(make_spec(command='echo "cache=$UV_CACHE_DIR"'))
-    install_fake_torch(paths.workdir(job_id))
     loop = dispatcher.Dispatcher(dispatcher.DispatcherDeps(smi=fake_smi()))
     loop.run_once()
     deadline = time.monotonic() + 60
