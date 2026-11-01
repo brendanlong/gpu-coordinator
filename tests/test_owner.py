@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shlex
 import time
 from pathlib import Path
 
@@ -58,12 +60,15 @@ def test_a_running_job_is_killed_and_nothing_more_is_written(gpuc_home: Path) ->
 def test_the_runner_checks_again_before_the_write_that_ends_the_attempt(
     gpuc_home: Path,
 ) -> None:
-    job_id = prepare(command="true")
-
-    def sleep(seconds: float) -> None:
-        time.sleep(seconds)
-        another_machine_takes_over()
+    # The job takes over itself: a takeover from the runner's poll sleep never
+    # happened when every phase exited before the first poll.
+    owner_file = shlex.quote(str(paths.owner_file()))
+    takeover = shlex.quote(json.dumps({"instance": "another-pod/another-boot"}))
+    job_id = prepare(
+        command=f"echo {takeover} > {owner_file}.tmp && mv {owner_file}.tmp {owner_file}"
+    )
 
     with pytest.raises(StoodDown):
-        run(job_id, deps(sleep=sleep, hard_exit=hard_exit))
+        run(job_id, deps(hard_exit=hard_exit))
     assert jobs.read_state(job_id).status == "running"
+    assert "STANDING DOWN: another-pod/another-boot" in log_of(job_id)
