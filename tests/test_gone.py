@@ -14,12 +14,11 @@ from typing import Any
 
 import pytest
 
-from gpuc.control import wait as wait_mod
 from gpuc.control.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
 from gpuc.control.config import config_file, registry_transaction
 from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
-from tests.conftest import ago, host_entry, load_registry
+from tests.conftest import ago, host_entry, load_registry, stub_wait_sleep
 from tests.fakeprovider import FakeProvider
 from tests.fakes3 import fake_s3
 
@@ -63,7 +62,7 @@ def succeeded(**when: float) -> dict[str, Any]:
 
 @pytest.fixture
 def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: None)
+    stub_wait_sleep(monkeypatch)
 
 
 # -- naming the host must not make the answer worse -----------------------------

@@ -41,7 +41,7 @@ from gpuc.control.s3index import IndexEntry, LocalIndex
 from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
-from tests.conftest import accept_job, host_entry
+from tests.conftest import accept_job, host_entry, stub_wait_sleep
 from tests.fakeprovider import FakeProvider
 from tests.fakes3 import fake_s3
 
@@ -112,7 +112,7 @@ def after_polls(
         return settled
 
     monkeypatch.setattr(wait_mod.Watch, "poll", poll)
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+    stub_wait_sleep(monkeypatch)
     return lambda: seen[0]
 
 
@@ -235,13 +235,12 @@ def test_wait_keeps_trying_a_host_it_cannot_reach_and_then_gives_up(
             )
         )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.2)
-    polls = [0]
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: polls.__setitem__(0, polls[0] + 1))
+    polls = stub_wait_sleep(monkeypatch)
 
     assert main(["wait", JOB, "--host", "local"]) == EXIT_ERROR
     captured = capsys.readouterr()
     assert "could not be asked" in captured.out
-    assert polls[0] > 1, "one failed poll is a blip, not a verdict"
+    assert len(polls) > 1, "one failed poll is a blip, not a verdict"
     # Said once, not once per poll.
     assert captured.err.count("still waiting") == 1
 
@@ -349,7 +348,7 @@ def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
             )
         )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+    stub_wait_sleep(monkeypatch)
 
     assert main(["wait", JOB, "--host", "local"]) == EXIT_OK
     out = capsys.readouterr().out
@@ -381,15 +380,14 @@ def test_wait_reads_a_terminated_rental_from_the_mirror_without_waiting_out_the_
         raise TransportError(message="ssh: connect to 1.2.3.4 port 22: Connection refused")
 
     monkeypatch.setattr(wait_mod, "open_session", unreachable)
-    sleeps = [0]
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: sleeps.__setitem__(0, sleeps[0] + 1))
+    sleeps = stub_wait_sleep(monkeypatch)
 
     assert wait_mod.TROUBLE_GRACE_S >= 60, "the grace is left as it ships"
     assert main(["wait", JOB, "--host", "gpuc-pod"]) == EXIT_OK
     captured = capsys.readouterr()
     assert "succeeded" in captured.out
     assert "from the S3 mirror" in captured.out
-    assert sleeps[0] == 0, "read on the first failed poll, not after a second one"
+    assert sleeps == [], "read on the first failed poll, not after a second one"
 
 
 def test_the_mirror_still_shouts_when_a_dead_host_lost_the_outputs(
@@ -415,7 +413,7 @@ def test_the_mirror_still_shouts_when_a_dead_host_lost_the_outputs(
             )
         )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+    stub_wait_sleep(monkeypatch)
 
     assert main(["wait", JOB, "--host", "local"]) == EXIT_OK
     assert "OUTPUTS LOST" in capsys.readouterr().out
@@ -464,7 +462,7 @@ def test_wait_json_carries_the_error_and_where_the_answer_came_from(
             )
         )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _seconds: None)
+    stub_wait_sleep(monkeypatch)
 
     assert main(["wait", JOB, "--host", "local", "--json"]) == EXIT_ERROR
     document = json.loads(capsys.readouterr().out)
@@ -499,15 +497,14 @@ def test_wait_reads_the_mirror_at_once_for_a_host_this_machine_has_forgotten(
     is the answer -- not exit 4, and not five minutes of asking nobody."""
     prefix = mirror(monkeypatch, "gpuc-pod")
     LocalIndex().record(IndexEntry(job_id=JOB, host="gpuc-pod", name="lego-s4", s3_prefix=prefix))
-    sleeps = [0]
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: sleeps.__setitem__(0, sleeps[0] + 1))
+    sleeps = stub_wait_sleep(monkeypatch)
 
     assert main(["wait", JOB, "--json"]) == EXIT_OK
     captured = capsys.readouterr()
     job = json.loads(captured.out)["jobs"][0]
     assert (job["status"], job["source"], job["host_state"]) == ("succeeded", "mirror", "gone")
     assert "not registered on this machine" in captured.err
-    assert sleeps[0] == 0
+    assert sleeps == []
 
 
 # -- `gpuc logs -f` ------------------------------------------------------------
@@ -561,7 +558,7 @@ def test_follow_rides_out_a_blip_on_the_first_poll_like_wait_does(
         return real(*args, **kwargs)
 
     monkeypatch.setattr(remote, "open_session", flaky)
-    monkeypatch.setattr(wait_mod.time, "sleep", lambda _s: None)
+    stub_wait_sleep(monkeypatch)
 
     assert main(["logs", JOB, "-f", "--host", "local"]) == EXIT_OK
     captured = capfd.readouterr()
