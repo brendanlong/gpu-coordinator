@@ -1717,8 +1717,8 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runpod", action="store_true", help="reuse or provision a RunPod pod")
     parser.add_argument(
         "--gpu",
-        help="comma-separated GPU names as RunPod lists them (`H100 SXM,RTX 4090`; "
-        "case and spaces do not matter), cheapest match wins",
+        help="comma-separated GPU names as RunPod lists them ('H100 SXM,RTX 4090'; "
+        "case, spaces and a leading NVIDIA do not matter), cheapest match wins",
     )
     parser.add_argument(
         "--gpu-count",

@@ -62,8 +62,8 @@ class Offer(TolerantModel):
 
 
 def gpu_name_key(name: str) -> str:
-    """A GPU name as `--gpu` matches it: case, spaces, punctuation and the
-    vendor prefix ignored, so `RTXPRO6000` and `rtx-pro-6000` both name the
+    """A GPU name as `--gpu` matches it: case, spaces, punctuation and a
+    leading NVIDIA ignored, so `RTXPRO6000` and `rtx-pro-6000` both name the
     catalog's `RTX PRO 6000`. Exact rather than a prefix, so `L40` never
     means `L40S` too."""
     return re.sub(r"[^a-z0-9]", "", name.casefold()).removeprefix("nvidia")
