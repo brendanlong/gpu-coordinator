@@ -134,7 +134,7 @@ Rules that avoid the classic failures:
 ```bash
 gpuc submit job.yaml --host local
 gpuc submit job.yaml --host <host>                              # any name from `gpuc host list`
-gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu A40,RTX4090 --cloud any
+gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu "A40,RTX 4090" --cloud any
 
 gpuc status                      # every host: free cards, queue, running job + phase, eta,
                                  # recent results; each job as `name (job-id)`, each running

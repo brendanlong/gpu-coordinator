@@ -164,12 +164,14 @@ there. It can send the job to a different host (`--host`, or `--runpod`).
 ## Rentals
 
 ```sh
-gpuc submit job.yaml --runpod --gpu A40,RTX4090 --max-price 0.60
+gpuc submit job.yaml --runpod --gpu "A40,RTX 4090" --max-price 0.60
 ```
 
-`--gpu` takes one or more GPU names and the cheapest available match is
-rented; `--gpu-count` and `--cloud community` (cheaper, less
-reliable) narrow the choice, and `gpuc submit --help` lists the rest. If a pod
+`--gpu` takes one or more GPU names, comma-separated and spelled as the
+RunPod catalog does (case, spaces and an `NVIDIA` prefix do not matter, and
+`H100` does not mean every H100: name `H100 SXM`, `H100 PCIe`, ... separately).
+The cheapest available match is rented; `--gpu-count` and `--cloud community`
+(cheaper, less reliable) narrow the choice, and `gpuc submit --help` lists the rest. If a pod
 fails to come up it is terminated and the next offer tried, for up to 15
 minutes. A running pod that already matches is reused rather than renting
 another (`--no-reuse` to always rent).

@@ -524,7 +524,7 @@ def rental_options(args: argparse.Namespace) -> RentalOptions | None:
     if not args.runpod:
         return None
     options = RentalOptions(
-        gpu_names=_comma_list(args.gpu),
+        gpu_names=[name.strip() for name in (args.gpu or "").split(",") if name.strip()],
         max_price_usd_hr=args.max_price,
         clouds=CLOUDS[args.cloud],
         cuda_min=args.cuda_min,
@@ -1715,7 +1715,11 @@ def _at_least_one(raw: str) -> int:
 
 def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runpod", action="store_true", help="reuse or provision a RunPod pod")
-    parser.add_argument("--gpu", help="comma-separated GPU names, cheapest match wins")
+    parser.add_argument(
+        "--gpu",
+        help="comma-separated GPU names as RunPod lists them (`H100 SXM,RTX 4090`; "
+        "case and spaces do not matter), cheapest match wins",
+    )
     parser.add_argument(
         "--gpu-count",
         type=_at_least_one,

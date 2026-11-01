@@ -61,9 +61,23 @@ class Offer(TolerantModel):
         return any(cuda_key(v) >= floor for v in self.cuda_versions)
 
 
+def gpu_name_key(name: str) -> str:
+    """A GPU name as `--gpu` matches it: case, spaces, punctuation and the
+    vendor prefix ignored, so `RTXPRO6000` and `rtx-pro-6000` both name the
+    catalog's `RTX PRO 6000`. Exact rather than a prefix, so `L40` never
+    means `L40S` too."""
+    return re.sub(r"[^a-z0-9]", "", name.casefold()).removeprefix("nvidia")
+
+
+def matches_gpu_names(constraints: Constraints, gpu_id: str, name: str) -> bool:
+    if not constraints.gpu_names:
+        return True
+    wanted = {gpu_name_key(n) for n in constraints.gpu_names}
+    return bool(wanted & {gpu_name_key(gpu_id), gpu_name_key(name)})
+
+
 def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
-    wanted = {name.casefold() for name in constraints.gpu_names}
-    if wanted and not wanted & {offer.gpu_id.casefold(), offer.name.casefold()}:
+    if not matches_gpu_names(constraints, offer.gpu_id, offer.name):
         return False
     cap = constraints.max_price_usd_hr
     if cap is not None and offer.price_usd_hr > cap:
