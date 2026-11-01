@@ -27,6 +27,8 @@ from .base import (
     ProviderError,
     SshEndpoint,
     cuda_key,
+    gpu_name_key,
+    matches_gpu_names,
     offer_satisfies,
 )
 
@@ -58,6 +60,23 @@ def _rate_limit_pause(header: str | None) -> float:
         return 0.0
     waits = [float(t) for r, t in re.findall(r"r=(\d+);t=(\d+)", header) if int(r) == 0]
     return min(max(waits), MAX_RATE_LIMIT_SLEEP_S) if waits else 0.0
+
+
+def _check_names_exist(names: list[str], gpus: list[dict[str, Any]]) -> None:
+    """The catalog lists every GPU type, stocked or not, so a name that
+    matches none of them is misspelled, and saying so beats the "no offers"
+    error that reads as an availability problem (#143)."""
+    catalog = {gpu_name_key(key): gpu["name"] for gpu in gpus for key in (gpu["id"], gpu["name"])}
+    unknown = [name for name in names if gpu_name_key(name) not in catalog]
+    if not unknown:
+        return
+    lines = []
+    for name in unknown:
+        near = sorted({full for key, full in catalog.items() if gpu_name_key(name) in key})
+        hint = f"did you mean {', '.join(near)}?" if near else "no similar name"
+        lines.append(f"--gpu {name!r} is not a RunPod GPU type ({hint})")
+    known = ", ".join(sorted(set(catalog.values())))
+    raise ProviderError("\n".join(lines) + f"\nRunPod GPU types: {known}")
 
 
 class RunPodProvider(Provider):
@@ -153,6 +172,7 @@ class RunPodProvider(Provider):
                 "minCudaVersion": constraints.cuda_min,
             }
             payload = self._json("GET", "/catalog/gpus", params=params)
+            _check_names_exist(constraints.gpu_names, payload["gpus"])
             found.extend(self._offers_from_catalog(payload["gpus"], cloud, constraints))
         found.sort(key=lambda offer: (offer.price_usd_hr, offer.gpu_id, offer.cloud))
         return found
@@ -164,12 +184,11 @@ class RunPodProvider(Provider):
         constraints: Constraints,
     ) -> list[Offer]:
         tier = cloud.lower()
-        wanted = {name.casefold() for name in constraints.gpu_names}
         offers: list[Offer] = []
         for gpu in gpus:
             # Before parsing, so a malformed row for a GPU nobody asked for
             # cannot fail the search.
-            if wanted and not wanted & {gpu["id"].casefold(), gpu["name"].casefold()}:
+            if not matches_gpu_names(constraints, gpu["id"], gpu["name"]):
                 continue
             if gpu.get("availability", "NONE") == "NONE":
                 continue

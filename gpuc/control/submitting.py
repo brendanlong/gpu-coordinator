@@ -67,8 +67,9 @@ class RentalOptions:
     def constraints(self) -> Constraints:
         if not self.gpu_names:
             raise UsageError(
-                "--runpod needs --gpu <name>[,<name>] (for example --gpu A40,RTX4090).\n"
-                "Names are matched against the RunPod catalog, short or full."
+                "--runpod needs --gpu <name>[,<name>] (for example --gpu 'A40,RTX 4090').\n"
+                "Names are matched against the RunPod catalog, "
+                "short or full, ignoring case and spaces."
             )
         return Constraints(
             gpu_names=self.gpu_names,

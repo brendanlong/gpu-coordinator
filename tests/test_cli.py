@@ -581,7 +581,7 @@ def test_submit_runpod_passes_the_flags_through(
                 str(job),
                 "--runpod",
                 "--gpu",
-                "A40,RTX4090",
+                "A40, RTX PRO 6000",
                 "--max-price",
                 "0.60",
                 "--cloud",
@@ -601,7 +601,7 @@ def test_submit_runpod_passes_the_flags_through(
     )
     constraints = seen["constraints"]
     assert isinstance(constraints, Constraints)
-    assert constraints.gpu_names == ["A40", "RTX4090"]
+    assert constraints.gpu_names == ["A40", "RTX PRO 6000"]
     assert constraints.max_price_usd_hr == 0.60
     assert constraints.clouds == ["SECURE", "COMMUNITY"]
     assert (seen["idle_minutes"], seen["disk_gb"]) == (2.0, 20)

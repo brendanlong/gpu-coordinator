@@ -60,6 +60,35 @@ def test_name_list_matches_short_name_and_catalog_id() -> None:
     assert by_short[0].price_usd_hr == 0.49
 
 
+def test_names_match_ignoring_case_spaces_punctuation_and_vendor() -> None:
+    provider = RecordedRunPod()
+    for spelling in [
+        "RTX 4090",
+        "rtx4090",
+        "RTX-4090",
+        "GeForce RTX 4090",
+        "nvidia geforce rtx 4090",
+    ]:
+        offers = provider.offers(Constraints(gpu_names=[spelling]))
+        assert [o.gpu_id for o in offers] == ["NVIDIA GeForce RTX 4090"], spelling
+    assert [o.gpu_id for o in provider.offers(Constraints(gpu_names=["A100PCIe"]))] == [
+        "NVIDIA A100 80GB PCIe"
+    ]
+
+
+def test_a_name_is_not_a_prefix_of_another() -> None:
+    offers = RecordedRunPod().offers(Constraints(gpu_names=["A40"]))
+    assert [o.gpu_id for o in offers] == ["NVIDIA A40"]
+
+
+def test_a_name_not_in_the_catalog_is_an_error_naming_close_matches() -> None:
+    with pytest.raises(ProviderError) as raised:
+        RecordedRunPod().offers(Constraints(gpu_names=["A40", "RTX"]))
+    message = str(raised.value)
+    assert "'RTX'" in message and "RTX 4090" in message
+    assert "'A40'" not in message
+
+
 def test_unavailable_tier_is_dropped_and_tiers_are_queried_separately() -> None:
     provider = RecordedRunPod()
     offers = provider.offers(Constraints(gpu_names=["A40"], clouds=["SECURE", "COMMUNITY"]))

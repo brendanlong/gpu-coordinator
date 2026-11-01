@@ -577,6 +577,8 @@ def test_offer_satisfies_checks_every_constraint() -> None:
     offer = make_offer()
     assert offer_satisfies(offer, CONSTRAINTS)
     assert not offer_satisfies(offer, Constraints(gpu_names=["RTX4090"]))
+    respelled = make_offer("RTX 4090", gpu_id="NVIDIA GeForce RTX 4090")
+    assert offer_satisfies(respelled, Constraints(gpu_names=["rtx-4090"]))
     assert not offer_satisfies(offer, Constraints(max_price_usd_hr=0.20))
     assert not offer_satisfies(offer, Constraints(clouds=["COMMUNITY"]))
     assert not offer_satisfies(offer, Constraints(cuda_min="13.0"))
