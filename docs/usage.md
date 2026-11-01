@@ -53,10 +53,11 @@ every field.
 | `use_shared` | `false` | may use the host's [shared GPUs](#shared-gpus) |
 | `cleanup` | `on_success` | when the job's checkout is deleted: `on_success`, `always` or `never` |
 
-Before `command` runs, gpuc checks inside the job's environment that its GPUs
-work (under the uv project's Python; set `python:` if yours is
-different), and if the job has torch, that torch can use them, and that every output destination is writable. A job fails early,
-with the reason in its log, rather than after hours of training.
+Before `command` runs, gpuc checks inside the job's environment that the CUDA
+driver can use its GPUs (and, if the job has torch, that torch can too) and
+that every output destination is writable. The check runs under the uv
+project's Python; set `python:` if yours is different. A job fails early, with
+the reason in its log, rather than after hours of training.
 
 ## Outputs
 

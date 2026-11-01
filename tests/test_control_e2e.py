@@ -107,13 +107,15 @@ def bootstrapped_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     root = tmp_path_factory.mktemp("control-e2e")
     fake_home = root / "home"
     (fake_home / ".local" / "bin").mkdir(parents=True)
+    # Before `patch`: building the fake driver can skip, and nothing would undo it.
+    ld_library_path = fake_cuda_env(os.environ)["LD_LIBRARY_PATH"]
     patch = pytest.MonkeyPatch()
     patch.setenv("HOME", str(fake_home))
     # The host's one card, which `host add` owns by default. This machine's
     # own, if it has any, are not this suite's to use.
     install_fake_nvidia_smi(fake_home / ".local" / "bin", [FAKE_GPUS[0]])
     patch.setenv("PATH", f"{fake_home / '.local' / 'bin'}{os.pathsep}{os.environ['PATH']}")
-    patch.setenv("LD_LIBRARY_PATH", fake_cuda_env(os.environ)["LD_LIBRARY_PATH"])
+    patch.setenv("LD_LIBRARY_PATH", ld_library_path)
     patch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
     patch.setenv("XDG_DATA_HOME", str(fake_home / ".local" / "share"))
     patch.setenv("XDG_CACHE_HOME", str(fake_home / ".cache"))
