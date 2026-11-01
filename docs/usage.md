@@ -54,8 +54,8 @@ every field.
 | `cleanup` | `on_success` | when the job's checkout is deleted: `on_success`, `always` or `never` |
 
 Before `command` runs, gpuc checks inside the job's environment that its GPUs
-work (this expects a uv project with torch; set `python:` if yours is
-different) and that every output destination is writable. A job fails early,
+work (under the uv project's Python; set `python:` if yours is
+different), and if the job has torch, that torch can use them, and that every output destination is writable. A job fails early,
 with the reason in its log, rather than after hours of training.
 
 ## Outputs
@@ -238,7 +238,7 @@ gpuc wait "$id" || echo "failed"
 | --- | --- |
 | `exit N` / `setup` | your command, or `setup`, exited non-zero |
 | `gpu-assert` | a card assigned to the job has disappeared from nvidia-smi |
-| `gpu-preflight` | torch in the job's environment could not use its GPUs; check the torch build against the host's driver |
+| `gpu-preflight` | the CUDA driver could not use the job's GPUs, or the job's torch could not; check the torch build against the host's driver |
 | `sync-preflight` | an output destination is not writable: usually a missing secret or a typo in the bucket |
 | `sync` | the final upload failed; `gpuc fetch <job-id>` gets the outputs from the host |
 | `no-outputs` | an `outputs:` path was never written; if the job wrote elsewhere, `gpuc fetch <job-id> --path <where>` |

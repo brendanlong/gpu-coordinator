@@ -18,9 +18,10 @@ from gpuc.host.jobs import HostConfig, JobState
 from gpuc.host.runner import RunnerDeps
 from tests.conftest import (
     FAKE_GPUS,
+    fake_cuda_env,
     fake_smi,
+    fake_torch,
     install_fake_nvidia_smi,
-    install_fake_torch,
     make_spec,
     wait_until,
 )
@@ -470,8 +471,7 @@ def run_detached(job_id: str, home: Path) -> subprocess.Popen[bytes]:
     signal to it is not also a signal to the test process. It asks the real
     `nvidia-smi` and runs the real preflight, so both are faked on the machine."""
     install_fake_nvidia_smi(home / "fake-bin")
-    install_fake_torch(paths.workdir(job_id))
-    env = dict(os.environ)
+    env = fake_cuda_env(os.environ)
     env["GPUC_HOME"] = str(home)
     env["PATH"] = f"{home / 'fake-bin'}{os.pathsep}{env['PATH']}"
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
@@ -622,25 +622,53 @@ def test_a_failed_utilization_sample_is_recorded_as_unknown_not_as_idle(
     assert "utilization sample failed" in log_of(job_id)
 
 
-def test_the_generated_preflight_asks_torch_whether_the_card_is_there() -> None:
-    """The command the injected `echo` below stands in for.
+def run_preflight(
+    tmp_path: Path, expected: int, visible: str, torch: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """The generated preflight, run as the runner runs it, from a checkout
+    over the fake driver (and with a fake torch in it, if given)."""
+    if torch is not None:
+        (tmp_path / "torch.py").write_text(torch)
+    env = fake_cuda_env(os.environ)
+    env.update(GPUC_EXPECTED_GPUS=str(expected), CUDA_VISIBLE_DEVICES=visible)
+    command = runner.preflight_command(make_spec(python=sys.executable))
+    return subprocess.run(
+        command, shell=True, cwd=tmp_path, env=env, capture_output=True, text=True, check=False
+    )
 
-    It runs under `uv run --no-sync` because the job's workdir is a uv project
-    and the repo's own venv has no torch, and it has to actually *count*
-    devices: importing torch proves nothing about a host whose driver is gone.
-    """
-    command = runner.preflight_command(make_spec())
-    assert command.startswith("uv run --no-sync python -c ")
-    assert "import os, sys, torch" in command
-    assert "torch.cuda.device_count()" in command
-    assert 'os.environ["GPUC_EXPECTED_GPUS"]' in command
-    assert "device_count()=={count}, expected {expected}" in command
+
+def test_the_preflight_needs_no_framework(tmp_path: Path) -> None:
+    proc = run_preflight(tmp_path, expected=2, visible="0,1")
+    assert proc.returncode == 0, proc.stderr
+    assert "torch" not in proc.stdout
 
 
-def test_the_jobs_python_is_the_interpreter_the_preflight_runs_under() -> None:
-    command = runner.preflight_command(make_spec(python=".venv/bin/python"))
-    assert command.startswith(".venv/bin/python -c ")
-    assert "torch.cuda.device_count()" in command
+def test_the_preflight_fails_when_the_driver_sees_fewer_cards(tmp_path: Path) -> None:
+    proc = run_preflight(tmp_path, expected=2, visible="0")
+    assert proc.returncode != 0
+    assert "expected 2" in proc.stderr
+
+
+def test_the_preflight_fails_when_the_driver_sees_no_card(tmp_path: Path) -> None:
+    proc = run_preflight(tmp_path, expected=1, visible="")
+    assert proc.returncode != 0
+    assert "CUDA_ERROR_NO_DEVICE" in proc.stderr
+
+
+def test_the_preflight_checks_torch_when_the_job_has_it(tmp_path: Path) -> None:
+    proc = run_preflight(tmp_path, expected=1, visible="0", torch=fake_torch())
+    assert proc.returncode == 0, proc.stderr
+    assert "torch 0.0-fake" in proc.stdout
+
+
+def test_the_preflight_fails_a_cpu_only_torch(tmp_path: Path) -> None:
+    proc = run_preflight(tmp_path, expected=1, visible="0", torch=fake_torch(cuda=False))
+    assert proc.returncode != 0
+    assert "cannot use CUDA" in proc.stderr
+
+
+def test_the_preflight_runs_under_uv_by_default() -> None:
+    assert runner.preflight_command(make_spec()).startswith("uv run --no-sync python -c ")
 
 
 def test_a_job_that_names_its_python_runs_its_preflight_through_it(gpuc_home: Path) -> None:

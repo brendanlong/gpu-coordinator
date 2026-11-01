@@ -1,8 +1,8 @@
 """`snakemake --executor gpuc` against this machine as a `local` host.
 
-The host is test_control_e2e's: a fake nvidia-smi, a stand-in torch in the
-checkout, and every gpuc directory redirected. Snakemake runs as a separate
-process, as it would for a user, and finds the plugin by its package name.
+The host is test_control_e2e's: a fake nvidia-smi, a stand-in CUDA driver,
+and every gpuc directory redirected. Snakemake runs as a separate process, as
+it would for a user, and finds the plugin by its package name.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from snakemake_executor_plugin_gpuc import GpucError, job_name, truthy
-from tests.conftest import install_fake_torch, wait_until
+from tests.conftest import wait_until
 from tests.test_control_e2e import bootstrapped_home, state_of
 
 __all__ = ["bootstrapped_home"]
@@ -61,7 +61,6 @@ def project(tmp_path: Path) -> Path:
     root.mkdir()
     (root / "Snakefile").write_text(SNAKEFILE)
     (root / ".gitignore").write_text(".snakemake/\n")
-    install_fake_torch(root)
     for argv in (
         ["git", "init", "-q"],
         ["git", "config", "user.email", "t@example.com"],

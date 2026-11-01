@@ -385,9 +385,11 @@ The order is the contract; each step is in `runner.py`.
    exclusion is dropped with a warning.
 2. `phase=setup`: `spec.setup` in `workdir` under `bash -eo pipefail`.
 3. `phase=preflight`: the GPU check inside the job's environment, the spec's
-   `python` over a probe (`is_available()`, a tensor add and `.item()`,
-   `device_count()` equal to `gpus`). Failure -> `failed: gpu-preflight`.
-   Skipped for a job with no cards, which then needs no torch.
+   `python` over a probe that needs no framework: the CUDA driver through
+   `ctypes` must see exactly `gpus` devices and open a context on each. If
+   `torch` is importable there, it must also pass `is_available()`, a tensor
+   add and `.item()`, and `device_count()` equal to `gpus`. Failure ->
+   `failed: gpu-preflight`. Skipped for a job with no cards.
 3b. Sync preflight, still before `main`: every `Destination` the job will
    upload to, the host's `jobs/<id>/` mirror included, proves a `.preflight`
    write works with the job's own environment. Failure ->
