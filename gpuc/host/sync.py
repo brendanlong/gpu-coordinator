@@ -301,9 +301,10 @@ class SyncLoop:
         self._workdir = workdir
         self._s3_prefix = s3_prefix
         self._runner = runner
-        # The job's environment, secrets included: uploads authenticate as the
-        # job, not as whatever the dispatcher happened to inherit.
-        self._env = env
+        self.env = env
+        """The job's environment, secrets included: uploads authenticate as
+        the job, not as whatever the dispatcher happened to inherit. Set by
+        the runner once it has opened the secrets."""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
@@ -330,7 +331,7 @@ class SyncLoop:
                 min_age_s=min_age_s,
                 runner=self._runner,
                 timeout=timeout,
-                env=self._env,
+                env=self.env,
                 baseline_map=baseline.read(self._spec.job_id),
                 record_missing=record_missing,
             )
@@ -340,7 +341,7 @@ class SyncLoop:
                     self._s3_prefix,
                     runner=self._runner,
                     timeout=timeout,
-                    env=self._env,
+                    env=self.env,
                 )
 
     def _loop(self) -> None:

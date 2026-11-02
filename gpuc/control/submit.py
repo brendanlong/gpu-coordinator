@@ -19,11 +19,12 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+import pyrage
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from gpuc.control.config import Reporter, Settings, default_s3_prefix, utc_now
-from gpuc.control.remote import HostSession, config_file
+from gpuc.control.remote import HostSession, RemoteError, config_file
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
 from gpuc.control.status import placement_unknown
 from gpuc.control.transport import (
@@ -530,6 +531,47 @@ def _push_without_git(
     return {"submitted_from": str(workdir), "submitted_at": utc_now(), "git": None}
 
 
+RECIPIENT_TIMEOUT_S = 180.0
+"""The host's `sealed.TIMEOUT_S` for fetching pyrage, and a round trip."""
+
+
+def host_recipient(session: HostSession) -> str:
+    """The host's public key for job secrets, made there on first ask."""
+    try:
+        answer = session.host_json("secrets-recipient", timeout=RECIPIENT_TIMEOUT_S, check=False)
+    except RemoteError as exc:
+        if "invalid choice" in str(exc):
+            raise SubmitError(
+                f"host {session.entry.name} runs a gpuc build from before encrypted secrets; "
+                f"submit without --no-bootstrap so this build is shipped first"
+            ) from exc
+        raise
+    recipient = answer.get("recipient") if isinstance(answer, dict) else None
+    if not isinstance(recipient, str) or not recipient.startswith("age1"):
+        why = answer.get("error") if isinstance(answer, dict) else None
+        raise SubmitError(
+            f"host {session.entry.name} has no key to encrypt secrets to: {why or answer!r}"
+        )
+    return recipient
+
+
+def deliver_secrets(session: HostSession, job_id: str, body: str, recipient: str) -> None:
+    """Encrypt the job's secrets to the host's own key and put them there.
+
+    Encrypted here, so the plaintext exists only in this process and, when
+    the job runs, in the pipe the host opens them through (`sealed`).
+    """
+    try:
+        sealed = pyrage.encrypt(
+            body.encode(), [pyrage.x25519.Recipient.from_str(recipient)], armored=True
+        )
+    except (pyrage.RecipientError, pyrage.EncryptError) as exc:
+        raise SubmitError(
+            f"could not encrypt secrets to {session.entry.name}'s key: {exc}"
+        ) from exc
+    session.transport.put_file(sealed.decode(), f"{session.home}/secrets/{job_id}.env.age", 0o600)
+
+
 def enqueue_spec(session: HostSession, prepared: Prepared) -> dict[str, Any]:
     """Put the spec in the staged job dir and ask the host to accept it.
 
@@ -653,6 +695,10 @@ def submit_spec(
         spec, f"host {entry.name}", ephemeral=session.config.ephemeral, scratch=scratch
     )
 
+    # Before anything is uploaded: a host that cannot make its key refuses
+    # the job now, not after the checkout has gone up.
+    recipient = host_recipient(session) if prepared.secrets_body else None
+
     for warning in prepared.warnings:
         report(f"WARNING: {warning}")
         notes.append(warning)
@@ -663,11 +709,9 @@ def submit_spec(
         session.host_json(f"archive-checkout {spec.job_id}", timeout=ARCHIVE_TIMEOUT_S)
         report("archived the checkout beside the queue; workdirs here are on scratch")
 
-    if prepared.secrets_body:
-        session.transport.put_file(
-            prepared.secrets_body, f"{session.home}/secrets/{spec.job_id}.env", 0o600
-        )
-        report(f"delivered {len(spec.secrets)} secret(s) as {spec.job_id}.env (0600)")
+    if prepared.secrets_body and recipient:
+        deliver_secrets(session, spec.job_id, prepared.secrets_body, recipient)
+        report(f"delivered {len(spec.secrets)} secret(s), encrypted to the host's key")
 
     response = enqueue_spec(session, prepared)
 

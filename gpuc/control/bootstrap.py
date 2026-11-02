@@ -35,6 +35,7 @@ from gpuc.control.remote import (
     PYTHON_FLOOR,
     HostConfigRead,
     HostSession,
+    RemoteError,
     env_prefix,
     host_python,
     parse_last_json,
@@ -474,6 +475,28 @@ def ensure_layout(transport: Transport, env: Mapping[str, str], home: str, pytho
     )
 
 
+SECRETS_KEY_TIMEOUT_S = 180.0
+"""Room for uv to fetch pyrage into an empty cache (`sealed.TIMEOUT_S`)."""
+
+
+def make_secrets_key(session: HostSession) -> list[str]:
+    """Have the host make its key for job secrets now, fetching pyrage.
+
+    Now rather than at the first submit that has secrets: a host that cannot
+    (no route to PyPI, no wheel for its libc) is better found out while
+    somebody is watching bootstrap than after a rental's handoff. A warning,
+    not a failure, since a host whose jobs carry no secrets never needs it.
+    """
+    try:
+        answer = session.host_json("secrets-recipient", timeout=SECRETS_KEY_TIMEOUT_S, check=False)
+    except (RemoteError, TransportError) as exc:
+        return [f"could not make the host's key for job secrets: {exc}"]
+    if isinstance(answer, dict) and isinstance(answer.get("recipient"), str):
+        return []
+    why = answer.get("error") if isinstance(answer, dict) else answer
+    return [f"jobs with secrets will fail here: the host could not make its key ({why})"]
+
+
 def run_health(session: HostSession, options: HealthOptions) -> dict[str, Any]:
     args = shlex.join(["health", *options.args()])
     result = session.host_cli(args, timeout=HEALTH_TIMEOUT_S, check=False)
@@ -681,7 +704,7 @@ def bootstrap_host(
     storage = storage_line(health)
     if storage:
         report(storage)
-    for warning in health.get("warnings", []):
+    for warning in [*health.get("warnings", []), *make_secrets_key(session)]:
         warnings.append(warning)
         report(f"WARNING: {warning}")
 

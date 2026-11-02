@@ -52,6 +52,7 @@ class ScriptedHost:
     aws_present: bool = True
     hf_present: bool = True
     health: dict[str, object] = field(default_factory=lambda: dict(HEALTH_OK))
+    secrets_key_error: str | None = None
     hf_install_fails: bool = False
     uv_cache: str = "/home/u/.cache/uv"
     config: dict[str, object] | None = None
@@ -101,6 +102,10 @@ class ScriptedHost:
             return 0, ""
         if "-m gpuc.host health" in command:
             return (0 if self.health.get("ok") else 1), json.dumps(self.health)
+        if "-m gpuc.host secrets-recipient" in command:
+            if self.secrets_key_error:
+                return 1, json.dumps({"error": self.secrets_key_error})
+            return 0, json.dumps({"recipient": "age1testkey"})
         if "spawn_detached_dispatcher" in command:
             return 0, "4242\n"
         if command.startswith("printf %s"):
@@ -337,6 +342,14 @@ def test_an_optional_tool_failure_is_a_warning_not_an_error(control_env: Path) -
     assert result.dispatcher_pid == 4242
     assert len(result.warnings) == 1
     assert "huggingface_hub" in result.warnings[0]
+
+
+def test_a_host_that_cannot_make_its_secrets_key_is_warned_about(control_env: Path) -> None:
+    host = ScriptedHost(secrets_key_error="pyrage failed (exit 2): no matching distribution")
+    _, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    assert result.dispatcher_pid == 4242
+    assert any("jobs with secrets will fail here" in w for w in result.warnings)
+    assert host.index_of("secrets-recipient") < host.index_of("spawn_detached_dispatcher")
 
 
 def test_the_dispatcher_is_started_with_the_home_tool_dirs_on_path(control_env: Path) -> None:

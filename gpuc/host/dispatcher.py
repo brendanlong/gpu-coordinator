@@ -33,6 +33,7 @@ from gpuc.host import (
     plan,
     queue,
     scope,
+    sealed,
     sync,
     terminate,
 )
@@ -1456,10 +1457,10 @@ class Dispatcher:
         # this case on an ephemeral host); otherwise our own environment, which
         # already carries the host env.
         env: dict[str, str] | None = None
-        env_file = paths.job_env_file(job_id)
-        if env_file.exists():
+        secrets = sealed.job_secrets(job_id)
+        if secrets:
             env = config.apply_env(dict(os.environ))
-            env.update(jobs.parse_env_file(env_file))
+            env.update(secrets)
         sync.sync_outputs(
             spec.outputs,
             paths.workdir(job_id),

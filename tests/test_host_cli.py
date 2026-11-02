@@ -824,3 +824,23 @@ def test_status_names_another_machine_only_while_it_renews(
     os.utime(paths.owner_file(), (stale, stale))
     _, payload = run(capsys, "status")
     assert isinstance(payload, dict) and payload["served_by"] is None
+
+
+def test_secrets_recipient_is_the_hosts_public_key(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, payload = run(capsys, "secrets-recipient")
+    assert code == 0
+    assert isinstance(payload, dict) and str(payload["recipient"]).startswith("age1")
+    assert run(capsys, "secrets-recipient")[1] == payload
+
+
+def test_secrets_recipient_says_why_it_has_no_key(
+    gpuc_home: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpuc.host import sealed
+
+    monkeypatch.setattr(sealed.shutil, "which", lambda *_a, **_k: None)
+    code, payload = run(capsys, "secrets-recipient")
+    assert code == 1
+    assert isinstance(payload, dict) and "uv is not installed" in str(payload["error"])
