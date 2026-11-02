@@ -51,7 +51,9 @@ plus a patch of uncommitted changes). Large data must come from S3 or HF inside
 the job, never from the checkout. Download it into `$GPUC_DATA_DIR/<name>`
 and skip the download when it is already there: that directory outlives the
 job, every job on the host sees it, and only `gpuc host clean <host> --data
-<name>` removes anything from it.
+<name>` removes anything from it. Hugging Face models and datasets are the
+exception: they already share one cache per host, so leave `HF_HOME` unset
+rather than pointing it into `$GPUC_DATA_DIR`, which would keep a second copy.
 
 ```yaml
 name: lego-s4                      # label only
