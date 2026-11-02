@@ -13,10 +13,12 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from gpuc.control import wait as wait_mod
 from gpuc.control.config import (
     HostCache,
     HostEntry,
@@ -420,3 +422,17 @@ def control_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
     (root / "config").mkdir(parents=True)
     (root / "state").mkdir(parents=True)
     yield root
+
+
+def stub_wait_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Make `wait`'s poll sleeps instant, and return the list they are recorded in.
+
+    Only `wait`'s own view of `time` is replaced: stubbing `time.sleep` itself
+    also stubbed the loop `subprocess` waits for a child in, so a host asked in
+    a thread counted thousands of sleeps on a busy machine.
+    """
+    slept: list[float] = []
+    monkeypatch.setattr(
+        wait_mod, "time", SimpleNamespace(monotonic=time.monotonic, sleep=slept.append)
+    )
+    return slept
