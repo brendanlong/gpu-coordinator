@@ -253,7 +253,7 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
 
             # Nothing here reaps the pod itself; the registry entry is dropped
             # by whatever looks next -- `status`, `bootstrap --all`, the next
-            # `host rent` reuse pass -- and by hand with `host remove`.
+            # `host rent` -- and by hand with `host remove`.
             assert main(["host", "remove", entry.name]) == 0
             assert load_registry().hosts == {}
             log(f"total wall time {time.monotonic() - started:.0f}s")

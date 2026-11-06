@@ -558,8 +558,8 @@ def _rental_match(name: str, *, free: bool) -> SimpleNamespace:
     return SimpleNamespace(
         free=free,
         view=SimpleNamespace(entry=SimpleNamespace(name=name)),
-        describe=lambda now: f"{name}: {'free' if free else 'busy'}",
-        document=lambda now: {"host": name, "free": free},
+        describe=lambda: f"{name}: {'free' if free else 'busy'}",
+        document=lambda: {"host": name, "free": free},
     )
 
 
@@ -604,10 +604,14 @@ def test_host_rent_refuses_while_a_matching_rental_is_free(
         "gpuc.control.hosts.provision",
         lambda *a, **k: pytest.fail("nothing may be bought while a matching rental is free"),
     )
-    assert main(["host", "rent", "--provider", "runpod", "--gpu", "A40"]) == EXIT_ERROR
-    err = capsys.readouterr().err
-    assert "gpuc-old-1: free" in err and "gpuc-busy-1" not in err
-    assert "--host gpuc-old-1" in err and "--force" in err
+    argv = ["host", "rent", "--provider", "runpod", "--gpu", "A40", "--json"]
+    assert main(argv) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "gpuc-old-1: free" in captured.err and "gpuc-busy-1" not in captured.err
+    assert "--host gpuc-old-1" in captured.err and "--force" in captured.err
+    document = json.loads(captured.out)
+    assert document["exit_code"] == EXIT_ERROR
+    assert [m["host"] for m in document["matching_rentals"] if m["free"]] == ["gpuc-old-1"]
 
 
 def test_host_rent_force_rents_anyway_and_lists_what_matched(

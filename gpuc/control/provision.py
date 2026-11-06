@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -623,22 +623,22 @@ class Match:
         """A job asking for `gpu_count` cards would start on it now."""
         return not self.view.queue and len(self.view.free) >= self.gpu_count
 
-    def idles_out_in_s(self, now: datetime) -> float | None:
-        if not self.free or self.view.running or self.view.idle_since is None:
+    @property
+    def idles_out_in_s(self) -> float | None:
+        if not self.free or self.view.running or self.view.idle_for_s is None:
             return None
-        ends = self.view.idle_since + timedelta(minutes=self.idle_minutes)
-        return max((ends - now).total_seconds(), 0.0)
+        return max(self.idle_minutes * 60.0 - self.view.idle_for_s, 0.0)
 
-    def describe(self, now: datetime) -> str:
+    def describe(self) -> str:
         name = self.view.entry.name
         if self.free:
-            left = self.idles_out_in_s(now)
+            left = self.idles_out_in_s
             if left is not None:
                 when = f"idles out in about {left / 60.0:.0f} min"
             elif self.view.running:
                 when = "running a job, with enough cards free"
             else:
-                when = "idle-out time unknown"
+                when = "its host does not say when it idles out"
             return f"{name} ({_label(self.offer)}): free, {when}"
         return (
             f"{name} ({_label(self.offer)}): busy, {len(self.view.running)} running, "
@@ -646,8 +646,8 @@ class Match:
             f"{len(self.view.owned)} card(s) free"
         )
 
-    def document(self, now: datetime) -> dict[str, Any]:
-        left = self.idles_out_in_s(now)
+    def document(self) -> dict[str, Any]:
+        left = self.idles_out_in_s
         return {
             "host": self.view.entry.name,
             "pod_id": self.view.entry.pod_id,
@@ -694,6 +694,11 @@ def matching_rentals(
             continue
         if isinstance(asked, Unaskable):
             report(f"could not ask rental {entry.name} whether it is free: {asked.reason}")
+            continue
+        if asked.pod is None and asked.pod_error:
+            # A provider read that failed is no answer about the pod, and a
+            # free rental hidden by one is a duplicate bought without a word.
+            report(f"could not ask the provider about rental {entry.name}: {asked.pod_error}")
             continue
         match = _match(entry, asked, constraints, provider)
         if match is not None:

@@ -49,8 +49,9 @@ def address_for(name: str, pod: Pod, provider: str) -> HostEntry | None:
 
 def offer_of(provider: Mapping[str, Any] | None) -> Offer | None:
     """The offer a pod's own `provider` block says it was bought on, or None
-    when the block has none this build can read: that costs a reuse, since
-    nothing is known to compare a request with, and nothing more.
+    when the block has none this build can read: that pod never counts as a
+    match for `host rent`, since nothing is known to compare a request with,
+    and nothing more.
     """
     value = (provider or {}).get("offer")
     if not isinstance(value, dict):

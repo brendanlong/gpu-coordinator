@@ -358,6 +358,10 @@ The rules it holds to:
   mirror every job's state and log, then `terminate.self_terminate()`. Only a
   failed *terminate* stops the shutdown: remove `draining`, keep dispatching,
   retry every 10 minutes.
+  The idle clock is held in memory only, so `status` derives its
+  `idle_for_s` instead: time since the later of the last job's `ended_at`
+  and the dispatcher lock's mtime (written only when a dispatcher takes the
+  lock, which restarts the clock).
 - **Exit** when the queue is empty, nothing is running and the host is not
   ephemeral. An ephemeral host keeps its dispatcher until terminate.
 
@@ -976,11 +980,12 @@ the same submit path as every other host.
    owns enough cards, the provider reports it RUNNING, its dispatcher heartbeat
    is fresh, and it is not draining; it is *free* when its queue is empty and
    enough of its owned cards are free. Any free match refuses the rent unless
-   `--force`, naming it and when it idles out: the host's `idle_since` (the
-   later of its last job's end and its dispatcher lock's mtime, so derived and
-   never stored) plus its own `idle_minutes`. Busy matches are listed and the
-   rent goes on. Local and ssh hosts are never compared: one may be a host
-   this work is not allowed to use. A registered pod the provider no longer
+   `--force`, naming it and when it idles out (its own `idle_minutes` less the
+   `idle_for_s` its `status` reports), and the `--json` error carries every
+   match. Busy matches are listed and the rent goes on. A rental whose pod the
+   provider could not be asked about is reported, never taken for "no match".
+   Local and ssh hosts are never compared: one may be a host this work is not
+   allowed to use. Nor are rentals not registered on this machine. A registered pod the provider no longer
    has is forgotten rather than dialled.
 2. Then, for each offer in order: `create`; poll `get` until the pod is
    running **and** `ssh.direct` present; poll SSH until a trivial command

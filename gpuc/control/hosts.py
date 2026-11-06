@@ -7,7 +7,6 @@ rendering stays in the CLI.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
 from gpuc.control import rented, version
@@ -124,19 +123,20 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
     constraints = options.constraints()
     provider = make_provider(settings, options.provider)
     matches = matching_rentals(constraints, settings, provider=provider, report=report)
-    now = datetime.now(UTC)
+    found = {"matching_rentals": [match.document() for match in matches]}
     free = [match for match in matches if match.free]
     if free and not options.force:
-        listing = "\n".join(f"  {match.describe(now)}" for match in free)
+        listing = "\n".join(f"  {match.describe()}" for match in free)
         raise CliError(
             f"a rental that matches is free, so nothing was rented:\n{listing}\n"
             f"Submit to it with `gpuc submit <job.yaml> --host {free[0].view.entry.name}`, "
-            f"or pass --force to rent another anyway."
+            f"or pass --force to rent another anyway.",
+            found,
         )
     if matches:
         report(
-            "matching rentals, rented another anyway:\n"
-            + "\n".join(f"  {match.describe(now)}" for match in matches)
+            "matching rentals (renting another anyway):\n"
+            + "\n".join(f"  {match.describe()}" for match in matches)
         )
     entry = provision(
         constraints,
@@ -149,10 +149,7 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
         image=options.image or settings.image,
         health_options=options.health,
     )
-    document = {
-        **host_document(entry),
-        "matching_rentals": [match.document(now) for match in matches],
-    }
+    document = {**host_document(entry), **found}
     return HostChange(document, [f"next: gpuc submit <job.yaml> --host {entry.name}"])
 
 

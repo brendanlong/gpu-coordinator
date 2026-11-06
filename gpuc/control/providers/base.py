@@ -45,9 +45,9 @@ class Constraints(BaseModel):
 
 class Offer(TolerantModel):
     """One catalog entry. Read tolerantly because the `offer` a pod's own
-    config records was written by whichever build rented it: a pod we cannot
-    reuse is a smaller failure than one we cannot read, and one we cannot read
-    is one `host rent` buys a second of."""
+    config records was written by whichever build rented it: a pod that
+    cannot be compared with a request is a smaller failure than one that
+    cannot be read at all."""
 
     gpu_id: str = ""
     name: str = ""

@@ -328,9 +328,10 @@ Rules, and they are not optional:
   request is free, and names it with how long until it idles out: submit to
   that one instead. `--force` rents another anyway, which is right when you
   want several at once. Matching rentals that are busy are listed and do not
-  stop the rent. Local and ssh hosts are not compared.
+  stop the rent. Local and ssh hosts are not compared, and nor are pods
+  registered only on another machine (`gpuc pods` lists those).
 - Renting by mistake is cheap to undo: `gpuc host terminate <host>` ends a
-  rental with nothing queued, no `--force` needed.
+  fresh rental with nothing queued, no `--force` needed.
 - **Nothing on this machine watches a pod after it is set up, or ends one on
   its own.** A pod whose dispatcher dies never idles out and bills until a
   person ends it: `gpuc pods` shows every pod with our prefix, its hourly cost

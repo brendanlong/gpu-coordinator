@@ -13,7 +13,6 @@ import json
 import re
 import urllib.error
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
 
@@ -586,7 +585,7 @@ def test_offer_satisfies_checks_every_constraint() -> None:
     assert not offer_satisfies(offer, Constraints(cuda_min="13.0"))
 
 
-# -- reuse: the host, not the cache, says what it is -----------------------------
+# -- matching rentals: the host, not the cache, says what it is -----------------------------
 
 
 def _register_reusable(
@@ -654,9 +653,9 @@ def test_a_live_matching_rental_is_free_and_says_when_it_idles_out(
     assert match.view.entry.name == "gpuc-e2e-aaa"
     assert match.free
     assert any("-m gpuc.host status" in command for command in host.commands)
-    left = match.idles_out_in_s(datetime.now(UTC))
+    left = match.idles_out_in_s
     assert left is not None and 14 * 60 < left <= 15 * 60
-    assert "idles out in about 15 min" in match.describe(datetime.now(UTC))
+    assert "idles out in about 15 min" in match.describe()
     assert provider.created == []
 
 
@@ -669,8 +668,8 @@ def test_a_rental_with_a_queued_job_is_busy(
     state.write_text(json.dumps(JobState(status="queued").to_dict()))
     [match] = _matches(provider, [])
     assert not match.free
-    assert match.idles_out_in_s(datetime.now(UTC)) is None
-    assert "busy, 0 running, 1 queued" in match.describe(datetime.now(UTC))
+    assert match.idles_out_in_s is None
+    assert "busy, 0 running, 1 queued" in match.describe()
 
 
 def test_matching_judges_the_card_count_by_the_hosts_answer_not_the_cache(
@@ -687,6 +686,23 @@ def test_a_stale_dispatcher_does_not_match(
     provider = _live(host)
     (host.path(host.home) / "dispatcher.heartbeat").unlink()
     assert _matches(provider, []) == []
+
+
+def test_a_rental_the_provider_cannot_be_asked_about_is_reported(
+    control_env: Path, ssh_key: Path, host: FakeHost
+) -> None:
+    class Down(FakeProvider):
+        def get(self, pod_id: str) -> Pod | None:
+            raise ProviderError("GET /pods/pod9 -> HTTP 502")
+
+    pod = running_pod("gpuc-e2e-aaa", "pod9")
+    provider = Down([make_offer()])
+    provider.adopt(pod)
+    _register_reusable(pod, host)
+    _beating(host)
+    reports: list[str] = []
+    assert _matches(provider, reports) == []
+    assert any("could not ask the provider about rental gpuc-e2e-aaa" in r for r in reports)
 
 
 def test_a_rental_that_cannot_be_asked_is_reported_and_skipped(

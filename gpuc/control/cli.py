@@ -1871,7 +1871,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = exit_code_for(exc)
         if code is None:
             raise
-        return failed(args, failure_message(exc), code)
+        document = exc.document if isinstance(exc, CliError) else None
+        return failed(args, failure_message(exc), code, document)
     return emit(args, answer)
 
 
