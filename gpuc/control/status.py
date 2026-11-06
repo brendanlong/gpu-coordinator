@@ -18,7 +18,7 @@ from gpuc.control import version
 from gpuc.control.config import HostEntry, Settings
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.jsonout import OUTPUT_SCHEMA_VERSION
-from gpuc.control.providers.base import Pod, Provider
+from gpuc.control.providers.base import Pod, Providers
 from gpuc.control.remote import Asked, Gone, HostSession, Unaskable, ask
 from gpuc.control.s3index import IndexEntry, job_uri
 from gpuc.host import jobs
@@ -546,7 +546,7 @@ def gather(
     *,
     request: str = "status",
     session: HostSession | None = None,
-    provider: Provider | None = None,
+    providers: Providers | None = None,
 ) -> HostView:
     """One host's status: `ask` it, and read the answer.
 
@@ -555,7 +555,7 @@ def gather(
     needs the host's cards, dispatcher and queue -- matching rentals, teardown, the
     queue placement after a submit -- keeps working against a host that has
     not been bootstrapped since."""
-    return parse_status(entry, ask(entry, request, settings, provider=provider, session=session))
+    return parse_status(entry, ask(entry, request, settings, providers=providers, session=session))
 
 
 def parse_status(entry: HostEntry, asked: Asked) -> HostView:

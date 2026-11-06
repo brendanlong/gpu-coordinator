@@ -50,8 +50,9 @@ from gpuc.control.exits import (
     EXIT_USAGE,
 )
 from gpuc.control.jsonout import note
-from gpuc.control.providers.base import Provider, ProviderError
+from gpuc.control.providers.base import Provider, ProviderError, Providers
 from gpuc.control.providers.runpod import RunPodProvider
+from gpuc.control.providers.vast import VastProvider
 from gpuc.control.provision import ProvisionError
 from gpuc.control.remote import (
     MAX_PARALLEL_HOSTS,
@@ -203,11 +204,12 @@ def exit_code_of(answer: Answer) -> int:
 
 PROVIDERS: dict[str, Callable[[Settings], Provider]] = {
     "runpod": lambda settings: RunPodProvider(prefix=settings.runpod_pod_prefix),
+    "vast": lambda settings: VastProvider(prefix=settings.runpod_pod_prefix),
 }
 """Every rental provider, by the name a host's `rental.provider` gives it."""
 
 
-def make_provider(settings: Settings, provider: str = "runpod") -> Provider:
+def make_provider(settings: Settings, provider: str) -> Provider:
     try:
         factory = PROVIDERS[provider]
     except KeyError:
@@ -217,27 +219,40 @@ def make_provider(settings: Settings, provider: str = "runpod") -> Provider:
     return factory(settings)
 
 
-def provider_for(
+def providers_for(
     entries: Sequence[HostEntry], settings: Settings, report: Callable[[str], None] = note
-) -> Provider | None:
-    """The provider to ask about these hosts' pods, if any of them is rented.
+) -> Providers:
+    """The providers to ask about these hosts' pods: one for each provider
+    any of them is rented from.
 
     Only built when a rental is on screen, and never fatal: a status of two
     ssh boxes must not need an API key, and one with a rental must not fail
-    outright for want of one -- the pod line is missing and says so.
+    outright for want of one -- its pod line is missing and says so.
     """
-    names = {entry.rental.provider for entry in entries if entry.rental is not None}
-    if not names:
-        return None
-    try:
-        return make_provider(settings, sorted(names)[0])
-    except ProviderError as exc:
-        report(f"pod status unavailable: {exc}")
-        return None
+    providers: dict[str, Provider] = {}
+    for name in sorted({entry.rental.provider for entry in entries if entry.rental is not None}):
+        try:
+            providers[name] = make_provider(settings, name)
+        except ProviderError as exc:
+            report(f"{name} pod status unavailable: {exc}")
+    return providers
+
+
+def every_provider(settings: Settings) -> tuple[Providers, list[str]]:
+    """Every provider this machine has a key for, and why each other one is
+    missing: what a command about the account rather than one host asks."""
+    providers: dict[str, Provider] = {}
+    missing: list[str] = []
+    for name in PROVIDERS:
+        try:
+            providers[name] = make_provider(settings, name)
+        except ProviderError as exc:
+            missing.append(f"{name}: {exc}")
+    return providers, missing
 
 
 def gather_all(
-    entries: Sequence[HostEntry], settings: Settings, provider: Provider | None, request: str
+    entries: Sequence[HostEntry], settings: Settings, providers: Providers, request: str
 ) -> Iterator[status_mod.HostView]:
     """Every host's status, asked for at once and yielded as each answers.
 
@@ -251,7 +266,7 @@ def gather_all(
         return
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(entries))) as pool:
         futures = [
-            pool.submit(status_mod.gather, entry, settings, request=request, provider=provider)
+            pool.submit(status_mod.gather, entry, settings, request=request, providers=providers)
             for entry in entries
         ]
         for future in as_completed(futures):
@@ -476,11 +491,11 @@ def status(
         else:
             # Neither here nor in the index: a typo, not a rental that ended.
             registry.require(host)
-    provider = provider_for(entries, settings) if entries else None
+    providers = providers_for(entries, settings) if entries else {}
     request = status_mod.status_request(
         recent=None if all_jobs else recent, since_s=None if all_jobs else since_s
     )
-    for view in gather_all(entries, settings, provider, request):
+    for view in gather_all(entries, settings, providers, request):
         if view.gone:
             fill_from_mirror(view, index.index, index.on(view.entry.name))
         shown(view)
@@ -840,7 +855,7 @@ def locate_many(
     explicit: str | None,
     settings: Settings,
     *,
-    provider: Provider | None = None,
+    providers: Providers | None = None,
     skipped: Collection[str] = (),
 ) -> dict[str, Placed]:
     """The host each job is on: `--host` if given, else the index (local, then
@@ -892,8 +907,9 @@ def locate_many(
             continue
         unplaced[job_id] = indexed
     if unplaced:
-        provider = provider or provider_for(list(registry.hosts.values()), settings)
-        placed.update(_ask_around(unplaced, registry, settings, provider))
+        if providers is None:
+            providers = providers_for(list(registry.hosts.values()), settings)
+        placed.update(_ask_around(unplaced, registry, settings, providers))
     return {job_id: placed[job_id] for job_id in ids}
 
 
@@ -929,7 +945,7 @@ def _ask_around(
     unplaced: dict[str, IndexEntry | None],
     registry: Registry,
     settings: Settings,
-    provider: Provider | None,
+    providers: Providers,
 ) -> dict[str, Placed]:
     """`locate_many` for the ids that need a host to say it has them."""
     named = {
@@ -946,7 +962,7 @@ def _ask_around(
             session = before.session if isinstance(before, Answered) else None
             request = status_mod.status_request(questions[name])
             return name, ask(
-                registry.hosts[name], request, settings, provider=provider, session=session
+                registry.hosts[name], request, settings, providers=providers, session=session
             )
 
         if not questions:
@@ -1094,8 +1110,10 @@ def job_verbs(
     """
     read = open_registry()
     registry = read.named()
-    provider = provider_for(list(registry.hosts.values()), settings)
-    placed = locate_many(job_ids, registry, host, settings, provider=provider, skipped=read.skipped)
+    providers = providers_for(list(registry.hosts.values()), settings)
+    placed = locate_many(
+        job_ids, registry, host, settings, providers=providers, skipped=read.skipped
+    )
     done: dict[str, Done] = {}
     on_host: dict[str, list[str]] = {}
     for job_id, where in placed.items():
@@ -1122,7 +1140,7 @@ def job_verbs(
             location.entry,
             f"{verb} {' '.join(shlex.quote(job_id) for job_id in ids)}{args}",
             settings,
-            provider=provider,
+            providers=providers,
             session=session,
             check=False,
         )
@@ -1397,7 +1415,7 @@ def read_log(
     reached = location.asked
     if reached is None:
         entry = location.require_entry()
-        reached = ask(entry, None, settings, provider=provider_for([entry], settings))
+        reached = ask(entry, None, settings, providers=providers_for([entry], settings))
     remote = None
     purged = False
     failed = False

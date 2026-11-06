@@ -77,7 +77,7 @@ def terminate(provider: FakeProvider, target: str, **kwargs: Any) -> teardown.Te
         target,
         Settings(),
         registry=load_registry(),
-        provider=provider,
+        providers={provider.name: provider},
         report=lambda _: None,
         sleep=lambda _: None,
         **kwargs,

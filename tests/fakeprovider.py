@@ -15,14 +15,12 @@ from typing import Any
 
 from gpuc.control.providers.base import (
     DEFAULT_CUDA_MIN,
-    DEFAULT_IMAGE,
     DEFAULT_PREFIX,
     Cloud,
     Constraints,
     CreateRefused,
     Offer,
     Pod,
-    PodStatus,
     Provider,
     ProviderError,
     SshEndpoint,
@@ -62,7 +60,7 @@ class PodScript:
     """Raised by `create` after the pod was made: an answer lost on the way back."""
     hidden_for_lists: int = 0
     """How many `list` calls miss a pod whose create was lost."""
-    status_after_polls: dict[int, PodStatus] = field(default_factory=dict)
+    status_after_polls: dict[int, str] = field(default_factory=dict)
     cuda_version: str = "12.8"
 
 
@@ -77,6 +75,9 @@ class FakeProvider(Provider):
     """Speaks the base class's vocabulary, as the real provider does."""
 
     name = "runpod"
+    api_key_env = "RUNPOD_API_KEY"
+    default_image = "runpod/pytorch:test-default"
+    clouds = ("SECURE", "COMMUNITY")
 
     def __init__(
         self,
@@ -122,8 +123,8 @@ class FakeProvider(Provider):
         offer: Offer,
         name: str,
         *,
-        image: str = DEFAULT_IMAGE,
-        disk_gb: int = 20,
+        image: str,
+        disk_gb: int,
         cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod:

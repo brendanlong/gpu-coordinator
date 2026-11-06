@@ -16,9 +16,10 @@ from gpuc.control.actions import (
     Interrupted,
     UsageError,
     connection_document,
+    every_provider,
     host_document,
     make_provider,
-    provider_for,
+    providers_for,
 )
 from gpuc.control.bootstrap import (
     DEFAULT_HEALTH,
@@ -43,9 +44,16 @@ from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import owned_entries
 from gpuc.control.jsonout import warn
 from gpuc.control.probe import ProbeReport, probe_host
-from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
+from gpuc.control.providers.base import (
+    DEFAULT_CUDA_MIN,
+    MINIMUMS,
+    Cloud,
+    Constraints,
+    Provider,
+)
 from gpuc.control.provision import matching_rentals, provision
 from gpuc.control.remote import Gone, RemoteError, rental_state
+from gpuc.control.teardown import find_pod
 from gpuc.control.transport import TransportError
 
 
@@ -78,9 +86,12 @@ class RentalOptions:
     provider: str
     gpu_names: list[str]
     max_price_usd_hr: float | None = None
-    clouds: list[Cloud] = field(default_factory=lambda: list[Cloud](["SECURE"]))
+    clouds: list[Cloud] = field(default_factory=list[Cloud])
+    """Empty is the provider's default tier."""
     cuda_min: str = DEFAULT_CUDA_MIN
     gpu_count: int = 1
+    minimums: dict[str, float] = field(default_factory=dict[str, float])
+    """Floors on the offer, keyed as `providers.base.MINIMUMS` is."""
     force: bool = False
     name_hint: str = "job"
     idle_minutes: float = DEFAULT_IDLE_MINUTES
@@ -88,19 +99,36 @@ class RentalOptions:
     image: str | None = None
     health: HealthOptions = DEFAULT_HEALTH
 
-    def constraints(self) -> Constraints:
+    def constraints(self, provider: Provider, settings: Settings) -> Constraints:
+        """What to search `provider` for. A flag it cannot search by is a
+        usage error, not a floor quietly dropped: a rental that ignored
+        `--min-inet-down` is the slow host the flag was there to avoid."""
         if not self.gpu_names:
             raise UsageError(
                 "host rent needs --gpu <name>[,<name>] (for example --gpu 'A40,RTX 4090').\n"
                 "Names are matched against the provider's catalog, "
                 "short or full, ignoring case and spaces."
             )
+        if self.clouds and not provider.clouds:
+            raise UsageError(f"--cloud chooses a RunPod tier; {provider.name} has none")
+        unsupported = [MINIMUMS[key] for key in self.minimums if key not in provider.filters]
+        if unsupported:
+            raise UsageError(
+                f"{provider.name} cannot be searched by {', '.join(unsupported)}"
+                + (
+                    f"; it can by {', '.join(MINIMUMS[k] for k in sorted(provider.filters))}"
+                    if provider.filters
+                    else ""
+                )
+            )
         return Constraints(
             gpu_names=self.gpu_names,
             max_price_usd_hr=self.max_price_usd_hr,
-            clouds=self.clouds,
+            clouds=self.clouds or list(provider.clouds[:1]),
             cuda_min=self.cuda_min,
             gpu_count=self.gpu_count,
+            disk_gb=self.disk_gb if self.disk_gb is not None else settings.disk_gb,
+            minimums=self.minimums,
         )
 
 
@@ -120,8 +148,8 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
     rentals are compared: an ssh or local host may be one this work is not
     meant to use.
     """
-    constraints = options.constraints()
     provider = make_provider(settings, options.provider)
+    constraints = options.constraints(provider, settings)
     matches = matching_rentals(constraints, settings, provider=provider, report=report)
     found = {"matching_rentals": [match.document() for match in matches]}
     free = [match for match in matches if match.free]
@@ -145,7 +173,6 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
         report=report,
         name_hint=options.name_hint,
         idle_minutes=options.idle_minutes,
-        disk_gb=options.disk_gb if options.disk_gb is not None else settings.disk_gb,
         image=options.image or settings.image,
         health_options=options.health,
     )
@@ -160,12 +187,11 @@ def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEnt
     one: the pod owns its config and carries its own record of what it was
     bought as (`rented`), so all this has to find is the door.
     """
-    provider = make_provider(settings)
-    pod = provider.get(pod_id)
-    if pod is None or provider.is_gone(pod):
+    provider, pod = find_pod(pod_id, every_provider(settings)[0])
+    if provider.is_gone(pod):
         raise CliError(
-            f"pod {pod_id} is {'gone' if pod is None else pod.status} on this account, so "
-            f"there is nothing to add. `gpuc pods` lists the pods it can see."
+            f"pod {pod_id} is {pod.status} at {provider.name}, so there is nothing to add. "
+            f"`gpuc pods` lists the pods it can see."
         )
     reached = rented.address_for(address.name, pod, provider.name)
     if reached is None:
@@ -563,7 +589,7 @@ def bootstrap_every_host(
         return tally
     # Built once, and only when a rental is registered: a host that fails to
     # answer may simply have ended, and only the provider knows which.
-    provider = provider_for(hosts, settings, report)
+    providers = providers_for(hosts, settings, report)
     for index, entry in enumerate(hosts, start=1):
         if index > 1:
             report("")
@@ -585,7 +611,7 @@ def bootstrap_every_host(
             report(f"\n{tally.render()}")
             raise
         except (BootstrapError, ConfigError, RemoteError, TransportError) as exc:
-            state = rental_state(entry, provider)
+            state = rental_state(entry, providers)
             if isinstance(state, Gone):
                 report(f"{state.reason}; forgetting this host")
                 tally.record(entry, "gone")

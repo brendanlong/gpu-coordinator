@@ -70,8 +70,9 @@ def gpuc_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]
     monkeypatch.setenv("GPUC_HOME", str(home))
     # No test may inherit a real provider key from the developer running it: a
     # test that needs one sets its own, and one that does not must behave the
-    # same on a laptop with `RUNPOD_API_KEY` exported and on a bare CI runner.
+    # same on a laptop with a provider key exported and on a bare CI runner.
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
     # Pin the isolation mode: whether *this* machine can make systemd scopes is
     # not something a unit test should depend on. The cgroup path has its own
     # tests, which set this to `cgroup` themselves.
@@ -418,6 +419,7 @@ def control_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
     monkeypatch.setenv("GPUC_STATE_DIR", str(root / "state"))
     monkeypatch.delenv("GPUC_HOME", raising=False)
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("VAST_API_KEY", raising=False)
     monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
     (root / "config").mkdir(parents=True)
     (root / "state").mkdir(parents=True)

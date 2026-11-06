@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from gpuc.control import pods as pods_mod
+from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import EXIT_OK, main
 from gpuc.control.config import Settings, registry_transaction
 from gpuc.control.status import CardView, HostState, HostView, render
@@ -44,7 +45,7 @@ def test_table_names_the_host_each_pod_is_here_and_counts_the_rest(
     _register("gpuc-e2e-aaa", "pod1")
     monkeypatch.setattr("gpuc.control.pods.heartbeat_age", lambda *a: 4.0)
 
-    text = pods_mod.render(pods_mod.gather(Settings(), provider))
+    text = pods_mod.render(pods_mod.gather(Settings(), {"runpod": provider}))
 
     lines = text.splitlines()
     assert lines[0].split() == list(pods_mod.COLUMNS)
@@ -53,7 +54,7 @@ def test_table_names_the_host_each_pod_is_here_and_counts_the_rest(
     assert lines[2].split()[-2:] == ["-", "-"]
     assert "not registered here: gpuc-leak-bbb (podL)" in text
     assert "2 pod(s) with our prefix, $0.98/h total" in text
-    assert f"1 other pod(s) in the account, never touched: {FOREIGN} (RUNNING)" in text
+    assert f"1 other pod(s) in the accounts, never touched: {FOREIGN} (runpod, RUNNING)" in text
     # Someone else's pod contributes no cost and no row of its own.
     assert FOREIGN not in "\n".join(lines[:3])
 
@@ -63,7 +64,7 @@ def test_a_young_unregistered_pod_is_flagged_as_possibly_still_provisioning(
 ) -> None:
     """The registry entry is written only after connect, minutes into a
     `host rent`; a pod inside that window is not a leak to end."""
-    text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
+    text = pods_mod.render(pods_mod.gather(Settings(), {"runpod": provider}, heartbeats=False))
     note = next(line for line in text.splitlines() if "provisioning ceiling" in line)
     assert note.startswith("gpuc-e2e-aaa:")
     assert "gpuc-leak-bbb" not in note
@@ -74,24 +75,24 @@ def test_two_pods_that_compare_equal_are_still_told_apart(control_env: Path) -> 
     pods with the same fields would otherwise hide each other from the table."""
     fake = FakeProvider(existing=[running_pod(FOREIGN, "podF"), running_pod(FOREIGN, "podG")])
     fake.adopt(running_pod("gpuc-e2e-aaa", "pod1"), PodScript(ssh_after_polls=0))
-    view = pods_mod.gather(Settings(), fake, heartbeats=False)
+    view = pods_mod.gather(Settings(), {"runpod": fake}, heartbeats=False)
     assert [row.pod.id for row in view.rows] == ["pod1"]
-    assert [pod.id for pod in view.others] == ["podF", "podG"]
+    assert [pod.id for _, pod in view.others] == ["podF", "podG"]
 
 
 def test_a_pod_registered_nowhere_here_says_who_will_deal_with_it(
     control_env: Path, provider: FakeProvider
 ) -> None:
-    text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
+    text = pods_mod.render(pods_mod.gather(Settings(), {"runpod": provider}, heartbeats=False))
     assert "gpuc host add <name> --pod <id>" in text
     # It bills until somebody ends it, and this is where the command to do that is.
     assert "gpuc host terminate <id> --force" in text
-    view = pods_mod.gather(Settings(), provider, heartbeats=False)
+    view = pods_mod.gather(Settings(), {"runpod": provider}, heartbeats=False)
     assert [row.host for row in view.rows] == [None, None]
 
 
 def test_empty_account_renders_a_hint(control_env: Path) -> None:
-    text = pods_mod.render(pods_mod.gather(Settings(), FakeProvider()))
+    text = pods_mod.render(pods_mod.gather(Settings(), {"runpod": FakeProvider()}))
     assert "(no pods with our prefix)" in text
 
 
@@ -122,7 +123,7 @@ def test_status_forgets_a_rental_the_provider_no_longer_has(
 ) -> None:
     """A rental that ended itself is a state, not a host nobody can reach."""
     _register("gpuc-e2e-aaa", "pod1")
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: FakeProvider())
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider())
     capsys.readouterr()
 
     assert main(["status"]) == EXIT_OK
@@ -138,7 +139,7 @@ def test_status_json_forgets_the_rental_it_just_reported(
 ) -> None:
     """The document still lists the host; the entry is gone once it is printed."""
     _register("gpuc-e2e-aaa", "pod1")
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: FakeProvider())
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider())
     capsys.readouterr()
 
     assert main(["status", "--json"]) == EXIT_OK

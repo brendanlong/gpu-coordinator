@@ -14,7 +14,6 @@ from gpuc.control.providers.base import (
     CreateRefused,
     Offer,
     Pod,
-    PodStatus,
     ProviderError,
     owned_pods,
 )
@@ -47,7 +46,7 @@ class RecordedRunPod(RunPodProvider):
         raise AssertionError(f"unexpected request {method} {path}")
 
 
-def pod(name: str, cost: float, status: PodStatus = "RUNNING") -> Pod:
+def pod(name: str, cost: float, status: str = "RUNNING") -> Pod:
     return Pod(id=name, name=name, status=status, cost_usd_hr=cost)
 
 
@@ -163,7 +162,7 @@ def test_create_requires_our_prefix() -> None:
     provider = RecordedRunPod()
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
     with pytest.raises(ProviderError, match="must start with"):
-        provider.create(offer, "scratch-pod")
+        provider.create(offer, "scratch-pod", image="img", disk_gb=20)
     assert not any(path == "/pods" for _, path, _ in provider.requests)
 
 
@@ -191,7 +190,7 @@ def test_runpod_says_which_statuses_are_dead_and_which_are_gone() -> None:
     assert provider.broken_host.search("failed to create shim task: OCI runtime create failed")
 
 
-@pytest.mark.runpod
+@pytest.mark.rental
 @pytest.mark.skipif(not os.environ.get("RUNPOD_API_KEY"), reason="needs RUNPOD_API_KEY")
 def test_live_a40_secure_offers() -> None:
     offers = RunPodProvider().offers(
@@ -231,7 +230,7 @@ def test_only_a_4xx_create_is_a_refusal(status: int, refused: bool) -> None:
     provider = Failing()
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
     with pytest.raises(ProviderError) as error:
-        provider.create(offer, "gpuc-x")
+        provider.create(offer, "gpuc-x", image="img", disk_gb=20)
     assert isinstance(error.value, CreateRefused) is refused
 
 
@@ -249,5 +248,5 @@ def test_an_unreadable_create_answer_is_a_provider_error(answer: Any) -> None:
     provider = Garbled()
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
     with pytest.raises(ProviderError) as error:
-        provider.create(offer, "gpuc-x")
+        provider.create(offer, "gpuc-x", image="img", disk_gb=20)
     assert not isinstance(error.value, CreateRefused)
