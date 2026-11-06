@@ -14,7 +14,7 @@ import re
 import urllib.error
 from collections.abc import Callable
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
@@ -25,7 +25,14 @@ from gpuc.control.config import (
     registry_transaction,
     utc_now,
 )
-from gpuc.control.providers.base import Constraints, Offer, Pod, ProviderError, offer_satisfies
+from gpuc.control.providers.base import (
+    Constraints,
+    Offer,
+    Pod,
+    ProviderError,
+    Unauthorized,
+    offer_satisfies,
+)
 from gpuc.control.provision import (
     Match,
     ProvisionDeps,
@@ -164,12 +171,28 @@ def test_create_uses_the_spec_defaults(
     control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:
     provider = FakeProvider([make_offer()])
-    run(provider, host, offline_health, image="runpod/pytorch:test", disk_gb=20)
+    provision(
+        CONSTRAINTS.model_copy(update={"disk_gb": 20}),
+        Settings(),
+        provider=provider,
+        image="runpod/pytorch:test",
+        report=lambda _: None,
+        health_options=offline_health,
+        deps=deps(host),
+    )
     created = provider.created[0]
     assert created["image"] == "runpod/pytorch:test"
     assert created["disk_gb"] == 20
     assert created["cuda_min"] == "12.8"
     assert created["name"].startswith("gpuc-")
+
+
+def test_no_image_is_the_providers_own(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    provider = FakeProvider([make_offer()])
+    run(provider, host, offline_health)
+    assert provider.created[0]["image"] == provider.default_image
 
 
 def test_the_one_cuda_floor_reaches_the_catalog_query_and_the_create(
@@ -206,6 +229,23 @@ def test_capacity_error_advances_to_the_next_offer(
     assert [c["offer"].gpu_id for c in provider.created] == ["cheap", "dearer"]
     assert provider.terminated == []  # nothing was ever created for the first offer
     assert load_registry().hosts[entry.name].pod_id == "pod1"
+
+
+def test_a_key_that_may_not_create_stops_at_the_first_offer(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    """A read-only key is refused on every offer alike; trying them all says
+    the same thing fifty times."""
+
+    class ReadOnly(FakeProvider):
+        def create(self, offer: Offer, name: str, **kwargs: Any) -> Pod:
+            self.created.append({"offer": offer})
+            raise Unauthorized("HTTP 401: your key lacks the instance_write permission")
+
+    provider = ReadOnly([make_offer(price=0.20, gpu_id="a"), make_offer(price=0.40, gpu_id="b")])
+    with pytest.raises(ProvisionError, match="no other offer could fix this"):
+        run(provider, host, offline_health)
+    assert len(provider.created) == 1
 
 
 def test_broken_host_log_terminates_and_replaces(

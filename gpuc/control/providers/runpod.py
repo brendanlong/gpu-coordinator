@@ -16,7 +16,6 @@ from gpuc._version import user_agent
 
 from .base import (
     DEFAULT_CUDA_MIN,
-    DEFAULT_IMAGE,
     DEFAULT_PREFIX,
     Cloud,
     Constraints,
@@ -26,12 +25,14 @@ from .base import (
     Provider,
     ProviderError,
     SshEndpoint,
+    Unauthorized,
     cuda_key,
     gpu_name_key,
     matches_gpu_names,
     offer_satisfies,
 )
 
+IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 LOG_READ_S = 10.0
 """How long a log tail reads the SSE stream: it stays open after the backfill."""
 DEFAULT_POD_ENV = {"HF_HUB_ENABLE_HF_TRANSFER": "0"}
@@ -85,6 +86,9 @@ class RunPodProvider(Provider):
     whole flow without waiting them out."""
 
     name = "runpod"
+    api_key_env = "RUNPOD_API_KEY"
+    default_image = IMAGE
+    clouds = ("SECURE", "COMMUNITY")
 
     def __init__(
         self,
@@ -93,9 +97,9 @@ class RunPodProvider(Provider):
         prefix: str = DEFAULT_PREFIX,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        key = api_key or os.environ.get("RUNPOD_API_KEY")
+        key = api_key or os.environ.get(self.api_key_env)
         if not key:
-            raise ProviderError("RUNPOD_API_KEY is not set")
+            raise ProviderError(f"{self.api_key_env} is not set")
         self._api_key = key
         self.prefix = prefix
         self._sleep = sleep
@@ -163,7 +167,7 @@ class RunPodProvider(Provider):
 
     def offers(self, constraints: Constraints) -> list[Offer]:
         found: list[Offer] = []
-        for cloud in constraints.clouds:
+        for cloud in constraints.clouds or self.clouds[:1]:
             params: dict[str, Any] = {
                 "include": "AVAILABILITY",
                 "product": "POD",
@@ -220,8 +224,8 @@ class RunPodProvider(Provider):
         offer: Offer,
         name: str,
         *,
-        image: str = DEFAULT_IMAGE,
-        disk_gb: int = 20,
+        image: str,
+        disk_gb: int,
         cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod:
@@ -241,6 +245,8 @@ class RunPodProvider(Provider):
         try:
             created = self._json("POST", "/pods", body=body)
         except RunPodError as error:
+            if error.status in (401, 403):
+                raise Unauthorized(str(error)) from error
             if 400 <= error.status < 500:
                 raise CreateRefused(str(error)) from error
             raise

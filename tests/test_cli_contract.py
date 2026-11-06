@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from gpuc.control import status as status_mod
+from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import (
     EXIT_ERROR,
     EXIT_INTERRUPTED,
@@ -1201,7 +1202,7 @@ def test_host_terminate_json_is_what_was_ended_and_what_it_was_doing(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"), PodScript(ssh_after_polls=0))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
     register_host(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4", pod_id="pod1")
     capsys.readouterr()
 

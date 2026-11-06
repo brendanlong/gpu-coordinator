@@ -8,6 +8,10 @@ the pod 404s within two seconds), so no account key needs to be delivered. The
 catch is that RunPod puts that key and RUNPOD_POD_ID in /etc/rp_environment,
 which only *interactive* shells source -- and the dispatcher is started over a
 non-interactive SSH session, so we read that file ourselves.
+
+Vast does the same with a key scoped to the one instance, `CONTAINER_API_KEY`,
+and its id, `CONTAINER_ID`: set on the container, so in PID 1's environment,
+and absent from an SSH session's.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from gpuc.host import USER_AGENT, paths
 from gpuc.host.jobs import HostConfig, parse_env_file
 
 RUNPOD_API = "https://api.runpod.io/v2"
+VAST_API = "https://console.vast.ai/api/v0"
 DEFAULT_TIMEOUT_S = 60.0
 
 TerminateCall = Callable[[str, str], str]
@@ -43,6 +48,20 @@ def rp_environment() -> dict[str, str]:
     return parse_env_file(rp_environment_path())
 
 
+def container_environment_path() -> Path:
+    return Path(os.environ.get("GPUC_CONTAINER_ENVIRONMENT", "/proc/1/environ"))
+
+
+def container_environment() -> dict[str, str]:
+    """PID 1's environment: what the container was started with."""
+    try:
+        raw = container_environment_path().read_bytes()
+    except OSError:
+        return {}
+    pairs = (item.decode(errors="replace").partition("=") for item in raw.split(b"\0") if item)
+    return {key: value for key, _, value in pairs}
+
+
 @dataclass(frozen=True)
 class Provider:
     """What ending a rental needs from one provider: the call, and where the
@@ -52,8 +71,9 @@ class Provider:
     api_key_env: str
     pod_id_env: str
     environment_file: Callable[[], dict[str, str]]
-    """The provider's own on-pod environment file, sourced by interactive
-    shells only, so read here rather than inherited."""
+    """Where the provider leaves the pod's own id and key, which an SSH
+    session does not inherit, so read here."""
+    environment_path: Callable[[], Path]
 
 
 def _provider(kind: str) -> Provider:
@@ -78,7 +98,7 @@ def read_api_key(kind: str = "runpod") -> str:
         return pod_key
     raise TerminateError(
         f"no provider API key: {path} is missing or empty, {provider.api_key_env} is unset, "
-        f"and {rp_environment_path()} has no {provider.api_key_env}"
+        f"and {provider.environment_path()} has no {provider.api_key_env}"
     )
 
 
@@ -99,17 +119,33 @@ def read_pod_id(config: dict[str, Any] | None = None) -> str:
         return pod_id
     raise TerminateError(
         f"no pod id: config.json has no provider.pod_id, {provider.pod_id_env} is unset, "
-        f"and {rp_environment_path()} has no {provider.pod_id_env}"
+        f"and {provider.environment_path()} has no {provider.pod_id_env}"
     )
 
 
 def runpod_terminate(pod_id: str, api_key: str) -> str:
-    url = f"{RUNPOD_API}/pods/{pod_id}/action"
     body = json.dumps({"action": "terminate"}).encode()
+    return _call("POST", f"{RUNPOD_API}/pods/{pod_id}/action", api_key, body)
+
+
+def vast_terminate(pod_id: str, api_key: str) -> str:
+    """Destroy, not stop: a stopped instance goes on billing for its disk.
+    Vast can refuse with a 200 and `success: false`, which is no destroy."""
+    body = _call("DELETE", f"{VAST_API}/instances/{pod_id}/", api_key)
+    try:
+        answer = json.loads(body) if body.strip() else {}
+    except ValueError:
+        answer = {}
+    if isinstance(answer, dict) and answer.get("success") is False:
+        raise TerminateError(f"DELETE instance {pod_id} refused: {body[-500:]}")
+    return body
+
+
+def _call(method: str, url: str, api_key: str, body: bytes | None = None) -> str:
     request = urllib.request.Request(
         url,
         data=body,
-        method="POST",
+        method=method,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -122,13 +158,22 @@ def runpod_terminate(pod_id: str, api_key: str) -> str:
             return response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[-500:]
-        raise TerminateError(f"POST {url} -> HTTP {exc.code}: {detail}") from exc
+        raise TerminateError(f"{method} {url} -> HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise TerminateError(f"POST {url} failed: {exc.reason}") from exc
+        raise TerminateError(f"{method} {url} failed: {exc.reason}") from exc
 
 
 PROVIDERS: dict[str, Provider] = {
-    "runpod": Provider(runpod_terminate, "RUNPOD_API_KEY", "RUNPOD_POD_ID", rp_environment),
+    "runpod": Provider(
+        runpod_terminate, "RUNPOD_API_KEY", "RUNPOD_POD_ID", rp_environment, rp_environment_path
+    ),
+    "vast": Provider(
+        vast_terminate,
+        "CONTAINER_API_KEY",
+        "CONTAINER_ID",
+        container_environment,
+        container_environment_path,
+    ),
 }
 
 

@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from gpuc.control import version as version_mod
+from gpuc.control.actions import PROVIDERS
 from gpuc.control.bootstrap import BootstrapError, BootstrapResult, HealthOptions
 from gpuc.control.clean import purge_host
 from gpuc.control.cli import (
@@ -580,7 +581,7 @@ def test_host_rent_passes_the_flags_through_and_names_the_host(
     assert constraints.gpu_names == ["A40", "RTX PRO 6000"]
     assert constraints.max_price_usd_hr == 0.60
     assert constraints.clouds == ["SECURE", "COMMUNITY"]
-    assert (seen["idle_minutes"], seen["disk_gb"], seen["name_hint"]) == (2.0, 20, "e2e")
+    assert (seen["idle_minutes"], constraints.disk_gb, seen["name_hint"]) == (2.0, 20, "e2e")
     document = json.loads(capsys.readouterr().out)
     assert (document["name"], document["kind"], document["matching_rentals"]) == (
         "gpuc-e2e-1",
@@ -668,11 +669,12 @@ def test_pods_lists_ours_and_counts_the_others(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider(existing=[running_pod("other-tenant", "podF")])
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
     assert main(["pods", "--no-heartbeat"]) == 0
     out = capsys.readouterr().out
     assert "gpuc-e2e-aaa" in out
-    assert "1 other pod(s) in the account, never touched: other-tenant (RUNNING)" in out
+    assert "1 other pod(s) in the accounts, never touched: other-tenant (runpod, RUNNING)" in out
+    assert "not asked, vast: VAST_API_KEY is not set" in out
 
 
 # -- first-run experience -------------------------------------------------------
@@ -737,20 +739,20 @@ def test_no_note_once_a_config_file_exists(
 def test_runpod_commands_fail_fast_without_an_api_key(
     control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Before the spec is mirrored, before a host is picked, before any spend."""
+    """Before anything is bought, and saying which key is missing."""
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    for argv in (
-        ["host", "rent", "--provider", "runpod", "--gpu", "A40"],
-        ["pods"],
-        ["host", "add", "rented", "--pod", "pod1"],
-        ["host", "terminate", "gpuc-e2e-aaa"],
-    ):
-        assert main(argv) == 1
-        err = capsys.readouterr().err
-        assert err.strip().splitlines() == [
-            "error: RUNPOD_API_KEY is not set; export it before using `gpuc host rent`, "
-            "`gpuc host add --pod`, `gpuc host terminate` or `gpuc pods`"
-        ]
+    monkeypatch.setattr(
+        "gpuc.control.hosts.matching_rentals",
+        lambda *a, **k: pytest.fail("nothing may be asked without a key"),
+    )
+    assert main(["host", "rent", "--provider", "runpod", "--gpu", "A40"]) == EXIT_ERROR
+    assert "RUNPOD_API_KEY is not set" in capsys.readouterr().err
+    assert main(["pods"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "RUNPOD_API_KEY is not set" in err and "VAST_API_KEY is not set" in err
+    for argv in (["host", "add", "rented", "--pod", "pod1"], ["host", "terminate", "pod1"]):
+        assert main(argv) == EXIT_NOT_FOUND
+        assert "no API key is set" in capsys.readouterr().err
 
 
 def test_host_rent_refuses_a_pod_with_no_gpu(
@@ -1254,7 +1256,7 @@ def test_logs_of_a_job_whose_rental_has_ended_are_the_mirrors_and_exit_zero(
     job_id = "20260101-000000-aaaaaa"
     register_host(name="gpuc-pod", kind="rental", pod_id="pod-1", ssh="root@1.2.3.4")
     _mirrored_log(monkeypatch, "gpuc-pod", job_id)
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: FakeProvider())
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider())
     _probes(monkeypatch, {"gpuc-pod": RemoteError("gpuc-pod", "printf %s", "must not be asked")})
     capsys.readouterr()
     assert main(["logs", job_id]) == 0
@@ -2440,7 +2442,7 @@ def test_pods_json_separates_ours_from_everyone_elses(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider(existing=[running_pod("subrep-other", "podF")])
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
     capsys.readouterr()
     assert main(["pods", "--no-heartbeat", "--json"]) == 0
     document = one_document(capsys)
@@ -2448,7 +2450,9 @@ def test_pods_json_separates_ours_from_everyone_elses(
     assert pod["name"] == "gpuc-e2e-aaa"
     assert pod["host"] is None
     assert pod["heartbeat_age_s"] is None
-    assert document["others"] == [{"id": "podF", "name": "subrep-other", "status": "RUNNING"}]
+    assert document["others"] == [
+        {"provider": "runpod", "id": "podF", "name": "subrep-other", "status": "RUNNING"}
+    ]
 
 
 def test_clean_json_carries_what_went_and_what_was_kept(
@@ -2691,7 +2695,7 @@ def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
     with registry_transaction() as registry:
         registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: _NoPods())
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: _NoPods())
     capsys.readouterr()
 
     assert main(["host", "bootstrap", "--all"]) == 0
@@ -2711,7 +2715,7 @@ def test_host_bootstrap_all_forgets_a_terminated_rental_too(
         registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     terminated = Pod(id="p1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
-    monkeypatch.setattr("gpuc.control.actions.make_provider", lambda *a, **k: _NoPods(terminated))
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: _NoPods(terminated))
     capsys.readouterr()
 
     assert main(["host", "bootstrap", "--all"]) == 0
@@ -2820,7 +2824,7 @@ def adoptable(monkeypatch: pytest.MonkeyPatch, fake_host: FakeHost) -> FakeProvi
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
     fake_host.put_file(
         json.dumps(
             {
@@ -2866,8 +2870,8 @@ def test_host_add_pod_refuses_a_pod_that_is_gone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adoptable(monkeypatch, fake_host)
-    assert main(["host", "add", "rented", "--pod", "podX"]) == EXIT_ERROR
-    assert "nothing to add" in capsys.readouterr().err
+    assert main(["host", "add", "rented", "--pod", "podX"]) == EXIT_NOT_FOUND
+    assert "no host or pod named 'podX'" in capsys.readouterr().err
     assert load_registry().hosts == {}
 
 
@@ -2887,7 +2891,7 @@ def test_a_pod_whose_bootstrap_failed_says_it_will_not_end_itself(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
 
     def fail(*_: Any, **__: Any) -> BootstrapResult:
         raise BootstrapError("host health failed")
@@ -2910,7 +2914,7 @@ def test_host_add_pod_says_an_unbootstrapped_pod_will_never_end_itself(
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
 
     assert (
         main(["host", "add", "rented", "--pod", "pod1", "--gpus", "GPU-1111", "--no-bootstrap"])
@@ -2930,7 +2934,7 @@ def rented_host(monkeypatch: pytest.MonkeyPatch) -> FakeProvider:
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     provider = FakeProvider()
     provider.adopt(running_pod("gpuc-e2e-aaa", "pod1"))
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
     register_host(name="gpuc-e2e-aaa", kind="rental", ssh="root@1.2.3.4", pod_id="pod1")
     return provider
 

@@ -39,6 +39,7 @@ from gpuc.control.actions import (
     UsageError,
     cancel_jobs,
     config_document,
+    every_provider,
     exit_code_for,
     failure_message,
     find_job,
@@ -47,7 +48,6 @@ from gpuc.control.actions import (
     init_config,
     jobs_answer,
     locate,
-    make_provider,
     preempt_jobs,
     read_log,
     registry_answer,
@@ -95,7 +95,7 @@ from gpuc.control.hosts import (
 )
 from gpuc.control.jsonout import note, warn
 from gpuc.control.probe import probe_host
-from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud
+from gpuc.control.providers.base import DEFAULT_CUDA_MIN, MINIMUMS, Cloud
 from gpuc.control.remote import HostSession, RemoteError, open_session, read_config, resolve_home
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import SubmitResult
@@ -330,7 +330,7 @@ def cmd_host_terminate(args: argparse.Namespace) -> Answer:
         args.name,
         settings,
         registry=open_registry().named(),
-        provider=make_provider(settings),
+        providers=every_provider(settings)[0],
         force=args.force,
         report=note,
     )
@@ -521,6 +521,16 @@ def _probe_config(entry: HostEntry, settings: Settings) -> dict[str, Any] | None
         return None
 
 
+MINIMUM_UNITS: dict[str, tuple[str, str]] = {
+    "gpu_ram_gb": ("GB", "Vast only: at least this much memory on each GPU"),
+    "tflops": ("TFLOPS", "Vast only: at least this much total compute, as Vast measures it"),
+    "inet_down_mbps": ("MBPS", "Vast only: download at least this fast, in Mb/s"),
+    "inet_up_mbps": ("MBPS", "Vast only: upload at least this fast, in Mb/s"),
+    "disk_bw_mbps": ("MBPS", "Vast only: disk reads at least this fast, in MB/s"),
+    "reliability": ("FRACTION", "Vast only: a machine reliability score of at least this (0-1)"),
+}
+"""`--help` for each flag of `MINIMUMS`."""
+
 CLOUDS: dict[str, list[Cloud]] = {
     "secure": ["SECURE"],
     "community": ["COMMUNITY"],
@@ -533,9 +543,14 @@ def rental_options(args: argparse.Namespace) -> RentalOptions:
         provider=args.provider,
         gpu_names=[name.strip() for name in (args.gpu or "").split(",") if name.strip()],
         max_price_usd_hr=args.max_price,
-        clouds=CLOUDS[args.cloud],
+        clouds=CLOUDS[args.cloud] if args.cloud else [],
         cuda_min=args.cuda_min,
         gpu_count=args.gpu_count,
+        minimums={
+            key: getattr(args, flag.removeprefix("--").replace("-", "_"))
+            for key, flag in MINIMUMS.items()
+            if getattr(args, flag.removeprefix("--").replace("-", "_")) is not None
+        },
         force=args.force,
         name_hint=args.name_hint,
         disk_gb=args.disk,
@@ -1025,8 +1040,11 @@ def cmd_requeue(args: argparse.Namespace) -> Answer:
 
 def cmd_pods(args: argparse.Namespace) -> Answer:
     settings = load_settings()
-    view = pods_mod.gather(settings, make_provider(settings), heartbeats=not args.no_heartbeat)
-    return Answer(view.document(), pods_mod.render(view))
+    providers, missing = every_provider(settings)
+    if not providers:
+        raise CliError("no provider can be asked: " + "; ".join(missing))
+    view = pods_mod.gather(settings, providers, missing=missing, heartbeats=not args.no_heartbeat)
+    return Answer(view.document(), pods_mod.render(view), failures=view.failures)
 
 
 def cmd_version(args: argparse.Namespace) -> Answer:
@@ -1118,8 +1136,9 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument(
         "--pod",
         metavar="POD_ID",
-        help="adopt a RunPod pod this account is already renting, whichever machine created "
-        "it: its address comes from the provider and its config from the pod",
+        help="adopt a pod (or Vast instance) one of your provider accounts is already "
+        "renting, whichever machine created it: its address comes from the provider and its "
+        "config from the pod",
     )
     add.add_argument(
         "--gpus",
@@ -1762,10 +1781,13 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--cloud",
         choices=sorted(CLOUDS),
-        default="secure",
-        help="which RunPod tier to buy from; community is cheaper and less reliable "
+        help="RunPod only: which tier to buy from; community is cheaper and less reliable "
         "(default secure)",
     )
+    for key, flag in MINIMUMS.items():
+        parser.add_argument(
+            flag, type=float, metavar=MINIMUM_UNITS[key][0], help=MINIMUM_UNITS[key][1]
+        )
     parser.add_argument(
         "--cuda-min",
         default=DEFAULT_CUDA_MIN,
@@ -1788,14 +1810,6 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--name-hint", default="job", help="goes into the pod name")
     parser.add_argument("--health-args", default="", help="extra flags for `gpuc.host health`")
-
-
-def wants_runpod(args: argparse.Namespace) -> bool:
-    if getattr(args, "pod", None):
-        return True  # `gpuc host add --pod` asks the provider where that pod is
-    if args.command == "host" and args.host_command in ("rent", "terminate"):
-        return True
-    return args.command == "pods"
 
 
 def first_run_note() -> None:
@@ -1844,15 +1858,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if code and "--json" in raw:
             jsonout.emit_error("the command line was rejected; the reason is on stderr", code)
         raise
-    if wants_runpod(args) and not os.environ.get("RUNPOD_API_KEY"):
-        # Before anything else: provisioning spends money, and a missing key
-        # is better found before the registry or a provider is touched.
-        return failed(
-            args,
-            "RUNPOD_API_KEY is not set; export it before using `gpuc host rent`, "
-            "`gpuc host add --pod`, `gpuc host terminate` or `gpuc pods`",
-            EXIT_ERROR,
-        )
     if args.command not in ("config", "skill"):
         first_run_note()
     try:

@@ -63,7 +63,8 @@ def install_service(bind: str, port: int, report: Reporter = print) -> list[Path
         "  systemctl --user daemon-reload\n"
         f"  systemctl --user enable --now {SERVICE_NAME}\n"
         f"  journalctl --user -u {SERVICE_NAME} -f\n"
-        f"It reads RUNPOD_API_KEY from {config_dir()}/env if that file exists, and needs "
+        f"It reads provider keys (RUNPOD_API_KEY, VAST_API_KEY) from {config_dir()}/env if "
+        f"that file exists, and needs "
         f"`loginctl enable-linger` to outlive your login session."
     )
     return written

@@ -61,18 +61,20 @@ gpuc host probe gpubox --all-gpus                             # what the box has
 Cards can be named by nvidia-smi index or UUID. Shared cards are only used by
 jobs that ask for them ([usage.md](usage.md#shared-gpus)).
 
-### A RunPod rental
+### A rental (RunPod or Vast.ai)
 
 `gpuc host rent` rents a pod, sets it up and registers it as a host, and the
 pod shuts itself down once its queue has been empty for 15 minutes.
 
 ```sh
-export RUNPOD_API_KEY=...
+export RUNPOD_API_KEY=...         # or VAST_API_KEY for --provider vast
 gpuc host rent --provider runpod --gpu A40 --max-price 0.60
 gpuc submit job.yaml --host <the name it printed>
 ```
 
-Your `ssh_key`'s public half is added to the RunPod account the first time.
+Your `ssh_key`'s public half is added to the provider account the first time.
+Vast.ai is cheaper and its machines vary more; see
+[usage.md](usage.md#rentals) for the floors that keep the slow ones out.
 Choosing GPUs, renting more than one and ending a pod early are in
 [usage.md](usage.md#rentals).
 
@@ -93,9 +95,9 @@ gpuc config show     # the settings in effect
 | --- | --- | --- |
 | `s3_bucket` | unset | an S3 bucket gpuc mirrors job specs, logs and state to, so you can read a job's log and resubmit it after its host is gone. Strongly recommended with rentals |
 | `ssh_key` | unset | the private key used to reach hosts |
-| `image` | a RunPod PyTorch image | the default pod image for rentals |
+| `image` | each provider's own | the image every rental gets; RunPod's default is a PyTorch image, Vast's its base image |
 | `disk_gb` | `50` | the default pod disk for rentals |
-| `runpod_pod_prefix` | `"gpuc-"` | gpuc only ever touches pods whose name starts with this |
+| `runpod_pod_prefix` | `"gpuc-"` | gpuc only ever touches rentals whose name starts with this, at every provider |
 
 This machine reaches the bucket with your usual AWS credentials (environment,
 `~/.aws/credentials`, or an instance role). Rentals get mirrored to it

@@ -948,7 +948,18 @@ which mean the rental has ended (`gone_statuses`), which mean it can be
 dialled (`running_statuses`), the log signature of a broken host, and how a
 terminate is retried and confirmed (`terminate_confirmed`). Nothing outside
 `providers/` names a status; `actions.PROVIDERS` maps a rental's `provider`
-name to its class. Adding a provider is one class and one table entry.
+name to its class. Adding a provider is one class and one table entry, plus
+its self-terminate in `gpuc/host/terminate.py`.
+
+Every command asks each rental about at its own provider (`Providers`, by
+name), built only for the providers its hosts are rented from and only if
+that provider's key is set; one without a key is reported, never fatal to
+the others. `pods`, `host add --pod` and a bare pod id to `host terminate`
+look at every provider whose key is set. A request's floors
+(`Constraints.minimums`) are judged by the one `offer_satisfies`, against a
+search's offers and a registered rental's recorded one alike; a floor a
+provider cannot search by (`Provider.filters`) is a usage error, never
+dropped.
 
 ### RunPod (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
 
@@ -968,6 +979,31 @@ name to its class. Adding a provider is one class and one table entry.
   and a timeout). `terminate(id)`: `POST /pods/{id}/action {"action":"terminate"}`
   then poll `get` until `TERMINATED` or 404. `list()`:
   `GET /pods?includeClusterPods=true`.
+
+### Vast.ai (REST, `https://console.vast.ai/api/v0`, bearer `VAST_API_KEY`)
+
+- `offers(constraints)`: one `POST /bundles/` for on-demand, verified,
+  rentable machines with `num_gpus` equal to the count, `direct_port_count >= 1`
+  (rsync cannot use Vast's ssh proxy), `disk_space >= disk`, `cuda_max_good >=`
+  the floor, `dph_total <=` the cap and each floor (`gpu_ram` in MB). GPU names
+  are *not* searched: Vast matches only its own spelling, so every offer comes
+  back (~600 for one GPU) and names are matched by `offer_satisfies`. An offer
+  is one machine; its `id` is `Offer.offer_id`.
+- `create(offer)`: `PUT /asks/{offer_id}/` with `image`, `disk`, `label`
+  (the pod name), `runtype: "ssh_direct"`, `cancel_unavail: true`. A 4xx is
+  `CreateRefused` (an offer someone else took is 404/410). The account's ssh
+  keys (`GET`/`POST /ssh/`) go into every instance.
+- `get(id)`: `GET /instances/{id}/`, `{"instances": null}` or 404 once gone.
+  Status is `actual_status` (`created` before there is one), or `destroyed`
+  once `cur_state` is `unloaded`. Running: `running`; dead: `exited`,
+  `stopped`, `offline`, `destroyed`; gone: `destroyed`. The ssh door is
+  `public_ipaddr` and `ports["22/tcp"][0].HostPort`, as root.
+- `terminate(id)`: `DELETE /instances/{id}/` (destroy: a stopped instance
+  bills for its disk). `logs(id)`: `PUT /instances/request_logs/{id}/` names a
+  URL the log appears at a moment later. `list()`: `GET /instances/`.
+- The instance ends itself with the per-instance `CONTAINER_API_KEY`, which can
+  destroy only that instance, and `CONTAINER_ID`: set on the container, so read
+  from `/proc/1/environ`, since an ssh session does not inherit them.
 
 ## Provisioning flow (`gpuc host rent`)
 
@@ -993,7 +1029,7 @@ the same submit path as every other host.
    its `first_config`, whose `provider` block carries the offer and
    `created_at` (`rented.py`: the pod is its own record, and this machine
    keeps none); run bootstrap; register it. The pod terminates itself with the
-   pod-scoped key RunPod leaves in its own `/etc/rp_environment`.
+   pod-scoped key its provider leaves on it.
 3. **One ceiling bounds the whole attempt** (`CEILING_MINUTES`), every offer
    included, and every failure gets one of three verdicts
    (`provision.verdict`): *keep waiting*, *next offer*, or *abort* (a local
@@ -1129,8 +1165,8 @@ every bootstrap and reported back by `python -m gpuc.host status`
 ## Testing rules
 
 - `./check.sh` is the whole suite, and what CI runs. A bare `pytest` is safe
-  too: `addopts` in `pyproject.toml` excludes the `runpod` marker, so the tests
-  that rent hardware never run by accident -- opt in with `pytest -m runpod`.
+  too: `addopts` in `pyproject.toml` excludes the `rental` marker, so the tests
+  that rent hardware never run by accident -- opt in with `pytest -m rental`.
   Nothing else is excluded by default.
 - `./check.sh` runs the suite in parallel (`pytest-xdist`, `-n auto`), so a
   test owns everything it touches: paths under its own `tmp_path`, ports the
@@ -1146,10 +1182,11 @@ every bootstrap and reported back by `python -m gpuc.host status`
   (`torch.zeros(8)`), never more than ~100 MB VRAM because other people's jobs
   share the card, and they skip themselves on a machine whose `nvidia-smi` does
   not report `tests.conftest.LOCAL_GPU_UUID` -- which is every CI runner.
-- RunPod integration: A40 only, `--max-price 0.60`, a job whose command
-  is under two minutes, `--idle-min 2`, and the test asserts teardown via
-  `list()` and prints the final `GET /billing/pods`
-  for the pod. A pod whose name lacks the `runpod_pod_prefix` belongs to
+- Rental integration (`test_rental_e2e.py`, one case per provider): the
+  cheapest small card (an A40 on RunPod at `--max-price 0.60`, a consumer card
+  on Vast at `--max-price 0.40` with network and reliability floors), a job
+  whose command is under two minutes, `--idle-min 2`, and the test asserts
+  the self-terminate via the provider's `get`. A pod whose name lacks the `runpod_pod_prefix` belongs to
   someone else: read it in `list()`, never act on it. Every test that creates
   a pod has a `finally` that terminates it.
 

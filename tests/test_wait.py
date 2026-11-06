@@ -27,6 +27,7 @@ from unittest import mock
 import pytest
 
 from gpuc.control import wait as wait_mod
+from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import (
     EXIT_ERROR,
     EXIT_INTERRUPTED,
@@ -371,9 +372,10 @@ def test_wait_reads_a_terminated_rental_from_the_mirror_without_waiting_out_the_
             )
         )
     ended = Pod(id="pod-1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
-    monkeypatch.setattr(
-        "gpuc.control.actions.make_provider",
-        lambda *_a, **_k: FakeProvider(existing=[ended]),
+    monkeypatch.setitem(
+        PROVIDERS,
+        "runpod",
+        lambda *_: FakeProvider(existing=[ended]),
     )
 
     def unreachable(*_a: Any, **_k: Any) -> Any:
