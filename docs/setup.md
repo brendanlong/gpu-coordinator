@@ -63,13 +63,13 @@ jobs that ask for them ([usage.md](usage.md#shared-gpus)).
 
 ### A RunPod rental
 
-There is nothing to register: `gpuc submit --runpod` rents a pod, sets it up
-and queues the job on it, and the pod shuts itself down once its queue has been
-empty for 15 minutes.
+`gpuc host rent` rents a pod, sets it up and registers it as a host, and the
+pod shuts itself down once its queue has been empty for 15 minutes.
 
 ```sh
 export RUNPOD_API_KEY=...
-gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60
+gpuc host rent --provider runpod --gpu A40 --max-price 0.60
+gpuc submit job.yaml --host <the name it printed>
 ```
 
 Your `ssh_key`'s public half is added to the RunPod account the first time.

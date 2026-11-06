@@ -1,4 +1,4 @@
-"""Turn constraints into a bootstrapped RunPod host, or give the money back.
+"""Turn constraints into a bootstrapped rented host, or give the money back.
 
 The local side owns an ephemeral host until it has proven healthy, so every
 failure path here ends in a terminate the provider has confirmed before the
@@ -74,7 +74,7 @@ from gpuc.control.status import parse_status
 from gpuc.control.transport import LocalToolMissing, SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
-"""How long one `submit --runpod` may spend buying, waiting for and proving a
+"""How long one `host rent` may spend buying, waiting for and proving a
 host, every offer it tries included. Per attempt, not per offer: with N
 offers a per-offer ceiling was N x 15 minutes of somebody's evening."""
 POLL_INTERVAL_S = 5.0
@@ -209,7 +209,6 @@ def provision(
     constraints: Constraints,
     settings: Settings,
     *,
-    reuse: bool = False,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
     disk_gb: int = DEFAULT_DISK_GB,
@@ -219,12 +218,7 @@ def provision(
     health_options: HealthOptions = DEFAULT_HEALTH,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
-    """Create, wait for, bootstrap and register one pod, or with `reuse` return a
-    live one that already matches. Returns its registry entry."""
-    if reuse:
-        existing = pick_reusable_host(constraints, settings, provider=provider, report=report)
-        if existing is not None:
-            return existing
+    """Create, wait for, bootstrap and register one pod. Returns its registry entry."""
     deps = deps or ProvisionDeps()
     progress = _Progress(report, deps.now)
 

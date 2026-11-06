@@ -30,6 +30,7 @@ from gpuc.control.actions import (
     EXIT_OK,
     EXIT_USAGE,
     INDEX_SHORT,
+    PROVIDERS,
     Answer,
     CliError,
     Done,
@@ -83,19 +84,22 @@ from gpuc.control.config import (
 from gpuc.control.fetch import fetch_jobs, fetch_line
 from gpuc.control.gpuinfo import owned_entries, summarize
 from gpuc.control.gpuinfo import rows as gpu_rows
-from gpuc.control.hosts import add_host, bootstrap_and_record, bootstrap_every_host, set_host
+from gpuc.control.hosts import (
+    DEFAULT_IDLE_MINUTES,
+    RentalOptions,
+    add_host,
+    bootstrap_and_record,
+    bootstrap_every_host,
+    rent_host,
+    set_host,
+)
 from gpuc.control.jsonout import note, warn
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud
 from gpuc.control.remote import HostSession, RemoteError, open_session, read_config, resolve_home
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import SubmitResult
-from gpuc.control.submitting import (
-    DEFAULT_IDLE_MINUTES,
-    RentalOptions,
-    requeue_job,
-    submit_job,
-)
+from gpuc.control.submitting import requeue_job, submit_job
 from gpuc.control.transport import (
     NO_GIT_EXCLUDES,
     Transport,
@@ -306,6 +310,11 @@ def cmd_host_remove(args: argparse.Namespace) -> Answer:
     document = remove_host(args.name)
     lines = [f"removed host {args.name}", *[f"  {text}" for text in document["notes"]]]
     return Answer(document, "\n".join(lines))
+
+
+def cmd_host_rent(args: argparse.Namespace) -> Answer:
+    change = rent_host(rental_options(args), load_settings(), progress(args))
+    return Answer(change.document, change.render())
 
 
 def cmd_host_terminate(args: argparse.Namespace) -> Answer:
@@ -519,11 +528,9 @@ CLOUDS: dict[str, list[Cloud]] = {
 }
 
 
-def rental_options(args: argparse.Namespace) -> RentalOptions | None:
-    """`--runpod` and its flags, or None when the job names a host instead."""
-    if not args.runpod:
-        return None
+def rental_options(args: argparse.Namespace) -> RentalOptions:
     options = RentalOptions(
+        provider=args.provider,
         gpu_names=[name.strip() for name in (args.gpu or "").split(",") if name.strip()],
         max_price_usd_hr=args.max_price,
         clouds=CLOUDS[args.cloud],
@@ -585,7 +592,6 @@ def cmd_submit(args: argparse.Namespace) -> Answer:
         args.job_file,
         settings,
         host=args.host,
-        rental=rental_options(args),
         overrides=overrides,
         workdir=Path.cwd(),
         use_git=not args.no_git,
@@ -1009,7 +1015,6 @@ def cmd_requeue(args: argparse.Namespace) -> Answer:
         args.job_id,
         load_settings(),
         host=args.host,
-        rental=rental_options(args),
         workdir=Path.cwd(),
         use_git=not args.no_git,
         bootstrap=not args.no_bootstrap,
@@ -1292,6 +1297,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(remove, "what was forgotten: the entry's name, kind and pod id")
     remove.set_defaults(func=cmd_host_remove)
 
+    rent = host.add_parser(
+        "rent",
+        help="reuse a matching rental or rent the cheapest that matches, and register it as "
+        "a host (costs money until it idles out)",
+    )
+    add_rent_flags(rent)
+    add_json_flag(rent, "the host as `host list --json` reports it, and whether it was reused")
+    rent.set_defaults(func=cmd_host_rent)
+
     terminate = host.add_parser(
         "terminate",
         help="end a rented pod now and forget it here (the pod stops billing)",
@@ -1326,7 +1340,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_no_git_flag(submit)
     add_bootstrap_flag(submit)
-    add_runpod_flags(submit)
+    add_moved_runpod_flag(submit)
     add_json_flag(submit)
     submit.set_defaults(func=cmd_submit)
 
@@ -1587,11 +1601,11 @@ def build_parser() -> argparse.ArgumentParser:
     requeue.add_argument(
         "--host",
         metavar="NAME",
-        help="submit to this host instead of the one the job ran on; not with --runpod",
+        help="submit to this host instead of the one the job ran on",
     )
     add_no_git_flag(requeue)
     add_bootstrap_flag(requeue)
-    add_runpod_flags(requeue)
+    add_moved_runpod_flag(requeue)
     add_json_flag(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
@@ -1713,11 +1727,26 @@ def _at_least_one(raw: str) -> int:
     return value
 
 
-def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--runpod", action="store_true", help="reuse or provision a RunPod pod")
+class _RunpodMoved(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, *_: object) -> None:
+        parser.error(
+            "--runpod is gone: rent with `gpuc host rent --provider runpod --gpu <name> ...`, "
+            "then submit with --host and the name it prints"
+        )
+
+
+def add_moved_runpod_flag(parser: argparse.ArgumentParser) -> None:
+    """Where `--runpod` went, for the command lines and scripts that still say it."""
+    parser.add_argument("--runpod", nargs=0, action=_RunpodMoved, help=argparse.SUPPRESS)
+
+
+def add_rent_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--provider", required=True, choices=sorted(PROVIDERS), help="who to rent from"
+    )
     parser.add_argument(
         "--gpu",
-        help="comma-separated GPU names as RunPod lists them ('H100 SXM,RTX 4090'; "
+        help="comma-separated GPU names as the provider lists them ('H100 SXM,RTX 4090'; "
         "case, spaces and a leading NVIDIA do not matter), cheapest match wins",
     )
     parser.add_argument(
@@ -1725,7 +1754,7 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
         type=_at_least_one,
         default=1,
         metavar="N",
-        help="GPUs on the pod (default 1); the spec's `gpus:` must fit in it",
+        help="GPUs on the pod (default 1)",
     )
     parser.add_argument("--max-price", type=float, help="USD per hour, for the whole pod")
     parser.add_argument(
@@ -1758,9 +1787,9 @@ def add_runpod_flags(parser: argparse.ArgumentParser) -> None:
 def wants_runpod(args: argparse.Namespace) -> bool:
     if getattr(args, "pod", None):
         return True  # `gpuc host add --pod` asks the provider where that pod is
-    if args.command == "host" and args.host_command == "terminate":
+    if args.command == "host" and args.host_command in ("rent", "terminate"):
         return True
-    return bool(getattr(args, "runpod", False)) or args.command == "pods"
+    return args.command == "pods"
 
 
 def first_run_note() -> None:
@@ -1814,7 +1843,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the spec has been mirrored and a host picked helps nobody.
         return failed(
             args,
-            "RUNPOD_API_KEY is not set; export it before using --runpod, "
+            "RUNPOD_API_KEY is not set; export it before using `gpuc host rent`, "
             "`gpuc host add --pod`, `gpuc host terminate` or `gpuc pods`",
             EXIT_ERROR,
         )

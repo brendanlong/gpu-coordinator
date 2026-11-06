@@ -62,7 +62,7 @@ def test_a_young_unregistered_pod_is_flagged_as_possibly_still_provisioning(
     control_env: Path, provider: FakeProvider
 ) -> None:
     """The registry entry is written only after connect, minutes into a
-    `submit --runpod`; a pod inside that window is not a leak to end."""
+    `host rent`; a pod inside that window is not a leak to end."""
     text = pods_mod.render(pods_mod.gather(Settings(), provider, heartbeats=False))
     note = next(line for line in text.splitlines() if "provisioning ceiling" in line)
     assert note.startswith("gpuc-e2e-aaa:")

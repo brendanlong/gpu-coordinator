@@ -48,7 +48,7 @@ gpuc/
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
-    provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse
+    provision.py   # `host rent`: offers, create, wait for ssh, bootstrap, reuse
     teardown.py    # `host terminate`: end a rental on purpose, and forget it here
     rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
@@ -965,26 +965,25 @@ name to its class. Adding a provider is one class and one table entry.
   then poll `get` until `TERMINATED` or 404. `list()`:
   `GET /pods?includeClusterPods=true`.
 
-## Provisioning flow (`gpuc submit --runpod`)
+## Provisioning flow (`gpuc host rent`)
 
-1. Parse, validate and prepare the spec (secrets present, `{job_id}`
-   expanded) before anything is bought: the same pipeline as `--host`, which
-   then rents or looks up the host, opens one session, ships this build if the
-   host runs another, judges the fit against the host's own config, stages,
-   enqueues and records the job (local index, then the mirror, once).
-2. Unless `--no-reuse`: pick an existing registered pod whose own config records
+Renting ends at a registered host, and nothing else buys one: `submit`,
+`requeue` and the Snakemake plugin only ever name a host, so a rental takes
+the same submit path as every other host.
+
+1. Unless `--no-reuse`: pick an existing registered pod whose own config records
    an offer that still satisfies the constraints, which owns enough cards, whose
    pod the provider reports RUNNING, whose dispatcher heartbeat is fresh, and
-   which is not draining; enqueue there. A registered pod the provider no longer
+   which is not draining; return it. A registered pod the provider no longer
    has is forgotten rather than dialled.
-3. Else, for each offer in order: `create`; poll `get` until the pod is
+2. Else, for each offer in order: `create`; poll `get` until the pod is
    running **and** `ssh.direct` present; poll SSH until a trivial command
    succeeds; probe the pod once (the same probe `host add` runs); write the pod
    its `first_config`, whose `provider` block carries the offer and
    `created_at` (`rented.py`: the pod is its own record, and this machine
-   keeps none); run bootstrap; enqueue. The pod terminates itself with the
+   keeps none); run bootstrap; register it. The pod terminates itself with the
    pod-scoped key RunPod leaves in its own `/etc/rp_environment`.
-4. **One ceiling bounds the whole attempt** (`CEILING_MINUTES`), every offer
+3. **One ceiling bounds the whole attempt** (`CEILING_MINUTES`), every offer
    included, and every failure gets one of three verdicts
    (`provision.verdict`): *keep waiting*, *next offer*, or *abort* (a local
    ssh misconfiguration, an `ssh` or `rsync` this machine does not have, the
@@ -999,7 +998,7 @@ name to its class. Adding a provider is one class and one table entry.
    a short while, and terminates what it finds before anything else is
    bought. One it cannot look for, or cannot terminate, is reported as
    possibly billing and ends the attempt.
-5. From bootstrap on, the only things that end the pod are the pod itself,
+4. From bootstrap on, the only things that end the pod are the pod itself,
    through that pod-scoped key, and a client running `gpuc host terminate`.
 
 ## Ending a rental on purpose (`gpuc host terminate`, `teardown.py`)

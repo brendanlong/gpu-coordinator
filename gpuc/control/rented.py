@@ -4,7 +4,7 @@ A pod's `config.json` -- the file a host owns, and the only copy of what it is
 -- holds the offer it was bought on and when it was created, under the
 `provider` block that already named its `kind` and `pod_id`. That is what lets
 `gpuc host add --pod` on a second machine register the pod from the pod
-itself, and what `submit --runpod` compares a request against when it reuses
+itself, and what `host rent` compares a request against when it reuses
 one, with nothing the creating machine remembers involved.
 """
 

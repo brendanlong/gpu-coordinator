@@ -16,10 +16,12 @@ from gpuc.control.actions import (
     Interrupted,
     UsageError,
     connection_document,
+    host_document,
     make_provider,
     provider_for,
 )
 from gpuc.control.bootstrap import (
+    DEFAULT_HEALTH,
     BootstrapError,
     BootstrapResult,
     HealthOptions,
@@ -41,6 +43,8 @@ from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import owned_entries
 from gpuc.control.jsonout import warn
 from gpuc.control.probe import ProbeReport, probe_host
+from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
+from gpuc.control.provision import pick_reusable_host, provision
 from gpuc.control.remote import Gone, RemoteError, rental_state
 from gpuc.control.transport import TransportError
 
@@ -60,6 +64,81 @@ class HostChange:
 
     def render(self) -> str:
         return "\n".join(self.lines)
+
+
+DEFAULT_IDLE_MINUTES = 15.0
+"""How long a rental sits with an empty queue before it ends itself, unless
+`--idle-min` says otherwise."""
+
+
+@dataclass
+class RentalOptions:
+    """`gpuc host rent` and its flags: what to rent, from whom, and how."""
+
+    provider: str
+    gpu_names: list[str]
+    max_price_usd_hr: float | None = None
+    clouds: list[Cloud] = field(default_factory=lambda: list[Cloud](["SECURE"]))
+    cuda_min: str = DEFAULT_CUDA_MIN
+    gpu_count: int = 1
+    reuse: bool = True
+    name_hint: str = "job"
+    idle_minutes: float = DEFAULT_IDLE_MINUTES
+    disk_gb: int | None = None
+    image: str | None = None
+    health: HealthOptions = DEFAULT_HEALTH
+
+    def constraints(self) -> Constraints:
+        if not self.gpu_names:
+            raise UsageError(
+                "host rent needs --gpu <name>[,<name>] (for example --gpu 'A40,RTX 4090').\n"
+                "Names are matched against the provider's catalog, "
+                "short or full, ignoring case and spaces."
+            )
+        return Constraints(
+            gpu_names=self.gpu_names,
+            max_price_usd_hr=self.max_price_usd_hr,
+            clouds=self.clouds,
+            cuda_min=self.cuda_min,
+            gpu_count=self.gpu_count,
+        )
+
+
+def rent_host(options: RentalOptions, settings: Settings, report: Reporter = print) -> HostChange:
+    """Reuse a matching rental or buy one, and register it as a host.
+
+    Renting is a host command and not a step of `submit`, so that a rented
+    host is driven like any other: `submit --host`, `status`, `wait` and the
+    Snakemake plugin all name it, and none of them has a second path that
+    buys hardware. The rental ends itself once its queue has been empty for
+    `idle_minutes`, so a host rented here wants its jobs within that time.
+    """
+    constraints = options.constraints()
+    provider = make_provider(settings, options.provider)
+    entry = None
+    if options.reuse:
+        entry = pick_reusable_host(constraints, settings, provider=provider, report=report)
+    reused = entry is not None
+    if entry is None:
+        entry = provision(
+            constraints,
+            settings,
+            provider=provider,
+            report=report,
+            name_hint=options.name_hint,
+            idle_minutes=options.idle_minutes,
+            disk_gb=options.disk_gb if options.disk_gb is not None else settings.disk_gb,
+            image=options.image or settings.image,
+            health_options=options.health,
+        )
+    document = {**host_document(entry), "reused": reused}
+    verb = "reusing" if reused else "rented"
+    lines = [
+        f"{verb} host {entry.name} [{options.provider} pod {entry.pod_id}] with "
+        f"{len(_owned(entry))} GPU(s)",
+        f"next: gpuc submit <job.yaml> --host {entry.name}",
+    ]
+    return HostChange(document, lines)
 
 
 def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEntry:

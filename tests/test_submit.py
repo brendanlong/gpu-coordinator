@@ -15,7 +15,6 @@ from gpuc.control.s3index import LocalIndex, S3Index, spec_key
 from gpuc.control.submit import (
     JobSpecModel,
     SubmitError,
-    check_gpu_count,
     gather_secrets,
     load_document,
     prepare,
@@ -725,18 +724,6 @@ def test_a_mirrored_spec_is_validated_like_a_job_file_with_unknown_keys_dropped(
         validate(document)
     with pytest.raises(SubmitError, match="gpus"):
         validate(job_document(gpus=-1), tolerant=True)
-
-
-def test_the_gpu_count_of_a_pod_to_be_is_checked_before_it_is_bought() -> None:
-    model = validate(job_document(gpus=2))
-    with pytest.raises(SubmitError) as caught:
-        check_gpu_count(model, 1)
-    assert "--gpu-count" in str(caught.value)
-
-
-def test_a_spec_that_fits_the_pod_or_names_no_count_passes_the_gpu_count_check() -> None:
-    check_gpu_count(validate(job_document(gpus=2)), 2)
-    check_gpu_count(validate(job_document(gpus=8)), None)
 
 
 def test_a_long_job_is_fine_on_a_pod(repo: Path) -> None:

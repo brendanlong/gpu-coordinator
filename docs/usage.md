@@ -160,26 +160,30 @@ host without systemd user sessions (RunPod included) a process that
 daemonizes itself can escape.
 
 `gpuc requeue` needs `s3_bucket` set, since it reads the original spec from
-there. It can send the job to a different host (`--host`, or `--runpod`).
+there. It can send the job to a different host (`--host`).
 
 ## Rentals
 
 ```sh
-gpuc submit job.yaml --runpod --gpu "A40,RTX 4090" --max-price 0.60
+gpuc host rent --provider runpod --gpu "A40,RTX 4090" --max-price 0.60
+gpuc submit job.yaml --host <the name it printed>
 ```
+
+A rental is a host like any other once `host rent` has registered it: submit
+to it, `status` it and `wait` on its jobs by name.
 
 `--gpu` takes one or more GPU names, comma-separated and spelled as the
 RunPod catalog does (case, spaces and an `NVIDIA` prefix do not matter). A name
 picks one GPU type, not a family: list `H100 SXM,H100 PCIe` to take either. A
 name RunPod does not have is an error that lists the ones it does.
 The cheapest available match is rented; `--gpu-count` and `--cloud community`
-(cheaper, less reliable) narrow the choice, and `gpuc submit --help` lists the rest. If a pod
+(cheaper, less reliable) narrow the choice, and `gpuc host rent --help` lists the rest. If a pod
 fails to come up it is terminated and the next offer tried, for up to 15
 minutes. A running pod that already matches is reused rather than renting
 another (`--no-reuse` to always rent).
 
 The pod terminates itself once its queue has been empty for `--idle-min`
-(default 15), after finishing its uploads. Nothing on your machine needs to
+(default 15), after finishing its uploads, so submit to it within that time. Nothing on your machine needs to
 stay running. A rental's disk goes with it, so give every output an `s3` or
 `hf` destination and set `s3_bucket` so its logs outlive it.
 

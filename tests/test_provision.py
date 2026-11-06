@@ -635,15 +635,8 @@ def test_reuse_picks_a_live_matching_host_by_asking_it(
     _beating(host)
 
     reports: list[str] = []
-    chosen = provision(
-        CONSTRAINTS,
-        Settings(),
-        provider=provider,
-        reuse=True,
-        report=reports.append,
-        deps=deps(host),
-    )
-    assert chosen.name == entry.name
+    chosen = pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
+    assert chosen is not None and chosen.name == entry.name
     assert provider.created == []
     assert any("-m gpuc.host status" in command for command in host.commands)
     assert any(line.startswith("reusing host gpuc-e2e-aaa") for line in reports)
@@ -842,11 +835,11 @@ def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
     provider = FakeProvider([make_offer()])
     _register_reusable(pod, host)
     host.wipe()
+    assert pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=print) is None
     entry = provision(
         CONSTRAINTS,
         Settings(),
         provider=provider,
-        reuse=True,
         report=lambda _: None,
         health_options=offline_health,
         deps=deps(host),

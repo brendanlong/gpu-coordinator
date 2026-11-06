@@ -1,7 +1,7 @@
 """`gpuc submit` and `gpuc requeue`: what they do, for the CLI and the dashboard.
 
-One pipeline for both, whichever way the host arrives: parse and prepare
-(everything that needs no host), rent or look up the host, open one session,
+One pipeline for both: parse and prepare (everything that needs no host),
+look up the host, open one session,
 ship this build if the host runs another, judge the fit against the host's
 own config, stage, enqueue, record. Both return the `SubmitResult` with its
 placement filled in; rendering it as text or as the `--json` document stays
@@ -10,7 +10,6 @@ with the caller.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -20,21 +19,16 @@ from gpuc.control.actions import (
     NotFound,
     UsageError,
     locate,
-    make_provider,
     mirror_is_the_answer,
     placement_after,
 )
-from gpuc.control.bootstrap import DEFAULT_HEALTH, HealthOptions, ensure_build
+from gpuc.control.bootstrap import ensure_build
 from gpuc.control.config import HostEntry, Reporter, Settings, open_registry
-from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
-from gpuc.control.provision import provision
 from gpuc.control.remote import HostSession, open_session
 from gpuc.control.s3index import S3Index, S3ObjectMissing
 from gpuc.control.submit import (
     Prepared,
     SubmitResult,
-    check_gpu_count,
-    check_kept_allowed,
     load_document,
     prepare,
     refuse_unreadable_config,
@@ -42,70 +36,6 @@ from gpuc.control.submit import (
     validate,
     with_overrides,
 )
-
-DEFAULT_IDLE_MINUTES = 15.0
-"""How long a rental sits with an empty queue before it ends itself, unless
-`--idle-min` says otherwise."""
-
-
-@dataclass
-class RentalOptions:
-    """`--runpod` and its flags: what to rent, and how, when the job names no host."""
-
-    gpu_names: list[str]
-    max_price_usd_hr: float | None = None
-    clouds: list[Cloud] = field(default_factory=lambda: list[Cloud](["SECURE"]))
-    cuda_min: str = DEFAULT_CUDA_MIN
-    gpu_count: int = 1
-    reuse: bool = True
-    name_hint: str = "job"
-    idle_minutes: float = DEFAULT_IDLE_MINUTES
-    disk_gb: int | None = None
-    image: str | None = None
-    health: HealthOptions = DEFAULT_HEALTH
-
-    def constraints(self) -> Constraints:
-        if not self.gpu_names:
-            raise UsageError(
-                "--runpod needs --gpu <name>[,<name>] (for example --gpu 'A40,RTX 4090').\n"
-                "Names are matched against the RunPod catalog, "
-                "short or full, ignoring case and spaces."
-            )
-        return Constraints(
-            gpu_names=self.gpu_names,
-            max_price_usd_hr=self.max_price_usd_hr,
-            clouds=self.clouds,
-            cuda_min=self.cuda_min,
-            gpu_count=self.gpu_count,
-        )
-
-
-def rent_host(
-    rental: RentalOptions, prepared: Prepared, settings: Settings, report: Reporter
-) -> HostEntry:
-    check_gpu_count(prepared.model, rental.gpu_count)
-    check_kept_allowed(prepared.spec, "a --runpod pod", ephemeral=True)
-    return provision(
-        rental.constraints(),
-        settings,
-        provider=make_provider(settings),
-        report=report,
-        reuse=rental.reuse,
-        name_hint=rental.name_hint,
-        idle_minutes=rental.idle_minutes,
-        disk_gb=rental.disk_gb if rental.disk_gb is not None else settings.disk_gb,
-        image=rental.image or settings.image,
-        health_options=rental.health,
-    )
-
-
-def check_placement(*, runpod: bool, host: str | None) -> None:
-    """Judge the provisioning flags once, before anything is bought or written."""
-    if runpod and host:
-        raise UsageError(
-            f"--runpod creates a pod and --host {host} names a host that already "
-            f"exists, so they cannot be combined. Drop one."
-        )
 
 
 def ensure_package_current(session: HostSession, *, bootstrap: bool, report: Reporter) -> None:
@@ -175,7 +105,6 @@ def submit_job(
     settings: Settings,
     *,
     host: str | None,
-    rental: RentalOptions | None = None,
     overrides: dict[str, Any] | None = None,
     workdir: Path,
     use_git: bool = True,
@@ -183,18 +112,15 @@ def submit_job(
     report: Reporter = print,
 ) -> SubmitResult:
     """`gpuc submit`: everything that needs no host first, then the host."""
-    check_placement(runpod=rental is not None, host=host)
-    if rental is None and not host:
-        raise UsageError("submit needs --host <name> (see `gpuc host list`)")
+    if not host:
+        raise UsageError(
+            "submit needs --host <name> (see `gpuc host list`, or `gpuc host rent` for a new one)"
+        )
     document = with_overrides(load_document(job_file), **(overrides or {}))
     model = validate(document, str(job_file))
     prepared = prepare(model, workdir, use_git=use_git)
-    if rental is not None:
-        entry = rent_host(rental, prepared, settings, report)
-    else:
-        entry = open_registry().require(host or "")
     return enqueue(
-        entry,
+        open_registry().require(host),
         prepared,
         settings,
         workdir=workdir,
@@ -209,7 +135,6 @@ def requeue_job(
     settings: Settings,
     *,
     host: str | None,
-    rental: RentalOptions | None = None,
     workdir: Path,
     use_git: bool = True,
     bootstrap: bool = True,
@@ -217,7 +142,6 @@ def requeue_job(
 ) -> SubmitResult:
     """`gpuc requeue`: the mirrored spec as a new job, on the host named or
     the one the job ran on."""
-    check_placement(runpod=rental is not None, host=host)
     s3 = S3Index.from_settings(settings)
     if s3 is None:
         raise CliError(
@@ -237,29 +161,26 @@ def requeue_job(
     model = validate(document, f"spec for {job_id}", tolerant=True)
     prepared = prepare(model, workdir, requeued_from=job_id, use_git=use_git)
     session: HostSession | None = None
-    if rental is not None:
-        entry = rent_host(rental, prepared, settings, report)
+    # `--host` is where it goes, so it has to be one this machine has.
+    # Otherwise where the job ran, by the same lookup every other job
+    # command uses: the index, then every registered host. A second
+    # client with no index of its own still finds it, and an id nobody
+    # knows is exit 4.
+    read = open_registry()
+    if host:
+        entry = read.require(host)
     else:
-        # `--host` is where it goes, so it has to be one this machine has.
-        # Otherwise where the job ran, by the same lookup every other job
-        # command uses: the index, then every registered host. A second
-        # client with no index of its own still finds it, and an id nobody
-        # knows is exit 4.
-        read = open_registry()
-        if host:
-            entry = read.require(host)
-        else:
-            location = locate(job_id, read.named(), None, settings, skipped=read.skipped)
-            trouble = location.trouble
-            if location.entry is None or trouble is not None:
-                gone = trouble is not None and mirror_is_the_answer(trouble)
-                raise CliError(
-                    f"job {job_id} ran on host {location.host}, which "
-                    f"{'is gone' if gone else 'could not be asked'}: "
-                    f"{location.trouble_reason}\n"
-                    f"Name another host with --host, or --runpod."
-                )
-            entry, session = location.entry, location.session
+        location = locate(job_id, read.named(), None, settings, skipped=read.skipped)
+        trouble = location.trouble
+        if location.entry is None or trouble is not None:
+            gone = trouble is not None and mirror_is_the_answer(trouble)
+            raise CliError(
+                f"job {job_id} ran on host {location.host}, which "
+                f"{'is gone' if gone else 'could not be asked'}: "
+                f"{location.trouble_reason}\n"
+                f"Name another host with --host (`gpuc host rent` makes a new one)."
+            )
+        entry, session = location.entry, location.session
     return enqueue(
         entry,
         prepared,

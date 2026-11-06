@@ -154,10 +154,9 @@ class Executor(RemoteExecutor):
         for rule in workflow.rules:
             if rule.norun or is_set(rule.resources.get("gpu")):
                 continue
-            placed = [key for key in ("host", "runpod") if is_set(rule.resources.get(key))]
-            if placed:
+            if is_set(rule.resources.get("host")):
                 raise WorkflowError(
-                    f"rule {rule.name} sets `{placed[0]}` but no `gpu`, so it would run on the "
+                    f"rule {rule.name} sets `host` but no `gpu`, so it would run on the "
                     "controller rather than on gpuc; give it `gpu=1` or more"
                 )
             local.append(rule.name)
@@ -378,10 +377,9 @@ class Executor(RemoteExecutor):
         """The spec gpuc gets, and the `gpuc submit` argv that goes with it."""
         resources: Mapping[str, Any] = job.resources
         host = resources.get("host") or self.settings.host
-        runpod = resources.get("runpod")
-        if not host and not runpod:
+        if not host:
             raise WorkflowError(
-                "no gpuc host: pass --gpuc-host, or give the rule a `host` or `runpod` resource"
+                "no gpuc host: pass --gpuc-host, or give the rule a `host` resource"
             )
         gpus = int(resources.get("gpu") or 0)
         if gpus < 1:
@@ -406,12 +404,7 @@ class Executor(RemoteExecutor):
             if resources.get(key) is not None:
                 spec[key] = truthy(resources[key])
 
-        argv = ["submit", "-"]
-        if runpod:
-            argv += ["--runpod", "--gpu", str(runpod), "--gpu-count", str(gpus)]
-        else:
-            argv += ["--host", str(host)]
-        return spec, argv
+        return spec, ["submit", "-", "--host", str(host)]
 
     def secret_env(self) -> dict[str, str]:
         """Snakemake's `--envvars` and its storage plugins' credentials, which

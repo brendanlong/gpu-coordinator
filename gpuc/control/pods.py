@@ -163,7 +163,7 @@ def render(view: PodsView) -> str:
             names = ", ".join(pod.name for pod in young)
             lines.append(
                 f"{names}: younger than the {CEILING_MINUTES:.0f} min provisioning ceiling, "
-                f"so a `gpuc submit --runpod` elsewhere may still be setting it up; "
+                f"so a `gpuc host rent` elsewhere may still be setting it up; "
                 f"ending it now would cost that submit its pod."
             )
     if view.others:

@@ -36,7 +36,7 @@ gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
 |---|---|---|
 | `local` | the job fits on this machine's own cards | free, and shared with everything else using that GPU |
 | `ssh` | a bigger or shared box already registered | free to you; only the cards registered to that host are ever used |
-| `rental` (`--runpod`) | nothing registered is big enough, or they are all busy | costs money; provisions the cheapest matching pod, idles down after 15 min |
+| `rental` (`gpuc host rent`) | nothing registered is big enough, or they are all busy | costs money; rents the cheapest matching pod (or reuses one) and registers it as a host; idles down 15 min after its queue empties |
 
 Prefer a host you already have over a pod you pay for; a busy host queues your
 job behind the running one, which is usually fine. If nothing is registered,
@@ -127,7 +127,7 @@ Rules that avoid the classic failures:
   hours. Other frameworks (ONNX Runtime, JAX) can still fall back to the CPU
   silently: assert the GPU provider at the top of your own script.
 - Match the torch build to the host's driver, which `gpuc host probe <host>`
-  prints. cu128 is the safe default; a `--runpod` pod is filtered to CUDA >=
+  prints. cu128 is the safe default; a rented pod is filtered to CUDA >=
   12.8 (`--cuda-min` to change it).
 - Say how long the job will take. `progress_command` gives `gpuc status` a
   live end time instead of your guess; a progress command that breaks is
@@ -139,7 +139,8 @@ Rules that avoid the classic failures:
 ```bash
 gpuc submit job.yaml --host local
 gpuc submit job.yaml --host <host>                              # any name from `gpuc host list`
-gpuc submit job.yaml --runpod --gpu A40 --max-price 0.60        # or --gpu "A40,RTX 4090" --cloud any
+gpuc host rent --provider runpod --gpu A40 --max-price 0.60     # prints the host name to submit to;
+                                                                # or --gpu "A40,RTX 4090" --cloud any
 
 gpuc status                      # every host: free cards, queue, running job + phase, eta,
                                  # recent results; each job as `name (job-id)`, each running
@@ -319,7 +320,8 @@ Rules, and they are not optional:
   proves healthy is terminated and the next offer tried, cheapest first,
   inside one 15-minute ceiling for the whole attempt.
 - The pod terminates itself 15 minutes after its queue empties (`--idle-min`),
-  draining its uploads first. There is **no overall pod lifetime**; per-job
+  draining its uploads first, and that clock runs from `host rent`: submit
+  right after renting. There is **no overall pod lifetime**; per-job
   `max_runtime_min` is the cap.
 - An existing gpuc pod is reused when its recorded offer still matches the
   request, it owns enough cards, the provider says it is RUNNING, its

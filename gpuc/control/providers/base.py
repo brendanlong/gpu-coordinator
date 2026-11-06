@@ -47,7 +47,7 @@ class Offer(TolerantModel):
     """One catalog entry. Read tolerantly because the `offer` a pod's own
     config records was written by whichever build rented it: a pod we cannot
     reuse is a smaller failure than one we cannot read, and one we cannot read
-    is one `submit --runpod` buys a second of."""
+    is one `host rent` buys a second of."""
 
     gpu_id: str = ""
     name: str = ""
