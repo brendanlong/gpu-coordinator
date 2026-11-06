@@ -44,6 +44,10 @@ RATE_LIMIT_RETRIES = 5
 OFFER_LIMIT = 10_000
 """Every offer, in effect: the search cannot match GPU names loosely, so
 names are matched here, over all of them (~600 for one GPU, 1.7 MB)."""
+MB_PER_GB = 1000
+"""`gpu_ram` is in MB, and a little under the card's name in MiB: a 24 GB
+RTX 4090 is 24564 and an 80 GB H100 81559, so `--min-gpu-ram 24` would miss
+the card it names at 1024."""
 LOG_FETCH_ATTEMPTS = 5
 LOG_FETCH_WAIT_S = 2.0
 
@@ -73,9 +77,9 @@ class VastProvider(Provider):
     default_image = IMAGE
     filters = frozenset(SEARCH_FIELDS)
     running_statuses = ("running",)
-    dead_statuses = ("exited", "stopped", "offline", "destroyed")
-    """`offline` is a machine that lost its link to Vast: nothing on it can be
-    reached, and on a marketplace it is as likely never to return."""
+    dead_statuses = ("exited", "stopped", "destroyed")
+    """Not `offline` or `unknown`: those are Vast losing touch with the
+    machine, which may still be running a job over ssh."""
     gone_statuses = ("destroyed",)
 
     def __init__(
@@ -112,6 +116,13 @@ class VastProvider(Provider):
                 if error.code == 429 and attempt < RATE_LIMIT_RETRIES - 1:
                     self._sleep(2.0 * (attempt + 1))
                     continue
+                if error.code == 401 or (error.code == 404 and '"auth_error"' in text):
+                    # Vast answers a key it does not know with a 404, and a
+                    # 404 read as "no such instance" forgets a rental that is
+                    # still billing.
+                    raise Unauthorized(
+                        f"{method} {url} -> HTTP {error.code}: {text[:500]}"
+                    ) from error
                 raise VastError(method, url, error.code, text) from error
             except OSError as error:
                 raise ProviderError(f"{method} {url}: {error}") from error
@@ -163,8 +174,6 @@ class VastProvider(Provider):
         try:
             created = self._json("PUT", f"/asks/{offer.offer_id}/", body)
         except VastError as error:
-            if error.status == 401:
-                raise Unauthorized(str(error)) from error
             # An offer someone else rented first is a 404 or a 410, and the
             # ordinary outcome on a marketplace: nothing was created.
             if 400 <= error.status < 500 and error.status != 429:
@@ -183,12 +192,10 @@ class VastProvider(Provider):
         )
 
     def get(self, pod_id: str) -> Pod | None:
-        try:
-            payload = self._json("GET", f"/instances/{pod_id}/")
-        except VastError as error:
-            if error.status == 404:
-                return None
-            raise
+        """None only when Vast answers that the account has no such
+        instance (`instances: null`); every error raises, since a rental
+        read as gone over one is forgotten while it bills."""
+        payload = self._json("GET", f"/instances/{pod_id}/")
         instance = (payload or {}).get("instances")
         if not instance:
             return None
@@ -233,6 +240,8 @@ class VastProvider(Provider):
         registered = self._json("GET", "/ssh/") or []
         keys = registered if isinstance(registered, list) else registered.get("keys") or []
         for key in keys:
+            if key.get("deleted_at"):
+                continue
             parts = str(key.get("public_key", "")).split()
             if len(parts) > 1 and parts[1] == blob:
                 return False
@@ -255,12 +264,14 @@ def search_query(constraints: Constraints) -> dict[str, Any]:
         "direct_port_count": {"gte": 1},
         "disk_space": {"gte": constraints.disk_gb},
         "cuda_max_good": {"gte": float(constraints.cuda_min)},
+        "cpu_arch": {"eq": "amd64"},
+        # Prices include storage, at Vast's default size unless told the disk.
+        "allocated_storage": constraints.disk_gb,
     }
     if constraints.max_price_usd_hr is not None:
         query["dph_total"] = {"lte": constraints.max_price_usd_hr}
     for key, floor in constraints.minimums.items():
-        # `gpu_ram` is searched and reported in MB; the floor is in GB.
-        query[SEARCH_FIELDS[key]] = {"gte": floor * 1024 if key == "gpu_ram_gb" else floor}
+        query[SEARCH_FIELDS[key]] = {"gte": floor * MB_PER_GB if key == "gpu_ram_gb" else floor}
     return query
 
 
@@ -274,7 +285,7 @@ def offer_from_api(row: dict[str, Any]) -> Offer:
         availability="HIGH",
         cuda_versions=[f"{float(cuda):g}"] if cuda else [],
         offer_id=str(row.get("id") or ""),
-        gpu_ram_gb=round(float(gpu_ram) / 1024, 1) if gpu_ram else None,
+        gpu_ram_gb=round(float(gpu_ram) / MB_PER_GB, 1) if gpu_ram else None,
         tflops=_number(row.get("total_flops")),
         inet_down_mbps=_number(row.get("inet_down")),
         inet_up_mbps=_number(row.get("inet_up")),
@@ -320,7 +331,9 @@ def _direct_ssh(instance: dict[str, Any]) -> SshEndpoint | None:
     """The machine's own address and the host port its 22 is mapped to; None
     until Vast has mapped it."""
     address = instance.get("public_ipaddr")
-    mapped = ((instance.get("ports") or {}).get("22/tcp") or [{}])[0].get("HostPort")
+    ports = instance.get("ports")
+    bindings = ports.get("22/tcp") if isinstance(ports, dict) else None
+    mapped = bindings[0].get("HostPort") if isinstance(bindings, list) and bindings else None
     if not address or not mapped:
         return None
     return SshEndpoint(host=str(address).strip(), port=int(mapped), username="root")

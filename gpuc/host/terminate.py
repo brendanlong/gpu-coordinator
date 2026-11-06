@@ -129,8 +129,16 @@ def runpod_terminate(pod_id: str, api_key: str) -> str:
 
 
 def vast_terminate(pod_id: str, api_key: str) -> str:
-    """Destroy, not stop: a stopped instance goes on billing for its disk."""
-    return _call("DELETE", f"{VAST_API}/instances/{pod_id}/", api_key)
+    """Destroy, not stop: a stopped instance goes on billing for its disk.
+    Vast can refuse with a 200 and `success: false`, which is no destroy."""
+    body = _call("DELETE", f"{VAST_API}/instances/{pod_id}/", api_key)
+    try:
+        answer = json.loads(body) if body.strip() else {}
+    except ValueError:
+        answer = {}
+    if isinstance(answer, dict) and answer.get("success") is False:
+        raise TerminateError(f"DELETE instance {pod_id} refused: {body[-500:]}")
+    return body
 
 
 def _call(method: str, url: str, api_key: str, body: bytes | None = None) -> str:

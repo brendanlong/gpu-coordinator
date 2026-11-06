@@ -191,8 +191,10 @@ gpuc host rent --provider vast --gpu "RTX 4090" --max-price 0.50 \
 
 `--min-inet-up`, `--min-disk-bw` and `--min-tflops` are the others. A machine
 that passes them still has to pass the health check before anything runs on
-it, and one that fails is ended and the next offer tried. Rent at least as many cards as the job's `gpus:`. If a pod fails to
-come up it is terminated and the next offer tried, for up to 15 minutes.
+it, and one that fails is ended and the next offer tried.
+
+Rent at least as many cards as the job's `gpus:`. If a pod fails to come up
+it is terminated and the next offer tried, for up to 15 minutes.
 
 `host rent` refuses while a rental you already have matches the request and
 is free: it names that host and how soon it idles out, so you can submit

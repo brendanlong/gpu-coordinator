@@ -40,7 +40,7 @@ down when its work is done and nobody watching.
   specs, the job index, and each job's log and state. It is a copy, never the
   queue.
 
-RunPod and Vast.ai are the rental providers, and S3 and Hugging Face the first
+RunPod and Vast.ai are the first rental providers, and S3 and Hugging Face the first
 backup destinations. Adding another of either changes nothing else in this document.
 
 ## Preconditions

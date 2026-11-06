@@ -197,7 +197,7 @@ def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEnt
     if reached is None:
         raise CliError(
             f"pod {pod_id} ({pod.name}) is {pod.status} and has no direct SSH endpoint yet, so "
-            f"it cannot be asked what it is. Try again once `gpuc pods` shows it RUNNING."
+            f"it cannot be asked what it is. Try again once `gpuc pods` shows it running."
         )
     return address.model_copy(
         update={"ssh": reached.ssh, "port": reached.port, "rental": reached.rental}

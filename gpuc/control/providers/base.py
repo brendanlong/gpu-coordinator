@@ -35,9 +35,11 @@ class CreateRefused(ProviderError):
 
 
 class Unauthorized(CreateRefused):
-    """The account's key may not create anything at all: refused like any
-    other offer, but no other offer can do better, so the attempt stops. A
-    read-only Vast key was refused on all 51 offers in turn before this."""
+    """The provider refused the account's key itself. On a create that is
+    refused like any other offer, but no other offer can do better, so the
+    attempt stops: a read-only Vast key was refused on all 51 offers in turn
+    before this. Anywhere else it is a provider that could not be asked,
+    never an answer about a pod."""
 
 
 MINIMUMS: dict[str, str] = {

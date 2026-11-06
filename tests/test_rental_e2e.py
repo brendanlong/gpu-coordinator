@@ -291,7 +291,11 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
                 # Teardown must never mask the real failure, whatever went wrong.
                 except Exception as exc:
                     log(f"finally: terminate of {pod_id} failed: {exc}")
-            live = [p for p in provider.list_ours() if p.id in provider.created_ids]
+            live = [
+                p
+                for p in provider.list_ours()
+                if p.id in provider.created_ids and not provider.is_gone(p)
+            ]
             log(f"finally: our live pods = {[p.name for p in live]}")
             everything = [(p.name, p.status) for p in provider.list_ours()]
             log(f"finally: all prefixed pods = {everything}")

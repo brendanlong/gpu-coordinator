@@ -148,11 +148,23 @@ def resolve(target: str, registry: Registry, providers: Providers) -> Target:
 
 def find_pod(target: str, providers: Providers) -> tuple[Provider, Pod]:
     """The pod with our prefix whose id or name is `target`, at whichever
-    provider has it."""
+    provider has it. A provider that cannot be listed is not one that lacks
+    it: with no pod found elsewhere, that is the error, not "no such pod"."""
+    unlisted: list[str] = []
     for provider in providers.values():
-        for pod in provider.list_ours():
+        try:
+            pods = provider.list_ours()
+        except ProviderError as exc:
+            unlisted.append(f"{provider.name}: {exc}")
+            continue
+        for pod in pods:
             if target in (pod.id, pod.name):
                 return provider, pod
+    if unlisted:
+        raise ProviderError(
+            f"no pod named {target!r} at the providers that answered, and these could not "
+            f"be asked: {'; '.join(unlisted)}"
+        )
     asked = ", ".join(providers) or "no provider (no API key is set)"
     raise HostNotFound(
         f"no host or pod named {target!r} (pods were looked for at {asked}). `gpuc host "

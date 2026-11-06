@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import os
+import urllib.error
+import urllib.request
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +14,7 @@ import pytest
 from gpuc.control.actions import UsageError
 from gpuc.control.config import Settings
 from gpuc.control.hosts import RentalOptions
-from gpuc.control.providers.base import Constraints, CreateRefused, ProviderError
+from gpuc.control.providers.base import Constraints, CreateRefused, ProviderError, Unauthorized
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.providers.vast import VastError, VastProvider, pod_from_api, search_query
 from gpuc.host import terminate
@@ -59,7 +63,7 @@ def test_names_match_loosely_and_the_cheapest_comes_first() -> None:
     offers = RecordedVast().offers(Constraints(gpu_names=["rtx4090"]))
     assert [o.offer_id for o in offers] == ["59244968", "59360049"]
     offer = offers[0]
-    assert (offer.name, offer.gpu_ram_gb, offer.cuda_versions) == ("RTX 4090", 24.0, ["13.2"])
+    assert (offer.name, offer.gpu_ram_gb, offer.cuda_versions) == ("RTX 4090", 24.6, ["13.2"])
     assert offer.cloud is None and offer.label == "RTX 4090 $0.374/h"
 
 
@@ -76,7 +80,8 @@ def test_the_search_carries_every_floor_and_never_the_names() -> None:
     assert query["num_gpus"] == {"eq": 2}
     assert query["disk_space"] == {"gte": 80}
     assert query["dph_total"] == {"lte": 0.5}
-    assert query["gpu_ram"] == {"gte": 24 * 1024}
+    assert query["gpu_ram"] == {"gte": 24 * 1000}
+    assert query["allocated_storage"] == 80
     assert query["inet_down"] == {"gte": 500}
     assert query["reliability"] == {"gte": 0.98}
     assert query["direct_port_count"] == {"gte": 1}
@@ -149,18 +154,58 @@ def test_a_released_contract_is_gone_and_an_exited_one_dead() -> None:
     assert provider.is_dead(exited) and not provider.is_gone(exited)
 
 
-def test_get_of_an_instance_vast_no_longer_has_is_none() -> None:
-    missing = VastError("GET", "/instances/1/", 404, "")
+def test_get_is_none_only_when_vast_says_it_has_no_such_instance() -> None:
     provider = RecordedVast(
-        {("GET", "/instances/1/"): missing, ("GET", "/instances/2/"): {"instances": None}}
+        {
+            ("GET", "/instances/1/"): {"instances": None},
+            ("GET", "/instances/2/"): VastError("GET", "/instances/2/", 404, "{}"),
+        }
     )
     assert provider.get("1") is None
-    assert provider.get("2") is None
+    with pytest.raises(ProviderError):
+        provider.get("2")
+
+
+def test_a_key_vast_does_not_know_is_never_an_instance_that_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vast answers an unknown key with a 404, the status a missing
+    instance would have, and a rental read as gone is forgotten while it
+    bills."""
+
+    def refuse(request: urllib.request.Request, timeout: float) -> Any:
+        body = io.BytesIO(b'{"success":false,"error":"auth_error","msg":"Invalid user key"}')
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", Message(), body)
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse)
+    provider = VastProvider(api_key="revoked", sleep=lambda _: None)
+    with pytest.raises(Unauthorized):
+        provider.get("4242")
+    with pytest.raises(Unauthorized):
+        provider.terminate("4242")
 
 
 def test_terminate_treats_an_instance_already_gone_as_done() -> None:
     missing = VastError("DELETE", "/instances/1/", 404, "")
     RecordedVast({("DELETE", "/instances/1/"): missing}).terminate("1")
+
+
+def test_ports_in_another_shape_are_no_door_rather_than_a_crash() -> None:
+    assert pod_from_api({**INSTANCE, "ports": [8080, 8081]}).ssh_direct is None
+    assert pod_from_api({**INSTANCE, "ports": {"22/tcp": []}}).ssh_direct is None
+
+
+def test_an_offline_machine_is_not_dead() -> None:
+    """Vast lost touch with it; it may still be running a job over ssh."""
+    offline = pod_from_api({**INSTANCE, "actual_status": "offline"})
+    assert not VastProvider(api_key="k").is_dead(offline)
+
+
+def test_a_card_meets_the_floor_its_name_says() -> None:
+    """Vast reports a 24 GB card as 24564 MB."""
+    offers = RecordedVast().offers(Constraints(minimums={"gpu_ram_gb": 24}))
+    assert len(offers) == 3
+    assert search_query(Constraints(minimums={"gpu_ram_gb": 24}))["gpu_ram"] == {"gte": 24000}
 
 
 def test_the_ssh_key_is_added_once() -> None:
@@ -221,3 +266,11 @@ def test_live_search_finds_a_cheap_rtx_4090_with_every_floor_known() -> None:
     assert offer.gpu_ram_gb and offer.gpu_ram_gb > 20
     assert offer.inet_down_mbps is not None and offer.inet_down_mbps >= 100
     assert [o.price_usd_hr for o in offers] == sorted(o.price_usd_hr for o in offers)
+
+
+def test_a_destroy_vast_refused_with_a_200_is_no_destroy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(terminate, "_call", lambda *a, **k: '{"success": false, "msg": "nope"}')
+    with pytest.raises(terminate.TerminateError):
+        terminate.vast_terminate("4242", "inst-key")
+    monkeypatch.setattr(terminate, "_call", lambda *a, **k: '{"success": true}')
+    terminate.vast_terminate("4242", "inst-key")
