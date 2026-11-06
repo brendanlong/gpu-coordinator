@@ -196,9 +196,13 @@ class VastProvider(Provider):
         instance (`instances: null`); every error raises, since a rental
         read as gone over one is forgotten while it bills."""
         payload = self._json("GET", f"/instances/{pod_id}/")
-        instance = (payload or {}).get("instances")
-        if not instance:
+        if not isinstance(payload, dict) or "instances" not in payload:
+            raise ProviderError(f"GET /instances/{pod_id}/: unexpected answer: {payload!r}")
+        instance = payload["instances"]
+        if instance is None:
             return None
+        if not isinstance(instance, dict):
+            raise ProviderError(f"GET /instances/{pod_id}/: unexpected answer: {payload!r}")
         return pod_from_api(instance)
 
     def logs(self, pod_id: str, tail: int = 100) -> str:
@@ -242,7 +246,9 @@ class VastProvider(Provider):
         for key in keys:
             if key.get("deleted_at"):
                 continue
-            parts = str(key.get("public_key", "")).split()
+            # `public_key` is what the API answered when this was written;
+            # its documentation says `key`.
+            parts = str(key.get("public_key") or key.get("key") or "").split()
             if len(parts) > 1 and parts[1] == blob:
                 return False
         self._json("POST", "/ssh/", {"ssh_key": entry})

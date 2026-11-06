@@ -143,7 +143,12 @@ def resolve(target: str, registry: Registry, providers: Providers) -> Target:
             )
         return Target(pod_id=entry.rental.pod_id, provider=provider, entry=entry)
     provider, pod = find_pod(target, providers)
-    return Target(pod_id=pod.id, provider=provider, pod=pod, entry=_entry_for_pod(pod.id, registry))
+    return Target(
+        pod_id=pod.id,
+        provider=provider,
+        pod=pod,
+        entry=_entry_for_pod(provider.name, pod.id, registry),
+    )
 
 
 def find_pod(target: str, providers: Providers) -> tuple[Provider, Pod]:
@@ -173,9 +178,17 @@ def find_pod(target: str, providers: Providers) -> tuple[Provider, Pod]:
     )
 
 
-def _entry_for_pod(pod_id: str, registry: Registry) -> HostEntry | None:
-    """The registry entry for a pod named by id, so it is forgotten too."""
-    return next((e for e in registry.hosts.values() if e.pod_id == pod_id), None)
+def _entry_for_pod(provider: str, pod_id: str, registry: Registry) -> HostEntry | None:
+    """The registry entry for a pod named by id, so it is forgotten too. By
+    provider as well: two providers can each have a pod `4242`."""
+    return next(
+        (
+            e
+            for e in registry.hosts.values()
+            if e.rental is not None and (e.rental.provider, e.rental.pod_id) == (provider, pod_id)
+        ),
+        None,
+    )
 
 
 def inspect(target: Target, settings: Settings) -> Termination:

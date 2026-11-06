@@ -166,6 +166,12 @@ def test_get_is_none_only_when_vast_says_it_has_no_such_instance() -> None:
         provider.get("2")
 
 
+@pytest.mark.parametrize("answer", [None, {}, {"success": False, "error": "temporary_error"}])
+def test_an_answer_that_is_not_about_the_instance_is_an_error_not_gone(answer: Any) -> None:
+    with pytest.raises(ProviderError):
+        RecordedVast({("GET", "/instances/1/"): answer}).get("1")
+
+
 def test_a_key_vast_does_not_know_is_never_an_instance_that_is_gone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -212,6 +218,8 @@ def test_the_ssh_key_is_added_once() -> None:
     key = "ssh-ed25519 AAAAblob me@laptop"
     known = RecordedVast({("GET", "/ssh/"): [{"public_key": "ssh-ed25519 AAAAblob other"}]})
     assert known.ensure_ssh_key(key) is False
+    documented = RecordedVast({("GET", "/ssh/"): [{"key": "ssh-ed25519 AAAAblob other"}]})
+    assert documented.ensure_ssh_key(key) is False
     fresh = RecordedVast({("GET", "/ssh/"): [], ("POST", "/ssh/"): {"success": True}})
     assert fresh.ensure_ssh_key(key) is True
     assert fresh.requests[-1] == ("POST", "/ssh/", {"ssh_key": key})
