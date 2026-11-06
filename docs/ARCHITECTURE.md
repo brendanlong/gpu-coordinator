@@ -43,12 +43,12 @@ gpuc/
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
     actions.py     # one function per command returning its Answer (document + text + what failed); the CLI and the web call these
     exits.py       # the exit codes, and the one table that maps them onto HTTP statuses
-    hosts.py       # the actions of `host add`, `host set` and `host bootstrap`
-    submitting.py  # the actions of `submit` and `requeue`: rent or look up the host, re-ship, enqueue
+    hosts.py       # the actions of `host add`, `host set`, `host rent` and `host bootstrap`
+    submitting.py  # the actions of `submit` and `requeue`: look up the host, re-ship, enqueue
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
-    provision.py   # `--runpod`: offers, create, wait for ssh, bootstrap, reuse
+    provision.py   # `host rent`: matching rentals, offers, create, wait for ssh, bootstrap
     teardown.py    # `host terminate`: end a rental on purpose, and forget it here
     rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
@@ -358,6 +358,10 @@ The rules it holds to:
   mirror every job's state and log, then `terminate.self_terminate()`. Only a
   failed *terminate* stops the shutdown: remove `draining`, keep dispatching,
   retry every 10 minutes.
+  The idle clock is held in memory only, so `status` derives its
+  `idle_for_s` instead: time since the later of the last job's `ended_at`
+  and the dispatcher lock's mtime (written only when a dispatcher takes the
+  lock, which restarts the clock).
 - **Exit** when the queue is empty, nothing is running and the host is not
   ephemeral. An ephemeral host keeps its dispatcher until terminate.
 
@@ -965,26 +969,32 @@ name to its class. Adding a provider is one class and one table entry.
   then poll `get` until `TERMINATED` or 404. `list()`:
   `GET /pods?includeClusterPods=true`.
 
-## Provisioning flow (`gpuc submit --runpod`)
+## Provisioning flow (`gpuc host rent`)
 
-1. Parse, validate and prepare the spec (secrets present, `{job_id}`
-   expanded) before anything is bought: the same pipeline as `--host`, which
-   then rents or looks up the host, opens one session, ships this build if the
-   host runs another, judges the fit against the host's own config, stages,
-   enqueues and records the job (local index, then the mirror, once).
-2. Unless `--no-reuse`: pick an existing registered pod whose own config records
-   an offer that still satisfies the constraints, which owns enough cards, whose
-   pod the provider reports RUNNING, whose dispatcher heartbeat is fresh, and
-   which is not draining; enqueue there. A registered pod the provider no longer
+Renting ends at a registered host, and nothing else buys one: `submit`,
+`requeue` and the Snakemake plugin only ever name a host, so a rental takes
+the same submit path as every other host.
+
+1. Ask every registered rental of the same provider, at once. One matches when
+   its own config records an offer that still satisfies the constraints, it
+   owns enough cards, the provider reports it RUNNING, its dispatcher heartbeat
+   is fresh, and it is not draining; it is *free* when its queue is empty and
+   enough of its owned cards are free. Any free match refuses the rent unless
+   `--force`, naming it and when it idles out (its own `idle_minutes` less the
+   `idle_for_s` its `status` reports), and the `--json` error carries every
+   match. Busy matches are listed and the rent goes on. A rental whose pod the
+   provider could not be asked about is reported, never taken for "no match".
+   Local and ssh hosts are never compared: one may be a host this work is not
+   allowed to use. Nor are rentals not registered on this machine. A registered pod the provider no longer
    has is forgotten rather than dialled.
-3. Else, for each offer in order: `create`; poll `get` until the pod is
+2. Then, for each offer in order: `create`; poll `get` until the pod is
    running **and** `ssh.direct` present; poll SSH until a trivial command
    succeeds; probe the pod once (the same probe `host add` runs); write the pod
    its `first_config`, whose `provider` block carries the offer and
    `created_at` (`rented.py`: the pod is its own record, and this machine
-   keeps none); run bootstrap; enqueue. The pod terminates itself with the
+   keeps none); run bootstrap; register it. The pod terminates itself with the
    pod-scoped key RunPod leaves in its own `/etc/rp_environment`.
-4. **One ceiling bounds the whole attempt** (`CEILING_MINUTES`), every offer
+3. **One ceiling bounds the whole attempt** (`CEILING_MINUTES`), every offer
    included, and every failure gets one of three verdicts
    (`provision.verdict`): *keep waiting*, *next offer*, or *abort* (a local
    ssh misconfiguration, an `ssh` or `rsync` this machine does not have, the
@@ -999,7 +1009,7 @@ name to its class. Adding a provider is one class and one table entry.
    a short while, and terminates what it finds before anything else is
    bought. One it cannot look for, or cannot terminate, is reported as
    possibly billing and ends the attempt.
-5. From bootstrap on, the only things that end the pod are the pod itself,
+4. From bootstrap on, the only things that end the pod are the pod itself,
    through that pod-scoped key, and a client running `gpuc host terminate`.
 
 ## Ending a rental on purpose (`gpuc host terminate`, `teardown.py`)
@@ -1113,7 +1123,7 @@ every bootstrap and reported back by `python -m gpuc.host status`
 - A host on another build is still asked, not shipped to: a request its
   on-host CLI rejects (argparse's exit 2) is `Unaskable` with the reason and
   `gpuc host bootstrap <host>`, never a traceback. What needs only the host's
-  cards, dispatcher and queue (reuse, teardown, `pods`, the placement after a
+  cards, dispatcher and queue (matching rentals, teardown, `pods`, the placement after a
   submit) sends a bare `status`, which every build understands.
 
 ## Testing rules

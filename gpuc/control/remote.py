@@ -32,6 +32,9 @@ from gpuc.control.transport import DEFAULT_TIMEOUT_S, CommandResult, Transport, 
 from gpuc.host import jobs
 from gpuc.host.jobs import HostConfig
 
+MAX_PARALLEL_HOSTS = 8
+"""How many hosts one command asks at once."""
+
 PYTHON_FLOOR = (3, 11)
 """What the on-host package needs; bootstrap spells the same tuple for `uv`."""
 

@@ -27,13 +27,14 @@ from gpuc.control.config import (
 )
 from gpuc.control.providers.base import Constraints, Offer, Pod, ProviderError, offer_satisfies
 from gpuc.control.provision import (
+    Match,
     ProvisionDeps,
     ProvisionError,
-    pick_reusable_host,
+    matching_rentals,
     pod_name,
     provision,
 )
-from gpuc.host.jobs import HostConfig
+from gpuc.host.jobs import HostConfig, JobState
 from tests.conftest import host_entry, load_registry
 from tests.fakehost import FakeHost
 from tests.fakeprovider import (
@@ -584,7 +585,7 @@ def test_offer_satisfies_checks_every_constraint() -> None:
     assert not offer_satisfies(offer, Constraints(cuda_min="13.0"))
 
 
-# -- reuse: the host, not the cache, says what it is -----------------------------
+# -- matching rentals: the host, not the cache, says what it is -----------------------------
 
 
 def _register_reusable(
@@ -622,92 +623,105 @@ def _register_reusable(
 
 
 def _beating(host: FakeHost) -> None:
+    """A live dispatcher: a fresh heartbeat, and the lock it took (whose
+    mtime is when its idle clock started)."""
     (host.path(host.home) / "dispatcher.heartbeat").touch()
+    (host.path(host.home) / "dispatcher.lock").touch()
 
 
-def test_reuse_picks_a_live_matching_host_by_asking_it(
-    control_env: Path, ssh_key: Path, host: FakeHost
-) -> None:
+def _matches(
+    provider: FakeProvider, reports: list[str], constraints: Constraints = CONSTRAINTS
+) -> list[Match]:
+    return matching_rentals(constraints, Settings(), provider=provider, report=reports.append)
+
+
+def _live(host: FakeHost, **register: object) -> FakeProvider:
     pod = running_pod("gpuc-e2e-aaa", "pod9")
     provider = FakeProvider([make_offer()])
     provider.adopt(pod)
-    entry = _register_reusable(pod, host)
+    _register_reusable(pod, host, **register)  # pyright: ignore[reportArgumentType]
     _beating(host)
+    return provider
 
+
+def test_a_live_matching_rental_is_free_and_says_when_it_idles_out(
+    control_env: Path, ssh_key: Path, host: FakeHost
+) -> None:
+    provider = _live(host)
     reports: list[str] = []
-    chosen = provision(
-        CONSTRAINTS,
-        Settings(),
-        provider=provider,
-        reuse=True,
-        report=reports.append,
-        deps=deps(host),
-    )
-    assert chosen.name == entry.name
-    assert provider.created == []
+    [match] = _matches(provider, reports)
+    assert match.view.entry.name == "gpuc-e2e-aaa"
+    assert match.free
     assert any("-m gpuc.host status" in command for command in host.commands)
-    assert any(line.startswith("reusing host gpuc-e2e-aaa") for line in reports)
+    left = match.idles_out_in_s
+    assert left is not None and 14 * 60 < left <= 15 * 60
+    assert "idles out in about 15 min" in match.describe()
+    assert provider.created == []
 
 
-def test_reuse_judges_the_card_count_by_the_hosts_answer_not_the_cache(
+def test_a_rental_with_a_queued_job_is_busy(
+    control_env: Path, ssh_key: Path, host: FakeHost
+) -> None:
+    provider = _live(host)
+    state = host.path(f"{host.home}/jobs/20260101-000000-aaaaaa/state.json")
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps(JobState(status="queued").to_dict()))
+    [match] = _matches(provider, [])
+    assert not match.free
+    assert match.idles_out_in_s is None
+    assert "busy, 0 running, 1 queued" in match.describe()
+
+
+def test_matching_judges_the_card_count_by_the_hosts_answer_not_the_cache(
     control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     """The cache says four cards; the host says one. The host wins."""
+    provider = _live(host)
+    assert _matches(provider, [], CONSTRAINTS.model_copy(update={"gpu_count": 2})) == []
+
+
+def test_a_stale_dispatcher_does_not_match(
+    control_env: Path, ssh_key: Path, host: FakeHost
+) -> None:
+    provider = _live(host)
+    (host.path(host.home) / "dispatcher.heartbeat").unlink()
+    assert _matches(provider, []) == []
+
+
+def test_a_rental_the_provider_cannot_be_asked_about_is_reported(
+    control_env: Path, ssh_key: Path, host: FakeHost
+) -> None:
+    class Down(FakeProvider):
+        def get(self, pod_id: str) -> Pod | None:
+            raise ProviderError("GET /pods/pod9 -> HTTP 502")
+
     pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
+    provider = Down([make_offer()])
     provider.adopt(pod)
     _register_reusable(pod, host)
     _beating(host)
-    wanted = CONSTRAINTS.model_copy(update={"gpu_count": 2})
     reports: list[str] = []
-    assert pick_reusable_host(wanted, Settings(), provider=provider, report=reports.append) is None
-    assert any("owns 1 GPU(s)" in line for line in reports)
+    assert _matches(provider, reports) == []
+    assert any("could not ask the provider about rental gpuc-e2e-aaa" in r for r in reports)
 
 
-def test_reuse_skips_a_stale_dispatcher(control_env: Path, ssh_key: Path, host: FakeHost) -> None:
-    pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
-    provider.adopt(pod)
-    _register_reusable(pod, host)
-    reports: list[str] = []
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
-        is None
-    )
-    assert any("dispatcher heartbeat is unknown" in line for line in reports)
-
-
-def test_reuse_skips_a_host_that_cannot_be_asked(
+def test_a_rental_that_cannot_be_asked_is_reported_and_skipped(
     control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
-    pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
-    provider.adopt(pod)
-    _register_reusable(pod, host)
+    provider = _live(host)
     host.refuse = 99
     reports: list[str] = []
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
-        is None
-    )
-    assert any("could not be asked" in line for line in reports)
+    assert _matches(provider, reports) == []
+    assert any("could not ask rental gpuc-e2e-aaa" in line for line in reports)
 
 
-def test_reuse_skips_a_pod_that_is_too_expensive(
+def test_a_pod_that_is_too_expensive_does_not_match(
     control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
-    pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
-    provider.adopt(pod)
-    _register_reusable(pod, host, price=2.50)
-    _beating(host)
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=lambda _: None)
-        is None
-    )
+    assert _matches(_live(host, price=2.50), []) == []
 
 
-def test_reuse_skips_a_pod_that_is_not_running(
+def test_a_pod_that_is_not_running_is_never_dialled(
     control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     pod = running_pod("gpuc-e2e-aaa", "pod9").model_copy(update={"status": "EXITED"})
@@ -715,34 +729,8 @@ def test_reuse_skips_a_pod_that_is_not_running(
     provider.adopt(pod, PodScript(ssh_after_polls=0, status_after_polls={1: "EXITED"}))
     _register_reusable(pod, host)
     _beating(host)
-    reports: list[str] = []
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
-        is None
-    )
-    assert any("pod pod9 is EXITED" in line for line in reports)
-    assert host.commands == []  # a dead pod is never dialled
-
-
-def test_no_reuse_always_provisions(
-    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
-) -> None:
-    pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
-    provider.adopt(pod)
-    _register_reusable(pod, host)
-    _beating(host)
-    host.wipe()  # the new pod's home is empty, as a fresh pod's is
-    chosen = provision(
-        CONSTRAINTS,
-        Settings(),
-        provider=provider,
-        report=lambda _: None,
-        health_options=offline_health,
-        deps=deps(host),
-    )
-    assert chosen.name != pod.name
-    assert len(provider.created) == 1
+    assert _matches(provider, []) == []
+    assert host.commands == []
 
 
 def test_ctrl_c_during_bootstrap_terminates_the_pod(
@@ -801,58 +789,24 @@ def test_a_provider_that_never_answers_still_stops_at_the_ceiling(
     assert provider.terminated == ["pod1"]
 
 
-def test_reuse_skips_a_draining_host(control_env: Path, ssh_key: Path, host: FakeHost) -> None:
+def test_a_draining_rental_does_not_match(control_env: Path, ssh_key: Path, host: FakeHost) -> None:
     """A draining pod is terminating itself; a job enqueued there dies with it."""
-    pod = running_pod("gpuc-e2e-aaa", "pod9")
-    provider = FakeProvider([make_offer()])
-    provider.adopt(pod)
-    _register_reusable(pod, host)
-    _beating(host)
+    provider = _live(host)
     (host.path(host.home) / "draining").touch()
-    reports: list[str] = []
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
-        is None
-    )
-    assert any("draining" in line for line in reports)
+    assert _matches(provider, []) == []
 
 
-def test_reuse_forgets_a_host_whose_pod_is_gone(
+def test_a_rental_whose_pod_is_gone_is_forgotten(
     control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
-    """A registry entry for a dead pod must be cleaned, not left to break submit."""
     pod = running_pod("gpuc-e2e-aaa", "podGONE")
     provider = FakeProvider([make_offer()])  # never adopted: the provider has no such pod
     _register_reusable(pod, host)
     reports: list[str] = []
-
-    assert (
-        pick_reusable_host(CONSTRAINTS, Settings(), provider=provider, report=reports.append)
-        is None
-    )
+    assert _matches(provider, reports) == []
     assert host.commands == []  # no ssh to an address the pod no longer owns
     assert load_registry().hosts == {}
     assert any("forgetting" in line for line in reports)
-
-
-def test_reuse_falls_through_to_a_fresh_pod_when_the_old_one_is_gone(
-    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
-) -> None:
-    pod = running_pod("gpuc-e2e-aaa", "podGONE")
-    provider = FakeProvider([make_offer()])
-    _register_reusable(pod, host)
-    host.wipe()
-    entry = provision(
-        CONSTRAINTS,
-        Settings(),
-        provider=provider,
-        reuse=True,
-        report=lambda _: None,
-        health_options=offline_health,
-        deps=deps(host),
-    )
-    assert entry.pod_id == "pod1"
-    assert sorted(load_registry().hosts) == [entry.name]
 
 
 def test_the_pod_is_given_its_own_record_of_what_it_was_bought_as(
@@ -860,7 +814,7 @@ def test_the_pod_is_given_its_own_record_of_what_it_was_bought_as(
 ) -> None:
     """Nothing about the pod lives only on this machine: a second machine
     reads what it was rented as off the pod itself (`rented`), and so does the
-    next `submit` here when it decides whether to reuse it.
+    next `host rent` here when it looks for a matching rental.
     """
     provider = FakeProvider([make_offer()])
     entry = run(provider, host, offline_health)

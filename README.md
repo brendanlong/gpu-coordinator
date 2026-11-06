@@ -4,7 +4,7 @@ One submit path (`gpuc submit`) for three kinds of GPU host:
 
 - **local** — this machine and the cards you hand it,
 - **ssh** — a shared box you have no sudo on, using a subset of its GPUs,
-- **rental** — a RunPod pod, provisioned for the job and torn down after it.
+- **rental** — a RunPod pod, rented with `gpuc host rent` and torn down once its queue is empty.
 
 A project by [Brendan Long](https://www.brendanlong.com/pages/about-me.html).
 The announcement post is
@@ -45,7 +45,7 @@ outright.
 uv tool install "git+https://github.com/brendanlong/gpu-coordinator@main"
 gpuc host add local                          # installs gpuc there; every card nvidia-smi
                                              # reports, or --gpus 0 (index or GPU-… UUID)
-gpuc submit job.example.yaml --host local    # or --runpod --gpu A40 --max-price 0.60
+gpuc submit job.example.yaml --host local    # or a pod from `gpuc host rent --provider runpod --gpu A40`
 gpuc status                                  # queues, running jobs, recent results
 gpuc logs <job-id> -f                        # streams until the job ends, then exits with it
 gpuc wait <job-id> [<job-id> ...]            # the same wait with no log, for a sweep

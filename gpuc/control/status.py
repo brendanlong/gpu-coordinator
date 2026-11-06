@@ -326,6 +326,9 @@ class HostView:
     served_by: str | None = None
     """Another machine the host's queue says is serving it; see `owner`."""
     draining: bool = False
+    idle_for_s: float | None = None
+    """How long the host's queue has been empty, by its own account; None
+    while it holds a job, or from a build that does not say."""
     cards: list[CardView] = field(default_factory=list)
     """The cards this host owns, then those it may borrow, as the host itself
     resolved them: the config may name cards by nvidia-smi index, and only the
@@ -549,7 +552,7 @@ def gather(
 
     A bare `status` unless the caller needs the window or particular jobs:
     it is the one request every build of the host understands, so what only
-    needs the host's cards, dispatcher and queue -- reuse, teardown, the
+    needs the host's cards, dispatcher and queue -- matching rentals, teardown, the
     queue placement after a submit -- keeps working against a host that has
     not been bootstrapped since."""
     return parse_status(entry, ask(entry, request, settings, provider=provider, session=session))
@@ -581,6 +584,7 @@ def parse_status(entry: HostEntry, asked: Asked) -> HostView:
     view.heartbeat_age_s = _as_float(payload.get("dispatcher_heartbeat_age_s"))
     view.served_by = _as_str(payload.get("served_by"))
     view.draining = bool(payload.get("draining"))
+    view.idle_for_s = _as_float(payload.get("idle_for_s"))
     view.queue, view.running, view.finished = job_views(payload)
     view.finished_count = _as_int(payload.get("finished_count"))
     return view

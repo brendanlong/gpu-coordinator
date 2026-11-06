@@ -54,6 +54,7 @@ from gpuc.control.providers.base import Provider, ProviderError
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.provision import ProvisionError
 from gpuc.control.remote import (
+    MAX_PARALLEL_HOSTS,
     Answered,
     Asked,
     Gone,
@@ -92,7 +93,15 @@ __all__ = [
 
 
 class CliError(RuntimeError):
+    """A failure the command reports and exits on. `document` is what its
+    `--json` error still has to show beside the message: what was in flight
+    when a Ctrl-C landed, or what a refusal found."""
+
     exit_code = EXIT_ERROR
+
+    def __init__(self, message: str, document: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.document = document or {}
 
 
 class UsageError(CliError):
@@ -117,10 +126,6 @@ class Interrupted(CliError):
     """
 
     exit_code = EXIT_INTERRUPTED
-
-    def __init__(self, message: str, document: dict[str, Any] | None = None) -> None:
-        super().__init__(message)
-        self.document = document or {}
 
 
 FAILURES = (
@@ -229,9 +234,6 @@ def provider_for(
     except ProviderError as exc:
         report(f"pod status unavailable: {exc}")
         return None
-
-
-MAX_PARALLEL_HOSTS = 8
 
 
 def gather_all(

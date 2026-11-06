@@ -171,7 +171,7 @@ def job_state(entry: HostEntry, settings: Settings, job_id: str) -> dict[str, An
     return {"status": "unknown", "phase": None, "reason": None}
 
 
-def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
+def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
     live_settings: Settings,
     workdir: Path,
     aws_env: None,
@@ -182,36 +182,21 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
         pytest.skip("RUNPOD_API_KEY is not set")
     provider = RecordingProvider(live_settings.runpod_pod_prefix)
     monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
-    monkeypatch.setattr("gpuc.control.submitting.make_provider", lambda *a, **k: provider)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
     monkeypatch.chdir(workdir)
     started = time.monotonic()
 
     try:
         with capsys.disabled():
-            log("submitting; provisioning starts now")
-            assert (
-                main(
-                    [
-                        "submit",
-                        "job.yaml",
-                        "--runpod",
-                        "--gpu",
-                        "A40",
-                        "--max-price",
-                        "0.60",
-                        "--cloud",
-                        "any",
-                        "--idle-min",
-                        "2",
-                        "--disk",
-                        "20",
-                        "--name-hint",
-                        NAME_HINT,
-                        "--no-reuse",
-                    ]
-                )
-                == 0
-            )
+            log("renting; provisioning starts now")
+            rent = ["host", "rent", "--provider", "runpod", "--gpu", "A40"]
+            rent += ["--max-price", "0.60", "--cloud", "any", "--idle-min", "2", "--disk", "20"]
+            rent += ["--name-hint", NAME_HINT, "--force"]
+            assert main(rent) == 0
+            rented = [e for e in load_registry().hosts.values() if e.kind == "rental"]
+            assert len(rented) == 1, rented
+            log(f"rented {rented[0].name} after {time.monotonic() - started:.0f}s")
+            assert main(["submit", "job.yaml", "--host", rented[0].name]) == 0
             log(f"submit returned after {time.monotonic() - started:.0f}s")
 
             entries = [e for e in load_registry().hosts.values() if e.kind == "rental"]
@@ -268,7 +253,7 @@ def test_submit_to_a_real_pod_runs_a_gpu_job_and_tears_itself_down(
 
             # Nothing here reaps the pod itself; the registry entry is dropped
             # by whatever looks next -- `status`, `bootstrap --all`, the next
-            # `submit` reuse pass -- and by hand with `host remove`.
+            # `host rent` -- and by hand with `host remove`.
             assert main(["host", "remove", entry.name]) == 0
             assert load_registry().hosts == {}
             log(f"total wall time {time.monotonic() - started:.0f}s")

@@ -1,4 +1,4 @@
-"""Turn constraints into a bootstrapped RunPod host, or give the money back.
+"""Turn constraints into a bootstrapped rented host, or give the money back.
 
 The local side owns an ephemeral host until it has proven healthy, so every
 failure path here ends in a terminate the provider has confirmed before the
@@ -23,11 +23,12 @@ import re
 import secrets
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from gpuc.control import rented
 from gpuc.control.bootstrap import (
@@ -63,6 +64,7 @@ from gpuc.control.providers.base import (
     offer_satisfies,
 )
 from gpuc.control.remote import (
+    MAX_PARALLEL_HOSTS,
     Answered,
     Gone,
     RemoteError,
@@ -70,11 +72,11 @@ from gpuc.control.remote import (
     ask,
     reason_of,
 )
-from gpuc.control.status import parse_status
+from gpuc.control.status import HostView, parse_status
 from gpuc.control.transport import LocalToolMissing, SshUnusable, Transport, TransportError
 
 CEILING_MINUTES = 15.0
-"""How long one `submit --runpod` may spend buying, waiting for and proving a
+"""How long one `host rent` may spend buying, waiting for and proving a
 host, every offer it tries included. Per attempt, not per offer: with N
 offers a per-offer ceiling was N x 15 minutes of somebody's evening."""
 POLL_INTERVAL_S = 5.0
@@ -209,7 +211,6 @@ def provision(
     constraints: Constraints,
     settings: Settings,
     *,
-    reuse: bool = False,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
     disk_gb: int = DEFAULT_DISK_GB,
@@ -219,12 +220,7 @@ def provision(
     health_options: HealthOptions = DEFAULT_HEALTH,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
-    """Create, wait for, bootstrap and register one pod, or with `reuse` return a
-    live one that already matches. Returns its registry entry."""
-    if reuse:
-        existing = pick_reusable_host(constraints, settings, provider=provider, report=report)
-        if existing is not None:
-            return existing
+    """Create, wait for, bootstrap and register one pod. Returns its registry entry."""
     deps = deps or ProvisionDeps()
     progress = _Progress(report, deps.now)
 
@@ -611,67 +607,114 @@ def _tail(text: str, lines: int = 15) -> str:
     return "\n".join(f"  {line}" for line in text.strip().splitlines()[-lines:])
 
 
-def pick_reusable_host(
+@dataclass
+class Match:
+    """A registered rental that answered and could take a job like the one
+    being rented for: the same provider, an offer that satisfies the request,
+    enough owned cards, a live dispatcher, not draining."""
+
+    view: HostView
+    gpu_count: int
+    idle_minutes: float
+    offer: Offer
+
+    @property
+    def free(self) -> bool:
+        """A job asking for `gpu_count` cards would start on it now."""
+        return not self.view.queue and len(self.view.free) >= self.gpu_count
+
+    @property
+    def idles_out_in_s(self) -> float | None:
+        if not self.free or self.view.running or self.view.idle_for_s is None:
+            return None
+        return max(self.idle_minutes * 60.0 - self.view.idle_for_s, 0.0)
+
+    def describe(self) -> str:
+        name = self.view.entry.name
+        if self.free:
+            left = self.idles_out_in_s
+            if left is not None:
+                when = f"idles out in about {left / 60.0:.0f} min"
+            elif self.view.running:
+                when = "running a job, with enough cards free"
+            else:
+                when = "its host does not say when it idles out"
+            return f"{name} ({_label(self.offer)}): free, {when}"
+        return (
+            f"{name} ({_label(self.offer)}): busy, {len(self.view.running)} running, "
+            f"{len(self.view.queue)} queued, {len(self.view.free)} of "
+            f"{len(self.view.owned)} card(s) free"
+        )
+
+    def document(self) -> dict[str, Any]:
+        left = self.idles_out_in_s
+        return {
+            "host": self.view.entry.name,
+            "pod_id": self.view.entry.pod_id,
+            "free": self.free,
+            "running": len(self.view.running),
+            "queued": len(self.view.queue),
+            "free_gpus": len(self.view.free),
+            "idles_out_in_s": None if left is None else round(left),
+        }
+
+
+def matching_rentals(
     constraints: Constraints,
     settings: Settings,
     *,
     provider: Provider,
     report: Reporter = print,
-) -> HostEntry | None:
-    """An existing gpuc pod that is running, matches the constraints, and dispatches.
+) -> list[Match]:
+    """Every registered rental of this provider that could take the job being
+    rented for, each asked at once.
 
-    Every fact is the host's own: its pod is looked up at the provider and
-    its `status` asked over ssh (`ask`), and the offer it was bought on is
-    read from the config that answer came with. Nothing here is decided on
-    the registry's cache of any of that.
+    Every fact is the host's own: its pod is looked up at the provider and its
+    `status` asked over ssh, and the offer it was bought on is read from the
+    config that answer came with. A rental the provider no longer has is
+    forgotten here, since it can only mislead what comes after.
     """
-    for entry in open_registry().registry.listing():
-        if entry.rental is None:
-            continue
-        asked = ask(entry, "status", settings, provider=provider)
+    entries = [
+        entry
+        for entry in open_registry().registry.listing()
+        if entry.rental is not None and entry.rental.provider == provider.name
+    ]
+    if not entries:
+        return []
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(entries))) as pool:
+        answers = list(
+            pool.map(lambda entry: ask(entry, "status", settings, provider=provider), entries)
+        )
+    matches: list[Match] = []
+    for entry, asked in zip(entries, answers, strict=True):
+        assert entry.rental is not None
         if isinstance(asked, Gone):
-            # The pod is gone for good, so the entry can only mislead `status`,
-            # `logs` and the next reuse pass. Drop it here rather than leaving
-            # submit to fail on an ssh to an address someone else now owns.
-            report(f"reuse: forgetting {entry.name}, its {asked.reason}")
+            report(f"forgetting {entry.name}, its {asked.reason}")
             forget_host(entry.name, entry.rental.pod_id, report)
             continue
         if isinstance(asked, Unaskable):
-            report(f"reuse: skipping {entry.name}, it could not be asked: {asked.reason}")
+            report(f"could not ask rental {entry.name} whether it is free: {asked.reason}")
             continue
-        if not provider.is_running(asked.pod):
-            status = asked.pod.status if asked.pod else "unknown to the provider"
-            report(f"reuse: skipping {entry.name}, its pod is {status}")
+        if asked.pod is None and asked.pod_error:
+            # A provider read that failed is no answer about the pod, and a
+            # free rental hidden by one is a duplicate bought without a word.
+            report(f"could not ask the provider about rental {entry.name}: {asked.pod_error}")
             continue
-        skip = _unreusable(entry, asked, constraints, provider)
-        if skip:
-            report(f"reuse: skipping {entry.name}, {skip}")
-            continue
-        age = parse_status(entry, asked).heartbeat_age_s or 0.0
-        report(f"reusing host {entry.name} ({entry.rental.pod_id}, heartbeat {age:.0f}s old)")
-        return entry
-    return None
+        match = _match(entry, asked, constraints, provider)
+        if match is not None:
+            matches.append(match)
+    return matches
 
 
-def _unreusable(
+def _match(
     entry: HostEntry, asked: Answered, constraints: Constraints, provider: Provider
-) -> str | None:
-    """Why this answering, running pod is not the one to enqueue on, or None."""
+) -> Match | None:
+    if not provider.is_running(asked.pod):
+        return None
     offer = rented.offer_of(asked.session.config.provider)
-    if offer is None:
-        return "its config records no offer to compare with this request"
-    if not offer_satisfies(offer, constraints):
-        return (
-            f"its {offer.name or 'unrecorded'}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h "
-            f"offer does not match this request"
-        )
+    if offer is None or not offer_satisfies(offer, constraints):
+        return None
     view = parse_status(entry, asked)
-    if len(view.owned) < constraints.gpu_count:
-        return f"it owns {len(view.owned)} GPU(s) and this request needs {constraints.gpu_count}"
-    if not view.dispatcher_alive:
-        age = "unknown" if view.heartbeat_age_s is None else f"{view.heartbeat_age_s:.0f}s old"
-        return f"its dispatcher heartbeat is {age}"
-    if view.draining:
-        # It is terminating itself; a job enqueued now dies with the pod.
-        return "it is draining (terminating itself)"
-    return None
+    if len(view.owned) < constraints.gpu_count or not view.dispatcher_alive or view.draining:
+        return None
+    return Match(view, constraints.gpu_count, asked.session.config.idle_minutes, offer)

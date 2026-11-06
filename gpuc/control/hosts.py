@@ -16,10 +16,12 @@ from gpuc.control.actions import (
     Interrupted,
     UsageError,
     connection_document,
+    host_document,
     make_provider,
     provider_for,
 )
 from gpuc.control.bootstrap import (
+    DEFAULT_HEALTH,
     BootstrapError,
     BootstrapResult,
     HealthOptions,
@@ -41,6 +43,8 @@ from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import owned_entries
 from gpuc.control.jsonout import warn
 from gpuc.control.probe import ProbeReport, probe_host
+from gpuc.control.providers.base import DEFAULT_CUDA_MIN, Cloud, Constraints
+from gpuc.control.provision import matching_rentals, provision
 from gpuc.control.remote import Gone, RemoteError, rental_state
 from gpuc.control.transport import TransportError
 
@@ -60,6 +64,93 @@ class HostChange:
 
     def render(self) -> str:
         return "\n".join(self.lines)
+
+
+DEFAULT_IDLE_MINUTES = 15.0
+"""How long a rental sits with an empty queue before it ends itself, unless
+`--idle-min` says otherwise."""
+
+
+@dataclass
+class RentalOptions:
+    """`gpuc host rent` and its flags: what to rent, from whom, and how."""
+
+    provider: str
+    gpu_names: list[str]
+    max_price_usd_hr: float | None = None
+    clouds: list[Cloud] = field(default_factory=lambda: list[Cloud](["SECURE"]))
+    cuda_min: str = DEFAULT_CUDA_MIN
+    gpu_count: int = 1
+    force: bool = False
+    name_hint: str = "job"
+    idle_minutes: float = DEFAULT_IDLE_MINUTES
+    disk_gb: int | None = None
+    image: str | None = None
+    health: HealthOptions = DEFAULT_HEALTH
+
+    def constraints(self) -> Constraints:
+        if not self.gpu_names:
+            raise UsageError(
+                "host rent needs --gpu <name>[,<name>] (for example --gpu 'A40,RTX 4090').\n"
+                "Names are matched against the provider's catalog, "
+                "short or full, ignoring case and spaces."
+            )
+        return Constraints(
+            gpu_names=self.gpu_names,
+            max_price_usd_hr=self.max_price_usd_hr,
+            clouds=self.clouds,
+            cuda_min=self.cuda_min,
+            gpu_count=self.gpu_count,
+        )
+
+
+def rent_host(options: RentalOptions, settings: Settings, report: Reporter = print) -> HostChange:
+    """Rent a new host and register it, unless a matching rental is free.
+
+    Renting is a host command and not a step of `submit`, so that a rented
+    host is driven like any other: `submit --host`, `status`, `wait` and the
+    Snakemake plugin all name it, and none of them has a second path that
+    buys hardware.
+
+    It always buys, rather than handing back a rental that matches: more
+    than one of a kind is often the point, and a pod reused silently may be
+    minutes from idling out. What it refuses without `--force` is buying a
+    second while one that matches is free, because an agent handed a fresh
+    host reads past a warning and the pod bills until it idles out. Only
+    rentals are compared: an ssh or local host may be one this work is not
+    meant to use.
+    """
+    constraints = options.constraints()
+    provider = make_provider(settings, options.provider)
+    matches = matching_rentals(constraints, settings, provider=provider, report=report)
+    found = {"matching_rentals": [match.document() for match in matches]}
+    free = [match for match in matches if match.free]
+    if free and not options.force:
+        listing = "\n".join(f"  {match.describe()}" for match in free)
+        raise CliError(
+            f"a rental that matches is free, so nothing was rented:\n{listing}\n"
+            f"Submit to it with `gpuc submit <job.yaml> --host {free[0].view.entry.name}`, "
+            f"or pass --force to rent another anyway.",
+            found,
+        )
+    if matches:
+        report(
+            "matching rentals (renting another anyway):\n"
+            + "\n".join(f"  {match.describe()}" for match in matches)
+        )
+    entry = provision(
+        constraints,
+        settings,
+        provider=provider,
+        report=report,
+        name_hint=options.name_hint,
+        idle_minutes=options.idle_minutes,
+        disk_gb=options.disk_gb if options.disk_gb is not None else settings.disk_gb,
+        image=options.image or settings.image,
+        health_options=options.health,
+    )
+    document = {**host_document(entry), **found}
+    return HostChange(document, [f"next: gpuc submit <job.yaml> --host {entry.name}"])
 
 
 def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEntry:

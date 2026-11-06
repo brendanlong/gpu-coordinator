@@ -536,79 +536,130 @@ def test_requeue_without_an_s3_bucket_explains_the_gap(
     assert "s3_bucket is unset" in capsys.readouterr().err
 
 
-def test_submit_runpod_without_a_gpu_name_says_which_flag_is_missing(
-    control_env: Path,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_host_rent_without_a_gpu_name_says_which_flag_is_missing(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\n')
-    assert main(["submit", str(job), "--runpod"]) == EXIT_USAGE
+    assert main(["host", "rent", "--provider", "runpod"]) == EXIT_USAGE
     assert "--gpu <name>" in capsys.readouterr().err
 
 
-def test_submit_runpod_passes_the_flags_through(
-    control_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\ngpus: 1\n')
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = fake_s3(monkeypatch)
-
-    seen: dict[str, object] = {}
-
+def _rented(seen: dict[str, object]) -> Any:
     def fake_provision(constraints: Constraints, settings: Settings, **kwargs: object):
         seen.update(kwargs)
         seen["constraints"] = constraints
-        seen["mirrored_before_provisioning"] = sorted(s3.objects)
         return host_entry(name="gpuc-e2e-1", kind="rental", gpus=["GPU-1"])
 
-    def fake_enqueue(entry: HostEntry, prepared: Prepared, *args: object, **kwargs: object):
-        seen["host"] = entry.name
-        seen["job_id"] = prepared.spec.job_id
-        return SubmitResult(job_id=prepared.spec.job_id, host=entry.name)
+    return fake_provision
 
-    monkeypatch.setattr("gpuc.control.submitting.provision", fake_provision)
-    monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
 
-    assert (
-        main(
-            [
-                "submit",
-                str(job),
-                "--runpod",
-                "--gpu",
-                "A40, RTX PRO 6000",
-                "--max-price",
-                "0.60",
-                "--cloud",
-                "any",
-                "--cuda-min",
-                "12.8",
-                "--idle-min",
-                "2",
-                "--disk",
-                "20",
-                "--no-reuse",
-                "--name-hint",
-                "e2e",
-            ]
-        )
-        == 0
+def _rental_match(name: str, *, free: bool) -> SimpleNamespace:
+    """What `matching_rentals` hands `host rent`, as far as it reads it."""
+    return SimpleNamespace(
+        free=free,
+        view=SimpleNamespace(entry=SimpleNamespace(name=name)),
+        describe=lambda: f"{name}: {'free' if free else 'busy'}",
+        document=lambda: {"host": name, "free": free},
     )
+
+
+def test_host_rent_passes_the_flags_through_and_names_the_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr("gpuc.control.hosts.provision", _rented(seen))
+    monkeypatch.setattr("gpuc.control.hosts.matching_rentals", lambda *a, **k: [])
+
+    argv = ["host", "rent", "--provider", "runpod", "--gpu", "A40, RTX PRO 6000"]
+    argv += ["--max-price", "0.60", "--cloud", "any", "--cuda-min", "12.8", "--idle-min", "2"]
+    argv += ["--disk", "20", "--name-hint", "e2e", "--json"]
+    assert main(argv) == 0
     constraints = seen["constraints"]
     assert isinstance(constraints, Constraints)
     assert constraints.gpu_names == ["A40", "RTX PRO 6000"]
     assert constraints.max_price_usd_hr == 0.60
     assert constraints.clouds == ["SECURE", "COMMUNITY"]
-    assert (seen["idle_minutes"], seen["disk_gb"]) == (2.0, 20)
-    assert (seen["reuse"], seen["name_hint"]) == (False, "e2e")
-    # The spec is mirrored once, after the host has accepted it: nothing is
-    # written to S3 before a pod is bought.
-    assert seen["mirrored_before_provisioning"] == []
+    assert (seen["idle_minutes"], seen["disk_gb"], seen["name_hint"]) == (2.0, 20, "e2e")
+    document = json.loads(capsys.readouterr().out)
+    assert (document["name"], document["kind"], document["matching_rentals"]) == (
+        "gpuc-e2e-1",
+        "rental",
+        [],
+    )
+
+
+def test_host_rent_refuses_while_a_matching_rental_is_free(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "gpuc.control.hosts.matching_rentals",
+        lambda *a, **k: [
+            _rental_match("gpuc-busy-1", free=False),
+            _rental_match("gpuc-old-1", free=True),
+        ],
+    )
+    monkeypatch.setattr(
+        "gpuc.control.hosts.provision",
+        lambda *a, **k: pytest.fail("nothing may be bought while a matching rental is free"),
+    )
+    argv = ["host", "rent", "--provider", "runpod", "--gpu", "A40", "--json"]
+    assert main(argv) == EXIT_ERROR
+    captured = capsys.readouterr()
+    assert "gpuc-old-1: free" in captured.err and "gpuc-busy-1" not in captured.err
+    assert "--host gpuc-old-1" in captured.err and "--force" in captured.err
+    document = json.loads(captured.out)
+    assert document["exit_code"] == EXIT_ERROR
+    assert [m["host"] for m in document["matching_rentals"] if m["free"]] == ["gpuc-old-1"]
+
+
+def test_host_rent_force_rents_anyway_and_lists_what_matched(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr("gpuc.control.hosts.provision", _rented(seen))
+    monkeypatch.setattr(
+        "gpuc.control.hosts.matching_rentals",
+        lambda *a, **k: [_rental_match("gpuc-old-1", free=True)],
+    )
+    argv = ["host", "rent", "--provider", "runpod", "--gpu", "A40", "--force", "--json"]
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert "gpuc-old-1: free" in captured.err
+    document = json.loads(captured.out)
+    assert document["matching_rentals"] == [{"host": "gpuc-old-1", "free": True}]
+
+
+def test_host_rent_rents_beside_busy_rentals_without_force(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr("gpuc.control.hosts.provision", _rented({}))
+    monkeypatch.setattr(
+        "gpuc.control.hosts.matching_rentals",
+        lambda *a, **k: [_rental_match("gpuc-busy-1", free=False)],
+    )
+    assert main(["host", "rent", "--provider", "runpod", "--gpu", "A40"]) == 0
+    out = capsys.readouterr().out
+    assert "gpuc-busy-1: busy" in out
+    assert "--host gpuc-e2e-1" in out
+
+
+def test_submit_and_requeue_runpod_say_where_renting_went(
+    control_env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text('command: "true"\n')
+    for argv in (
+        ["submit", str(job), "--runpod", "--gpu", "A40"],
+        ["requeue", "job-1", "--gpu", "A40", "--runpod"],
+    ):
+        with pytest.raises(SystemExit) as exited:
+            main(argv)
+        assert exited.value.code == EXIT_USAGE
+        assert "gpuc host rent" in capsys.readouterr().err
 
 
 def test_pods_lists_ours_and_counts_the_others(
@@ -622,32 +673,6 @@ def test_pods_lists_ours_and_counts_the_others(
     out = capsys.readouterr().out
     assert "gpuc-e2e-aaa" in out
     assert "1 other pod(s) in the account, never touched: other-tenant (RUNNING)" in out
-
-
-def test_requeue_runpod_reads_the_spec_from_s3_and_provisions(
-    control_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = fake_s3(monkeypatch)
-    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
-        {"job_id": "20260101-000000-aaaaaa", "command": "true", "gpus": 1, "attempt": 1}
-    ).encode()
-    seen: dict[str, object] = {}
-
-    def fake_provision(constraints: Constraints, settings: Settings, **kwargs: object):
-        seen["gpu_names"] = constraints.gpu_names
-        return host_entry(name="gpuc-e2e-1", kind="rental", gpus=["GPU-1"])
-
-    def fake_enqueue(entry: HostEntry, prepared: Prepared, *args: object, **kwargs: object):
-        seen["requeued_from"] = prepared.requeued_from
-        return SubmitResult(job_id="new", host=entry.name, requeued_from=prepared.requeued_from)
-
-    monkeypatch.setattr("gpuc.control.submitting.provision", fake_provision)
-    monkeypatch.setattr("gpuc.control.submitting.enqueue", fake_enqueue)
-
-    assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 0
-    assert seen == {"gpu_names": ["A40"], "requeued_from": "20260101-000000-aaaaaa"}
 
 
 # -- first-run experience -------------------------------------------------------
@@ -715,7 +740,7 @@ def test_runpod_commands_fail_fast_without_an_api_key(
     """Before the spec is mirrored, before a host is picked, before any spend."""
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     for argv in (
-        ["submit", "job.yaml", "--runpod", "--gpu", "A40"],
+        ["host", "rent", "--provider", "runpod", "--gpu", "A40"],
         ["pods"],
         ["host", "add", "rented", "--pod", "pod1"],
         ["host", "terminate", "gpuc-e2e-aaa"],
@@ -723,71 +748,21 @@ def test_runpod_commands_fail_fast_without_an_api_key(
         assert main(argv) == 1
         err = capsys.readouterr().err
         assert err.strip().splitlines() == [
-            "error: RUNPOD_API_KEY is not set; export it before using --runpod, "
+            "error: RUNPOD_API_KEY is not set; export it before using `gpuc host rent`, "
             "`gpuc host add --pod`, `gpuc host terminate` or `gpuc pods`"
         ]
 
 
-def test_submit_runpod_refuses_a_too_big_spec_before_creating_a_pod(
-    control_env: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
+def test_host_rent_refuses_a_pod_with_no_gpu(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A spec that cannot run on the pod we would buy must fail before we buy it."""
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\ngpus: 4\n')
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    created: list[object] = []
     monkeypatch.setattr(
-        "gpuc.control.submitting.provision",
-        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
-    )
-
-    assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
-    assert "--gpu-count" in capsys.readouterr().err
-    assert created == []
-
-
-def test_submit_runpod_refuses_a_pod_with_no_gpu_even_for_a_job_that_needs_none(
-    control_env: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\ngpus: 0\n')
-    created: list[object] = []
-    monkeypatch.setattr(
-        "gpuc.control.submitting.provision",
-        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
+        "gpuc.control.hosts.provision", lambda *a, **k: pytest.fail("nothing may be bought")
     )
     with pytest.raises(SystemExit) as exited:
-        main(["submit", str(job), "--runpod", "--gpu-count", "0"])
+        main(["host", "rent", "--provider", "runpod", "--gpu", "A40", "--gpu-count", "0"])
     assert exited.value.code == EXIT_USAGE
     assert "--gpu-count: must be at least 1" in capsys.readouterr().err
-    assert created == []
-
-
-def test_submit_runpod_refuses_missing_secrets_before_creating_a_pod(
-    control_env: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\ngpus: 1\nsecrets: ["GPUC_DEFINITELY_UNSET"]\n')
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    created: list[object] = []
-    monkeypatch.delenv("GPUC_DEFINITELY_UNSET", raising=False)
-    monkeypatch.setattr(
-        "gpuc.control.submitting.provision",
-        lambda *a, **k: created.append(a) or host_entry(name="gpuc-x", kind="rental"),
-    )
-
-    assert main(["submit", str(job), "--runpod", "--gpu", "A40"]) == 1
-    assert "GPUC_DEFINITELY_UNSET" in capsys.readouterr().err
-    assert created == []
 
 
 # -- clean --purge --verify ---------------------------------------------------
@@ -1838,18 +1813,6 @@ def _set_host(
         registry.put(entry)
 
 
-def test_runpod_and_host_together_are_a_usage_error(
-    control_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One picks a host that exists, the other buys one. Not both."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\n')
-    register_host(name="gpubox", kind="ssh", ssh="me@box", gpus=GPU)
-    assert main(["submit", str(job), "--runpod", "--gpu", "A40", "--host", "gpubox"]) == EXIT_USAGE
-    assert main(["requeue", "job-1", "--host", "gpubox", "--runpod", "--gpu", "A40"]) == EXIT_USAGE
-
-
 def test_requeue_of_an_unknown_job_is_exit_four(
     control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2084,28 +2047,6 @@ def test_requeue_ignores_spec_keys_an_older_build_mirrored(
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local"]) == 0
     assert [m.command for m in submitted] == ["true"]
-
-
-def test_requeue_runpod_refuses_an_output_without_the_job_id_before_provisioning(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
-    s3 = fake_s3(monkeypatch)
-    s3.objects["bucket/gpuc/specs/20260101-000000-aaaaaa.json"] = json.dumps(
-        {
-            "job_id": "20260101-000000-aaaaaa",
-            "command": "true",
-            "gpus": 1,
-            "outputs": [{"path": "results", "s3": "s3://b/exp/results"}],
-        }
-    ).encode()
-    monkeypatch.setattr(
-        "gpuc.control.submitting.provision",
-        lambda *a, **k: pytest.fail("no pod may be bought for a spec that is refused"),
-    )
-    assert main(["requeue", "20260101-000000-aaaaaa", "--runpod", "--gpu", "A40"]) == 1
-    assert "does not include the job id" in capsys.readouterr().err
 
 
 def test_requeue_expands_the_mirrored_template_with_the_new_id(
@@ -3082,7 +3023,13 @@ def test_the_commands_the_dashboard_could_want_live_outside_the_cli() -> None:
 
     moved = {
         submitting: ["submit_job", "requeue_job", "ensure_package_current", "enqueue"],
-        hosts: ["add_host", "set_host", "bootstrap_and_record", "bootstrap_every_host"],
+        hosts: [
+            "add_host",
+            "set_host",
+            "rent_host",
+            "bootstrap_and_record",
+            "bootstrap_every_host",
+        ],
         actions: ["unhosted_jobs", "status", "locate", "read_log"],
     }
     for module, names in moved.items():
@@ -3104,6 +3051,7 @@ def test_the_commands_the_dashboard_could_want_live_outside_the_cli() -> None:
         cli.cmd_requeue: "requeue_job",
         cli.cmd_host_add: "add_host",
         cli.cmd_host_set: "set_host",
+        cli.cmd_host_rent: "rent_host",
         cli.cmd_host_bootstrap: "bootstrap_every_host",
         cli.cmd_status: "status",
     }

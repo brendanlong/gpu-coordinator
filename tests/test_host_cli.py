@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -824,3 +825,22 @@ def test_status_names_another_machine_only_while_it_renews(
     os.utime(paths.owner_file(), (stale, stale))
     _, payload = run(capsys, "status")
     assert isinstance(payload, dict) and payload["served_by"] is None
+
+
+def test_idle_time_counts_from_the_later_of_the_last_job_end_and_the_dispatcher_start(
+    gpuc_home: Path,
+) -> None:
+    paths.ensure_layout()
+    assert cli.idle_for_s({}) is None
+    paths.lock_file().touch()
+    since_start = cli.idle_for_s({})
+    assert since_start is not None and since_start < 60
+
+    long_ago = jobs.JobState(status="failed", ended_at="2000-01-01T00:00:00+00:00")
+    just_now = jobs.JobState(status="succeeded", ended_at=ago(seconds=5))
+    with_old_job = cli.idle_for_s({"a": long_ago})
+    assert with_old_job is not None and abs(with_old_job - since_start) < 1
+    os.utime(paths.lock_file(), (0, 0))
+    idle = cli.idle_for_s({"a": long_ago, "b": just_now})
+    assert idle is not None and 4 < idle < 60
+    assert cli.idle_for_s({"b": just_now, "q": jobs.JobState(status="queued")}) is None

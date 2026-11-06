@@ -297,12 +297,7 @@ def prepare(
     environ: Mapping[str, str] | None = None,
     use_git: bool = True,
 ) -> Prepared:
-    """The checks every submit runs, once, before a host is involved.
-
-    `submit --runpod` provisions first and enqueues second, so a missing
-    secret or a non-git workdir found here costs nothing, where the same
-    failure discovered by a pod that is already billing costs a pod.
-    """
+    """The checks every submit runs, once, before a host is involved."""
     spec = expand_job_id(model.to_spec(job_id or jobs.new_job_id()))
     secrets_body = gather_secrets(spec.secrets, environ)
     if use_git:
@@ -354,15 +349,6 @@ def shell_syntax_warnings(model: JobSpecModel) -> list[str]:
                 "that: `command: bash run.sh`."
             )
     return warnings
-
-
-def check_gpu_count(model: JobSpecModel, gpu_count: int | None) -> None:
-    """A rental is bought with `--gpu-count` cards; the spec must fit it."""
-    if gpu_count is not None and model.gpus > gpu_count:
-        raise SubmitError(
-            f"the spec asks for {model.gpus} GPU(s) but this request would create a pod with "
-            f"{gpu_count}.\nRaise --gpu-count, or lower `gpus:` in the spec."
-        )
 
 
 def _not_a_repo(workdir: Path, exc: Exception) -> SubmitError:

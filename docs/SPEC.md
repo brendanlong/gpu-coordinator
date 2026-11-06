@@ -88,7 +88,11 @@ destinations. Adding another of either changes nothing else in this document.
 - Connecting selects which cards are owned and which are shared. By default
   a host owns every card it has that is not shared, including cards that
   appear later.
-- An existing matching rental is reused before a new one is created. Rentals
+- **Renting is a command of its own**, which leaves the rental registered as
+  a host; jobs are queued on it by name like on any other host. Renting is
+  refused while a rental that matches is free, unless the user insists, and
+  the refusal names that rental and, where its host can tell, how soon it
+  will idle out. Rentals
   that are not ours are never touched.
 
 ## Queueing

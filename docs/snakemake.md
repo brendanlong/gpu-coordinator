@@ -52,7 +52,7 @@ queue decides how many of those actually run.
 
 | setting | default | meaning |
 | --- | --- | --- |
-| `--gpuc-host NAME` | none | the host to queue jobs on. Required unless every rule sets `host` or `runpod` |
+| `--gpuc-host NAME` | none | the host to queue jobs on. Required unless every rule sets `host`. For a rental, `gpuc host rent` first and pass the name it prints |
 | `--gpuc-setup CMD` | `uv sync --frozen` | each job's `setup`; `""` runs none |
 | `--gpuc-python CMD` | `uv run --no-sync python` | runs the job's `snakemake` and is the spec's `python` |
 | `--gpuc-gpuc CMD` | `gpuc` | how to run gpuc on this machine, e.g. `"uv run gpuc"` |
@@ -61,7 +61,7 @@ queue decides how many of those actually run.
 written for the local executor already says it: `resources: gpu=1` or more.
 A rule with no `gpu`, or `gpu=0`, runs on the controller the way a
 `localrule: True` does, with no gpuc job, card or copy of the tree. A rule
-that sets `host` or `runpod` without `gpu` is refused before anything runs,
+that sets `host` without `gpu` is refused before anything runs,
 though a dry run (`-n`) does not check. A `gpu` given as a function is judged per job, and one that comes to 0 fails
 that job: whether a rule runs on the controller is decided per rule.
 
@@ -71,7 +71,6 @@ The resources of a GPU rule become job spec fields:
 | --- | --- |
 | `gpu` | `gpus` |
 | `host` | `--host`, overriding `--gpuc-host` |
-| `runpod` | `gpuc submit --runpod --gpu <value> --gpu-count <gpu>` |
 | `priority` | `priority` |
 | `max_runtime_min` | `max_runtime_min` |
 | `use_shared`, `auto_preempt` | the spec fields; `1`, `true`, `yes` and `on` are true |

@@ -146,7 +146,7 @@ runpod_pod_prefix = "{DEFAULT_PREFIX}"
 # the RunPod account. Unset means ssh picks its own.
 # ssh_key = "~/.ssh/id_ed25519"
 
-# Defaults for `gpuc submit --runpod`; override per submit with --disk.
+# Defaults for `gpuc host rent`; override per rental with --disk.
 image = "{DEFAULT_IMAGE}"
 disk_gb = {DEFAULT_DISK_GB}
 """
