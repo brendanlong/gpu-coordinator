@@ -1839,8 +1839,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             jsonout.emit_error("the command line was rejected; the reason is on stderr", code)
         raise
     if wants_runpod(args) and not os.environ.get("RUNPOD_API_KEY"):
-        # Before anything else: provisioning spends money, and finding out after
-        # the spec has been mirrored and a host picked helps nobody.
+        # Before anything else: provisioning spends money, and a missing key
+        # is better found before the registry or a provider is touched.
         return failed(
             args,
             "RUNPOD_API_KEY is not set; export it before using `gpuc host rent`, "

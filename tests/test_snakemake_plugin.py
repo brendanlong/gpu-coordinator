@@ -179,6 +179,17 @@ def test_a_rule_placed_on_a_host_without_a_gpu_is_refused(project: Path, tmp_pat
     assert "rule placed sets `host` but no `gpu`" in done.stderr, done.stderr[-4000:]
 
 
+def test_a_rule_asking_for_runpod_is_told_where_renting_went(project: Path, tmp_path: Path) -> None:
+    with (project / "Snakefile").open("a") as f:
+        f.write(
+            '\nrule rented:\n    output: "x"\n    resources: gpu=1, runpod="A40"\n'
+            '    shell: "true"\n'
+        )
+    done = snakemake(project, tmp_path, "x")
+    assert done.returncode != 0
+    assert "gpuc host rent" in done.stderr, done.stderr[-4000:]
+
+
 def test_a_gpu_function_that_comes_to_zero_fails_the_job(
     bootstrapped_home: Path, project: Path, tmp_path: Path
 ) -> None:

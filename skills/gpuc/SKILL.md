@@ -316,12 +316,14 @@ Rules, and they are not optional:
 
 ## RunPod specifics
 
-- Provisioning to job start is about a minute. A pod that fails before it
+- Provisioning to a registered host is about a minute. Rent with a
+  `--gpu-count` that fits the spec's `gpus:`; submit checks it only once the
+  pod is billing. A pod that fails before it
   proves healthy is terminated and the next offer tried, cheapest first,
   inside one 15-minute ceiling for the whole attempt.
 - The pod terminates itself 15 minutes after its queue empties (`--idle-min`),
-  draining its uploads first, and that clock runs from `host rent`: submit
-  right after renting. There is **no overall pod lifetime**; per-job
+  draining its uploads first. A reused pod may have been idle for most of
+  that already, and keeps its own `--idle-min`: submit right after renting. There is **no overall pod lifetime**; per-job
   `max_runtime_min` is the cap.
 - An existing gpuc pod is reused when its recorded offer still matches the
   request, it owns enough cards, the provider says it is RUNNING, its

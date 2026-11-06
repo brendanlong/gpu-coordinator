@@ -1,6 +1,6 @@
 # A complete gpuc job spec. Submit with:
 #   gpuc submit job.example.yaml --host local
-#   gpuc submit job.example.yaml --runpod --gpu A40 --max-price 0.60
+#   gpuc submit job.example.yaml --host <a name `gpuc host rent` printed>
 #
 # Only `command` is required. Paths in `outputs` are relative to the workdir,
 # which is an rsync of this repository's tracked *and* untracked files (git's

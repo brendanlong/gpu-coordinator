@@ -43,8 +43,8 @@ gpuc/
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
     actions.py     # one function per command returning its Answer (document + text + what failed); the CLI and the web call these
     exits.py       # the exit codes, and the one table that maps them onto HTTP statuses
-    hosts.py       # the actions of `host add`, `host set` and `host bootstrap`
-    submitting.py  # the actions of `submit` and `requeue`: rent or look up the host, re-ship, enqueue
+    hosts.py       # the actions of `host add`, `host set`, `host rent` and `host bootstrap`
+    submitting.py  # the actions of `submit` and `requeue`: look up the host, re-ship, enqueue
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue

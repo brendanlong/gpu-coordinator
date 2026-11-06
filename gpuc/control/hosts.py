@@ -132,12 +132,15 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
             health_options=options.health,
         )
     document = {**host_document(entry), "reused": reused}
-    verb = "reusing" if reused else "rented"
-    lines = [
-        f"{verb} host {entry.name} [{options.provider} pod {entry.pod_id}] with "
-        f"{len(_owned(entry))} GPU(s)",
-        f"next: gpuc submit <job.yaml> --host {entry.name}",
-    ]
+    lines = []
+    if reused:
+        # The pod's idle clock is its own and has been running: a reused pod
+        # with nothing queued may be minutes from ending itself.
+        lines.append(
+            f"it ends itself once idle for {entry.config.idle_minutes:g} min, its own setting "
+            f"rather than --idle-min, and may already have been idle for some of that"
+        )
+    lines.append(f"next: gpuc submit <job.yaml> --host {entry.name}")
     return HostChange(document, lines)
 
 

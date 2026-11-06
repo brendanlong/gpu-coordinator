@@ -152,6 +152,12 @@ class Executor(RemoteExecutor):
         workflow: Any = self.workflow
         local = []
         for rule in workflow.rules:
+            if is_set(rule.resources.get("runpod")):
+                raise WorkflowError(
+                    f"rule {rule.name} sets `runpod`, which is gone: rent with `gpuc host rent "
+                    "--provider runpod --gpu <name>`, then pass --gpuc-host or a `host` resource "
+                    "with the name it prints"
+                )
             if rule.norun or is_set(rule.resources.get("gpu")):
                 continue
             if is_set(rule.resources.get("host")):

@@ -592,9 +592,7 @@ def test_host_rent_reuses_a_matching_rental_before_buying_one(
         lambda *a, **k: pytest.fail("a matching rental must be reused, not a new one bought"),
     )
     assert main(["host", "rent", "--provider", "runpod", "--gpu", "A40"]) == 0
-    out = capsys.readouterr().out
-    assert "reusing host gpuc-old-1" in out
-    assert "--host gpuc-old-1" in out
+    assert "--host gpuc-old-1" in capsys.readouterr().out
 
 
 def test_submit_and_requeue_runpod_say_where_renting_went(
