@@ -824,3 +824,19 @@ def test_status_names_another_machine_only_while_it_renews(
     os.utime(paths.owner_file(), (stale, stale))
     _, payload = run(capsys, "status")
     assert isinstance(payload, dict) and payload["served_by"] is None
+
+
+def test_idle_since_is_the_later_of_the_last_job_end_and_the_dispatcher_start(
+    gpuc_home: Path,
+) -> None:
+    paths.ensure_layout()
+    assert cli.idle_since({}) is None
+    paths.lock_file().touch()
+    started = cli.idle_since({})
+    assert started is not None
+
+    later = jobs.JobState(status="succeeded", ended_at="2999-01-01T00:00:00+00:00")
+    earlier = jobs.JobState(status="failed", ended_at="2000-01-01T00:00:00+00:00")
+    assert cli.idle_since({"a": earlier}) == started
+    assert cli.idle_since({"a": earlier, "b": later}) == "2999-01-01T00:00:00+00:00"
+    assert cli.idle_since({"a": later, "q": jobs.JobState(status="queued")}) is None

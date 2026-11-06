@@ -179,15 +179,18 @@ name RunPod does not have is an error that lists the ones it does.
 The cheapest available match is rented; `--gpu-count` and `--cloud community`
 (cheaper, less reliable) narrow the choice, and `gpuc host rent --help` lists
 the rest. Rent at least as many cards as the job's `gpus:`. If a pod fails to
-come up it is terminated and the next offer tried, for up to 15 minutes. A
-running pod that already matches is reused rather than renting another
-(`--no-reuse` to always rent).
+come up it is terminated and the next offer tried, for up to 15 minutes.
+
+`host rent` refuses while a rental you already have matches the request and
+is free: it names that host and how soon it idles out, so you can submit
+there instead. `--force` rents another anyway. Rentals that match but are
+busy are listed and do not stop it. Local and ssh hosts are not compared.
 
 The pod terminates itself once its queue has been empty for `--idle-min`
-(default 15), after finishing its uploads, so submit to it right away: a
-reused pod may already have been idle for most of that, and keeps its own
-`--idle-min`. Nothing on your machine needs to stay running. A rental's disk goes with it, so give every output an `s3` or
-`hf` destination and set `s3_bucket` so its logs outlive it.
+(default 15), after finishing its uploads, so submit to it right away.
+Nothing on your machine needs to stay running. A rental's disk goes with it,
+so give every output an `s3` or `hf` destination and set `s3_bucket` so its
+logs outlive it.
 
 ```sh
 gpuc pods                            # every gpuc pod on the account, with its cost

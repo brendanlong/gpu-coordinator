@@ -48,7 +48,7 @@ gpuc/
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
-    provision.py   # `host rent`: offers, create, wait for ssh, bootstrap, reuse
+    provision.py   # `host rent`: matching rentals, offers, create, wait for ssh, bootstrap
     teardown.py    # `host terminate`: end a rental on purpose, and forget it here
     rented.py      # a pod is its own record: the `provider` block in its config.json
     pods.py        # `gpuc pods`
@@ -971,12 +971,18 @@ Renting ends at a registered host, and nothing else buys one: `submit`,
 `requeue` and the Snakemake plugin only ever name a host, so a rental takes
 the same submit path as every other host.
 
-1. Unless `--no-reuse`: pick an existing registered pod whose own config records
-   an offer that still satisfies the constraints, which owns enough cards, whose
-   pod the provider reports RUNNING, whose dispatcher heartbeat is fresh, and
-   which is not draining; return it. A registered pod the provider no longer
+1. Ask every registered rental of the same provider, at once. One matches when
+   its own config records an offer that still satisfies the constraints, it
+   owns enough cards, the provider reports it RUNNING, its dispatcher heartbeat
+   is fresh, and it is not draining; it is *free* when its queue is empty and
+   enough of its owned cards are free. Any free match refuses the rent unless
+   `--force`, naming it and when it idles out: the host's `idle_since` (the
+   later of its last job's end and its dispatcher lock's mtime, so derived and
+   never stored) plus its own `idle_minutes`. Busy matches are listed and the
+   rent goes on. Local and ssh hosts are never compared: one may be a host
+   this work is not allowed to use. A registered pod the provider no longer
    has is forgotten rather than dialled.
-2. Else, for each offer in order: `create`; poll `get` until the pod is
+2. Then, for each offer in order: `create`; poll `get` until the pod is
    running **and** `ssh.direct` present; poll SSH until a trivial command
    succeeds; probe the pod once (the same probe `host add` runs); write the pod
    its `first_config`, whose `provider` block carries the offer and
@@ -1112,7 +1118,7 @@ every bootstrap and reported back by `python -m gpuc.host status`
 - A host on another build is still asked, not shipped to: a request its
   on-host CLI rejects (argparse's exit 2) is `Unaskable` with the reason and
   `gpuc host bootstrap <host>`, never a traceback. What needs only the host's
-  cards, dispatcher and queue (reuse, teardown, `pods`, the placement after a
+  cards, dispatcher and queue (matching rentals, teardown, `pods`, the placement after a
   submit) sends a bare `status`, which every build understands.
 
 ## Testing rules

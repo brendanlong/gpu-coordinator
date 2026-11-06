@@ -6,6 +6,7 @@ Output is JSON on stdout so the control side never has to parse prose.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -312,6 +313,24 @@ def _job_entry(
     return entry
 
 
+def idle_since(states: dict[str, JobState]) -> str | None:
+    """When the queue last emptied, as the dispatcher's idle timer counts it,
+    or None while it holds a job.
+
+    Derived rather than recorded: the timer starts when the last job ends, or
+    when a dispatcher takes the lock (it keeps the start in memory only, so a
+    new one starts afresh), whichever is later. A finished job someone has
+    since purged makes this early, never late.
+    """
+    if any(not state.finished for state in states.values()):
+        return None
+    ends = [jobs.parse_time(state.ended_at) for state in states.values()]
+    with contextlib.suppress(FileNotFoundError):
+        ends.append(datetime.fromtimestamp(paths.lock_file().stat().st_mtime, UTC))
+    known = [end for end in ends if end is not None]
+    return max(known).isoformat() if known else None
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """The host, and the jobs asked about: exactly the ids named, those this
     host has, or with none named the ones `in_window` picks."""
@@ -349,6 +368,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 **table,
                 "ephemeral": config.ephemeral,
                 "draining": paths.draining_file().exists(),
+                "idle_since": idle_since(states),
                 "dispatcher_heartbeat_age_s": None if heartbeat is None else round(heartbeat, 1),
                 # Another machine's claim on this queue, which keeps any
                 # dispatcher started here from serving it.

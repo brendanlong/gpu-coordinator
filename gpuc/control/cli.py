@@ -536,7 +536,7 @@ def rental_options(args: argparse.Namespace) -> RentalOptions:
         clouds=CLOUDS[args.cloud],
         cuda_min=args.cuda_min,
         gpu_count=args.gpu_count,
-        reuse=not args.no_reuse,
+        force=args.force,
         name_hint=args.name_hint,
         disk_gb=args.disk,
         image=args.image,
@@ -1299,11 +1299,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     rent = host.add_parser(
         "rent",
-        help="reuse a matching rental or rent the cheapest that matches, and register it as "
-        "a host (costs money until it idles out)",
+        help="rent the cheapest pod that matches and register it as a host (costs money until "
+        "it idles out); refused while a matching rental is free, unless --force",
     )
     add_rent_flags(rent)
-    add_json_flag(rent, "the host as `host list --json` reports it, and whether it was reused")
+    add_json_flag(
+        rent, "the host as `host list --json` reports it, and the matching rentals it found"
+    )
     rent.set_defaults(func=cmd_host_rent)
 
     terminate = host.add_parser(
@@ -1779,7 +1781,11 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
     parser.add_argument("--image", help="pod image; default from config")
-    parser.add_argument("--no-reuse", action="store_true", help="always create a new pod")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="rent even if a registered rental that matches is free",
+    )
     parser.add_argument("--name-hint", default="job", help="goes into the pod name")
     parser.add_argument("--health-args", default="", help="extra flags for `gpuc.host health`")
 

@@ -544,26 +544,36 @@ def test_host_rent_without_a_gpu_name_says_which_flag_is_missing(
     assert "--gpu <name>" in capsys.readouterr().err
 
 
-def test_host_rent_passes_the_flags_through_and_names_the_host(
-    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
-    seen: dict[str, object] = {}
-
+def _rented(seen: dict[str, object]) -> Any:
     def fake_provision(constraints: Constraints, settings: Settings, **kwargs: object):
         seen.update(kwargs)
         seen["constraints"] = constraints
         return host_entry(name="gpuc-e2e-1", kind="rental", gpus=["GPU-1"])
 
-    monkeypatch.setattr("gpuc.control.hosts.provision", fake_provision)
-    monkeypatch.setattr(
-        "gpuc.control.hosts.pick_reusable_host",
-        lambda *a, **k: pytest.fail("--no-reuse must not look for a pod to reuse"),
+    return fake_provision
+
+
+def _rental_match(name: str, *, free: bool) -> SimpleNamespace:
+    """What `matching_rentals` hands `host rent`, as far as it reads it."""
+    return SimpleNamespace(
+        free=free,
+        view=SimpleNamespace(entry=SimpleNamespace(name=name)),
+        describe=lambda now: f"{name}: {'free' if free else 'busy'}",
+        document=lambda now: {"host": name, "free": free},
     )
+
+
+def test_host_rent_passes_the_flags_through_and_names_the_host(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr("gpuc.control.hosts.provision", _rented(seen))
+    monkeypatch.setattr("gpuc.control.hosts.matching_rentals", lambda *a, **k: [])
 
     argv = ["host", "rent", "--provider", "runpod", "--gpu", "A40, RTX PRO 6000"]
     argv += ["--max-price", "0.60", "--cloud", "any", "--cuda-min", "12.8", "--idle-min", "2"]
-    argv += ["--disk", "20", "--no-reuse", "--name-hint", "e2e", "--json"]
+    argv += ["--disk", "20", "--name-hint", "e2e", "--json"]
     assert main(argv) == 0
     constraints = seen["constraints"]
     assert isinstance(constraints, Constraints)
@@ -572,27 +582,65 @@ def test_host_rent_passes_the_flags_through_and_names_the_host(
     assert constraints.clouds == ["SECURE", "COMMUNITY"]
     assert (seen["idle_minutes"], seen["disk_gb"], seen["name_hint"]) == (2.0, 20, "e2e")
     document = json.loads(capsys.readouterr().out)
-    assert (document["name"], document["kind"], document["reused"]) == (
+    assert (document["name"], document["kind"], document["matching_rentals"]) == (
         "gpuc-e2e-1",
         "rental",
-        False,
+        [],
     )
 
 
-def test_host_rent_reuses_a_matching_rental_before_buying_one(
+def test_host_rent_refuses_while_a_matching_rental_is_free(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     monkeypatch.setattr(
-        "gpuc.control.hosts.pick_reusable_host",
-        lambda *a, **k: host_entry(name="gpuc-old-1", kind="rental", gpus=["GPU-1"]),
+        "gpuc.control.hosts.matching_rentals",
+        lambda *a, **k: [
+            _rental_match("gpuc-busy-1", free=False),
+            _rental_match("gpuc-old-1", free=True),
+        ],
     )
     monkeypatch.setattr(
         "gpuc.control.hosts.provision",
-        lambda *a, **k: pytest.fail("a matching rental must be reused, not a new one bought"),
+        lambda *a, **k: pytest.fail("nothing may be bought while a matching rental is free"),
+    )
+    assert main(["host", "rent", "--provider", "runpod", "--gpu", "A40"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "gpuc-old-1: free" in err and "gpuc-busy-1" not in err
+    assert "--host gpuc-old-1" in err and "--force" in err
+
+
+def test_host_rent_force_rents_anyway_and_lists_what_matched(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr("gpuc.control.hosts.provision", _rented(seen))
+    monkeypatch.setattr(
+        "gpuc.control.hosts.matching_rentals",
+        lambda *a, **k: [_rental_match("gpuc-old-1", free=True)],
+    )
+    argv = ["host", "rent", "--provider", "runpod", "--gpu", "A40", "--force", "--json"]
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert "gpuc-old-1: free" in captured.err
+    document = json.loads(captured.out)
+    assert document["matching_rentals"] == [{"host": "gpuc-old-1", "free": True}]
+
+
+def test_host_rent_rents_beside_busy_rentals_without_force(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
+    monkeypatch.setattr("gpuc.control.hosts.provision", _rented({}))
+    monkeypatch.setattr(
+        "gpuc.control.hosts.matching_rentals",
+        lambda *a, **k: [_rental_match("gpuc-busy-1", free=False)],
     )
     assert main(["host", "rent", "--provider", "runpod", "--gpu", "A40"]) == 0
-    assert "--host gpuc-old-1" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "gpuc-busy-1: busy" in out
+    assert "--host gpuc-e2e-1" in out
 
 
 def test_submit_and_requeue_runpod_say_where_renting_went(

@@ -4,8 +4,8 @@ A pod's `config.json` -- the file a host owns, and the only copy of what it is
 -- holds the offer it was bought on and when it was created, under the
 `provider` block that already named its `kind` and `pod_id`. That is what lets
 `gpuc host add --pod` on a second machine register the pod from the pod
-itself, and what `host rent` compares a request against when it reuses
-one, with nothing the creating machine remembers involved.
+itself, and what `host rent` compares a request against when it looks for a
+matching rental, with nothing the creating machine remembers involved.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ def pod_record(address: HostEntry, offer: Offer, created_at: str) -> dict[str, A
 
     `kind` and `pod_id` name the rental. What follows is what a machine that
     did not create this pod needs in order to judge it: the offer
-    `pick_reusable_host` compares against, and when the pod was bought.
+    `matching_rentals` compares against, and when the pod was bought.
     """
     return {
         **(address.provider_block() or {}),

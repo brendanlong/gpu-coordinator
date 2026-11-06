@@ -54,6 +54,7 @@ from gpuc.control.providers.base import Provider, ProviderError
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.provision import ProvisionError
 from gpuc.control.remote import (
+    MAX_PARALLEL_HOSTS,
     Answered,
     Asked,
     Gone,
@@ -229,9 +230,6 @@ def provider_for(
     except ProviderError as exc:
         report(f"pod status unavailable: {exc}")
         return None
-
-
-MAX_PARALLEL_HOSTS = 8
 
 
 def gather_all(

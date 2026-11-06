@@ -36,7 +36,7 @@ gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
 |---|---|---|
 | `local` | the job fits on this machine's own cards | free, and shared with everything else using that GPU |
 | `ssh` | a bigger or shared box already registered | free to you; only the cards registered to that host are ever used |
-| `rental` (`gpuc host rent`) | nothing registered is big enough, or they are all busy | costs money; rents the cheapest matching pod (or reuses one) and registers it as a host; idles down 15 min after its queue empties |
+| `rental` (`gpuc host rent`) | nothing registered is big enough, or they are all busy | costs money; rents the cheapest matching pod and registers it as a host; idles down 15 min after its queue empties |
 
 Prefer a host you already have over a pod you pay for; a busy host queues your
 job behind the running one, which is usually fine. If nothing is registered,
@@ -322,13 +322,15 @@ Rules, and they are not optional:
   proves healthy is terminated and the next offer tried, cheapest first,
   inside one 15-minute ceiling for the whole attempt.
 - The pod terminates itself 15 minutes after its queue empties (`--idle-min`),
-  draining its uploads first. A reused pod may have been idle for most of
-  that already, and keeps its own `--idle-min`: submit right after renting. There is **no overall pod lifetime**; per-job
-  `max_runtime_min` is the cap.
-- An existing gpuc pod is reused when its recorded offer still matches the
-  request, it owns enough cards, the provider says it is RUNNING, its
-  dispatcher heartbeat is under 30 s old, and it is not draining. `--no-reuse`
-  forces a new one.
+  draining its uploads first, so submit right after renting. There is **no
+  overall pod lifetime**; per-job `max_runtime_min` is the cap.
+- `host rent` refuses (exit 1) while a registered rental that matches the
+  request is free, and names it with how long until it idles out: submit to
+  that one instead. `--force` rents another anyway, which is right when you
+  want several at once. Matching rentals that are busy are listed and do not
+  stop the rent. Local and ssh hosts are not compared.
+- Renting by mistake is cheap to undo: `gpuc host terminate <host>` ends a
+  rental with nothing queued, no `--force` needed.
 - **Nothing on this machine watches a pod after it is set up, or ends one on
   its own.** A pod whose dispatcher dies never idles out and bills until a
   person ends it: `gpuc pods` shows every pod with our prefix, its hourly cost

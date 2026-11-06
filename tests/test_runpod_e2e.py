@@ -191,7 +191,7 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
             log("renting; provisioning starts now")
             rent = ["host", "rent", "--provider", "runpod", "--gpu", "A40"]
             rent += ["--max-price", "0.60", "--cloud", "any", "--idle-min", "2", "--disk", "20"]
-            rent += ["--name-hint", NAME_HINT, "--no-reuse"]
+            rent += ["--name-hint", NAME_HINT, "--force"]
             assert main(rent) == 0
             rented = [e for e in load_registry().hosts.values() if e.kind == "rental"]
             assert len(rented) == 1, rented

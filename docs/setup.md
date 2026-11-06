@@ -73,7 +73,7 @@ gpuc submit job.yaml --host <the name it printed>
 ```
 
 Your `ssh_key`'s public half is added to the RunPod account the first time.
-Choosing GPUs, reuse and ending a pod early are in
+Choosing GPUs, renting more than one and ending a pod early are in
 [usage.md](usage.md#rentals).
 
 To drive a pod that another of your machines rented: `gpuc pods` lists them,
