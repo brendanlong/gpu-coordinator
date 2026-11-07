@@ -1080,8 +1080,12 @@ once it returns there is no host left to own any state.
 A host this machine does not trust never receives the submitter's AWS keys.
 Trust is the registry entry's (`trusted`), never the host's config: a host
 that could say it was trusted would decide what it is sent. `host rent`
-registers a rental untrusted unless `--trusted`; `host add` registers a host
-trusted unless `--untrusted`, which is how a second machine adopts a rental.
+registers a rental untrusted unless `--trusted`. `host add` takes `--trusted`
+or `--untrusted`; with neither, a new host is trusted and a registered one
+keeps what it was. An entry with no `trusted` is untrusted if it is a rental.
+An untrusted host's `s3_prefix` must be the one this machine would give it,
+and no scoped location may hold `*` or `?`: the prefix is the host's config,
+so it would otherwise choose what its keys reach.
 
 - A job whose `secrets:` name any `AWS_*` key gets, in their place, keys from
   STS `GetFederationToken` minted with the submitter's own, lasting the
@@ -1095,8 +1099,7 @@ trusted unless `--untrusted`, which is how a second machine adopts a rental.
   or nothing a narrowed key could do.
 - An untrusted rental's own `~/.aws/credentials`, for the mirror, is the same
   kind of key narrowed to `{s3_prefix}/jobs`, re-minted on every bootstrap and
-  every submit. When it cannot be minted the file is removed, never left
-  holding what was there.
+  every submit. One that cannot be minted leaves the file as it is.
 - A key that cannot be minted is never replaced by the real one: the submit
   fails before anything is shipped.
 - No client renews a key, since no client watches a rental. Submit warns when

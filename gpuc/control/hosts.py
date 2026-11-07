@@ -219,7 +219,7 @@ def add_host(
     fields: dict[str, Any],
     env_updates: dict[str, str | None],
     force: bool = False,
-    trusted: bool = True,
+    trusted: bool | None = None,
     health: HealthOptions | None = None,
     report: Reporter = print,
 ) -> HostChange:
@@ -229,6 +229,11 @@ def add_host(
     and a host that already has a `config.json` is adopted as it stands --
     which is what makes a second machine driving a box somebody else set up the
     ordinary path. Flags are explicit overrides of it, and say so.
+
+    `trusted` None trusts a host this machine has not registered and leaves
+    the one it has as it was: re-adding a host is how an entry written by an
+    earlier build is fixed, and must not quietly send real keys to a rental
+    rented untrusted.
 
     `health` None skips the bootstrap. Otherwise a host whose config names no
     build, or another build than this one, is bootstrapped: a registered host
@@ -249,7 +254,6 @@ def add_host(
         port=port,
         gpuc_home=gpuc_home,
         persistent_root=persistent_root,
-        trusted=trusted,
     )
     if pod_id:
         address = _pod_address(address, pod_id, settings)
@@ -280,6 +284,8 @@ def add_host(
             entry = entry.with_cache(python=current.python).model_copy(
                 update={"bootstrapped_at": current.bootstrapped_at}
             )
+        keep = current.trusted if current is not None else True
+        entry = entry.model_copy(update={"trusted": keep if trusted is None else trusted})
         registry.put(entry)
     warnings: list[str] = []
     if not connection.adopted and not _owned(entry):

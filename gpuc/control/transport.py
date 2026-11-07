@@ -323,7 +323,7 @@ class SshTransport:
         # `~/.aws/credentials` while a submit replaces it.
         return self.ssh_argv(
             f'dir="$(dirname {quoted})" && mkdir -p "$dir" && tmp="$dir/.gpuc-put.$$" && '
-            f'{{ (umask 077 && cat > "$tmp") && chmod {mode:o} "$tmp" && mv -f "$tmp" {quoted} '
+            f'{{ (umask 077 && cat > "$tmp") && chmod {mode:o} "$tmp" && mv -fT "$tmp" {quoted} '
             f'|| {{ rm -f "$tmp"; exit 1; }}; }}'
         )
 

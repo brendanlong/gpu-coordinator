@@ -106,7 +106,7 @@ def federation_token(
 
 def _split(uri: str) -> tuple[str, str]:
     bucket, _, key = uri.removeprefix("s3://").partition("/")
-    return bucket, key.strip("/")
+    return bucket, key.rstrip("/")
 
 
 def access_policy(uris: Iterable[str]) -> dict[str, Any]:
@@ -114,10 +114,15 @@ def access_policy(uris: Iterable[str]) -> dict[str, Any]:
 
     No deletes: the host never deletes (`aws s3 sync` runs without
     `--delete`). A multipart upload that fails is aborted, so that is allowed.
+    A location with a `*` or `?` is refused rather than escaped: it is never a
+    real bucket or prefix, and one from a host's config is a widening attempt.
     """
     objects: list[str] = []
     listed: dict[str, list[str]] = {}
-    for uri in uris:
+    # Once each: STS caps the policy at 2048 characters, and outputs often share one.
+    for uri in dict.fromkeys(uri.rstrip("/") for uri in uris):
+        if any(char in uri for char in "*?"):
+            raise AwsKeyError(f"{uri} has a `*` or `?`, which a policy reads as a wildcard")
         bucket, key = _split(uri)
         objects.append(f"arn:aws:s3:::{bucket}/{key}/*")
         listed.setdefault(bucket, []).extend([key, f"{key}/*"])
@@ -154,6 +159,11 @@ def narrowed(
             "a narrowed AWS key is minted from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, "
             "and both are needed"
         )
+    if credentials.get("AWS_SESSION_TOKEN") or access_key_id.startswith("ASIA"):
+        raise AwsKeyError(
+            "these AWS keys are temporary (from SSO or a role), and a narrowed key can only be "
+            f"minted from an IAM user's long-term keys; use those, {TRUST}"
+        )
     issued = mint(_session_name(name), access_policy(uris), access_key_id, secret_access_key)
     return NarrowedKey(
         access_key_id=issued["AccessKeyId"],
@@ -169,12 +179,32 @@ def _session_name(name: str) -> str:
     return re.sub(r"[^\w+=,.@-]", "-", f"gpuc-{name}", flags=re.ASCII)[:32]
 
 
+def check_prefix(config: HostConfig, expected: str | None) -> None:
+    """Refuse an untrusted host's `s3_prefix` unless it is the one this machine
+    would give it (`config.default_s3_prefix`).
+
+    The prefix is the host's own config, and its keys are scoped from it: a
+    host that named another host's prefix, or another bucket, would have this
+    machine mint keys that reach those.
+    """
+    given = config.s3_prefix.rstrip("/") if config.s3_prefix else None
+    wanted = expected.rstrip("/") if expected else None
+    if given != wanted:
+        fix = f"--s3-prefix {wanted}" if wanted else "--s3-prefix ''"
+        raise AwsKeyError(
+            f"the host's s3_prefix is {given or 'unset'}, not {wanted or 'unset'} as this machine "
+            f"would set it, and an untrusted host does not choose where its keys reach. Set it "
+            f"back with `gpuc host set {config.host} {fix}`, {TRUST}"
+        )
+
+
 def job_secrets(
     spec: JobSpec,
     config: HostConfig,
     secrets: Mapping[str, str],
     *,
     trusted: bool,
+    expected_prefix: str | None,
     mint: Mint = federation_token,
 ) -> tuple[dict[str, str], NarrowedKey | None]:
     """The secrets this job's host is given: as named on a trusted host, and
@@ -207,6 +237,7 @@ def job_secrets(
             "the job names AWS keys in `secrets:` but uploads nothing to S3, and the keys an "
             f"untrusted host is given can only use where it uploads. Drop them, {TRUST}."
         )
+    check_prefix(config, expected_prefix)
     key = narrowed(spec.job_id, uris, secrets, mint)
     kept = {name: value for name, value in secrets.items() if name not in KEY_VARS}
     return {**kept, **key.env()}, key
@@ -218,6 +249,7 @@ def deliver_mirror_key(
     report: Reporter,
     *,
     trusted: bool,
+    expected_prefix: str | None,
     environ: Mapping[str, str] | None = None,
     mint: Mint = federation_token,
 ) -> str | None:
@@ -233,10 +265,9 @@ def deliver_mirror_key(
 
     Bootstrap delivers it, so a pod whose home was wiped gets it back with
     everything else, and so does every submit, since a narrowed key lasts 36
-    hours and the rental may outlive that. On an untrusted rental a key that
-    cannot be narrowed removes the file instead: it may hold an earlier
-    build's copy of the real keys. Returns a warning when the mirror will go
-    without.
+    hours and the rental may outlive that. Only ever a refresh: a key that
+    cannot be renewed leaves whatever is there, since deleting it would stop
+    a mirror that still works. Returns a warning when it was not renewed.
     """
     if not config.ephemeral or not config.s3_prefix:
         return None
@@ -254,18 +285,14 @@ def deliver_mirror_key(
     elif not trusted:
         mirror = f"{config.s3_prefix.rstrip('/')}/jobs"
         try:
+            check_prefix(config, expected_prefix)
             key = narrowed(config.host, [mirror], environ, mint)
             keys = key.env()
             described = f"an AWS key for {mirror} only, until {key.expires:%Y-%m-%d %H:%M %Z},"
         except AwsKeyError as exc:
             problem = str(exc)
     if problem is not None:
-        if trusted:
-            return (
-                f"the pod cannot mirror logs to {config.s3_prefix} with keys from here: {problem}"
-            )
-        transport.run(f'rm -f "{path}"', check=False)
-        return f"the pod cannot mirror logs to {config.s3_prefix}, and has no AWS keys: {problem}"
+        return f"the pod's mirror key for {config.s3_prefix} was not renewed: {problem}"
     region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or "us-east-1"
     body = "[default]\n" + f"region = {region}\n"
     body += "".join(f"{name.lower()} = {value}\n" for name, value in keys.items())

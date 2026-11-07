@@ -176,9 +176,9 @@ backup destinations. Adding another of either changes nothing else in this docum
   deleted once the job is finished and its uploads are confirmed.
 - **A host the user does not trust never sees their own AWS keys.** It is
   given temporary keys instead, which can use only where its jobs upload and
-  its mirror goes. A rental is untrusted and any other host trusted unless
-  the user says otherwise, and each client decides for itself: a host never
-  says whether it is trusted.
+  its mirror goes. A rental a client rents is untrusted and a host it adds
+  trusted unless the user says otherwise, and each client decides for itself:
+  a host never says whether it is trusted.
 - Plain, non-secret environment is part of the job spec and may be mirrored.
 
 ## Monitoring

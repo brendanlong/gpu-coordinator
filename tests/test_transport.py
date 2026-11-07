@@ -254,6 +254,15 @@ def test_put_file_replaces_the_file_whole_with_its_mode_and_leaves_nothing_besid
     assert [path.name for path in target.parent.iterdir()] == ["j1.env"]
 
 
+def test_put_file_onto_a_directory_fails_and_leaves_nothing(tmp_path: Path) -> None:
+    target = tmp_path / "secrets"
+    target.mkdir()
+    command = make_ssh(tmp_path).put_file_argv(str(target), 0o600)[-1]
+    result = subprocess.run(["bash", "-c", command], input="x", text=True, check=False)
+    assert result.returncode != 0
+    assert not [path for path in tmp_path.rglob("*") if ".gpuc-put" in path.name]
+
+
 def test_local_run_uses_a_non_login_shell() -> None:
     result = LocalTransport().run("shopt -q login_shell && echo login || echo non-login")
     assert "non-login" in result.stdout

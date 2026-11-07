@@ -888,7 +888,7 @@ AWS_SECRETS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
 RENTAL_CONFIG = {
     "host": "pod",
     "gpus": ["GPU-a"],
-    "s3_prefix": "s3://mirror/gpuc/pod",
+    "s3_prefix": "s3://mirror/gpuc/gpubox",
     "provider": {"kind": "runpod", "pod_id": "p1"},
 }
 SSH_CONFIG = {key: value for key, value in RENTAL_CONFIG.items() if key != "provider"}
@@ -930,7 +930,13 @@ def submit_with_keys(
     live.config_read = HostConfigRead(config or RENTAL_CONFIG)
     prepared = prepare(validate(document), repo, environ=environ or REAL_KEYS)
     return submit_prepared(
-        live, prepared, Settings(), workdir=repo, report=lambda _: None, mint=sts or FakeSts()
+        live,
+        prepared,
+        Settings(s3_bucket="mirror"),
+        workdir=repo,
+        report=lambda _: None,
+        s3=S3Index("mirror", FakeS3Client()),
+        mint=sts or FakeSts(),
     )
 
 
@@ -980,7 +986,7 @@ def test_an_untrusted_rental_gets_keys_that_can_only_use_where_the_job_uploads(
     assert job_mint[2:] == ("AKIAREAL", "real-secret")
     objects = {
         f"arn:aws:s3:::data/exp/{job_id}/results/*",
-        f"arn:aws:s3:::mirror/gpuc/pod/jobs/{job_id}/*",
+        f"arn:aws:s3:::mirror/gpuc/gpubox/jobs/{job_id}/*",
     }
     assert granted(job_mint[1]) == {
         "s3:PutObject": objects,
@@ -988,7 +994,7 @@ def test_an_untrusted_rental_gets_keys_that_can_only_use_where_the_job_uploads(
         "s3:AbortMultipartUpload": objects,
         "s3:ListBucket": {"arn:aws:s3:::data", "arn:aws:s3:::mirror"},
     }
-    assert granted(mirror_mint[1])["s3:PutObject"] == {"arn:aws:s3:::mirror/gpuc/pod/jobs/*"}
+    assert granted(mirror_mint[1])["s3:PutObject"] == {"arn:aws:s3:::mirror/gpuc/gpubox/jobs/*"}
 
     assert env_of(host, job_id) == {
         "AWS_ACCESS_KEY_ID": "ASIANARROW1",
@@ -1076,3 +1082,32 @@ def test_a_job_that_may_outlast_its_narrowed_keys_is_warned(control_env: Path, r
     assert any("may run 48h" in note and "--trusted" in note for note in long.notes)
     short = submit_with_keys(repo, job_document(secrets=AWS_SECRETS, max_runtime_min=60))
     assert not any("may run" in note for note in short.notes)
+
+
+@pytest.mark.parametrize(
+    "prefix", ["s3://mirror/gpuc/another-host", "s3://other-bucket/gpuc/gpubox", None]
+)
+def test_an_untrusted_host_does_not_choose_where_its_keys_reach(
+    control_env: Path, repo: Path, prefix: str | None
+) -> None:
+    host, sts = FakeHost(), FakeSts()
+    with pytest.raises(SubmitError, match="does not choose where its keys reach"):
+        submit_with_keys(
+            repo,
+            job_document(secrets=AWS_SECRETS, outputs=[{"path": "r", "s3": "s3://data/{job_id}"}]),
+            config={**RENTAL_CONFIG, "s3_prefix": prefix},
+            sts=sts,
+            host=host,
+        )
+    assert sts.minted == [] and host.rsyncs == []
+
+
+def test_temporary_keys_in_the_shell_are_refused_with_the_reason(
+    control_env: Path, repo: Path
+) -> None:
+    with pytest.raises(SubmitError, match="long-term keys"):
+        submit_with_keys(
+            repo,
+            job_document(secrets=[*AWS_SECRETS, "AWS_SESSION_TOKEN"]),
+            environ={**REAL_KEYS, "AWS_SESSION_TOKEN": "t"},
+        )

@@ -17,7 +17,7 @@ from gpuc.control.bootstrap import (
     bootstrap_host,
     package_files,
 )
-from gpuc.control.config import HostEntry
+from gpuc.control.config import HostEntry, Settings
 from gpuc.control.remote import NO_CONFIG, HostConfigRead, HostSession
 from gpuc.control.transport import CommandResult, Transport
 from gpuc.host.jobs import HostConfig
@@ -439,8 +439,14 @@ def test_bootstrap_gives_a_rental_its_mirror_key_by_this_machines_trust_in_it(
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shhh")
     rented = {**CONFIG_ON_HOST, "s3_prefix": "s3://b/gpuc/h", "provider": {"kind": "runpod"}}
+    settings = Settings(s3_bucket="b")
     trusted = ScriptedHost(config=dict(rented))
-    bootstrap_host(entry(kind="rental", pod_id="pod1"), transport=trusted, report=lambda _: None)
+    bootstrap_host(
+        entry(kind="rental", pod_id="pod1").model_copy(update={"trusted": True}),
+        settings,
+        transport=trusted,
+        report=lambda _: None,
+    )
     assert "aws_secret_access_key = shhh" in trusted.puts["/home/u/.gpuc/.aws/credentials"][0]
 
     # Untrusted, by an IAM user STS refuses: no key is left there at all.
@@ -451,12 +457,13 @@ def test_bootstrap_gives_a_rental_its_mirror_key_by_this_machines_trust_in_it(
     refusing.activate()
     untrusted = ScriptedHost(config=dict(rented))
     _, result = bootstrap_host(
-        entry(kind="rental", pod_id="pod1").model_copy(update={"trusted": False}),
+        entry(kind="rental", pod_id="pod1"),
+        settings,
         transport=untrusted,
         report=lambda _: None,
     )
     assert not any(path.endswith("/.aws/credentials") for path in untrusted.puts)
-    assert any("has no AWS keys" in warning for warning in result.warnings)
+    assert any("not renewed" in warning for warning in result.warnings)
     refusing.assert_no_pending_responses()
 
 

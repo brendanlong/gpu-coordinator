@@ -664,7 +664,12 @@ def submit_spec(
 
     try:
         secrets, narrowed = awskeys.job_secrets(
-            spec, session.config, prepared.secrets, trusted=entry.trusted, mint=mint
+            spec,
+            session.config,
+            prepared.secrets,
+            trusted=entry.trusted,
+            expected_prefix=default_s3_prefix(settings, entry.name),
+            mint=mint,
         )
     except awskeys.AwsKeyError as exc:
         raise SubmitError(f"host {entry.name} is not trusted with your AWS keys: {exc}") from exc
@@ -676,6 +681,17 @@ def submit_spec(
         )
         report(f"note: {notes[-1]}")
         warnings += narrowed_runtime_warnings(spec, narrowed)
+
+    mirror_warning = awskeys.deliver_mirror_key(
+        session.transport,
+        session.config,
+        report,
+        trusted=entry.trusted,
+        expected_prefix=default_s3_prefix(settings, entry.name),
+        mint=mint,
+    )
+    if mirror_warning:
+        warnings.append(mirror_warning)
 
     for warning in warnings:
         report(f"WARNING: {warning}")
@@ -692,12 +708,6 @@ def submit_spec(
             env_file(secrets), f"{session.home}/secrets/{spec.job_id}.env", 0o600
         )
         report(f"delivered {len(secrets)} secret(s) as {spec.job_id}.env (0600)")
-    mirror_warning = awskeys.deliver_mirror_key(
-        session.transport, session.config, report, trusted=entry.trusted, mint=mint
-    )
-    if mirror_warning:
-        report(f"WARNING: {mirror_warning}")
-        notes.append(mirror_warning)
 
     response = enqueue_spec(session, prepared)
 

@@ -24,6 +24,7 @@ from gpuc.control.config import (
     HostEntry,
     Reporter,
     Settings,
+    default_s3_prefix,
     first_config,
     load_settings,
     transport_for,
@@ -631,7 +632,13 @@ def bootstrap_host(
     for warning in (
         aws_warning,
         ensure_hf_cli(transport, uv, config.env, report),
-        deliver_mirror_key(transport, config, report, trusted=entry.trusted),
+        deliver_mirror_key(
+            transport,
+            config,
+            report,
+            trusted=entry.trusted,
+            expected_prefix=default_s3_prefix(settings, entry.name),
+        ),
     ):
         if warning:
             warnings.append(warning)

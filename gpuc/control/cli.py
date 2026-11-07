@@ -237,7 +237,7 @@ def cmd_host_add(args: argparse.Namespace) -> Answer:
         fields=fields,
         env_updates=env_updates,
         force=args.force,
-        trusted=not args.untrusted,
+        trusted=args.trusted,
         health=None if args.no_bootstrap else health_options(args),
         report=progress(args),
     )
@@ -365,7 +365,8 @@ def cmd_host_list(args: argparse.Namespace) -> Answer:
         # `gpuc host list --json` and `gpuc host probe`, not here: it is longer
         # than everything else on the line put together.
         lines.append(
-            f"host {entry.name} [{entry.kind}] {entry.ssh or 'this machine'}  "
+            f"host {entry.name} [{entry.kind}{'' if entry.trusted else ', untrusted'}] "
+            f"{entry.ssh or 'this machine'}  "
             f"gpus {len(owned)} ({summary}{driver})"
         )
         stale = shipped_note(entry)
@@ -1167,9 +1168,20 @@ def build_parser() -> argparse.ArgumentParser:
         "filesystem when they differ",
     )
     add.add_argument("--scratch-dir", help=SCRATCH_DIR_HELP)
-    add.add_argument(
+    trust = add.add_mutually_exclusive_group()
+    trust.add_argument(
+        "--trusted",
+        dest="trusted",
+        action="store_const",
+        const=True,
+        help="send its jobs your own AWS keys, as named in their `secrets:`. Without this or "
+        "--untrusted, a new host is trusted and one already registered keeps what it was",
+    )
+    trust.add_argument(
         "--untrusted",
-        action="store_true",
+        dest="trusted",
+        action="store_const",
+        const=False,
         help="send its jobs AWS keys that last 36h and can only use where the job uploads, "
         "never your own (what `host rent` does unless --trusted)",
     )

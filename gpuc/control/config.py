@@ -261,6 +261,15 @@ class HostEntry(TolerantModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _untrusted_unless_said(cls, data: Any) -> Any:
+        """An entry with no `trusted` -- written before there was one -- is
+        trusted as a new one of its kind would be: a rental not."""
+        if isinstance(data, dict) and data.get("trusted") is None:
+            return {**data, "trusted": data.get("rental") is None}
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _refuse_an_earlier_builds_rental(cls, data: Any) -> Any:
         """An entry with a top-level `pod_id` and no `rental` was written by
         a build that spelled a rental that way. Read tolerantly it would be

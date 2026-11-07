@@ -11,6 +11,7 @@ from botocore.stub import Stubber
 
 from gpuc.control import awskeys
 from gpuc.control.awskeys import AwsKeyError, access_policy, deliver_mirror_key, narrowed
+from gpuc.control.transport import LocalTransport
 from gpuc.host.jobs import HostConfig
 from tests.test_bootstrap import ScriptedHost
 from tests.test_submit import FakeSts
@@ -80,15 +81,34 @@ def test_only_a_refusal_is_blamed_on_the_missing_grant(
     assert "--trusted" in str(exc.value)
 
 
+def mirror(
+    host: Any,
+    config: HostConfig,
+    *,
+    trusted: bool,
+    environ: dict[str, str] = KEYS,
+    sts: FakeSts | None = None,
+    progress: list[str] | None = None,
+) -> str | None:
+    return deliver_mirror_key(
+        host,
+        config,
+        (progress if progress is not None else []).append,
+        trusted=trusted,
+        expected_prefix=config.s3_prefix,
+        environ=environ,
+        mint=sts or FakeSts(),
+    )
+
+
+RENTAL = HostConfig(host="gpuc-x", s3_prefix="s3://bucket/gpuc/gpuc-x", provider=RENTED)
+
+
 def test_an_untrusted_rental_mirrors_with_a_key_narrowed_to_its_own_jobs() -> None:
     host, sts = ScriptedHost(), FakeSts()
-    config = HostConfig(host="gpuc-x", s3_prefix="s3://bucket/gpuc/gpuc-x", provider=RENTED)
     progress: list[str] = []
     environ = {**KEYS, "AWS_REGION": "eu-west-1"}
-    assert (
-        deliver_mirror_key(host, config, progress.append, trusted=False, environ=environ, mint=sts)
-        is None
-    )
+    assert mirror(host, RENTAL, trusted=False, environ=environ, sts=sts, progress=progress) is None
     [(name, policy, *_)] = sts.minted
     assert name == "gpuc-gpuc-x"
     assert policy["Statement"][0]["Resource"] == ["arn:aws:s3:::bucket/gpuc/gpuc-x/jobs/*"]
@@ -101,29 +121,46 @@ def test_an_untrusted_rental_mirrors_with_a_key_narrowed_to_its_own_jobs() -> No
 
 def test_a_trusted_rental_mirrors_with_the_keys_themselves() -> None:
     host, sts = ScriptedHost(), FakeSts()
-    config = HostConfig(host="gpuc-x", s3_prefix="s3://b/x", provider=RENTED)
-    assert (
-        deliver_mirror_key(host, config, lambda _: None, trusted=True, environ=KEYS, mint=sts)
-        is None
-    )
+    assert mirror(host, RENTAL, trusted=True, sts=sts) is None
     ((_, (body, _)),) = host.puts.items()
     assert "aws_secret_access_key = shhh" in body
     assert sts.minted == []
 
 
-@pytest.mark.parametrize(("environ", "sts"), [(KEYS, FakeSts(refuses=True)), ({}, FakeSts())])
-def test_an_untrusted_rental_with_no_narrowed_key_is_left_with_no_aws_keys(
-    environ: dict[str, str], sts: FakeSts
+@pytest.mark.parametrize(
+    ("environ", "sts"), [(KEYS, FakeSts(refuses=True)), ({}, FakeSts())], ids=["refused", "no-keys"]
+)
+def test_a_mirror_key_that_cannot_be_renewed_is_left_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environ: dict[str, str], sts: FakeSts
 ) -> None:
-    """Rather than with whatever is there: an earlier build put the real keys there."""
-    host = ScriptedHost()
-    config = HostConfig(host="gpuc-x", s3_prefix="s3://b/x", provider=RENTED)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    credentials = tmp_path / ".aws" / "credentials"
+    credentials.parent.mkdir()
+    credentials.write_text("[default]\naws_session_token = earlier\n")
+    warning = mirror(LocalTransport(), RENTAL, trusted=False, environ=environ, sts=sts)
+    assert warning and "not renewed" in warning
+    assert credentials.read_text() == "[default]\naws_session_token = earlier\n"
+
+
+def test_a_host_with_its_own_idea_of_its_prefix_gets_no_mirror_key() -> None:
+    host, sts = ScriptedHost(), FakeSts()
     warning = deliver_mirror_key(
-        host, config, lambda _: None, trusted=False, environ=environ, mint=sts
+        host,
+        RENTAL,
+        lambda _: None,
+        trusted=False,
+        expected_prefix="s3://bucket/gpuc/somebody-else",
+        environ=KEYS,
+        mint=sts,
     )
-    assert warning and "has no AWS keys" in warning
-    assert host.puts == {}
-    assert any("rm -f" in command and ".aws/credentials" in command for command in host.events)
+    assert warning and "does not choose where its keys reach" in warning
+    assert sts.minted == [] and host.puts == {}
+
+
+def test_a_wildcard_never_reaches_a_policy() -> None:
+    for uri in ("s3://*", "s3://bucket/gpuc/?/x"):
+        with pytest.raises(AwsKeyError, match="wildcard"):
+            access_policy([uri])
 
 
 def test_no_mirror_or_a_shared_box_is_never_touched() -> None:
@@ -132,10 +169,7 @@ def test_no_mirror_or_a_shared_box_is_never_touched() -> None:
     shared_box = HostConfig(host="gpubox", s3_prefix="s3://b/x")
     for config in (no_mirror, shared_box):
         for trusted in (True, False):
-            assert (
-                deliver_mirror_key(host, config, lambda _: None, trusted=trusted, environ=KEYS)
-                is None
-            )
+            assert mirror(host, config, trusted=trusted) is None
     assert host.puts == {} and host.events == []
 
 
@@ -151,3 +185,10 @@ def test_the_session_name_fits_what_sts_takes(monkeypatch: pytest.MonkeyPatch) -
     assert len(name) <= 32 and name.startswith("gpuc-")
     assert all(c.isascii() and (c.isalnum() or c in "_+=,.@-") for c in name)
     assert awskeys.MAX_DURATION_S == 36 * 3600
+
+
+def test_a_destination_is_granted_once_and_with_its_key_exactly() -> None:
+    policy = access_policy(["s3://b//runs/j1", "s3://b//runs/j1/", "s3://b//runs/j1"])
+    [objects, listing] = policy["Statement"]
+    assert objects["Resource"] == ["arn:aws:s3:::b//runs/j1/*"]
+    assert listing["Condition"]["StringLike"]["s3:prefix"] == ["/runs/j1", "/runs/j1/*"]

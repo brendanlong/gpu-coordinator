@@ -207,7 +207,7 @@ Nothing on your machine needs to stay running. A rental's disk goes with it,
 so give every output an `s3` or `hf` destination and set `s3_bucket` so its
 logs outlive it.
 
-A rental's jobs get AWS keys that can only read and write their own outputs
+A rental's jobs, on one you rent, get AWS keys that can only read and write their own outputs
 and logs, for 36 hours from submit, instead of yours
 ([setup.md](setup.md#credentials-for-jobs)). A job that uses its keys for
 anything else, or runs longer than that, needs a rental rented with

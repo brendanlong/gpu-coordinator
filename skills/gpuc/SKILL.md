@@ -338,7 +338,8 @@ Rules, and they are not optional:
   want several at once. Matching rentals that are busy are listed and do not
   stop the rent. Local and ssh hosts are not compared, and nor are pods
   registered only on another machine (`gpuc pods` lists those).
-- A rental never gets your AWS keys: a job's `AWS_*` secrets arrive as keys
+- A rental you rent never gets your AWS keys (`host list` marks it
+  `untrusted`): a job's `AWS_*` secrets arrive as keys
   that last 36 hours from submit and can only read and write its own S3
   outputs and logs. A job that reads other S3 data with them, or may run
   longer, needs `host rent --trusted`. A job with `s3` outputs must list the
