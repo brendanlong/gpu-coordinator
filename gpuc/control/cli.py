@@ -86,10 +86,12 @@ from gpuc.control.gpuinfo import owned_entries, summarize
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.hosts import (
     DEFAULT_IDLE_MINUTES,
+    DEFAULT_QUOTE_LIMIT,
     RentalOptions,
     add_host,
     bootstrap_and_record,
     bootstrap_every_host,
+    quote_rental,
     rent_host,
     set_host,
 )
@@ -315,6 +317,13 @@ def cmd_host_remove(args: argparse.Namespace) -> Answer:
 
 def cmd_host_rent(args: argparse.Namespace) -> Answer:
     change = rent_host(rental_options(args), load_settings(), progress(args))
+    return Answer(change.document, change.render())
+
+
+def cmd_host_quote(args: argparse.Namespace) -> Answer:
+    change = quote_rental(
+        rental_options(args), load_settings(), limit=args.limit, report=progress(args)
+    )
     return Answer(change.document, change.render())
 
 
@@ -1347,6 +1356,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rent.set_defaults(func=cmd_host_rent)
 
+    quote = host.add_parser(
+        "quote",
+        help="list the offers `host rent` with the same flags would try, cheapest first, and "
+        "whether it would refuse; rents nothing, and ignores the flags that only shape the pod",
+    )
+    add_rent_flags(quote)
+    quote.add_argument(
+        "--limit",
+        type=_at_least_one,
+        default=DEFAULT_QUOTE_LIMIT,
+        metavar="N",
+        help=f"how many offers to list (default {DEFAULT_QUOTE_LIMIT})",
+    )
+    add_json_flag(
+        quote,
+        "the offers, how many matched, the matching rentals, and whether `host rent` would refuse",
+    )
+    quote.set_defaults(func=cmd_host_quote)
+
     terminate = host.add_parser(
         "terminate",
         help="end a rented pod now and forget it here (the pod stops billing)",
@@ -1761,7 +1789,8 @@ def add_no_git_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def _at_least_one(raw: str) -> int:
-    """A pod with no GPU is not a host gpuc rents, whatever the spec asks for."""
+    """A pod with no GPU is not a host gpuc rents, whatever the spec asks for,
+    and a quote of no offers answers nothing."""
     value = int(raw)
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
