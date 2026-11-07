@@ -338,6 +338,13 @@ Rules, and they are not optional:
   want several at once. Matching rentals that are busy are listed and do not
   stop the rent. Local and ssh hosts are not compared, and nor are pods
   registered only on another machine (`gpuc pods` lists those).
+- A rental never gets your AWS keys: a job's `AWS_*` secrets arrive as keys
+  that last 36 hours from submit and can only write its S3 outputs and logs.
+  A job that reads S3 with them, or may run longer, needs `host rent
+  --trusted`. A submit that fails mentioning `sts:GetFederationToken` means
+  the user's IAM user lacks that permission
+  (`docs/setup.md`, "Credentials for jobs"); ask them rather than
+  renting `--trusted` on your own.
 - Renting by mistake is cheap to undo: `gpuc host terminate <host>` ends a
   fresh rental with nothing queued, no `--force` needed.
 - **Nothing on this machine watches a pod after it is set up, or ends one on

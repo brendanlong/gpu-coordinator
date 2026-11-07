@@ -207,6 +207,11 @@ Nothing on your machine needs to stay running. A rental's disk goes with it,
 so give every output an `s3` or `hf` destination and set `s3_bucket` so its
 logs outlive it.
 
+A rental's jobs get AWS keys that can only write their outputs and logs, for
+36 hours from submit, instead of yours ([setup.md](setup.md#credentials-for-jobs)).
+A job that reads from S3 with its keys, or runs longer than that, needs a
+rental rented with `--trusted`, which gets your keys as they are.
+
 ```sh
 gpuc pods                            # every gpuc pod at every provider, with its cost
 gpuc host terminate <name>           # end one now; refuses unless it is idle (--force)

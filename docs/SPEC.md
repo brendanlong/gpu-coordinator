@@ -173,6 +173,9 @@ backup destinations. Adding another of either changes nothing else in this docum
   command lines, never in a provider's pod environment, never in logs, and
   never in anything synced to a backup destination. A job's secrets are
   deleted once the job is finished and its uploads are confirmed.
+- **A rental never sees the user's own AWS keys** unless it was rented as
+  trusted. It is given temporary keys instead, which can write only where
+  its jobs upload and its mirror goes.
 - Plain, non-secret environment is part of the job spec and may be mirrored.
 
 ## Monitoring

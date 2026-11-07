@@ -629,7 +629,12 @@ def test_offer_satisfies_checks_every_constraint() -> None:
 
 
 def _register_reusable(
-    pod: Pod, host: FakeHost, *, price: float = 0.49, gpus: list[str] | None = None
+    pod: Pod,
+    host: FakeHost,
+    *,
+    price: float = 0.49,
+    gpus: list[str] | None = None,
+    trusted: bool = False,
 ) -> HostEntry:
     """A pod registered here, whose own `config.json` on the host says what it
     was bought as and which cards it owns. The registry's cache deliberately
@@ -643,6 +648,7 @@ def _register_reusable(
             "pod_id": pod.id,
             "offer": make_offer(price=price).model_dump(mode="json"),
             "created_at": utc_now(),
+            "trusted": trusted,
         },
     )
     host.put_file(json.dumps(on_host.to_dict()), f"{host.home}/config.json", 0o644)
@@ -670,9 +676,15 @@ def _beating(host: FakeHost) -> None:
 
 
 def _matches(
-    provider: FakeProvider, reports: list[str], constraints: Constraints = CONSTRAINTS
+    provider: FakeProvider,
+    reports: list[str],
+    constraints: Constraints = CONSTRAINTS,
+    *,
+    trusted: bool = False,
 ) -> list[Match]:
-    return matching_rentals(constraints, Settings(), provider=provider, report=reports.append)
+    return matching_rentals(
+        constraints, Settings(), provider=provider, trusted=trusted, report=reports.append
+    )
 
 
 def _live(host: FakeHost, **register: object) -> FakeProvider:
@@ -753,6 +765,14 @@ def test_a_rental_that_cannot_be_asked_is_reported_and_skipped(
     reports: list[str] = []
     assert _matches(provider, reports) == []
     assert any("could not ask rental gpuc-e2e-aaa" in line for line in reports)
+
+
+def test_asked_for_trusted_only_a_trusted_rental_matches(
+    control_env: Path, ssh_key: Path, host: FakeHost
+) -> None:
+    assert _matches(_live(host), [], trusted=True) == []
+    assert len(_matches(_live(host, trusted=True), [], trusted=True)) == 1
+    assert len(_matches(_live(host, trusted=True), [])) == 1
 
 
 def test_a_pod_that_is_too_expensive_does_not_match(

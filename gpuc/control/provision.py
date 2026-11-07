@@ -212,6 +212,7 @@ def provision(
     provider: Provider,
     report: Reporter = print,
     health_options: HealthOptions = DEFAULT_HEALTH,
+    trusted: bool = False,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
     """Create, wait for, bootstrap and register one pod. Returns its registry
@@ -252,6 +253,7 @@ def provision(
                 idle_minutes=idle_minutes,
                 image=image or provider.default_image,
                 health_options=health_options,
+                trusted=trusted,
                 progress=progress,
                 deps=deps,
                 deadline=deadline,
@@ -303,6 +305,7 @@ def _try_offer(
     idle_minutes: float,
     image: str,
     health_options: HealthOptions,
+    trusted: bool,
     progress: _Progress,
     deps: ProvisionDeps,
     deadline: float,
@@ -384,7 +387,7 @@ def _try_offer(
             fields={
                 "idle_minutes": idle_minutes,
                 "created_at": created_at,
-                "provider": rented.pod_record(address, offer, created_at),
+                "provider": rented.pod_record(address, offer, created_at, trusted=trusted),
             },
             transport=transport,
         ).entry
@@ -657,10 +660,12 @@ def matching_rentals(
     settings: Settings,
     *,
     provider: Provider,
+    trusted: bool = False,
     report: Reporter = print,
 ) -> list[Match]:
     """Every registered rental of this provider that could take the job being
-    rented for, each asked at once.
+    rented for, each asked at once. Asked for `trusted`, only a rental that
+    was rented `--trusted` matches: the job wants keys the others never get.
 
     Every fact is the host's own: its pod is looked up at the provider and its
     `status` asked over ssh, and the offer it was bought on is read from the
@@ -697,7 +702,7 @@ def matching_rentals(
             report(f"could not ask the provider about rental {entry.name}: {asked.pod_error}")
             continue
         match = _match(entry, asked, constraints, provider)
-        if match is not None:
+        if match is not None and not (trusted and asked.session.config.narrows_aws):
             matches.append(match)
     return matches
 

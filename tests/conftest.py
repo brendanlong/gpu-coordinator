@@ -49,6 +49,15 @@ SEEN_AT = "2026-09-15T12:00:00+00:00"
 how old the cache is has something stable to say."""
 
 
+@pytest.fixture(autouse=True)
+def no_aws_keys(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test but the live one sees the developer's AWS keys: a submit to a
+    rental mints narrowed keys from them, and a unit test must never reach STS."""
+    if request.node.get_closest_marker("rental") is None:
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+
+
 def ago(**delta: float) -> str:
     """An ISO timestamp `delta` before now; a negative delta is in the future."""
     return (datetime.now(UTC) - timedelta(**delta)).isoformat()

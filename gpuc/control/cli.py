@@ -556,6 +556,7 @@ def rental_options(args: argparse.Namespace) -> RentalOptions:
         disk_gb=args.disk,
         image=args.image,
         health=health_options(args),
+        trusted=args.trusted,
     )
     if args.idle_min is not None:
         options.idle_minutes = args.idle_min
@@ -1809,6 +1810,12 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
         help="rent even if a registered rental that matches is free",
     )
     parser.add_argument("--name-hint", default="job", help="goes into the pod name")
+    parser.add_argument(
+        "--trusted",
+        action="store_true",
+        help="send jobs your own AWS keys, as named in their `secrets:`; by default a rental "
+        "gets keys that last 36h and can only write where the job uploads",
+    )
     parser.add_argument("--health-args", default="", help="extra flags for `gpuc.host health`")
 
 

@@ -994,6 +994,16 @@ class HostConfig:
     def ephemeral(self) -> bool:
         return self.provider is not None
 
+    @property
+    def narrows_aws(self) -> bool:
+        """Is this host given narrowed AWS keys rather than the submitter's own?
+
+        Every rental is, unless it was rented `--trusted`: a rental may be a
+        stranger's machine, and its record of that lives with the rest of what
+        it was bought as, so every client that drives it reads the same answer.
+        """
+        return self.provider is not None and self.provider.get("trusted") is not True
+
     def may_borrow(self, spec: JobSpec) -> bool:
         """May this job be given one of this host's shared cards?
 

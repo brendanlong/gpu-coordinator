@@ -98,6 +98,7 @@ class RentalOptions:
     disk_gb: int | None = None
     image: str | None = None
     health: HealthOptions = DEFAULT_HEALTH
+    trusted: bool = False
 
     def constraints(self, provider: Provider, settings: Settings) -> Constraints:
         """What to search `provider` for. A flag it cannot search by is a
@@ -150,7 +151,9 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
     """
     provider = make_provider(settings, options.provider)
     constraints = options.constraints(provider, settings)
-    matches = matching_rentals(constraints, settings, provider=provider, report=report)
+    matches = matching_rentals(
+        constraints, settings, provider=provider, trusted=options.trusted, report=report
+    )
     found = {"matching_rentals": [match.document() for match in matches]}
     free = [match for match in matches if match.free]
     if free and not options.force:
@@ -175,6 +178,7 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
         idle_minutes=options.idle_minutes,
         image=options.image or settings.image,
         health_options=options.health,
+        trusted=options.trusted,
     )
     document = {**host_document(entry), **found}
     return HostChange(document, [f"next: gpuc submit <job.yaml> --host {entry.name}"])
