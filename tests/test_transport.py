@@ -242,11 +242,25 @@ def test_ssh_transport_against_localhost(ssh_localhost: None, tmp_path: Path) ->
         ssh.run("exit 9")
 
 
-def test_put_file_creates_the_file_with_umask_077_and_quotes_the_dirname(tmp_path: Path) -> None:
-    command = make_ssh(tmp_path).put_file_argv("/home/u/.gpuc/secrets/j1.env")[-1]
-    assert "umask 077" in command
-    assert '"$(dirname' in command
-    assert command.index("umask 077") < command.index("chmod 600")
+def test_put_file_replaces_the_file_whole_with_its_mode_and_leaves_nothing_beside_it(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "a dir" / "secrets" / "j1.env"
+    command = make_ssh(tmp_path).put_file_argv(str(target), 0o600)[-1]
+    for content in ("first\n", "second\n"):
+        subprocess.run(["bash", "-c", command], input=content, text=True, check=True)
+        assert target.read_text() == content
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert [path.name for path in target.parent.iterdir()] == ["j1.env"]
+
+
+def test_put_file_onto_a_directory_fails_and_leaves_nothing(tmp_path: Path) -> None:
+    target = tmp_path / "secrets"
+    target.mkdir()
+    command = make_ssh(tmp_path).put_file_argv(str(target), 0o600)[-1]
+    result = subprocess.run(["bash", "-c", command], input="x", text=True, check=False)
+    assert result.returncode != 0
+    assert not [path for path in tmp_path.rglob("*") if ".gpuc-put" in path.name]
 
 
 def test_local_run_uses_a_non_login_shell() -> None:

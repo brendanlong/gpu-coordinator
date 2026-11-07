@@ -227,8 +227,8 @@ class HostEntry(TolerantModel):
     Two kinds of thing, and only two:
 
     - the **address** -- `ssh`, `port`, `gpuc_home` / `persistent_root`,
-      `rental` -- hand-entered, local to this machine, and saying nothing
-      about how the host behaves;
+      `rental` -- and `trusted`: hand-entered, local to this machine, and
+      saying nothing about how the host behaves;
     - the **cache**, a copy of what the host said the last time we asked.
 
     What the host *is* -- its cards, its mirror, its env, its timers -- lives in
@@ -244,11 +244,29 @@ class HostEntry(TolerantModel):
     gpuc_home: str | None = None
     persistent_root: str | None = None
     rental: Rental | None = None
+    trusted: bool = True
+    """Is this host given the submitter's own AWS keys, or keys narrowed to
+    what it uploads (`awskeys`)? A rental starts untrusted unless rented
+    `--trusted`, and every other host trusted unless added `--untrusted`.
+
+    This machine's judgment, kept here and not in the host's config: a host
+    that could say it was trusted would be the one deciding what it is sent.
+    So a second machine driving the same rental decides for itself, with
+    `host add --untrusted`."""
     bootstrapped_at: str | None = None
     """When *this* machine last bootstrapped the host. Another machine's
     bootstrap is invisible here, which is why nothing decides on it: it is a
     label on `gpuc host list` and nothing more."""
     cache: HostCache = Field(default_factory=HostCache)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _untrusted_unless_said(cls, data: Any) -> Any:
+        """An entry with no `trusted` -- written before there was one -- is
+        trusted as a new one of its kind would be: a rental not."""
+        if isinstance(data, dict) and data.get("trusted") is None:
+            return {**data, "trusted": data.get("rental") is None}
+        return data
 
     @model_validator(mode="before")
     @classmethod

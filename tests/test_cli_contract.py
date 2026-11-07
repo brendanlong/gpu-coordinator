@@ -1108,6 +1108,14 @@ def test_host_add_json_is_the_host_as_list_reports_it_plus_what_add_did(
     assert fake_host.config is not None
 
 
+def test_host_add_untrusted_is_recorded_in_the_registry(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--untrusted", "--json"]) == EXIT_OK
+    assert document_of(capsys)["trusted"] is False
+    assert load_registry().hosts["gpubox"].trusted is False
+
+
 def test_host_add_json_carries_the_owns_nothing_warning_in_the_document(
     control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1548,3 +1556,26 @@ def test_a_job_on_a_host_this_build_cannot_read_is_not_a_missing_job(
     err = capsys.readouterr().err
     assert "registry entry could not be read" in err
     assert "no registered host knows" not in err
+
+
+def test_re_adding_a_host_keeps_this_machines_trust_in_it(
+    control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--untrusted"]) == EXIT_OK
+    assert main(["host", "add", "gpubox", "--ssh", "me@box"]) == EXIT_OK
+    assert load_registry().hosts["gpubox"].trusted is False
+
+
+def test_an_entry_from_before_trust_was_recorded_trusts_only_what_is_not_rented() -> None:
+    rental = {"name": "pod", "ssh": "root@1.2.3.4", "rental": {"provider": "runpod", "pod_id": "p"}}
+    assert HostEntry.model_validate(rental).trusted is False
+    assert HostEntry.model_validate({"name": "box", "ssh": "me@box"}).trusted is True
+    assert HostEntry.model_validate({**rental, "trusted": True}).trusted is True
+
+
+def test_host_add_trusted_says_so_for_a_host_already_registered(
+    control_env: Path, fake_host: FakeHost
+) -> None:
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--untrusted"]) == EXIT_OK
+    assert main(["host", "add", "gpubox", "--ssh", "me@box", "--trusted"]) == EXIT_OK
+    assert load_registry().hosts["gpubox"].trusted is True

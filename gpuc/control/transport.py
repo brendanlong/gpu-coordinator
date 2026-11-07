@@ -317,10 +317,14 @@ class SshTransport:
     def put_file_argv(self, remote_path: str, mode: int = 0o600) -> list[str]:
         quoted = shlex.quote(remote_path)
         # umask first: `cat >` alone creates the file 0644, so a secret is
-        # world-readable for as long as it takes the chmod to land.
+        # world-readable for as long as it takes the chmod to land. Written
+        # beside the target and renamed over it, as `LocalTransport` does, so a
+        # reader never sees it half-written: the dispatcher's `aws` reads
+        # `~/.aws/credentials` while a submit replaces it.
         return self.ssh_argv(
-            f'mkdir -p "$(dirname {quoted})" && (umask 077 && cat > {quoted}) '
-            f"&& chmod {mode:o} {quoted}"
+            f'dir="$(dirname {quoted})" && mkdir -p "$dir" && tmp="$dir/.gpuc-put.$$" && '
+            f'{{ (umask 077 && cat > "$tmp") && chmod {mode:o} "$tmp" && mv -fT "$tmp" {quoted} '
+            f'|| {{ rm -f "$tmp"; exit 1; }}; }}'
         )
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:

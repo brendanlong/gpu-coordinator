@@ -117,6 +117,29 @@ Uploading outputs to S3, and a host mirroring logs to your bucket, need the two
 AWS keys; uploading to Hugging Face needs `HF_TOKEN`. Secrets are stored on the
 host in a file only you can read, and deleted when the job is done.
 
+A rental is someone else's machine, so one you rent is never sent your AWS keys. It
+gets temporary keys instead, made from yours at submit, which last 36 hours
+and can only read and write where the job uploads. For that, your IAM user
+needs permission to make them, once:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "sts:GetFederationToken",
+  "Resource": "arn:aws:sts::<account-id>:federated-user/gpuc-*"
+}
+```
+
+These must be the IAM user's long-term keys, not temporary ones from SSO or a
+role, and the temporary keys can do no more than the user can, so an IAM user
+that can only reach your buckets keeps them that way. A rental you trust with
+your own keys, for a job that reads other data from S3 with them, say, is
+rented with `gpuc host rent --trusted`. Each machine decides this for itself:
+to drive a rental another machine rented without trusting it, add it with
+`gpuc host add <name> --pod <id> --untrusted`. Re-adding a host keeps what
+was decided unless `--trusted` or `--untrusted` says otherwise. Buckets encrypted with your own
+KMS key need a trusted host.
+
 ## The web dashboard
 
 An optional page showing the same thing as `gpuc status`, with buttons to

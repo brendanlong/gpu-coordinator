@@ -239,6 +239,7 @@ def cmd_host_add(args: argparse.Namespace) -> Answer:
         fields=fields,
         env_updates=env_updates,
         force=args.force,
+        trusted=args.trusted,
         health=None if args.no_bootstrap else health_options(args),
         report=progress(args),
     )
@@ -373,7 +374,8 @@ def cmd_host_list(args: argparse.Namespace) -> Answer:
         # `gpuc host list --json` and `gpuc host probe`, not here: it is longer
         # than everything else on the line put together.
         lines.append(
-            f"host {entry.name} [{entry.kind}] {entry.ssh or 'this machine'}  "
+            f"host {entry.name} [{entry.kind}{'' if entry.trusted else ', untrusted'}] "
+            f"{entry.ssh or 'this machine'}  "
             f"gpus {len(owned)} ({summary}{driver})"
         )
         stale = shipped_note(entry)
@@ -565,6 +567,7 @@ def rental_options(args: argparse.Namespace) -> RentalOptions:
         disk_gb=args.disk,
         image=args.image,
         health=health_options(args),
+        trusted=args.trusted,
     )
     if args.idle_min is not None:
         options.idle_minutes = args.idle_min
@@ -1174,6 +1177,23 @@ def build_parser() -> argparse.ArgumentParser:
         "filesystem when they differ",
     )
     add.add_argument("--scratch-dir", help=SCRATCH_DIR_HELP)
+    trust = add.add_mutually_exclusive_group()
+    trust.add_argument(
+        "--trusted",
+        dest="trusted",
+        action="store_const",
+        const=True,
+        help="send its jobs your own AWS keys, as named in their `secrets:`. Without this or "
+        "--untrusted, a new host is trusted and one already registered keeps what it was",
+    )
+    trust.add_argument(
+        "--untrusted",
+        dest="trusted",
+        action="store_const",
+        const=False,
+        help="send its jobs AWS keys that last 36h and can only use where the job uploads, "
+        "never your own (what `host rent` does unless --trusted)",
+    )
     add.add_argument("--s3-prefix", help="s3://bucket/prefix for log and state mirroring")
     add.add_argument(
         "--retention-days",
@@ -1838,6 +1858,12 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
         help="rent even if a registered rental that matches is free",
     )
     parser.add_argument("--name-hint", default="job", help="goes into the pod name")
+    parser.add_argument(
+        "--trusted",
+        action="store_true",
+        help="send its jobs your own AWS keys, as named in their `secrets:`; by default a "
+        "rental gets keys that last 36h and can only use where the job uploads",
+    )
     parser.add_argument("--health-args", default="", help="extra flags for `gpuc.host health`")
 
 

@@ -13,17 +13,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc._version import user_agent
+from gpuc.control.awskeys import deliver_mirror_key
 from gpuc.control.config import (
     HostEntry,
     Reporter,
     Settings,
+    default_s3_prefix,
     first_config,
     load_settings,
     transport_for,
@@ -53,7 +54,6 @@ PYTHON_FLOOR_TEXT = ".".join(str(part) for part in PYTHON_FLOOR)
 PYTHON_INSTALL = "3.12"
 INSTALL_TIMEOUT_S = 900.0
 HEALTH_TIMEOUT_S = 300.0
-AWS_KEY_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 
 
 class BootstrapError(RuntimeError):
@@ -520,44 +520,6 @@ def driver_version(health: dict[str, Any]) -> str | None:
     return None
 
 
-def deliver_s3_credentials(
-    transport: Transport,
-    config: HostConfig,
-    report: Reporter,
-    environ: Mapping[str, str] | None = None,
-) -> str | None:
-    """Give a *rented* host S3 credentials of its own, for the mirror.
-
-    Each job's sync runs with the job's own `secrets:`, but the dispatcher's
-    drain mirrors every job's log.txt and state.json after the jobs -- and
-    their secrets files -- are gone, with only its own environment to do it.
-    So the pod gets a `~/.aws/credentials` from the bootstrapping shell,
-    written from stdin at 0600, never via argv and never in the pod env
-    (`GET /pods` returns the env to any holder of an account key). A rental
-    only: its `$HOME` is ours, and a shared box's user has their own. Part of
-    bootstrap so a pod whose home was wiped gets them back with everything
-    else. Returns a warning when the mirror will go without.
-    """
-    if not config.ephemeral or not config.s3_prefix:
-        return None
-    environ = dict(os.environ) if environ is None else dict(environ)
-    if not (environ.get("AWS_ACCESS_KEY_ID") and environ.get("AWS_SECRET_ACCESS_KEY")):
-        return (
-            f"no AWS credentials in this environment, so the pod cannot mirror logs to "
-            f"{config.s3_prefix}; export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY before "
-            f"bootstrapping if you want the mirror"
-        )
-    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-    body = "[default]\n" + f"region = {region}\n"
-    for name in AWS_KEY_VARS:
-        if environ.get(name):
-            body += f"{name.lower()} = {environ[name]}\n"
-    home = transport.run('printf %s "$HOME"', check=True).stdout.strip()
-    transport.put_file(body, f"{home}/.aws/credentials", 0o600)
-    report(f"delivered S3 credentials to {home}/.aws/credentials (0600) for the log mirror")
-    return None
-
-
 def start_dispatcher(session: HostSession) -> int:
     # The dispatcher re-derives PATH and the host env from config.json itself;
     # setting them here means the very first process in the chain already has
@@ -670,7 +632,13 @@ def bootstrap_host(
     for warning in (
         aws_warning,
         ensure_hf_cli(transport, uv, config.env, report),
-        deliver_s3_credentials(transport, config, report),
+        deliver_mirror_key(
+            transport,
+            config,
+            report,
+            trusted=entry.trusted,
+            expected_prefix=default_s3_prefix(settings, entry.name),
+        ),
     ):
         if warning:
             warnings.append(warning)

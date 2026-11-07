@@ -6,17 +6,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+import boto3
 import pytest
+from botocore.stub import Stubber
 
 from gpuc.control import version as version_mod
 from gpuc.control.bootstrap import (
     BootstrapError,
     HealthOptions,
     bootstrap_host,
-    deliver_s3_credentials,
     package_files,
 )
-from gpuc.control.config import HostEntry
+from gpuc.control.config import HostEntry, Settings
 from gpuc.control.remote import NO_CONFIG, HostConfigRead, HostSession
 from gpuc.control.transport import CommandResult, Transport
 from gpuc.host.jobs import HostConfig
@@ -432,58 +433,44 @@ def test_a_rented_pods_own_record_is_not_disturbed_by_bootstrap(control_env: Pat
     assert host.config["provider"] == bought
 
 
+def test_bootstrap_gives_a_rental_its_mirror_key_by_this_machines_trust_in_it(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shhh")
+    rented = {**CONFIG_ON_HOST, "s3_prefix": "s3://b/gpuc/h", "provider": {"kind": "runpod"}}
+    settings = Settings(s3_bucket="b")
+    trusted = ScriptedHost(config=dict(rented))
+    bootstrap_host(
+        entry(kind="rental", pod_id="pod1").model_copy(update={"trusted": True}),
+        settings,
+        transport=trusted,
+        report=lambda _: None,
+    )
+    assert "aws_secret_access_key = shhh" in trusted.puts["/home/u/.gpuc/.aws/credentials"][0]
+
+    # Untrusted, by an IAM user STS refuses: no key is left there at all.
+    sts = boto3.client("sts", region_name="us-east-1")
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: sts)
+    refusing = Stubber(sts)
+    refusing.add_client_error("get_federation_token", service_error_code="AccessDenied")
+    refusing.activate()
+    untrusted = ScriptedHost(config=dict(rented))
+    _, result = bootstrap_host(
+        entry(kind="rental", pod_id="pod1"),
+        settings,
+        transport=untrusted,
+        report=lambda _: None,
+    )
+    assert not any(path.endswith("/.aws/credentials") for path in untrusted.puts)
+    assert any("not renewed" in warning for warning in result.warnings)
+    refusing.assert_no_pending_responses()
+
+
 def test_a_host_nobody_rents_gets_no_provider_block(control_env: Path) -> None:
     host = ScriptedHost(config=dict(CONFIG_ON_HOST))
     bootstrap_host(entry(), transport=host, report=lambda _: None)
     assert host.config is not None and host.config.get("provider") is None
-
-
-def test_s3_credentials_are_delivered_0600_to_a_rental_with_a_mirror() -> None:
-    host = ScriptedHost()
-    config = HostConfig(
-        host="gpuc-x", s3_prefix="s3://bucket/gpuc/gpuc-x", provider={"kind": "runpod"}
-    )
-    progress: list[str] = []
-    assert (
-        deliver_s3_credentials(
-            host,
-            config,
-            progress.append,
-            {
-                "AWS_ACCESS_KEY_ID": "AKIA",
-                "AWS_SECRET_ACCESS_KEY": "shhh",
-                "AWS_REGION": "us-east-1",
-            },
-        )
-        is None
-    )
-    ((path, (body, mode)),) = host.puts.items()
-    assert path.endswith("/.aws/credentials")
-    assert "aws_access_key_id = AKIA" in body and "region = us-east-1" in body
-    assert mode == 0o600
-    assert not any("shhh" in line for line in progress)
-
-
-def test_s3_credentials_are_a_warning_without_them_and_nothing_without_a_mirror() -> None:
-    host = ScriptedHost()
-    rented = HostConfig(host="gpuc-x", s3_prefix="s3://b/x", provider={"kind": "runpod"})
-    warning = deliver_s3_credentials(host, rented, lambda m: None, {})
-    assert warning and "AWS_ACCESS_KEY_ID" in warning
-    assert host.puts == {}
-    no_mirror = HostConfig(host="gpuc-x", provider={"kind": "runpod"})
-    assert (
-        deliver_s3_credentials(host, no_mirror, lambda m: None, {"AWS_ACCESS_KEY_ID": "a"}) is None
-    )
-    assert host.puts == {}
-
-
-def test_s3_credentials_are_never_written_to_a_host_somebody_else_owns() -> None:
-    """A shared box's `~/.aws` is its user's; only a rental's home is ours."""
-    host = ScriptedHost()
-    shared_box = HostConfig(host="gpubox", s3_prefix="s3://b/x")
-    environ = {"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "shhh"}
-    assert deliver_s3_credentials(host, shared_box, lambda m: None, environ) is None
-    assert host.puts == {}
 
 
 def test_health_options_round_trip_through_the_hosts_own_flags() -> None:

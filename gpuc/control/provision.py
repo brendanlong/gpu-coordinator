@@ -212,6 +212,7 @@ def provision(
     provider: Provider,
     report: Reporter = print,
     health_options: HealthOptions = DEFAULT_HEALTH,
+    trusted: bool = False,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
     """Create, wait for, bootstrap and register one pod. Returns its registry
@@ -252,6 +253,7 @@ def provision(
                 idle_minutes=idle_minutes,
                 image=image or provider.default_image,
                 health_options=health_options,
+                trusted=trusted,
                 progress=progress,
                 deps=deps,
                 deadline=deadline,
@@ -303,6 +305,7 @@ def _try_offer(
     idle_minutes: float,
     image: str,
     health_options: HealthOptions,
+    trusted: bool,
     progress: _Progress,
     deps: ProvisionDeps,
     deadline: float,
@@ -355,6 +358,7 @@ def _try_offer(
         address = rented.address_for(name, pod, provider.name)
         if address is None:
             raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
+        address = address.model_copy(update={"trusted": trusted})
         transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
         # The one look at the pod's cards, the same probe `gpuc host add`
@@ -657,10 +661,13 @@ def matching_rentals(
     settings: Settings,
     *,
     provider: Provider,
+    trusted: bool = False,
     report: Reporter = print,
 ) -> list[Match]:
     """Every registered rental of this provider that could take the job being
-    rented for, each asked at once.
+    rented for, each asked at once. Only rentals trusted as this one would be
+    match: an untrusted one cannot have the keys a trusted rent is for, and a
+    trusted one would be handed keys the rent did not ask to send.
 
     Every fact is the host's own: its pod is looked up at the provider and its
     `status` asked over ssh, and the offer it was bought on is read from the
@@ -697,7 +704,7 @@ def matching_rentals(
             report(f"could not ask the provider about rental {entry.name}: {asked.pod_error}")
             continue
         match = _match(entry, asked, constraints, provider)
-        if match is not None:
+        if match is not None and entry.trusted == trusted:
             matches.append(match)
     return matches
 

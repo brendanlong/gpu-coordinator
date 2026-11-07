@@ -16,12 +16,14 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from gpuc.control import awskeys
 from gpuc.control.config import Reporter, Settings, default_s3_prefix, utc_now
 from gpuc.control.remote import HostSession, config_file
 from gpuc.control.s3index import IndexEntry, LocalIndex, S3Index, S3IndexError
@@ -248,7 +250,7 @@ def _no_job_id(output: jobs.Output, key: str, destination: str, job_id: str) -> 
     )
 
 
-def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -> str:
+def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -> dict[str, str]:
     environ = environ if environ is not None else os.environ
     missing = [name for name in names if not environ.get(name)]
     if missing:
@@ -257,15 +259,16 @@ def gather_secrets(names: list[str], environ: Mapping[str, str] | None = None) -
             f"Export them (for example `export {missing[0]}=...`) or drop them from the "
             f"spec's `secrets:` list, then submit again."
         )
-    lines: list[str] = []
     for name in names:
-        value = environ[name]
-        if "\n" in value:
+        if "\n" in environ[name]:
             raise SubmitError(
                 f"secret {name} contains a newline; the env file format cannot hold it"
             )
-        lines.append(f"{name}={value}")
-    return "".join(f"{line}\n" for line in lines)
+    return {name: environ[name] for name in names}
+
+
+def env_file(secrets: Mapping[str, str]) -> str:
+    return "".join(f"{name}={value}\n" for name, value in secrets.items())
 
 
 @dataclass
@@ -275,7 +278,7 @@ class Prepared:
     model: JobSpecModel
     spec: JobSpec
     """The job as the host will run it: `{job_id}` expanded."""
-    secrets_body: str
+    secrets: dict[str, str]
     requeued_from: str | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -299,7 +302,7 @@ def prepare(
 ) -> Prepared:
     """The checks every submit runs, once, before a host is involved."""
     spec = expand_job_id(model.to_spec(job_id or jobs.new_job_id()))
-    secrets_body = gather_secrets(spec.secrets, environ)
+    secrets = gather_secrets(spec.secrets, environ)
     if use_git:
         try:
             git_tracked_files(workdir)
@@ -310,7 +313,7 @@ def prepare(
         *preexisting_output_warnings(spec, workdir),
         *timeout_warnings(spec),
     ]
-    return Prepared(model, spec, secrets_body, requeued_from, warnings)
+    return Prepared(model, spec, secrets, requeued_from, warnings)
 
 
 def shell_syntax_warnings(model: JobSpecModel) -> list[str]:
@@ -443,6 +446,25 @@ def preexisting_output_warnings(spec: JobSpec, workdir: Path) -> list[str]:
                 f"(for example {output.path}/{{job_id}}/) if you meant them to be"
             )
     return warnings
+
+
+def narrowed_runtime_warnings(spec: JobSpec, key: awskeys.NarrowedKey) -> list[str]:
+    """A job that says it may run longer than its narrowed keys last.
+
+    Its uploads stop working when they expire, and nothing can renew them:
+    no client watches a rental. The clock started at submit, so time in the
+    queue counts too. Said rather than refused, since a limit or an estimate
+    is not a promise either way.
+    """
+    minutes = max(spec.max_runtime_min or 0, spec.estimated_runtime_min or 0)
+    left_h = (key.expires - datetime.now(UTC)).total_seconds() / 3600
+    if minutes / 60 <= left_h:
+        return []
+    return [
+        f"this job may run {minutes / 60:g}h, and its AWS keys stop working in "
+        f"{left_h:.0f}h, counting from now and not from when it starts, taking its uploads "
+        f"with them; {awskeys.TRUST}"
+    ]
 
 
 def timeout_warnings(spec: JobSpec) -> list[str]:
@@ -609,6 +631,7 @@ def submit_spec(
     report: Reporter = print,
     use_git: bool = True,
     s3: S3Index | None = None,
+    mint: awskeys.Mint = awskeys.federation_token,
 ) -> SubmitResult:
     """Judge the prepared job against the host, stage it, enqueue it, record it.
 
@@ -639,7 +662,38 @@ def submit_spec(
         spec, f"host {entry.name}", ephemeral=session.config.ephemeral, scratch=scratch
     )
 
-    for warning in prepared.warnings:
+    try:
+        secrets, narrowed = awskeys.job_secrets(
+            spec,
+            session.config,
+            prepared.secrets,
+            trusted=entry.trusted,
+            expected_prefix=default_s3_prefix(settings, entry.name),
+            mint=mint,
+        )
+    except awskeys.AwsKeyError as exc:
+        raise SubmitError(f"host {entry.name} is not trusted with your AWS keys: {exc}") from exc
+    warnings = list(prepared.warnings)
+    if narrowed is not None:
+        notes.append(
+            f"host {entry.name} is not trusted with your AWS keys, so the job's can only use "
+            f"{', '.join(narrowed.prefixes)}, until {narrowed.expires:%Y-%m-%d %H:%M %Z}"
+        )
+        report(f"note: {notes[-1]}")
+        warnings += narrowed_runtime_warnings(spec, narrowed)
+
+    mirror_warning = awskeys.deliver_mirror_key(
+        session.transport,
+        session.config,
+        report,
+        trusted=entry.trusted,
+        expected_prefix=default_s3_prefix(settings, entry.name),
+        mint=mint,
+    )
+    if mirror_warning:
+        warnings.append(mirror_warning)
+
+    for warning in warnings:
         report(f"WARNING: {warning}")
         notes.append(warning)
 
@@ -649,11 +703,11 @@ def submit_spec(
         session.host_json(f"archive-checkout {spec.job_id}", timeout=ARCHIVE_TIMEOUT_S)
         report("archived the checkout beside the queue; workdirs here are on scratch")
 
-    if prepared.secrets_body:
+    if secrets:
         session.transport.put_file(
-            prepared.secrets_body, f"{session.home}/secrets/{spec.job_id}.env", 0o600
+            env_file(secrets), f"{session.home}/secrets/{spec.job_id}.env", 0o600
         )
-        report(f"delivered {len(spec.secrets)} secret(s) as {spec.job_id}.env (0600)")
+        report(f"delivered {len(secrets)} secret(s) as {spec.job_id}.env (0600)")
 
     response = enqueue_spec(session, prepared)
 

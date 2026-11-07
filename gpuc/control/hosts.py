@@ -99,6 +99,7 @@ class RentalOptions:
     disk_gb: int | None = None
     image: str | None = None
     health: HealthOptions = DEFAULT_HEALTH
+    trusted: bool = False
 
     def constraints(self, provider: Provider, settings: Settings) -> Constraints:
         """What to search `provider` for. A flag it cannot search by is a
@@ -168,6 +169,7 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
         idle_minutes=options.idle_minutes,
         image=options.image or settings.image,
         health_options=options.health,
+        trusted=options.trusted,
     )
     document = {**host_document(entry), **found}
     return HostChange(document, [f"next: gpuc submit <job.yaml> --host {entry.name}"])
@@ -248,7 +250,9 @@ def _rental_search(
     return (
         provider,
         constraints,
-        matching_rentals(constraints, settings, provider=provider, report=report),
+        matching_rentals(
+            constraints, settings, provider=provider, trusted=options.trusted, report=report
+        ),
     )
 
 
@@ -300,6 +304,7 @@ def add_host(
     fields: dict[str, Any],
     env_updates: dict[str, str | None],
     force: bool = False,
+    trusted: bool | None = None,
     health: HealthOptions | None = None,
     report: Reporter = print,
 ) -> HostChange:
@@ -309,6 +314,11 @@ def add_host(
     and a host that already has a `config.json` is adopted as it stands --
     which is what makes a second machine driving a box somebody else set up the
     ordinary path. Flags are explicit overrides of it, and say so.
+
+    `trusted` None trusts a host this machine has not registered and leaves
+    the one it has as it was: re-adding a host is how an entry written by an
+    earlier build is fixed, and must not quietly send real keys to a rental
+    rented untrusted.
 
     `health` None skips the bootstrap. Otherwise a host whose config names no
     build, or another build than this one, is bootstrapped: a registered host
@@ -359,6 +369,8 @@ def add_host(
             entry = entry.with_cache(python=current.python).model_copy(
                 update={"bootstrapped_at": current.bootstrapped_at}
             )
+        keep = current.trusted if current is not None else True
+        entry = entry.model_copy(update={"trusted": keep if trusted is None else trusted})
         registry.put(entry)
     warnings: list[str] = []
     if not connection.adopted and not _owned(entry):
