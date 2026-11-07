@@ -1023,10 +1023,10 @@ the same submit path as every other host.
    Local and ssh hosts are never compared: one may be a host this work is not
    allowed to use. Nor are rentals not registered on this machine. A registered pod the provider no longer
    has is forgotten rather than dialled.
-   `host quote` takes the same flags and runs this step and the offer search
-   below, the same calls in the same order, and stops before the first
-   `create`: a quote and the rent it is for can only differ by what the
-   provider's catalog did in between.
+   `host quote` takes the same flags, runs this step and the same
+   `Provider.offers` search, and stops there: it registers no ssh key and
+   creates nothing, so the offers it lists are the ones the rent would try,
+   in order, as long as the catalog has not moved in between.
 2. Then, for each offer in order: `create`; poll `get` until the pod is
    running **and** `ssh.direct` present; poll SSH until a trivial command
    succeeds; probe the pod once (the same probe `host add` runs); write the pod

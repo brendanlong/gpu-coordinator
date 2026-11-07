@@ -196,11 +196,10 @@ it, and one that fails is ended and the next offer tried.
 Rent at least as many cards as the job's `gpus:`. If a pod fails to come up
 it is terminated and the next offer tried, for up to 15 minutes.
 
-To see what a rent would cost first, run `gpuc host quote` with the same
-flags. It lists the cheapest offers in the order `host rent` would try them
-(`--limit`, default 5), each with the hourly price of the whole pod, and says
-whether the rent would be refused. It rents nothing. More than one is listed
-because a rent moves on to the next offer when one fails.
+To see what a rent would cost first, run it as `gpuc host quote` with the
+same flags. It lists the cheapest offers in the order `host rent` would try
+them, each with the hourly price of the whole pod, and says whether the rent
+would be refused. It rents nothing.
 
 `host rent` refuses while a rental you already have matches the request and
 is free: it names that host and how soon it idles out, so you can submit

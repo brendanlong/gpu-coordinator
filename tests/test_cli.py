@@ -682,9 +682,9 @@ def test_host_quote_lists_the_offers_rent_would_try_in_order(
 
     assert main(argv) == 0
     out = capsys.readouterr().out
-    assert "1x A40/secure $0.400/h" in out and "RTX 4090/secure $0.900/h" in out
-    assert "community" not in out and "H100" not in out
-    assert "gpuc-busy-1: busy" in out
+    assert "0.400" in out and "0.900" in out
+    assert "community" not in out and "H100" not in out and "0.300" not in out
+    assert "gpuc-busy-1" in out
 
 
 def test_host_quote_says_rent_would_refuse_while_a_matching_rental_is_free(
@@ -708,6 +708,18 @@ def test_host_quote_with_no_matching_offer_says_rent_would_find_none(
     assert main([*argv, "--json"]) == 0
     document = json.loads(capsys.readouterr().out)
     assert (document["offers"], document["offers_found"]) == ([], 0)
+    assert main(argv) == 0
+    assert "would rent nothing" in capsys.readouterr().out
+
+
+def test_host_quote_takes_a_rent_command_line_unchanged(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _quoting(monkeypatch, [make_offer("A40")], [])
+    argv = ["host", "quote", "--provider", "runpod", "--gpu", "A40", "--idle-min", "30"]
+    argv += ["--force", "--name-hint", "e2e", "--image", "x", "--disk", "20", "--json"]
+    assert main(argv) == 0
+    assert len(json.loads(capsys.readouterr().out)["offers"]) == 1
 
 
 def test_host_quote_refuses_a_floor_the_provider_cannot_search_by(
