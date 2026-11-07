@@ -86,10 +86,12 @@ from gpuc.control.gpuinfo import owned_entries, summarize
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.hosts import (
     DEFAULT_IDLE_MINUTES,
+    DEFAULT_QUOTE_LIMIT,
     RentalOptions,
     add_host,
     bootstrap_and_record,
     bootstrap_every_host,
+    quote_rental,
     rent_host,
     set_host,
 )
@@ -317,6 +319,13 @@ def cmd_host_rent(args: argparse.Namespace) -> Answer:
     return Answer(change.document, change.render())
 
 
+def cmd_host_quote(args: argparse.Namespace) -> Answer:
+    change = quote_rental(
+        search_options(args), load_settings(), limit=args.limit, report=progress(args)
+    )
+    return Answer(change.document, change.render())
+
+
 def cmd_host_terminate(args: argparse.Namespace) -> Answer:
     """End a rental now: the provider call, then forget the host here.
 
@@ -538,8 +547,9 @@ CLOUDS: dict[str, list[Cloud]] = {
 }
 
 
-def rental_options(args: argparse.Namespace) -> RentalOptions:
-    options = RentalOptions(
+def search_options(args: argparse.Namespace) -> RentalOptions:
+    """What `add_offer_flags` asks for: the offers, not what is done with one."""
+    return RentalOptions(
         provider=args.provider,
         gpu_names=[name.strip() for name in (args.gpu or "").split(",") if name.strip()],
         max_price_usd_hr=args.max_price,
@@ -551,12 +561,16 @@ def rental_options(args: argparse.Namespace) -> RentalOptions:
             for key, flag in MINIMUMS.items()
             if getattr(args, flag.removeprefix("--").replace("-", "_")) is not None
         },
-        force=args.force,
-        name_hint=args.name_hint,
         disk_gb=args.disk,
-        image=args.image,
-        health=health_options(args),
     )
+
+
+def rental_options(args: argparse.Namespace) -> RentalOptions:
+    options = search_options(args)
+    options.force = args.force
+    options.name_hint = args.name_hint
+    options.image = args.image
+    options.health = health_options(args)
     if args.idle_min is not None:
         options.idle_minutes = args.idle_min
     return options
@@ -1327,6 +1341,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rent.set_defaults(func=cmd_host_rent)
 
+    quote = host.add_parser(
+        "quote",
+        help="list the offers `host rent` with the same flags would try first, cheapest first, "
+        "and whether it would refuse; rents nothing",
+    )
+    add_offer_flags(quote)
+    quote.add_argument(
+        "--limit",
+        type=_at_least_one,
+        default=DEFAULT_QUOTE_LIMIT,
+        metavar="N",
+        help=f"how many offers to list (default {DEFAULT_QUOTE_LIMIT})",
+    )
+    add_json_flag(
+        quote,
+        "the offers, the number found, the matching rentals, and whether `host rent` would refuse",
+    )
+    quote.set_defaults(func=cmd_host_quote)
+
     terminate = host.add_parser(
         "terminate",
         help="end a rented pod now and forget it here (the pod stops billing)",
@@ -1761,7 +1794,9 @@ def add_moved_runpod_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runpod", nargs=0, action=_RunpodMoved, help=argparse.SUPPRESS)
 
 
-def add_rent_flags(parser: argparse.ArgumentParser) -> None:
+def add_offer_flags(parser: argparse.ArgumentParser) -> None:
+    """The flags that choose which offers `host rent` tries, shared with
+    `host quote` so that a quote is for exactly the rent it names."""
     parser.add_argument(
         "--provider", required=True, choices=sorted(PROVIDERS), help="who to rent from"
     )
@@ -1795,13 +1830,19 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
         f"(default {DEFAULT_CUDA_MIN})",
     )
     parser.add_argument(
+        "--disk", type=int, help="container disk in GB, which Vast prices; default from config"
+    )
+
+
+def add_rent_flags(parser: argparse.ArgumentParser) -> None:
+    add_offer_flags(parser)
+    parser.add_argument(
         "--idle-min",
         type=float,
         metavar="MINUTES",
         help=f"terminate the pod once its queue has been empty this long "
         f"(default {DEFAULT_IDLE_MINUTES:g})",
     )
-    parser.add_argument("--disk", type=int, help="container disk in GB; default from config")
     parser.add_argument("--image", help="pod image; default from config")
     parser.add_argument(
         "--force",

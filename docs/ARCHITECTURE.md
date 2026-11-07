@@ -43,7 +43,7 @@ gpuc/
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
     actions.py     # one function per command returning its Answer (document + text + what failed); the CLI and the web call these
     exits.py       # the exit codes, and the one table that maps them onto HTTP statuses
-    hosts.py       # the actions of `host add`, `host set`, `host rent` and `host bootstrap`
+    hosts.py       # the actions of `host add`, `host set`, `host rent`, `host quote` and `host bootstrap`
     submitting.py  # the actions of `submit` and `requeue`: look up the host, re-ship, enqueue
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
@@ -1023,6 +1023,10 @@ the same submit path as every other host.
    Local and ssh hosts are never compared: one may be a host this work is not
    allowed to use. Nor are rentals not registered on this machine. A registered pod the provider no longer
    has is forgotten rather than dialled.
+   `host quote` takes the same flags and runs this step and the offer search
+   below, the same calls in the same order, and stops before the first
+   `create`: a quote and the rent it is for can only differ by what the
+   provider's catalog did in between.
 2. Then, for each offer in order: `create`; poll `get` until the pod is
    running **and** `ssh.direct` present; poll SSH until a trivial command
    succeeds; probe the pod once (the same probe `host add` runs); write the pod

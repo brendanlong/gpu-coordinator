@@ -38,7 +38,7 @@ from gpuc.control.submit import JobSpecModel, Prepared, SubmitResult, expand_job
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, load_registry, register_host
 from tests.fakehost import FakeHost
-from tests.fakeprovider import FakeProvider, running_pod
+from tests.fakeprovider import FakeProvider, make_offer, running_pod
 from tests.fakes3 import FakeS3Client, fake_s3
 
 GPU = "GPU-2a4bad3b-9fe3-7031-914d-384254e92908"
@@ -646,6 +646,77 @@ def test_host_rent_rents_beside_busy_rentals_without_force(
     out = capsys.readouterr().out
     assert "gpuc-busy-1: busy" in out
     assert "--host gpuc-e2e-1" in out
+
+
+def _quoting(monkeypatch: pytest.MonkeyPatch, offers: list[Any], matches: list[Any]) -> None:
+    provider = FakeProvider(offers)
+    monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda settings, name: provider)
+    monkeypatch.setattr("gpuc.control.hosts.matching_rentals", lambda *a, **k: matches)
+    monkeypatch.setattr(
+        "gpuc.control.hosts.provision", lambda *a, **k: pytest.fail("a quote never rents")
+    )
+
+
+def test_host_quote_lists_the_offers_rent_would_try_in_order(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    offers = [
+        make_offer("A40", price=0.40),
+        make_offer("RTX 4090", price=0.69),
+        make_offer("A40", price=0.35, cloud="COMMUNITY"),
+        make_offer("A40", price=0.30, cuda_versions=("12.4",)),
+        make_offer("RTX 4090", price=0.90),
+        make_offer("H100", price=2.00),
+    ]
+    _quoting(monkeypatch, offers, [_rental_match("gpuc-busy-1", free=False)])
+    argv = ["host", "quote", "--provider", "runpod", "--gpu", "A40,RTX 4090"]
+    assert main([*argv, "--limit", "2", "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert [(o["name"], o["price_usd_hr"]) for o in document["offers"]] == [
+        ("A40", 0.40),
+        ("RTX 4090", 0.69),
+    ]
+    assert document["offers_found"] == 3
+    assert document["would_refuse"] is False
+    assert document["matching_rentals"] == [{"host": "gpuc-busy-1", "free": False}]
+
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "1x A40/secure $0.400/h" in out and "RTX 4090/secure $0.900/h" in out
+    assert "community" not in out and "H100" not in out
+    assert "gpuc-busy-1: busy" in out
+
+
+def test_host_quote_says_rent_would_refuse_while_a_matching_rental_is_free(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _quoting(monkeypatch, [make_offer("A40")], [_rental_match("gpuc-old-1", free=True)])
+    assert main(["host", "quote", "--provider", "runpod", "--gpu", "A40", "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["would_refuse"] is True
+    assert len(document["offers"]) == 1
+    assert main(["host", "quote", "--provider", "runpod", "--gpu", "A40"]) == 0
+    out = capsys.readouterr().out
+    assert "would refuse" in out and "--host gpuc-old-1" in out
+
+
+def test_host_quote_with_no_matching_offer_says_rent_would_find_none(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _quoting(monkeypatch, [make_offer("A40", price=0.49)], [])
+    argv = ["host", "quote", "--provider", "runpod", "--gpu", "A40", "--max-price", "0.3"]
+    assert main([*argv, "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert (document["offers"], document["offers_found"]) == ([], 0)
+
+
+def test_host_quote_refuses_a_floor_the_provider_cannot_search_by(
+    control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _quoting(monkeypatch, [make_offer("A40")], [])
+    argv = ["host", "quote", "--provider", "runpod", "--gpu", "A40", "--min-inet-down", "500"]
+    assert main(argv) == EXIT_USAGE
+    assert "--min-inet-down" in capsys.readouterr().err
 
 
 def test_submit_and_requeue_runpod_say_where_renting_went(

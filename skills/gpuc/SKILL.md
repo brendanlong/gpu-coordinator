@@ -36,7 +36,7 @@ gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
 |---|---|---|
 | `local` | the job fits on this machine's own cards | free, and shared with everything else using that GPU |
 | `ssh` | a bigger or shared box already registered | free to you; only the cards registered to that host are ever used |
-| `rental` (`gpuc host rent`) | nothing registered is big enough, or they are all busy | costs money; rents the cheapest matching pod and registers it as a host; idles down 15 min after its queue empties |
+| `rental` (`gpuc host rent`) | nothing registered is big enough, or they are all busy | costs money (`gpuc host quote` with the same flags prices it first); rents the cheapest matching pod and registers it as a host; idles down 15 min after its queue empties |
 
 Prefer a host you already have over a pod you pay for; a busy host queues your
 job behind the running one, which is usually fine. If nothing is registered,
@@ -139,6 +139,8 @@ Rules that avoid the classic failures:
 ```bash
 gpuc submit job.yaml --host local
 gpuc submit job.yaml --host <host>                              # any name from `gpuc host list`
+gpuc host quote --provider runpod --gpu A40 --max-price 0.60    # what that rent would cost: the offers it
+                                                                # would try, cheapest first; rents nothing
 gpuc host rent --provider runpod --gpu A40 --max-price 0.60     # prints the host name to submit to;
                                                                 # or --gpu "A40,RTX 4090" --cloud any
 gpuc host rent --provider vast --gpu "RTX 4090" --max-price 0.50 --min-inet-down 500 --min-reliability 0.98
@@ -292,6 +294,7 @@ unchanged by the flag. Prefer it to scraping any of the text output.
 | `pods` | `{pods[], hourly_usd, others[], notes[]}` |
 | `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
 | `host list` | `{hosts[], errors[]}` |
+| `host quote` | `{provider, gpu_count, offers[], offers_found, matching_rentals[], would_refuse}`; each offer's `price_usd_hr` is for the whole pod, and `offers[]` is in the order `host rent` would try them |
 | `host remove` | `{host, kind, pod_id, notes[]}`; a rental is not terminated by this |
 | `host terminate` | `{host, pod_id, pod_name, pod_status, cost_usd_hr, checked, running[], queued[], outputs_pending[], terminated, forgotten, notes[]}`; `checked` false means the host could not be asked, so the three lists are empty for want of an answer |
 | `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
