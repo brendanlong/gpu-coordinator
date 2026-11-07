@@ -4,7 +4,7 @@ import json
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -884,12 +884,14 @@ def test_an_estimate_inside_the_timeout_is_not_warned_about(control_env: Path, r
 
 
 REAL_KEYS = {"AWS_ACCESS_KEY_ID": "AKIAREAL", "AWS_SECRET_ACCESS_KEY": "real-secret"}
+AWS_SECRETS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
 RENTAL_CONFIG = {
     "host": "pod",
     "gpus": ["GPU-a"],
     "s3_prefix": "s3://mirror/gpuc/pod",
     "provider": {"kind": "runpod", "pod_id": "p1"},
 }
+SSH_CONFIG = {key: value for key, value in RENTAL_CONFIG.items() if key != "provider"}
 
 
 @dataclass
@@ -903,61 +905,69 @@ class FakeSts:
         self, name: str, policy: dict[str, Any], access_key_id: str, secret: str
     ) -> dict[str, Any]:
         if self.refuses:
-            raise AwsKeyError(
-                f"AccessDenied: not authorized to perform sts:GetFederationToken\n{GRANT}"
-            )
+            raise AwsKeyError(f"AccessDenied: sts:GetFederationToken\n{GRANT}")
         self.minted.append((name, policy, access_key_id, secret))
         return {
             "AccessKeyId": f"ASIANARROW{len(self.minted)}",
             "SecretAccessKey": "narrow-secret",
             "SessionToken": "narrow-token",
-            "Expiration": datetime(2026, 11, 9, 12, tzinfo=UTC),
+            "Expiration": datetime.now(UTC) + timedelta(hours=36),
         }
 
 
-def submit_to_rental(
+def submit_with_keys(
     repo: Path,
     document: dict[str, Any],
     *,
+    trusted: bool = False,
     config: dict[str, Any] | None = None,
     sts: FakeSts | None = None,
     host: FakeHost | None = None,
+    environ: dict[str, str] | None = None,
 ) -> Any:
     live = session(host or FakeHost())
+    live.entry = live.entry.model_copy(update={"trusted": trusted})
     live.config_read = HostConfigRead(config or RENTAL_CONFIG)
-    prepared = prepare(validate(document), repo, environ=REAL_KEYS)
+    prepared = prepare(validate(document), repo, environ=environ or REAL_KEYS)
     return submit_prepared(
         live, prepared, Settings(), workdir=repo, report=lambda _: None, mint=sts or FakeSts()
     )
 
 
-def written_under(policy: dict[str, Any]) -> set[str]:
-    return {
-        resource
-        for statement in policy["Statement"]
-        if "s3:PutObject" in statement["Action"]
-        for resource in statement["Resource"]
-    }
+def env_of(host: FakeHost, job_id: str) -> dict[str, str]:
+    body, mode = host.puts[f"{REMOTE_HOME}/secrets/{job_id}.env"]
+    assert mode == 0o600
+    return dict(line.split("=", 1) for line in body.splitlines())
 
 
-def actions(policy: dict[str, Any]) -> set[str]:
-    found: set[str] = set()
+def credentials_of(host: FakeHost) -> list[str]:
+    return [body for path, (body, _) in host.puts.items() if path.endswith("/.aws/credentials")]
+
+
+def granted(policy: dict[str, Any]) -> dict[str, set[str]]:
+    """Each action the policy allows, and the resources it allows it on."""
+    found: dict[str, set[str]] = {}
     for statement in policy["Statement"]:
+        assert statement["Effect"] == "Allow"
         action = statement["Action"]
-        found |= {action} if isinstance(action, str) else set(action)
+        resources = statement["Resource"]
+        for name in [action] if isinstance(action, str) else action:
+            found.setdefault(name, set()).update(
+                [resources] if isinstance(resources, str) else resources
+            )
     return found
 
 
-def test_a_rental_is_sent_keys_that_can_only_write_where_the_job_uploads(
+def test_an_untrusted_rental_gets_keys_that_can_only_use_where_the_job_uploads(
     control_env: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for name, value in REAL_KEYS.items():
         monkeypatch.setenv(name, value)
     host, sts = FakeHost(), FakeSts()
-    result = submit_to_rental(
+    result = submit_with_keys(
         repo,
         job_document(
-            secrets=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+            secrets=AWS_SECRETS,
             outputs=[{"path": "results", "s3": "s3://data/exp/{job_id}/results"}],
         ),
         sts=sts,
@@ -968,65 +978,92 @@ def test_a_rental_is_sent_keys_that_can_only_write_where_the_job_uploads(
 
     (job_mint, mirror_mint) = sts.minted
     assert job_mint[2:] == ("AKIAREAL", "real-secret")
-    assert written_under(job_mint[1]) == {
+    objects = {
         f"arn:aws:s3:::data/exp/{job_id}/results/*",
         f"arn:aws:s3:::mirror/gpuc/pod/jobs/{job_id}/*",
     }
-    assert written_under(mirror_mint[1]) == {"arn:aws:s3:::mirror/gpuc/pod/jobs/*"}
-    for _, policy, _, _ in sts.minted:
-        assert actions(policy) == {"s3:PutObject", "s3:AbortMultipartUpload", "s3:ListBucket"}
+    assert granted(job_mint[1]) == {
+        "s3:PutObject": objects,
+        "s3:GetObject": objects,
+        "s3:AbortMultipartUpload": objects,
+        "s3:ListBucket": {"arn:aws:s3:::data", "arn:aws:s3:::mirror"},
+    }
+    assert granted(mirror_mint[1])["s3:PutObject"] == {"arn:aws:s3:::mirror/gpuc/pod/jobs/*"}
 
-    env_path = f"{REMOTE_HOME}/secrets/{job_id}.env"
-    body, mode = host.puts[env_path]
-    assert mode == 0o600
-    assert {line.split("=", 1)[0]: line.split("=", 1)[1] for line in body.splitlines()} == {
+    assert env_of(host, job_id) == {
         "AWS_ACCESS_KEY_ID": "ASIANARROW1",
         "AWS_SECRET_ACCESS_KEY": "narrow-secret",
         "AWS_SESSION_TOKEN": "narrow-token",
     }
-    [(credentials, credentials_mode)] = [
-        put for path, put in host.puts.items() if path.endswith("/.aws/credentials")
-    ]
+    [credentials] = credentials_of(host)
     assert "aws_access_key_id = ASIANARROW2" in credentials
     assert "aws_session_token = narrow-token" in credentials
-    assert credentials_mode == 0o600
-    assert any("can only write" in note and "2026-11-09" in note for note in result.notes)
+    assert any("can only use" in note for note in result.notes)
 
 
-def test_other_secrets_reach_a_rental_as_they_are(control_env: Path, repo: Path) -> None:
+def test_a_pod_that_says_it_is_trusted_is_not_believed(control_env: Path, repo: Path) -> None:
+    forged = {**RENTAL_CONFIG, "provider": {"kind": "runpod", "pod_id": "p1", "trusted": True}}
     host = FakeHost()
-    live = session(host)
-    live.config_read = HostConfigRead(RENTAL_CONFIG)
-    environ = {**REAL_KEYS, "HF_TOKEN": "hf_x"}
-    prepared = prepare(
-        validate(job_document(secrets=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "HF_TOKEN"])),
+    result = submit_with_keys(repo, job_document(secrets=AWS_SECRETS), config=forged, host=host)
+    assert env_of(host, result.job_id)["AWS_ACCESS_KEY_ID"] == "ASIANARROW1"
+
+
+def test_other_secrets_reach_an_untrusted_host_as_they_are(control_env: Path, repo: Path) -> None:
+    host = FakeHost()
+    result = submit_with_keys(
         repo,
-        environ=environ,
+        job_document(secrets=[*AWS_SECRETS, "HF_TOKEN"]),
+        host=host,
+        environ={**REAL_KEYS, "HF_TOKEN": "hf_x"},
     )
-    result = submit_prepared(
-        live, prepared, Settings(), workdir=repo, report=lambda _: None, mint=FakeSts()
-    )
-    body, _ = host.puts[f"{REMOTE_HOME}/secrets/{result.job_id}.env"]
-    assert "HF_TOKEN=hf_x\n" in body and "AKIAREAL" not in body
+    assert env_of(host, result.job_id)["HF_TOKEN"] == "hf_x"
 
 
-def test_a_trusted_rental_and_an_ssh_host_get_the_keys_themselves(
-    control_env: Path, repo: Path
-) -> None:
-    trusted = {**RENTAL_CONFIG, "provider": {"kind": "runpod", "pod_id": "p1", "trusted": True}}
-    ssh_host = {key: value for key, value in RENTAL_CONFIG.items() if key != "provider"}
-    for config in (trusted, ssh_host):
+def test_a_trusted_host_gets_the_keys_themselves(control_env: Path, repo: Path) -> None:
+    for config in (RENTAL_CONFIG, SSH_CONFIG):
         host, sts = FakeHost(), FakeSts()
-        result = submit_to_rental(
+        result = submit_with_keys(
             repo,
-            job_document(secrets=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]),
+            job_document(secrets=AWS_SECRETS),
+            trusted=True,
             config=config,
             sts=sts,
             host=host,
         )
-        body, _ = host.puts[f"{REMOTE_HOME}/secrets/{result.job_id}.env"]
-        assert "AWS_SECRET_ACCESS_KEY=real-secret\n" in body
+        assert env_of(host, result.job_id)["AWS_SECRET_ACCESS_KEY"] == "real-secret"
         assert sts.minted == []
+
+
+def test_an_untrusted_ssh_host_narrows_its_jobs_and_keeps_its_own_aws_dir(
+    control_env: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in REAL_KEYS.items():
+        monkeypatch.setenv(name, value)
+    host = FakeHost()
+    result = submit_with_keys(repo, job_document(secrets=AWS_SECRETS), config=SSH_CONFIG, host=host)
+    assert env_of(host, result.job_id)["AWS_ACCESS_KEY_ID"] == "ASIANARROW1"
+    assert credentials_of(host) == []
+    assert not any(".aws" in command for command in host.commands)
+
+
+@pytest.mark.parametrize(
+    ("document", "says"),
+    [
+        (job_document(secrets=AWS_SECRETS), "uploads nothing to S3"),
+        (
+            job_document(outputs=[{"path": "results", "s3": "s3://data/{job_id}"}]),
+            "name no AWS keys",
+        ),
+    ],
+)
+def test_aws_keys_an_untrusted_host_could_not_use_are_refused_before_anything_ships(
+    control_env: Path, repo: Path, document: dict[str, Any], says: str
+) -> None:
+    host = FakeHost()
+    with pytest.raises(SubmitError) as exc:
+        submit_with_keys(repo, document, config={**SSH_CONFIG, "s3_prefix": None}, host=host)
+    assert says in str(exc.value) and "--trusted" in str(exc.value)
+    assert host.rsyncs == [] and host.puts == {}
 
 
 def test_a_key_that_cannot_be_narrowed_stops_the_submit_before_anything_ships(
@@ -1034,21 +1071,15 @@ def test_a_key_that_cannot_be_narrowed_stops_the_submit_before_anything_ships(
 ) -> None:
     host = FakeHost()
     with pytest.raises(SubmitError) as exc:
-        submit_to_rental(
-            repo,
-            job_document(secrets=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]),
-            sts=FakeSts(refuses=True),
-            host=host,
+        submit_with_keys(
+            repo, job_document(secrets=AWS_SECRETS), sts=FakeSts(refuses=True), host=host
         )
     assert "sts:GetFederationToken" in str(exc.value) and "--trusted" in str(exc.value)
     assert host.rsyncs == [] and host.puts == {}
 
 
 def test_a_job_that_may_outlast_its_narrowed_keys_is_warned(control_env: Path, repo: Path) -> None:
-    result = submit_to_rental(
-        repo,
-        job_document(
-            secrets=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], max_runtime_min=48 * 60
-        ),
-    )
-    assert any("may run 48h" in note and "--trusted" in note for note in result.notes)
+    long = submit_with_keys(repo, job_document(secrets=AWS_SECRETS, max_runtime_min=48 * 60))
+    assert any("may run 48h" in note and "--trusted" in note for note in long.notes)
+    short = submit_with_keys(repo, job_document(secrets=AWS_SECRETS, max_runtime_min=60))
+    assert not any("may run" in note for note in short.notes)

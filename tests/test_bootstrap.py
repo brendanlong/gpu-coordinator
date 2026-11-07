@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+import boto3
 import pytest
+from botocore.stub import Stubber
 
 from gpuc.control import version as version_mod
 from gpuc.control.bootstrap import (
@@ -429,6 +431,33 @@ def test_a_rented_pods_own_record_is_not_disturbed_by_bootstrap(control_env: Pat
     )
     assert host.config is not None
     assert host.config["provider"] == bought
+
+
+def test_bootstrap_gives_a_rental_its_mirror_key_by_this_machines_trust_in_it(
+    control_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shhh")
+    rented = {**CONFIG_ON_HOST, "s3_prefix": "s3://b/gpuc/h", "provider": {"kind": "runpod"}}
+    trusted = ScriptedHost(config=dict(rented))
+    bootstrap_host(entry(kind="rental", pod_id="pod1"), transport=trusted, report=lambda _: None)
+    assert "aws_secret_access_key = shhh" in trusted.puts["/home/u/.gpuc/.aws/credentials"][0]
+
+    # Untrusted, by an IAM user STS refuses: no key is left there at all.
+    sts = boto3.client("sts", region_name="us-east-1")
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: sts)
+    refusing = Stubber(sts)
+    refusing.add_client_error("get_federation_token", service_error_code="AccessDenied")
+    refusing.activate()
+    untrusted = ScriptedHost(config=dict(rented))
+    _, result = bootstrap_host(
+        entry(kind="rental", pod_id="pod1").model_copy(update={"trusted": False}),
+        transport=untrusted,
+        report=lambda _: None,
+    )
+    assert not any(path.endswith("/.aws/credentials") for path in untrusted.puts)
+    assert any("has no AWS keys" in warning for warning in result.warnings)
+    refusing.assert_no_pending_responses()
 
 
 def test_a_host_nobody_rents_gets_no_provider_block(control_env: Path) -> None:

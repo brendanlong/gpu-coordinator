@@ -339,9 +339,10 @@ Rules, and they are not optional:
   stop the rent. Local and ssh hosts are not compared, and nor are pods
   registered only on another machine (`gpuc pods` lists those).
 - A rental never gets your AWS keys: a job's `AWS_*` secrets arrive as keys
-  that last 36 hours from submit and can only write its S3 outputs and logs.
-  A job that reads S3 with them, or may run longer, needs `host rent
-  --trusted`. A submit that fails mentioning `sts:GetFederationToken` means
+  that last 36 hours from submit and can only read and write its own S3
+  outputs and logs. A job that reads other S3 data with them, or may run
+  longer, needs `host rent --trusted`. A job with `s3` outputs must list the
+  AWS keys in `secrets:` there; nothing falls back to the host's. A submit that fails mentioning `sts:GetFederationToken` means
   the user's IAM user lacks that permission
   (`docs/setup.md`, "Credentials for jobs"); ask them rather than
   renting `--trusted` on your own.

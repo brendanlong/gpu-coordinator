@@ -16,6 +16,7 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -447,20 +448,22 @@ def preexisting_output_warnings(spec: JobSpec, workdir: Path) -> list[str]:
     return warnings
 
 
-def narrowed_runtime_warnings(spec: JobSpec) -> list[str]:
+def narrowed_runtime_warnings(spec: JobSpec, key: awskeys.NarrowedKey) -> list[str]:
     """A job that says it may run longer than its narrowed keys last.
 
     Its uploads stop working when they expire, and nothing can renew them:
-    no client watches a rental. Said rather than refused, since a limit or an
-    estimate is not a promise either way.
+    no client watches a rental. The clock started at submit, so time in the
+    queue counts too. Said rather than refused, since a limit or an estimate
+    is not a promise either way.
     """
     minutes = max(spec.max_runtime_min or 0, spec.estimated_runtime_min or 0)
-    if minutes * 60 <= awskeys.MAX_DURATION_S:
+    left_h = (key.expires - datetime.now(UTC)).total_seconds() / 3600
+    if minutes / 60 <= left_h:
         return []
     return [
-        f"this job may run {minutes / 60:g}h, and the AWS keys a rental is given stop working "
-        f"{awskeys.MAX_DURATION_S / 3600:g}h after submit, taking its uploads with them; rent "
-        f"with --trusted to send your own keys"
+        f"this job may run {minutes / 60:g}h, and its AWS keys stop working in "
+        f"{left_h:.0f}h, counting from now and not from when it starts, taking its uploads "
+        f"with them; {awskeys.TRUST}"
     ]
 
 
@@ -660,19 +663,19 @@ def submit_spec(
     )
 
     try:
-        secrets, narrowed = awskeys.job_secrets(spec, session.config, prepared.secrets, mint)
+        secrets, narrowed = awskeys.job_secrets(
+            spec, session.config, prepared.secrets, trusted=entry.trusted, mint=mint
+        )
     except awskeys.AwsKeyError as exc:
-        raise SubmitError(
-            f"host {entry.name} is a rental, so it is sent narrowed AWS keys: {exc}"
-        ) from exc
+        raise SubmitError(f"host {entry.name} is not trusted with your AWS keys: {exc}") from exc
     warnings = list(prepared.warnings)
     if narrowed is not None:
         notes.append(
-            f"host {entry.name} is a rental, so the job's AWS keys can only write "
+            f"host {entry.name} is not trusted with your AWS keys, so the job's can only use "
             f"{', '.join(narrowed.prefixes)}, until {narrowed.expires:%Y-%m-%d %H:%M %Z}"
         )
         report(f"note: {notes[-1]}")
-        warnings += narrowed_runtime_warnings(spec)
+        warnings += narrowed_runtime_warnings(spec, narrowed)
 
     for warning in warnings:
         report(f"WARNING: {warning}")
@@ -690,7 +693,7 @@ def submit_spec(
         )
         report(f"delivered {len(secrets)} secret(s) as {spec.job_id}.env (0600)")
     mirror_warning = awskeys.deliver_mirror_key(
-        session.transport, session.config, report, mint=mint
+        session.transport, session.config, report, trusted=entry.trusted, mint=mint
     )
     if mirror_warning:
         report(f"WARNING: {mirror_warning}")

@@ -631,7 +631,7 @@ def bootstrap_host(
     for warning in (
         aws_warning,
         ensure_hf_cli(transport, uv, config.env, report),
-        deliver_mirror_key(transport, config, report),
+        deliver_mirror_key(transport, config, report, trusted=entry.trusted),
     ):
         if warning:
             warnings.append(warning)

@@ -358,6 +358,7 @@ def _try_offer(
         address = rented.address_for(name, pod, provider.name)
         if address is None:
             raise ProvisionError(f"pod {pod.id} has no direct SSH endpoint")
+        address = address.model_copy(update={"trusted": trusted})
         transport = deps.transport_factory(address, settings)
         _wait_for_ssh(transport, deadline, progress, deps)
         # The one look at the pod's cards, the same probe `gpuc host add`
@@ -387,7 +388,7 @@ def _try_offer(
             fields={
                 "idle_minutes": idle_minutes,
                 "created_at": created_at,
-                "provider": rented.pod_record(address, offer, created_at, trusted=trusted),
+                "provider": rented.pod_record(address, offer, created_at),
             },
             transport=transport,
         ).entry
@@ -664,8 +665,9 @@ def matching_rentals(
     report: Reporter = print,
 ) -> list[Match]:
     """Every registered rental of this provider that could take the job being
-    rented for, each asked at once. Asked for `trusted`, only a rental that
-    was rented `--trusted` matches: the job wants keys the others never get.
+    rented for, each asked at once. Only rentals trusted as this one would be
+    match: an untrusted one cannot have the keys a trusted rent is for, and a
+    trusted one would be handed keys the rent did not ask to send.
 
     Every fact is the host's own: its pod is looked up at the provider and its
     `status` asked over ssh, and the offer it was bought on is read from the
@@ -702,7 +704,7 @@ def matching_rentals(
             report(f"could not ask the provider about rental {entry.name}: {asked.pod_error}")
             continue
         match = _match(entry, asked, constraints, provider)
-        if match is not None and not (trusted and asked.session.config.narrows_aws):
+        if match is not None and entry.trusted == trusted:
             matches.append(match)
     return matches
 

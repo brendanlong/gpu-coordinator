@@ -219,6 +219,7 @@ def add_host(
     fields: dict[str, Any],
     env_updates: dict[str, str | None],
     force: bool = False,
+    trusted: bool = True,
     health: HealthOptions | None = None,
     report: Reporter = print,
 ) -> HostChange:
@@ -248,6 +249,7 @@ def add_host(
         port=port,
         gpuc_home=gpuc_home,
         persistent_root=persistent_root,
+        trusted=trusted,
     )
     if pod_id:
         address = _pod_address(address, pod_id, settings)

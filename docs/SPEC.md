@@ -82,7 +82,8 @@ backup destinations. Adding another of either changes nothing else in this docum
 - A queue that outlives its machine is served by one machine at a time.
   Another takes it over only once that one has gone quiet, and a machine
   that finds its queue taken over stops, killing what it was running.
-- The client's record of a host is an address plus a cache. Anything that
+- The client's record of a host is an address, whether it trusts the host
+  with the user's keys, and a cache. Anything that
   decides something asks the host; output from the cache is labelled with its
   age.
 - Connecting selects which cards are owned and which are shared. By default
@@ -173,9 +174,11 @@ backup destinations. Adding another of either changes nothing else in this docum
   command lines, never in a provider's pod environment, never in logs, and
   never in anything synced to a backup destination. A job's secrets are
   deleted once the job is finished and its uploads are confirmed.
-- **A rental never sees the user's own AWS keys** unless it was rented as
-  trusted. It is given temporary keys instead, which can write only where
-  its jobs upload and its mirror goes.
+- **A host the user does not trust never sees their own AWS keys.** It is
+  given temporary keys instead, which can use only where its jobs upload and
+  its mirror goes. A rental is untrusted and any other host trusted unless
+  the user says otherwise, and each client decides for itself: a host never
+  says whether it is trusted.
 - Plain, non-secret environment is part of the job spec and may be mirrored.
 
 ## Monitoring

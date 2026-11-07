@@ -119,8 +119,8 @@ host in a file only you can read, and deleted when the job is done.
 
 A rental is someone else's machine, so it is never sent your AWS keys. It
 gets temporary keys instead, made from yours at submit, which last 36 hours
-and can only write where the job uploads. For that, your IAM user needs
-permission to make them, once:
+and can only read and write where the job uploads. For that, your IAM user
+needs permission to make them, once:
 
 ```json
 {
@@ -131,8 +131,13 @@ permission to make them, once:
 ```
 
 These must be the IAM user's long-term keys, not temporary ones from SSO or a
-role. A rental you trust with your own keys, for a job that reads from S3 with
-them, say, is rented with `gpuc host rent --trusted`.
+role, and the temporary keys can do no more than the user can, so an IAM user
+that can only reach your buckets keeps them that way. A rental you trust with
+your own keys, for a job that reads other data from S3 with them, say, is
+rented with `gpuc host rent --trusted`. Each machine decides this for itself:
+to drive a rental another machine rented without trusting it, add it with
+`gpuc host add <name> --pod <id> --untrusted`. Buckets encrypted with your own
+KMS key need a trusted host.
 
 ## The web dashboard
 

@@ -142,6 +142,7 @@ def test_happy_path_registers_a_bootstrapped_host(
     assert any("dispatcher pid" in line for line in reports)
 
     assert load_registry().hosts[entry.name].pod_id == entry.pod_id
+    assert load_registry().hosts[entry.name].trusted is False
     assert provider.terminated == []
     assert provider.registered_keys == [ssh_key.read_text()]
     assert all(line.startswith("[") and "+" in line for line in reports)
@@ -648,7 +649,6 @@ def _register_reusable(
             "pod_id": pod.id,
             "offer": make_offer(price=price).model_dump(mode="json"),
             "created_at": utc_now(),
-            "trusted": trusted,
         },
     )
     host.put_file(json.dumps(on_host.to_dict()), f"{host.home}/config.json", 0o644)
@@ -662,7 +662,7 @@ def _register_reusable(
         gpus=["GPU-1", "GPU-2", "GPU-3", "GPU-4"],
         created_at=utc_now(),
         provider={"kind": "runpod", "pod_id": pod.id},
-    )
+    ).model_copy(update={"trusted": trusted})
     with registry_transaction() as registry:
         registry.put(entry)
     return entry
@@ -767,12 +767,19 @@ def test_a_rental_that_cannot_be_asked_is_reported_and_skipped(
     assert any("could not ask rental gpuc-e2e-aaa" in line for line in reports)
 
 
-def test_asked_for_trusted_only_a_trusted_rental_matches(
+def test_only_a_rental_trusted_as_the_rent_would_be_matches(
     control_env: Path, ssh_key: Path, host: FakeHost
 ) -> None:
     assert _matches(_live(host), [], trusted=True) == []
     assert len(_matches(_live(host, trusted=True), [], trusted=True)) == 1
-    assert len(_matches(_live(host, trusted=True), [])) == 1
+    assert _matches(_live(host, trusted=True), []) == []
+
+
+def test_a_rental_rented_trusted_is_trusted_here(
+    control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
+) -> None:
+    entry = run(FakeProvider([make_offer()]), host, offline_health, trusted=True)
+    assert load_registry().hosts[entry.name].trusted is True
 
 
 def test_a_pod_that_is_too_expensive_does_not_match(

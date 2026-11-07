@@ -19,22 +19,17 @@ from gpuc.control.config import HostEntry, Rental
 from gpuc.control.providers.base import Offer, Pod
 
 
-def pod_record(
-    address: HostEntry, offer: Offer, created_at: str, *, trusted: bool = False
-) -> dict[str, Any]:
+def pod_record(address: HostEntry, offer: Offer, created_at: str) -> dict[str, Any]:
     """The `provider` block a pod is given: its own record of what it was bought as.
 
     `kind` and `pod_id` name the rental. What follows is what a machine that
     did not create this pod needs in order to judge it: the offer
-    `matching_rentals` compares against, when the pod was bought, and whether
-    it was rented `--trusted` with the submitter's own AWS keys
-    (`HostConfig.narrows_aws`).
+    `matching_rentals` compares against, and when the pod was bought.
     """
     return {
         **(address.provider_block() or {}),
         "offer": offer.model_dump(mode="json"),
         "created_at": created_at,
-        "trusted": trusted,
     }
 
 

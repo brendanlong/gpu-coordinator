@@ -48,7 +48,7 @@ gpuc/
     status.py      # gather a host's status, render it, project queue start times
     wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
     submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
-    awskeys.py     # the AWS keys a rental is given: narrowed by STS unless it was rented --trusted
+    awskeys.py     # the AWS keys a host is given: narrowed by STS unless this machine trusts it
     provision.py   # `host rent`: matching rentals, offers, create, wait for ssh, bootstrap
     teardown.py    # `host terminate`: end a rental on purpose, and forget it here
     rented.py      # a pod is its own record: the `provider` block in its config.json
@@ -218,8 +218,8 @@ defaults.
   "env": {"REQUIRE_CUDA": "1"},
   "secrets": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "HF_TOKEN", "WANDB_API_KEY"],
                                         # read from the submitter's env, delivered as ~/.gpuc/secrets/<jobid>.env (0600),
-                                        # sourced into the job's environment by the runner. On a rental
-                                        # the AWS_* ones are swapped for narrowed keys (Narrowed AWS keys)
+                                        # sourced into the job's environment by the runner. On an untrusted
+                                        # host the AWS_* ones are swapped for narrowed keys (Narrowed AWS keys)
   "outputs": [{"path": "results", "s3": "s3://bucket/exp/{job_id}/results"},
               {"path": "checkpoints", "hf": "org/repo", "hf_path": "{job_id}",
                "hf_create": false}],   # create the repo if the sync preflight finds it missing
@@ -822,9 +822,10 @@ and nowhere else, so one box driven from two machines has one configuration.
    and `uv tool install huggingface_hub`, both skipped if present. Their
    failures are warnings, except that a host registered with an `s3_prefix`
    whose `aws` could not be installed fails bootstrap outright. A rental with
-   an `s3_prefix` is also given `~/.aws/credentials` (0600, from stdin) minted
-   from the bootstrapping shell's `AWS_*` (see Narrowed AWS keys), and again
-   on every submit; a shared box's `~/.aws` is never touched.
+   an `s3_prefix` is also given `~/.aws/credentials` (0600, from stdin) out of
+   the bootstrapping shell's `AWS_*`, narrowed unless it is trusted (see
+   Narrowed AWS keys), and again on every submit; a shared box's `~/.aws` is
+   never touched.
 3. **Never rewrite `~/.gpuc/config.json`.** The host owns it, so bootstrap reads
    it and merges back only what it derived (`remote.write_config`): the commit
    just shipped, and the managed env keys the host names none of. The one
@@ -1076,25 +1077,30 @@ once it returns there is no host left to own any state.
 
 ## Narrowed AWS keys
 
-A rental may be a stranger's machine, so unless it was rented `--trusted`
-(`"trusted": true` in its `provider` block, read through
-`HostConfig.narrows_aws`) it never receives the submitter's AWS keys:
+A host this machine does not trust never receives the submitter's AWS keys.
+Trust is the registry entry's (`trusted`), never the host's config: a host
+that could say it was trusted would decide what it is sent. `host rent`
+registers a rental untrusted unless `--trusted`; `host add` registers a host
+trusted unless `--untrusted`, which is how a second machine adopts a rental.
 
 - A job whose `secrets:` name any `AWS_*` key gets, in their place, keys from
   STS `GetFederationToken` minted with the submitter's own, lasting the
-  maximum 36 hours from submit. Their session policy allows `s3:PutObject`
-  and `s3:AbortMultipartUpload` under each S3 target the sync preflight
-  checks (the job's `outputs:` and `{s3_prefix}/jobs/<id>`), and
-  `s3:ListBucket` restricted to those prefixes. Nothing else: no reads, no
-  deletes. A job's code that reads S3 with them fails.
-- The host's own `~/.aws/credentials`, for the mirror, is the same kind of key
-  narrowed to `{s3_prefix}/jobs`, re-minted on every bootstrap and every
-  submit, so a rental is never more than 36 hours past its last submit.
+  maximum 36 hours from submit. Their session policy allows `s3:PutObject`,
+  `s3:GetObject` and `s3:AbortMultipartUpload` under each S3 target the sync
+  preflight checks (the job's `outputs:` and `{s3_prefix}/jobs/<id>`), and
+  `s3:ListBucket` restricted to those prefixes. Nothing else: no deletes, no
+  other bucket, no other AWS API.
+- A job whose `outputs:` go to S3 without naming AWS keys, or that names them
+  with no S3 target, is refused at submit: there is nothing to fall back on,
+  or nothing a narrowed key could do.
+- An untrusted rental's own `~/.aws/credentials`, for the mirror, is the same
+  kind of key narrowed to `{s3_prefix}/jobs`, re-minted on every bootstrap and
+  every submit. When it cannot be minted the file is removed, never left
+  holding what was there.
 - A key that cannot be minted is never replaced by the real one: the submit
-  fails before anything is shipped, and the mirror key is a warning with
-  nothing written.
+  fails before anything is shipped.
 - No client renews a key, since no client watches a rental. Submit warns when
-  a job's `max_runtime_min` or estimate is longer than the key lasts.
+  a job's `max_runtime_min` or estimate is longer than what is left of it.
 
 ## Web dashboard (`gpuc web serve`)
 
