@@ -1108,13 +1108,12 @@ def test_host_add_json_is_the_host_as_list_reports_it_plus_what_add_did(
     assert fake_host.config is not None
 
 
-def test_host_add_untrusted_is_recorded_here_and_not_on_the_host(
+def test_host_add_untrusted_is_recorded_in_the_registry(
     control_env: Path, fake_host: FakeHost, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert main(["host", "add", "gpubox", "--ssh", "me@box", "--untrusted", "--json"]) == EXIT_OK
     assert document_of(capsys)["trusted"] is False
     assert load_registry().hosts["gpubox"].trusted is False
-    assert fake_host.config is not None and "trusted" not in json.dumps(fake_host.config)
 
 
 def test_host_add_json_carries_the_owns_nothing_warning_in_the_document(

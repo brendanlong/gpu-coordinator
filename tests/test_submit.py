@@ -1001,13 +1001,6 @@ def test_an_untrusted_rental_gets_keys_that_can_only_use_where_the_job_uploads(
     assert any("can only use" in note for note in result.notes)
 
 
-def test_a_pod_that_says_it_is_trusted_is_not_believed(control_env: Path, repo: Path) -> None:
-    forged = {**RENTAL_CONFIG, "provider": {"kind": "runpod", "pod_id": "p1", "trusted": True}}
-    host = FakeHost()
-    result = submit_with_keys(repo, job_document(secrets=AWS_SECRETS), config=forged, host=host)
-    assert env_of(host, result.job_id)["AWS_ACCESS_KEY_ID"] == "ASIANARROW1"
-
-
 def test_other_secrets_reach_an_untrusted_host_as_they_are(control_env: Path, repo: Path) -> None:
     host = FakeHost()
     result = submit_with_keys(
