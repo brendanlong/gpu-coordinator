@@ -6,7 +6,7 @@ from typing import Any, cast
 import pytest
 
 from gpuc.control.config import HostEntry
-from gpuc.control.providers.base import Pod, PodStatus
+from gpuc.control.providers.base import Pod
 from gpuc.control.status import (
     CardView,
     HostState,
@@ -200,14 +200,14 @@ def test_the_two_utilizations_say_where_they_came_from() -> None:
     assert host_json(view())["provider_util"] is None
 
 
-def _pod(status: PodStatus) -> Pod:
+def _pod(status: str) -> Pod:
     return Pod(id="pod-1", name="gpuc-e2e-1", status=status, cost_usd_hr=0.0, gpu_name="A40")
 
 
-def _provider(pod: Pod | None = None) -> FakeProvider:
+def _providers(pod: Pod | None = None) -> dict[str, FakeProvider]:
     """A provider holding `pod`, or knowing nothing about the one the registry
     still lists."""
-    return FakeProvider(existing=[pod] if pod is not None else [])
+    return {"runpod": FakeProvider(existing=[pod] if pod is not None else [])}
 
 
 def _runpod_entry() -> HostEntry:
@@ -220,7 +220,7 @@ def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
     def explode(*_: Any, **__: Any) -> Any:
         raise AssertionError("status must not ssh to a pod that no longer exists")
 
-    view = gather(_runpod_entry(), session=cast(Any, explode), provider=_provider())
+    view = gather(_runpod_entry(), session=cast(Any, explode), providers=_providers())
     assert view.gone and not view.reachable
     assert "no longer exists" in (view.error or "")
     # The rental ended, which is not a host the command could not read.
@@ -232,7 +232,7 @@ def test_a_host_whose_pod_is_gone_says_so_instead_of_trying_ssh() -> None:
 
 
 def test_a_terminated_pod_reads_as_gone_too() -> None:
-    view = gather(_runpod_entry(), provider=_provider(_pod("TERMINATED")))
+    view = gather(_runpod_entry(), providers=_providers(_pod("TERMINATED")))
     assert view.gone and view.failure is None
     assert "TERMINATED" in render(view)
 
@@ -240,7 +240,7 @@ def test_a_terminated_pod_reads_as_gone_too() -> None:
 def test_a_stopped_pod_is_unaskable_and_is_not_forgotten() -> None:
     """An EXITED pod is one the provider still has: nothing runs on it, and only
     a person decides whether to fix it or drop it."""
-    view = gather(_runpod_entry(), provider=_provider(_pod("EXITED")))
+    view = gather(_runpod_entry(), providers=_providers(_pod("EXITED")))
     assert view.state is HostState.UNASKABLE and not view.reachable
     assert view.failure is not None
     assert "gpuc host terminate gpuc-e2e-1" in (view.error or "")
@@ -272,7 +272,7 @@ class _RefusingSession:
 
 def test_an_unaskable_host_is_a_failure_and_says_what_to_run_next() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box")
-    view = gather(entry, session=cast(Any, _RefusingSession()), provider=None)
+    view = gather(entry, session=cast(Any, _RefusingSession()), providers=None)
     assert not view.reachable
     assert view.failure == "ssh: connect to 1.2.3.4 port 22: No route to host"
     text = render(view)

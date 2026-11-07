@@ -27,7 +27,7 @@ from gpuc.control.config import (
     transport_for,
     update_cache,
 )
-from gpuc.control.providers.base import Pod, Provider, ProviderError
+from gpuc.control.providers.base import Pod, ProviderError, Providers
 from gpuc.control.transport import DEFAULT_TIMEOUT_S, CommandResult, Transport, TransportError
 from gpuc.host import jobs
 from gpuc.host.jobs import HostConfig
@@ -472,7 +472,7 @@ Asked = Answered | Unaskable | Gone
 
 
 def rental_state(
-    entry: HostEntry, provider: Provider | None
+    entry: HostEntry, providers: Providers | None
 ) -> Unaskable | Gone | tuple[Pod | None, str | None]:
     """The provider's word on a rental's pod, before any ssh is tried.
 
@@ -484,7 +484,10 @@ def rental_state(
     provider could not be asked, which rides along as a failure rather than
     stopping the host being asked.
     """
-    if provider is None or entry.rental is None:
+    if entry.rental is None:
+        return None, None
+    provider = (providers or {}).get(entry.rental.provider)
+    if provider is None:
         return None, None
     pod_id = entry.rental.pod_id
     try:
@@ -509,7 +512,7 @@ def ask(
     verb: str | None,
     settings: Settings | None = None,
     *,
-    provider: Provider | None = None,
+    providers: Providers | None = None,
     session: HostSession | None = None,
     check: bool = True,
 ) -> Asked:
@@ -521,7 +524,7 @@ def ask(
     code. An ssh that fails is `Unaskable` with what ssh said and, after it,
     the provider's complaint if it had one: neither is hidden.
     """
-    state = rental_state(entry, provider)
+    state = rental_state(entry, providers)
     if isinstance(state, (Unaskable, Gone)):
         return state
     pod, pod_error = state

@@ -40,8 +40,8 @@ down when its work is done and nobody watching.
   specs, the job index, and each job's log and state. It is a copy, never the
   queue.
 
-RunPod is the first rental provider, and S3 and Hugging Face the first backup
-destinations. Adding another of either changes nothing else in this document.
+RunPod and Vast.ai are the first rental providers, and S3 and Hugging Face the first
+backup destinations. Adding another of either changes nothing else in this document.
 
 ## Preconditions
 
@@ -229,8 +229,9 @@ destinations. Adding another of either changes nothing else in this document.
 ## Non-goals
 
 - A scheduler that picks a host for a job, or moves jobs between hosts.
-- Requirements beyond a GPU count: no VRAM, CPU or memory matching. A CUDA
-  floor informs rental selection only.
+- Job requirements beyond a GPU count: no VRAM, CPU or memory matching. A
+  CUDA floor, and floors on a rented machine's GPU memory, compute, network,
+  disk speed and reliability, inform rental selection only.
 - Multi-node jobs, spot or interruptible instances, running jobs in
   containers.
 - A guaranteed rental teardown. A rental ends itself when idle; one whose

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -12,10 +12,9 @@ from gpuc.control.tolerant import TolerantModel
 
 Cloud = Literal["SECURE", "COMMUNITY"]
 Availability = Literal["NONE", "LOW", "MEDIUM", "HIGH"]
-PodStatus = Literal["PROVISIONING", "STARTING", "RUNNING", "EXITED", "ERROR", "TERMINATED"]
 
-DEFAULT_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 DEFAULT_PREFIX = "gpuc-"
+DEFAULT_DISK_GB = 50
 DEFAULT_CUDA_MIN = "12.8"
 """The CUDA floor a request carries unless `--cuda-min` says otherwise: the
 one default, so the catalog query and the create ask for the same thing."""
@@ -35,12 +34,37 @@ class CreateRefused(ProviderError):
     created. Any other way a create fails may have left a pod behind."""
 
 
+class Unauthorized(CreateRefused):
+    """The provider refused the account's key itself. On a create that is
+    refused like any other offer, but no other offer can do better, so the
+    attempt stops: a read-only Vast key was refused on all 51 offers in turn
+    before this. Anywhere else it is a provider that could not be asked,
+    never an answer about a pod."""
+
+
+MINIMUMS: dict[str, str] = {
+    "gpu_ram_gb": "--min-gpu-ram",
+    "tflops": "--min-tflops",
+    "inet_down_mbps": "--min-inet-down",
+    "inet_up_mbps": "--min-inet-up",
+    "disk_bw_mbps": "--min-disk-bw",
+    "reliability": "--min-reliability",
+}
+"""Every floor a rental request can set on an offer, by the `Offer` field it
+is a floor on, and the flag that sets it. They choose which machine is
+rented and nothing else: a job states only a GPU count."""
+
+
 class Constraints(BaseModel):
     gpu_names: list[str] = Field(default_factory=list)
     max_price_usd_hr: float | None = None
-    clouds: list[Cloud] = Field(default_factory=lambda: ["SECURE"])
+    clouds: list[Cloud] = Field(default_factory=list)
+    """Empty is any: a provider with no tiers has nothing to choose from."""
     cuda_min: str = DEFAULT_CUDA_MIN
     gpu_count: int = 1
+    disk_gb: int = DEFAULT_DISK_GB
+    minimums: dict[str, float] = Field(default_factory=dict)
+    """Floors on `Offer` fields, keyed as `MINIMUMS` is."""
 
 
 class Offer(TolerantModel):
@@ -52,9 +76,25 @@ class Offer(TolerantModel):
     gpu_id: str = ""
     name: str = ""
     price_usd_hr: float = 0.0
-    cloud: Cloud = "SECURE"
+    cloud: Cloud | None = None
     availability: Availability = "NONE"
     cuda_versions: list[str] = Field(default_factory=list)
+    offer_id: str = ""
+    """The provider's id for this one offer, where it rents a particular
+    machine rather than a GPU type (Vast)."""
+    gpu_ram_gb: float | None = None
+    tflops: float | None = None
+    inet_down_mbps: float | None = None
+    inet_up_mbps: float | None = None
+    disk_bw_mbps: float | None = None
+    reliability: float | None = None
+    """What the provider says about the machine, for `Constraints.minimums`.
+    None is unknown, and an unknown never meets a floor."""
+
+    @property
+    def label(self) -> str:
+        tier = f"/{self.cloud.lower()}" if self.cloud else ""
+        return f"{self.name}{tier} ${self.price_usd_hr:.3f}/h"
 
     def matches_cuda_floor(self, cuda_min: str) -> bool:
         floor = cuda_key(cuda_min)
@@ -84,6 +124,10 @@ def offer_satisfies(offer: Offer, constraints: Constraints) -> bool:
         return False
     if constraints.clouds and offer.cloud not in constraints.clouds:
         return False
+    for key, floor in constraints.minimums.items():
+        value = getattr(offer, key, None)
+        if not isinstance(value, int | float) or value < floor:
+            return False
     return offer.matches_cuda_floor(constraints.cuda_min)
 
 
@@ -96,7 +140,9 @@ class SshEndpoint(BaseModel):
 class Pod(BaseModel):
     id: str
     name: str
-    status: PodStatus
+    status: str
+    """In the provider's own words: each provider says which of its statuses
+    are running, dead and gone."""
     cost_usd_hr: float
     gpu_name: str | None = None
     gpu_count: int = 0
@@ -121,15 +167,22 @@ class Provider(ABC):
     provider's vocabulary lives on the instance, so the provisioning and
     teardown flows are written once and read it from here.
 
-    The defaults below are RunPod's, which every provider so far shares; a
-    provider with another vocabulary overrides them, and nothing outside
-    `providers/` names a status.
+    The defaults below are RunPod's; a provider with another vocabulary
+    overrides them, and nothing outside `providers/` names a status.
     """
 
     name: str
     """What a registry entry's `rental.provider` calls this provider, and
     the key `actions.PROVIDERS` builds it from again."""
     prefix: str
+    api_key_env: str
+    """Where the account key is read from on the client."""
+    default_image: str
+    """The image a rental gets when neither `--image` nor the config names one."""
+    filters: frozenset[str] = frozenset()
+    """The `MINIMUMS` this provider's catalog can be searched by."""
+    clouds: tuple[Cloud, ...] = ()
+    """Its tiers, the first being the default; empty for a provider without."""
     dead_statuses: tuple[str, ...] = ("EXITED", "ERROR", "TERMINATED")
     """Pod statuses nothing can run on. A pod in one is a failed host."""
     gone_statuses: tuple[str, ...] = ("TERMINATED",)
@@ -216,8 +269,8 @@ class Provider(ABC):
         offer: Offer,
         name: str,
         *,
-        image: str = DEFAULT_IMAGE,
-        disk_gb: int = 20,
+        image: str,
+        disk_gb: int,
         cuda_min: str = DEFAULT_CUDA_MIN,
         gpu_count: int = 1,
     ) -> Pod: ...
@@ -237,3 +290,9 @@ class Provider(ABC):
 
     @abstractmethod
     def ensure_ssh_key(self, public_key: str) -> bool: ...
+
+
+Providers = Mapping[str, "Provider"]
+"""The providers a command can ask about rentals, by `Provider.name`. Each
+rental is asked about at its own; one whose provider is missing is asked
+about at none, and says so."""

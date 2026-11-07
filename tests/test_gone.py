@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
 from gpuc.control.config import config_file, registry_transaction
 from gpuc.control.providers.base import Pod
@@ -186,9 +187,7 @@ def test_status_lists_a_terminated_rentals_jobs_from_the_mirror_and_forgets_it(
             )
         )
     ended = Pod(id="pod-1", name=POD, status="TERMINATED", cost_usd_hr=0.0)
-    monkeypatch.setattr(
-        "gpuc.control.actions.make_provider", lambda *_a, **_k: FakeProvider(existing=[ended])
-    )
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider(existing=[ended]))
     assert main(["status"]) == EXIT_OK
     captured = capsys.readouterr()
     assert f"host {POD} [rental]" in captured.out and "GONE" in captured.out

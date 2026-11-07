@@ -1,4 +1,4 @@
-"""`gpuc pods`: the provider's view, so what is billing is visible without trusting our state.
+"""`gpuc pods`: every provider's view, so what is billing is visible without trusting our state.
 
 Pods without our prefix are counted and named and nothing else: they belong to
 someone else and this command is the place that habit is most easily broken.
@@ -14,17 +14,31 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from gpuc.control.config import HostEntry, Settings, open_registry
-from gpuc.control.providers.base import Pod, Provider, owned_pods
+from gpuc.control.providers.base import Pod, Provider, ProviderError, Providers, owned_pods
 from gpuc.control.provision import CEILING_MINUTES
 from gpuc.control.remote import ask
 from gpuc.control.status import format_duration, parse_status
 
-COLUMNS = ("NAME", "ID", "STATUS", "GPU", "$/H", "CUDA", "AGE", "UTIL", "HOST", "HEARTBEAT")
+COLUMNS = (
+    "NAME",
+    "PROVIDER",
+    "ID",
+    "STATUS",
+    "GPU",
+    "$/H",
+    "CUDA",
+    "AGE",
+    "UTIL",
+    "HOST",
+    "HEARTBEAT",
+)
 
 
 @dataclass
 class PodRow:
     pod: Pod
+    provider: Provider
+    """Whose vocabulary says whether this pod still bills."""
     host: str | None
     """The registry name this machine drives the pod under; None if it does not."""
     heartbeat_s: float | None = None
@@ -37,6 +51,7 @@ class PodRow:
         heartbeat = "-" if self.heartbeat_s is None else f"{self.heartbeat_s:.0f}s"
         return [
             self.pod.name,
+            self.provider.name,
             self.pod.id,
             self.pod.status,
             gpu,
@@ -52,6 +67,7 @@ class PodRow:
         pod = self.pod
         age = pod.age
         return {
+            "provider": self.provider.name,
             "id": pod.id,
             "name": pod.name,
             "status": pod.status,
@@ -69,14 +85,17 @@ class PodRow:
 
 @dataclass
 class PodsView:
-    provider: Provider
-    """Whose vocabulary says which of these pods still bill."""
     rows: list[PodRow] = field(default_factory=list)
-    others: list[Pod] = field(default_factory=list)
+    others: list[tuple[str, Pod]] = field(default_factory=list)
+    """Pods without our prefix, with the provider each is at."""
+    notes: list[str] = field(default_factory=list)
+    """Providers not asked, for want of a key."""
+    failures: list[str] = field(default_factory=list)
+    """Providers that were asked and did not answer."""
 
     @property
     def hourly(self) -> float:
-        return sum(row.pod.cost_usd_hr for row in self.rows if not self.provider.is_gone(row.pod))
+        return sum(row.pod.cost_usd_hr for row in self.rows if not row.provider.is_gone(row.pod))
 
     def document(self) -> dict[str, Any]:
         """`gpuc pods --json`: the provider's answer, ours and everyone else's.
@@ -92,38 +111,52 @@ class PodsView:
             "pods": [row.document() for row in self.rows],
             "hourly_usd": round(self.hourly, 4),
             "others": [
-                {"id": pod.id, "name": pod.name, "status": pod.status} for pod in self.others
+                {"provider": provider, "id": pod.id, "name": pod.name, "status": pod.status}
+                for provider, pod in self.others
             ],
-            "notes": [],
+            "notes": list(self.notes),
+            "failures": list(self.failures),
         }
 
 
 def gather(
     settings: Settings,
-    provider: Provider,
+    providers: Providers,
     *,
+    missing: list[str] | None = None,
     heartbeats: bool = True,
 ) -> PodsView:
-    view = PodsView(provider)
-    pods = provider.list()
-    ours = owned_pods(pods, provider.prefix)
-    ours_ids = {pod.id for pod in ours}
-    others = [pod for pod in pods if pod.id not in ours_ids]
+    """Every provider in `providers` is listed; one that fails is a failure
+    beside the others' rows, never instead of them. `missing` is why each
+    provider not in `providers` was not asked."""
+    view = PodsView(notes=[f"not asked, {why}" for why in missing or []])
     registry = open_registry().registry
-    by_pod_id = {e.rental.pod_id: e for e in registry.hosts.values() if e.rental is not None}
-
-    for pod in sorted(ours, key=lambda p: p.name):
-        entry = by_pod_id.get(pod.id)
-        # Only bootstrapped, running hosts can answer; anything else costs an ssh timeout.
-        age = (
-            heartbeat_age(entry, settings)
-            if heartbeats and entry is not None and provider.is_running(pod)
-            else None
-        )
-        view.rows.append(
-            PodRow(pod=pod, host=entry.name if entry is not None else None, heartbeat_s=age)
-        )
-    view.others = sorted(others, key=lambda p: p.name)
+    by_pod_id = {
+        (e.rental.provider, e.rental.pod_id): e
+        for e in registry.hosts.values()
+        if e.rental is not None
+    }
+    for provider in providers.values():
+        try:
+            pods = provider.list()
+        except ProviderError as exc:
+            view.failures.append(f"{provider.name}: {exc}")
+            continue
+        ours = owned_pods(pods, provider.prefix)
+        ours_ids = {pod.id for pod in ours}
+        view.others += [(provider.name, pod) for pod in pods if pod.id not in ours_ids]
+        for pod in ours:
+            entry = by_pod_id.get((provider.name, pod.id))
+            # Only bootstrapped, running hosts can answer; anything else costs an ssh timeout.
+            age = (
+                heartbeat_age(entry, settings)
+                if heartbeats and entry is not None and provider.is_running(pod)
+                else None
+            )
+            host = entry.name if entry is not None else None
+            view.rows.append(PodRow(pod=pod, provider=provider, host=host, heartbeat_s=age))
+    view.rows.sort(key=lambda row: row.pod.name)
+    view.others.sort(key=lambda other: other[1].name)
     return view
 
 
@@ -149,7 +182,7 @@ def render(view: PodsView) -> str:
     else:
         lines.append(f"{len(view.rows)} pod(s) with our prefix, ${view.hourly:.2f}/h total")
     unregistered = [
-        row.pod for row in view.rows if row.host is None and not view.provider.is_gone(row.pod)
+        row.pod for row in view.rows if row.host is None and not row.provider.is_gone(row.pod)
     ]
     if unregistered:
         names = ", ".join(f"{pod.name} ({pod.id})" for pod in unregistered)
@@ -167,6 +200,8 @@ def render(view: PodsView) -> str:
                 f"ending it now would cost that submit its pod."
             )
     if view.others:
-        names = ", ".join(f"{pod.name} ({pod.status})" for pod in view.others)
-        lines.append(f"{len(view.others)} other pod(s) in the account, never touched: {names}")
+        names = ", ".join(f"{pod.name} ({provider}, {pod.status})" for provider, pod in view.others)
+        lines.append(f"{len(view.others)} other pod(s) in the accounts, never touched: {names}")
+    lines += [f"note: {note}" for note in view.notes]
+    lines += [f"error: could not list the pods at {failure}" for failure in view.failures]
     return "\n".join(lines)

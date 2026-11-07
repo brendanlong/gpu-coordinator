@@ -35,7 +35,7 @@ from gpuc.control.config import (
     Settings,
     forget_host,
 )
-from gpuc.control.providers.base import Pod, Provider, ProviderError
+from gpuc.control.providers.base import Pod, Provider, ProviderError, Providers
 
 
 class TerminateError(RuntimeError):
@@ -55,6 +55,7 @@ class Target:
     """Which pod this is about, and what this machine knows about it."""
 
     pod_id: str
+    provider: Provider
     pod: Pod | None = None
     entry: HostEntry | None = None
 
@@ -117,14 +118,15 @@ class Termination:
         }
 
 
-def resolve(target: str, registry: Registry, provider: Provider) -> Target:
+def resolve(target: str, registry: Registry, providers: Providers) -> Target:
     """A registered host name, a pod id, or a pod name -- in that order.
 
     The registry comes first because that is the name the user sees everywhere
     else, and a pod is only looked for when no host answers to the name: the
     provider read costs an API call, and a name this machine drives is not
-    ambiguous. Pods without our prefix are not searched, for the same reason
-    nothing else here touches them.
+    ambiguous. A pod is looked for at every provider in `providers`; pods
+    without our prefix are not searched, for the same reason nothing else
+    here touches them.
     """
     entry = registry.hosts.get(target)
     if entry is not None:
@@ -133,28 +135,63 @@ def resolve(target: str, registry: Registry, provider: Provider) -> Target:
                 f"host {entry.name} is a {entry.kind!r} host: there is no rental to end.\n"
                 f"`gpuc host remove {entry.name}` forgets it here, and nothing on it changes."
             )
-        return Target(pod_id=entry.rental.pod_id, entry=entry)
-    pod = _find_pod(target, provider)
-    return Target(pod_id=pod.id, pod=pod, entry=_entry_for_pod(pod.id, registry))
-
-
-def _find_pod(target: str, provider: Provider) -> Pod:
-    for pod in provider.list_ours():
-        if target in (pod.id, pod.name):
-            return pod
-    raise HostNotFound(
-        f"no host or pod named {target!r}. `gpuc host list` has this machine's hosts and "
-        f"`gpuc pods` every pod in the account with our prefix; a pod without the prefix "
-        f"is not ours and is only ever ended in the provider's console."
+        provider = providers.get(entry.rental.provider)
+        if provider is None:
+            raise ProviderError(
+                f"host {entry.name} is rented from {entry.rental.provider}, which cannot be "
+                f"asked from here: its API key is not set"
+            )
+        return Target(pod_id=entry.rental.pod_id, provider=provider, entry=entry)
+    provider, pod = find_pod(target, providers)
+    return Target(
+        pod_id=pod.id,
+        provider=provider,
+        pod=pod,
+        entry=_entry_for_pod(provider.name, pod.id, registry),
     )
 
 
-def _entry_for_pod(pod_id: str, registry: Registry) -> HostEntry | None:
-    """The registry entry for a pod named by id, so it is forgotten too."""
-    return next((e for e in registry.hosts.values() if e.pod_id == pod_id), None)
+def find_pod(target: str, providers: Providers) -> tuple[Provider, Pod]:
+    """The pod with our prefix whose id or name is `target`, at whichever
+    provider has it. A provider that cannot be listed is not one that lacks
+    it: with no pod found elsewhere, that is the error, not "no such pod"."""
+    unlisted: list[str] = []
+    for provider in providers.values():
+        try:
+            pods = provider.list_ours()
+        except ProviderError as exc:
+            unlisted.append(f"{provider.name}: {exc}")
+            continue
+        for pod in pods:
+            if target in (pod.id, pod.name):
+                return provider, pod
+    if unlisted:
+        raise ProviderError(
+            f"no pod named {target!r} at the providers that answered, and these could not "
+            f"be asked: {'; '.join(unlisted)}"
+        )
+    asked = ", ".join(providers) or "no provider (no API key is set)"
+    raise HostNotFound(
+        f"no host or pod named {target!r} (pods were looked for at {asked}). `gpuc host "
+        f"list` has this machine's hosts and `gpuc pods` every pod with our prefix; a pod "
+        f"without the prefix is not ours and is only ever ended in the provider's console."
+    )
 
 
-def inspect(target: Target, settings: Settings, provider: Provider) -> Termination:
+def _entry_for_pod(provider: str, pod_id: str, registry: Registry) -> HostEntry | None:
+    """The registry entry for a pod named by id, so it is forgotten too. By
+    provider as well: two providers can each have a pod `4242`."""
+    return next(
+        (
+            e
+            for e in registry.hosts.values()
+            if e.rental is not None and (e.rental.provider, e.rental.pod_id) == (provider, pod_id)
+        ),
+        None,
+    )
+
+
+def inspect(target: Target, settings: Settings) -> Termination:
     """What the pod is doing, as the host itself reports it.
 
     One `gpuc status` of that host: the provider read fills in what is being
@@ -162,6 +199,7 @@ def inspect(target: Target, settings: Settings, provider: Provider) -> Terminati
     the whole point of the return -- an empty queue and a question nobody
     answered must never read alike, and only one of them is safe to act on.
     """
+    provider = target.provider
     result = Termination(target=target)
     if target.entry is None:
         result.unasked = (
@@ -172,7 +210,7 @@ def inspect(target: Target, settings: Settings, provider: Provider) -> Terminati
         # `target.pod` None, and None is not a dead pod.
         result.nothing_can_run = target.pod is not None and provider.is_dead(target.pod)
         return result
-    view = status_mod.gather(target.entry, settings, provider=provider)
+    view = status_mod.gather(target.entry, settings, providers={provider.name: provider})
     target.pod = view.pod or target.pod
     if not view.reachable:
         # Gone, or unaskable with a pod the provider itself calls dead: what
@@ -232,7 +270,7 @@ def terminate(
     settings: Settings,
     *,
     registry: Registry,
-    provider: Provider,
+    providers: Providers,
     force: bool = False,
     report: Reporter = print,
     sleep: Callable[[float], None] = time.sleep,
@@ -257,11 +295,12 @@ def terminate(
     look at, which `is_dead` would also call dead, and a busy host would be
     ended over a 503.
     """
-    resolved = resolve(target, registry, provider)
+    resolved = resolve(target, registry, providers)
+    provider = resolved.provider
     if force:
         result = Termination(target=resolved)
     else:
-        result = inspect(resolved, settings, provider)
+        result = inspect(resolved, settings)
         if not result.nothing_can_run and (result.busy or not result.checked):
             raise TerminateRefused(refusal(result))
     if resolved.pod is None:

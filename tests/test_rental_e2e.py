@@ -1,10 +1,10 @@
-"""The live test: one real A40 pod, one real job, real teardown.
+"""The live test: one real rental per provider, one real job, real teardown.
 
-Costs money (about $0.10). Everything it creates is terminated in a `finally`
-that verifies against the provider, not against our own state. Pods without the
-`gpuc-` prefix belong to other people and are only ever read.
+Costs money (about $0.10 each). Everything it creates is terminated in a
+`finally` that verifies against the provider, not against our own state. Pods
+without the `gpuc-` prefix belong to other people and are only ever read.
 
-Run it with:  uv run pytest -m runpod -s
+Run it with:  uv run pytest -m rental -s   (`-k vast` or `-k runpod` for one)
 """
 
 from __future__ import annotations
@@ -22,18 +22,38 @@ from typing import Any
 import pytest
 
 from gpuc.control import status as status_mod
+from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import main
 from gpuc.control.config import (
     HostEntry,
     Settings,
     load_settings,
 )
-from gpuc.control.providers.base import Offer, Pod
+from gpuc.control.providers.base import Offer, Pod, Provider
 from gpuc.control.providers.runpod import RunPodProvider
+from gpuc.control.providers.vast import VastProvider
 from gpuc.control.s3index import LocalIndex
 from tests.conftest import load_registry
 
-pytestmark = pytest.mark.runpod
+pytestmark = pytest.mark.rental
+
+RENTS: dict[str, tuple[type[RunPodProvider] | type[VastProvider], list[str]]] = {
+    "runpod": (RunPodProvider, ["--gpu", "A40", "--max-price", "0.60", "--cloud", "any"]),
+    "vast": (
+        VastProvider,
+        [
+            "--gpu",
+            "RTX 3090,RTX 4090,RTX A5000,RTX 3080,RTX 4080",
+            "--max-price",
+            "0.40",
+            "--min-inet-down",
+            "300",
+            "--min-reliability",
+            "0.97",
+        ],
+    ),
+}
+"""Each provider's class, and the cheapest rental of it the job runs on."""
 
 BUCKET = "brendanlong-experiments"
 OUTPUT_PREFIX = "gpuc-e2e"
@@ -91,17 +111,20 @@ def wait_until(
     raise AssertionError(f"timed out after {timeout_s:.0f}s waiting for {what}")
 
 
-class RecordingProvider(RunPodProvider):
+def recording(cls: Any, prefix: str) -> Any:
     """A real provider that remembers what it created, so `finally` can undo it."""
 
-    def __init__(self, prefix: str) -> None:
-        super().__init__(prefix=prefix)
-        self.created_ids: list[str] = []
+    class Recording(cls):
+        def __init__(self) -> None:
+            super().__init__(prefix=prefix)
+            self.created_ids: list[str] = []
 
-    def create(self, offer: Offer, name: str, **kwargs: Any) -> Pod:
-        pod = super().create(offer, name, **kwargs)
-        self.created_ids.append(pod.id)
-        return pod
+        def create(self, offer: Offer, name: str, **kwargs: Any) -> Pod:
+            pod = super().create(offer, name, **kwargs)
+            self.created_ids.append(pod.id)
+            return pod
+
+    return Recording()
 
 
 @pytest.fixture
@@ -171,17 +194,20 @@ def job_state(entry: HostEntry, settings: Settings, job_id: str) -> dict[str, An
     return {"status": "unknown", "phase": None, "reason": None}
 
 
+@pytest.mark.parametrize("kind", sorted(RENTS))
 def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
+    kind: str,
     live_settings: Settings,
     workdir: Path,
     aws_env: None,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    if not os.environ.get("RUNPOD_API_KEY"):
-        pytest.skip("RUNPOD_API_KEY is not set")
-    provider = RecordingProvider(live_settings.runpod_pod_prefix)
-    monkeypatch.setattr("gpuc.control.cli.make_provider", lambda *a, **k: provider)
+    cls, rent_args = RENTS[kind]
+    if not os.environ.get(cls.api_key_env):
+        pytest.skip(f"{cls.api_key_env} is not set")
+    provider = recording(cls, live_settings.runpod_pod_prefix)
+    monkeypatch.setitem(PROVIDERS, kind, lambda *_: provider)
     monkeypatch.setattr("gpuc.control.hosts.make_provider", lambda *a, **k: provider)
     monkeypatch.chdir(workdir)
     started = time.monotonic()
@@ -189,9 +215,8 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
     try:
         with capsys.disabled():
             log("renting; provisioning starts now")
-            rent = ["host", "rent", "--provider", "runpod", "--gpu", "A40"]
-            rent += ["--max-price", "0.60", "--cloud", "any", "--idle-min", "2", "--disk", "20"]
-            rent += ["--name-hint", NAME_HINT, "--force"]
+            rent = ["host", "rent", "--provider", kind, *rent_args]
+            rent += ["--idle-min", "2", "--disk", "20", "--name-hint", NAME_HINT, "--force"]
             assert main(rent) == 0
             rented = [e for e in load_registry().hosts.values() if e.kind == "rental"]
             assert len(rented) == 1, rented
@@ -266,13 +291,16 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
                 # Teardown must never mask the real failure, whatever went wrong.
                 except Exception as exc:
                     log(f"finally: terminate of {pod_id} failed: {exc}")
-            live = [p for p in provider.list_ours() if p.id in provider.created_ids]
+            live = [
+                p
+                for p in provider.list_ours()
+                if p.id in provider.created_ids and not provider.is_gone(p)
+            ]
             log(f"finally: our live pods = {[p.name for p in live]}")
             everything = [(p.name, p.status) for p in provider.list_ours()]
             log(f"finally: all prefixed pods = {everything}")
             assert live == []
 
 
-def _gone(provider: RunPodProvider, pod_id: str) -> bool:
-    pod = provider.get(pod_id)
-    return pod is None or pod.status == "TERMINATED"
+def _gone(provider: Provider, pod_id: str) -> bool:
+    return provider.is_gone(provider.get(pod_id))

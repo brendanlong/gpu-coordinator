@@ -1,11 +1,11 @@
 ---
 name: gpuc
-description: Run GPU jobs with gpu-coordinator (gpuc) on this machine, a box you reach over ssh, or a RunPod pod. Use when asked to train, evaluate, or run anything on a GPU, to check on or cancel a GPU job, or to read its logs.
+description: Run GPU jobs with gpu-coordinator (gpuc) on this machine, a box you reach over ssh, or a rented RunPod pod or Vast.ai instance. Use when asked to train, evaluate, or run anything on a GPU, to check on or cancel a GPU job, or to read its logs.
 ---
 
 # Running GPU jobs with gpuc
 
-`gpuc` is a per-host job queue plus RunPod provisioning. The host is
+`gpuc` is a per-host job queue plus RunPod and Vast.ai provisioning. The host is
 authoritative for its own queue and state; S3 is a mirror. Hosts registered
 once stay registered for every session of this user.
 
@@ -141,6 +141,7 @@ gpuc submit job.yaml --host local
 gpuc submit job.yaml --host <host>                              # any name from `gpuc host list`
 gpuc host rent --provider runpod --gpu A40 --max-price 0.60     # prints the host name to submit to;
                                                                 # or --gpu "A40,RTX 4090" --cloud any
+gpuc host rent --provider vast --gpu "RTX 4090" --max-price 0.50 --min-inet-down 500 --min-reliability 0.98
 
 gpuc status                      # every host: free cards, queue, running job + phase, eta,
                                  # recent results; each job as `name (job-id)`, each running
@@ -179,7 +180,7 @@ gpuc set <jobid> --priority 10 --estimate 150 --max-runtime 600
 gpuc requeue <jobid> --host <host>
                                  # re-run from the mirrored spec as a new job; needs s3_bucket
                                  # set, and re-syncs the workdir from your current directory
-gpuc pods                        # RunPod: every pod we own, cost, age, util, host name
+gpuc pods                        # every pod we own at every provider: cost, age, util, host name
 ```
 
 `failed: <reason>` reasons you will see: `gpu-preflight` (no working CUDA in
@@ -308,13 +309,20 @@ Rules, and they are not optional:
   exit_code}`. `error` (singular) means it did not do what you asked; `errors`
   (plural) is trouble it survived.
 - A job's `util` is the host's own nvidia-smi sampler; a pod's `provider_util`
-  is RunPod's reading for the whole pod. Do not compare them. `util_mean` is
+  is the provider's reading for the whole pod. Do not compare them. `util_mean` is
   the average over the whole of `main` (over `util_samples` 30 s samples), and
   survives the job: `gpuc status --recent 20` prints it per finished job,
   which is the evidence for whether a job would use a second card.
 - Ignore keys you do not recognise; more will be added.
 
-## RunPod specifics
+## Rental specifics (RunPod and Vast.ai)
+
+- `--provider runpod` needs `RUNPOD_API_KEY`, `--provider vast` needs
+  `VAST_API_KEY`. Vast is cheaper and its machines vary: hold its offers to
+  `--min-inet-down`/`--min-inet-up` (Mb/s), `--min-reliability` (0-1),
+  `--min-gpu-ram` (GB), `--min-disk-bw` (MB/s) and `--min-tflops`, all of
+  which only Vast can search by (on RunPod they are a usage error, as is
+  `--cloud` on Vast).
 
 - Provisioning to a registered host is about a minute. Rent with a
   `--gpu-count` that fits the spec's `gpus:`; submit checks it only once the

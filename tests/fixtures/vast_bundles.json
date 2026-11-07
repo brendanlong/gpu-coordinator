@@ -1,0 +1,52 @@
+{
+ "offers": [
+  {
+   "id": 59360049,
+   "gpu_name": "RTX 4090",
+   "num_gpus": 1,
+   "dph_total": 0.3743703703703704,
+   "cuda_max_good": 13.2,
+   "gpu_ram": 24564,
+   "total_flops": 82.57536,
+   "inet_down": 878.9,
+   "inet_up": 911.2,
+   "disk_bw": 3919.2,
+   "reliability2": 0.9505011,
+   "disk_space": 193.97614660747865,
+   "direct_port_count": 199,
+   "rentable": true
+  },
+  {
+   "id": 59244968,
+   "gpu_name": "RTX 4090",
+   "num_gpus": 1,
+   "dph_total": 0.3743703703703704,
+   "cuda_max_good": 13.2,
+   "gpu_ram": 24564,
+   "total_flops": 82.57536,
+   "inet_down": 881.6,
+   "inet_up": 881.4,
+   "disk_bw": 2534.0,
+   "reliability2": 0.9952917,
+   "disk_space": 1411.275,
+   "direct_port_count": 24,
+   "rentable": true
+  },
+  {
+   "id": 58777468,
+   "gpu_name": "RTX 3090",
+   "num_gpus": 1,
+   "dph_total": 0.382962962962963,
+   "cuda_max_good": 13.0,
+   "gpu_ram": 24564,
+   "total_flops": 81.395712,
+   "inet_down": 50.0,
+   "inet_up": 779.5,
+   "disk_bw": 2033.0,
+   "reliability2": 0.9969464,
+   "disk_space": 142.81654352699115,
+   "direct_port_count": 12,
+   "rentable": true
+  }
+ ]
+}

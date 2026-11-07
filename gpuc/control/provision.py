@@ -39,7 +39,6 @@ from gpuc.control.bootstrap import (
     bootstrap_host,
 )
 from gpuc.control.config import (
-    DEFAULT_DISK_GB,
     HostEntry,
     Reporter,
     Settings,
@@ -54,13 +53,13 @@ from gpuc.control.connect import connect_host
 from gpuc.control.gpuinfo import summarize
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import (
-    DEFAULT_IMAGE,
     Constraints,
     CreateRefused,
     Offer,
     Pod,
     Provider,
     ProviderError,
+    Unauthorized,
     offer_satisfies,
 )
 from gpuc.control.remote import (
@@ -127,7 +126,7 @@ def verdict(exc: BaseException, *, polling: bool = False) -> Verdict:
     have, is never the offer's: every pod would be bought, waited on and
     terminated identically, so it ends the attempt at the first one.
     """
-    if isinstance(exc, (SshUnusable, LocalToolMissing, Unprovisionable)):
+    if isinstance(exc, (SshUnusable, LocalToolMissing, Unprovisionable, Unauthorized)):
         return Verdict.ABORT
     if isinstance(exc, TransportError) and SSH_MISCONFIGURED.search(str(exc)):
         return Verdict.ABORT
@@ -183,8 +182,8 @@ def public_key_path(settings: Settings) -> Path:
         if not candidate.exists():
             raise ProvisionError(
                 f"ssh_key is {settings.ssh_key} in {config_file()}, but its public half "
-                f"{candidate} does not exist.\nRunPod needs the public key to authorise the "
-                f"pod; create it with `ssh-keygen -y -f {settings.ssh_key_path} > {candidate}`."
+                f"{candidate} does not exist.\nThe provider needs the public key to authorise "
+                f"the pod; create it with `ssh-keygen -y -f {settings.ssh_key_path} > {candidate}`."
             )
         return candidate
     for name in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"):
@@ -203,24 +202,20 @@ def pod_name(prefix: str, name_hint: str) -> str:
     return f"{prefix}{hint}-{secrets.token_hex(3)}"
 
 
-def _label(offer: Offer) -> str:
-    return f"{offer.name}/{offer.cloud.lower()} ${offer.price_usd_hr:.3f}/h"
-
-
 def provision(
     constraints: Constraints,
     settings: Settings,
     *,
     name_hint: str = "job",
     idle_minutes: float = 15.0,
-    disk_gb: int = DEFAULT_DISK_GB,
-    image: str = DEFAULT_IMAGE,
+    image: str | None = None,
     provider: Provider,
     report: Reporter = print,
     health_options: HealthOptions = DEFAULT_HEALTH,
     deps: ProvisionDeps | None = None,
 ) -> HostEntry:
-    """Create, wait for, bootstrap and register one pod. Returns its registry entry."""
+    """Create, wait for, bootstrap and register one pod. Returns its registry
+    entry. `image` None is the provider's own default."""
     deps = deps or ProvisionDeps()
     progress = _Progress(report, deps.now)
 
@@ -237,7 +232,7 @@ def provision(
         )
     deadline = deps.now() + CEILING_MINUTES * 60.0
     progress(
-        f"{len(offers)} offer(s): {', '.join(_label(o) for o in offers[:6])}; "
+        f"{len(offers)} offer(s): {', '.join(o.label for o in offers[:6])}; "
         f"ceiling {CEILING_MINUTES:.0f} min for the whole attempt"
     )
 
@@ -245,7 +240,7 @@ def provision(
     billing: list[str] = []
     for offer in offers:
         if deps.now() >= deadline:
-            failures.append(f"  - {_label(offer)}: not tried, the ceiling had passed")
+            failures.append(f"  - {offer.label}: not tried, the ceiling had passed")
             continue
         try:
             return _try_offer(
@@ -255,8 +250,7 @@ def provision(
                 provider=provider,
                 name_hint=name_hint,
                 idle_minutes=idle_minutes,
-                disk_gb=disk_gb,
-                image=image,
+                image=image or provider.default_image,
                 health_options=health_options,
                 progress=progress,
                 deps=deps,
@@ -265,14 +259,14 @@ def provision(
             )
         except RECOVERABLE as exc:
             first = _first_line(exc)
-            failures.append(f"  - {_label(offer)}: {first}")
+            failures.append(f"  - {offer.label}: {first}")
             if verdict(exc) is Verdict.ABORT:
                 raise ProvisionError(
                     f"provisioning stopped, no other offer could fix this: {first}\n"
                     + "\n".join(failures)
                     + f"\n{_cleanup(billing)}"
                 ) from exc
-            progress(f"offer {_label(offer)} failed: {first}")
+            progress(f"offer {offer.label} failed: {first}")
     raise ProvisionError(
         "every offer failed to produce a healthy pod:\n"
         + "\n".join(failures)
@@ -307,7 +301,6 @@ def _try_offer(
     provider: Provider,
     name_hint: str,
     idle_minutes: float,
-    disk_gb: int,
     image: str,
     health_options: HealthOptions,
     progress: _Progress,
@@ -319,7 +312,7 @@ def _try_offer(
     out is appended to `billing`, so the caller's report can name it."""
     name = pod_name(provider.prefix, name_hint)
     progress(
-        f"creating {name}: {_label(offer)} x{constraints.gpu_count}, disk {disk_gb}GB, "
+        f"creating {name}: {offer.label} x{constraints.gpu_count}, disk {constraints.disk_gb}GB, "
         f"cuda>={constraints.cuda_min}, image {image}"
     )
     try:
@@ -327,7 +320,7 @@ def _try_offer(
             offer,
             name,
             image=image,
-            disk_gb=disk_gb,
+            disk_gb=constraints.disk_gb,
             cuda_min=constraints.cuda_min,
             gpu_count=constraints.gpu_count,
         )
@@ -639,9 +632,9 @@ class Match:
                 when = "running a job, with enough cards free"
             else:
                 when = "its host does not say when it idles out"
-            return f"{name} ({_label(self.offer)}): free, {when}"
+            return f"{name} ({self.offer.label}): free, {when}"
         return (
-            f"{name} ({_label(self.offer)}): busy, {len(self.view.running)} running, "
+            f"{name} ({self.offer.label}): busy, {len(self.view.running)} running, "
             f"{len(self.view.queue)} queued, {len(self.view.free)} of "
             f"{len(self.view.owned)} card(s) free"
         )
@@ -683,7 +676,10 @@ def matching_rentals(
         return []
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_HOSTS, len(entries))) as pool:
         answers = list(
-            pool.map(lambda entry: ask(entry, "status", settings, provider=provider), entries)
+            pool.map(
+                lambda entry: ask(entry, "status", settings, providers={provider.name: provider}),
+                entries,
+            )
         )
     matches: list[Match] = []
     for entry, asked in zip(entries, answers, strict=True):

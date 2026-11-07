@@ -23,15 +23,13 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.jsonout import warn
-from gpuc.control.providers.base import DEFAULT_IMAGE, DEFAULT_PREFIX
+from gpuc.control.providers.base import DEFAULT_DISK_GB, DEFAULT_PREFIX
 from gpuc.control.tolerant import TolerantModel
 from gpuc.control.transport import Transport, make_transport
 from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
 HostKind = Literal["local", "ssh", "rental"]
-
-DEFAULT_DISK_GB = 50
 
 
 Reporter = Callable[[str], None]
@@ -115,7 +113,8 @@ class Settings(TolerantModel):
     s3_bucket: str | None = None
     runpod_pod_prefix: str = DEFAULT_PREFIX
     ssh_key: str | None = None
-    image: str = DEFAULT_IMAGE
+    image: str | None = None
+    """Every rental's image; None is each provider's own."""
     disk_gb: int = DEFAULT_DISK_GB
 
     @property
@@ -139,15 +138,17 @@ CONFIG_TEMPLATE = f"""\
 # cannot work.
 # s3_bucket = "my-experiments"
 
-# Only pods whose name starts with this are ever read or terminated.
+# Only rentals whose name starts with this are ever read or terminated, at
+# every provider (RunPod and Vast alike, despite the name).
 runpod_pod_prefix = "{DEFAULT_PREFIX}"
 
 # Private key for ssh and rsync to hosts and pods; its ".pub" is uploaded to
-# the RunPod account. Unset means ssh picks its own.
+# each provider account. Unset means ssh picks its own.
 # ssh_key = "~/.ssh/id_ed25519"
 
-# Defaults for `gpuc host rent`; override per rental with --disk.
-image = "{DEFAULT_IMAGE}"
+# Defaults for `gpuc host rent`; override per rental with --image and --disk.
+# Unset `image` means each provider's own default.
+# image = "my/image:tag"
 disk_gb = {DEFAULT_DISK_GB}
 """
 

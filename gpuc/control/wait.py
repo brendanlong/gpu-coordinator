@@ -28,12 +28,12 @@ from gpuc.control.actions import (
     Unlocated,
     locate_many,
     mirror_is_the_answer,
-    provider_for,
+    providers_for,
     read_mirror,
 )
 from gpuc.control.config import HostEntry, Settings, open_registry
 from gpuc.control.jsonout import note
-from gpuc.control.providers.base import Provider
+from gpuc.control.providers.base import Providers
 from gpuc.control.remote import Answered, HostSession, Unaskable, ask, open_session
 from gpuc.control.s3index import JobIndex
 from gpuc.control.status import JobView
@@ -185,7 +185,7 @@ class Watch:
         targets: Sequence[tuple[str, str, HostEntry | None]],
         settings: Settings,
         *,
-        provider: Provider | None = None,
+        providers: Providers | None = None,
         sessions: dict[str, HostSession] | None = None,
         gone: dict[str, str] | None = None,
         unknown: dict[str, str] | None = None,
@@ -201,7 +201,7 @@ class Watch:
         a failure to report, not the mirror's moment."""
         self.settings = settings
         self.patient = patient
-        self.provider = provider
+        self.providers = providers
         self.index = JobIndex(self.settings)
         self.entries = {host: entry for _, host, entry in targets if entry is not None}
         self.gone = dict(gone or {})
@@ -294,7 +294,7 @@ class Watch:
             self.entries[name],
             request,
             self.settings,
-            provider=self.provider,
+            providers=self.providers,
             session=self._sessions.get(name),
         )
         if not isinstance(asked, Answered):
@@ -413,7 +413,7 @@ def start(
     kept: its session is the one the poll goes on using."""
     read = open_registry()
     registry = read.named()
-    provider = provider_for(list(registry.hosts.values()), settings, note)
+    providers = providers_for(list(registry.hosts.values()), settings, note)
     targets: list[tuple[str, str, HostEntry | None]] = []
     sessions: dict[str, HostSession] = {}
     gone: dict[str, str] = {}
@@ -421,7 +421,9 @@ def start(
     unaskable: dict[str, tuple[str, str]] = {}
     # Deduplicated, so `xargs gpuc wait` on a list with a repeat in it
     # neither polls twice nor prints the outcome twice.
-    placed = locate_many(job_ids, registry, host, settings, provider=provider, skipped=read.skipped)
+    placed = locate_many(
+        job_ids, registry, host, settings, providers=providers, skipped=read.skipped
+    )
     for job_id, location in placed.items():
         if isinstance(location, Unlocated):
             # One typo in a list of twenty must not throw away the nineteen:
@@ -444,7 +446,7 @@ def start(
     return Watch(
         targets,
         settings,
-        provider=provider,
+        providers=providers,
         sessions=sessions,
         gone=gone,
         unknown=unknown,

@@ -77,7 +77,7 @@ def terminate(provider: FakeProvider, target: str, **kwargs: Any) -> teardown.Te
         target,
         Settings(),
         registry=load_registry(),
-        provider=provider,
+        providers={provider.name: provider},
         report=lambda _: None,
         sleep=lambda _: None,
         **kwargs,
@@ -418,3 +418,29 @@ def test_an_unregistered_pod_the_provider_reports_stopped_is_ended_without_force
 
     assert fake.terminated == ["podL"]
     assert (result.terminated, result.checked) == (True, False)
+
+
+def test_a_pod_found_at_one_provider_never_takes_another_providers_host(
+    control_env: Path, provider: FakeProvider
+) -> None:
+    """Two providers can each have a pod `pod1`; ending Vast's must leave the
+    RunPod rental registered here under that id alone."""
+
+    class Vast(FakeProvider):
+        name = "vast"
+
+    vast = Vast()
+    vast.adopt(running_pod("gpuc-vast-bbb", "pod1"), PodScript(ssh_after_polls=0))
+    register("gpuc-e2e-aaa", "pod1")
+    result = teardown.terminate(
+        "gpuc-vast-bbb",
+        Settings(),
+        registry=load_registry(),
+        providers={"runpod": provider, "vast": vast},
+        force=True,
+        report=lambda _: None,
+        sleep=lambda _: None,
+    )
+    assert result.terminated and result.target.entry is None
+    assert vast.terminated == ["pod1"] and provider.terminated == []
+    assert "gpuc-e2e-aaa" in load_registry().hosts
