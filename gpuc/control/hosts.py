@@ -49,9 +49,10 @@ from gpuc.control.providers.base import (
     MINIMUMS,
     Cloud,
     Constraints,
+    Offer,
     Provider,
 )
-from gpuc.control.provision import matching_rentals, provision
+from gpuc.control.provision import Match, matching_rentals, provision
 from gpuc.control.remote import Gone, RemoteError, rental_state
 from gpuc.control.teardown import find_pod
 from gpuc.control.transport import TransportError
@@ -148,19 +149,11 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
     rentals are compared: an ssh or local host may be one this work is not
     meant to use.
     """
-    provider = make_provider(settings, options.provider)
-    constraints = options.constraints(provider, settings)
-    matches = matching_rentals(constraints, settings, provider=provider, report=report)
+    provider, constraints, matches = _rental_search(options, settings, report)
     found = {"matching_rentals": [match.document() for match in matches]}
-    free = [match for match in matches if match.free]
+    free = _free_listing(matches)
     if free and not options.force:
-        listing = "\n".join(f"  {match.describe()}" for match in free)
-        raise CliError(
-            f"a rental that matches is free, so nothing was rented:\n{listing}\n"
-            f"Submit to it with `gpuc submit <job.yaml> --host {free[0].view.entry.name}`, "
-            f"or pass --force to rent another anyway.",
-            found,
-        )
+        raise CliError(f"a rental that matches is free, so nothing was rented:\n{free}", found)
     if matches:
         report(
             "matching rentals (renting another anyway):\n"
@@ -178,6 +171,98 @@ def rent_host(options: RentalOptions, settings: Settings, report: Reporter = pri
     )
     document = {**host_document(entry), **found}
     return HostChange(document, [f"next: gpuc submit <job.yaml> --host {entry.name}"])
+
+
+DEFAULT_QUOTE_LIMIT = 5
+
+
+def quote_rental(
+    options: RentalOptions,
+    settings: Settings,
+    *,
+    limit: int = DEFAULT_QUOTE_LIMIT,
+    report: Reporter = print,
+) -> HostChange:
+    """The offers `host rent` would try first, in the order it would try
+    them, and whether it would refuse; nothing is created.
+
+    More than one offer because `rent` moves on when a pod fails its health
+    check or the offer is taken first: what a person approves is the range.
+    The search is the one `provision` makes, so a quote cannot disagree with
+    the rent it is for.
+    """
+    provider, constraints, matches = _rental_search(options, settings, report)
+    offers = provider.offers(constraints)
+    free = _free_listing(matches)
+    document = {
+        "provider": provider.name,
+        "gpu_count": constraints.gpu_count,
+        "offers": [offer.model_dump(mode="json") for offer in offers[:limit]],
+        "offers_found": len(offers),
+        "matching_rentals": [match.document() for match in matches],
+        "would_refuse": free is not None,
+    }
+    lines = [_quote_line(offer, constraints.gpu_count) for offer in offers[:limit]]
+    if not offers:
+        lines.append(f"no {provider.name} offers match; host rent would rent nothing")
+    elif len(offers) > limit:
+        lines.append(f"... and {len(offers) - limit} more (--limit)")
+    if free:
+        lines.append(
+            f"host rent would refuse without --force, a rental that matches is free:\n{free}"
+        )
+    elif matches:
+        lines.append(
+            "matching rentals, all busy:\n"
+            + "\n".join(f"  {match.describe()}" for match in matches)
+        )
+    return HostChange(document, lines)
+
+
+def _quote_line(offer: Offer, gpu_count: int) -> str:
+    facts = [f"cuda {offer.cuda_versions[-1]}" if offer.cuda_versions else "cuda ?"]
+    for key, template in _QUOTED_FACTS.items():
+        value = getattr(offer, key)
+        if value is not None:
+            facts.append(template.format(value))
+    return f"{gpu_count}x {offer.label} for the pod  {', '.join(facts)}"
+
+
+_QUOTED_FACTS: dict[str, str] = {
+    "gpu_ram_gb": "{:.0f}GB",
+    "tflops": "{:.0f} TFLOPS",
+    "inet_down_mbps": "down {:.0f}Mbps",
+    "inet_up_mbps": "up {:.0f}Mbps",
+    "disk_bw_mbps": "disk {:.0f}MB/s",
+    "reliability": "reliability {:.3f}",
+}
+"""The `Offer` facts a quote shows where the provider gives them: those
+`--min-*` can hold an offer to."""
+
+
+def _rental_search(
+    options: RentalOptions, settings: Settings, report: Reporter
+) -> tuple[Provider, Constraints, list[Match]]:
+    provider = make_provider(settings, options.provider)
+    constraints = options.constraints(provider, settings)
+    return (
+        provider,
+        constraints,
+        matching_rentals(constraints, settings, provider=provider, report=report),
+    )
+
+
+def _free_listing(matches: list[Match]) -> str | None:
+    """The free matches that refuse a rent, and what to do instead."""
+    free = [match for match in matches if match.free]
+    if not free:
+        return None
+    listing = "\n".join(f"  {match.describe()}" for match in free)
+    return (
+        f"{listing}\n"
+        f"Submit to it with `gpuc submit <job.yaml> --host {free[0].view.entry.name}`, "
+        f"or pass --force to rent another anyway."
+    )
 
 
 def _pod_address(address: HostEntry, pod_id: str, settings: Settings) -> HostEntry:
