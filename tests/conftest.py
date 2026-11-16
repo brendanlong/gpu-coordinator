@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -189,6 +190,14 @@ def git_commit(root: Path, *paths: str) -> Path:
     ):
         subprocess.run(argv, cwd=root, check=True, capture_output=True)
     return root
+
+
+def document_of(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    """stdout must be exactly one JSON object, whatever else the command said."""
+    document = json.loads(capsys.readouterr().out)
+    assert isinstance(document, dict)
+    assert document["schema_version"] == 2
+    return document
 
 
 def accept_job(spec: JobSpec, **state: Any) -> str:

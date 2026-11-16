@@ -43,12 +43,14 @@ from gpuc.control.status import CardView, HostState, HostView
 from tests.conftest import (
     FAKE_GPUS,
     accept_job,
+    document_of,
     host_entry,
     install_fake_nvidia_smi,
     load_registry,
     register_host,
 )
 from tests.fakehost import FakeHost
+from tests.test_cli import bootstrapping
 
 GPU = FAKE_GPUS[0]
 
@@ -970,14 +972,6 @@ def test_the_installed_commit_comes_from_direct_url_json(
 # -- `--json` on every command -------------------------------------------------
 
 
-def document_of(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
-    """stdout must be exactly one JSON object, whatever else the command said."""
-    document = json.loads(capsys.readouterr().out)
-    assert isinstance(document, dict)
-    assert document["schema_version"] == 2
-    return document
-
-
 JSON_COMMANDS = [
     ["status"],
     ["submit"],
@@ -1231,8 +1225,6 @@ def test_host_terminate_json_is_what_was_ended_and_what_it_was_doing(
 def test_host_bootstrap_json_is_what_the_bootstrap_left_on_the_host(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from tests.test_cli import bootstrapping
-
     register_host(name="local", gpus=GPU)
     bootstrapping(monkeypatch)
     capsys.readouterr()
@@ -1257,7 +1249,6 @@ def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from gpuc.control.bootstrap import BootstrapError
-    from tests.test_cli import bootstrapping
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
@@ -1292,8 +1283,6 @@ def test_host_bootstrap_all_json_is_the_tally_per_host_as_data(
 def test_host_bootstrap_all_json_interrupted_names_the_hosts_never_reached(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from tests.test_cli import bootstrapping
-
     register_host(name="abox", kind="ssh", ssh="me@a")
     register_host(name="bbox", kind="ssh", ssh="me@b")
     register_host(name="cbox", kind="ssh", ssh="me@c")
@@ -1324,7 +1313,6 @@ def test_host_bootstrap_all_json_on_a_registry_that_breaks_mid_run_is_the_error_
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from gpuc.control.config import LocalStateUnreadable
-    from tests.test_cli import bootstrapping
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     register_host(name="local", gpus=GPU)

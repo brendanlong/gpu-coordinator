@@ -35,7 +35,7 @@ from gpuc.control.remote import HostConfigRead, HostSession, RemoteError
 from gpuc.control.status import placement_unknown
 from gpuc.control.submit import JobSpecModel, Prepared, SubmitResult, expand_job_id
 from gpuc.host.jobs import HostConfig
-from tests.conftest import host_entry, load_registry, register_host
+from tests.conftest import document_of, host_entry, load_registry, register_host
 from tests.fakehost import FakeHost
 from tests.fakeprovider import FakeProvider, make_offer, running_pod
 from tests.fakes3 import FakeS3Client, fake_s3
@@ -1154,7 +1154,7 @@ def test_a_verb_on_many_jobs_is_one_lookup_and_one_call_per_host(
         "a": ["status j1 j2 j3 j4", "cancel j1 j2"],
         "b": ["status j1 j2 j3 j4", "cancel j3"],
     }
-    document = one_document(capsys)
+    document = document_of(capsys)
     jobs = cast("list[dict[str, Any]]", document["jobs"])
     assert [(job["job_id"], job["host"], job.get("status")) for job in jobs] == [
         ("j1", "a", "cancelling"),
@@ -1204,7 +1204,7 @@ def test_status_of_ids_reports_every_one_when_one_cannot_be_placed(
     )
     capsys.readouterr()
     assert main(["status", "j1", "j2", "--json"]) == EXIT_ERROR
-    jobs = cast("list[dict[str, Any]]", one_document(capsys)["jobs"])
+    jobs = cast("list[dict[str, Any]]", document_of(capsys)["jobs"])
     assert [(job["job_id"], job["status"], job["error"] is None) for job in jobs] == [
         ("j1", "running", True),
         ("j2", None, False),
@@ -1267,7 +1267,7 @@ def test_a_verb_on_a_job_whose_host_is_down_is_exit_one_with_the_reason(
     _probes(monkeypatch, {"gpubox": RemoteError("gpubox", "printf %s", "no route to host")})
     capsys.readouterr()
     assert main(["cancel", "20260101-000000-aaaaaa", "--json"]) == EXIT_ERROR
-    document = one_document(capsys)
+    document = document_of(capsys)
     assert "no route to host" in str(document["errors"])
 
 
@@ -1300,7 +1300,7 @@ def test_logs_of_a_job_on_a_host_this_machine_has_forgotten_are_the_mirrors(
     _probes(monkeypatch, {})
     capsys.readouterr()
     assert main(["logs", job_id, "--json"]) == 0
-    document = one_document(capsys)
+    document = document_of(capsys)
     assert (document["source"], document["host"]) == ("s3", "gpuc-pod")
     assert document["lines"] == ["epoch 1", "epoch 2"]
     assert any(
@@ -1930,16 +1930,9 @@ def test_host_add_and_set_refuse_a_gpus_value_that_is_neither(
 # -- `--json` on every command ------------------------------------------------
 
 
-def one_document(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
-    document = json.loads(capsys.readouterr().out)
-    assert isinstance(document, dict)
-    assert document["schema_version"] == 2
-    return document
-
-
 def one_job(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
     """The one entry of a job verb's `{jobs, errors}` document."""
-    document = one_document(capsys)
+    document = document_of(capsys)
     jobs = document["jobs"]
     assert isinstance(jobs, list) and len(jobs) == 1
     return cast("dict[str, Any]", jobs[0])
@@ -2006,7 +1999,7 @@ def test_requeue_json_names_the_job_it_came_from(
     capsys.readouterr()
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--host", "local", "--json"]) == 0
-    document = one_document(capsys)
+    document = document_of(capsys)
     assert document["requeued_from"] == "20260101-000000-aaaaaa"
     assert document["job_id"] == "new"
 
@@ -2068,7 +2061,7 @@ def test_requeue_without_a_host_finds_the_job_on_a_host_this_client_never_submit
     capsys.readouterr()
 
     assert main(["requeue", "20260101-000000-aaaaaa", "--json"]) == 0
-    document = one_document(capsys)
+    document = document_of(capsys)
     assert submitted == ["b"]
     assert document["host"] == "b"
     assert document["requeued_from"] == "20260101-000000-aaaaaa"
@@ -2419,6 +2412,20 @@ def test_set_updates_the_mirrored_spec_so_requeue_carries_it(
     assert mirrored["some_future_field"] == 1
 
 
+class MovedThenBusy:
+    """Moves the job to priority 5, then cannot answer `status`."""
+
+    entry = host_entry(name="local", gpus=[GPU])
+    config = HostConfig(host="local", gpus=[GPU])
+
+    def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
+        if args.startswith("set"):
+            return {
+                "jobs": [{"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}]
+            }
+        raise RemoteError("local", "status", "host is busy")
+
+
 def test_set_priority_updates_the_mirrored_spec_so_requeue_carries_the_new_priority(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2426,26 +2433,13 @@ def test_set_priority_updates_the_mirrored_spec_so_requeue_carries_the_new_prior
     move left only on the host comes back at the priority it was submitted at."""
     from gpuc.control.s3index import S3Index
 
-    class Moved:
-        entry = host_entry(name="local", gpus=[GPU])
-        config = HostConfig(host="local", gpus=[GPU])
-
-        def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
-            if args.startswith("set"):
-                return {
-                    "jobs": [
-                        {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
-                    ]
-                }
-            raise RemoteError("local", "status", "host is busy")
-
     main(["host", "add", "local", "--gpus", GPU])
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     s3 = fake_s3(monkeypatch)
     S3Index("bucket", s3).put_spec_document(
         "20260101-000000-aaaaaa", {"command": "true", "priority": 50, "some_future_field": 1}
     )
-    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: MovedThenBusy())
     capsys.readouterr()
     argv = ["set", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -2461,23 +2455,10 @@ def test_set_priority_updates_the_mirrored_spec_so_requeue_carries_the_new_prior
 def test_set_priority_says_so_when_the_mirror_kept_the_old_priority(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class Moved:
-        entry = host_entry(name="local", gpus=[GPU])
-        config = HostConfig(host="local", gpus=[GPU])
-
-        def host_json(self, args: str, *, timeout: float = 0.0, check: bool = True) -> object:
-            if args.startswith("set"):
-                return {
-                    "jobs": [
-                        {"job_id": "20260101-000000-aaaaaa", "status": "queued", "priority": 5}
-                    ]
-                }
-            raise RemoteError("local", "status", "host is busy")
-
     main(["host", "add", "local", "--gpus", GPU])
     (Path(control_env) / "config/config.toml").write_text('s3_bucket = "bucket"\n')
     fake_s3(monkeypatch)
-    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: Moved())
+    monkeypatch.setattr("gpuc.control.remote.open_session", lambda *a, **k: MovedThenBusy())
     capsys.readouterr()
     argv = ["set", "20260101-000000-aaaaaa", "--priority", "5", "--host", "local", "--json"]
     assert main(argv) == 0
@@ -2513,7 +2494,7 @@ def test_pods_json_separates_ours_from_everyone_elses(
     monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: provider)
     capsys.readouterr()
     assert main(["pods", "--no-heartbeat", "--json"]) == 0
-    document = one_document(capsys)
+    document = document_of(capsys)
     (pod,) = document["pods"]  # type: ignore[misc]
     assert pod["name"] == "gpuc-e2e-aaa"
     assert pod["host"] is None
@@ -2538,7 +2519,7 @@ def test_clean_json_carries_what_went_and_what_was_kept(
     monkeypatch.setattr("gpuc.control.cli.clean_host", lambda *a, **k: report)
     capsys.readouterr()
     assert main(["clean", "--host", "local", "--all-finished", "--json"]) == 0
-    document = one_document(capsys)
+    document = document_of(capsys)
     assert document["freed_bytes"] == 2048
     assert document["removed"] == report.removed
     assert document["skipped"] == report.skipped
@@ -2557,7 +2538,7 @@ def test_clean_json_still_exits_one_when_the_host_reported_errors(
     )
     capsys.readouterr()
     assert main(["clean", "--host", "local", "--all-finished", "--json"]) == 1
-    assert one_document(capsys)["errors"] == ["could not remove workdir"]
+    assert document_of(capsys)["errors"] == ["could not remove workdir"]
 
 
 def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
@@ -2576,7 +2557,7 @@ def test_host_probe_json_keeps_the_raw_sections_and_the_notes(
     )
     capsys.readouterr()
     assert main(["host", "probe", "gpubox", "--json"]) == 0
-    document = one_document(capsys)
+    document = document_of(capsys)
     assert document["driver_version"] == "580.173.02"
     assert document["has_nvidia_smi"] is True
     assert document["sections"]["uv"] == "not installed"  # type: ignore[index]
@@ -2645,7 +2626,7 @@ def test_host_probe_json_is_written_after_the_registry_write_it_can_fail_on(
     monkeypatch.setattr("gpuc.control.cli.update_cache", lambda *a, **k: locked())
     capsys.readouterr()
     assert main(["host", "probe", "gpubox", "--json"]) == 1
-    document = one_document(capsys)
+    document = document_of(capsys)
     assert "state lock" in str(document["error"])
 
 
@@ -2656,7 +2637,7 @@ def test_host_list_json_reports_the_host_env_by_name_only(
     register_host(name="local", gpus=GPU, env={"HF_TOKEN": "hf_secret"})
     capsys.readouterr()
     assert main(["host", "list", "--json"]) == 0
-    document = one_document(capsys)
+    document = document_of(capsys)
     (host,) = document["hosts"]  # type: ignore[misc]
     assert host["env"] == {"HF_TOKEN": "<set>"}
     assert "hf_secret" not in json.dumps(document)
@@ -2737,22 +2718,6 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
     assert registry.require("pod").bootstrapped_at is None
 
 
-class _NoPods:
-    """A provider whose account has no pod by that id any more."""
-
-    def __init__(self, pod: Pod | None = None) -> None:
-        self._pod = pod
-
-    def get(self, pod_id: str) -> Pod | None:
-        return self._pod
-
-    def is_gone(self, pod: Pod | None) -> bool:
-        return pod is None or pod.status == "TERMINATED"
-
-    def is_dead(self, pod: Pod | None) -> bool:
-        return pod is None or pod.status in ("EXITED", "TERMINATED")
-
-
 def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2763,7 +2728,7 @@ def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
     with registry_transaction() as registry:
         registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
-    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: _NoPods())
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider())
     capsys.readouterr()
 
     assert main(["host", "bootstrap", "--all"]) == 0
@@ -2783,7 +2748,7 @@ def test_host_bootstrap_all_forgets_a_terminated_rental_too(
         registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     terminated = Pod(id="p1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
-    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: _NoPods(terminated))
+    monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider(existing=[terminated]))
     capsys.readouterr()
 
     assert main(["host", "bootstrap", "--all"]) == 0
