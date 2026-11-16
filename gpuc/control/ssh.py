@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import shlex
 
-from gpuc.control.transport import CommandResult, Transport
+from gpuc.control.transport import Transport
 
 DEFAULT_SHELL = "/bin/bash"
 
@@ -59,20 +59,9 @@ def shell_command(directory: str, command: str, fallback: str | None = None) -> 
 def command_argv(
     transport: Transport, directory: str, command: str, fallback: str | None = None
 ) -> list[str]:
-    """The argv for one non-interactive command, for `--print` to show."""
+    """The argv for one non-interactive command: run with our stdin, stdout
+    and stderr, so its output streams, or shown by `--print`."""
     return transport.argv(shell_command(directory, command, fallback))
-
-
-def run_command(
-    transport: Transport,
-    directory: str,
-    command: str,
-    fallback: str | None = None,
-    *,
-    timeout: float = 3600.0,
-) -> CommandResult:
-    """Run one command in `directory` on the host, whatever it exits."""
-    return transport.run(shell_command(directory, command, fallback), timeout=timeout, check=False)
 
 
 def print_line(argv: list[str]) -> str:
