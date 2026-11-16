@@ -14,7 +14,7 @@ import pytest
 
 from gpuc.host import dispatcher, gpus, jobs, paths, queue
 from gpuc.host.jobs import HostConfig, JobSpec
-from tests.conftest import LOCAL_GPU_UUID, requires_gpu, wait_until
+from tests.conftest import LOCAL_GPU_UUID, make_spec, requires_gpu, wait_until
 
 pytestmark = [pytest.mark.gpu, requires_gpu]
 
@@ -64,15 +64,9 @@ def stop_dispatcher(pid: int) -> None:
 
 
 def spec_for(command: str, **overrides: object) -> JobSpec:
-    document: dict[str, object] = {
-        "job_id": jobs.new_job_id(),
-        "name": "gpu-integration",
-        "command": command,
-        "gpus": 1,
-        "setup": "uv sync --frozen --quiet",
-    }
-    document.update(overrides)
-    return JobSpec.from_dict(document)
+    return make_spec(
+        name="gpu-integration", command=command, setup="uv sync --frozen --quiet", **overrides
+    )
 
 
 def test_a_real_gpu_job_runs_on_the_assigned_card_and_succeeds(

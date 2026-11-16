@@ -8,9 +8,9 @@ from pathlib import Path
 
 from gpuc.host import baseline, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig
-from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import FAKE_GPUS, make_spec
+from tests.test_runner import deps
 
 
 class Recorder:
@@ -55,7 +55,7 @@ def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=recorder),
     )
     assert (code, jobs.read_state(job_id).status) == (0, "succeeded")
     assert "report-elephant.md" in recorder.excluded()
@@ -71,9 +71,7 @@ def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, fake_aws: Non
             job_id,
             [FAKE_GPUS[0]],
             1,
-            RunnerDeps(
-                smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
-            ),
+            deps(command_runner=recorder),
         )
         == 0
     )
@@ -89,7 +87,7 @@ def test_a_job_that_produced_nothing_new_fails_as_no_outputs(
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=recorder),
     )
     state = jobs.read_state(job_id)
     assert (code, state.status, state.reason) == (1, "failed", "no-outputs")
@@ -108,9 +106,7 @@ def test_the_baseline_is_taken_before_setup_so_setup_output_counts(
             job_id,
             [FAKE_GPUS[0]],
             1,
-            RunnerDeps(
-                smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
-            ),
+            deps(command_runner=recorder),
         )
         == 0
     )
@@ -149,7 +145,7 @@ def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, fake_aws: None)
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=recorder),
     )
     # The final pass drops the min-age exclusions but keeps the baseline ones.
     final = recorder.uploads()[-1]
@@ -166,17 +162,15 @@ def test_a_preempted_re_run_keeps_the_baseline_the_first_attempt_took(
     `no-outputs` with its results sitting right there."""
     job_id, results = prepare(gpuc_home, "true")
     recorder = Recorder()
-    deps = RunnerDeps(
-        smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
-    )
-    runner.run_job(job_id, [FAKE_GPUS[0]], 1, deps)
+    job_deps = deps(command_runner=recorder)
+    runner.run_job(job_id, [FAKE_GPUS[0]], 1, job_deps)
     first = baseline.read(job_id)
     assert "report-elephant.md" in first["results"]
 
     # ...and then a preempted attempt leaves a checkpoint of its own behind.
     (results / "ckpt-100.bin").write_text("weights\n")
     jobs.update_state(job_id, status="queued", attempt=2, ended_at=None)
-    runner.run_job(job_id, [FAKE_GPUS[0]], 2, deps)
+    runner.run_job(job_id, [FAKE_GPUS[0]], 2, job_deps)
 
     assert baseline.read(job_id) == first
     assert "ckpt-100.bin" not in baseline.read(job_id)["results"]

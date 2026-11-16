@@ -10,9 +10,9 @@ import pytest
 from gpuc.host import destinations, jobs, paths, preflight, queue, runner
 from gpuc.host.destinations import S3, HuggingFace
 from gpuc.host.jobs import HostConfig
-from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import FAKE_GPUS, make_spec
+from tests.test_runner import deps
 
 
 class FakeRunner:
@@ -178,7 +178,7 @@ def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=fake, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=fake),
     )
 
     state = jobs.read_state(job_id)
@@ -197,9 +197,7 @@ def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, fake_aws: None) -
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(
-            smi=fake_smi(), command_runner=FakeRunner(), preflight=False, poll_interval_s=0.02
-        ),
+        deps(command_runner=FakeRunner()),
     )
 
     assert (code, jobs.read_state(job_id).status) == (0, "succeeded")

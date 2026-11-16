@@ -63,26 +63,19 @@ NO_NVIDIA_SMI = '#!/bin/sh\necho "sh: 1: nvidia-smi: not found"\nexit 127\n'
 class FakeHost:
     host = "fake"
 
-    def __init__(
-        self,
-        root: Path,
-        *,
-        gpus: Sequence[str] | None = DEFAULT_GPUS,
-        refuse: int = 0,
-        refusal: str = "ssh: connect to host 1.2.3.4 port 22000: Connection refused",
-    ) -> None:
+    def __init__(self, root: Path) -> None:
         self.home_dir = root / "home"
-        self.refuse = refuse
+        self.refuse = 0
         """Connections to refuse before the first command that gets through,
         as a pod whose sshd is still coming up does; `refusal` is what ssh
         says each time."""
-        self.refusal = refusal
+        self.refusal = "ssh: connect to host 1.2.3.4 port 22000: Connection refused"
         self.commands: list[str] = []
         self.gpuc_home = "$HOME/.gpuc"
         """The host's `GPUC_HOME` as an entry spells it; `$HOME` expands here."""
         bin_dir = self.home_dir / ".local" / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
-        self.set_gpus(gpus)
+        self.set_gpus(DEFAULT_GPUS)
         _shim(bin_dir / "uv", UV_SHIM.format(python=shlex.quote(_bare_python(root / "python"))))
         _shim(bin_dir / "hf", "#!/bin/sh\nexit 0\n")
         _shim(self.home_dir / ".local/aws-cli/v2/current/bin/aws", "#!/bin/sh\nexit 0\n")
@@ -278,7 +271,7 @@ def fake_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeH
         return host
 
     for module in ("connect", "probe", "cli", "remote", "bootstrap"):
-        monkeypatch.setattr(f"gpuc.control.{module}.transport_for", factory, raising=False)
+        monkeypatch.setattr(f"gpuc.control.{module}.transport_for", factory)
     try:
         yield host
     finally:
