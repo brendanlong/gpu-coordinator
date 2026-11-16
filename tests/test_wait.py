@@ -29,14 +29,14 @@ import pytest
 from gpuc.control import wait as wait_mod
 from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import main
-from gpuc.control.config import config_file, registry_transaction
+from gpuc.control.config import config_file
 from gpuc.control.exits import EXIT_ERROR, EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
 from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
 from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, paths
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
-from tests.conftest import accept_job, host_entry, stub_wait_sleep
+from tests.conftest import accept_job, register_host, stub_wait_sleep
 from tests.fakeprovider import FakeProvider
 from tests.fakes3 import fake_s3
 
@@ -59,16 +59,13 @@ def host_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_env: Path
     paths.heartbeat_file().touch()
     monkeypatch.delenv("GPUC_HOME")
     (home / "pkg").symlink_to(Path(__file__).resolve().parents[1])
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name="local",
-                kind="local",
-                gpus=[GPU],
-                gpuc_home=str(home),
-                python=sys.executable,
-            )
-        )
+    register_host(
+        name="local",
+        kind="local",
+        gpus=[GPU],
+        gpuc_home=str(home),
+        python=sys.executable,
+    )
     return home
 
 
@@ -223,12 +220,9 @@ def test_wait_keeps_trying_a_host_it_cannot_reach_and_then_gives_up(
     runs out, which here is a fifth of a second rather than five minutes.
     """
     put_job(host_home)
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name="local", kind="local", gpus=[GPU], gpuc_home=str(host_home), python="/no/such"
-            )
-        )
+    register_host(
+        name="local", kind="local", gpus=[GPU], gpuc_home=str(host_home), python="/no/such"
+    )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.2)
     polls = stub_wait_sleep(monkeypatch)
 
@@ -331,17 +325,14 @@ def test_wait_reads_the_outcome_from_the_mirror_when_the_host_has_gone(
     # The index `gpuc submit` writes here: the mirrored state.json has no name
     # (that lives in the spec), so this is where the line's label comes from.
     LocalIndex().record(IndexEntry(job_id=JOB, host="local", name="lego-s4", s3_prefix=prefix))
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name="local",
-                kind="local",
-                gpus=[GPU],
-                gpuc_home=str(host_home),
-                python="/no/such",
-                s3_prefix=prefix,
-            )
-        )
+    register_host(
+        name="local",
+        kind="local",
+        gpus=[GPU],
+        gpuc_home=str(host_home),
+        python="/no/such",
+        s3_prefix=prefix,
+    )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
     stub_wait_sleep(monkeypatch)
 
@@ -359,12 +350,9 @@ def test_wait_reads_a_terminated_rental_from_the_mirror_without_waiting_out_the_
     five-minute grace for an ssh blip would only be five minutes of nothing:
     the mirror is read on the first poll that fails."""
     prefix = mirror(monkeypatch, "gpuc-pod")
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name="gpuc-pod", kind="rental", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=prefix
-            )
-        )
+    register_host(
+        name="gpuc-pod", kind="rental", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=prefix
+    )
     ended = Pod(id="pod-1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
     monkeypatch.setitem(
         PROVIDERS,
@@ -397,17 +385,14 @@ def test_the_mirror_still_shouts_when_a_dead_host_lost_the_outputs(
     """
     put_job(host_home)
     prefix = mirror(monkeypatch, "local", outputs_lost=True)
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name="local",
-                kind="local",
-                gpus=[GPU],
-                gpuc_home=str(host_home),
-                python="/no/such",
-                s3_prefix=prefix,
-            )
-        )
+    register_host(
+        name="local",
+        kind="local",
+        gpus=[GPU],
+        gpuc_home=str(host_home),
+        python="/no/such",
+        s3_prefix=prefix,
+    )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
     stub_wait_sleep(monkeypatch)
 
@@ -451,12 +436,9 @@ def test_wait_json_carries_the_error_and_where_the_answer_came_from(
 ) -> None:
     """`status` alone cannot say "we never found out"; `error` is the key to check."""
     put_job(host_home)
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name="local", kind="local", gpus=[GPU], gpuc_home=str(host_home), python="/no/such"
-            )
-        )
+    register_host(
+        name="local", kind="local", gpus=[GPU], gpuc_home=str(host_home), python="/no/such"
+    )
     monkeypatch.setattr(wait_mod, "TROUBLE_GRACE_S", 0.0)
     stub_wait_sleep(monkeypatch)
 

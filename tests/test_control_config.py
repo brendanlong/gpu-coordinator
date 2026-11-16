@@ -26,7 +26,7 @@ from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.transport import LocalTransport, SshTransport
 from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import HostConfig
-from tests.conftest import SEEN_AT, host_entry, load_registry
+from tests.conftest import SEEN_AT, host_entry, load_registry, register_host
 
 
 def test_settings_read_the_xdg_overridden_config(control_env: Path) -> None:
@@ -55,8 +55,7 @@ def test_registry_round_trips(control_env: Path) -> None:
 
 
 def test_unknown_host_error_lists_the_known_ones(control_env: Path) -> None:
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="local"))
+    register_host(name="local")
     with pytest.raises(ConfigError) as exc:
         load_registry().require("gpubox")
     assert "Known hosts: local" in str(exc.value)

@@ -173,10 +173,10 @@ def register_host(*, gpus: str | list[str] | None = None, **fields: Any) -> Host
     return entry
 
 
-def _gpus(gpus: str | list[str] | None) -> list[str]:
+def _gpus(gpus: str | list[str] | None) -> list[str] | None:
     if isinstance(gpus, str):
         return [part for part in gpus.split(",") if part]
-    return list(gpus or [])
+    return None if gpus is None else list(gpus)
 
 
 def git_commit(root: Path, *paths: str) -> Path:

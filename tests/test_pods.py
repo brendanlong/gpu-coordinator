@@ -10,26 +10,23 @@ import pytest
 from gpuc.control import pods as pods_mod
 from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import main
-from gpuc.control.config import Settings, registry_transaction
+from gpuc.control.config import Settings
 from gpuc.control.exits import EXIT_OK
 from gpuc.control.status import CardView, HostState, HostView, render
-from tests.conftest import host_entry, load_registry
+from tests.conftest import host_entry, load_registry, register_host
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
 FOREIGN = "other-someone-else"
 
 
 def _register(pod_name: str, pod_id: str) -> None:
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name=pod_name,
-                kind="rental",
-                pod_id=pod_id,
-                ssh="root@1.2.3.4",
-                python="/root/python",
-            )
-        )
+    register_host(
+        name=pod_name,
+        kind="rental",
+        pod_id=pod_id,
+        ssh="root@1.2.3.4",
+        python="/root/python",
+    )
 
 
 @pytest.fixture

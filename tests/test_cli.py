@@ -2694,16 +2694,13 @@ def test_host_bootstrap_all_carries_on_past_a_host_that_fails(
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
     register_host(name="zbox", kind="ssh", ssh="me@zbox")
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name="pod",
-                kind="rental",
-                ssh="root@1.2.3.4",
-                pod_id="p1",
-                bootstrapped_at=None,
-            )
-        )
+    register_host(
+        name="pod",
+        kind="rental",
+        ssh="root@1.2.3.4",
+        pod_id="p1",
+        bootstrapped_at=None,
+    )
     attempted = bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     capsys.readouterr()
 
@@ -2725,8 +2722,7 @@ def test_host_bootstrap_all_forgets_a_rental_the_provider_no_longer_has(
     from gpuc.control.bootstrap import BootstrapError
 
     register_host(name="gpubox", kind="ssh", ssh="me@box")
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
+    register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider())
     capsys.readouterr()
@@ -2744,8 +2740,7 @@ def test_host_bootstrap_all_forgets_a_terminated_rental_too(
     """The case #68 describes: the pod is still in the account, TERMINATED."""
     from gpuc.control.bootstrap import BootstrapError
 
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
+    register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
     terminated = Pod(id="p1", name="gpuc-pod", status="TERMINATED", cost_usd_hr=0.0)
     monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider(existing=[terminated]))
@@ -2763,8 +2758,7 @@ def test_host_bootstrap_all_keeps_a_rental_the_provider_cannot_be_asked_about(
     from gpuc.control.bootstrap import BootstrapError
     from gpuc.control.providers.base import ProviderError
 
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1"))
+    register_host(name="pod", kind="rental", ssh="root@1.2.3.4", pod_id="p1")
     bootstrapping(monkeypatch, fail={"pod": BootstrapError("ssh to pod failed")})
 
     def unavailable(*a: object, **k: object) -> object:
