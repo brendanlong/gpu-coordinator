@@ -732,21 +732,6 @@ def test_host_quote_refuses_a_floor_the_provider_cannot_search_by(
     assert "--min-inet-down" in capsys.readouterr().err
 
 
-def test_submit_and_requeue_runpod_say_where_renting_went(
-    control_env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\n')
-    for argv in (
-        ["submit", str(job), "--runpod", "--gpu", "A40"],
-        ["requeue", "job-1", "--gpu", "A40", "--runpod"],
-    ):
-        with pytest.raises(SystemExit) as exited:
-            main(argv)
-        assert exited.value.code == EXIT_USAGE
-        assert "gpuc host rent" in capsys.readouterr().err
-
-
 def test_pods_lists_ours_and_counts_the_others(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1383,7 +1383,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_no_git_flag(submit)
     add_bootstrap_flag(submit)
-    add_moved_runpod_flag(submit)
     add_json_flag(submit)
     submit.set_defaults(func=cmd_submit)
 
@@ -1648,7 +1647,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_no_git_flag(requeue)
     add_bootstrap_flag(requeue)
-    add_moved_runpod_flag(requeue)
     add_json_flag(requeue)
     requeue.set_defaults(func=cmd_requeue)
 
@@ -1769,19 +1767,6 @@ def _at_least_one(raw: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
     return value
-
-
-class _RunpodMoved(argparse.Action):
-    def __call__(self, parser: argparse.ArgumentParser, *_: object) -> None:
-        parser.error(
-            "--runpod is gone: rent with `gpuc host rent --provider runpod --gpu <name> ...`, "
-            "then submit with --host and the name it prints"
-        )
-
-
-def add_moved_runpod_flag(parser: argparse.ArgumentParser) -> None:
-    """Where `--runpod` went, for the command lines and scripts that still say it."""
-    parser.add_argument("--runpod", nargs=0, action=_RunpodMoved, help=argparse.SUPPRESS)
 
 
 def add_rent_flags(parser: argparse.ArgumentParser) -> None:
