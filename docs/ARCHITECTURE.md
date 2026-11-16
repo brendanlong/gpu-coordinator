@@ -824,8 +824,8 @@ and nowhere else, so one box driven from two machines has one configuration.
    failures are warnings, except that a host registered with an `s3_prefix`
    whose `aws` could not be installed fails bootstrap outright. A rental with
    an `s3_prefix` is also given `~/.aws/credentials` (0600, from stdin) out of
-   the bootstrapping shell's `AWS_*` (see Narrowed AWS keys); a shared box's
-   `~/.aws` is never touched.
+   the bootstrapping shell's `AWS_*`, again on every submit (see Narrowed AWS
+   keys); a shared box's `~/.aws` is never touched.
 3. **Never rewrite `~/.gpuc/config.json`.** The host owns it, so bootstrap reads
    it and merges back only what it derived (`remote.write_config`): the commit
    just shipped, and the managed env keys the host names none of. The one
@@ -1047,7 +1047,7 @@ the same submit path as every other host.
    `Provider.terminate_confirmed`; a terminate it could not confirm is
    reported loudly and leaves the registry entry in place.
    **A create that fails is not proof nothing was bought.** Only the
-   provider refusing it (`CreateRefused`, a 4xx) goes straight
+   provider refusing it (`CreateRefused`, a 4xx other than 429) goes straight
    to the next offer. Any other failure, a timeout, a 5xx, an unparseable
    answer or a Ctrl-C, looks for a pod under the attempt's unique name for
    a short while, and terminates what it finds before anything else is
