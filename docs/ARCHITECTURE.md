@@ -907,6 +907,13 @@ dropped.
 
 What every provider holds to, whatever its API looks like:
 
+- **A rental is ours by its name.** Every pod is created named with the
+  `runpod_pod_prefix` setting (default `gpuc-`), as RunPod's `name` or
+  Vast's `label`, and `list_ours` is the pods whose name has that prefix.
+  Nothing is ever done to a pod without it, and clients that share a
+  prefix recognise each other's rentals.
+- **Only on-demand machines are rented**, never spot or interruptible ones
+  (Vast: on-demand, verified, rentable offers only).
 - **No secret in a pod's environment.** A provider returns a pod's env to
   anyone holding an account key; secrets go over ssh into 0600 files.
 - **The account's ssh keys are merged into, never replaced:** the user's

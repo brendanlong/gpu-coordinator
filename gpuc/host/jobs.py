@@ -618,6 +618,15 @@ class JobState:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def file_document(self) -> dict[str, Any]:
+        """What state.json holds: `to_dict`, plus `live_max_runtime`.
+
+        Written, never read: a runner adopted across an upgrade still runs
+        the build before this one, which takes `max_runtime_min` as the limit
+        only when this says so, and falls back to the spec's otherwise. Drop
+        it once no such runner can still be alive (#160)."""
+        return {**self.to_dict(), "live_max_runtime": True}
+
     @property
     def finished(self) -> bool:
         return self.status in FINISHED_STATUSES
@@ -781,7 +790,7 @@ def read_spec(job_id: str) -> JobSpec:
 
 
 def write_state(job_id: str, state: JobState) -> None:
-    atomic_write_json(paths.state_file(job_id), state.to_dict())
+    atomic_write_json(paths.state_file(job_id), state.file_document())
 
 
 def read_state(job_id: str) -> JobState:

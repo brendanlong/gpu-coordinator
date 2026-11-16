@@ -414,11 +414,10 @@ def test_control_socket_dir_falls_back_to_a_per_uid_tmp_dir(
     assert transport.control_socket_dir() == Path(f"/tmp/gpuc-{os.getuid()}")
 
 
-def test_the_control_socket_dir_is_0700(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    ssh = SshTransport(host="h", target="u@h", control_dir=transport.control_socket_dir())
-    ssh._prepare()
-    assert stat.S_IMODE((tmp_path / "gpuc").stat().st_mode) == 0o700
+def test_building_an_ssh_command_makes_the_control_socket_dir_0700() -> None:
+    shutil.rmtree(SHORT_CONTROL_DIR, ignore_errors=True)
+    SshTransport(host="h", target="u@h", control_dir=SHORT_CONTROL_DIR).argv("true")
+    assert stat.S_IMODE(SHORT_CONTROL_DIR.stat().st_mode) == 0o700
 
 
 def test_a_control_path_that_would_overrun_sun_path_fails_before_ssh_runs() -> None:

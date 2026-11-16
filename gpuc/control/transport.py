@@ -244,6 +244,9 @@ class SshTransport:
     known_hosts: Path | None = None
 
     def ssh_options(self) -> list[str]:
+        # Here, not in each caller: every ssh this builds needs the socket
+        # directory and the known_hosts file to exist, `gpuc ssh` included.
+        self._prepare()
         options = [
             "-o",
             "BatchMode=yes",
@@ -308,7 +311,6 @@ class SshTransport:
     def run(
         self, command: str, *, timeout: float = DEFAULT_TIMEOUT_S, check: bool = True
     ) -> CommandResult:
-        self._prepare()
         return _execute(self.host, self.argv(command), timeout=timeout, check=check)
 
     def put_file_argv(self, remote_path: str, mode: int = 0o600) -> list[str]:
@@ -325,7 +327,6 @@ class SshTransport:
         )
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
-        self._prepare()
         data = content.encode() if isinstance(content, str) else content
         # Content goes over stdin: secrets must never appear in argv, where any
         # other user on the box can read them out of /proc.
@@ -347,7 +348,6 @@ class SshTransport:
         files: Sequence[str] | None = None,
         excludes: Sequence[str] = (),
     ) -> CommandResult:
-        self._prepare()
         argv = rsync_argv(
             local_root,
             f"{self.target}:{remote_path}",
@@ -358,7 +358,6 @@ class SshTransport:
         return _execute(self.host, argv, timeout=3600.0, check=True, stdin=_files_stdin(files))
 
     def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
-        self._prepare()
         argv = pull_argv(f"{self.target}:{remote_root}", local_root, self.rsync_ssh_command())
         return _execute(
             self.host, argv, timeout=PULL_TIMEOUT_S, check=True, stdin=_files_stdin(files)
