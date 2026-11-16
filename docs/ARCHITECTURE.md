@@ -10,73 +10,17 @@ that function's docstring and is not repeated here.
 
 ## Package layout
 
-One uv project, Python >= 3.11, package `gpuc`, CLI entry point `gpuc`.
+One uv project, Python >= 3.11, package `gpuc`, CLI entry point `gpuc`, in
+two halves that share only `gpuc/_version.py` (stdlib only):
 
-```
-gpuc/
-  _version.py    # __version__ and user_agent(); STDLIB ONLY, imported by both halves
-  host/          # runs ON hosts. STDLIB ONLY: `python -m gpuc.host <cmd>` with a bare interpreter
-    __main__.py    # the on-host CLI the control side drives over ssh
-    paths.py       # the ~/.gpuc layout
-    jobs.py        # job ids, HostConfig/JobSpec/JobState, the per-job lock, tolerant readers, atomic writes
-    queue.py       # accept a job, list the queue, claim, cancel, preempt, the next attempt of a preempted or restarted job
-    plan.py        # the dispatch rule, pure: what a pass does with each queued job, and when each will start
-    settable.py    # `gpuc set`: the one table of settable fields, their checks, and applying a patch
-    dispatcher.py  # lock+heartbeat, act on the plan, launch runners, escalate stops, idle terminate
-    runner.py      # one job: env, CUDA_VISIBLE_DEVICES, preflights, wall-clock limit, sync, exit code
-    scope.py       # systemd --user scope probe/wrap/stop; the cgroup kill path
-    procs.py       # process facts, and JobProcesses: the one object every stop goes through
-    destinations.py # where files go: one Destination per store (S3, Hugging Face); upload, put_file, preflight
-    preflight.py   # sync preflight: prove every destination can be written before the job runs
-    baseline.py    # what was already under `outputs:` before the job started
-    checkout.py    # a host with scratch: archive the checkout at enqueue, unpack it before a run
-    cleanup.py     # `cleanup:` policy, workdir sizing, the `clean`/`purge` sweeps
-    gpus.py        # the one nvidia-smi table parser and the one index/UUID resolver (`resolve`); utilization sampling
-    progress.py    # the optional `progress_command`: run it, read a percentage off it
-    sync.py        # periodic upload loop, recording each destination's result in the job's state
-    health.py      # host preflight: driver, owned GPUs, disk, uv cache placement, the one network throughput test
-    storage.py     # the data directory and the HF cache: `host clean --data` and `--hf-cache`
-    fetch.py       # which workdir files `gpuc fetch` copies
-    terminate.py   # self-terminate via provider API (urllib), key from the pod's own environment
-    owner.py       # owner.json: which machine serves this queue, and noticing it was replaced
-  control/       # runs on the local machine; may use third-party deps
-    cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
-    actions.py     # one function per command returning its Answer (document + text + what failed); the CLI and the web call these
-    exits.py       # the exit codes, and the one table that maps them onto HTTP statuses
-    hosts.py       # the actions of `host add`, `host set`, `host rent`, `host quote` and `host bootstrap`
-    submitting.py  # the actions of `submit` and `requeue`: look up the host, re-ship, enqueue
-    status.py      # gather a host's status, render it, project queue start times
-    wait.py        # the poll `gpuc wait` and `gpuc logs -f` block on until a job ends
-    submit.py      # validate a spec, sync the workdir, deliver secrets, enqueue
-    awskeys.py     # the AWS keys a host is given: narrowed by STS unless this machine trusts it
-    provision.py   # `host rent`: matching rentals, offers, create, wait for ssh, bootstrap
-    teardown.py    # `host terminate`: end a rental on purpose, and forget it here
-    rented.py      # a pod is its own record: the `provider` block in its config.json
-    pods.py        # `gpuc pods`
-    config.py      # ~/.local/share/gpu-coordinator/ layout, Settings, the hosts registry
-    tolerant.py    # the pydantic base every shared-state model reads through
-    connect.py     # `host add` / `host set`: read or write the host's own config.json
-    bootstrap.py   # install uv + this package on a host, run host health, start the dispatcher; `ensure_build` ships
-    probe.py       # `host probe`: what a host has, before bootstrap
-    remote.py      # HostSession (opened on a fresh read of config.json) and `ask`: the one way to ask a host
-    transport.py   # LocalTransport / SshTransport: run, rsync, pull, put_file(0600), tail
-    ssh.py         # `gpuc ssh`: the interactive form of the transport
-    clean.py       # `gpuc clean` / `gpuc host clean` over the transport
-    fetch.py       # `gpuc fetch`: ask each host for its jobs' files, pull them here
-    s3index.py     # the S3 mirror of specs and the job index, and the local index
-    gpuinfo.py     # per-GPU name/VRAM for the registry and every listing, over the host's own table and resolver
-    version.py     # this build's commit, and comparing it with a host's
-    jsonout.py     # the `--json` rules
-    skill.py       # `gpuc skill`: the agent guide, from the wheel or the checkout
-    web/           # `gpuc web`: stdlib http.server, bcrypt login, a static page over the same documents
-    providers/
-      base.py      # Provider interface: offers(constraints), create, get, logs, terminate, list
-      runpod.py    # v2 REST implementation
-      vast.py      # Vast.ai REST implementation
-snakemake_executor_plugin_gpuc/  # `snakemake --executor gpuc`; a second top-level package in the wheel
-skills/gpuc/SKILL.md  # the agent guide; force-included in the wheel as gpuc/SKILL.md
-tests/
-```
+- `gpuc/host/` runs on hosts, as `python -m gpuc.host <cmd>`, and imports
+  nothing outside the standard library.
+- `gpuc/control/` runs on the client and may use third-party dependencies.
+  Every command is one function in `actions.py` returning its `Answer`; the
+  CLI (`cli.py`) and the web app (`web/`) both call those, and nothing else.
+
+The wheel also carries `snakemake_executor_plugin_gpuc/`, a second top-level
+package, and the agent guide `skills/gpuc/SKILL.md` as `gpuc/SKILL.md`.
 
 `gpuc.host` must be importable and runnable with a bare interpreter: the
 bootstrap rsyncs the package to the host and runs it with the uv-managed
@@ -961,49 +905,28 @@ search's offers and a registered rental's recorded one alike; a floor a
 provider cannot search by (`Provider.filters`) is a usage error, never
 dropped.
 
-### RunPod (v2 REST, `https://api.runpod.io/v2`, bearer `RUNPOD_API_KEY`)
+What every provider holds to, whatever its API looks like:
 
-- `offers(constraints)`: `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=<tier>&minCudaVersion=<x>`
-  once per requested tier, `<x>` being the one CUDA floor the create also gets
-  (`DEFAULT_CUDA_MIN` unless `--cuda-min`); filter by name list / max price /
-  availability != NONE and at least one `cudaVersions[].available`; sort by
-  price. Pass GPU ids exactly as the catalog returns them.
-- `create(offer)`: `POST /pods` with `name="gpuc-<host>"`, `image`, `gpu.id`,
-  `gpu.minCudaVersion`, `cloud`, `disk`, `ports: ["22/tcp"]`,
-  `startSsh: true`, `env: {"HF_HUB_ENABLE_HF_TRANSFER": "0"}`. Before the
-  first create ever, ensure the local public key is in
-  `PUT /account/ssh-keys` (merge, do not replace others). One capacity
-  error -> next offer. Never set secrets in `env`.
-- `get(id)`: status, `cudaVersion`, `cost`, `runtime.gpus[].util`,
-  `ssh.direct`. `logs(id)`: `GET /pods/{id}/logs` (SSE; read with urllib
-  and a timeout). `terminate(id)`: `POST /pods/{id}/action {"action":"terminate"}`
-  then poll `get` until `TERMINATED` or 404. `list()`:
-  `GET /pods?includeClusterPods=true`.
-
-### Vast.ai (REST, `https://console.vast.ai/api/v0`, bearer `VAST_API_KEY`)
-
-- `offers(constraints)`: one `POST /bundles/` for on-demand, verified,
-  rentable machines with `num_gpus` equal to the count, `direct_port_count >= 1`
-  (rsync cannot use Vast's ssh proxy), `disk_space >= disk`, `cuda_max_good >=`
-  the floor, `dph_total <=` the cap and each floor (`gpu_ram` in MB). GPU names
-  are *not* searched: Vast matches only its own spelling, so every offer comes
-  back (~600 for one GPU) and names are matched by `offer_satisfies`. An offer
-  is one machine; its `id` is `Offer.offer_id`.
-- `create(offer)`: `PUT /asks/{offer_id}/` with `image`, `disk`, `label`
-  (the pod name), `runtype: "ssh_direct"`, `cancel_unavail: true`. A 4xx is
-  `CreateRefused` (an offer someone else took is 404/410). The account's ssh
-  keys (`GET`/`POST /ssh/`) go into every instance.
-- `get(id)`: `GET /instances/{id}/`, `{"instances": null}` or 404 once gone.
-  Status is `actual_status` (`created` before there is one), or `destroyed`
-  once `cur_state` is `unloaded`. Running: `running`; dead: `exited`,
-  `stopped`, `offline`, `destroyed`; gone: `destroyed`. The ssh door is
-  `public_ipaddr` and `ports["22/tcp"][0].HostPort`, as root.
-- `terminate(id)`: `DELETE /instances/{id}/` (destroy: a stopped instance
-  bills for its disk). `logs(id)`: `PUT /instances/request_logs/{id}/` names a
-  URL the log appears at a moment later. `list()`: `GET /instances/`.
-- The instance ends itself with the per-instance `CONTAINER_API_KEY`, which can
-  destroy only that instance, and `CONTAINER_ID`: set on the container, so read
-  from `/proc/1/environ`, since an ssh session does not inherit them.
+- **No secret in a pod's environment.** A provider returns a pod's env to
+  anyone holding an account key; secrets go over ssh into 0600 files.
+- **The account's ssh keys are merged into, never replaced:** the user's
+  other machines are on them too.
+- **A rental must be reachable by direct ssh**, since rsync cannot go
+  through a provider's ssh proxy: RunPod pods get `ports: ["22/tcp"]`, and
+  a Vast offer must have `direct_port_count >= 1`.
+- **Ending a rental destroys it.** A stopped Vast instance still bills for
+  its disk; a terminate is confirmed by polling until the pod is gone.
+- **The pod ends itself with a key scoped to it**, found in the pod's own
+  environment, never one the client sends: RunPod's `RUNPOD_API_KEY` and
+  `RUNPOD_POD_ID` from `/etc/rp_environment`, Vast's `CONTAINER_API_KEY`
+  and `CONTAINER_ID` from `/proc/1/environ`, since an ssh session inherits
+  neither.
+- **The CUDA floor a search filters on is the one the create asks for**,
+  where the provider takes one (RunPod's `minCudaVersion`); Vast filters on
+  `cuda_max_good`.
+- **GPU names are matched by `offer_satisfies`**, not by the provider's
+  search, where the provider only knows its own spelling (Vast); RunPod's
+  GPU ids are passed back exactly as its catalog returned them.
 
 ## Provisioning flow (`gpuc host rent`)
 
