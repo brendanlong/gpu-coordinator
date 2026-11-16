@@ -43,7 +43,6 @@ __all__ = [
     "recently_modified",
     "run_command",
     "sync_job_meta",
-    "sync_output",
     "sync_outputs",
 ]
 
@@ -105,10 +104,11 @@ def mirror_for(job_id: str, s3_prefix: str | None) -> destinations.S3 | None:
     return destinations.S3(f"{s3_prefix.rstrip('/')}/jobs/{job_id}")
 
 
-def sync_output(
+def _sync_output(
     output: Output,
     workdir: Path,
     job_id: str,
+    entries: baseline.Entries,
     *,
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
@@ -123,7 +123,6 @@ def sync_output(
     writes its first checkpoint an hour in has not failed anything.
     """
     local = workdir / output.path.format(job_id=job_id)
-    entries = baseline.read(job_id).get(baseline.output_key(output, job_id), {})
     # Files that were in the checkout and have not been touched are not this
     # job's output; uploading them would publish the last run's results under
     # this run's name.
@@ -176,12 +175,14 @@ def sync_outputs(
     record_missing: bool = True,
 ) -> None:
     errors: list[SyncError] = []
+    entries = baseline.read(job_id)
     for output in outputs:
         try:
-            sync_output(
+            _sync_output(
                 output,
                 workdir,
                 job_id,
+                entries.get(baseline.output_key(output, job_id), {}),
                 min_age_s=min_age_s,
                 runner=runner,
                 timeout=timeout,

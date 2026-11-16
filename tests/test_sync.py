@@ -69,8 +69,8 @@ def test_final_sync_includes_the_files_just_written(gpuc_home: Path, fake_aws: s
     (workdir / "out").mkdir(parents=True)
     (workdir / "out" / "ckpt.pt").write_text("done")
     runner = RecordingRunner()
-    sync.sync_output(
-        Output(path="out", s3="s3://bucket/prefix"), workdir, job_id, min_age_s=0.0, runner=runner
+    sync.sync_outputs(
+        [Output(path="out", s3="s3://bucket/prefix")], workdir, job_id, min_age_s=0.0, runner=runner
     )
     assert "--exclude" not in runner.calls[0]
 
@@ -83,7 +83,7 @@ def test_a_periodic_sync_output_excludes_files_still_being_written(
     (workdir / "out").mkdir(parents=True)
     (workdir / "out" / "ckpt.pt").write_text("half-written")
     runner = RecordingRunner()
-    sync.sync_output(Output(path="out", s3="s3://b/o"), workdir, job_id, runner=runner)
+    sync.sync_outputs([Output(path="out", s3="s3://b/o")], workdir, job_id, runner=runner)
     argv = runner.calls[0]
     assert argv[argv.index("--exclude") + 1] == "ckpt.pt"
 
@@ -121,7 +121,7 @@ def test_job_id_is_expanded_in_destinations(gpuc_home: Path, fake_aws: str) -> N
     (workdir / "results").mkdir(parents=True)
     runner = RecordingRunner()
     output = Output(path="results", s3="s3://b/exp/{job_id}/results")
-    sync.sync_output(output, workdir, job_id, runner=runner)
+    sync.sync_outputs([output], workdir, job_id, runner=runner)
     assert runner.calls[0][4] == f"s3://b/exp/{job_id}/results"
 
 
@@ -131,7 +131,7 @@ def test_hf_upload_argv(gpuc_home: Path, fake_aws: str) -> None:
     (workdir / "ckpt").mkdir(parents=True)
     runner = RecordingRunner()
     output = Output(path="ckpt", hf="org/repo", hf_path="{job_id}/ckpt")
-    sync.sync_output(output, workdir, job_id, min_age_s=0.0, runner=runner)
+    sync.sync_outputs([output], workdir, job_id, min_age_s=0.0, runner=runner)
     assert runner.calls[0] == [
         "/fake/hf",
         "upload",
@@ -219,7 +219,7 @@ def test_each_destination_of_an_output_gets_its_own_record(gpuc_home: Path, fake
     workdir = paths.workdir(job_id)
     (workdir / "ckpt").mkdir(parents=True)
     output = Output(path="ckpt", s3="s3://b/{job_id}", hf="org/repo")
-    sync.sync_output(output, workdir, job_id, runner=RecordingRunner())
+    sync.sync_outputs([output], workdir, job_id, runner=RecordingRunner())
     records = jobs.read_state(job_id).output_uploads()
     assert sorted((u.output, u.to) for u in records) == [
         ("ckpt", f"hf://org/repo/{job_id}"),
@@ -238,7 +238,7 @@ def test_a_failure_at_one_destination_is_recorded_there_and_success_elsewhere(
     (workdir / "ckpt").mkdir(parents=True)
     output = Output(path="ckpt", s3="s3://b/{job_id}", hf="org/repo")
     with pytest.raises(sync.SyncError, match="AccessDenied"):
-        sync.sync_output(output, workdir, job_id, runner=FailingAt("org/repo"))
+        sync.sync_outputs([output], workdir, job_id, runner=FailingAt("org/repo"))
     state = jobs.read_state(job_id)
     by_uri = {u.to: u for u in state.output_uploads()}
     s3, hf = by_uri[f"s3://b/{job_id}"], by_uri[f"hf://org/repo/{job_id}"]
@@ -255,13 +255,13 @@ def test_a_later_success_clears_the_error_and_a_later_failure_keeps_ok_at(
     workdir = paths.workdir(job_id)
     (workdir / "ckpt").mkdir(parents=True)
     output = Output(path="ckpt", s3="s3://b/o")
-    sync.sync_output(output, workdir, job_id, runner=RecordingRunner())
+    sync.sync_outputs([output], workdir, job_id, runner=RecordingRunner())
     (first,) = jobs.read_state(job_id).output_uploads()
     with pytest.raises(sync.SyncError):
-        sync.sync_output(output, workdir, job_id, runner=RecordingRunner(returncode=1))
+        sync.sync_outputs([output], workdir, job_id, runner=RecordingRunner(returncode=1))
     (failed,) = jobs.read_state(job_id).output_uploads()
     assert failed.ok_at == first.ok_at and failed.error
-    sync.sync_output(output, workdir, job_id, runner=RecordingRunner())
+    sync.sync_outputs([output], workdir, job_id, runner=RecordingRunner())
     (healed,) = jobs.read_state(job_id).output_uploads()
     assert healed.ok_at and healed.error is None
 
@@ -327,7 +327,7 @@ def test_the_exclude_list_is_capped_instead_of_building_a_huge_argv(
     runner = RecordingRunner()
     output = Output(path="outputs", s3="s3://b/p")
     with pytest.raises(sync.TooManyRecentFiles, match="skipping this sync tick"):
-        sync.sync_output(output, paths.workdir(job_id), job_id, runner=runner)
+        sync.sync_outputs([output], paths.workdir(job_id), job_id, runner=runner)
     assert runner.calls == []
 
 

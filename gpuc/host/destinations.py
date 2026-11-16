@@ -39,7 +39,7 @@ class SyncError(RuntimeError):
 class MissingOutput(SyncError):
     """The output path the spec names is not there. Not the same failure as a
     broken upload: nothing was produced, so `sync` would be a misleading
-    reason. Raised by `sync.sync_output`, the one place that looks."""
+    reason. Raised by `sync.sync_outputs`, the one place that looks."""
 
 
 class PreflightFailed(RuntimeError):
