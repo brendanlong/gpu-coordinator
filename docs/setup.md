@@ -73,10 +73,9 @@ gpuc submit job.yaml --host <the name it printed>
 ```
 
 Your `ssh_key`'s public half is added to the provider account the first time.
-Vast.ai is cheaper and its machines vary more; see
-[usage.md](usage.md#rentals) for the floors that keep the slow ones out.
-Choosing GPUs, renting more than one and ending a pod early are in
-[usage.md](usage.md#rentals).
+Vast.ai is cheaper and its machines vary more. Choosing GPUs, the floors that
+keep slow Vast machines out, renting more than one and ending a pod early are
+in [usage.md](usage.md#rentals).
 
 To drive a pod that another of your machines rented: `gpuc pods` lists them,
 and `gpuc host add <name> --pod <pod-id>` adopts one.

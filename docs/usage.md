@@ -191,7 +191,7 @@ gpuc host rent --provider vast --gpu "RTX 4090" --max-price 0.50 \
 
 `--min-inet-up`, `--min-disk-bw` and `--min-tflops` are the others. A machine
 that passes them still has to pass the health check before anything runs on
-it, and one that fails is ended and the next offer tried.
+it.
 
 Rent at least as many cards as the job's `gpus:`. If a pod fails to come up
 it is terminated and the next offer tried, for up to 15 minutes.
@@ -212,11 +212,9 @@ Nothing on your machine needs to stay running. A rental's disk goes with it,
 so give every output an `s3` or `hf` destination and set `s3_bucket` so its
 logs outlive it.
 
-A rental's jobs, on one you rent, get AWS keys that can only read and write their own outputs
-and logs, for 36 hours from submit, instead of yours
-([setup.md](setup.md#credentials-for-jobs)). A job that uses its keys for
-anything else, or runs longer than that, needs a rental rented with
-`--trusted`, which gets your keys as they are.
+A rental you rent gives its jobs narrowed, 36-hour AWS keys instead of yours
+([setup.md](setup.md#credentials-for-jobs)); rent with `--trusted` if a job
+needs more.
 
 ```sh
 gpuc pods                            # every gpuc pod at every provider, with its cost
@@ -234,8 +232,8 @@ A finished job's directory holds its checkout and whatever it built there
 (usually a virtualenv). Its log and state are kept; the rest is deleted:
 
 - when the job succeeds (`cleanup: on_success`, the default),
-- or a day after it ends, whatever happened (unless `cleanup: never`) (`gpuc host set <host>
-  --workdir-days N` to change that),
+- or a day after it ends, whatever happened, unless `cleanup: never`
+  (`--workdir-days` on `gpuc host set` changes the day),
 
 but never while outputs are waiting to upload, and never outputs that are kept
 on the host. To clean up by hand:

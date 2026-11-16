@@ -72,6 +72,7 @@ gpuc/
     providers/
       base.py      # Provider interface: offers(constraints), create, get, logs, terminate, list
       runpod.py    # v2 REST implementation
+      vast.py      # Vast.ai REST implementation
 snakemake_executor_plugin_gpuc/  # `snakemake --executor gpuc`; a second top-level package in the wheel
 skills/gpuc/SKILL.md  # the agent guide; force-included in the wheel as gpuc/SKILL.md
 tests/
@@ -90,7 +91,7 @@ queue.
 ## User agent
 
 One string, `gpuc/_version.py:user_agent()`, on every outbound request from
-either half: the RunPod API, a pod's self-terminate, the health check's
+either half: the provider APIs, a pod's self-terminate, the health check's
 download, bootstrap's `curl`, every control-side boto3 client, and
 `HF_HUB_USER_AGENT_ORIGIN` in each job's environment. `gpuc._version` must
 stay stdlib-only and bootstrap must ship it. The `aws` CLI on a host cannot
@@ -104,7 +105,7 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": null | ["
                      #                              # (null: every unshared card); see GPU ownership
                      #  "shared_gpus": ["<index>" | "GPU-uuid", ...],  # cards it may borrow while
                      #                              # nobody else is on them; see Shared GPUs
-                     #  "provider": null | {"kind":"runpod","pod_id":..},
+                     #  "provider": null | {"kind": "runpod" | "vast", "pod_id", "offer", "created_at"},
                      #  "idle_minutes": 15, "s3_prefix": "s3://bucket/gpuc/<host>",
                      #  "retention_days": null | N,   # auto-purge horizon; null never purges
                      #  "workdir_days": null | N,     # auto workdir sweep horizon; see Retention
@@ -754,9 +755,10 @@ asked with its reason at once and never from the mirror.
 
 ## Transport
 
-`LocalTransport` runs subprocesses directly. Both expose the same protocol,
-including `argv(command)` and `interactive_argv(command)`, so nothing above
-them asks which kind it holds. `SshTransport` uses the system `ssh`/`rsync`
+`LocalTransport` runs subprocesses directly and `SshTransport` over ssh. Both
+expose the same protocol, including `argv(command)` and
+`interactive_argv(command)`, so nothing above them asks which kind it holds.
+`SshTransport` uses the system `ssh`/`rsync`
 with `-o BatchMode=yes -o ConnectTimeout=15`, per-command timeouts, and host
 keys pinned on first contact into `~/.local/share/gpu-coordinator/known_hosts`,
 except for ephemeral hosts, which get `known_hosts.d/<pod>`.
@@ -779,7 +781,7 @@ index so it carries untracked files and never touches the user's staging.
 `hosts.json` holds two kinds of thing about a host and only two:
 
 - the **address**: `name`, `ssh`, `port`, `gpuc_home` / `persistent_root`,
-  `rental`, hand-entered, local to this machine, and everything needed to open
+  `rental`, and `trusted` (see Narrowed AWS keys), hand-entered, local to this machine, and everything needed to open
   a session and find `config.json`. Nothing in it is a fact about how the host
   behaves. A host is a rental exactly when it has a `rental: {provider,
   pod_id}`; `kind` (`local`, `ssh`, `rental`) is derived from the address and
@@ -822,9 +824,8 @@ and nowhere else, so one box driven from two machines has one configuration.
    failures are warnings, except that a host registered with an `s3_prefix`
    whose `aws` could not be installed fails bootstrap outright. A rental with
    an `s3_prefix` is also given `~/.aws/credentials` (0600, from stdin) out of
-   the bootstrapping shell's `AWS_*`, narrowed unless it is trusted (see
-   Narrowed AWS keys), and again on every submit; a shared box's `~/.aws` is
-   never touched.
+   the bootstrapping shell's `AWS_*` (see Narrowed AWS keys); a shared box's
+   `~/.aws` is never touched.
 3. **Never rewrite `~/.gpuc/config.json`.** The host owns it, so bootstrap reads
    it and merges back only what it derived (`remote.write_config`): the commit
    just shipped, and the managed env keys the host names none of. The one
@@ -1046,7 +1047,7 @@ the same submit path as every other host.
    `Provider.terminate_confirmed`; a terminate it could not confirm is
    reported loudly and leaves the registry entry in place.
    **A create that fails is not proof nothing was bought.** Only the
-   provider refusing it (`CreateRefused`, a 4xx for RunPod) goes straight
+   provider refusing it (`CreateRefused`, a 4xx) goes straight
    to the next offer. Any other failure, a timeout, a 5xx, an unparseable
    answer or a Ctrl-C, looks for a pod under the attempt's unique name for
    a short while, and terminates what it finds before anything else is
@@ -1220,9 +1221,7 @@ every bootstrap and reported back by `python -m gpuc.host status`
   share the card, and they skip themselves on a machine whose `nvidia-smi` does
   not report `tests.conftest.LOCAL_GPU_UUID` -- which is every CI runner.
 - Rental integration (`test_rental_e2e.py`, one case per provider): the
-  cheapest small card (an A40 on RunPod at `--max-price 0.60`, a consumer card
-  on Vast at `--max-price 0.40` with network and reliability floors), a job
-  whose command is under two minutes, `--idle-min 2`, and the test asserts
+  cheapest small card, a job whose command is under two minutes, `--idle-min 2`, and the test asserts
   the self-terminate via the provider's `get`. A pod whose name lacks the `runpod_pod_prefix` belongs to
   someone else: read it in `list()`, never act on it. Every test that creates
   a pod has a `finally` that terminates it.

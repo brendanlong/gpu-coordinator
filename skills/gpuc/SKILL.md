@@ -36,7 +36,7 @@ gpuc` from a checkout. Registering, bootstrapping and configuring hosts is
 |---|---|---|
 | `local` | the job fits on this machine's own cards | free, and shared with everything else using that GPU |
 | `ssh` | a bigger or shared box already registered | free to you; only the cards registered to that host are ever used |
-| `rental` (`gpuc host rent`) | nothing registered is big enough, or they are all busy | costs money (`gpuc host quote` with the same flags prices it first); rents the cheapest matching pod and registers it as a host; idles down 15 min after its queue empties |
+| `rental` (`gpuc host rent`) | nothing registered is big enough, or they are all busy | costs money (`gpuc host quote` with the same flags prices it first); rents the cheapest matching pod and registers it as a host |
 
 Prefer a host you already have over a pod you pay for; a busy host queues your
 job behind the running one, which is usually fine. If nothing is registered,
