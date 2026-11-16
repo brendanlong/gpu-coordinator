@@ -30,7 +30,7 @@ def systemd_scopes() -> bool:
     A fixture, not a module-level `skipif`: `scope.probe()` execs systemd, and
     collecting this file must not run anything on the machine.
     """
-    return scope.probe(use_cache=False)
+    return scope.probe.__wrapped__()
 
 
 @pytest.fixture
@@ -89,10 +89,10 @@ def test_scopes_need_a_user_instance_that_outlives_logout(
     monkeypatch.setattr(scope, "_output", fake_output)
     monkeypatch.setattr(scope, "under_user_manager", lambda: False)
     linger = "no"
-    assert not scope.probe(use_cache=False)
+    assert not scope.probe.__wrapped__()
     assert ran == [scope.LINGER_ARGV]
     linger = "Linger=yes"
-    assert scope.probe(use_cache=False)
+    assert scope.probe.__wrapped__()
     assert ran[-1] == scope.PROBE_ARGV
 
 
@@ -113,7 +113,7 @@ def test_a_caller_under_the_user_manager_gets_scopes_without_linger(
     monkeypatch.setattr(
         scope, "_output", lambda argv, _t: (0 if argv == scope.PROBE_ARGV else 1, "")
     )
-    assert scope.probe(use_cache=False)
+    assert scope.probe.__wrapped__()
 
 
 def test_a_pgid_host_records_its_isolation_and_a_clean_phase_logs_no_leftovers(

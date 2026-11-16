@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from gpuc.host import destinations, jobs, paths, sync
-from gpuc.host.destinations import CommandRunner, Env, PreflightFailed, RepoExists, run_command
+from gpuc.host.destinations import CommandRunner, Env, PreflightFailed, run_command
 from gpuc.host.jobs import HostConfig, JobSpec
 
 __all__ = ["PREFLIGHT_NAME", "PreflightFailed", "describe", "run", "targets"]
@@ -49,7 +49,6 @@ def run(
     *,
     runner: CommandRunner = run_command,
     env: Env = None,
-    repo_exists: RepoExists | None = None,
 ) -> list[str]:
     """Every destination this job proved it can write. Raises PreflightFailed.
 
@@ -61,8 +60,6 @@ def run(
     for destination in targets(spec, config):
         if probe is None:
             probe = _probe_file(spec.job_id)
-        if repo_exists is not None and isinstance(destination, destinations.HuggingFace):
-            destination.repo_exists = repo_exists
         destination.preflight(probe, runner=runner, env=env)
         checked.append(destination.uri)
     return checked

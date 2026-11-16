@@ -11,6 +11,7 @@ including every RunPod pod and the shared box) keep the process-group kill.
 from __future__ import annotations
 
 import base64
+import functools
 import os
 import subprocess
 from pathlib import Path
@@ -32,8 +33,6 @@ PROBE_TIMEOUT_S = 20.0
 
 PROBE_ARGV = ["systemd-run", "--user", "--scope", "--collect", "--quiet", "--", "true"]
 LINGER_ARGV = ["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"]
-
-_probed: bool | None = None
 
 
 def _run(argv: list[str], timeout: float) -> int:
@@ -90,20 +89,15 @@ def scopes_outlive_caller() -> bool:
     return under_user_manager() or lingering()
 
 
-def probe(*, use_cache: bool = True) -> bool:
+@functools.cache
+def probe() -> bool:
     """Can this user create transient scopes worth running in? Cached for the
     process's life.
 
     Needs a user D-Bus and cgroup delegation, not just the binary, so the only
     reliable answer is to create one; and see `scopes_outlive_caller`.
     """
-    global _probed
-    if use_cache and _probed is not None:
-        return _probed
-    result = scopes_outlive_caller() and _run(PROBE_ARGV, PROBE_TIMEOUT_S) == 0
-    if use_cache:
-        _probed = result
-    return result
+    return scopes_outlive_caller() and _run(PROBE_ARGV, PROBE_TIMEOUT_S) == 0
 
 
 def isolation() -> str:

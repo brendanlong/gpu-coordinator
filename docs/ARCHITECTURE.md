@@ -37,7 +37,7 @@ gpuc/
     health.py      # host preflight: driver, owned GPUs, disk, uv cache placement, the one network throughput test
     storage.py     # the data directory and the HF cache: `host clean --data` and `--hf-cache`
     fetch.py       # which workdir files `gpuc fetch` copies
-    terminate.py   # self-terminate via provider API (urllib), key from ~/.gpuc/secrets
+    terminate.py   # self-terminate via provider API (urllib), key from the pod's own environment
     owner.py       # owner.json: which machine serves this queue, and noticing it was replaced
   control/       # runs on the local machine; may use third-party deps
     cli.py         # argparse and the text output of every `gpuc` command; `main` emits each answer once
@@ -112,7 +112,7 @@ config.json          # {"schema_version": 1, "host": "<name>", "gpus": null | ["
                      #  "created_at": str,            # when this config was first written
                      #  "pkg_commit": null | "<sha>", # the commit bootstrap shipped to this host
                      #  "env": {"HF_HOME": ...}}      # host-wide; see Persistent root
-secrets/<name>       # 0600 files delivered over SSH after boot. Never in argv, never in pod env.
+secrets/<jobid>.env  # a job's secrets, 0600, delivered over SSH. Never in argv, never in pod env.
 data/                # GPUC_DATA_DIR unless the host's env names another; see The data directory
 incoming/<jobid>/    # a job `gpuc submit` is still building: the rsynced workdir, then the spec.
                      # `enqueue` renames the whole dir into jobs/, which is the acceptance

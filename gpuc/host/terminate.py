@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from gpuc.host import USER_AGENT, paths
+from gpuc.host import USER_AGENT
 from gpuc.host.jobs import HostConfig, parse_env_file
 
 RUNPOD_API = "https://api.runpod.io/v2"
@@ -85,11 +85,6 @@ def _provider(kind: str) -> Provider:
 
 def read_api_key(kind: str = "runpod") -> str:
     provider = _provider(kind)
-    path = paths.secrets_file(kind)
-    if path.exists():
-        key = path.read_text().strip()
-        if key:
-            return key
     env_key = os.environ.get(provider.api_key_env, "").strip()
     if env_key:
         return env_key
@@ -97,7 +92,7 @@ def read_api_key(kind: str = "runpod") -> str:
     if pod_key:
         return pod_key
     raise TerminateError(
-        f"no provider API key: {path} is missing or empty, {provider.api_key_env} is unset, "
+        f"no provider API key: {provider.api_key_env} is unset, "
         f"and {provider.environment_path()} has no {provider.api_key_env}"
     )
 

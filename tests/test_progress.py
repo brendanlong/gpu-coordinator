@@ -247,9 +247,11 @@ def test_clearing_the_estimate_withdraws_the_eta_it_published(gpuc_home: Path) -
     """An estimate somebody decided was wrong must not outlive the decision."""
     job_id = prepare(command="true", estimated_runtime_min=90.0)
     with live_runner(job_id) as (started, _log):
-        started._publish_estimated_eta(90.0, 0.0)  # pyright: ignore[reportPrivateUsage]
+        started._estimate = 90.0  # pyright: ignore[reportPrivateUsage]
+        started._publish_estimated_eta(0.0)  # pyright: ignore[reportPrivateUsage]
         assert jobs.read_state(job_id).eta
-        started._publish_estimated_eta(None, 0.0)  # pyright: ignore[reportPrivateUsage]
+        started._estimate = None  # pyright: ignore[reportPrivateUsage]
+        started._publish_estimated_eta(0.0)  # pyright: ignore[reportPrivateUsage]
     assert jobs.read_state(job_id).eta is None
 
 
@@ -259,7 +261,8 @@ def test_an_eta_the_runner_did_not_publish_is_not_withdrawn(gpuc_home: Path) -> 
     job_id = prepare(command="true")
     jobs.update_state(job_id, eta=jobs.utc_in(3600.0))
     with live_runner(job_id) as (started, _log):
-        started._publish_estimated_eta(None, 0.0)  # pyright: ignore[reportPrivateUsage]
+        started._estimate = None  # pyright: ignore[reportPrivateUsage]
+        started._publish_estimated_eta(0.0)  # pyright: ignore[reportPrivateUsage]
     assert jobs.read_state(job_id).eta
 
 

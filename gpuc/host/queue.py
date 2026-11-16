@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 from gpuc.host import checkout, cleanup, jobs, paths
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
-from gpuc.host.procs import from_another_boot
+from gpuc.host.procs import runner_from_another_boot
 
 PREEMPTED = "preempted"
 """The reason of an attempt stopped so that something else can have its GPUs.
@@ -121,8 +121,6 @@ def cancel(job_id: str) -> str:
     will run the job, so nothing will need them. A running job gets the
     intent, and its runner (or, as a backstop, the dispatcher) acts on it.
     """
-    if not paths.job_dir(job_id).is_dir():
-        raise FileNotFoundError(f"no such job: {job_id}")
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
         if state.finished:
@@ -334,9 +332,7 @@ def requeue_after_restart(job_id: str) -> JobState | None:
     """
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
-        if state.status != "running" or not from_another_boot(
-            state.runner_boot_id, state.runner_init_start
-        ):
+        if state.status != "running" or not runner_from_another_boot(state):
             return None
         preempting = state.intent == PREEMPT
         attempt = None

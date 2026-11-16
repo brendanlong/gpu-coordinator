@@ -43,7 +43,6 @@ __all__ = [
     "recently_modified",
     "run_command",
     "sync_job_meta",
-    "sync_output",
     "sync_outputs",
 ]
 
@@ -105,16 +104,16 @@ def mirror_for(job_id: str, s3_prefix: str | None) -> destinations.S3 | None:
     return destinations.S3(f"{s3_prefix.rstrip('/')}/jobs/{job_id}")
 
 
-def sync_output(
+def _sync_output(
     output: Output,
     workdir: Path,
     job_id: str,
+    entries: baseline.Entries,
     *,
     min_age_s: float = MIN_AGE_S,
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
-    baseline_entries: baseline.Entries | None = None,
     record_missing: bool = True,
 ) -> None:
     """Upload one output to each of its destinations, recording each result.
@@ -124,7 +123,6 @@ def sync_output(
     writes its first checkpoint an hour in has not failed anything.
     """
     local = workdir / output.path.format(job_id=job_id)
-    entries = baseline_entries or {}
     # Files that were in the checkout and have not been touched are not this
     # job's output; uploading them would publish the last run's results under
     # this run's name.
@@ -174,21 +172,21 @@ def sync_outputs(
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
-    baseline_map: baseline.Baseline | None = None,
     record_missing: bool = True,
 ) -> None:
     errors: list[SyncError] = []
+    entries = baseline.read(job_id)
     for output in outputs:
         try:
-            sync_output(
+            _sync_output(
                 output,
                 workdir,
                 job_id,
+                entries.get(baseline.output_key(output, job_id), {}),
                 min_age_s=min_age_s,
                 runner=runner,
                 timeout=timeout,
                 env=env,
-                baseline_entries=(baseline_map or {}).get(baseline.output_key(output, job_id)),
                 record_missing=record_missing,
             )
         except SyncError as exc:
@@ -331,7 +329,6 @@ class SyncLoop:
                 runner=self._runner,
                 timeout=timeout,
                 env=self._env,
-                baseline_map=baseline.read(self._spec.job_id),
                 record_missing=record_missing,
             )
             if meta:

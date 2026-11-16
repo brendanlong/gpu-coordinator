@@ -126,6 +126,16 @@ def recorded_process_alive(
     return not (recorded_starttime and current_start and recorded_starttime != current_start)
 
 
+def runner_from_another_boot(state: JobState) -> bool:
+    return from_another_boot(state.runner_boot_id, state.runner_init_start)
+
+
+def runner_alive(state: JobState) -> bool:
+    return recorded_process_alive(
+        state.runner_pid, state.runner_boot_id, state.runner_starttime, state.runner_init_start
+    )
+
+
 def _live_pgrp(stat: str) -> int | None:
     """Field 5 of ``/proc/<pid>/stat``, split after the comm as in
     `parse_starttime`; None for a zombie, which holds nothing any more."""
@@ -173,7 +183,7 @@ class JobProcesses:
         hold that number now, and adoption after a reboot SIGKILLed exactly
         that. The same identity rule as `recorded_process_alive`.
         """
-        if from_another_boot(state.runner_boot_id, state.runner_init_start):
+        if runner_from_another_boot(state):
             return JobProcesses()
         return JobProcesses(state.cgroup_unit, state.pgid or None, state.runner_pid)
 
@@ -264,8 +274,8 @@ class JobProcesses:
         One rung per grace period: the job's processes, then a SIGTERM to the
         runner (which handles it with a final sync), then the runner's own
         group. Nothing inside the first grace period -- the runner acts within
-        a poll -- and nothing at all if the caller decided the runner is busy
-        finishing (see `Dispatcher.escalate_stops`).
+        a poll; the caller decides how long a runner busy finishing gets
+        (see `Dispatcher.escalate_stops`).
         """
         if elapsed_s <= grace_s:
             return
