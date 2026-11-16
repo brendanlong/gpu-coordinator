@@ -15,8 +15,9 @@ from typing import Any
 import pytest
 
 from gpuc.control.actions import PROVIDERS
-from gpuc.control.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
+from gpuc.control.cli import main
 from gpuc.control.config import config_file, registry_transaction
+from gpuc.control.exits import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK
 from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
 from tests.conftest import ago, host_entry, load_registry, stub_wait_sleep

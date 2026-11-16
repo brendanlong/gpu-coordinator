@@ -12,12 +12,13 @@ from gpuc.control.config import Settings
 from gpuc.control.providers.base import (
     Constraints,
     CreateRefused,
+    HttpError,
     Offer,
     Pod,
     ProviderError,
     owned_pods,
 )
-from gpuc.control.providers.runpod import RunPodError, RunPodProvider
+from gpuc.control.providers.runpod import RunPodProvider
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -162,7 +163,7 @@ def test_create_requires_our_prefix() -> None:
     provider = RecordedRunPod()
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
     with pytest.raises(ProviderError, match="must start with"):
-        provider.create(offer, "scratch-pod", image="img", disk_gb=20)
+        provider.create(offer, "scratch-pod", image="img", constraints=Constraints(disk_gb=20))
     assert not any(path == "/pods" for _, path, _ in provider.requests)
 
 
@@ -224,13 +225,13 @@ def test_only_a_4xx_create_is_a_refusal(status: int, refused: bool) -> None:
     class Failing(RecordedRunPod):
         def _json(self, method: str, path: str, **kwargs: Any) -> Any:
             if method == "POST" and path == "/pods":
-                raise RunPodError(method, path, status, "no")
+                raise HttpError(method, path, status, "no")
             return super()._json(method, path, **kwargs)
 
     provider = Failing()
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
     with pytest.raises(ProviderError) as error:
-        provider.create(offer, "gpuc-x", image="img", disk_gb=20)
+        provider.create(offer, "gpuc-x", image="img", constraints=Constraints(disk_gb=20))
     assert isinstance(error.value, CreateRefused) is refused
 
 
@@ -248,5 +249,5 @@ def test_an_unreadable_create_answer_is_a_provider_error(answer: Any) -> None:
     provider = Garbled()
     offer = provider.offers(Constraints(gpu_names=["A40"]))[0]
     with pytest.raises(ProviderError) as error:
-        provider.create(offer, "gpuc-x", image="img", disk_gb=20)
+        provider.create(offer, "gpuc-x", image="img", constraints=Constraints(disk_gb=20))
     assert not isinstance(error.value, CreateRefused)

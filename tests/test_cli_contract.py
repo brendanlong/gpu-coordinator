@@ -21,15 +21,7 @@ import pytest
 
 from gpuc.control import status as status_mod
 from gpuc.control.actions import PROVIDERS
-from gpuc.control.cli import (
-    EXIT_ERROR,
-    EXIT_INTERRUPTED,
-    EXIT_LOCAL_STATE,
-    EXIT_NOT_FOUND,
-    EXIT_OK,
-    EXIT_USAGE,
-    main,
-)
+from gpuc.control.cli import main
 from gpuc.control.config import (
     HostEntry,
     backup_path,
@@ -37,6 +29,14 @@ from gpuc.control.config import (
     hosts_file,
     pod_known_hosts_file,
     read_registry,
+)
+from gpuc.control.exits import (
+    EXIT_ERROR,
+    EXIT_INTERRUPTED,
+    EXIT_LOCAL_STATE,
+    EXIT_NOT_FOUND,
+    EXIT_OK,
+    EXIT_USAGE,
 )
 from gpuc.control.s3index import S3IndexError
 from gpuc.control.status import CardView, HostState, HostView

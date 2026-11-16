@@ -197,6 +197,11 @@ def public_key_path(settings: Settings) -> Path:
     )
 
 
+DEFAULT_IDLE_MINUTES = 15.0
+"""How long a rental sits with an empty queue before it ends itself, unless
+`--idle-min` says otherwise."""
+
+
 def pod_name(prefix: str, name_hint: str) -> str:
     hint = re.sub(r"[^a-z0-9-]+", "-", name_hint.lower()).strip("-") or "job"
     return f"{prefix}{hint}-{secrets.token_hex(3)}"
@@ -207,7 +212,7 @@ def provision(
     settings: Settings,
     *,
     name_hint: str = "job",
-    idle_minutes: float = 15.0,
+    idle_minutes: float = DEFAULT_IDLE_MINUTES,
     image: str | None = None,
     provider: Provider,
     report: Reporter = print,
@@ -323,9 +328,7 @@ def _try_offer(
             offer,
             name,
             image=image,
-            disk_gb=constraints.disk_gb,
-            cuda_min=constraints.cuda_min,
-            gpu_count=constraints.gpu_count,
+            constraints=constraints,
         )
     except CreateRefused:
         raise

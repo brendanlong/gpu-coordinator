@@ -11,6 +11,7 @@ import http.client
 import io
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlencode, urlsplit
@@ -19,11 +20,12 @@ import pytest
 
 from gpuc.control import status as status_mod
 from gpuc.control import web
-from gpuc.control.cli import EXIT_USAGE, main
+from gpuc.control.cli import main
 from gpuc.control.config import HostEntry, Settings, hosts_file
+from gpuc.control.exits import EXIT_USAGE
 from gpuc.control.remote import HostSession, RemoteError
 from gpuc.control.status import CardView, HostState, HostView
-from gpuc.control.web.app import Dashboard, ServerThread
+from gpuc.control.web.app import Dashboard, make_server
 from gpuc.control.web.auth import (
     SESSION_COOKIE,
     Sessions,
@@ -116,8 +118,12 @@ def app(password_hash: str) -> Dashboard:
 
 @pytest.fixture
 def client(app: Dashboard, control_env: Path):
-    with ServerThread(app) as server:
-        yield Client(server.url)
+    server = make_server("127.0.0.1", 0, app)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = server.server_address[:2]
+    yield Client(f"http://{host}:{port}")
+    server.shutdown()
+    server.server_close()
 
 
 @pytest.fixture

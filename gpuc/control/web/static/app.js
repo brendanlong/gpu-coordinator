@@ -103,9 +103,11 @@ function short(commit) {
 function queueNote(result) {
   if (result.dispatched) return "dispatched already; it is running now";
   if (result.queue_position === null || result.queue_position === undefined) return "";
-  const starts = result.starts_in_s === null
-    ? `start time unknown (${result.starts_unknown})`
-    : `starts ${fmtWait(result.starts_in_s)}`;
+  const starts = result.starts_in_s !== null
+    ? `starts ${fmtWait(result.starts_in_s)}`
+    : result.starts_unknown
+      ? `start time unknown (${result.starts_unknown})`
+      : "start time unknown";
   return `position ${result.queue_position} of ${result.queue_length}; ${starts}`;
 }
 

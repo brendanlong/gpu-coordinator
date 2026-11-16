@@ -7,7 +7,7 @@ CLI would refuse to cancel is one the dashboard refuses too, with the same
 words.
 
 An `Answer` is what a command hands back: the document, the text form, and
-what failed -- `exit_code_of` is the one place that becomes a number, and
+what failed -- `Answer.exit_code` is the one place that becomes a number, and
 `exits.http_status` the one place that number becomes an HTTP status.
 """
 
@@ -29,7 +29,6 @@ from gpuc.control.config import (
     ConfigError,
     HostEntry,
     HostNotFound,
-    LocalStateUnreadable,
     Registry,
     RegistryRead,
     Settings,
@@ -82,15 +81,6 @@ from gpuc.control.teardown import TerminateError
 from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, settable
 from gpuc.host.jobs import FINISHED_STATUSES
-
-__all__ = [
-    "EXIT_ERROR",
-    "EXIT_INTERRUPTED",
-    "EXIT_LOCAL_STATE",
-    "EXIT_NOT_FOUND",
-    "EXIT_OK",
-    "EXIT_USAGE",
-]
 
 
 class CliError(RuntimeError):
@@ -152,10 +142,6 @@ def exit_code_for(exc: BaseException) -> int | None:
     One table for the CLI's top-level handler and the dashboard's, so a refused
     job is exit 4 on the command line and 404 on the wire, never two opinions.
     """
-    if isinstance(exc, LocalStateUnreadable):
-        return EXIT_LOCAL_STATE
-    if isinstance(exc, HostNotFound):
-        return EXIT_NOT_FOUND
     if isinstance(exc, FAILURES):
         return getattr(exc, "exit_code", EXIT_ERROR)
     if isinstance(exc, json.JSONDecodeError):
@@ -189,17 +175,13 @@ class Answer:
 
     @property
     def exit_code(self) -> int:
-        return exit_code_of(self)
-
-
-def exit_code_of(answer: Answer) -> int:
-    """The one rule: unknown beats everything, a relayed outcome is itself,
-    else 1 for any failure and 0 for none."""
-    if answer.unknown:
-        return EXIT_LOCAL_STATE
-    if answer.outcome is not None:
-        return answer.outcome
-    return EXIT_ERROR if answer.failures else EXIT_OK
+        """The one rule: unknown beats everything, a relayed outcome is itself,
+        else 1 for any failure and 0 for none."""
+        if self.unknown:
+            return EXIT_LOCAL_STATE
+        if self.outcome is not None:
+            return self.outcome
+        return EXIT_ERROR if self.failures else EXIT_OK
 
 
 PROVIDERS: dict[str, Callable[[Settings], Provider]] = {

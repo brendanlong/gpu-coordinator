@@ -21,8 +21,9 @@ from typing import Any
 import pytest
 
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, remote_path
-from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_USAGE, main
+from gpuc.control.cli import main
 from gpuc.control.config import HostEntry
+from gpuc.control.exits import EXIT_NOT_FOUND, EXIT_USAGE
 from gpuc.control.remote import env_prefix, host_command
 from gpuc.host import dispatcher, health, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig, JobState

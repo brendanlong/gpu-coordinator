@@ -11,7 +11,8 @@ from typing import cast
 import pytest
 
 from gpuc.control import ssh as ssh_mod
-from gpuc.control.cli import EXIT_NOT_FOUND, EXIT_OK, main
+from gpuc.control.cli import main
+from gpuc.control.exits import EXIT_NOT_FOUND, EXIT_OK
 from gpuc.control.transport import CommandResult, LocalTransport, SshTransport, Transport
 from tests.conftest import register_host
 

@@ -11,15 +11,7 @@ from gpuc.control import version as version_mod
 from gpuc.control.actions import PROVIDERS
 from gpuc.control.bootstrap import BootstrapError, BootstrapResult, HealthOptions
 from gpuc.control.clean import purge_host
-from gpuc.control.cli import (
-    EXIT_ERROR,
-    EXIT_INTERRUPTED,
-    EXIT_LOCAL_STATE,
-    EXIT_NOT_FOUND,
-    EXIT_USAGE,
-    build_parser,
-    main,
-)
+from gpuc.control.cli import build_parser, main
 from gpuc.control.config import (
     HostEntry,
     LocalStateUnreadable,
@@ -29,6 +21,13 @@ from gpuc.control.config import (
     load_settings,
     registry_transaction,
     utc_now,
+)
+from gpuc.control.exits import (
+    EXIT_ERROR,
+    EXIT_INTERRUPTED,
+    EXIT_LOCAL_STATE,
+    EXIT_NOT_FOUND,
+    EXIT_USAGE,
 )
 from gpuc.control.gpuinfo import owned_entries
 from gpuc.control.providers.base import Constraints, Pod

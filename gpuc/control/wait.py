@@ -19,9 +19,6 @@ from typing import Any
 
 from gpuc.control import status as status_mod
 from gpuc.control.actions import (
-    EXIT_ERROR,
-    EXIT_NOT_FOUND,
-    EXIT_OK,
     Answer,
     Mirrored,
     NotFound,
@@ -32,6 +29,7 @@ from gpuc.control.actions import (
     read_mirror,
 )
 from gpuc.control.config import HostEntry, Settings, open_registry
+from gpuc.control.exits import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK
 from gpuc.control.jsonout import note
 from gpuc.control.remote import Answered, HostSession, Unaskable, ask, open_session
 from gpuc.control.s3index import JobIndex

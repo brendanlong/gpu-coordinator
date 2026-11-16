@@ -23,12 +23,6 @@ from gpuc.control import version as version_mod
 from gpuc.control import wait as wait_mod
 from gpuc.control import web as web_mod
 from gpuc.control.actions import (
-    EXIT_ERROR,
-    EXIT_INTERRUPTED,
-    EXIT_LOCAL_STATE,
-    EXIT_NOT_FOUND,
-    EXIT_OK,
-    EXIT_USAGE,
     INDEX_SHORT,
     PROVIDERS,
     Answer,
@@ -83,11 +77,14 @@ from gpuc.control.config import (
     transport_for,
     update_cache,
 )
+from gpuc.control.exits import (
+    EXIT_INTERRUPTED,
+    EXIT_USAGE,
+)
 from gpuc.control.fetch import fetch_jobs, fetch_line
 from gpuc.control.gpuinfo import owned_entries, summarize
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.hosts import (
-    DEFAULT_IDLE_MINUTES,
     DEFAULT_QUOTE_LIMIT,
     RentalOptions,
     add_host,
@@ -100,6 +97,7 @@ from gpuc.control.hosts import (
 from gpuc.control.jsonout import note, warn
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import DEFAULT_CUDA_MIN, MINIMUMS, Cloud
+from gpuc.control.provision import DEFAULT_IDLE_MINUTES
 from gpuc.control.remote import HostSession, RemoteError, open_session, read_config, resolve_home
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import SubmitResult
@@ -114,12 +112,6 @@ from gpuc.host import settable as settable_mod
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
 __all__ = [
-    "EXIT_ERROR",
-    "EXIT_INTERRUPTED",
-    "EXIT_LOCAL_STATE",
-    "EXIT_NOT_FOUND",
-    "EXIT_OK",
-    "EXIT_USAGE",
     "CliError",
     "NotFound",
     "UsageError",
@@ -538,28 +530,22 @@ CLOUDS: dict[str, list[Cloud]] = {
 
 
 def rental_options(args: argparse.Namespace) -> RentalOptions:
-    options = RentalOptions(
+    return RentalOptions(
         provider=args.provider,
         gpu_names=[name.strip() for name in (args.gpu or "").split(",") if name.strip()],
         max_price_usd_hr=args.max_price,
         clouds=CLOUDS[args.cloud] if args.cloud else [],
         cuda_min=args.cuda_min,
         gpu_count=args.gpu_count,
-        minimums={
-            key: getattr(args, flag.removeprefix("--").replace("-", "_"))
-            for key, flag in MINIMUMS.items()
-            if getattr(args, flag.removeprefix("--").replace("-", "_")) is not None
-        },
+        minimums={key: getattr(args, key) for key in MINIMUMS if getattr(args, key) is not None},
         force=args.force,
         name_hint=args.name_hint,
         disk_gb=args.disk,
         image=args.image,
         health=health_options(args),
         trusted=args.trusted,
+        idle_minutes=args.idle_min,
     )
-    if args.idle_min is not None:
-        options.idle_minutes = args.idle_min
-    return options
 
 
 def cmd_config_init(args: argparse.Namespace) -> Answer:
@@ -1823,7 +1809,7 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
     )
     for key, flag in MINIMUMS.items():
         parser.add_argument(
-            flag, type=float, metavar=MINIMUM_UNITS[key][0], help=MINIMUM_UNITS[key][1]
+            flag, dest=key, type=float, metavar=MINIMUM_UNITS[key][0], help=MINIMUM_UNITS[key][1]
         )
     parser.add_argument(
         "--cuda-min",
@@ -1834,6 +1820,7 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--idle-min",
         type=float,
+        default=DEFAULT_IDLE_MINUTES,
         metavar="MINUTES",
         help=f"terminate the pod once its queue has been empty this long "
         f"(default {DEFAULT_IDLE_MINUTES:g})",

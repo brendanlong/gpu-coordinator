@@ -14,9 +14,15 @@ import pytest
 from gpuc.control.actions import UsageError
 from gpuc.control.config import Settings
 from gpuc.control.hosts import RentalOptions
-from gpuc.control.providers.base import Constraints, CreateRefused, ProviderError, Unauthorized
+from gpuc.control.providers.base import (
+    Constraints,
+    CreateRefused,
+    HttpError,
+    ProviderError,
+    Unauthorized,
+)
 from gpuc.control.providers.runpod import RunPodProvider
-from gpuc.control.providers.vast import VastError, VastProvider, pod_from_api, search_query
+from gpuc.control.providers.vast import VastProvider, pod_from_api, search_query
 from gpuc.host import terminate
 from gpuc.host.jobs import HostConfig
 
@@ -102,17 +108,19 @@ def test_a_name_no_offer_has_says_which_names_there_are() -> None:
 
 
 def test_an_offer_someone_else_took_is_a_refusal_not_a_maybe() -> None:
-    gone = VastError("PUT", "/asks/1/", 410, '{"error": "no_such_ask"}')
+    gone = HttpError("PUT", "/asks/1/", 410, '{"error": "no_such_ask"}')
     provider = RecordedVast({("PUT", "/asks/59244968/"): gone})
     offer = provider.offers(Constraints(gpu_names=["RTX 4090"]))[0]
     with pytest.raises(CreateRefused):
-        provider.create(offer, "gpuc-e2e-abc123", image="img", disk_gb=20)
+        provider.create(offer, "gpuc-e2e-abc123", image="img", constraints=Constraints(disk_gb=20))
 
 
 def test_create_rents_the_offer_by_its_id_with_direct_ssh() -> None:
     provider = RecordedVast({("PUT", "/asks/59244968/"): {"success": True, "new_contract": 4242}})
     offer = provider.offers(Constraints(gpu_names=["RTX 4090"]))[0]
-    pod = provider.create(offer, "gpuc-e2e-abc123", image="img", disk_gb=20)
+    pod = provider.create(
+        offer, "gpuc-e2e-abc123", image="img", constraints=Constraints(disk_gb=20)
+    )
     assert pod.id == "4242"
     _, _, body = provider.requests[-1]
     assert body["runtype"] == "ssh_direct" and body["disk"] == 20 and body["image"] == "img"
@@ -123,7 +131,7 @@ def test_create_refuses_a_name_without_our_prefix() -> None:
     provider = RecordedVast()
     offer = provider.offers(Constraints(gpu_names=["RTX 4090"]))[0]
     with pytest.raises(ProviderError, match="must start with"):
-        provider.create(offer, "scratch", image="img", disk_gb=20)
+        provider.create(offer, "scratch", image="img", constraints=Constraints(disk_gb=20))
     assert not any(method == "PUT" for method, _, _ in provider.requests)
 
 
@@ -158,7 +166,7 @@ def test_get_is_none_only_when_vast_says_it_has_no_such_instance() -> None:
     provider = RecordedVast(
         {
             ("GET", "/instances/1/"): {"instances": None},
-            ("GET", "/instances/2/"): VastError("GET", "/instances/2/", 404, "{}"),
+            ("GET", "/instances/2/"): HttpError("GET", "/instances/2/", 404, "{}"),
         }
     )
     assert provider.get("1") is None
@@ -192,7 +200,7 @@ def test_a_key_vast_does_not_know_is_never_an_instance_that_is_gone(
 
 
 def test_terminate_treats_an_instance_already_gone_as_done() -> None:
-    missing = VastError("DELETE", "/instances/1/", 404, "")
+    missing = HttpError("DELETE", "/instances/1/", 404, "")
     RecordedVast({("DELETE", "/instances/1/"): missing}).terminate("1")
 
 

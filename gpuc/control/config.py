@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from gpuc.control.exits import EXIT_LOCAL_STATE, EXIT_NOT_FOUND
 from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.jsonout import warn
 from gpuc.control.providers.base import DEFAULT_DISK_GB, DEFAULT_PREFIX
@@ -48,9 +49,13 @@ class LocalStateUnreadable(ConfigError):
     turned into a wrong answer instead of an error.
     """
 
+    exit_code = EXIT_LOCAL_STATE
+
 
 class HostNotFound(ConfigError):
-    """A named host is not in the registry (CLI exit 4, not a generic failure)."""
+    """A named host is not in the registry."""
+
+    exit_code = EXIT_NOT_FOUND
 
 
 def config_dir() -> Path:
