@@ -337,17 +337,6 @@ def test_a_lowered_max_runtime_ends_a_running_job(gpuc_home: Path) -> None:
     assert "max_runtime_min is now 0.001 min" in log_of(job_id)
 
 
-def test_a_state_from_an_earlier_build_keeps_the_specs_limit(gpuc_home: Path) -> None:
-    """A state enqueued before the limit lived there has no `max_runtime_min`,
-    and its null must not read as "no limit"."""
-    job_id = prepare(command="sleep 60", max_runtime_min=0.01)
-    jobs.update_state(job_id, max_runtime_min=None, live_max_runtime=False)
-    assert run(job_id) != 0
-    state = jobs.read_state(job_id)
-    assert (state.status, state.reason, state.live_max_runtime) == ("failed", "timeout", True)
-    assert state.max_runtime_min == 0.01
-
-
 def test_utilization_is_sampled_in_main_only(gpuc_home: Path) -> None:
     """Setup is the hour spent downloading a checkpoint at 0% util, and a
     sample from there would show `gpuc status` an idle job that has not

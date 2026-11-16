@@ -86,7 +86,7 @@ def list_queued() -> list[QueueEntry]:
     return sorted(entries)
 
 
-def claim(job_id: str, attempt: int, spec: JobSpec | None = None, **fields: object) -> bool:
+def claim(job_id: str, attempt: int, **fields: object) -> bool:
     """Take a job out of the queue, recording what became of it: the runner's
     first act, for the job and the attempt it was started for.
 
@@ -96,18 +96,11 @@ def claim(job_id: str, attempt: int, spec: JobSpec | None = None, **fields: obje
     that was slow to start, lost that claim, and arrives after the attempt it
     lost to has been preempted and queued again was assigned its cards for a
     pass that is over, and must not take them now.
-
-    A state an earlier build enqueued gets the spec's wall-clock limit made
-    live here, under the same lock as the check: decided from a copy read any
-    earlier, it would undo a `gpuc set --max-runtime` that landed in between.
     """
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
         if state.status != "queued" or state.attempt != attempt:
             return False
-        if spec is not None and not state.live_max_runtime:
-            state.max_runtime_min = spec.max_runtime_min
-            state.live_max_runtime = True
         jobs.write_state(job_id, jobs.apply_fields(state, fields))
     return True
 
@@ -298,7 +291,6 @@ def _write_queued_again(
             priority=state.priority,
             estimated_runtime_min=state.estimated_runtime_min,
             max_runtime_min=state.max_runtime_min,
-            live_max_runtime=state.live_max_runtime,
             ran=ran,
             restarts=state.restarts if restarts is None else restarts,
         ),

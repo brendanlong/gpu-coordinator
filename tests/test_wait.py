@@ -653,12 +653,7 @@ def test_wait_reports_a_job_whose_hosts_registry_entry_it_cannot_read(
     from gpuc.control.config import hosts_file
 
     document = json.loads(hosts_file().read_text())
-    document["hosts"]["gpuc-old"] = {
-        "name": "gpuc-old",
-        "kind": "runpod",
-        "ssh": "root@1.2.3.4",
-        "pod_id": "podOLD",
-    }
+    document["hosts"]["gpuc-old"] = {"name": "gpuc-old", "port": "twenty-two"}
     hosts_file().write_text(json.dumps(document))
     other = "20260101-000000-aaaaaa"
     LocalIndex().record(IndexEntry(job_id=other, host="gpuc-old", name="j"))

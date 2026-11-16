@@ -127,9 +127,7 @@ jobs/<jobid>/
                      #  "priority": p,                         # the live priority, which orders
                      #                                        # the queue of `queued` states
                      #  "estimated_runtime_min": null | m,     # the live estimate, as `gpuc set` left it
-                     #  "max_runtime_min": null | m,           # the live wall-clock limit, as
-                     #  "live_max_runtime": bool,              # `gpuc set` left it; meant only
-                     #                                        # when live_max_runtime, else the spec's
+                     #  "max_runtime_min": null | m,           # the live wall-clock limit, as `gpuc set` left it
                      #  "reason": str|null, "problems": [str, ...],  # what ended it, and what else went wrong
                      #  "exit_code": int|null, "gpus": [...],   # UUIDs, from the runner's claim
                      #  "started_at", "ended_at",
@@ -226,8 +224,7 @@ defaults.
   "sync_interval_s": 180,
   "priority": 50,                       # copied into the state at enqueue; the state's copy is
                                         # the live one (`gpuc set`, `gpuc preempt --priority`)
-  "max_runtime_min": null,              # copied into the state at enqueue, where `gpuc set` edits
-                                        # it; a state an earlier build wrote gets it at the claim
+  "max_runtime_min": null,              # copied into the state at enqueue, where `gpuc set` edits it
   "estimated_runtime_min": null,        # the submitter's own guess, measured from the runner's
                                         # start exactly as max_runtime_min is. Informational only;
                                         # copied into the state at enqueue, where `gpuc set` edits it
@@ -446,8 +443,7 @@ submitter is [usage.md](usage.md#progress-and-estimates).
   monitor loop re-reads it from the job's state every `ESTIMATE_REFRESH_S`,
   which is how `gpuc set` reaches a running job. The wall-clock limit is
   re-read with it, the same way; they are the only things a running job
-  re-reads. `gpuc set --max-runtime` refuses a running job whose state is not
-  `live_max_runtime`: its runner is from a build that does not re-read the limit.
+  re-reads.
 - `progress_command` runs in `workdir/` with the job's environment, during
   `main` only; `progress.parse` accepts a fraction with a decimal point or a
   percentage with a `%`, and nothing else. Above 0% the runner replaces `eta`
