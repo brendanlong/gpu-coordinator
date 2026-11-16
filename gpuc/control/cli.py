@@ -61,6 +61,8 @@ from gpuc.control.actions import (
 from gpuc.control.bootstrap import HealthOptions
 from gpuc.control.clean import (
     CleanError,
+    DataReport,
+    PruneReport,
     clean_host,
     parse_only,
     prune_hf_cache,
@@ -437,8 +439,7 @@ def cmd_clean(args: argparse.Namespace) -> Answer:
     )
     entry = open_registry().require(args.host)
     report = clean_host(
-        entry,
-        settings,
+        open_session(entry, settings),
         all_finished=args.all_finished,
         older_than_days=args.older_than,
         dry_run=args.dry_run,
@@ -448,10 +449,6 @@ def cmd_clean(args: argparse.Namespace) -> Answer:
         only=only,
     )
     return Answer(report.document(), report.render(), failures=list(report.errors))
-
-
-def without_host(document: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in document.items() if key != "host"}
 
 
 def cmd_host_clean(args: argparse.Namespace) -> Answer:
@@ -468,32 +465,23 @@ def cmd_host_clean(args: argparse.Namespace) -> Answer:
     document: dict[str, Any] = {"host": entry.name}
     lines: list[str] = []
     failures: list[str] = []
+    parts: list[tuple[str, Callable[[], PruneReport | DataReport]]] = []
     if args.uv_cache:
-        try:
-            uv = prune_uv_cache(entry, settings, session=session)
-            document["uv_cache"] = without_host(uv.document())
-            lines.append(uv.render())
-        except (CleanError, RemoteError) as exc:
-            document["uv_cache"] = {"errors": [str(exc)]}
-            failures.append(str(exc))
+        parts.append(("uv_cache", lambda: prune_uv_cache(session)))
     if args.hf_cache:
-        try:
-            hf, errors = prune_hf_cache(entry, settings, session=session)
-            document["hf_cache"] = {**without_host(hf.document()), "errors": errors}
-            lines.append(hf.render())
-        except (CleanError, RemoteError) as exc:
-            errors = [str(exc)]
-            document["hf_cache"] = {"errors": errors}
-        failures += errors
+        parts.append(("hf_cache", lambda: prune_hf_cache(session)))
     if args.data:
+        parts.append(("data", lambda: remove_data(session, args.data)))
+    for key, run in parts:
         try:
-            data = remove_data(entry, args.data, settings, session=session)
-            document["data"] = data.document()
-            lines.append(data.render())
-            failures += data.errors
+            report = run()
         except (CleanError, RemoteError) as exc:
-            document["data"] = {"errors": [str(exc)]}
+            document[key] = {"errors": [str(exc)]}
             failures.append(str(exc))
+            continue
+        document[key] = report.document()
+        lines.append(report.render())
+        failures += report.errors
     return Answer(document, "\n".join(lines), failures=failures)
 
 
@@ -686,7 +674,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
     unhosted = result.unhosted_text(args.host)
     if unhosted:
         lines.append(unhosted)
-    return result.answer(recent=recent, since_s=since_s, text="\n".join(lines) or None)
+    return result.answer("\n".join(lines) or None)
 
 
 def ssh_target(args: argparse.Namespace, settings: Settings) -> tuple[HostEntry, str, str | None]:
@@ -920,7 +908,7 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
     # ask every registered host in turn, 60s each, which is exactly where
     # somebody who mistyped an id reaches for Ctrl-C.
     try:
-        watch = wait_mod.start([args.job_id], args.host, settings)
+        watch = wait_mod.Watch([args.job_id], args.host, settings)
         watched = watch.jobs[args.job_id]
         watch.poll()
         watch.check_known()
@@ -1024,7 +1012,7 @@ def cmd_wait(args: argparse.Namespace) -> Answer:
         # `start` is inside too: with no --host and nothing in the index it asks
         # every registered host in turn, 60s each, and that is the wait a user
         # interrupts most.
-        watch = wait_mod.start(args.job_ids, args.host, load_settings())
+        watch = wait_mod.Watch(args.job_ids, args.host, load_settings())
         waited = wait_mod.block(
             watch, interval=args.interval, on_settled=lambda watched: announce(watched.line())
         )

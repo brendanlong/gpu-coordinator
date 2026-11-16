@@ -899,9 +899,7 @@ def test_a_verified_list_too_long_for_an_argument_travels_as_a_file(
         )
 
     session = FileSession([{"purged": [], "purge_skipped": [], "removed": []}])
-    clean_mod.purge_host(
-        mirrored_host(), Settings(), session=as_session(session), verify=True, s3_client=client
-    )
+    clean_mod.purge_host(as_session(session), verify=True, s3_client=client)
     (call,) = session.calls
     assert "--verified-file " in call and "--verified " not in call
     ((path, content),) = puts.items()
@@ -937,7 +935,7 @@ def test_verify_is_one_host_call_carrying_the_ids_the_mirror_has_a_log_for(
             "bucket/gpuc/gpubox/jobs/nolog/state.json": b"{}",
         }
     )
-    entry = mirrored_host()
+    mirrored_host()
     session = StubSession(
         [
             {
@@ -949,9 +947,7 @@ def test_verify_is_one_host_call_carrying_the_ids_the_mirror_has_a_log_for(
         ]
     )
     report = purge_host(
-        entry,
-        Settings(),
-        session=as_session(session),
+        as_session(session),
         older_than_days=7.0,
         verify=True,
         s3_client=client,
@@ -969,12 +965,10 @@ def test_verify_with_nothing_mirrored_still_passes_an_empty_verified_list(
 ) -> None:
     """`--verified ''` is "none of them are backed up", which must not collapse
     into leaving the flag off and letting the host trust its own records."""
-    entry = mirrored_host()
+    mirrored_host()
     session = StubSession([{"dry_run": True, "purged": []}])
     report = purge_host(
-        entry,
-        Settings(),
-        session=as_session(session),
+        as_session(session),
         only=["gone"],
         verify=True,
         dry_run=True,
@@ -996,13 +990,11 @@ def test_verify_asks_the_host_nothing_when_the_mirror_cannot_be_listed(
         def list_objects_v2(self, **_: Any) -> dict[str, Any]:
             raise RuntimeError("AccessDenied")
 
-    entry = mirrored_host()
+    mirrored_host()
     session = StubSession([])
     with pytest.raises(CleanError, match="AccessDenied"):
         purge_host(
-            entry,
-            Settings(),
-            session=as_session(session),
+            as_session(session),
             older_than_days=7.0,
             verify=True,
             s3_client=Refusing(),
@@ -1370,12 +1362,10 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
     """`--purge --all-finished --yes` is allowed, and never silent about it."""
     from gpuc.control.clean import clean_host
 
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession([{"dry_run": False, "purged": [purged_entry("old")], "freed_bytes": 1}])
     report = clean_host(
-        entry,
-        Settings(),
-        session=as_session(session),
+        as_session(session),
         purge=True,
         all_finished=True,
     )
@@ -1385,13 +1375,11 @@ def test_a_confirmed_horizon_zero_purge_says_what_it_is_doing(control_env: Path)
 
 def test_verify_with_force_passes_both_and_reports_the_forced_purge(control_env: Path) -> None:
     client = FakeS3Client()
-    entry = mirrored_host()
+    mirrored_host()
     forced = {**purged_entry("gone"), "forced": True}
     session = StubSession([{"dry_run": False, "purged": [forced], "freed_bytes": 1024}])
     report = purge_host(
-        entry,
-        Settings(),
-        session=as_session(session),
+        as_session(session),
         older_than_days=7.0,
         force=True,
         verify=True,
@@ -1428,12 +1416,10 @@ def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
     """Naming ids is the confirmation `--purge --all-finished` needs `--yes` for."""
     from gpuc.control.clean import clean_host
 
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession([{"dry_run": False, "purged": [purged_entry("a")], "freed_bytes": 1}])
     report = clean_host(
-        entry,
-        Settings(),
-        session=as_session(session),
+        as_session(session),
         purge=True,
         only=["a", "b"],
     )
@@ -1447,9 +1433,9 @@ def test_only_purges_the_named_jobs_at_horizon_zero_and_scopes_the_sweep(
 def test_only_without_purge_cleans_just_those_workdirs(control_env: Path) -> None:
     from gpuc.control.clean import clean_host
 
-    entry = host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
+    host_entry(name="gpubox", kind="ssh", ssh="me@gpubox", python="/usr/bin/python3")
     session = StubSession([{"dry_run": False, "removed": [], "freed_bytes": 0}])
-    clean_host(entry, Settings(), session=as_session(session), only=["a"])
+    clean_host(as_session(session), only=["a"])
     assert session.calls == ["clean --only a"]
 
 
@@ -1459,7 +1445,7 @@ def test_only_with_verify_names_the_jobs_and_what_the_mirror_vouches_for(
     """The host scopes purge and sweep to `--only`, and judges the backup by
     `--verified`: one call, both lists."""
     client = FakeS3Client(objects={"bucket/gpuc/gpubox/jobs/kept/log.txt": b"hello\n"})
-    entry = mirrored_host()
+    mirrored_host()
     session = StubSession(
         [
             {
@@ -1471,9 +1457,7 @@ def test_only_with_verify_names_the_jobs_and_what_the_mirror_vouches_for(
         ]
     )
     report = purge_host(
-        entry,
-        Settings(),
-        session=as_session(session),
+        as_session(session),
         only=["kept", "gone"],
         verify=True,
         s3_client=client,

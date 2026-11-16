@@ -269,17 +269,15 @@ class Dashboard:
         with nobody watching, so `forget_gone_rentals` is the CLI's alone."""
         settings = self.load_settings()
         read = read_registry()
-        recent = int_param(request, "recent", status_mod.RECENT_FINISHED)
-        since_s = since_seconds(request.param("since"), "since")
         result = status(
             read,
             settings,
             host=request.param("host") or None,
             all_jobs=flag_param(request, "all"),
-            recent=recent,
-            since_s=since_s,
+            recent=int_param(request, "recent", status_mod.RECENT_FINISHED),
+            since_s=since_seconds(request.param("since"), "since"),
         )
-        return Response.answer(result.answer(recent=recent, since_s=since_s), gathered_at=utc_now())
+        return Response.answer(result.answer(), gathered_at=utc_now())
 
     def api_hosts(self, request: Request) -> Response:
         read = read_registry()

@@ -33,7 +33,6 @@ from gpuc.control.actions import (
 )
 from gpuc.control.config import HostEntry, Settings, open_registry
 from gpuc.control.jsonout import note
-from gpuc.control.providers.base import Providers
 from gpuc.control.remote import Answered, HostSession, Unaskable, ask, open_session
 from gpuc.control.s3index import JobIndex
 from gpuc.control.status import JobView
@@ -182,49 +181,67 @@ class Watch:
 
     def __init__(
         self,
-        targets: Sequence[tuple[str, str, HostEntry | None]],
+        job_ids: Sequence[str],
+        host: str | None,
         settings: Settings,
         *,
-        providers: Providers | None = None,
-        sessions: dict[str, HostSession] | None = None,
-        gone: dict[str, str] | None = None,
-        unknown: dict[str, str] | None = None,
-        unaskable: dict[str, tuple[str, str]] | None = None,
         patient: bool = True,
     ) -> None:
-        """`targets` is `(job_id, host name, entry)`, the entry None for a host
-        this machine has forgotten; `gone` is the reason each host the locator
-        already found gone is not going to be asked at all; `unknown` is the
-        ids no host knows, settled before the first poll so the others are
-        still waited for and reported; `unaskable` maps an id to the host the
-        index names for it and why that host cannot be opened here, which is
-        a failure to report, not the mirror's moment."""
+        """Resolve each id to a host (`locate_many`). A host asked on the way
+        is kept: its session is the one the poll goes on using.
+
+        An id no host knows is settled before the first poll, so the others
+        are still waited for and reported; one whose host cannot be opened
+        here is a failure to report, not the mirror's moment; a host the
+        locator already found gone is never asked at all."""
         self.settings = settings
         self.patient = patient
-        self.providers = providers
-        self.index = JobIndex(self.settings)
-        self.entries = {host: entry for _, host, entry in targets if entry is not None}
-        self.gone = dict(gone or {})
-        self.jobs = {
-            job_id: Watched(job_id, host, mirror_prefix=self.index.mirror_prefix(job_id, entry))
-            for job_id, host, entry in targets
-        }
-        self.jobs.update(
-            {
-                job_id: Watched(job_id, NO_HOST, error=reason, missing=True)
-                for job_id, reason in (unknown or {}).items()
-            }
-        )
-        self.jobs.update(
-            {
-                job_id: Watched(job_id, host, error=reason, host_state="unaskable")
-                for job_id, (host, reason) in (unaskable or {}).items()
-            }
-        )
+        self.index = JobIndex(settings)
+        read = open_registry()
+        registry = read.named()
+        self.providers = providers_for(list(registry.hosts.values()), settings, note)
+        self.entries: dict[str, HostEntry] = {}
+        self.gone: dict[str, str] = {}
+        self.jobs: dict[str, Watched] = {}
         self.by_host: dict[str, list[str]] = {}
-        for job_id, host, _ in targets:
-            self.by_host.setdefault(host, []).append(job_id)
-        self._sessions: dict[str, HostSession] = dict(sessions or {})
+        self._sessions: dict[str, HostSession] = {}
+        # Deduplicated, so `xargs gpuc wait` on a list with a repeat in it
+        # neither polls twice nor prints the outcome twice.
+        placed = locate_many(
+            job_ids, registry, host, settings, providers=self.providers, skipped=read.skipped
+        )
+        for job_id, location in placed.items():
+            if isinstance(location, Unlocated):
+                # One typo in a list of twenty must not throw away the
+                # nineteen: it is reported with them, and makes the exit 4 --
+                # or 1, when a host that could not be asked may have it.
+                if location.missing:
+                    self.jobs[job_id] = Watched(
+                        job_id, NO_HOST, error=location.reason, missing=True
+                    )
+                else:
+                    self.jobs[job_id] = Watched(
+                        job_id, NO_HOST, error=location.reason, host_state="unaskable"
+                    )
+                continue
+            trouble = location.trouble
+            if location.entry is None and isinstance(trouble, Unaskable):
+                self.jobs[job_id] = Watched(
+                    job_id, location.host, error=trouble.reason, host_state="unaskable"
+                )
+                continue
+            self.jobs[job_id] = Watched(
+                job_id,
+                location.host,
+                mirror_prefix=self.index.mirror_prefix(job_id, location.entry),
+            )
+            self.by_host.setdefault(location.host, []).append(job_id)
+            if location.entry is not None:
+                self.entries[location.host] = location.entry
+            if location.session is not None:
+                self._sessions[location.host] = location.session
+            if trouble is not None and mirror_is_the_answer(trouble):
+                self.gone[location.host] = trouble.reason
         self._trouble: dict[str, tuple[float, str]] = {}
         self._dispatcher_warned: set[str] = set()
         self._announced: set[str] = set()
@@ -402,59 +419,6 @@ class Watch:
             note(f"host {name} is answering again")
 
 
-def start(
-    job_ids: Sequence[str],
-    host: str | None,
-    settings: Settings,
-    *,
-    patient: bool = True,
-) -> Watch:
-    """Resolve each id to a host (`locate_many`). A host asked on the way is
-    kept: its session is the one the poll goes on using."""
-    read = open_registry()
-    registry = read.named()
-    providers = providers_for(list(registry.hosts.values()), settings, note)
-    targets: list[tuple[str, str, HostEntry | None]] = []
-    sessions: dict[str, HostSession] = {}
-    gone: dict[str, str] = {}
-    unknown: dict[str, str] = {}
-    unaskable: dict[str, tuple[str, str]] = {}
-    # Deduplicated, so `xargs gpuc wait` on a list with a repeat in it
-    # neither polls twice nor prints the outcome twice.
-    placed = locate_many(
-        job_ids, registry, host, settings, providers=providers, skipped=read.skipped
-    )
-    for job_id, location in placed.items():
-        if isinstance(location, Unlocated):
-            # One typo in a list of twenty must not throw away the nineteen:
-            # it is reported with them, and makes the exit 4 -- or 1, when a
-            # host that could not be asked may have it.
-            if location.missing:
-                unknown[job_id] = location.reason
-            else:
-                unaskable[job_id] = (NO_HOST, location.reason)
-            continue
-        trouble = location.trouble
-        if location.entry is None and isinstance(trouble, Unaskable):
-            unaskable[job_id] = (location.host, trouble.reason)
-            continue
-        targets.append((job_id, location.host, location.entry))
-        if location.session is not None:
-            sessions[location.host] = location.session
-        if trouble is not None and mirror_is_the_answer(trouble):
-            gone[location.host] = trouble.reason
-    return Watch(
-        targets,
-        settings,
-        providers=providers,
-        sessions=sessions,
-        gone=gone,
-        unknown=unknown,
-        unaskable=unaskable,
-        patient=patient,
-    )
-
-
 def look(
     job_ids: Sequence[str],
     host: str | None,
@@ -464,7 +428,7 @@ def look(
     stands. Exit 4 for an id no host has and 1 for one that could not be
     asked about, after the rest have been reported; how the jobs themselves
     went is the answer, not the exit code."""
-    watch = start(job_ids, host, settings, patient=False)
+    watch = Watch(job_ids, host, settings, patient=False)
     watch.poll()
     looked = [watch.jobs[job_id] for job_id in dict.fromkeys(job_ids)]
     errors = [job.error for job in looked if job.error is not None]

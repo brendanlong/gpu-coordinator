@@ -1372,6 +1372,7 @@ def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
             "before_bytes": 18874368 * 1024,
             "after_bytes": 11534336 * 1024,
             "freed_bytes": (18874368 - 11534336) * 1024,
+            "errors": [],
         },
     }
 

@@ -305,7 +305,7 @@ def test_an_interrupt_before_the_first_poll_is_reported_too(
     def interrupted(*_args: Any, **_kwargs: Any) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(wait_mod, "start", interrupted)
+    monkeypatch.setattr(wait_mod, "locate_many", interrupted)
     assert main(["wait", JOB, "--json"]) == EXIT_INTERRUPTED
     document = json.loads(capsys.readouterr().out)
     assert document["exit_code"] == EXIT_INTERRUPTED

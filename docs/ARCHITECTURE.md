@@ -68,7 +68,6 @@ gpuc/
     version.py     # this build's commit, and comparing it with a host's
     jsonout.py     # the `--json` rules
     skill.py       # `gpuc skill`: the agent guide, from the wheel or the checkout
-    systemd.py     # what `web serve --install` needs of systemd: unit dir, ExecStart, write
     web/           # `gpuc web`: stdlib http.server, bcrypt login, a static page over the same documents
     providers/
       base.py      # Provider interface: offers(constraints), create, get, logs, terminate, list

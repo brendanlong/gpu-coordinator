@@ -696,7 +696,7 @@ def test_serve_install_refuses_a_bind_that_would_rewrite_the_unit(
 
 
 def test_exec_start_words_are_quoted_the_way_systemd_reads_them() -> None:
-    from gpuc.control.systemd import quote
+    from gpuc.control.web.service import quote
 
     assert quote("/home/me/.local/bin/gpuc") == "/home/me/.local/bin/gpuc"
     assert quote("--bind") == "--bind"
