@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from snakemake_executor_plugin_gpuc import GpucError, job_name, truthy
-from tests.conftest import wait_until
+from tests.conftest import git_commit, wait_until
 from tests.test_control_e2e import bootstrapped_home, state_of
 
 __all__ = ["bootstrapped_home"]
@@ -61,15 +61,7 @@ def project(tmp_path: Path) -> Path:
     root.mkdir()
     (root / "Snakefile").write_text(SNAKEFILE)
     (root / ".gitignore").write_text(".snakemake/\n")
-    for argv in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "t@example.com"],
-        ["git", "config", "user.name", "t"],
-        ["git", "add", "-A"],
-        ["git", "commit", "-qm", "init"],
-    ):
-        subprocess.run(argv, cwd=root, check=True, capture_output=True)
-    return root
+    return git_commit(root)
 
 
 def snakemake_argv(results: Path, *targets: str) -> list[str]:

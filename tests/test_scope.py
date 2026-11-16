@@ -19,6 +19,7 @@ from gpuc.control.status import HostState, HostView, host_json, job_views
 from gpuc.host import jobs, paths, queue, runner, scope
 from gpuc.host.runner import RunnerDeps
 from tests.conftest import FAKE_GPUS, fake_smi, host_entry, make_spec
+from tests.test_runner import deps
 
 pytestmark = pytest.mark.usefixtures("gpuc_home")
 
@@ -121,9 +122,7 @@ def test_a_pgid_host_records_its_isolation_and_a_clean_phase_logs_no_leftovers(
 ) -> None:
     monkeypatch.setenv(scope.ISOLATION_ENV, scope.PGID)
     job_id = prepare("true")
-    runner.run_job(
-        job_id, [FAKE_GPUS[0]], 1, RunnerDeps(smi=fake_smi(), preflight=False, poll_interval_s=0.02)
-    )
+    runner.run_job(job_id, [FAKE_GPUS[0]], 1, deps())
     state = jobs.read_state(job_id)
     assert (state.isolation, state.cgroup_unit) == ("pgid", None)
     assert "leftover" not in paths.log_file(job_id).read_text()

@@ -16,11 +16,11 @@ import pytest
 
 from gpuc.control.actions import PROVIDERS
 from gpuc.control.cli import main
-from gpuc.control.config import config_file, registry_transaction
+from gpuc.control.config import config_file
 from gpuc.control.exits import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK
 from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
-from tests.conftest import ago, host_entry, load_registry, stub_wait_sleep
+from tests.conftest import ago, load_registry, register_host, stub_wait_sleep
 from tests.fakeprovider import FakeProvider
 from tests.fakes3 import fake_s3
 
@@ -181,12 +181,7 @@ def test_status_lists_a_terminated_rentals_jobs_from_the_mirror_and_forgets_it(
     control_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mirror(monkeypatch, {JOB: succeeded(minutes=5)})
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name=POD, kind="rental", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=PREFIX
-            )
-        )
+    register_host(name=POD, kind="rental", pod_id="pod-1", ssh="root@1.2.3.4", s3_prefix=PREFIX)
     ended = Pod(id="pod-1", name=POD, status="TERMINATED", cost_usd_hr=0.0)
     monkeypatch.setitem(PROVIDERS, "runpod", lambda *_: FakeProvider(existing=[ended]))
     assert main(["status"]) == EXIT_OK
@@ -221,8 +216,7 @@ def test_a_typod_host_for_a_job_the_index_puts_elsewhere_is_no_such_host(
     """Otherwise the mirror's stale copy of a job still running on its real
     host would be printed as the answer, or the job reported lost."""
     mirror(monkeypatch, {JOB: {"status": "running", "started_at": ago(hours=1)}}, host="box")
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="box", kind="ssh", ssh="me@box"))
+    register_host(name="box", kind="ssh", ssh="me@box")
     for command in ("logs", "wait", "cancel"):
         assert main([command, JOB, "--host", "boxx"]) == EXIT_NOT_FOUND, command
         captured = capsys.readouterr()

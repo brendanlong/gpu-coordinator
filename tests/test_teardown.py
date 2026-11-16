@@ -8,11 +8,11 @@ from typing import Any
 import pytest
 
 from gpuc.control import teardown
-from gpuc.control.config import HostNotFound, Settings, registry_transaction
+from gpuc.control.config import HostNotFound, Settings
 from gpuc.control.providers.base import ProviderError
 from gpuc.control.remote import RemoteError
 from gpuc.host.jobs import HostConfig
-from tests.conftest import host_entry, load_registry
+from tests.conftest import load_registry, register_host
 from tests.fakeprovider import FakeProvider, PodScript, running_pod
 
 FOREIGN = "other-someone-else"
@@ -27,16 +27,13 @@ def provider() -> FakeProvider:
 
 
 def register(name: str = "gpuc-e2e-aaa", pod_id: str = "pod1") -> None:
-    with registry_transaction() as registry:
-        registry.put(
-            host_entry(
-                name=name,
-                kind="rental",
-                pod_id=pod_id,
-                ssh="root@1.2.3.4",
-                python="/root/python",
-            )
-        )
+    register_host(
+        name=name,
+        kind="rental",
+        pod_id=pod_id,
+        ssh="root@1.2.3.4",
+        python="/root/python",
+    )
 
 
 def host_payload(**overrides: Any) -> dict[str, Any]:
@@ -231,8 +228,7 @@ def test_somebody_elses_pod_is_not_ours_to_end(control_env: Path, provider: Fake
 
 
 def test_a_non_rental_host_has_nothing_to_terminate(control_env: Path) -> None:
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="gpubox", kind="ssh", ssh="me@gpubox"))
+    register_host(name="gpubox", kind="ssh", ssh="me@gpubox")
 
     with pytest.raises(teardown.TerminateRefused) as error:
         terminate(FakeProvider(), "gpubox")

@@ -10,9 +10,9 @@ import pytest
 from gpuc.host import destinations, jobs, paths, preflight, queue, runner
 from gpuc.host.destinations import S3, HuggingFace
 from gpuc.host.jobs import HostConfig
-from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import FAKE_GPUS, make_spec
+from tests.test_runner import deps
 
 
 class FakeRunner:
@@ -33,11 +33,6 @@ class FakeRunner:
         return CommandResult(argv, 0, "")
 
 
-@pytest.fixture
-def tools(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/usr/bin/{name}")
-
-
 def copied_to(commands: Sequence[list[str]]) -> list[str]:
     return [argv[-2] for argv in commands if argv[1:3] == ["s3", "cp"]]
 
@@ -52,14 +47,14 @@ def repo_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(destinations, "hf_repo_exists", lambda repo, env=None: False)
 
 
-def test_nothing_is_checked_without_outputs_or_a_mirror(gpuc_home: Path, tools: None) -> None:
+def test_nothing_is_checked_without_outputs_or_a_mirror(gpuc_home: Path, fake_aws: None) -> None:
     fake = FakeRunner()
     assert preflight.run(make_spec(), HostConfig(host="h"), runner=fake, env={}) == []
     assert fake.commands == []
 
 
 def test_every_s3_output_and_the_host_mirror_get_a_preflight_object(
-    gpuc_home: Path, tools: None
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/exp/{job_id}/results"}])
     config = HostConfig(host="h", s3_prefix="s3://bucket/gpuc/h")
@@ -75,7 +70,9 @@ def test_every_s3_output_and_the_host_mirror_get_a_preflight_object(
     ]
 
 
-def test_a_mirror_alone_is_checked_for_a_job_with_no_outputs(gpuc_home: Path, tools: None) -> None:
+def test_a_mirror_alone_is_checked_for_a_job_with_no_outputs(
+    gpuc_home: Path, fake_aws: None
+) -> None:
     spec = make_spec()
     fake = FakeRunner()
     checked = preflight.run(
@@ -96,7 +93,7 @@ def test_a_missing_aws_binary_fails_with_the_command(
     assert "not found" in caught.value.detail
 
 
-def test_a_denied_write_names_the_destination(gpuc_home: Path, tools: None) -> None:
+def test_a_denied_write_names_the_destination(gpuc_home: Path, fake_aws: None) -> None:
     fake = FakeRunner(fail_on="s3://bucket/gpuc", output="An error occurred (AccessDenied)")
     with pytest.raises(preflight.PreflightFailed) as caught:
         preflight.run(
@@ -125,7 +122,7 @@ def test_targets_are_every_output_destination_then_the_mirror(gpuc_home: Path) -
 
 
 def test_hf_outputs_check_the_token_and_write_a_preflight_file(
-    gpuc_home: Path, tools: None, repo_found: None
+    gpuc_home: Path, fake_aws: None, repo_found: None
 ) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/repo", "hf_path": "{job_id}"}])
     fake = FakeRunner()
@@ -141,7 +138,7 @@ def test_hf_outputs_check_the_token_and_write_a_preflight_file(
 
 
 def test_a_bad_hf_token_fails_before_the_job_runs(
-    gpuc_home: Path, tools: None, repo_found: None
+    gpuc_home: Path, fake_aws: None, repo_found: None
 ) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/repo"}])
     fake = FakeRunner(fail_on="auth whoami", output="Invalid user token")
@@ -152,7 +149,7 @@ def test_a_bad_hf_token_fails_before_the_job_runs(
 
 
 def test_a_missing_repo_fails_unless_hf_create_is_set(
-    gpuc_home: Path, tools: None, repo_missing: None
+    gpuc_home: Path, fake_aws: None, repo_missing: None
 ) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/new"}])
     fake = FakeRunner()
@@ -162,7 +159,7 @@ def test_a_missing_repo_fails_unless_hf_create_is_set(
     assert not any("repos" in " ".join(argv) for argv in fake.commands)
 
 
-def test_hf_create_creates_the_repo(gpuc_home: Path, tools: None, repo_missing: None) -> None:
+def test_hf_create_creates_the_repo(gpuc_home: Path, fake_aws: None, repo_missing: None) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/new", "hf_create": True}])
     fake = FakeRunner()
     preflight.run(spec, HostConfig(host="h"), runner=fake, env={})
@@ -170,7 +167,7 @@ def test_hf_create_creates_the_repo(gpuc_home: Path, tools: None, repo_missing: 
 
 
 def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
-    gpuc_home: Path, tools: None
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     jobs.write_config(HostConfig(host="test-host", s3_prefix="s3://bucket/gpuc/h"))
     spec = make_spec(command="echo SHOULD-NOT-RUN")
@@ -181,7 +178,7 @@ def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=fake, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=fake),
     )
 
     state = jobs.read_state(job_id)
@@ -191,7 +188,7 @@ def test_a_failed_preflight_fails_the_job_with_the_command_in_the_log(
     assert "aws s3 cp" in log and "NoSuchBucket" in log
 
 
-def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, tools: None) -> None:
+def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="test-host", s3_prefix="s3://bucket/gpuc/h"))
     spec = make_spec(command="echo RAN")
     job_id = queue.enqueue(spec)
@@ -200,9 +197,7 @@ def test_a_healthy_preflight_lets_the_job_run(gpuc_home: Path, tools: None) -> N
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(
-            smi=fake_smi(), command_runner=FakeRunner(), preflight=False, poll_interval_s=0.02
-        ),
+        deps(command_runner=FakeRunner()),
     )
 
     assert (code, jobs.read_state(job_id).status) == (0, "succeeded")

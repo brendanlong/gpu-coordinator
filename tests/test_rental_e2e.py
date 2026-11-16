@@ -12,7 +12,6 @@ from __future__ import annotations
 import configparser
 import os
 import shutil
-import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -33,7 +32,7 @@ from gpuc.control.providers.base import Offer, Pod, Provider
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.providers.vast import VastProvider
 from gpuc.control.s3index import LocalIndex
-from tests.conftest import load_registry
+from tests.conftest import git_commit, load_registry
 
 pytestmark = pytest.mark.rental
 
@@ -152,15 +151,7 @@ def workdir(tmp_path: Path) -> Path:
     (root / "pyproject.toml").write_text(PYPROJECT)
     (root / "README.md").write_text("gpuc live test project\n")
     (root / "job.yaml").write_text(JOB)
-    for argv in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "t@example.com"],
-        ["git", "config", "user.name", "gpuc"],
-        ["git", "add", "-A"],
-        ["git", "commit", "-qm", "e2e"],
-    ):
-        subprocess.run(argv, cwd=root, check=True, capture_output=True)
-    return root
+    return git_commit(root)
 
 
 @pytest.fixture

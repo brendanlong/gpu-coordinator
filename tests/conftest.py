@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -29,7 +30,7 @@ from gpuc.control.config import (
     registry_transaction,
 )
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.host import jobs, paths, queue, scope
+from gpuc.host import destinations, jobs, paths, queue, scope
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
 from tests import fake_nvidia_smi
 
@@ -71,6 +72,12 @@ def empty_caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+
+
+@pytest.fixture
+def fake_aws(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`aws` and `hf` found at `/fake/<name>`, whatever is installed here."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
 
 
 @pytest.fixture
@@ -166,10 +173,31 @@ def register_host(*, gpus: str | list[str] | None = None, **fields: Any) -> Host
     return entry
 
 
-def _gpus(gpus: str | list[str] | None) -> list[str]:
+def _gpus(gpus: str | list[str] | None) -> list[str] | None:
     if isinstance(gpus, str):
         return [part for part in gpus.split(",") if part]
-    return list(gpus or [])
+    return None if gpus is None else list(gpus)
+
+
+def git_commit(root: Path, *paths: str) -> Path:
+    """Make `root` a git repository with `paths` (default: everything) committed."""
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "t"],
+        ["git", "add", *(paths or ["-A"])],
+        ["git", "commit", "-qm", "init"],
+    ):
+        subprocess.run(argv, cwd=root, check=True, capture_output=True)
+    return root
+
+
+def document_of(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    """stdout must be exactly one JSON object, whatever else the command said."""
+    document = json.loads(capsys.readouterr().out)
+    assert isinstance(document, dict)
+    assert document["schema_version"] == 2
+    return document
 
 
 def accept_job(spec: JobSpec, **state: Any) -> str:

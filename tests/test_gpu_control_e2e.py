@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -15,7 +14,7 @@ import pytest
 
 from gpuc.control.cli import main
 from gpuc.host import gpus
-from tests.conftest import LOCAL_GPU_UUID, requires_gpu, wait_until
+from tests.conftest import LOCAL_GPU_UUID, git_commit, requires_gpu, wait_until
 from tests.test_control_e2e import (
     HEALTH_ARGS,
     SHARED_UV_CACHE,
@@ -45,15 +44,7 @@ def torch_workdir(tmp_path: Path, torch_project: Path) -> Path:
     for name in ("pyproject.toml", "uv.lock"):
         shutil.copy(torch_project / name, root / name)
     (root / "README.md").write_text("test project\n")
-    for argv in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "t@example.com"],
-        ["git", "config", "user.name", "t"],
-        ["git", "add", "-A"],
-        ["git", "commit", "-qm", "init"],
-    ):
-        subprocess.run(argv, cwd=root, check=True, capture_output=True)
-    return root
+    return git_commit(root)
 
 
 @pytest.fixture

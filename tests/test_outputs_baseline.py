@@ -6,13 +6,11 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-import pytest
-
-from gpuc.host import baseline, destinations, jobs, paths, queue, runner
+from gpuc.host import baseline, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig
-from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import FAKE_GPUS, make_spec
+from tests.test_runner import deps
 
 
 class Recorder:
@@ -48,19 +46,16 @@ def prepare(gpuc_home: Path, command: str, **overrides: object) -> tuple[str, Pa
     return job_id, results
 
 
-@pytest.fixture
-def aws(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
-
-
-def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(gpuc_home: Path, aws: None) -> None:
+def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(
+    gpuc_home: Path, fake_aws: None
+) -> None:
     job_id, _ = prepare(gpuc_home, "echo produced > results/new.txt")
     recorder = Recorder()
     code = runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=recorder),
     )
     assert (code, jobs.read_state(job_id).status) == (0, "succeeded")
     assert "report-elephant.md" in recorder.excluded()
@@ -68,7 +63,7 @@ def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(gpuc_home: Path, a
     assert jobs.read_state(job_id).outputs_uploaded(jobs.read_spec(job_id))
 
 
-def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, aws: None) -> None:
+def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, fake_aws: None) -> None:
     job_id, _ = prepare(gpuc_home, "echo rewritten > results/report-elephant.md")
     recorder = Recorder()
     assert (
@@ -76,23 +71,23 @@ def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, aws: None) ->
             job_id,
             [FAKE_GPUS[0]],
             1,
-            RunnerDeps(
-                smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
-            ),
+            deps(command_runner=recorder),
         )
         == 0
     )
     assert "report-elephant.md" not in recorder.excluded()
 
 
-def test_a_job_that_produced_nothing_new_fails_as_no_outputs(gpuc_home: Path, aws: None) -> None:
+def test_a_job_that_produced_nothing_new_fails_as_no_outputs(
+    gpuc_home: Path, fake_aws: None
+) -> None:
     job_id, _ = prepare(gpuc_home, "true")
     recorder = Recorder()
     code = runner.run_job(
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=recorder),
     )
     state = jobs.read_state(job_id)
     assert (code, state.status, state.reason) == (1, "failed", "no-outputs")
@@ -102,7 +97,7 @@ def test_a_job_that_produced_nothing_new_fails_as_no_outputs(gpuc_home: Path, aw
 
 
 def test_the_baseline_is_taken_before_setup_so_setup_output_counts(
-    gpuc_home: Path, aws: None
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id, _ = prepare(gpuc_home, "true", setup="echo from-setup > results/setup.txt")
     recorder = Recorder()
@@ -111,9 +106,7 @@ def test_the_baseline_is_taken_before_setup_so_setup_output_counts(
             job_id,
             [FAKE_GPUS[0]],
             1,
-            RunnerDeps(
-                smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
-            ),
+            deps(command_runner=recorder),
         )
         == 0
     )
@@ -144,7 +137,7 @@ def test_a_file_restored_with_the_same_mtime_is_still_baseline(gpuc_home: Path) 
     assert not baseline.has_new_content(results, entries)
 
 
-def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, aws: None) -> None:
+def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="h", s3_prefix=None))
     job_id, _ = prepare(gpuc_home, "sleep 0.1; echo late > results/late.txt")
     recorder = Recorder()
@@ -152,7 +145,7 @@ def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, aws: None) -> N
         job_id,
         [FAKE_GPUS[0]],
         1,
-        RunnerDeps(smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02),
+        deps(command_runner=recorder),
     )
     # The final pass drops the min-age exclusions but keeps the baseline ones.
     final = recorder.uploads()[-1]
@@ -161,7 +154,7 @@ def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, aws: None) -> N
 
 
 def test_a_preempted_re_run_keeps_the_baseline_the_first_attempt_took(
-    gpuc_home: Path, aws: None
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """Re-scanned at the start of attempt 2, the files attempt 1 produced would
     be recorded as files the *checkout* arrived with -- so this attempt would
@@ -169,17 +162,15 @@ def test_a_preempted_re_run_keeps_the_baseline_the_first_attempt_took(
     `no-outputs` with its results sitting right there."""
     job_id, results = prepare(gpuc_home, "true")
     recorder = Recorder()
-    deps = RunnerDeps(
-        smi=fake_smi(), command_runner=recorder, preflight=False, poll_interval_s=0.02
-    )
-    runner.run_job(job_id, [FAKE_GPUS[0]], 1, deps)
+    job_deps = deps(command_runner=recorder)
+    runner.run_job(job_id, [FAKE_GPUS[0]], 1, job_deps)
     first = baseline.read(job_id)
     assert "report-elephant.md" in first["results"]
 
     # ...and then a preempted attempt leaves a checkpoint of its own behind.
     (results / "ckpt-100.bin").write_text("weights\n")
     jobs.update_state(job_id, status="queued", attempt=2, ended_at=None)
-    runner.run_job(job_id, [FAKE_GPUS[0]], 2, deps)
+    runner.run_job(job_id, [FAKE_GPUS[0]], 2, job_deps)
 
     assert baseline.read(job_id) == first
     assert "ckpt-100.bin" not in baseline.read(job_id)["results"]

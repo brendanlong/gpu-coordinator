@@ -956,12 +956,11 @@ def test_a_preempted_job_keeps_its_workdir_whatever_its_policy_says(gpuc_home: P
 
 
 def test_the_runner_keeps_a_workdir_holding_outputs_that_never_reached_anywhere(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """`cleanup: always` is not a licence to delete the only copy of a result:
     the runner's delete goes through the same predicate as every other, and a
     workdir whose `outputs:` are still pending stays whatever the policy says."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     from gpuc.host.sync import CommandResult
 
     def failing(argv: list[str], _timeout: float | None, _env: object) -> CommandResult:

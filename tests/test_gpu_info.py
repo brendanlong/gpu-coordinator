@@ -9,7 +9,7 @@ from gpuc.control.config import HostEntry, registry_transaction
 from gpuc.control.gpuinfo import GpuInfo, from_table, rows, summarize, table_of, vram_text
 from gpuc.control.status import CardView, HostState, HostView, JobView, render
 from gpuc.host import gpus
-from tests.conftest import host_entry, load_registry
+from tests.conftest import host_entry, load_registry, register_host
 
 SMI_OUTPUT = """\
 0, GPU-80646905-50a9-afc1-4375-43ca475b15e4, NVIDIA A40, 46068
@@ -89,8 +89,7 @@ def test_status_names_the_cards_and_who_holds_them() -> None:
 
 
 def test_a_host_registered_before_gpu_info_existed_still_lists(control_env: Path, capsys) -> None:
-    with registry_transaction() as registry:
-        registry.put(host_entry(name="old", gpus=["GPU-x"]))
+    register_host(name="old", gpus=["GPU-x"])
     assert main(["host", "list"]) == 0
     out = capsys.readouterr().out
     assert "gpus 1 (1x unknown GPU)" in out
