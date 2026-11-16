@@ -131,11 +131,6 @@ def gather(
     provider not in `providers` was not asked."""
     view = PodsView(notes=[f"not asked, {why}" for why in missing or []])
     registry = open_registry().registry
-    by_pod_id = {
-        (e.rental.provider, e.rental.pod_id): e
-        for e in registry.hosts.values()
-        if e.rental is not None
-    }
     for provider in providers.values():
         try:
             pods = provider.list()
@@ -146,7 +141,7 @@ def gather(
         ours_ids = {pod.id for pod in ours}
         view.others += [(provider.name, pod) for pod in pods if pod.id not in ours_ids]
         for pod in ours:
-            entry = by_pod_id.get((provider.name, pod.id))
+            entry = registry.rental(provider.name, pod.id)
             # Only bootstrapped, running hosts can answer; anything else costs an ssh timeout.
             age = (
                 heartbeat_age(entry, settings)

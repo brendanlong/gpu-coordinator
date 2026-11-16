@@ -644,8 +644,7 @@ def test_an_interrupted_follow_is_never_exit_zero(
 
 def test_a_follow_retries_a_log_that_is_not_written_yet_and_a_read_does_not() -> None:
     """A plain read must fail on a missing log: that is what sends it to S3."""
-    assert tail_command("/j/log.txt", 10, follow=True, retry=True).startswith("tail -F ")
-    assert tail_command("/j/log.txt", 10, follow=True).startswith("tail -f ")
+    assert tail_command("/j/log.txt", 10, follow=True).startswith("tail -F ")
     assert tail_command("/j/log.txt", 10).startswith("tail -n ")
 
 

@@ -249,6 +249,21 @@ def test_a_key_that_may_not_create_stops_at_the_first_offer(
     assert len(provider.created) == 1
 
 
+@pytest.mark.parametrize("clouds", [("SECURE", "COMMUNITY"), ()])
+def test_no_offers_suggests_another_tier_only_where_the_provider_has_tiers(
+    control_env: Path,
+    ssh_key: Path,
+    host: FakeHost,
+    offline_health: HealthOptions,
+    clouds: tuple[str, ...],
+) -> None:
+    provider = FakeProvider([])
+    provider.clouds = clouds  # type: ignore[assignment]
+    with pytest.raises(ProvisionError, match="no offers match") as error:
+        run(provider, host, offline_health)
+    assert ("--cloud" in str(error.value)) == bool(clouds)
+
+
 def test_broken_host_log_terminates_and_replaces(
     control_env: Path, ssh_key: Path, host: FakeHost, offline_health: HealthOptions
 ) -> None:

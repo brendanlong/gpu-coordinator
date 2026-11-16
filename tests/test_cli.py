@@ -475,7 +475,9 @@ def test_submit_without_a_host_says_which_flag_is_missing(
 ) -> None:
     job = tmp_path / "job.yaml"
     job.write_text("command: true\n")
-    assert main(["submit", str(job)]) == EXIT_USAGE
+    with pytest.raises(SystemExit) as exc:
+        main(["submit", str(job)])
+    assert exc.value.code == EXIT_USAGE
     assert "--host" in capsys.readouterr().err
 
 

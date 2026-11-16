@@ -826,7 +826,7 @@ def cmd_set(args: argparse.Namespace) -> Answer:
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
     # `-F`, not `-f`: `gpuc submit && gpuc logs -f` is the obvious pair to type,
     # and a job that has not been dispatched yet has no log.txt to open.
-    return transport.argv(tail_command(remote_path, lines, follow=True, retry=True))
+    return transport.argv(tail_command(remote_path, lines, follow=True))
 
 
 def check_interval(args: argparse.Namespace, *, polls: bool) -> None:
@@ -1371,7 +1371,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit = sub.add_parser("submit", help="submit a job file to a host")
     submit.add_argument("job_file")
     submit.add_argument(
-        "--host", metavar="NAME", help="a registered host to submit to (see `gpuc host list`)"
+        "--host",
+        required=True,
+        metavar="NAME",
+        help="a registered host to submit to (see `gpuc host list`, or `gpuc host rent` for a "
+        "new one)",
     )
     submit.add_argument(
         "--use-shared",

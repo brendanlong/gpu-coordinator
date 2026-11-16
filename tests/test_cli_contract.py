@@ -1051,11 +1051,9 @@ def test_a_ctrl_c_is_exit_130_and_a_document_whoever_was_running(
 
 
 def test_a_usage_error_under_json_is_a_document_too(
-    control_env: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    job = tmp_path / "job.yaml"
-    job.write_text('command: "true"\n')
-    assert main(["submit", str(job), "--json"]) == EXIT_USAGE
+    assert main(["host", "clean", "local", "--json"]) == EXIT_USAGE
     assert json.loads(capsys.readouterr().out)["exit_code"] == EXIT_USAGE
 
 

@@ -716,7 +716,7 @@ anything (exit 3, a `.bak` kept).
 The table is in usage.md. The contract behind it: **a command reports
 everything it found out and exits non-zero if any part of it failed.** Every
 action returns an `Answer` carrying its document and its failures, and one
-function (`actions.exit_code_of`) turns that into a code: unknown local state
+function (`actions.Answer.exit_code`) turns that into a code: unknown local state
 is 3, a relayed outcome (a job's, a remote command's) is itself, any failure
 is 1, else 0; `exits.http_status` is the one table from those codes to HTTP
 statuses (0 → 200, 1 → 500, 2 → 400, 3 → 503, 4 → 404). What an `Unaskable` or

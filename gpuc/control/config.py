@@ -521,8 +521,18 @@ class Registry(TolerantModel):
             )
         return entry
 
-    def listing(self) -> list[HostEntry]:
-        return list(self.hosts.values())
+    def rental(self, provider: str, pod_id: str) -> HostEntry | None:
+        """The entry for a pod named by id. By provider as well: two providers
+        can each have a pod `4242`."""
+        return next(
+            (
+                entry
+                for entry in self.hosts.values()
+                if entry.rental is not None
+                and (entry.rental.provider, entry.rental.pod_id) == (provider, pod_id)
+            ),
+            None,
+        )
 
     def put(self, entry: HostEntry) -> None:
         self.hosts[entry.name] = entry

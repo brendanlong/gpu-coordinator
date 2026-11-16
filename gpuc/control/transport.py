@@ -278,13 +278,10 @@ class SshTransport:
         options += ["-p", str(self.port)]
         return options
 
-    def ssh_argv(self, command: str) -> list[str]:
+    def argv(self, command: str) -> list[str]:
         # The remote login shell may be anything; bash -c makes the command we
         # send mean the same thing everywhere, without sourcing a profile.
         return ["ssh", *self.ssh_options(), self.target, f"bash -c {shlex.quote(command)}"]
-
-    def argv(self, command: str) -> list[str]:
-        return self.ssh_argv(command)
 
     def interactive_argv(self, command: str) -> list[str]:
         """`-t` forces a tty: without it the remote shell has no job control,
@@ -312,7 +309,7 @@ class SshTransport:
         self, command: str, *, timeout: float = DEFAULT_TIMEOUT_S, check: bool = True
     ) -> CommandResult:
         self._prepare()
-        return _execute(self.host, self.ssh_argv(command), timeout=timeout, check=check)
+        return _execute(self.host, self.argv(command), timeout=timeout, check=check)
 
     def put_file_argv(self, remote_path: str, mode: int = 0o600) -> list[str]:
         quoted = shlex.quote(remote_path)
@@ -321,7 +318,7 @@ class SshTransport:
         # beside the target and renamed over it, as `LocalTransport` does, so a
         # reader never sees it half-written: the dispatcher's `aws` reads
         # `~/.aws/credentials` while a submit replaces it.
-        return self.ssh_argv(
+        return self.argv(
             f'dir="$(dirname {quoted})" && mkdir -p "$dir" && tmp="$dir/.gpuc-put.$$" && '
             f'{{ (umask 077 && cat > "$tmp") && chmod {mode:o} "$tmp" && mv -fT "$tmp" {quoted} '
             f'|| {{ rm -f "$tmp"; exit 1; }}; }}'
@@ -368,17 +365,15 @@ class SshTransport:
         )
 
 
-def tail_command(
-    remote_path: str, lines: int = 200, follow: bool = False, retry: bool = False
-) -> str:
+def tail_command(remote_path: str, lines: int = 200, follow: bool = False) -> str:
     """The one `tail` line both transports (and `gpuc logs -f`) send.
 
-    `retry` waits for a log that is not there yet instead of failing, which is
-    what a follow of a job still in the queue needs and what a plain read must
-    not do: a missing log is exactly the non-zero exit that sends `gpuc logs`
-    to the S3 mirror.
+    A follow is `-F`, which waits for a log that is not there yet instead of
+    failing: what a follow of a job still in the queue needs, and what a plain
+    read must not do, since a missing log is exactly the non-zero exit that
+    sends `gpuc logs` to the S3 mirror.
     """
-    flags = "-F " if follow and retry else "-f " if follow else ""
+    flags = "-F " if follow else ""
     return f"tail {flags}-n {lines} {shlex.quote(remote_path)}"
 
 
