@@ -18,6 +18,7 @@ from gpuc.control.transport import (
     SshUnusable,
     TransportError,
 )
+from tests.conftest import git_commit
 
 # A real ControlPath has to fit in sun_path, so the fixtures use a short one;
 # pytest's own tmp_path is deliberately too long (see the control-path tests).
@@ -320,15 +321,7 @@ def repo_with(root: Path, files: dict[str, str], commit: list[str]) -> Path:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
-    for argv in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "t@example.com"],
-        ["git", "config", "user.name", "t"],
-        ["git", "add", *commit],
-        ["git", "commit", "-qm", "init"],
-    ):
-        subprocess.run(argv, cwd=root, check=True, capture_output=True)
-    return root
+    return git_commit(root, *commit)
 
 
 def test_untracked_files_are_synced_and_ignored_ones_are_not(tmp_path: Path) -> None:

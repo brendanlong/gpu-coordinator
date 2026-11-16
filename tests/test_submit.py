@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -27,7 +26,7 @@ from gpuc.control.submit import (
 from gpuc.control.submit import submit_spec as submit_prepared
 from gpuc.control.transport import CommandResult
 from gpuc.host import gpus, jobs
-from tests.conftest import host_entry
+from tests.conftest import git_commit, host_entry
 from tests.fakes3 import FakeS3Client
 
 REMOTE_HOME = "/home/u/.gpuc"
@@ -131,15 +130,7 @@ def repo(tmp_path: Path) -> Path:
     (root / "big.bin").write_text("ignored junk\n")
     (root / ".venv").mkdir()
     (root / ".venv" / "huge").write_text("x" * 100)
-    for argv in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "t@example.com"],
-        ["git", "config", "user.name", "t"],
-        ["git", "add", "src/train.py"],
-        ["git", "commit", "-qm", "init"],
-    ):
-        subprocess.run(argv, cwd=root, check=True, capture_output=True)
-    return root
+    return git_commit(root, "src/train.py")
 
 
 def job_document(**overrides: Any) -> dict[str, Any]:

@@ -178,6 +178,19 @@ def _gpus(gpus: str | list[str] | None) -> list[str]:
     return list(gpus or [])
 
 
+def git_commit(root: Path, *paths: str) -> Path:
+    """Make `root` a git repository with `paths` (default: everything) committed."""
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "t"],
+        ["git", "add", *(paths or ["-A"])],
+        ["git", "commit", "-qm", "init"],
+    ):
+        subprocess.run(argv, cwd=root, check=True, capture_output=True)
+    return root
+
+
 def accept_job(spec: JobSpec, **state: Any) -> str:
     """A job on the host, accepted the way `gpuc submit` gets one accepted
     (`queue.enqueue`: spec and initial state written under `incoming/`, then

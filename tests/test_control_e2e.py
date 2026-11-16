@@ -27,6 +27,7 @@ from gpuc.host.dispatcher import LockBody
 from tests.conftest import (
     FAKE_GPUS,
     fake_cuda_env,
+    git_commit,
     install_fake_nvidia_smi,
     load_registry,
     wait_until,
@@ -70,15 +71,7 @@ def workdir(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     (root / "hello.txt").write_text("hello\n")
-    for argv in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "t@example.com"],
-        ["git", "config", "user.name", "t"],
-        ["git", "add", "-A"],
-        ["git", "commit", "-qm", "init"],
-    ):
-        subprocess.run(argv, cwd=root, check=True, capture_output=True)
-    return root
+    return git_commit(root)
 
 
 SHARED_UV_CACHE = str(Path.home() / ".cache/uv")
