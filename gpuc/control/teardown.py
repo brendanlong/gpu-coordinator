@@ -147,7 +147,7 @@ def resolve(target: str, registry: Registry, providers: Providers) -> Target:
         pod_id=pod.id,
         provider=provider,
         pod=pod,
-        entry=_entry_for_pod(provider.name, pod.id, registry),
+        entry=registry.rental(provider.name, pod.id),
     )
 
 
@@ -175,19 +175,6 @@ def find_pod(target: str, providers: Providers) -> tuple[Provider, Pod]:
         f"no host or pod named {target!r} (pods were looked for at {asked}). `gpuc host "
         f"list` has this machine's hosts and `gpuc pods` every pod with our prefix; a pod "
         f"without the prefix is not ours and is only ever ended in the provider's console."
-    )
-
-
-def _entry_for_pod(provider: str, pod_id: str, registry: Registry) -> HostEntry | None:
-    """The registry entry for a pod named by id, so it is forgotten too. By
-    provider as well: two providers can each have a pod `4242`."""
-    return next(
-        (
-            e
-            for e in registry.hosts.values()
-            if e.rental is not None and (e.rental.provider, e.rental.pod_id) == (provider, pod_id)
-        ),
-        None,
     )
 
 

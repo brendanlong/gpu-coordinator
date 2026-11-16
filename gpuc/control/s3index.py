@@ -183,7 +183,7 @@ class S3Index:
             raise S3IndexError(f"could not read s3://{self.bucket}/{key}: {exc}") from exc
 
     def put_spec_document(self, job_id: str, document: dict[str, Any]) -> str:
-        """Re-mirror a spec as raw JSON, for an edit to a spec already up there.
+        """Mirror a spec as raw JSON: the first copy at submit, and any edit to it.
 
         Raw, rather than through `JobSpec`: this is what `requeue` will submit,
         and a round trip would drop the keys a newer build wrote.

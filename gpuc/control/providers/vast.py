@@ -9,22 +9,19 @@ floors and the health check before handoff are for.
 from __future__ import annotations
 
 import json
-import os
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from gpuc._version import user_agent
 
 from .base import (
-    DEFAULT_CUDA_MIN,
-    DEFAULT_PREFIX,
+    LOG_TAIL_LINES,
     Constraints,
     CreateRefused,
+    HttpError,
     Offer,
     Pod,
     Provider,
@@ -62,16 +59,7 @@ SEARCH_FIELDS: dict[str, str] = {
 """Each `MINIMUMS` key, by the search field it is a floor on."""
 
 
-class VastError(ProviderError):
-    def __init__(self, method: str, url: str, status: int, body: str) -> None:
-        super().__init__(f"{method} {url} -> HTTP {status}: {body[:500]}")
-        self.status = status
-
-
 class VastProvider(Provider):
-    """`sleep` is every pause taken on the API's behalf (a 429's backoff), so
-    a test can run the whole flow without waiting them out."""
-
     name = "vast"
     api_key_env = "VAST_API_KEY"
     default_image = IMAGE
@@ -81,20 +69,6 @@ class VastProvider(Provider):
     """Not `offline` or `unknown`: those are Vast losing touch with the
     machine, which may still be running a job over ssh."""
     gone_statuses = ("destroyed",)
-
-    def __init__(
-        self,
-        api_key: str | None = None,
-        *,
-        prefix: str = DEFAULT_PREFIX,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        key = api_key or os.environ.get(self.api_key_env)
-        if not key:
-            raise ProviderError(f"{self.api_key_env} is not set")
-        self._api_key = key
-        self.prefix = prefix
-        self._sleep = sleep
 
     def _json(self, method: str, path: str, body: Any = None) -> Any:
         url = BASE_URL + path
@@ -123,7 +97,7 @@ class VastProvider(Provider):
                     raise Unauthorized(
                         f"{method} {url} -> HTTP {error.code}: {text[:500]}"
                     ) from error
-                raise VastError(method, url, error.code, text) from error
+                raise HttpError(method, url, error.code, text) from error
             except OSError as error:
                 raise ProviderError(f"{method} {url}: {error}") from error
             try:
@@ -156,24 +130,22 @@ class VastProvider(Provider):
         name: str,
         *,
         image: str,
-        disk_gb: int,
-        cuda_min: str = DEFAULT_CUDA_MIN,
-        gpu_count: int = 1,
+        constraints: Constraints,
     ) -> Pod:
-        """Rent the machine behind `offer`. `cuda_min` and `gpu_count` were
-        the search's: a Vast offer is already one machine with them."""
+        """Rent the machine behind `offer`. The CUDA floor and the GPU count
+        were the search's: a Vast offer is already one machine with them."""
         if not name.startswith(self.prefix):
             raise ProviderError(f"instance label {name!r} must start with {self.prefix!r}")
         body = {
             "image": image,
-            "disk": disk_gb,
+            "disk": constraints.disk_gb,
             "label": name,
             "runtype": "ssh_direct",
             "cancel_unavail": True,
         }
         try:
             created = self._json("PUT", f"/asks/{offer.offer_id}/", body)
-        except VastError as error:
+        except HttpError as error:
             # An offer someone else rented first is a 404 or a 410, and the
             # ordinary outcome on a marketplace: nothing was created.
             if 400 <= error.status < 500 and error.status != 429:
@@ -188,7 +160,7 @@ class VastProvider(Provider):
             status="created",
             cost_usd_hr=offer.price_usd_hr,
             gpu_name=offer.name,
-            gpu_count=gpu_count,
+            gpu_count=constraints.gpu_count,
         )
 
     def get(self, pod_id: str) -> Pod | None:
@@ -205,10 +177,12 @@ class VastProvider(Provider):
             raise ProviderError(f"GET /instances/{pod_id}/: unexpected answer: {payload!r}")
         return pod_from_api(instance)
 
-    def logs(self, pod_id: str, tail: int = 100) -> str:
+    def logs(self, pod_id: str) -> str:
         """The container log, which Vast writes to a URL it hands back and
         fills a moment later."""
-        answer = self._json("PUT", f"/instances/request_logs/{pod_id}/", {"tail": str(tail)})
+        answer = self._json(
+            "PUT", f"/instances/request_logs/{pod_id}/", {"tail": str(LOG_TAIL_LINES)}
+        )
         url = (answer or {}).get("result_url")
         if not url:
             return ""
@@ -229,7 +203,7 @@ class VastProvider(Provider):
         """Destroy, not stop: a stopped instance goes on billing for its disk."""
         try:
             self._json("DELETE", f"/instances/{pod_id}/")
-        except VastError as error:
+        except HttpError as error:
             if error.status != 404:
                 raise
 

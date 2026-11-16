@@ -7,7 +7,7 @@ CLI would refuse to cancel is one the dashboard refuses too, with the same
 words.
 
 An `Answer` is what a command hands back: the document, the text form, and
-what failed -- `exit_code_of` is the one place that becomes a number, and
+what failed -- `Answer.exit_code` is the one place that becomes a number, and
 `exits.http_status` the one place that number becomes an HTTP status.
 """
 
@@ -29,7 +29,6 @@ from gpuc.control.config import (
     ConfigError,
     HostEntry,
     HostNotFound,
-    LocalStateUnreadable,
     Registry,
     RegistryRead,
     Settings,
@@ -82,15 +81,6 @@ from gpuc.control.teardown import TerminateError
 from gpuc.control.transport import TransportError, tail_command
 from gpuc.host import jobs, settable
 from gpuc.host.jobs import FINISHED_STATUSES
-
-__all__ = [
-    "EXIT_ERROR",
-    "EXIT_INTERRUPTED",
-    "EXIT_LOCAL_STATE",
-    "EXIT_NOT_FOUND",
-    "EXIT_OK",
-    "EXIT_USAGE",
-]
 
 
 class CliError(RuntimeError):
@@ -152,10 +142,6 @@ def exit_code_for(exc: BaseException) -> int | None:
     One table for the CLI's top-level handler and the dashboard's, so a refused
     job is exit 4 on the command line and 404 on the wire, never two opinions.
     """
-    if isinstance(exc, LocalStateUnreadable):
-        return EXIT_LOCAL_STATE
-    if isinstance(exc, HostNotFound):
-        return EXIT_NOT_FOUND
     if isinstance(exc, FAILURES):
         return getattr(exc, "exit_code", EXIT_ERROR)
     if isinstance(exc, json.JSONDecodeError):
@@ -189,17 +175,13 @@ class Answer:
 
     @property
     def exit_code(self) -> int:
-        return exit_code_of(self)
-
-
-def exit_code_of(answer: Answer) -> int:
-    """The one rule: unknown beats everything, a relayed outcome is itself,
-    else 1 for any failure and 0 for none."""
-    if answer.unknown:
-        return EXIT_LOCAL_STATE
-    if answer.outcome is not None:
-        return answer.outcome
-    return EXIT_ERROR if answer.failures else EXIT_OK
+        """The one rule: unknown beats everything, a relayed outcome is itself,
+        else 1 for any failure and 0 for none."""
+        if self.unknown:
+            return EXIT_LOCAL_STATE
+        if self.outcome is not None:
+            return self.outcome
+        return EXIT_ERROR if self.failures else EXIT_OK
 
 
 PROVIDERS: dict[str, Callable[[Settings], Provider]] = {
@@ -294,6 +276,8 @@ class StatusResult:
     index_error: str | None = None
     """Why `unhosted`, or a gone host's jobs, may be short: an S3 index that
     could not be read."""
+    recent: int = status_mod.RECENT_FINISHED
+    since_s: float | None = None
 
     @property
     def errors(self) -> list[str]:
@@ -348,9 +332,7 @@ class StatusResult:
             return status_mod.HostState.UNASKABLE
         return status_mod.HostState.GONE
 
-    def document(
-        self, *, recent: int = status_mod.RECENT_FINISHED, since_s: float | None = None
-    ) -> dict[str, Any]:
+    def document(self) -> dict[str, Any]:
         return status_mod.document(
             self.views,
             errors=self.errors,
@@ -363,8 +345,8 @@ class StatusResult:
                 )
                 for entry in self.unhosted
             ],
-            recent=recent,
-            since_s=since_s,
+            recent=self.recent,
+            since_s=self.since_s,
         )
 
     def unhosted_text(self, host: str | None) -> str | None:
@@ -393,15 +375,9 @@ class StatusResult:
             lines.append(f"  bring one back with: gpuc requeue {first.job_id} --host {target}")
         return "\n".join(lines)
 
-    def answer(
-        self,
-        *,
-        recent: int = status_mod.RECENT_FINISHED,
-        since_s: float | None = None,
-        text: str | None = None,
-    ) -> Answer:
+    def answer(self, text: str | None = None) -> Answer:
         return Answer(
-            self.document(recent=recent, since_s=since_s),
+            self.document(),
             text,
             failures=self.failures,
             unknown=self.read.unreadable,
@@ -469,7 +445,7 @@ def status(
     except under `all_jobs`: a job the index knows is listed as one no host
     has whenever its host did not send it, so that list needs every job.
     """
-    result = StatusResult(read, every_host=host is None)
+    result = StatusResult(read, every_host=host is None, recent=recent, since_s=since_s)
     index = IndexRead(settings)
     registry = read.registry if not read.unreadable else Registry()
     entries = [entry for name, entry in registry.hosts.items() if host in (None, name)]

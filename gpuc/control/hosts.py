@@ -52,7 +52,7 @@ from gpuc.control.providers.base import (
     Offer,
     Provider,
 )
-from gpuc.control.provision import Match, matching_rentals, provision
+from gpuc.control.provision import DEFAULT_IDLE_MINUTES, Match, matching_rentals, provision
 from gpuc.control.remote import Gone, RemoteError, rental_state
 from gpuc.control.teardown import find_pod
 from gpuc.control.transport import TransportError
@@ -73,11 +73,6 @@ class HostChange:
 
     def render(self) -> str:
         return "\n".join(self.lines)
-
-
-DEFAULT_IDLE_MINUTES = 15.0
-"""How long a rental sits with an empty queue before it ends itself, unless
-`--idle-min` says otherwise."""
 
 
 @dataclass

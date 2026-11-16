@@ -23,9 +23,9 @@ from gpuc.control.remote import Asked, Gone, HostSession, Unaskable, ask
 from gpuc.control.s3index import IndexEntry, job_uri
 from gpuc.host import jobs
 from gpuc.host.cleanup import human_bytes
+from gpuc.host.dispatcher import HEARTBEAT_STALE_S
 from gpuc.host.gpus import Usage
 
-HEARTBEAT_STALE_S = 30.0
 RECENT_FINISHED = 5
 LEFTOVER_FLOOR_BYTES = 1 << 30
 """Only mention finished jobs' workdirs once they add up to something worth a
@@ -228,12 +228,12 @@ def parse_duration(text: str) -> float:
     return value * (unit or 3600.0)
 
 
-def format_age(stamp: str | None, now: datetime | None = None) -> str:
+def format_age(stamp: str | None) -> str:
     """`3m ago`, `2d ago`: enough to tell last night's run from last month's."""
     when = jobs.parse_time(stamp)
     if when is None:
         return "age unknown"
-    seconds = ((now or datetime.now(UTC)) - when).total_seconds()
+    seconds = (datetime.now(UTC) - when).total_seconds()
     if seconds < 0:
         return "just now"
     for unit, size in (("d", 86400.0), ("h", 3600.0), ("m", 60.0)):
@@ -862,13 +862,13 @@ def _gpu_lines(view: HostView) -> list[str]:
     return lines
 
 
-def within(job: JobView, since_s: float | None, now: datetime | None = None) -> bool:
+def within(job: JobView, since_s: float | None) -> bool:
     if since_s is None:
         return True
     ended = jobs.parse_time(job.ended_at)
     if ended is None:
         return False
-    return ((now or datetime.now(UTC)) - ended).total_seconds() <= since_s
+    return (datetime.now(UTC) - ended).total_seconds() <= since_s
 
 
 def finished_detail(job: JobView) -> str:

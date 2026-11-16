@@ -197,6 +197,11 @@ def public_key_path(settings: Settings) -> Path:
     )
 
 
+DEFAULT_IDLE_MINUTES = 15.0
+"""How long a rental sits with an empty queue before it ends itself, unless
+`--idle-min` says otherwise."""
+
+
 def pod_name(prefix: str, name_hint: str) -> str:
     hint = re.sub(r"[^a-z0-9-]+", "-", name_hint.lower()).strip("-") or "job"
     return f"{prefix}{hint}-{secrets.token_hex(3)}"
@@ -207,7 +212,7 @@ def provision(
     settings: Settings,
     *,
     name_hint: str = "job",
-    idle_minutes: float = 15.0,
+    idle_minutes: float = DEFAULT_IDLE_MINUTES,
     image: str | None = None,
     provider: Provider,
     report: Reporter = print,
@@ -226,10 +231,10 @@ def provision(
 
     offers = provider.offers(constraints)
     if not offers:
+        cloud = ", or try --cloud any" if provider.clouds else ""
         raise ProvisionError(
             f"no offers match {_describe(constraints)}.\n"
-            f"Relax --max-price, add another --gpu, or try --cloud any; "
-            f"availability moves hour to hour."
+            f"Relax --max-price, add another --gpu{cloud}; availability moves hour to hour."
         )
     deadline = deps.now() + CEILING_MINUTES * 60.0
     progress(
@@ -290,7 +295,8 @@ def _describe(constraints: Constraints) -> str:
     parts = [f"gpu={','.join(constraints.gpu_names) or 'any'}"]
     if constraints.max_price_usd_hr is not None:
         parts.append(f"max-price=${constraints.max_price_usd_hr:.2f}/h")
-    parts.append(f"cloud={'+'.join(c.lower() for c in constraints.clouds)}")
+    if constraints.clouds:
+        parts.append(f"cloud={'+'.join(c.lower() for c in constraints.clouds)}")
     parts.append(f"cuda>={constraints.cuda_min}")
     return " ".join(parts)
 
@@ -323,9 +329,7 @@ def _try_offer(
             offer,
             name,
             image=image,
-            disk_gb=constraints.disk_gb,
-            cuda_min=constraints.cuda_min,
-            gpu_count=constraints.gpu_count,
+            constraints=constraints,
         )
     except CreateRefused:
         raise
@@ -345,7 +349,8 @@ def _try_offer(
         raise
     created_at = utc_now()
     progress(
-        f"pod {pod.id} created ({pod.status}); {_left(deadline, deps):.0f}s of the ceiling left"
+        f"pod {pod.id} created ({pod.status}); "
+        f"{max(deadline - deps.now(), 0):.0f}s of the ceiling left"
     )
 
     try:
@@ -412,10 +417,6 @@ def _try_offer(
         if not _abandon(provider, name, pod.id, progress, deps, _first_line(exc)):
             billing.append(pod.id)
         raise
-
-
-def _left(deadline: float, deps: ProvisionDeps) -> float:
-    return max(deadline - deps.now(), 0.0)
 
 
 def _first_line(exc: BaseException) -> str:
@@ -595,13 +596,13 @@ def _safe_logs(provider: Provider, pod_id: str) -> str:
         return ""
 
 
-def _log_tail(provider: Provider, pod_id: str, lines: int = 15) -> str:
+def _log_tail(provider: Provider, pod_id: str) -> str:
     text = _safe_logs(provider, pod_id)
-    return _tail(text, lines) if text else "  (no pod logs available)"
+    return _tail(text) if text else "  (no pod logs available)"
 
 
-def _tail(text: str, lines: int = 15) -> str:
-    return "\n".join(f"  {line}" for line in text.strip().splitlines()[-lines:])
+def _tail(text: str) -> str:
+    return "\n".join(f"  {line}" for line in text.strip().splitlines()[-15:])
 
 
 @dataclass
@@ -676,7 +677,7 @@ def matching_rentals(
     """
     entries = [
         entry
-        for entry in open_registry().registry.listing()
+        for entry in open_registry().registry.hosts.values()
         if entry.rental is not None and entry.rental.provider == provider.name
     ]
     if not entries:

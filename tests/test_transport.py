@@ -106,15 +106,10 @@ def test_ssh_options_pin_batch_mode_timeout_and_known_hosts(tmp_path: Path) -> N
 
 
 def test_ssh_argv_runs_a_non_login_bash_with_the_command_last(tmp_path: Path) -> None:
-    argv = make_ssh(tmp_path).ssh_argv("uname -a")
+    argv = make_ssh(tmp_path).argv("uname -a")
     assert argv[0] == "ssh"
     assert argv[-2] == "user@box"
     assert argv[-1] == "bash -c 'uname -a'"
-
-
-def test_the_ssh_argv_is_the_one_run_uses(tmp_path: Path) -> None:
-    transport = make_ssh(tmp_path)
-    assert transport.argv("uname -a") == transport.ssh_argv("uname -a")
 
 
 def test_the_interactive_ssh_argv_keeps_every_option_but_batch_mode_and_adds_a_tty(
@@ -396,7 +391,7 @@ def test_the_patch_includes_staged_changes(tmp_path: Path) -> None:
 
 def test_both_transports_build_the_same_tail(tmp_path: Path) -> None:
     assert transport.tail_command("/a b/log.txt", 20) == "tail -n 20 '/a b/log.txt'"
-    assert transport.tail_command("/log.txt", 5, follow=True) == "tail -f -n 5 /log.txt"
+    assert transport.tail_command("/log.txt", 5, follow=True) == "tail -F -n 5 /log.txt"
 
 
 def test_rsync_excludes_reach_the_command_line(tmp_path: Path) -> None:

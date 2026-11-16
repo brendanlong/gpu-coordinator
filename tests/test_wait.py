@@ -28,15 +28,9 @@ import pytest
 
 from gpuc.control import wait as wait_mod
 from gpuc.control.actions import PROVIDERS
-from gpuc.control.cli import (
-    EXIT_ERROR,
-    EXIT_INTERRUPTED,
-    EXIT_NOT_FOUND,
-    EXIT_OK,
-    EXIT_USAGE,
-    main,
-)
+from gpuc.control.cli import main
 from gpuc.control.config import config_file, registry_transaction
+from gpuc.control.exits import EXIT_ERROR, EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
 from gpuc.control.providers.base import Pod
 from gpuc.control.s3index import IndexEntry, LocalIndex
 from gpuc.control.transport import TransportError, tail_command
@@ -305,7 +299,7 @@ def test_an_interrupt_before_the_first_poll_is_reported_too(
     def interrupted(*_args: Any, **_kwargs: Any) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(wait_mod, "start", interrupted)
+    monkeypatch.setattr(wait_mod, "locate_many", interrupted)
     assert main(["wait", JOB, "--json"]) == EXIT_INTERRUPTED
     document = json.loads(capsys.readouterr().out)
     assert document["exit_code"] == EXIT_INTERRUPTED
@@ -650,8 +644,7 @@ def test_an_interrupted_follow_is_never_exit_zero(
 
 def test_a_follow_retries_a_log_that_is_not_written_yet_and_a_read_does_not() -> None:
     """A plain read must fail on a missing log: that is what sends it to S3."""
-    assert tail_command("/j/log.txt", 10, follow=True, retry=True).startswith("tail -F ")
-    assert tail_command("/j/log.txt", 10, follow=True).startswith("tail -f ")
+    assert tail_command("/j/log.txt", 10, follow=True).startswith("tail -F ")
     assert tail_command("/j/log.txt", 10).startswith("tail -n ")
 
 

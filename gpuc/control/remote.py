@@ -36,6 +36,7 @@ MAX_PARALLEL_HOSTS = 8
 """How many hosts one command asks at once."""
 
 PYTHON_FLOOR = (3, 11)
+PYTHON_FLOOR_TEXT = ".".join(str(part) for part in PYTHON_FLOOR)
 """What the on-host package needs; bootstrap spells the same tuple for `uv`."""
 
 USAGE_EXIT = 2
@@ -350,11 +351,25 @@ def resolve_home(transport: Transport, entry: HostEntry) -> str:
     return home.rstrip("/")
 
 
+def uv_python_find(uv: str, env: str = "") -> str:
+    """The shell line that asks `uv` (already quoted) for an interpreter that
+    can run the package, prefixed by `env`.
+
+    From $HOME, without the project and without an inherited VIRTUAL_ENV:
+    otherwise `uv python find` returns the venv of whatever directory the
+    control side was invoked from (`uv run gpuc ...` exports VIRTUAL_ENV),
+    and the host would be pinned to an interpreter that can disappear.
+    """
+    return (
+        f'cd "$HOME" && {env}env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT '
+        f"{uv} python find --no-project '>={PYTHON_FLOOR_TEXT}' 2>/dev/null"
+    )
+
+
 _SAY_VERSION = "-c 'import sys; print(sys.executable, sys.version.split()[0])'"
+_HOME_UV = '"$HOME/.local/bin/uv"'
 PYTHON_PROBE = (
-    'if [ -x "$HOME/.local/bin/uv" ]; then p=$(cd "$HOME" && '
-    'env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT "$HOME/.local/bin/uv" python find '
-    f"--no-project '>={PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}' 2>/dev/null); "
+    f"if [ -x {_HOME_UV} ]; then p=$({uv_python_find(_HOME_UV)}); "
     f'[ -n "$p" ] && "$p" {_SAY_VERSION}; fi; '
     f"if command -v python3 >/dev/null 2>&1; then python3 {_SAY_VERSION}; fi"
 )
@@ -414,7 +429,7 @@ def open_session(
         raise RemoteError(
             entry.name,
             "open_session",
-            f"host {entry.name!r} has no Python >= {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]} to run "
+            f"host {entry.name!r} has no Python >= {PYTHON_FLOOR_TEXT} to run "
             f"the package with.\nRun: gpuc host bootstrap {entry.name}",
         )
     if record and (config_read.document is not None or python != entry.python):

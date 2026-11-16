@@ -227,20 +227,17 @@ def test_host_clean_prunes_rather_than_cleans(control_env: Path) -> None:
     from gpuc.control.clean import prune_uv_cache
 
     host = PruningHost()
-    report = prune_uv_cache(
-        entry(uv="/home/u/.local/bin/uv"),
-        session=session_for(entry(uv="/home/u/.local/bin/uv"), host),
-    )
+    report = prune_uv_cache(session_for(entry(uv="/home/u/.local/bin/uv"), host))
     assert "pruned 18.0 GiB -> ?" in report.render()
     # A side whose `du` failed is null, not zero, and so is what was freed.
     assert report.document() == {
-        "host": "h",
         "cache_dir": "/home/u/.cache/uv",
         "before": "18.0 GiB",
         "after": None,
         "before_bytes": 18874368 * 1024,
         "after_bytes": None,
         "freed_bytes": None,
+        "errors": [],
     }
     pruned = next(e for e in host.events if "cache prune" in e)
     # `uv cache clean` would throw away the wheels the next job wants to link.
@@ -252,10 +249,7 @@ def test_host_clean_passes_the_hosts_cache_dir(control_env: Path) -> None:
     from gpuc.control.clean import prune_uv_cache
 
     host = PruningHost()
-    prune_uv_cache(
-        entry(cache_dir="/vol/me/.cache/uv"),
-        session=session_for(entry(cache_dir="/vol/me/.cache/uv"), host),
-    )
+    prune_uv_cache(session_for(entry(cache_dir="/vol/me/.cache/uv"), host))
     pruned = next(e for e in host.events if "cache prune" in e)
     assert 'UV_CACHE_DIR="/vol/me/.cache/uv"' in pruned
 
@@ -270,4 +264,4 @@ def test_a_failed_prune_is_an_error_not_a_silent_no_op(control_env: Path) -> Non
             return super()._answer(command)
 
     with pytest.raises(CleanError, match="read-only"):
-        prune_uv_cache(entry(), session=session_for(entry(), Broken()))
+        prune_uv_cache(session_for(entry(), Broken()))

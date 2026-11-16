@@ -9,8 +9,9 @@ import pytest
 
 from gpuc.control import pods as pods_mod
 from gpuc.control.actions import PROVIDERS
-from gpuc.control.cli import EXIT_OK, main
+from gpuc.control.cli import main
 from gpuc.control.config import Settings, registry_transaction
+from gpuc.control.exits import EXIT_OK
 from gpuc.control.status import CardView, HostState, HostView, render
 from tests.conftest import host_entry, load_registry
 from tests.fakeprovider import FakeProvider, PodScript, running_pod

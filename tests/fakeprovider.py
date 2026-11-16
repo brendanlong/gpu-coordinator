@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from gpuc.control.providers.base import (
-    DEFAULT_CUDA_MIN,
     DEFAULT_PREFIX,
     Cloud,
     Constraints,
@@ -124,9 +123,7 @@ class FakeProvider(Provider):
         name: str,
         *,
         image: str,
-        disk_gb: int,
-        cuda_min: str = DEFAULT_CUDA_MIN,
-        gpu_count: int = 1,
+        constraints: Constraints,
     ) -> Pod:
         if not name.startswith(self.prefix):
             raise ProviderError(f"pod name {name!r} must start with {self.prefix!r}")
@@ -136,9 +133,9 @@ class FakeProvider(Provider):
                 "name": name,
                 "offer": offer,
                 "image": image,
-                "disk_gb": disk_gb,
-                "cuda_min": cuda_min,
-                "gpu_count": gpu_count,
+                "disk_gb": constraints.disk_gb,
+                "cuda_min": constraints.cuda_min,
+                "gpu_count": constraints.gpu_count,
             }
         )
         if script.create_error:
@@ -149,7 +146,7 @@ class FakeProvider(Provider):
             status="PROVISIONING",
             cost_usd_hr=offer.price_usd_hr,
             gpu_name=offer.gpu_id,
-            gpu_count=gpu_count,
+            gpu_count=constraints.gpu_count,
             cuda_version=script.cuda_version,
             created_at=datetime.now(UTC),
         )
@@ -181,7 +178,7 @@ class FakeProvider(Provider):
             )
         return entry.pod
 
-    def logs(self, pod_id: str, tail: int = 100) -> str:
+    def logs(self, pod_id: str) -> str:
         entry = self._pods.get(pod_id)
         return entry.script.log_text if entry else ""
 

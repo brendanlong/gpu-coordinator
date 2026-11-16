@@ -33,7 +33,7 @@ from gpuc.control.config import (
 from gpuc.control.connect import refuse_unreadable
 from gpuc.control.gpuinfo import describe_owned, owned_entries, summarize
 from gpuc.control.remote import (
-    PYTHON_FLOOR,
+    PYTHON_FLOOR_TEXT,
     HostConfigRead,
     HostSession,
     env_prefix,
@@ -41,6 +41,7 @@ from gpuc.control.remote import (
     parse_last_json,
     read_config,
     resolve_home,
+    uv_python_find,
 )
 from gpuc.control.transport import Transport, TransportError, git_tracked_files
 from gpuc.control.version import local_commit, package_root, short
@@ -50,7 +51,6 @@ from gpuc.host.jobs import HostConfig, cache_beside
 
 UV_INSTALLER = "https://astral.sh/uv/install.sh"
 AWS_CLI_ZIP = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
-PYTHON_FLOOR_TEXT = ".".join(str(part) for part in PYTHON_FLOOR)
 PYTHON_INSTALL = "3.12"
 INSTALL_TIMEOUT_S = 900.0
 HEALTH_TIMEOUT_S = 300.0
@@ -256,15 +256,7 @@ def install_uv(transport: Transport) -> str:
 
 
 def find_python(transport: Transport, uv: str, env: Mapping[str, str]) -> str | None:
-    # From $HOME, without the project and without an inherited VIRTUAL_ENV:
-    # otherwise `uv python find` returns the venv of whatever directory the
-    # control side was invoked from (`uv run gpuc ...` exports VIRTUAL_ENV),
-    # and the host would be pinned to an interpreter that can disappear.
-    result = transport.run(
-        f'cd "$HOME" && {env_prefix(env)}env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT '
-        f"{shlex.quote(uv)} python find --no-project '>={PYTHON_FLOOR_TEXT}' 2>/dev/null",
-        check=False,
-    )
+    result = transport.run(uv_python_find(shlex.quote(uv), env_prefix(env)), check=False)
     path = _first_line(result.stdout)
     return path or None
 

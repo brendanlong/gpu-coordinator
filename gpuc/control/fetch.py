@@ -41,10 +41,7 @@ def fetch_jobs(
             job.warnings.append(f"{rel} is not in its workdir")
         if list_only or not files:
             continue
-        session = sessions.get(job.host or "")
-        if session is None:
-            job.error = f"job {job.job_id}: host {job.host} answered but cannot be copied from"
-            continue
+        session = sessions[job.host or ""]
         dest = to / job.job_id
         try:
             dest.mkdir(parents=True, exist_ok=True)

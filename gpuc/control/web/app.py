@@ -18,7 +18,6 @@ import html
 import json
 import re
 import sys
-import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -31,8 +30,6 @@ from urllib.parse import parse_qs, urlsplit
 
 from gpuc.control import status as status_mod
 from gpuc.control.actions import (
-    EXIT_NOT_FOUND,
-    EXIT_USAGE,
     Answer,
     UsageError,
     cancel_jobs,
@@ -51,7 +48,7 @@ from gpuc.control.actions import (
     version_document,
 )
 from gpuc.control.config import Settings, load_settings, read_registry, utc_now
-from gpuc.control.exits import http_status
+from gpuc.control.exits import EXIT_NOT_FOUND, EXIT_USAGE, http_status
 from gpuc.control.jsonout import OUTPUT_SCHEMA_VERSION
 from gpuc.control.web.auth import SESSION_COOKIE, SESSION_TTL_S, Sessions, read_password_hash
 
@@ -269,17 +266,15 @@ class Dashboard:
         with nobody watching, so `forget_gone_rentals` is the CLI's alone."""
         settings = self.load_settings()
         read = read_registry()
-        recent = int_param(request, "recent", status_mod.RECENT_FINISHED)
-        since_s = since_seconds(request.param("since"), "since")
         result = status(
             read,
             settings,
             host=request.param("host") or None,
             all_jobs=flag_param(request, "all"),
-            recent=recent,
-            since_s=since_s,
+            recent=int_param(request, "recent", status_mod.RECENT_FINISHED),
+            since_s=since_seconds(request.param("since"), "since"),
         )
-        return Response.answer(result.answer(recent=recent, since_s=since_s), gathered_at=utc_now())
+        return Response.answer(result.answer(), gathered_at=utc_now())
 
     def api_hosts(self, request: Request) -> Response:
         read = read_registry()
@@ -481,24 +476,3 @@ def make_server(
     server = ThreadingHTTPServer((bind, port), make_handler(app))
     server.daemon_threads = True
     return server
-
-
-class ServerThread:
-    """A server on a background thread, for tests and for embedding."""
-
-    def __init__(self, app: Dashboard, bind: str = DEFAULT_BIND) -> None:
-        self.server = make_server(bind, 0, app)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-
-    @property
-    def url(self) -> str:
-        host, port = self.server.server_address[:2]
-        return f"http://{host}:{port}"
-
-    def __enter__(self) -> ServerThread:
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.server.shutdown()
-        self.server.server_close()

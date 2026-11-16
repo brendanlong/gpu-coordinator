@@ -74,6 +74,10 @@ Mint = Callable[[str, dict[str, Any], str, str], dict[str, Any]]
 """`(name, policy, access_key_id, secret_access_key)` -> STS's `Credentials`."""
 
 
+def aws_region(environ: Mapping[str, str]) -> str:
+    return environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+
+
 def federation_token(
     name: str, policy: dict[str, Any], access_key_id: str, secret_access_key: str
 ) -> dict[str, Any]:
@@ -81,12 +85,11 @@ def federation_token(
     from botocore.config import Config
     from botocore.exceptions import BotoCoreError, ClientError
 
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
     client = boto3.client(
         "sts",
         aws_access_key_id=access_key_id,
         aws_secret_access_key=secret_access_key,
-        region_name=region,
+        region_name=aws_region(os.environ),
         config=Config(user_agent_extra=user_agent()),
     )
     try:
@@ -293,8 +296,7 @@ def deliver_mirror_key(
             problem = str(exc)
     if problem is not None:
         return f"the pod's mirror key for {config.s3_prefix} was not renewed: {problem}"
-    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-    body = "[default]\n" + f"region = {region}\n"
+    body = "[default]\n" + f"region = {aws_region(environ)}\n"
     body += "".join(f"{name.lower()} = {value}\n" for name, value in keys.items())
     transport.put_file(body, path, 0o600)
     report(f"delivered {described} to {path} (0600) for the log mirror")

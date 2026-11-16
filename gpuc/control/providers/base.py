@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -15,6 +17,8 @@ Availability = Literal["NONE", "LOW", "MEDIUM", "HIGH"]
 
 DEFAULT_PREFIX = "gpuc-"
 DEFAULT_DISK_GB = 50
+LOG_TAIL_LINES = 100
+"""How much of a pod's log a provisioning failure shows."""
 DEFAULT_CUDA_MIN = "12.8"
 """The CUDA floor a request carries unless `--cuda-min` says otherwise: the
 one default, so the catalog query and the create ask for the same thing."""
@@ -27,6 +31,14 @@ def cuda_key(version: str) -> tuple[int, ...]:
 
 class ProviderError(RuntimeError):
     pass
+
+
+class HttpError(ProviderError):
+    """A provider's API answered with an HTTP error status."""
+
+    def __init__(self, method: str, url: str, status: int, body: str) -> None:
+        super().__init__(f"{method} {url} -> HTTP {status}: {body[:500]}")
+        self.status = status
 
 
 class CreateRefused(ProviderError):
@@ -198,6 +210,23 @@ class Provider(ABC):
     confirm_polls: int = 60
     confirm_poll_s: float = 5.0
 
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        prefix: str = DEFAULT_PREFIX,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """`sleep` is every pause taken on the API's behalf -- a `Retry-After`,
+        a rate-limit window -- so a test can run the whole flow without
+        waiting them out."""
+        key = api_key or os.environ.get(self.api_key_env)
+        if not key:
+            raise ProviderError(f"{self.api_key_env} is not set")
+        self._api_key = key
+        self.prefix = prefix
+        self._sleep = sleep
+
     def is_dead(self, pod: Pod | None) -> bool:
         return pod is None or pod.status in self.dead_statuses
 
@@ -270,16 +299,14 @@ class Provider(ABC):
         name: str,
         *,
         image: str,
-        disk_gb: int,
-        cuda_min: str = DEFAULT_CUDA_MIN,
-        gpu_count: int = 1,
+        constraints: Constraints,
     ) -> Pod: ...
 
     @abstractmethod
     def get(self, pod_id: str) -> Pod | None: ...
 
     @abstractmethod
-    def logs(self, pod_id: str, tail: int = 100) -> str: ...
+    def logs(self, pod_id: str) -> str: ...
 
     @abstractmethod
     def terminate(self, pod_id: str) -> None:

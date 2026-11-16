@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 
 from gpuc.control import skill
-from gpuc.control.cli import EXIT_ERROR, EXIT_OK, main
+from gpuc.control.cli import main
+from gpuc.control.exits import EXIT_ERROR, EXIT_OK
 
 REPO_SKILL = Path(__file__).resolve().parents[1] / "skills" / "gpuc" / "SKILL.md"
 

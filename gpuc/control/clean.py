@@ -15,9 +15,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-from gpuc.control.config import HostEntry, Settings
 from gpuc.control.exits import EXIT_USAGE
-from gpuc.control.remote import HostSession, env_prefix, open_session
+from gpuc.control.remote import HostSession, env_prefix
 from gpuc.control.s3index import S3Index, S3IndexError, job_uri, split_uri
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS, human_bytes
 
@@ -187,10 +186,8 @@ def check_flags(
 
 
 def clean_host(
-    entry: HostEntry,
-    settings: Settings | None = None,
+    session: HostSession,
     *,
-    session: HostSession | None = None,
     all_finished: bool = False,
     older_than_days: float | None = None,
     dry_run: bool = False,
@@ -200,12 +197,9 @@ def clean_host(
     only: list[str] | None = None,
     s3_client: Any | None = None,
 ) -> CleanReport:
-    session = session or open_session(entry, settings)
     if purge:
         report = purge_host(
-            entry,
-            settings,
-            session=session,
+            session,
             all_finished=all_finished,
             older_than_days=older_than_days,
             dry_run=dry_run,
@@ -231,7 +225,7 @@ def clean_host(
     # A workdir walk over many jobs is minutes of stat() on a slow volume, and
     # the host CLI is doing the deleting too.
     payload = session.host_json(" ".join(args), timeout=900.0, check=False)
-    return _report(entry.name, payload)
+    return _report(session.entry.name, payload)
 
 
 def _report(host: str, payload: Any, **extra: Any) -> CleanReport:
@@ -280,10 +274,8 @@ def _verified_arg(session: HostSession, verified: list[str]) -> str:
 
 
 def purge_host(
-    entry: HostEntry,
-    settings: Settings | None = None,
+    session: HostSession,
     *,
-    session: HostSession | None = None,
     all_finished: bool = False,
     older_than_days: float | None = None,
     dry_run: bool = False,
@@ -305,7 +297,6 @@ def purge_host(
     jobs, with the implied workdir sweep scoped to them as well, so purging one
     job does not reclaim the rest of the host's venvs as a side effect.
     """
-    session = session or open_session(entry, settings)
     days = (
         0.0
         if all_finished or only is not None
@@ -316,7 +307,7 @@ def purge_host(
     if verified is not None:
         args += f" {_verified_arg(session, verified)}"
     payload = session.host_json(args, timeout=900.0, check=False)
-    report = _report(entry.name, payload, purge=True)
+    report = _report(session.entry.name, payload, purge=True)
     if verified is not None:
         report.verified = [job["job_id"] for job in report.purged if job["job_id"] in verified]
     return report
@@ -369,6 +360,7 @@ class PruneReport:
     """The cache's size before the prune, in bytes; null if it could not be measured."""
     after_bytes: int | None
     what: str = "uv cache"
+    errors: list[str] = field(default_factory=list)
 
     @property
     def before(self) -> str | None:
@@ -392,13 +384,13 @@ class PruneReport:
 
     def document(self) -> dict[str, Any]:
         return {
-            "host": self.host,
             "cache_dir": self.cache_dir,
             "before": self.before,
             "after": self.after,
             "before_bytes": self.before_bytes,
             "after_bytes": self.after_bytes,
             "freed_bytes": self.freed_bytes,
+            "errors": self.errors,
         }
 
 
@@ -406,9 +398,7 @@ def _kib_to_bytes(raw: str | None) -> int | None:
     return int(raw) * 1024 if raw is not None and raw.isdigit() else None
 
 
-def prune_uv_cache(
-    entry: HostEntry, settings: Settings | None = None, *, session: HostSession | None = None
-) -> PruneReport:
+def prune_uv_cache(session: HostSession) -> PruneReport:
     """`uv cache prune` on the host: drop cache entries no venv can link to.
 
     Deliberately `prune` and not `clean`: pruning removes unused and
@@ -416,7 +406,7 @@ def prune_uv_cache(
     wheels the next job wants to link out of. Run with the host's own env, so
     it prunes the cache the host's jobs actually use.
     """
-    session = session or open_session(entry, settings)
+    entry = session.entry
     uv = entry.uv or "uv"
     result = session.transport.run(
         UV_CACHE_PRUNE.format(env=env_prefix(session.env), uv=shlex.quote(uv)),
@@ -437,23 +427,21 @@ def prune_uv_cache(
     )
 
 
-def prune_hf_cache(
-    entry: HostEntry, settings: Settings | None = None, *, session: HostSession | None = None
-) -> tuple[PruneReport, list[str]]:
+def prune_hf_cache(session: HostSession) -> PruneReport:
     """`hf cache prune` on the host, by the host's own code, which knows where
     the host's `env` puts the cache. The errors are the host's."""
-    session = session or open_session(entry, settings)
+    host = session.entry.name
     payload = session.host_json("hf-cache-prune", timeout=960.0, check=False)
     if not isinstance(payload, dict):
-        raise CleanError(f"host {entry.name}: hf-cache-prune printed no report")
-    report = PruneReport(
-        host=entry.name,
+        raise CleanError(f"host {host}: hf-cache-prune printed no report")
+    return PruneReport(
+        host=host,
         cache_dir=payload.get("cache_dir"),
         before_bytes=payload.get("before_bytes"),
         after_bytes=payload.get("after_bytes"),
         what="hf cache",
+        errors=[str(e) for e in payload.get("errors") or []],
     )
-    return report, [str(e) for e in payload.get("errors") or []]
 
 
 @dataclass
@@ -490,20 +478,14 @@ class DataReport:
         }
 
 
-def remove_data(
-    entry: HostEntry,
-    rels: list[str],
-    settings: Settings | None = None,
-    *,
-    session: HostSession | None = None,
-) -> DataReport:
-    session = session or open_session(entry, settings)
+def remove_data(session: HostSession, rels: list[str]) -> DataReport:
+    host = session.entry.name
     args = shlex.join(["data-remove", *rels])
     payload = session.host_json(args, timeout=900.0, check=False)
     if not isinstance(payload, dict):
-        raise CleanError(f"host {entry.name}: data-remove printed no report")
+        raise CleanError(f"host {host}: data-remove printed no report")
     return DataReport(
-        host=entry.name,
+        host=host,
         data_dir=payload.get("data_dir"),
         removed=list(payload.get("removed") or []),
         errors=[str(e) for e in payload.get("errors") or []],

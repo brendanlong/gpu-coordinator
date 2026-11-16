@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
 from datetime import datetime
 from http.client import HTTPResponse
 from typing import Any
@@ -15,11 +13,11 @@ from typing import Any
 from gpuc._version import user_agent
 
 from .base import (
-    DEFAULT_CUDA_MIN,
-    DEFAULT_PREFIX,
+    LOG_TAIL_LINES,
     Cloud,
     Constraints,
     CreateRefused,
+    HttpError,
     Offer,
     Pod,
     Provider,
@@ -44,14 +42,7 @@ USER_AGENT = user_agent()
 MAX_RATE_LIMIT_SLEEP_S = 60.0
 
 
-class RunPodError(ProviderError):
-    def __init__(self, method: str, url: str, status: int, body: str) -> None:
-        super().__init__(f"{method} {url} -> HTTP {status}: {body[:500]}")
-        self.status = status
-        self.body = body
-
-
-class PodNotFound(RunPodError):
+class PodNotFound(HttpError):
     pass
 
 
@@ -81,28 +72,12 @@ def _check_names_exist(names: list[str], gpus: list[dict[str, Any]]) -> None:
 
 
 class RunPodProvider(Provider):
-    """The v2 REST API. `sleep` is every pause the client takes on the API's
-    behalf -- a `Retry-After`, a rate-limit window -- so a test can run the
-    whole flow without waiting them out."""
+    """The v2 REST API."""
 
     name = "runpod"
     api_key_env = "RUNPOD_API_KEY"
     default_image = IMAGE
     clouds = ("SECURE", "COMMUNITY")
-
-    def __init__(
-        self,
-        api_key: str | None = None,
-        *,
-        prefix: str = DEFAULT_PREFIX,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        key = api_key or os.environ.get(self.api_key_env)
-        if not key:
-            raise ProviderError(f"{self.api_key_env} is not set")
-        self._api_key = key
-        self.prefix = prefix
-        self._sleep = sleep
 
     def _open(
         self,
@@ -138,7 +113,7 @@ class RunPodProvider(Provider):
                     continue
                 if error.code == 404:
                     raise PodNotFound(method, url, error.code, text) from error
-                raise RunPodError(method, url, error.code, text) from error
+                raise HttpError(method, url, error.code, text) from error
             except OSError as error:
                 # A `URLError` (DNS, refused), a socket timeout or a reset:
                 # every caller that catches `ProviderError` -- the terminate
@@ -225,26 +200,28 @@ class RunPodProvider(Provider):
         name: str,
         *,
         image: str,
-        disk_gb: int,
-        cuda_min: str = DEFAULT_CUDA_MIN,
-        gpu_count: int = 1,
+        constraints: Constraints,
     ) -> Pod:
         if not name.startswith(self.prefix):
             raise ProviderError(f"pod name {name!r} must start with {self.prefix!r}")
-        gpu: dict[str, Any] = {"id": offer.gpu_id, "count": gpu_count, "minCudaVersion": cuda_min}
+        gpu: dict[str, Any] = {
+            "id": offer.gpu_id,
+            "count": constraints.gpu_count,
+            "minCudaVersion": constraints.cuda_min,
+        }
         body = {
             "name": name,
             "image": image,
             "gpu": gpu,
             "cloud": offer.cloud,
-            "disk": disk_gb,
+            "disk": constraints.disk_gb,
             "ports": ["22/tcp"],
             "startSsh": True,
             "env": DEFAULT_POD_ENV,
         }
         try:
             created = self._json("POST", "/pods", body=body)
-        except RunPodError as error:
+        except HttpError as error:
             if error.status in (401, 403):
                 raise Unauthorized(str(error)) from error
             if 400 <= error.status < 500:
@@ -263,14 +240,14 @@ class RunPodProvider(Provider):
         except PodNotFound:
             return None
 
-    def logs(self, pod_id: str, tail: int = 100) -> str:
+    def logs(self, pod_id: str) -> str:
         lines: list[str] = []
         deadline = time.monotonic() + LOG_READ_S
         try:
             stream = self._open(
                 "GET",
                 f"/pods/{pod_id}/logs",
-                params={"tail": tail},
+                params={"tail": LOG_TAIL_LINES},
                 accept="text/event-stream",
                 timeout_s=LOG_READ_S,
             )
@@ -293,7 +270,7 @@ class RunPodProvider(Provider):
             self._json("POST", f"/pods/{pod_id}/action", body={"action": "terminate"})
         except PodNotFound:
             return
-        except RunPodError as error:
+        except HttpError as error:
             if error.status != 409:
                 raise
 

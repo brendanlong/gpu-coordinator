@@ -17,7 +17,6 @@ from gpuc.control import version as version_mod
 from gpuc.control.actions import (
     CliError,
     NotFound,
-    UsageError,
     locate,
     mirror_is_the_answer,
     placement_after,
@@ -104,7 +103,7 @@ def submit_job(
     job_file: str | Path,
     settings: Settings,
     *,
-    host: str | None,
+    host: str,
     overrides: dict[str, Any] | None = None,
     workdir: Path,
     use_git: bool = True,
@@ -112,10 +111,6 @@ def submit_job(
     report: Reporter = print,
 ) -> SubmitResult:
     """`gpuc submit`: everything that needs no host first, then the host."""
-    if not host:
-        raise UsageError(
-            "submit needs --host <name> (see `gpuc host list`, or `gpuc host rent` for a new one)"
-        )
     document = with_overrides(load_document(job_file), **(overrides or {}))
     model = validate(document, str(job_file))
     prepared = prepare(model, workdir, use_git=use_git)

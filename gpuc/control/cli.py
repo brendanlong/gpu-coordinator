@@ -23,12 +23,6 @@ from gpuc.control import version as version_mod
 from gpuc.control import wait as wait_mod
 from gpuc.control import web as web_mod
 from gpuc.control.actions import (
-    EXIT_ERROR,
-    EXIT_INTERRUPTED,
-    EXIT_LOCAL_STATE,
-    EXIT_NOT_FOUND,
-    EXIT_OK,
-    EXIT_USAGE,
     INDEX_SHORT,
     PROVIDERS,
     Answer,
@@ -61,6 +55,8 @@ from gpuc.control.actions import (
 from gpuc.control.bootstrap import HealthOptions
 from gpuc.control.clean import (
     CleanError,
+    DataReport,
+    PruneReport,
     clean_host,
     parse_only,
     prune_hf_cache,
@@ -81,11 +77,14 @@ from gpuc.control.config import (
     transport_for,
     update_cache,
 )
+from gpuc.control.exits import (
+    EXIT_INTERRUPTED,
+    EXIT_USAGE,
+)
 from gpuc.control.fetch import fetch_jobs, fetch_line
 from gpuc.control.gpuinfo import owned_entries, summarize
 from gpuc.control.gpuinfo import rows as gpu_rows
 from gpuc.control.hosts import (
-    DEFAULT_IDLE_MINUTES,
     DEFAULT_QUOTE_LIMIT,
     RentalOptions,
     add_host,
@@ -98,6 +97,7 @@ from gpuc.control.hosts import (
 from gpuc.control.jsonout import note, warn
 from gpuc.control.probe import probe_host
 from gpuc.control.providers.base import DEFAULT_CUDA_MIN, MINIMUMS, Cloud
+from gpuc.control.provision import DEFAULT_IDLE_MINUTES
 from gpuc.control.remote import HostSession, RemoteError, open_session, read_config, resolve_home
 from gpuc.control.skill import install_skill, read_skill
 from gpuc.control.submit import SubmitResult
@@ -112,12 +112,6 @@ from gpuc.host import settable as settable_mod
 from gpuc.host.cleanup import DEFAULT_RETENTION_DAYS
 
 __all__ = [
-    "EXIT_ERROR",
-    "EXIT_INTERRUPTED",
-    "EXIT_LOCAL_STATE",
-    "EXIT_NOT_FOUND",
-    "EXIT_OK",
-    "EXIT_USAGE",
     "CliError",
     "NotFound",
     "UsageError",
@@ -437,8 +431,7 @@ def cmd_clean(args: argparse.Namespace) -> Answer:
     )
     entry = open_registry().require(args.host)
     report = clean_host(
-        entry,
-        settings,
+        open_session(entry, settings),
         all_finished=args.all_finished,
         older_than_days=args.older_than,
         dry_run=args.dry_run,
@@ -448,10 +441,6 @@ def cmd_clean(args: argparse.Namespace) -> Answer:
         only=only,
     )
     return Answer(report.document(), report.render(), failures=list(report.errors))
-
-
-def without_host(document: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in document.items() if key != "host"}
 
 
 def cmd_host_clean(args: argparse.Namespace) -> Answer:
@@ -468,32 +457,23 @@ def cmd_host_clean(args: argparse.Namespace) -> Answer:
     document: dict[str, Any] = {"host": entry.name}
     lines: list[str] = []
     failures: list[str] = []
+    parts: list[tuple[str, Callable[[], PruneReport | DataReport]]] = []
     if args.uv_cache:
-        try:
-            uv = prune_uv_cache(entry, settings, session=session)
-            document["uv_cache"] = without_host(uv.document())
-            lines.append(uv.render())
-        except (CleanError, RemoteError) as exc:
-            document["uv_cache"] = {"errors": [str(exc)]}
-            failures.append(str(exc))
+        parts.append(("uv_cache", lambda: prune_uv_cache(session)))
     if args.hf_cache:
-        try:
-            hf, errors = prune_hf_cache(entry, settings, session=session)
-            document["hf_cache"] = {**without_host(hf.document()), "errors": errors}
-            lines.append(hf.render())
-        except (CleanError, RemoteError) as exc:
-            errors = [str(exc)]
-            document["hf_cache"] = {"errors": errors}
-        failures += errors
+        parts.append(("hf_cache", lambda: prune_hf_cache(session)))
     if args.data:
+        parts.append(("data", lambda: remove_data(session, args.data)))
+    for key, run in parts:
         try:
-            data = remove_data(entry, args.data, settings, session=session)
-            document["data"] = data.document()
-            lines.append(data.render())
-            failures += data.errors
+            report = run()
         except (CleanError, RemoteError) as exc:
-            document["data"] = {"errors": [str(exc)]}
+            document[key] = {"errors": [str(exc)]}
             failures.append(str(exc))
+            continue
+        document[key] = report.document()
+        lines.append(report.render())
+        failures += report.errors
     return Answer(document, "\n".join(lines), failures=failures)
 
 
@@ -550,28 +530,22 @@ CLOUDS: dict[str, list[Cloud]] = {
 
 
 def rental_options(args: argparse.Namespace) -> RentalOptions:
-    options = RentalOptions(
+    return RentalOptions(
         provider=args.provider,
         gpu_names=[name.strip() for name in (args.gpu or "").split(",") if name.strip()],
         max_price_usd_hr=args.max_price,
         clouds=CLOUDS[args.cloud] if args.cloud else [],
         cuda_min=args.cuda_min,
         gpu_count=args.gpu_count,
-        minimums={
-            key: getattr(args, flag.removeprefix("--").replace("-", "_"))
-            for key, flag in MINIMUMS.items()
-            if getattr(args, flag.removeprefix("--").replace("-", "_")) is not None
-        },
+        minimums={key: getattr(args, key) for key in MINIMUMS if getattr(args, key) is not None},
         force=args.force,
         name_hint=args.name_hint,
         disk_gb=args.disk,
         image=args.image,
         health=health_options(args),
         trusted=args.trusted,
+        idle_minutes=args.idle_min,
     )
-    if args.idle_min is not None:
-        options.idle_minutes = args.idle_min
-    return options
 
 
 def cmd_config_init(args: argparse.Namespace) -> Answer:
@@ -686,7 +660,7 @@ def cmd_status(args: argparse.Namespace) -> Answer:
     unhosted = result.unhosted_text(args.host)
     if unhosted:
         lines.append(unhosted)
-    return result.answer(recent=recent, since_s=since_s, text="\n".join(lines) or None)
+    return result.answer("\n".join(lines) or None)
 
 
 def ssh_target(args: argparse.Namespace, settings: Settings) -> tuple[HostEntry, str, str | None]:
@@ -852,7 +826,7 @@ def cmd_set(args: argparse.Namespace) -> Answer:
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:
     # `-F`, not `-f`: `gpuc submit && gpuc logs -f` is the obvious pair to type,
     # and a job that has not been dispatched yet has no log.txt to open.
-    return transport.argv(tail_command(remote_path, lines, follow=True, retry=True))
+    return transport.argv(tail_command(remote_path, lines, follow=True))
 
 
 def check_interval(args: argparse.Namespace, *, polls: bool) -> None:
@@ -920,7 +894,7 @@ def _follow_until_done(args: argparse.Namespace, settings: Settings) -> Answer:
     # ask every registered host in turn, 60s each, which is exactly where
     # somebody who mistyped an id reaches for Ctrl-C.
     try:
-        watch = wait_mod.start([args.job_id], args.host, settings)
+        watch = wait_mod.Watch([args.job_id], args.host, settings)
         watched = watch.jobs[args.job_id]
         watch.poll()
         watch.check_known()
@@ -1024,7 +998,7 @@ def cmd_wait(args: argparse.Namespace) -> Answer:
         # `start` is inside too: with no --host and nothing in the index it asks
         # every registered host in turn, 60s each, and that is the wait a user
         # interrupts most.
-        watch = wait_mod.start(args.job_ids, args.host, load_settings())
+        watch = wait_mod.Watch(args.job_ids, args.host, load_settings())
         waited = wait_mod.block(
             watch, interval=args.interval, on_settled=lambda watched: announce(watched.line())
         )
@@ -1397,7 +1371,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit = sub.add_parser("submit", help="submit a job file to a host")
     submit.add_argument("job_file")
     submit.add_argument(
-        "--host", metavar="NAME", help="a registered host to submit to (see `gpuc host list`)"
+        "--host",
+        required=True,
+        metavar="NAME",
+        help="a registered host to submit to (see `gpuc host list`, or `gpuc host rent` for a "
+        "new one)",
     )
     submit.add_argument(
         "--use-shared",
@@ -1835,7 +1813,7 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
     )
     for key, flag in MINIMUMS.items():
         parser.add_argument(
-            flag, type=float, metavar=MINIMUM_UNITS[key][0], help=MINIMUM_UNITS[key][1]
+            flag, dest=key, type=float, metavar=MINIMUM_UNITS[key][0], help=MINIMUM_UNITS[key][1]
         )
     parser.add_argument(
         "--cuda-min",
@@ -1846,6 +1824,7 @@ def add_rent_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--idle-min",
         type=float,
+        default=DEFAULT_IDLE_MINUTES,
         metavar="MINUTES",
         help=f"terminate the pod once its queue has been empty this long "
         f"(default {DEFAULT_IDLE_MINUTES:g})",
