@@ -107,10 +107,6 @@ def secrets_dir() -> Path:
     return home() / "secrets"
 
 
-def secrets_file(name: str) -> Path:
-    return secrets_dir() / name
-
-
 def job_env_file(job_id: str) -> Path:
     return secrets_dir() / f"{job_id}.env"
 

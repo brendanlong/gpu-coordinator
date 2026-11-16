@@ -63,7 +63,7 @@ def _polling_interval(fields: Any) -> float:
     return interval if interval > 0.0 else progress.DEFAULT_INTERVAL_S
 
 
-def normalize_cleanup(value: object, *, origin: str = "cleanup") -> str:
+def normalize_cleanup(value: object) -> str:
     """Validate a `cleanup:` value.
 
     A typo has to fail loudly here: the two ways of being wrong are keeping
@@ -74,7 +74,7 @@ def normalize_cleanup(value: object, *, origin: str = "cleanup") -> str:
         return DEFAULT_CLEANUP
     text = str(value)
     if text not in CLEANUP_POLICIES:
-        raise ValueError(f"{origin} must be one of {', '.join(CLEANUP_POLICIES)}, got {text!r}")
+        raise ValueError(f"cleanup must be one of {', '.join(CLEANUP_POLICIES)}, got {text!r}")
     return text
 
 

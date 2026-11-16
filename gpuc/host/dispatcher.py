@@ -43,10 +43,11 @@ from gpuc.host.procs import (
     JobProcesses,
     boot_id,
     cmdline,
-    from_another_boot,
     init_start,
     is_gpuc_process,
     recorded_process_alive,
+    runner_alive,
+    runner_from_another_boot,
     starttime,
 )
 from gpuc.host.terminate import TerminateCall
@@ -548,22 +549,18 @@ class _Running:
     """Which launch of the job this is, so a runner that died before claiming
     it can be told from one that queued the job again."""
     popen: subprocess.Popen[bytes] | None = None
-    runner_pid: int | None = None
-    runner_boot_id: str | None = None
-    runner_starttime: str | None = None
-    runner_init_start: str | None = None
+    adopted_from: jobs.JobState | None = None
+    """The state naming the runner, for one this dispatcher did not spawn."""
 
     @staticmethod
     def adopted(job_id: str, state: jobs.JobState) -> _Running:
-        return _Running(
-            job_id,
-            list(state.gpus),
-            state.attempt,
-            runner_pid=state.runner_pid,
-            runner_boot_id=state.runner_boot_id,
-            runner_starttime=state.runner_starttime,
-            runner_init_start=state.runner_init_start,
-        )
+        return _Running(job_id, list(state.gpus), state.attempt, adopted_from=state)
+
+    @property
+    def runner_pid(self) -> int | None:
+        if self.popen is not None:
+            return self.popen.pid
+        return self.adopted_from.runner_pid if self.adopted_from else None
 
     def alive(self) -> bool:
         """Is the runner still there? A spawned one is asked directly; an
@@ -571,9 +568,7 @@ class _Running:
         reused within a boot and from 1 again after one."""
         if self.popen is not None:
             return self.popen.poll() is None
-        return recorded_process_alive(
-            self.runner_pid, self.runner_boot_id, self.runner_starttime, self.runner_init_start
-        )
+        return self.adopted_from is not None and runner_alive(self.adopted_from)
 
 
 @dataclass
@@ -704,15 +699,10 @@ class Dispatcher:
                 continue
             if state.status != "running" or job_id in self.running:
                 continue
-            if from_another_boot(state.runner_boot_id, state.runner_init_start):
+            if runner_from_another_boot(state):
                 self._requeue_after_restart(job_id)
                 continue
-            if recorded_process_alive(
-                state.runner_pid,
-                state.runner_boot_id,
-                state.runner_starttime,
-                state.runner_init_start,
-            ):
+            if runner_alive(state):
                 self.running[job_id] = _Running.adopted(job_id, state)
                 self.log(f"adopted running job {job_id} (runner pid {state.runner_pid})")
             else:
@@ -831,10 +821,7 @@ class Dispatcher:
             else:
                 self._mark_runner_died(job_id, expect="queued")
             return
-        ours = entry.popen.pid if entry.popen is not None else entry.runner_pid
-        if state.runner_pid != ours and recorded_process_alive(
-            state.runner_pid, state.runner_boot_id, state.runner_starttime, state.runner_init_start
-        ):
+        if state.runner_pid != entry.runner_pid and runner_alive(state):
             self.running[job_id] = _Running.adopted(job_id, state)
             self.log(f"job {job_id} is running under runner pid {state.runner_pid}; adopted")
             return
@@ -849,8 +836,8 @@ class Dispatcher:
         it has not honoured within the grace period gets `JobProcesses.escalate`.
         A runner in its final sync is honouring it: the upload has no
         wall-clock cap by design, and a ladder that reached the runner there
-        would kill the one upload that matters most, so nothing is escalated
-        while the phase is `sync`.
+        would kill the one upload that matters most, so while the phase is
+        `sync` the ladder waits `SYNC_STOP_PATIENCE_S` instead.
         """
         now = self.deps.monotonic()
         grace = self.deps.kill_grace_s
@@ -862,10 +849,8 @@ class Dispatcher:
             # dispatcher we took over from -- needs a clock of its own, or a
             # runner that never acts on it is never escalated either.
             elapsed = now - self._stop_sent.setdefault(job_id, now)
-            # A runner in its final sync is honouring the request, and the
-            # upload has no cap by design; but one that is *hung* there holds
-            # the cards for ever, so the ladder starts after a long patience
-            # rather than never.
+            # One *hung* in its final sync would hold the cards for ever, so
+            # even there the ladder starts eventually.
             patience = SYNC_STOP_PATIENCE_S if state.phase == "sync" else grace
             if elapsed <= patience:
                 continue
@@ -1613,9 +1598,7 @@ class Dispatcher:
                 continue
             with contextlib.suppress(RuntimeError):
                 state = jobs.read_state(job_id)
-                if state.status == "running" and from_another_boot(
-                    state.runner_boot_id, state.runner_init_start
-                ):
+                if state.status == "running" and runner_from_another_boot(state):
                     self._requeue_after_restart(job_id)
 
     def idle_and_not_ephemeral(self) -> bool:

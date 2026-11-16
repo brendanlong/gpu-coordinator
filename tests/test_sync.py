@@ -192,13 +192,6 @@ def test_s3_put_file_puts_one_object_under_the_uri(tmp_path: Path, fake_aws: str
     ]
 
 
-def test_hf_put_file_lands_under_the_path(tmp_path: Path, fake_aws: str) -> None:
-    (tmp_path / "f").write_text("x")
-    runner = RecordingRunner()
-    HuggingFace("org/repo", "/runs/jid/").put_file(tmp_path / "f", "f", runner=runner)
-    assert runner.calls == [["/fake/hf", "upload", "org/repo", str(tmp_path / "f"), "runs/jid/f"]]
-
-
 # -- upload records -----------------------------------------------------------
 
 

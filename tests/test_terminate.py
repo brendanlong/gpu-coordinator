@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import pytest
 
-from gpuc.host import paths, terminate
+from gpuc.host import terminate
 from gpuc.host.jobs import HostConfig
 
 POD_CONFIG = HostConfig(host="pod-1", provider={"kind": "runpod", "pod_id": "abc123"})
@@ -22,15 +22,6 @@ def no_pod_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     rp = tmp_path / "rp_environment"
     monkeypatch.setenv("GPUC_RP_ENVIRONMENT", str(rp))
     return rp
-
-
-def test_api_key_prefers_the_secrets_file_override(
-    gpuc_home: Path, no_pod_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "from-env")
-    no_pod_env.write_text("export RUNPOD_API_KEY=from-file\n")
-    paths.secrets_file("runpod").write_text("from-secrets\n")
-    assert terminate.read_api_key() == "from-secrets"
 
 
 def test_api_key_falls_back_to_the_pod_env(
@@ -78,7 +69,6 @@ def test_pod_id_resolution_order(
 
 
 def test_missing_api_key_is_a_clear_error(gpuc_home: Path, no_pod_env: Path) -> None:
-    paths.secrets_file("runpod").write_text("   \n")
     with pytest.raises(terminate.TerminateError) as excinfo:
         terminate.read_api_key()
     assert "RUNPOD_API_KEY is unset" in str(excinfo.value)

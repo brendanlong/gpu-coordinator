@@ -524,7 +524,7 @@ def _selection(value: str | None) -> list[str] | None:
     return None if value is None else [j for j in (p.strip() for p in value.split(",")) if j]
 
 
-def _refusal(dry_run: bool, *selections: list[str] | None) -> cleanup.CleanResult | None:
+def _refusal(dry_run: bool, selection: list[str] | None) -> cleanup.CleanResult | None:
     """A report saying nothing was deleted, if any named job id is a typo.
 
     Checked before anything goes, and it refuses the whole selection rather
@@ -533,8 +533,7 @@ def _refusal(dry_run: bool, *selections: list[str] | None) -> cleanup.CleanResul
     would delete is not recoverable. Nothing else here half-honours a delete
     either.
     """
-    named = {job_id for selection in selections if selection for job_id in selection}
-    unknown = sorted(named - set(jobs.list_job_ids()))
+    unknown = sorted(set(selection or ()) - set(jobs.list_job_ids()))
     if not unknown:
         return None
     return cleanup.CleanResult(

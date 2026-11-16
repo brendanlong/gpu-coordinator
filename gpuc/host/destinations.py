@@ -176,18 +176,6 @@ class Destination:
     ) -> None:
         raise NotImplementedError
 
-    def put_file(
-        self,
-        local: Path,
-        name: str,
-        *,
-        runner: CommandRunner = run_command,
-        timeout: float | None = 300.0,
-        env: Env = None,
-    ) -> None:
-        """Upload one file as `name` directly under this destination."""
-        raise NotImplementedError
-
     def preflight(
         self, probe: Path, *, runner: CommandRunner = run_command, env: Env = None
     ) -> None:
@@ -249,9 +237,6 @@ class S3(Destination):
             )
 
 
-RepoExists = Callable[[str, Env], "bool | None"]
-
-
 def hf_repo_exists(repo: str, env: Env = None) -> bool | None:
     """Ask the Hub directly; None when the question could not be answered.
 
@@ -282,7 +267,6 @@ class HuggingFace(Destination):
     """Create the repo if the preflight finds it missing. Off by default: a
     typo in a repo name should fail the job in seconds, not quietly create
     `org/lego-s4-typo` and upload a run into it."""
-    repo_exists: RepoExists = hf_repo_exists
 
     def __post_init__(self) -> None:
         self.path = self.path.strip("/")
@@ -303,18 +287,6 @@ class HuggingFace(Destination):
         hf = _binary("hf", env, f"{local} to {self.uri}")
         argv = [hf, "upload", self.repo, str(local), self.path, *_excludes(exclude)]
         _run(argv, runner, timeout, env)
-
-    def put_file(
-        self,
-        local: Path,
-        name: str,
-        *,
-        runner: CommandRunner = run_command,
-        timeout: float | None = 300.0,
-        env: Env = None,
-    ) -> None:
-        hf = _binary("hf", env, f"{local} to {self.uri}")
-        _run([hf, "upload", self.repo, str(local), self._target(name)], runner, timeout, env)
 
     def preflight(
         self, probe: Path, *, runner: CommandRunner = run_command, env: Env = None
@@ -341,7 +313,7 @@ class HuggingFace(Destination):
                     f"{hf} repos create {self.repo} --type model --exist-ok",
                     f"exited {create.returncode}\n{create.output.strip()[-500:]}",
                 )
-        elif self.repo_exists(self.repo, env) is False:
+        elif hf_repo_exists(self.repo, env) is False:
             raise PreflightFailed(
                 f"{hf} upload {self.repo}",
                 f"the repo {self.repo} does not exist, or this token cannot see it. Create it "

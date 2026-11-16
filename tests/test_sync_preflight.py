@@ -42,12 +42,14 @@ def copied_to(commands: Sequence[list[str]]) -> list[str]:
     return [argv[-2] for argv in commands if argv[1:3] == ["s3", "cp"]]
 
 
-def yes(repo: str, env: Mapping[str, str] | None) -> bool:
-    return True
+@pytest.fixture
+def repo_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(destinations, "hf_repo_exists", lambda repo, env=None: True)
 
 
-def no(repo: str, env: Mapping[str, str] | None) -> bool:
-    return False
+@pytest.fixture
+def repo_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(destinations, "hf_repo_exists", lambda repo, env=None: False)
 
 
 def test_nothing_is_checked_without_outputs_or_a_mirror(gpuc_home: Path, tools: None) -> None:
@@ -123,11 +125,11 @@ def test_targets_are_every_output_destination_then_the_mirror(gpuc_home: Path) -
 
 
 def test_hf_outputs_check_the_token_and_write_a_preflight_file(
-    gpuc_home: Path, tools: None
+    gpuc_home: Path, tools: None, repo_found: None
 ) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/repo", "hf_path": "{job_id}"}])
     fake = FakeRunner()
-    checked = preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=yes)
+    checked = preflight.run(spec, HostConfig(host="h"), runner=fake, env={})
     assert checked == [f"hf://org/repo/{spec.job_id}"]
     assert fake.commands[0][1:] == ["auth", "whoami"]
     assert fake.commands[-1][1:4] == [
@@ -138,28 +140,32 @@ def test_hf_outputs_check_the_token_and_write_a_preflight_file(
     assert fake.commands[-1][-1] == f"{spec.job_id}/.preflight"
 
 
-def test_a_bad_hf_token_fails_before_the_job_runs(gpuc_home: Path, tools: None) -> None:
+def test_a_bad_hf_token_fails_before_the_job_runs(
+    gpuc_home: Path, tools: None, repo_found: None
+) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/repo"}])
     fake = FakeRunner(fail_on="auth whoami", output="Invalid user token")
     with pytest.raises(preflight.PreflightFailed) as caught:
-        preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=yes)
+        preflight.run(spec, HostConfig(host="h"), runner=fake, env={})
     assert "auth whoami" in caught.value.command
     assert "HF_TOKEN" in caught.value.detail
 
 
-def test_a_missing_repo_fails_unless_hf_create_is_set(gpuc_home: Path, tools: None) -> None:
+def test_a_missing_repo_fails_unless_hf_create_is_set(
+    gpuc_home: Path, tools: None, repo_missing: None
+) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/new"}])
     fake = FakeRunner()
     with pytest.raises(preflight.PreflightFailed) as caught:
-        preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=no)
+        preflight.run(spec, HostConfig(host="h"), runner=fake, env={})
     assert "hf_create: true" in caught.value.detail
     assert not any("repos" in " ".join(argv) for argv in fake.commands)
 
 
-def test_hf_create_creates_the_repo(gpuc_home: Path, tools: None) -> None:
+def test_hf_create_creates_the_repo(gpuc_home: Path, tools: None, repo_missing: None) -> None:
     spec = make_spec(outputs=[{"path": "ckpt", "hf": "org/new", "hf_create": True}])
     fake = FakeRunner()
-    preflight.run(spec, HostConfig(host="h"), runner=fake, env={}, repo_exists=no)
+    preflight.run(spec, HostConfig(host="h"), runner=fake, env={})
     assert fake.commands[1][1:] == ["repos", "create", "org/new", "--type", "model", "--exist-ok"]
 
 
