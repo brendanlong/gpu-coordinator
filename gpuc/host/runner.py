@@ -283,7 +283,7 @@ class JobRunner:
         # The submitter's estimate, published from the first phase on: a job
         # still installing torch is exactly the one somebody wants an end time
         # for. A `progress_command` replaces it with a measured one below.
-        self._publish_estimated_eta(self._estimate, phase_start - job_start)
+        self._publish_estimated_eta(phase_start - job_start)
         # Progress is a fraction of the job's own work, so only `main` can
         # report it: during setup the command would be reading a file the job
         # has not started writing.
@@ -301,7 +301,7 @@ class JobRunner:
             if t >= next_estimate:
                 next_estimate = t + deps.estimate_refresh_s
                 self._reread_live_fields(log)
-                self._publish_estimated_eta(self._estimate, t - job_start)
+                self._publish_estimated_eta(t - job_start)
             if self._max_runtime is not None and (t - job_start) >= self._max_runtime * 60.0:
                 self._kill(proc, "timeout", log)
                 break
@@ -336,10 +336,11 @@ class JobRunner:
             self._log(log, f"max_runtime_min is now {said}")
             self._max_runtime = limit
 
-    def _publish_estimated_eta(self, estimate: float | None, elapsed_s: float) -> None:
+    def _publish_estimated_eta(self, elapsed_s: float) -> None:
         """The end time the submitter's estimate implies, while that is the
         best we have. A measured one, once there is one, is never overwritten
         by a guess -- including a guess edited in halfway through the job."""
+        estimate = self._estimate
         if self._measured_eta or estimate == self._published_estimate:
             return
         if estimate is None:
@@ -738,15 +739,8 @@ class JobRunner:
             self._kill(proc, "terminated", log)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
-        requested = queue.stop_requested(self.job_id)
-        ran = self._main_started
-        if requested == "cancelled":
-            outcome = Outcome("cancelled", "cancelled", TERMINATED_EXIT_CODE, ran)
-        elif requested == queue.PREEMPTED:
-            outcome = Outcome("failed", queue.PREEMPTED, TERMINATED_EXIT_CODE, ran)
-        else:
-            outcome = Outcome("failed", "terminated", TERMINATED_EXIT_CODE, ran)
-        return self._finalize(outcome, sync_loop, log)
+        self.kill_reason = queue.stop_requested(self.job_id) or "terminated"
+        return self._finalize(self._classify(TERMINATED_EXIT_CODE, None), sync_loop, log)
 
     def _classify(self, code: int, failure_reason: str | None) -> Outcome:
         """The outcome of the phase that just ended, or that a stop landed

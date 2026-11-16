@@ -519,21 +519,21 @@ def remove_workdir(job_id: str, *, measured: int | None = None) -> int:
     """
     if not has_checkout(job_id):
         return 0
-    archived = paths.checkout_archive(job_id)
-    archived_bytes = _file_bytes(archived)
-    archived.unlink(missing_ok=True)
+    size = (workdir_size(job_id) or 0) if measured is None else measured
+    paths.checkout_archive(job_id).unlink(missing_ok=True)
     if not paths.workdir(job_id).is_dir():
-        return archived_bytes
+        return size
     root, keep = kept_paths(job_id)
-    held = kept_bytes(root, keep) if keep else 0
-    if measured is None:
-        measured = max(reclaimable_bytes(root) - held, 0) + archived_bytes
-    size = measured
     if not keep:
         shutil.rmtree(paths.workdir(job_id))
         return size
     _remove_around(root, keep)
-    jobs.update_state(job_id, checkout_removed_at=jobs.utc_now(), workdir_bytes=0, kept_bytes=held)
+    jobs.update_state(
+        job_id,
+        checkout_removed_at=jobs.utc_now(),
+        workdir_bytes=0,
+        kept_bytes=kept_bytes(root, keep),
+    )
     return size
 
 
@@ -703,7 +703,11 @@ def may_delete(job_id: str, state: JobState, what: str, evidence: Evidence) -> s
         return outputs_pending(job_id, spec, state)
     reasons: list[str] = []
     if not state.mirrored:
-        reasons.append(_not_backed_up(host_s3_prefix()))
+        reasons.append(
+            "not backed up: no s3_prefix on this host"
+            if host_s3_prefix() is None
+            else "not backed up: final upload failed"
+        )
     elif evidence.verified is not None and job_id not in evidence.verified:
         reasons.append("not backed up: the mirror has no log for it")
     pending = outputs_pending(job_id, spec, state)
@@ -918,12 +922,6 @@ def outputs_pending(job_id: str, spec: JobSpec, state: JobState) -> str | None:
         return None
     detail = " (the drain gave up: outputs_lost)" if state.outputs_lost else ""
     return f"outputs not confirmed uploaded{detail}"
-
-
-def _not_backed_up(prefix: str | None) -> str:
-    if prefix is None:
-        return "not backed up: no s3_prefix on this host"
-    return "not backed up: final upload failed"
 
 
 def purge_candidates(

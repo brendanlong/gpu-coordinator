@@ -883,7 +883,7 @@ def test_measuring_after_a_clean_took_the_workdir_records_zero(gpuc_home: Path) 
 
     def measure_then_someone_cleans(wanted: str) -> int | None:
         size = real(wanted)
-        cleanup.remove_workdir(wanted)  # the other process, mid-walk
+        cleanup.remove_workdir(wanted, measured=size)  # the other process, mid-walk
         return size
 
     with pytest.MonkeyPatch.context() as patch:

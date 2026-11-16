@@ -114,7 +114,6 @@ def sync_output(
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
-    baseline_entries: baseline.Entries | None = None,
     record_missing: bool = True,
 ) -> None:
     """Upload one output to each of its destinations, recording each result.
@@ -124,7 +123,7 @@ def sync_output(
     writes its first checkpoint an hour in has not failed anything.
     """
     local = workdir / output.path.format(job_id=job_id)
-    entries = baseline_entries or {}
+    entries = baseline.read(job_id).get(baseline.output_key(output, job_id), {})
     # Files that were in the checkout and have not been touched are not this
     # job's output; uploading them would publish the last run's results under
     # this run's name.
@@ -174,7 +173,6 @@ def sync_outputs(
     runner: CommandRunner = run_command,
     timeout: float | None = DEFAULT_TIMEOUT_S,
     env: Env = None,
-    baseline_map: baseline.Baseline | None = None,
     record_missing: bool = True,
 ) -> None:
     errors: list[SyncError] = []
@@ -188,7 +186,6 @@ def sync_outputs(
                 runner=runner,
                 timeout=timeout,
                 env=env,
-                baseline_entries=(baseline_map or {}).get(baseline.output_key(output, job_id)),
                 record_missing=record_missing,
             )
         except SyncError as exc:
@@ -331,7 +328,6 @@ class SyncLoop:
                 runner=self._runner,
                 timeout=timeout,
                 env=self._env,
-                baseline_map=baseline.read(self._spec.job_id),
                 record_missing=record_missing,
             )
             if meta:

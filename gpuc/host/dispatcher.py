@@ -24,7 +24,6 @@ from pathlib import Path
 
 from gpuc._version import is_other_build
 from gpuc.host import (
-    baseline,
     cleanup,
     gpus,
     jobs,
@@ -1453,7 +1452,6 @@ class Dispatcher:
             runner=self.deps.command_runner,
             timeout=timeout,
             env=env,
-            baseline_map=baseline.read(job_id),
         )
 
     # -- retention -------------------------------------------------------
