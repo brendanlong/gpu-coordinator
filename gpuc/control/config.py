@@ -273,24 +273,6 @@ class HostEntry(TolerantModel):
             return {**data, "trusted": data.get("rental") is None}
         return data
 
-    @model_validator(mode="before")
-    @classmethod
-    def _refuse_an_earlier_builds_rental(cls, data: Any) -> Any:
-        """An entry with a top-level `pod_id` and no `rental` was written by
-        a build that spelled a rental that way. Read tolerantly it would be
-        an ssh host -- never terminated, never reused, never forgotten when
-        its pod ends -- so it is refused instead, and the registry's usual
-        rule for an entry that does not validate (skip it, warn, exit 1)
-        prints the way back.
-        """
-        if isinstance(data, dict) and data.get("pod_id") and data.get("rental") is None:
-            document: dict[Any, Any] = data
-            raise ValueError(
-                f"a rental registered by an earlier build (pod {document['pod_id']}); "
-                f"run `gpuc host add <name> --pod {document['pod_id']}` again"
-            )
-        return data
-
     # -- the address ---------------------------------------------------------
 
     @property

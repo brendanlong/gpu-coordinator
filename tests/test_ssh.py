@@ -21,17 +21,12 @@ JOB = "20260915-120000-abc123"
 
 
 class RecordingTransport:
-    """A transport that runs nothing and remembers what it was asked to run."""
+    """A transport that runs nothing: only its argv are looked at."""
 
     host = "gpubox"
 
-    def __init__(self, returncode: int = 0) -> None:
-        self.commands: list[str] = []
-        self.returncode = returncode
-
     def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
-        self.commands.append(command)
-        return CommandResult(self.host, ["ssh", command], self.returncode, "out\n", "err\n")
+        raise AssertionError("not used")
 
     def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
         raise AssertionError("not used")
@@ -89,12 +84,12 @@ def test_a_job_target_lands_in_the_workdir_and_falls_back_to_the_job_dir() -> No
     assert command.endswith('exec "${SHELL:-/bin/bash}" -l')
 
 
-def test_one_command_runs_in_that_directory_and_propagates_the_exit_code() -> None:
-    transport = cast("Transport", RecordingTransport(returncode=7))
-    result = ssh_mod.run_command(transport, "$HOME/.gpuc", "ls -la")
-    assert result.returncode == 7
-    assert cast("RecordingTransport", transport).commands == [
-        "cd \"$HOME/.gpuc\" && exec /bin/bash -lc 'ls -la'"
+def test_one_command_runs_in_that_directory() -> None:
+    transport = cast("Transport", RecordingTransport())
+    assert ssh_mod.command_argv(transport, "$HOME/.gpuc", "ls -la") == [
+        "ssh",
+        "gpubox",
+        "cd \"$HOME/.gpuc\" && exec /bin/bash -lc 'ls -la'",
     ]
 
 
@@ -103,12 +98,8 @@ def test_one_command_lands_where_the_interactive_session_would() -> None:
     workdir was cleaned still has its job dir, and all three paths use it."""
     workdir, job_dir = f"$HOME/.gpuc/jobs/{JOB}/workdir", f"$HOME/.gpuc/jobs/{JOB}"
     transport = cast("Transport", RecordingTransport())
-    ssh_mod.run_command(transport, workdir, "ls", job_dir)
-    command = cast("RecordingTransport", transport).commands[0]
+    command = ssh_mod.command_argv(transport, workdir, "ls", job_dir)[-1]
     assert command.startswith(f'cd "{workdir}" 2>/dev/null || cd "{job_dir}" && ')
-    assert f'cd "{job_dir}"' in " ".join(
-        ssh_mod.command_argv(cast("Transport", RecordingTransport()), workdir, "ls", job_dir)
-    )
 
 
 def test_a_local_host_gets_a_login_shell_not_an_ssh(tmp_path: Path) -> None:
@@ -183,15 +174,16 @@ def test_print_on_a_local_host_shows_a_login_shell_not_an_ssh(
 
 
 def test_a_command_on_the_local_host_really_runs(
-    control_env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    control_env: Path, tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    """The live check, on `local` only: a real LocalTransport, a real shell."""
+    """The live check, on `local` only: a real LocalTransport, a real shell,
+    writing straight to our stdout."""
     home = tmp_path / "gpuc-home"
     (home / "jobs").mkdir(parents=True)
     register_host(name="local", gpuc_home=str(home), gpus=GPU)
-    capsys.readouterr()
+    capfd.readouterr()
     assert main(["ssh", "local", "--", "pwd"]) == EXIT_OK
-    assert capsys.readouterr().out.strip() == str(home)
+    assert capfd.readouterr().out.strip() == str(home)
     assert main(["ssh", "local", "--", "exit", "3"]) == 3
     # A shell line, not an argv: the exit code is still the remote command's.
     assert main(["ssh", "local", "--", "ls | wc -l"]) == EXIT_OK

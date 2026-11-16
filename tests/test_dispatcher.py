@@ -2041,13 +2041,14 @@ def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) 
     dispatcher.deps.smi = counting
     enqueue_in_order({"gpus": 1})
     dispatcher.run_once()
-    assert not any("memory.used" in " ".join(args) for args in asked)
+    assert len(asked) == 1, "only the pass's own card table"
 
     # Two borrowers, one pass: one sample, judged the same way for both.
+    asked.clear()
     enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
     queue.enqueue(make_spec(gpus=1, use_shared=True))
     dispatcher.run_once()
-    assert sum("memory.used" in " ".join(args) for args in asked) == 1
+    assert len(asked) == 2, "the card table and one sample"
 
 
 # -- automatic preemption -----------------------------------------------------

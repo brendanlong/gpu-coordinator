@@ -709,14 +709,10 @@ def cmd_ssh(args: argparse.Namespace) -> Answer:
         # Joined with spaces and handed to a shell, which is what `ssh host CMD`
         # has always done and what anyone typing `-- 'ls | wc -l'` expects.
         # shlex.join would quote the pipe back into a filename.
-        joined = " ".join(command)
+        argv = ssh_mod.command_argv(transport, directory, " ".join(command), fallback)
         if args.print_only:
-            argv = ssh_mod.command_argv(transport, directory, joined, fallback)
             return Answer({}, ssh_mod.print_line(argv))
-        result = ssh_mod.run_command(transport, directory, joined, fallback)
-        sys.stdout.write(result.stdout)
-        sys.stderr.write(result.stderr)
-        return Answer({}, outcome=result.returncode)
+        return Answer({}, outcome=subprocess.call(argv))
     if args.print_only:
         return Answer(
             {}, ssh_mod.print_line(ssh_mod.interactive_argv(transport, directory, fallback))

@@ -1519,11 +1519,6 @@ def read_mirror(
                         "job_id": job_id,
                         "name": (indexed.name if indexed else "") or "",
                         "outputs_pending": bool(document.get("outputs_lost")),
-                        # An earlier build's state has no limit and the spec's
-                        # is not read here, so not saying beats saying "none".
-                        "max_runtime_min": document.get("max_runtime_min")
-                        if document.get("live_max_runtime") is True
-                        else None,
                     }
                 ]
             }

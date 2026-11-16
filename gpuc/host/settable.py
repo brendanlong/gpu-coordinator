@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from gpuc.host import jobs, paths
-from gpuc.host.jobs import JobSpec, JobState
+from gpuc.host.jobs import JobState
 
 StateCheck = Callable[[str, float, JobState], "str | None"]
 
@@ -61,15 +61,6 @@ class Settable:
 def _max_runtime_check(job_id: str, minutes: float | None, state: JobState) -> str | None:
     if state.status != "running":
         return None
-    if not state.live_max_runtime:
-        # Its runner claimed the job with a build that drops the key, and it
-        # enforces the limit it started with: recording a new one would
-        # report success for nothing.
-        return (
-            f"job {job_id} was started by a gpuc build that reads max_runtime_min only at "
-            f"start, so it keeps the limit it has; `gpuc preempt` runs it again from the "
-            f"start under this build, which would honour a new one"
-        )
     started = jobs.parse_time(state.started_at)
     elapsed = None if started is None else (datetime.now(UTC) - started).total_seconds()
     if minutes is not None and elapsed is not None and minutes * 60.0 <= elapsed:
@@ -155,10 +146,6 @@ def apply(job_id: str, patch: Mapping[str, Any]) -> dict[str, Any]:
     if not paths.job_dir(job_id).is_dir():
         return {"job_id": job_id, "error": f"no job {job_id} on this host", "missing": True}
     try:
-        spec: JobSpec | None = jobs.read_spec(job_id)
-    except (RuntimeError, ValueError, OSError):
-        spec = None
-    try:
         with jobs.locked(job_id):
             state = jobs.read_state(job_id)
             for name, value in patch.items():
@@ -169,12 +156,7 @@ def apply(job_id: str, patch: Mapping[str, Any]) -> dict[str, Any]:
                     error = settable.state_check(job_id, value, state)
                     if error is not None:
                         return {"job_id": job_id, "error": error}
-            fields = dict(patch)
-            if "max_runtime_min" in patch:
-                # Only with a new limit: a running job whose runner predates
-                # the live one must not have its state claim otherwise.
-                fields["live_max_runtime"] = True
-            state = jobs.apply_fields(state, fields)
+            state = jobs.apply_fields(state, dict(patch))
             jobs.write_state(job_id, state)
     except (RuntimeError, OSError) as exc:
         return {"job_id": job_id, "error": f"could not change job {job_id}: {exc}"}
@@ -182,7 +164,7 @@ def apply(job_id: str, patch: Mapping[str, Any]) -> dict[str, Any]:
         "job_id": job_id,
         "status": state.status,
         **{name: getattr(state, name) for name in patch},
-        "warning": _outlives_its_limit(state.estimated_runtime_min, state.max_runtime(spec)),
+        "warning": _outlives_its_limit(state.estimated_runtime_min, state.max_runtime_min),
     }
 
 

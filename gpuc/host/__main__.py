@@ -258,8 +258,6 @@ def _job_entry(
 ) -> dict[str, Any]:
     spec = _spec(job_id)
     entry = {"job_id": job_id, "name": spec.name if spec else "", **state.to_dict()}
-    entry["max_runtime_min"] = state.max_runtime(spec)
-    entry.pop("live_max_runtime")
     # When a queued job's turn is expected, and why not if it cannot be
     # said. Null on anything that is not queued.
     entry["starts_in_s"] = projection.starts_in_s.get(job_id)

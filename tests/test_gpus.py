@@ -77,9 +77,9 @@ def test_owning_every_card_is_every_card_no_shared_entry_names() -> None:
     assert gpus.resolve(None, table, shared=["1", FAKE_GPUS[1]]).duplicates == [FAKE_GPUS[1]]
 
 
-def test_sample_utilization_filters_to_requested_uuids() -> None:
+def test_mean_utilization_is_over_the_requested_cards_only() -> None:
     smi = fake_smi(utilization={FAKE_GPUS[0]: 91.0, FAKE_GPUS[1]: 3.0})
-    assert gpus.sample_utilization([FAKE_GPUS[0]], smi) == {FAKE_GPUS[0]: 91.0}
+    assert gpus.mean_utilization([FAKE_GPUS[0]], smi) == pytest.approx(91.0)
     assert gpus.mean_utilization(FAKE_GPUS, smi) == pytest.approx(47.0)
     assert gpus.mean_utilization([], smi) == 0.0
 
@@ -93,38 +93,38 @@ def test_real_runner_reports_a_clear_error_when_binary_is_absent(
     assert "nvidia-smi not found" in str(excinfo.value)
 
 
-def garbage_smi(value: str):  # type: ignore[no-untyped-def]
-    def run(args: list[str]) -> str:
-        fields = next(a for a in args if a.startswith("--query-gpu=")).split("=", 1)[1].split(",")
-        return (
-            ", ".join(value if f == "utilization.gpu" or f == "index" else "GPU-x" for f in fields)
-            + "\n"
-        )
-
-    return run
+def one_card(index: str = "0", utilization: str = "0") -> gpus.SmiRunner:
+    """A single `GPU-x` row of the snapshot query, with `index` and
+    `utilization.gpu` as given."""
+    return lambda args: f"{index}, GPU-x, Fake, 1024, 0, {utilization}\n"
 
 
 @pytest.mark.parametrize("value", ["[N/A]", "[Not Supported]", "", "n/a"])
-def test_unparsable_utilization_is_a_gpu_error(value: str) -> None:
-    with pytest.raises(gpus.GpuError) as excinfo:
-        gpus.sample_utilization(["GPU-x"], garbage_smi(value))
-    assert "not a number" in str(excinfo.value)
+def test_an_unreadable_utilization_is_a_failed_sample(value: str) -> None:
+    with pytest.raises(gpus.GpuError, match="failed sample"):
+        gpus.mean_utilization(["GPU-x"], one_card(utilization=value))
+
+
+def test_one_unreadable_card_fails_the_whole_sample() -> None:
+    """Averaging only the cards that answered would report a two-card job's
+    mean off whichever card happened to have a reading."""
+
+    def two_cards(args: list[str]) -> str:
+        return "0, GPU-x, Fake, 1024, 0, 80\n1, GPU-y, Fake, 1024, 0, [N/A]\n"
+
+    with pytest.raises(gpus.GpuError, match="failed sample"):
+        gpus.mean_utilization(["GPU-x", "GPU-y"], two_cards)
 
 
 @pytest.mark.parametrize("value", ["[N/A]", "garbage"])
 def test_an_unparsable_index_is_a_gpu_error(value: str) -> None:
     with pytest.raises(gpus.GpuError, match="no card rows"):
-        gpus.list_gpus(garbage_smi(value))
+        gpus.list_gpus(one_card(index=value))
 
 
 def test_a_short_row_is_a_gpu_error_not_a_crash() -> None:
     with pytest.raises(gpus.GpuError, match="no card rows"):
         gpus.list_gpus(lambda args: "0\n")
-
-
-def test_mean_utilization_propagates_the_parse_error() -> None:
-    with pytest.raises(gpus.GpuError):
-        gpus.mean_utilization(["GPU-x"], garbage_smi("[N/A]"))
 
 
 def test_no_samples_for_real_gpus_is_an_error_not_zero_percent() -> None:
@@ -168,7 +168,7 @@ def test_a_reading_that_cannot_be_read_counts_as_in_use() -> None:
     nvidia-smi failing outright."""
 
     def unsupported(args: list[str]) -> str:
-        return f"{FAKE_GPUS[0]}, [N/A], [Not Supported]\n"
+        return f"0, {FAKE_GPUS[0]}, Fake, 1024, [N/A], [Not Supported]\n"
 
     unused, in_use = gpus.unused_gpus(FAKE_GPUS, unsupported)
     assert unused == []

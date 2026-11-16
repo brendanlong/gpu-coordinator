@@ -460,16 +460,7 @@ class JobState:
     changes."""
     max_runtime_min: float | None = None
     """The wall-clock limit in force, as `gpuc set --max-runtime` last left
-    it; the runner re-reads it like the estimate. Meant only when
-    `live_max_runtime` says so: see `max_runtime`."""
-    live_max_runtime: bool = False
-    """Whether `max_runtime_min` above is the limit, rather than the spec's.
-
-    False in a state an earlier build wrote, which never carried the limit:
-    there a null would read as "no limit" when the spec has one. It is also
-    how `gpuc set --max-runtime` tells whether a running job will see the
-    change: a runner from before the limit was live claimed the job with a
-    build that drops this key, and it enforces the limit it started with."""
+    it; the runner re-reads it like the estimate."""
     reason: str | None = None
     """What ended the job, one word: `exit N`, `timeout`, `sync-preflight` and so on."""
     problems: list[str] = field(default_factory=list)
@@ -591,7 +582,6 @@ class JobState:
             priority=as_int(fields, "priority", 50),
             estimated_runtime_min=as_opt_float(fields, "estimated_runtime_min"),
             max_runtime_min=as_opt_float(fields, "max_runtime_min"),
-            live_max_runtime=as_bool(fields, "live_max_runtime"),
             reason=as_opt_str(fields, "reason"),
             problems=as_str_list(fields, "problems"),
             exit_code=as_opt_int(fields, "exit_code"),
@@ -628,6 +618,15 @@ class JobState:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def file_document(self) -> dict[str, Any]:
+        """What state.json holds: `to_dict`, plus `live_max_runtime`.
+
+        Written, never read: a runner adopted across an upgrade still runs
+        the build before this one, which takes `max_runtime_min` as the limit
+        only when this says so, and falls back to the spec's otherwise. Drop
+        it once no such runner can still be alive (#160)."""
+        return {**self.to_dict(), "live_max_runtime": True}
+
     @property
     def finished(self) -> bool:
         return self.status in FINISHED_STATUSES
@@ -643,12 +642,6 @@ class JobState:
         precondition for deleting its job dir."""
         mirror = self.mirror
         return mirror is not None and mirror.ok_at is not None and mirror.error is None
-
-    def max_runtime(self, spec: JobSpec | None) -> float | None:
-        """The wall-clock limit in minutes this job is held to, if any."""
-        if self.live_max_runtime:
-            return self.max_runtime_min
-        return None if spec is None else spec.max_runtime_min
 
     def output_uploads(self) -> list[Upload]:
         return [u for u in self.uploads if u.output is not None]
@@ -680,7 +673,6 @@ class JobState:
             priority=spec.priority,
             estimated_runtime_min=spec.estimated_runtime_min,
             max_runtime_min=spec.max_runtime_min,
-            live_max_runtime=True,
             ran=False,
         )
 
@@ -798,7 +790,7 @@ def read_spec(job_id: str) -> JobSpec:
 
 
 def write_state(job_id: str, state: JobState) -> None:
-    atomic_write_json(paths.state_file(job_id), state.to_dict())
+    atomic_write_json(paths.state_file(job_id), state.file_document())
 
 
 def read_state(job_id: str) -> JobState:

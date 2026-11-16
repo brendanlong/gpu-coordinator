@@ -266,17 +266,6 @@ def test_set_changes_every_field_or_none(
     assert (state.estimated_runtime_min, state.priority) == (None, 5)
 
 
-def test_an_estimate_alone_leaves_an_earlier_builds_limit_alone(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Setting the estimate on a job an old runner is running must not make
-    its state claim a live limit that runner never reads."""
-    job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
-    jobs.write_state(job_id, jobs.JobState(status="running"))
-    code, _ = verb(capsys, "set", job_id, "--field", "estimated_runtime_min=60")
-    assert code == 0 and not jobs.read_state(job_id).live_max_runtime
-
-
 def test_set_estimate_warns_when_the_job_will_be_killed_first(
     gpuc_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -294,12 +283,12 @@ def test_set_max_runtime_on_a_queued_job(
     assert code == 0
     assert payload["max_runtime_min"] == 480.0 and payload["status"] == "queued"
     state = jobs.read_state(job_id)
-    assert state.max_runtime(jobs.read_spec(job_id)) == 480.0
+    assert state.max_runtime_min == 480.0
     assert paths.spec_file(job_id).read_text() == before
 
     code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=null")
     assert code == 0 and payload["max_runtime_min"] is None
-    assert jobs.read_state(job_id).max_runtime(jobs.read_spec(job_id)) is None
+    assert jobs.read_state(job_id).max_runtime_min is None
 
 
 def test_set_max_runtime_raises_a_running_jobs_limit_and_status_reports_it(
@@ -313,7 +302,7 @@ def test_set_max_runtime_raises_a_running_jobs_limit_and_status_reports_it(
     capsys.readouterr()
     assert cli.main(["status"]) == 0
     (entry,) = json.loads(capsys.readouterr().out)["jobs"]
-    assert entry["max_runtime_min"] == 600.0 and "live_max_runtime" not in entry
+    assert entry["max_runtime_min"] == 600.0
 
     _, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=450")
     assert "max_runtime_min" in (payload["warning"] or "")
@@ -328,22 +317,6 @@ def test_set_max_runtime_refuses_a_limit_the_running_job_has_already_outlived(
     code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=90")
     assert code == 1 and "would end it at once" in payload["error"]
     assert jobs.read_state(job_id).max_runtime_min == 420.0
-
-
-def test_set_max_runtime_refuses_a_job_run_by_a_build_that_would_not_see_it(
-    gpuc_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A runner from before the limit lived in the state enforces the spec's,
-    so recording a new one would report success for nothing."""
-    job_id = queue.enqueue(make_spec(max_runtime_min=420.0))
-    jobs.write_state(job_id, jobs.JobState(status="running"))
-    code, payload = verb(capsys, "set", job_id, "--field", "max_runtime_min=600")
-    assert code == 1 and "reads max_runtime_min only at start" in payload["error"]
-
-    queued = queue.enqueue(make_spec(max_runtime_min=420.0))
-    jobs.write_state(queued, jobs.JobState(status="queued"))
-    code, _ = verb(capsys, "set", queued, "--field", "max_runtime_min=600")
-    assert code == 0 and jobs.read_state(queued).max_runtime(jobs.read_spec(queued)) == 600.0
 
 
 @pytest.mark.parametrize("minutes", ["0", "-5", "NaN", "Infinity", '"60"'])

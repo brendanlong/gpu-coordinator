@@ -79,8 +79,8 @@ def parse_table(text: str) -> list[Gpu]:
     return rows
 
 
-def _query(fields: list[str], smi: SmiRunner, extra: list[str] | None = None) -> list[list[str]]:
-    args = [f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits", *(extra or [])]
+def _query(fields: list[str], smi: SmiRunner) -> list[list[str]]:
+    args = [f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"]
     rows: list[list[str]] = []
     for line in smi(args).splitlines():
         line = line.strip()
@@ -96,13 +96,6 @@ def _query(fields: list[str], smi: SmiRunner, extra: list[str] | None = None) ->
     return rows
 
 
-def _as_float(cell: str, field: str) -> float:
-    try:
-        return float(cell)
-    except ValueError as exc:
-        raise GpuError(f"nvidia-smi reported {field}={cell!r}, which is not a number") from exc
-
-
 def _maybe_float(cell: str) -> float | None:
     """`[N/A]` and `[Not Supported]` as None, for a reading that may be absent."""
     try:
@@ -113,14 +106,7 @@ def _maybe_float(cell: str) -> float | None:
 
 def list_gpus(smi: SmiRunner = run_nvidia_smi) -> list[Gpu]:
     """Every card the driver reports right now, as `TABLE_FIELDS` rows."""
-    text = smi([f"--query-gpu={','.join(TABLE_FIELDS)}", "--format=csv,noheader,nounits"])
-    table = parse_table(text)
-    if not table and text.strip():
-        raise GpuError(
-            f"nvidia-smi --query-gpu={','.join(TABLE_FIELDS)} returned no card rows: "
-            f"{text.strip()[-200:]!r}"
-        )
-    return table
+    return snapshot(smi)[0]
 
 
 def driver_version(smi: SmiRunner = run_nvidia_smi) -> str:
@@ -205,17 +191,6 @@ def describe_table(table: Sequence[Gpu]) -> str:
     return ", ".join(f"{gpu.index}={gpu.uuid}" for gpu in table) or "(no GPUs)"
 
 
-def sample_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> dict[str, float]:
-    if not uuids:
-        return {}
-    rows = _query(["uuid", "utilization.gpu"], smi, extra=["-i", ",".join(uuids)])
-    out: dict[str, float] = {}
-    for uuid, util in rows:
-        if uuid in uuids:
-            out[uuid] = _as_float(util, f"utilization.gpu for {uuid}")
-    return out
-
-
 def mean_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> float:
     """Mean `utilization.gpu` over `uuids`. No GPUs asked about means 0%.
 
@@ -225,13 +200,15 @@ def mean_utilization(uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi) -> f
     """
     if not uuids:
         return 0.0
-    samples = sample_utilization(uuids, smi)
-    if not samples:
+    _, usage = snapshot(smi)
+    readings = [usage[uuid].utilization_pct for uuid in uuids if uuid in usage]
+    known = [reading for reading in readings if reading is not None]
+    if not known or len(known) < len(readings):
         raise GpuError(
-            f"nvidia-smi reported no utilization for any of {', '.join(uuids)}; "
+            f"nvidia-smi gave no utilization.gpu reading for {', '.join(uuids)}; "
             f"treating this as a failed sample rather than 0% util"
         )
-    return sum(samples.values()) / len(samples)
+    return sum(known) / len(known)
 
 
 @dataclass(frozen=True)
@@ -270,11 +247,12 @@ USAGE_FIELDS = ("memory.used", "utilization.gpu")
 
 
 def snapshot(smi: SmiRunner = run_nvidia_smi) -> tuple[list[Gpu], dict[str, Usage]]:
-    """Every card and what is on each, from one nvidia-smi call.
+    """Every card and what is on each, from one nvidia-smi call: the one
+    query every reader of nvidia-smi but `driver_version` makes.
 
-    For `status`, which wants both at the same instant: a card that breaks
-    nvidia-smi breaks the listing anyway, so a second call for the readings
-    only adds a window for the two to disagree. Per row, not per call: a row
+    `status` wants both at the same instant: a card that breaks nvidia-smi
+    breaks the listing anyway, so a second call for the readings only adds a
+    window for the two to disagree. Per row, not per call: a row
     that does not parse costs that card its reading and nothing else. (No
     JSON to lean on instead -- nvidia-smi's only structured output is the
     full `-q -x` XML dump, far slower than a `--query-gpu`.)
@@ -312,9 +290,7 @@ def unused_gpus(
     samples: dict[str, Usage] = {}
     failure: str | None = None
     try:
-        fields = ["uuid", *USAGE_FIELDS]
-        rows = _query(fields, smi, extra=["-i", ",".join(uuids)])
-        samples = {u: Usage(u, _maybe_float(mem), _maybe_float(util)) for u, mem, util in rows}
+        _, samples = snapshot(smi)
     except GpuError as exc:
         failure = str(exc)
     unused: list[str] = []

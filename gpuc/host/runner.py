@@ -221,7 +221,7 @@ class JobRunner:
         """The estimate as the last re-read found it, which outlives the phase
         that read it: an estimate added during `setup` must not be undone by
         `main` starting from the value loaded at job start."""
-        self._max_runtime = self.state.max_runtime(self.spec)
+        self._max_runtime = self.state.max_runtime_min
         """The wall-clock limit as the last re-read found it, like `_estimate`."""
         self._published_estimate: float | None = None
         """The `estimated_runtime_min` behind the eta now in the state file,
@@ -330,7 +330,7 @@ class JobRunner:
         except (RuntimeError, OSError, ValueError):
             return
         self._estimate = state.estimated_runtime_min
-        limit = state.max_runtime(self.spec)
+        limit = state.max_runtime_min
         if limit != self._max_runtime:
             said = "no limit" if limit is None else f"{limit:g} min"
             self._log(log, f"max_runtime_min is now {said}")
@@ -571,7 +571,6 @@ class JobRunner:
         return queue.claim(
             self.job_id,
             self.attempt,
-            self.spec,
             status="running",
             gpus=self.assigned,
             phase="setup",
