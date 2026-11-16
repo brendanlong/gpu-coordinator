@@ -278,11 +278,10 @@ def test_failed_final_sync_does_not_mask_a_failed_job(
 
 
 def test_a_preempted_job_whose_final_upload_fails_still_comes_back(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """The upload failure is noted beside the reason, not folded into it: a
     `preempted+sync` reason was one the requeue did not recognise."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     command_runner, _ = uploading(fail_dest="s3://bucket/")
     job_id = prepare(
         command="mkdir -p results && echo hi > results/a.txt && sleep 30",
@@ -437,11 +436,8 @@ def test_the_pgid_goes_with_the_phase_that_owned_it(
     assert during_sync == [("sync", None, None)]
 
 
-def test_runner_uses_the_s3_prefix_for_log_and_state(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_runner_uses_the_s3_prefix_for_log_and_state(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="h", gpus=list(FAKE_GPUS), s3_prefix="s3://b/gpuc/h"))
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     calls: list[list[str]] = []
 
     def command_runner(
@@ -546,12 +542,11 @@ def test_a_job_cancelled_before_its_first_phase_never_runs_its_command(
 
 
 def test_a_job_stopped_before_main_skips_the_final_sync_and_is_never_no_outputs(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """A cancel that lands before the first phase ends a job that produced
     nothing: an `outputs:` path it never had the chance to write is not a
     problem of the job's, and the state says its main never started."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     uploads: list[list[str]] = []
 
     def recording(argv: list[str], timeout: float | None = None, env: sync.Env = None):
@@ -689,9 +684,8 @@ def test_preflight_is_a_real_phase(gpuc_home: Path) -> None:
 
 
 def test_a_missing_output_dir_fails_the_job_as_no_outputs_not_as_sync(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setattr(
         sync, "run_command", lambda argv, timeout=None, env=None: sync.CommandResult(argv, 0, "")
     )
@@ -717,11 +711,8 @@ def test_path_with_user_bins_skips_missing_dirs_and_never_duplicates(
     )
 
 
-def test_a_jobs_secrets_reach_the_sync_loop(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_jobs_secrets_reach_the_sync_loop(gpuc_home: Path, fake_aws: None) -> None:
     """`secrets: [AWS_ACCESS_KEY_ID]` must be enough: no ~/.aws on the host."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     seen: list[sync.Env] = []
 
@@ -743,11 +734,10 @@ def test_a_jobs_secrets_reach_the_sync_loop(
 
 
 def test_the_secrets_file_outlives_the_job_until_the_final_sync_is_done(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """Unlinking it before the final sync would break exactly the upload that
     matters most: the one carrying the finished run's outputs."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     present_during_sync: list[bool] = []
 
@@ -798,10 +788,7 @@ def uploading(
     return command_runner, calls
 
 
-def test_a_successful_final_sync_records_the_backup(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+def test_a_successful_final_sync_records_the_backup(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading()
     job_id = prepare(command="true")
@@ -811,10 +798,7 @@ def test_a_successful_final_sync_records_the_backup(
     assert state.mirror is not None and state.mirror.to == f"s3://b/gpuc/h/jobs/{job_id}"
 
 
-def test_a_failed_final_meta_sync_records_no_backup(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+def test_a_failed_final_meta_sync_records_no_backup(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading(ok=False)
     job_id = prepare(command="true")
@@ -834,8 +818,7 @@ def test_a_host_with_no_prefix_records_no_backup(gpuc_home: Path) -> None:
     assert not state.mirrored
 
 
-def test_confirmed_outputs_are_recorded(gpuc_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+def test_confirmed_outputs_are_recorded(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading()
     job_id = prepare(
@@ -847,9 +830,8 @@ def test_confirmed_outputs_are_recorded(gpuc_home: Path, monkeypatch: pytest.Mon
 
 
 def test_an_output_upload_that_fails_leaves_outputs_unconfirmed(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading(fail_dest="s3://bucket/")
     job_id = prepare(
@@ -866,9 +848,8 @@ def test_an_output_upload_that_fails_leaves_outputs_unconfirmed(
 
 
 def test_an_ephemeral_host_keeps_the_secrets_file_for_the_drain(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(
         HostConfig(
             host="pod",
@@ -892,11 +873,10 @@ def test_an_ephemeral_host_keeps_the_secrets_file_for_the_drain(
 
 
 def test_a_job_that_produced_nothing_does_not_keep_its_secrets_file(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """The drain only retries jobs that are holding something. Keeping a job's
     credentials on disk for a retry that will never come is pure exposure."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(
         HostConfig(
             host="pod",
@@ -916,10 +896,7 @@ def test_a_job_that_produced_nothing_does_not_keep_its_secrets_file(
     assert not paths.job_env_file(job_id).exists()
 
 
-def test_a_shared_host_still_removes_the_secrets_file(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
+def test_a_shared_host_still_removes_the_secrets_file(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     command_runner, _ = uploading(fail_dest="s3://bucket/")
     job_id = prepare(
@@ -1009,14 +986,13 @@ def test_a_preempted_job_goes_straight_from_running_to_queued(gpuc_home: Path) -
 
 
 def test_the_status_stays_running_until_the_mirror_has_been_written(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """A job is finished exactly when its runner has nothing left to do: the
     final sync, the workdir and the mirror all happen under `running` with
     `phase=sync`, and the terminal write comes after them. So a dispatcher
     escalating a stop keys its patience on the phase, and nothing has to
     guess whether the process behind a finished state is still cleaning up."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=[], s3_prefix="s3://b/gpuc/h"))
     at_mirror: list[tuple[str, str | None, int | None]] = []
     command_runner, calls = uploading()

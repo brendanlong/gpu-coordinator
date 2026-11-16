@@ -29,7 +29,7 @@ from gpuc.control.config import (
     registry_transaction,
 )
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.host import jobs, paths, queue, scope
+from gpuc.host import destinations, jobs, paths, queue, scope
 from gpuc.host.jobs import HostConfig, JobSpec, JobState
 from tests import fake_nvidia_smi
 
@@ -71,6 +71,12 @@ def empty_caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+
+
+@pytest.fixture
+def fake_aws(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`aws` and `hf` found at `/fake/<name>`, whatever is installed here."""
+    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
 
 
 @pytest.fixture

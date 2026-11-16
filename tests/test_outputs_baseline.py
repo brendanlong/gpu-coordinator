@@ -6,9 +6,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-import pytest
-
-from gpuc.host import baseline, destinations, jobs, paths, queue, runner
+from gpuc.host import baseline, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig
 from gpuc.host.runner import RunnerDeps
 from gpuc.host.sync import CommandResult
@@ -48,12 +46,9 @@ def prepare(gpuc_home: Path, command: str, **overrides: object) -> tuple[str, Pa
     return job_id, results
 
 
-@pytest.fixture
-def aws(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
-
-
-def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(gpuc_home: Path, aws: None) -> None:
+def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(
+    gpuc_home: Path, fake_aws: None
+) -> None:
     job_id, _ = prepare(gpuc_home, "echo produced > results/new.txt")
     recorder = Recorder()
     code = runner.run_job(
@@ -68,7 +63,7 @@ def test_a_pre_existing_file_is_excluded_and_a_new_one_is_not(gpuc_home: Path, a
     assert jobs.read_state(job_id).outputs_uploaded(jobs.read_spec(job_id))
 
 
-def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, aws: None) -> None:
+def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, fake_aws: None) -> None:
     job_id, _ = prepare(gpuc_home, "echo rewritten > results/report-elephant.md")
     recorder = Recorder()
     assert (
@@ -85,7 +80,9 @@ def test_a_modified_pre_existing_file_is_uploaded(gpuc_home: Path, aws: None) ->
     assert "report-elephant.md" not in recorder.excluded()
 
 
-def test_a_job_that_produced_nothing_new_fails_as_no_outputs(gpuc_home: Path, aws: None) -> None:
+def test_a_job_that_produced_nothing_new_fails_as_no_outputs(
+    gpuc_home: Path, fake_aws: None
+) -> None:
     job_id, _ = prepare(gpuc_home, "true")
     recorder = Recorder()
     code = runner.run_job(
@@ -102,7 +99,7 @@ def test_a_job_that_produced_nothing_new_fails_as_no_outputs(gpuc_home: Path, aw
 
 
 def test_the_baseline_is_taken_before_setup_so_setup_output_counts(
-    gpuc_home: Path, aws: None
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id, _ = prepare(gpuc_home, "true", setup="echo from-setup > results/setup.txt")
     recorder = Recorder()
@@ -144,7 +141,7 @@ def test_a_file_restored_with_the_same_mtime_is_still_baseline(gpuc_home: Path) 
     assert not baseline.has_new_content(results, entries)
 
 
-def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, aws: None) -> None:
+def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, fake_aws: None) -> None:
     jobs.write_config(HostConfig(host="h", s3_prefix=None))
     job_id, _ = prepare(gpuc_home, "sleep 0.1; echo late > results/late.txt")
     recorder = Recorder()
@@ -161,7 +158,7 @@ def test_final_sync_still_excludes_the_baseline(gpuc_home: Path, aws: None) -> N
 
 
 def test_a_preempted_re_run_keeps_the_baseline_the_first_attempt_took(
-    gpuc_home: Path, aws: None
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """Re-scanned at the start of attempt 2, the files attempt 1 produced would
     be recorded as files the *checkout* arrived with -- so this attempt would

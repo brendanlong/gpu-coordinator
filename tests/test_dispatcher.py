@@ -452,9 +452,8 @@ def configure_pod(idle_minutes: float = 15.0, age_h: float = 0.0) -> None:
 
 
 def test_idle_terminate_drains_syncs_and_calls_the_provider(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     monkeypatch.setenv("RUNPOD_POD_ID", "pod-1")
     configure_pod(idle_minutes=15.0)
@@ -1082,7 +1081,7 @@ def test_a_claim_lost_on_other_cards_keeps_both_sets_busy_until_it_is_adopted(
 
 
 def test_a_long_final_sync_after_a_cancel_is_never_sigkilled(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:
     """The bug this design exists for. The runner's terminal write is its last
     act, so a cancelled job stays `running` with `phase=sync` for the whole of
@@ -1091,7 +1090,6 @@ def test_a_long_final_sync_after_a_cancel_is_never_sigkilled(
     status first, cleared no intent, and the ladder then SIGKILLed the runner
     mid-cleanup once a cancel had taken over three grace periods: no mirror
     record, secrets left behind."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     jobs.write_config(HostConfig(host="h", gpus=list(FAKE_GPUS), s3_prefix="s3://b/gpuc/h"))
     clock = FakeClock()
     dispatcher, spawned = make_dispatcher(clock=clock)
@@ -1341,9 +1339,8 @@ def outputs_uploaded(job_id: str) -> bool:
 
 
 def test_the_drain_retries_unconfirmed_outputs_and_records_success(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     dispatcher, _ = make_dispatcher()
@@ -1353,9 +1350,8 @@ def test_the_drain_retries_unconfirmed_outputs_and_records_success(
 
 
 def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     attempts: list[list[str]] = []
@@ -1389,12 +1385,11 @@ def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
 
 
 def test_giving_up_on_outputs_marks_them_lost_and_changes_nothing_else(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:
     """`outputs_lost` is the drain's whole verdict. The job's outcome is the
     runner's, and the failure itself is already in the destination's upload
     record, where `status` reads it from."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
@@ -1423,9 +1418,8 @@ def test_giving_up_on_outputs_marks_them_lost_and_changes_nothing_else(
 
 
 def test_the_drain_records_the_meta_backup_for_every_job(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     job_id = queue.enqueue(make_spec())
@@ -1538,13 +1532,12 @@ def test_a_preempt_the_runner_ignores_is_escalated_and_the_job_still_comes_back(
 
 
 def test_the_drain_bounds_each_upload_and_skips_jobs_that_produced_nothing(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:
     """An unbounded upload can hang a billing pod for hours, and a job that
     declared outputs and never wrote them -- one that failed its sync
     preflight, say -- has nothing to retry; three tries would only burn the
     budget the jobs with real outputs need."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     monkeypatch.setenv("RUNPOD_API_KEY", "key")
     configure_pod(idle_minutes=0.0)
     pending = job_with_pending_outputs()
@@ -1783,12 +1776,11 @@ def test_a_preempted_job_still_finalizing_is_adopted_and_nothing_is_launched_int
 
 
 def test_a_job_queued_again_after_a_preempt_still_counts_as_holding_outputs(
-    gpuc_home: Path, monkeypatch: pytest.MonkeyPatch
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """The stopped attempt's results are still in that workdir, and the drain
     is the last thing that will ever look at them. Filtering the retry list on
     `finished` alone hid them the moment the job went back in the queue."""
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
     configure_pod(idle_minutes=0.0)
     job_id = job_with_pending_outputs()
     queue.enqueue(make_spec(priority=1))  # what the preempt is making room for

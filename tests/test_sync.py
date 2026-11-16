@@ -31,12 +31,6 @@ class RecordingRunner:
         return sync.CommandResult(argv, self.returncode, self.output)
 
 
-@pytest.fixture
-def fake_aws(monkeypatch: pytest.MonkeyPatch) -> str:
-    monkeypatch.setattr(destinations, "find_binary", lambda name, env=None: f"/fake/{name}")
-    return "/fake/aws"
-
-
 def test_recently_modified_finds_only_fresh_files(tmp_path: Path) -> None:
     old = tmp_path / "old.bin"
     new = tmp_path / "nested" / "new.bin"
@@ -50,7 +44,7 @@ def test_recently_modified_finds_only_fresh_files(tmp_path: Path) -> None:
 
 
 def test_s3_sync_excludes_files_written_in_the_last_ten_seconds(
-    tmp_path: Path, fake_aws: str
+    tmp_path: Path, fake_aws: None
 ) -> None:
     (tmp_path / "ckpt.pt").write_text("half-written")
     runner = RecordingRunner()
@@ -63,7 +57,7 @@ def test_s3_sync_excludes_files_written_in_the_last_ten_seconds(
     assert argv[argv.index("--exclude") + 1] == "ckpt.pt"
 
 
-def test_final_sync_includes_the_files_just_written(gpuc_home: Path, fake_aws: str) -> None:
+def test_final_sync_includes_the_files_just_written(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "out").mkdir(parents=True)
@@ -76,7 +70,7 @@ def test_final_sync_includes_the_files_just_written(gpuc_home: Path, fake_aws: s
 
 
 def test_a_periodic_sync_output_excludes_files_still_being_written(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
@@ -88,7 +82,7 @@ def test_a_periodic_sync_output_excludes_files_still_being_written(
     assert argv[argv.index("--exclude") + 1] == "ckpt.pt"
 
 
-def test_sync_error_carries_command_and_output(tmp_path: Path, fake_aws: str) -> None:
+def test_sync_error_carries_command_and_output(tmp_path: Path, fake_aws: None) -> None:
     runner = RecordingRunner(returncode=1, output="line1\nAccess Denied\n")
     with pytest.raises(sync.SyncError) as excinfo:
         S3("s3://bucket/p").upload_dir(tmp_path, runner=runner)
@@ -115,7 +109,7 @@ def test_a_missing_upload_binary_is_a_clear_sync_error(
     assert f"`{tool}` CLI not found" in str(excinfo.value)
 
 
-def test_job_id_is_expanded_in_destinations(gpuc_home: Path, fake_aws: str) -> None:
+def test_job_id_is_expanded_in_destinations(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "results").mkdir(parents=True)
@@ -125,7 +119,7 @@ def test_job_id_is_expanded_in_destinations(gpuc_home: Path, fake_aws: str) -> N
     assert runner.calls[0][4] == f"s3://b/exp/{job_id}/results"
 
 
-def test_hf_upload_argv(gpuc_home: Path, fake_aws: str) -> None:
+def test_hf_upload_argv(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "ckpt").mkdir(parents=True)
@@ -141,7 +135,7 @@ def test_hf_upload_argv(gpuc_home: Path, fake_aws: str) -> None:
     ]
 
 
-def test_sync_outputs_reports_every_failure(gpuc_home: Path, fake_aws: str) -> None:
+def test_sync_outputs_reports_every_failure(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "a").mkdir(parents=True)
@@ -182,7 +176,7 @@ def test_an_output_with_no_destination_expands_to_nothing() -> None:
     assert destinations.of(Output(path="ckpt"), "jid") == []
 
 
-def test_s3_put_file_puts_one_object_under_the_uri(tmp_path: Path, fake_aws: str) -> None:
+def test_s3_put_file_puts_one_object_under_the_uri(tmp_path: Path, fake_aws: None) -> None:
     (tmp_path / "log.txt").write_text("x")
     runner = RecordingRunner()
     local = tmp_path / "log.txt"
@@ -214,7 +208,7 @@ class FailingAt(RecordingRunner):
         return sync.CommandResult(argv, 0, "")
 
 
-def test_each_destination_of_an_output_gets_its_own_record(gpuc_home: Path, fake_aws: str) -> None:
+def test_each_destination_of_an_output_gets_its_own_record(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "ckpt").mkdir(parents=True)
@@ -231,7 +225,7 @@ def test_each_destination_of_an_output_gets_its_own_record(gpuc_home: Path, fake
 
 
 def test_a_failure_at_one_destination_is_recorded_there_and_success_elsewhere(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
@@ -249,7 +243,7 @@ def test_a_failure_at_one_destination_is_recorded_there_and_success_elsewhere(
 
 
 def test_a_later_success_clears_the_error_and_a_later_failure_keeps_ok_at(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
@@ -266,7 +260,7 @@ def test_a_later_success_clears_the_error_and_a_later_failure_keeps_ok_at(
     assert healed.ok_at and healed.error is None
 
 
-def test_sync_job_meta_uploads_log_and_state(gpuc_home: Path, fake_aws: str) -> None:
+def test_sync_job_meta_uploads_log_and_state(gpuc_home: Path, fake_aws: None) -> None:
     from gpuc.host import queue as q
 
     job_id = q.enqueue(make_spec())
@@ -282,7 +276,7 @@ def test_sync_job_meta_uploads_log_and_state(gpuc_home: Path, fake_aws: str) -> 
     assert len(runner.calls) == 2
 
 
-def test_sync_loop_final_runs_one_pass_and_stops(gpuc_home: Path, fake_aws: str) -> None:
+def test_sync_loop_final_runs_one_pass_and_stops(gpuc_home: Path, fake_aws: None) -> None:
     spec = make_spec(sync_interval_s=1, outputs=[{"path": "outputs", "s3": "s3://b/o"}])
     job_id = accept_job(spec)
     (paths.workdir(job_id) / "outputs").mkdir()
@@ -317,7 +311,7 @@ def test_run_command_turns_a_timeout_into_a_sync_error() -> None:
 
 
 def test_the_exclude_list_is_capped_instead_of_building_a_huge_argv(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = enqueued_job()
     outputs = paths.workdir(job_id) / "outputs"
@@ -332,7 +326,7 @@ def test_the_exclude_list_is_capped_instead_of_building_a_huge_argv(
 
 
 def test_a_capped_tick_is_skipped_with_a_log_line_and_is_not_an_error(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = jobs.new_job_id()
     runner = RecordingRunner()
@@ -349,7 +343,7 @@ def test_a_capped_tick_is_skipped_with_a_log_line_and_is_not_an_error(
 
 
 def test_a_missing_output_dir_is_warned_about_on_a_periodic_tick(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = jobs.new_job_id()
     loop = loop_for(job_id, RecordingRunner())
@@ -361,7 +355,7 @@ def test_a_missing_output_dir_is_warned_about_on_a_periodic_tick(
 
 
 def test_a_periodic_missing_output_is_the_destinations_error_and_the_loop_goes_on(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """Once it has stayed missing: the first ticks are a warning in the log and
     nothing in the record, since a job that writes its first checkpoint late
@@ -389,7 +383,7 @@ def test_a_periodic_missing_output_is_the_destinations_error_and_the_loop_goes_o
 
 
 def test_the_periodic_thread_survives_any_exception_and_records_it(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     def exploding(
         argv: list[str], timeout: float | None = None, env: sync.Env = None
@@ -407,7 +401,7 @@ def test_the_periodic_thread_survives_any_exception_and_records_it(
     assert "something unspeakable" in paths.log_file(job_id).read_text()
 
 
-def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: str) -> None:
+def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: None) -> None:
     """`final()` has to wait for a tick already in flight, not race it.
 
     Driven off the tick's own event rather than a sleep: `final()` is called
@@ -441,7 +435,7 @@ def test_final_never_overlaps_a_periodic_tick(gpuc_home: Path, fake_aws: str) ->
     assert overlaps == []
 
 
-def test_the_final_sync_has_no_wall_clock_timeout(gpuc_home: Path, fake_aws: str) -> None:
+def test_the_final_sync_has_no_wall_clock_timeout(gpuc_home: Path, fake_aws: None) -> None:
     job_id = jobs.new_job_id()
     runner = RecordingRunner()
     loop = loop_for(job_id, runner)
@@ -477,7 +471,7 @@ def enqueued_job() -> str:
     return job_id
 
 
-def test_final_meta_sync_records_when_and_where(gpuc_home: Path, fake_aws: str) -> None:
+def test_final_meta_sync_records_when_and_where(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     runner = RecordingRunner()
     assert sync.final_meta_sync(job_id, "s3://bucket/gpuc/host/", runner=runner) is None
@@ -499,7 +493,7 @@ def test_final_meta_sync_records_when_and_where(gpuc_home: Path, fake_aws: str) 
 
 
 def test_a_failed_meta_sync_records_the_error_and_not_a_success(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = enqueued_job()
     with pytest.raises(sync.SyncError):
@@ -511,7 +505,7 @@ def test_a_failed_meta_sync_records_the_error_and_not_a_success(
 
 
 def test_a_mirror_that_worked_before_and_then_fails_is_not_mirrored(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = enqueued_job()
     sync.final_meta_sync(job_id, "s3://bucket/x", runner=RecordingRunner())
@@ -522,7 +516,7 @@ def test_a_mirror_that_worked_before_and_then_fails_is_not_mirrored(
     assert not state.mirrored
 
 
-def test_no_prefix_records_nothing_and_uploads_nothing(gpuc_home: Path, fake_aws: str) -> None:
+def test_no_prefix_records_nothing_and_uploads_nothing(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     runner = RecordingRunner()
     assert sync.final_meta_sync(job_id, None, runner=runner) is None
@@ -531,7 +525,7 @@ def test_no_prefix_records_nothing_and_uploads_nothing(gpuc_home: Path, fake_aws
 
 
 def test_only_the_trailing_state_put_failing_keeps_the_record(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     job_id = enqueued_job()
     warning = sync.final_meta_sync(job_id, "s3://bucket/x", runner=FlakyRunner(fail_from=3))
@@ -540,7 +534,7 @@ def test_only_the_trailing_state_put_failing_keeps_the_record(
     assert jobs.read_state(job_id).mirrored
 
 
-def test_final_records_every_output_as_uploaded(gpuc_home: Path, fake_aws: str) -> None:
+def test_final_records_every_output_as_uploaded(gpuc_home: Path, fake_aws: None) -> None:
     job_id = jobs.new_job_id()
     loop = loop_for(job_id, RecordingRunner())
     with pytest.raises(sync.MissingOutput):
@@ -553,7 +547,7 @@ def test_final_records_every_output_as_uploaded(gpuc_home: Path, fake_aws: str) 
 
 
 def test_final_clears_ok_at_so_a_failed_last_upload_leaves_none(
-    gpuc_home: Path, fake_aws: str
+    gpuc_home: Path, fake_aws: None
 ) -> None:
     """A tick that worked an hour ago says nothing about the files the job
     wrote in its last minute: only the final upload can confirm them."""
@@ -572,7 +566,7 @@ def test_final_clears_ok_at_so_a_failed_last_upload_leaves_none(
     assert not jobs.read_state(job_id).outputs_uploaded(jobs.read_spec(job_id))
 
 
-def test_final_leaves_the_mirror_record_alone(gpuc_home: Path, fake_aws: str) -> None:
+def test_final_leaves_the_mirror_record_alone(gpuc_home: Path, fake_aws: None) -> None:
     job_id = jobs.new_job_id()
     loop = loop_for(job_id, RecordingRunner())
     (paths.workdir(job_id) / "outputs").mkdir(parents=True)
@@ -582,7 +576,7 @@ def test_final_leaves_the_mirror_record_alone(gpuc_home: Path, fake_aws: str) ->
     assert state.mirror is not None and state.mirror.ok_at == "2026-01-01T00:00:00Z"
 
 
-def test_final_with_nothing_declared_records_no_uploads(gpuc_home: Path, fake_aws: str) -> None:
+def test_final_with_nothing_declared_records_no_uploads(gpuc_home: Path, fake_aws: None) -> None:
     job_id = jobs.new_job_id()
     loop = loop_for(job_id, RecordingRunner(), outputs=[])
     loop.final()
