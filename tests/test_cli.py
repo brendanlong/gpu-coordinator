@@ -20,6 +20,7 @@ from gpuc.control.config import (
     hosts_file,
     load_settings,
     registry_transaction,
+    update_cache,
     utc_now,
 )
 from gpuc.control.exits import (
@@ -2633,12 +2634,8 @@ def bootstrapping(
         if error is not None:
             raise error
         kwargs.get("report", print)(f"fake bootstrap of {entry.name}")
-        updated = entry.with_cache(python="/root/python", uv="/root/uv").model_copy(
-            update={"bootstrapped_at": utc_now()}
-        )
-        return updated, BootstrapResult(
-            host=entry.name, home="/root/.gpuc", files=20, dispatcher_pid=4242
-        )
+        update_cache(entry.name, python="/root/python", uv="/root/uv", bootstrapped_at=utc_now())
+        return BootstrapResult(host=entry.name, home="/root/.gpuc", files=20, dispatcher_pid=4242)
 
     monkeypatch.setattr("gpuc.control.hosts.bootstrap_host", fake)
     return attempted

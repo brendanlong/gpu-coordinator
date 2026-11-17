@@ -38,7 +38,6 @@ from gpuc.control.config import (
     load_settings,
     open_registry,
     registry_transaction,
-    update_cache,
 )
 from gpuc.control.connect import Connection, connect_host, push_config
 from gpuc.control.gpuinfo import owned_entries
@@ -547,16 +546,7 @@ def bootstrap_and_record(
     entry: HostEntry, settings: Settings, health: HealthOptions, report: Reporter = print
 ) -> BootstrapResult:
     """Bootstrap one host, persist what it told us about itself, and say so."""
-    updated, result = bootstrap_host(entry, settings, health_options=health, report=report)
-    update_cache(
-        updated.name,
-        config=updated.cache.config,
-        python=updated.python,
-        uv=updated.uv,
-        gpu_info=updated.gpu_info,
-        driver_version=updated.driver_version,
-        bootstrapped_at=updated.bootstrapped_at,
-    )
+    result = bootstrap_host(entry, settings, health_options=health, report=report)
     report(result.render())
     return result
 

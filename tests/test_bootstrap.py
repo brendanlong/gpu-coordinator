@@ -13,15 +13,16 @@ from botocore.stub import Stubber
 from gpuc.control import version as version_mod
 from gpuc.control.bootstrap import (
     BootstrapError,
+    BootstrapResult,
     HealthOptions,
     bootstrap_host,
     package_files,
 )
-from gpuc.control.config import HostEntry, Settings
+from gpuc.control.config import HostEntry, Settings, registry_transaction
 from gpuc.control.remote import NO_CONFIG, HostConfigRead, HostSession
 from gpuc.control.transport import CommandResult, Transport
 from gpuc.host.jobs import HostConfig
-from tests.conftest import host_entry
+from tests.conftest import host_entry, load_registry
 
 HEALTH_OK = {
     "host": "h",
@@ -143,6 +144,16 @@ class ScriptedHost:
         return next(i for i, event in enumerate(self.events) if needle in event)
 
 
+def bootstrapped(
+    registered: HostEntry, host: Transport, settings: Settings | None = None
+) -> tuple[HostEntry, BootstrapResult]:
+    """Bootstrap a registered host, and what the registry then says about it."""
+    with registry_transaction() as registry:
+        registry.put(registered)
+    result = bootstrap_host(registered, settings, transport=host, report=lambda _: None)
+    return load_registry().require(registered.name), result
+
+
 def entry(**overrides: object) -> HostEntry:
     """A registered host whose cache says the host has one GPU.
 
@@ -162,7 +173,7 @@ def test_package_files_are_the_git_tracked_host_modules() -> None:
 
 def test_a_fully_provisioned_host_installs_nothing(control_env: Path) -> None:
     host = ScriptedHost()
-    updated, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    updated, result = bootstrapped(entry(), host)
     assert result.dispatcher_pid == 4242
     assert result.warnings == []
     assert updated.python == "/home/u/.local/python3.12"
@@ -175,7 +186,7 @@ def test_a_fully_provisioned_host_installs_nothing(control_env: Path) -> None:
 
 def test_a_bare_host_installs_uv_python_aws_and_hf(control_env: Path) -> None:
     host = ScriptedHost(uv_present=False, python_present=False, aws_present=False, hf_present=False)
-    _, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    _, result = bootstrapped(entry(), host)
     assert any("astral.sh/uv" in e for e in host.events)
     assert any("python install 3.12" in e for e in host.events)
     assert any("awscli-exe-linux" in e for e in host.events)
@@ -247,9 +258,7 @@ def test_bootstrap_leaves_the_config_the_host_already_has_alone(control_env: Pat
         "env": {"HF_HOME": "/big"},
     }
     host = ScriptedHost(config=dict(theirs))
-    updated, result = bootstrap_host(
-        entry(gpus=["GPU-a"], s3_prefix="s3://mine/gpuc/h"), transport=host, report=lambda _: None
-    )
+    updated, result = bootstrapped(entry(gpus=["GPU-a"], s3_prefix="s3://mine/gpuc/h"), host)
     assert result.warnings == []
     assert host.config is not None
     assert {key: host.config[key] for key in theirs} == theirs
@@ -262,9 +271,7 @@ def test_bootstrap_restores_a_config_on_a_host_that_has_none(control_env: Path) 
     """A host whose $HOME was wiped, or one registered before the split: there
     is nothing on the host to preserve, so the last config seen is written."""
     host = ScriptedHost()
-    updated, _ = bootstrap_host(
-        entry(s3_prefix="s3://mine/gpuc/h"), transport=host, report=lambda _: None
-    )
+    updated, _ = bootstrapped(entry(s3_prefix="s3://mine/gpuc/h"), host)
     assert host.config is not None
     assert host.config["gpus"] == ["GPU-a"]
     assert host.config["s3_prefix"] == "s3://mine/gpuc/h"
@@ -292,7 +299,7 @@ def test_bootstrap_says_so_when_the_config_it_restores_owns_no_card(
     control_env: Path,
 ) -> None:
     host = ScriptedHost()
-    _, result = bootstrap_host(host_entry(name="h", gpus=[]), transport=host, report=lambda _: None)
+    _, result = bootstrapped(host_entry(name="h", gpus=[]), host)
     (warning,) = result.warnings
     assert "no config of its own" in warning
     assert "gpuc host set h --gpus <list>" in warning
@@ -306,7 +313,7 @@ def test_bootstrap_gives_a_bare_host_it_knows_nothing_about_every_card(
     host = ScriptedHost()
     bare = host_entry(name="h")
     bare = bare.model_copy(update={"cache": bare.cache.model_copy(update={"config": {}})})
-    updated, result = bootstrap_host(bare, transport=host, report=lambda _: None)
+    updated, result = bootstrapped(bare, host)
     assert result.warnings == []
     assert host.config is not None
     assert "gpus" in host.config and host.config["gpus"] is None
@@ -334,7 +341,7 @@ def test_a_failed_health_check_fails_bootstrap_with_its_json(control_env: Path) 
 
 def test_an_optional_tool_failure_is_a_warning_not_an_error(control_env: Path) -> None:
     host = ScriptedHost(hf_present=False, hf_install_fails=True)
-    _, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    _, result = bootstrapped(entry(), host)
     assert result.dispatcher_pid == 4242
     assert len(result.warnings) == 1
     assert "huggingface_hub" in result.warnings[0]
@@ -356,7 +363,7 @@ def test_a_host_without_user_systemd_still_bootstraps(control_env: Path) -> None
             return super()._answer(command)
 
     host = NoSystemd()
-    _, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    _, result = bootstrapped(entry(), host)
     assert result.dispatcher_pid == 4242
     assert result.warnings == []
 
@@ -384,7 +391,7 @@ def test_a_host_without_a_mirror_only_warns_about_a_missing_aws_cli(control_env:
                 return 1, "curl: (6) could not resolve host"
             return super()._answer(command)
 
-    _, result = bootstrap_host(entry(), transport=NoAws(aws_present=False), report=lambda _: None)
+    _, result = bootstrapped(entry(), NoAws(aws_present=False))
     assert any("aws CLI install failed" in warning for warning in result.warnings)
 
 
@@ -395,7 +402,7 @@ def test_bootstrap_keeps_the_probes_cards_and_records_the_driver(control_env: Pa
 
     probed = entry(gpu_info={"GPU-a": GpuInfo(name="NVIDIA A40", vram_mib=46068, index=0)})
     host = ScriptedHost()
-    updated, _ = bootstrap_host(probed, transport=host, report=lambda _: None)
+    updated, _ = bootstrapped(probed, host)
     assert updated.gpu_info["GPU-a"].name == "NVIDIA A40"
     assert updated.driver_version == "580.173.02"
     assert not any("nvidia-smi" in event for event in host.events)
@@ -409,7 +416,7 @@ def test_bootstrap_records_the_commit_on_the_host_and_in_the_registry(control_en
     host = ScriptedHost(
         config={**CONFIG_ON_HOST, "pkg_commit": "a" * 40, "created_at": "2020-01-01T00:00:00+00:00"}
     )
-    updated, result = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    updated, result = bootstrapped(entry(), host)
     assert result.warnings == []
     assert updated.config.pkg_commit == version_mod.local_commit()
     assert host.config is not None
@@ -456,12 +463,7 @@ def test_bootstrap_gives_a_rental_its_mirror_key_by_this_machines_trust_in_it(
     refusing.add_client_error("get_federation_token", service_error_code="AccessDenied")
     refusing.activate()
     untrusted = ScriptedHost(config=dict(rented))
-    _, result = bootstrap_host(
-        entry(kind="rental", pod_id="pod1"),
-        settings,
-        transport=untrusted,
-        report=lambda _: None,
-    )
+    _, result = bootstrapped(entry(kind="rental", pod_id="pod1"), untrusted, settings)
     assert not any(path.endswith("/.aws/credentials") for path in untrusted.puts)
     assert any("not renewed" in warning for warning in result.warnings)
     refusing.assert_no_pending_responses()

@@ -28,6 +28,7 @@ from gpuc.control.config import (
     first_config,
     load_settings,
     transport_for,
+    update_cache,
     utc_now,
 )
 from gpuc.control.connect import refuse_unreadable
@@ -538,7 +539,7 @@ def bootstrap_host(
     transport: Transport | None = None,
     report: Reporter = print,
     health_options: HealthOptions = DEFAULT_HEALTH,
-) -> tuple[HostEntry, BootstrapResult]:
+) -> BootstrapResult:
     """Bring a host to a state where `python -m gpuc.host` runs and dispatches.
 
     Installs, ships and starts things; it does **not** configure the host.
@@ -549,7 +550,7 @@ def bootstrap_host(
     whose gpuc home was wiped): there is nothing to preserve, so it gets
     `first_config` with the last config this machine read off it on top.
 
-    Returns the entry with what the host said cached; the caller persists it.
+    What the host said is recorded in the registry's cache on the way out.
     """
     settings = settings if settings is not None else load_settings()
     transport = transport or transport_for(entry, settings)
@@ -653,12 +654,15 @@ def bootstrap_host(
     owned = owned_entries(session.config.gpus, session.config.shared_gpus, entry.gpu_info)
     if owned:
         report(f"gpus: {summarize(owned, entry.gpu_info)}")
-    updated = (
-        entry.with_cache(uv=uv, python=python, driver_version=driver_version(health))
-        .with_config(session.config_read.document or {})
-        .model_copy(update={"bootstrapped_at": utc_now()})
+    update_cache(
+        entry.name,
+        config=session.config_read.document or {},
+        python=python,
+        uv=uv,
+        driver_version=driver_version(health),
+        bootstrapped_at=utc_now(),
     )
-    return updated, BootstrapResult(
+    return BootstrapResult(
         host=entry.name,
         home=home,
         files=files,
