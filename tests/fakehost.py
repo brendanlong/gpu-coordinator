@@ -246,6 +246,54 @@ class FakeHost:
         return result
 
 
+class ScriptedTransport:
+    """A host that gives every command the same answer, for code that asks
+    once and parses the reply. Records what it ran; writes and copies are
+    not expected."""
+
+    host = "gpubox"
+
+    def __init__(
+        self,
+        stdout: str,
+        returncode: int = 0,
+        raises: Exception | None = None,
+        stderr: str = "",
+    ) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.raises = raises
+        self.stderr = stderr
+        self.commands: list[str] = []
+
+    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
+        self.commands.append(command)
+        if self.raises is not None:
+            raise self.raises
+        return CommandResult(self.host, ["ssh", command], self.returncode, self.stdout, self.stderr)
+
+    def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
+        raise AssertionError("not used")
+
+    def rsync(
+        self,
+        local_root: Path,
+        remote_path: str,
+        files: Sequence[str] | None = None,
+        excludes: Sequence[str] = (),
+    ) -> CommandResult:
+        raise AssertionError("not used")
+
+    def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
+        raise AssertionError("not used")
+
+    def argv(self, command: str) -> list[str]:
+        return ["sh", "-c", command]
+
+    def interactive_argv(self, command: str) -> list[str]:
+        return ["sh", "-c", command]
+
+
 def _shim(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)

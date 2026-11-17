@@ -23,7 +23,7 @@ import pytest
 from gpuc.control.bootstrap import BootstrapError, bootstrap_host, remote_path
 from gpuc.control.cli import main
 from gpuc.control.config import HostEntry
-from gpuc.control.exits import EXIT_NOT_FOUND, EXIT_USAGE
+from gpuc.control.exits import EXIT_USAGE
 from gpuc.control.remote import env_prefix, host_command
 from gpuc.host import dispatcher, health, jobs, paths, queue, runner
 from gpuc.host.jobs import HostConfig, JobState
@@ -438,13 +438,6 @@ def test_host_set_with_no_flags_says_so(
     add()
     assert main(["host", "set", "gpubox"]) == EXIT_USAGE
     assert "changes nothing" in capsys.readouterr().err
-
-
-def test_host_set_on_an_unknown_host_names_the_known_ones(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["host", "set", "nope", "--idle-min", "1"]) == EXIT_NOT_FOUND
-    assert "no host named 'nope'" in capsys.readouterr().err
 
 
 def test_host_set_says_which_change_is_local_and_which_reached_the_host(

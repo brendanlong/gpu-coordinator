@@ -21,48 +21,11 @@ from gpuc.control.remote import (
 )
 from gpuc.control.transport import CommandResult, Transport, TransportError
 from tests.conftest import host_entry
+from tests.fakehost import ScriptedTransport
 
 MOTD = """Welcome to Ubuntu 24.04!
  * Support: https://ubuntu.com/pro
 """
-
-
-class ScriptedTransport:
-    host = "gpubox"
-
-    def __init__(
-        self,
-        stdout: str,
-        returncode: int = 0,
-        raises: Exception | None = None,
-        stderr: str = "",
-    ) -> None:
-        self.stdout = stdout
-        self.returncode = returncode
-        self.raises = raises
-        self.stderr = stderr
-        self.commands: list[str] = []
-
-    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
-        self.commands.append(command)
-        if self.raises is not None:
-            raise self.raises
-        return CommandResult(self.host, ["ssh", command], self.returncode, self.stdout, self.stderr)
-
-    def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None:
-        raise AssertionError("not used")
-
-    def rsync(
-        self,
-        local_root: Path,
-        remote_path: str,
-        files: object = None,
-        excludes: object = (),
-    ) -> CommandResult:
-        raise AssertionError("not used")
-
-    def pull(self, remote_root: str, local_root: Path, files: object) -> CommandResult:
-        raise AssertionError("not used")
 
 
 class Recorder(ScriptedTransport):

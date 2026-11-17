@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 from gpuc.control.probe import parse_probe, probe_host, probe_script
-from gpuc.control.transport import CommandResult
 from tests.conftest import host_entry
+from tests.fakehost import ScriptedTransport
 
 PROBE_SCRIPT = probe_script()
 
@@ -218,42 +216,10 @@ def test_the_document_flags_every_card_assigned_or_not() -> None:
     assert document["assigned_missing"] == []
 
 
-class OneAnswerTransport:
-    """Says the same thing to every command: the probe only asks once."""
-
-    host = "gpubox"
-
-    def __init__(self, output: str) -> None:
-        self.output = output
-
-    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> CommandResult:
-        return CommandResult(self.host, ["ssh", command], 0, self.output, "")
-
-    def put_file(self, content: str | bytes, remote_path: str, mode: int = 0o600) -> None: ...
-
-    def rsync(
-        self,
-        local_root: Path,
-        remote_path: str,
-        files: Sequence[str] | None = None,
-        excludes: Sequence[str] = (),
-    ) -> CommandResult:
-        return CommandResult(self.host, ["rsync"], 0, "", "")
-
-    def pull(self, remote_root: str, local_root: Path, files: Sequence[str]) -> CommandResult:
-        return CommandResult(self.host, ["rsync"], 0, "", "")
-
-    def argv(self, command: str) -> list[str]:
-        return ["sh", "-c", command]
-
-    def interactive_argv(self, command: str) -> list[str]:
-        return ["sh", "-c", command]
-
-
 def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
     """The seam every other test here stubs: the registry's `--gpus` reaches the report."""
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", gpus=["1"])
-    report = probe_host(entry, transport=OneAnswerTransport(SAMPLE))
+    report = probe_host(entry, transport=ScriptedTransport(SAMPLE))
     assert report.owned == ["1"]
     assert [gpu.uuid for gpu in report.owned_rows] == [A40]
     assert TI not in report.render()
@@ -261,7 +227,7 @@ def test_probe_host_carries_the_registered_assignment_into_the_report() -> None:
 
 def test_probe_host_carries_the_registered_persistent_root_too() -> None:
     entry = host_entry(name="gpubox", kind="ssh", ssh="me@box", persistent_root="/mnt/ssd-2/me/")
-    report: Any = probe_host(entry, transport=OneAnswerTransport(OVERLAY_HOME))
+    report: Any = probe_host(entry, transport=ScriptedTransport(OVERLAY_HOME))
     assert report.persistent_root == "/mnt/ssd-2/me"
     assert report.document()["persistent_root"] == "/mnt/ssd-2/me"
     # An overlay $HOME that already has a root is the other half of the note

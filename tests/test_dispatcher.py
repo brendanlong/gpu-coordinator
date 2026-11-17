@@ -31,7 +31,7 @@ from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import procs as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig, Outcome
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import FAKE_GPUS, fake_smi, make_job, make_spec
 from tests.test_runner import deps as runner_deps
 
 
@@ -1152,14 +1152,7 @@ def test_spawned_children_get_the_home_tool_dirs_on_path(
 
 
 def finished_job(days_old: float = 30.0, *, mirrored: bool = True) -> str:
-    job_id = queue.enqueue(make_spec())
-    ended = (datetime.now(UTC) - timedelta(days=days_old)).isoformat()
-    jobs.update_state(job_id, status="succeeded", ended_at=ended)
-    if mirrored:
-        jobs.record_upload(job_id, f"s3://b/gpuc/h/jobs/{job_id}", None, ok_at=ended)
-    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
-    (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
-    return job_id
+    return make_job(days_old=days_old, mirrored=mirrored, prefix="s3://b/gpuc/h")
 
 
 def configure_retention(days: float | None, workdir_days: float | None = None) -> None:

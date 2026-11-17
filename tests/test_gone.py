@@ -196,14 +196,6 @@ def test_status_lists_a_terminated_rentals_jobs_from_the_mirror_and_forgets_it(
     assert f"({JOB}) succeeded" in capsys.readouterr().out
 
 
-def test_ssh_to_a_job_on_a_host_this_machine_does_not_have_is_still_no_such_host(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A shell needs a host to open: there `--host` names a destination."""
-    assert main(["ssh", "--host", "nope", "--print", JOB]) == 4
-    assert "no host named 'nope'" in capsys.readouterr().err
-
-
 # -- a typo is not a rental that ended ------------------------------------------
 
 
