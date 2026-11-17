@@ -1244,6 +1244,7 @@ def preempt_jobs(
     """
     if priority is not None:
         check_patch({"priority": priority})
+        priority = int(priority)
     done, _ = job_verbs(
         "preempt",
         job_ids,

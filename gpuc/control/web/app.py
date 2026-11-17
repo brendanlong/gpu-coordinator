@@ -309,11 +309,10 @@ class Dashboard:
     def api_preempt(self, request: Request) -> Response:
         job_id = job_id_of(request)
         body = request.json()
-        priority = body.get("priority")
-        if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
-            raise UsageError("preempt takes an integer `priority` (0-99), or none at all")
         return Response.answer(
-            jobs_answer(preempt_jobs([job_id], priority, host_of(body), self.load_settings()))
+            jobs_answer(
+                preempt_jobs([job_id], body.get("priority"), host_of(body), self.load_settings())
+            )
         )
 
     def api_set(self, request: Request) -> Response:

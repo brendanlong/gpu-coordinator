@@ -99,20 +99,17 @@ def summarize(owned: Sequence[str], info: Mapping[str, GpuInfo]) -> str:
     return ", ".join(f"{count}x {label}" for label, count in groups.items())
 
 
-def rows(
-    owned: Sequence[str], info: Mapping[str, GpuInfo], indices: Mapping[str, int] | None = None
-) -> list[tuple[str, str, str, str]]:
+def rows(owned: Sequence[str], info: Mapping[str, GpuInfo]) -> list[tuple[str, str, str, str]]:
     """`(index, name, vram, uuid)` per owned card, in the host's own order.
 
-    `indices` is the host's *current* numbering when a caller has it (`gpuc
-    status` asks the host); without it the index recorded at the last probe is
-    shown, and `?` when even that is unknown.
+    The index is the one recorded at the last probe, and `?` when even that is
+    unknown.
     """
     out: list[tuple[str, str, str, str]] = []
     for item in owned:
         uuid = uuid_of(item, info)
         entry = (info.get(uuid) if uuid else None) or GpuInfo()
-        index = (indices or {}).get(uuid or "", entry.index)
+        index = entry.index
         if index is None and item.isdigit():
             index = int(item)
         out.append(

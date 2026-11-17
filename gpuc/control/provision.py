@@ -438,7 +438,7 @@ def _abandon(
     """Terminate and forget a pod this run gave up on; False if it still bills."""
     progress(f"terminating {name} ({pod_id}): {reason}")
     try:
-        provider.terminate_confirmed(pod_id, report=progress, sleep=deps.sleep)
+        provider.terminate_confirmed(pod_id, report=progress)
     except ProviderError as exc:
         # A pod that is still billing must stay visible: its registry entry, if
         # it got one, is what `gpuc status` shows a POD line for.

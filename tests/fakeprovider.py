@@ -87,6 +87,7 @@ class FakeProvider(Provider):
         existing: list[Pod] | None = None,
     ) -> None:
         self.prefix = prefix
+        self._sleep = lambda _: None
         self._offers = offers if offers is not None else [make_offer()]
         self._scripts = iter(scripts or [])
         self._ids = itertools.count(1)
