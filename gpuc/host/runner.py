@@ -8,7 +8,7 @@ attempt -- a terminal status, or `queued` again for a preempted job -- so a
 job is finished exactly when its runner is gone, and nothing has to guess
 whether the process behind a finished state is still cleaning up.
 
-Exit-code discipline (measured in the shell implementation this replaces):
+Exit-code discipline:
 the job's exit code is captured before *any* cleanup, and a failed final sync
 turns an otherwise-green job into `failed: sync` so lost outputs are never
 silent.

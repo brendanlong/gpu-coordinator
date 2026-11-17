@@ -433,10 +433,9 @@ def preexisting_output_warnings(spec: JobSpec, workdir: Path) -> list[str]:
     """
     warnings: list[str] = []
     for output in spec.outputs:
-        # The raw `path`, exactly as the spec wrote it and as the host records
-        # its baseline: formatting `{job_id}` in here would ask about a
-        # directory this job has not created yet, and would raise on any other
-        # placeholder the path happens to contain.
+        # The raw `path`, exactly as the spec wrote it: formatting `{job_id}`
+        # in here would ask about a directory this job has not created yet,
+        # and would raise on any other placeholder the path happens to contain.
         root = workdir / output.path
         if not root.exists():
             continue
