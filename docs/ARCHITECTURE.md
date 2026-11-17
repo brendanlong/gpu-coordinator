@@ -229,11 +229,11 @@ The rules it holds to:
 - **One dispatch rule** (`plan.plan`), pure, over one pass's inputs: the queue
   in dispatch order, the owned cards free now, how many owned and
   shared cards nvidia-smi reports (capacity: a job wider than that fails), and
-  one nvidia-smi reading of the shared cards taken only if a job
-  needs to borrow. Per job it decides assigned, holds, stepped over or fails,
-  and, for a job that holds, which running `auto_preempt` jobs would cover its
-  gap; `launch_ready` acts on it every 2 s, and automatic preemption on that
-  set for the first job with a gap. Run forward over the running jobs' etas
+  the shared cards' usage from that same reading. Per job it decides
+  assigned, holds, stepped over or fails, and, for a job that holds, which
+  running `auto_preempt` jobs would cover its gap; `launch_ready` acts on one
+  walk every 2 s: the launches, then automatic preemption on that set for the
+  first job with a gap. Run forward over the running jobs' etas
   (`plan.project`) it is how the host says when each queued job will start.
 - **An `auto_preempt` job may take held cards**, launched like any other,
   unless the holder is *covered*: short of nothing once the cards on their
@@ -280,7 +280,7 @@ The rules it holds to:
   finished in between. An attempt that ended on its own first, or was
   cancelled while stopping, ends that way instead. A draining host refuses
   one.
-- **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
+- **Automatic preemption** (the end of `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
   `auto_preempt` jobs that together cover the gap, least important first, and
   only jobs the waiting one is ahead of in dispatch order. Nothing is

@@ -2245,7 +2245,7 @@ def test_nothing_is_stopped_for_a_job_that_has_been_cancelled(gpuc_home: Path) -
     dispatcher.run_once()
     doomed = queue.enqueue(make_spec(gpus=2, priority=10))
     assert queue.cancel(doomed) == "cancelled"
-    dispatcher.preempt_for_waiting()
+    dispatcher.launch_ready()
     assert not queue.is_preempted(cheap)
 
 
