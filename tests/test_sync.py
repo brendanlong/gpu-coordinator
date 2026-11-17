@@ -109,22 +109,12 @@ def test_a_missing_upload_binary_is_a_clear_sync_error(
     assert f"`{tool}` CLI not found" in str(excinfo.value)
 
 
-def test_job_id_is_expanded_in_destinations(gpuc_home: Path, fake_aws: None) -> None:
-    job_id = enqueued_job()
-    workdir = paths.workdir(job_id)
-    (workdir / "results").mkdir(parents=True)
-    runner = RecordingRunner()
-    output = Output(path="results", s3="s3://b/exp/{job_id}/results")
-    sync.sync_outputs([output], workdir, job_id, runner=runner)
-    assert runner.calls[0][4] == f"s3://b/exp/{job_id}/results"
-
-
 def test_hf_upload_argv(gpuc_home: Path, fake_aws: None) -> None:
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "ckpt").mkdir(parents=True)
     runner = RecordingRunner()
-    output = Output(path="ckpt", hf="org/repo", hf_path="{job_id}/ckpt")
+    output = Output(path="ckpt", hf="org/repo", hf_path=f"{job_id}/ckpt")
     sync.sync_outputs([output], workdir, job_id, min_age_s=0.0, runner=runner)
     assert runner.calls[0] == [
         "/fake/hf",
@@ -150,20 +140,13 @@ def test_sync_outputs_reports_every_failure(gpuc_home: Path, fake_aws: None) -> 
 # -- destinations -------------------------------------------------------------
 
 
-def test_destinations_of_expands_job_id_in_every_field() -> None:
-    output = Output(
-        path="ckpt",
-        s3="s3://b/exp/{job_id}/ckpt/",
-        hf="org/{job_id}",
-        hf_path="runs/{job_id}",
-        hf_create=True,
-    )
-    found = destinations.of(output, "jid")
-    assert found == [
-        S3("s3://b/exp/jid/ckpt"),
-        HuggingFace("org/jid", "runs/jid", create=True),
+def test_destinations_are_taken_as_submit_expanded_them() -> None:
+    """A `{{` the user escaped is a literal brace by now, not a placeholder."""
+    output = Output(path="ckpt", s3="s3://b/jid/a{b}", hf="org/jid", hf_path="runs/{x}")
+    assert [d.uri for d in destinations.of(output, "jid")] == [
+        "s3://b/jid/a{b}",
+        "hf://org/jid/runs/{x}",
     ]
-    assert [d.uri for d in found] == ["s3://b/exp/jid/ckpt", "hf://org/jid/runs/jid"]
 
 
 def test_the_hf_path_defaults_to_the_job_id() -> None:
@@ -212,7 +195,7 @@ def test_each_destination_of_an_output_gets_its_own_record(gpuc_home: Path, fake
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "ckpt").mkdir(parents=True)
-    output = Output(path="ckpt", s3="s3://b/{job_id}", hf="org/repo")
+    output = Output(path="ckpt", s3=f"s3://b/{job_id}", hf="org/repo")
     sync.sync_outputs([output], workdir, job_id, runner=RecordingRunner())
     records = jobs.read_state(job_id).output_uploads()
     assert sorted((u.output, u.to) for u in records) == [
@@ -230,7 +213,7 @@ def test_a_failure_at_one_destination_is_recorded_there_and_success_elsewhere(
     job_id = enqueued_job()
     workdir = paths.workdir(job_id)
     (workdir / "ckpt").mkdir(parents=True)
-    output = Output(path="ckpt", s3="s3://b/{job_id}", hf="org/repo")
+    output = Output(path="ckpt", s3=f"s3://b/{job_id}", hf="org/repo")
     with pytest.raises(sync.SyncError, match="AccessDenied"):
         sync.sync_outputs([output], workdir, job_id, runner=FailingAt("org/repo"))
     state = jobs.read_state(job_id)

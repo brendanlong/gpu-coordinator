@@ -178,6 +178,8 @@ def expand_job_id(spec: JobSpec) -> JobSpec:
     for output in spec.outputs:
         if output.kept:
             check_kept_path(output.path)
+        # The host fills the path in itself, so it is only checked here.
+        _expand(output, "path", output.path, spec.job_id)
         output.s3 = _expand(output, "s3", output.s3, spec.job_id)
         output.hf = _expand(output, "hf", output.hf, spec.job_id)
         output.hf_path = _expand(output, "hf_path", output.hf_path, spec.job_id)

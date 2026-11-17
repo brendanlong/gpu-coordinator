@@ -407,7 +407,6 @@ def probe_python(transport: Transport) -> str | None:
 def open_session(
     entry: HostEntry,
     settings: Settings | None = None,
-    transport: Transport | None = None,
     *,
     record: bool = True,
 ) -> HostSession:
@@ -421,7 +420,7 @@ def open_session(
     a poll that runs every few seconds passes `record=False`, because a
     dashboard must never write the registry.
     """
-    transport = transport or transport_for(entry, settings)
+    transport = transport_for(entry, settings)
     home = resolve_home(transport, entry)
     config_read = read_config(transport, home)
     python = entry.python or probe_python(transport)

@@ -218,7 +218,13 @@ def make_spec(**overrides: object) -> JobSpec:
         "gpus": 1,
     }
     document.update(overrides)
-    return JobSpec.from_dict(document)
+    spec = JobSpec.from_dict(document)
+    # What submit hands the host: `{job_id}` already filled into destinations.
+    for output in spec.outputs:
+        for key in ("s3", "hf", "hf_path"):
+            if value := getattr(output, key):
+                setattr(output, key, value.replace("{job_id}", spec.job_id))
+    return spec
 
 
 def wait_until(

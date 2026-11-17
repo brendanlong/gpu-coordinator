@@ -330,15 +330,24 @@ def test_an_hf_repo_per_run_with_a_fixed_path_is_a_unique_location(
     assert shipped["outputs"][0]["hf_path"] == "weights"
 
 
-@pytest.mark.parametrize("bad", ["s3://b/{job-id}/x", "s3://b/{jobid}/x", "s3://b/{}/x"])
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"path": "results", "s3": "s3://b/{job-id}/x"},
+        {"path": "results", "s3": "s3://b/{jobid}/x"},
+        {"path": "results", "s3": "s3://b/{}/x"},
+        # The host fills the path in, so a bad one would crash its runner.
+        {"path": "out/{epoch}", "s3": "s3://b/{job_id}"},
+    ],
+)
 def test_a_placeholder_this_does_not_know_is_refused_not_a_traceback(
-    control_env: Path, repo: Path, bad: str
+    control_env: Path, repo: Path, output: dict[str, str]
 ) -> None:
     host = FakeHost()
     with pytest.raises(SubmitError) as exc:
         submit_spec(
             host_entry(name="gpubox", gpus=["GPU-a"]),
-            validate(job_document(outputs=[{"path": "results", "s3": bad}])),
+            validate(job_document(outputs=[output])),
             Settings(),
             workdir=repo,
             session=session(host),
