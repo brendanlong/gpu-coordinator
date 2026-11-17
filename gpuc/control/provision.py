@@ -678,7 +678,9 @@ def matching_rentals(
     entries = [
         entry
         for entry in open_registry().registry.hosts.values()
-        if entry.rental is not None and entry.rental.provider == provider.name
+        if entry.rental is not None
+        and entry.rental.provider == provider.name
+        and entry.trusted == trusted
     ]
     if not entries:
         return []
@@ -705,7 +707,7 @@ def matching_rentals(
             report(f"could not ask the provider about rental {entry.name}: {asked.pod_error}")
             continue
         match = _match(entry, asked, constraints, provider)
-        if match is not None and entry.trusted == trusted:
+        if match is not None:
             matches.append(match)
     return matches
 

@@ -515,7 +515,7 @@ def test_submit_mirrors_the_spec_to_s3_when_a_bucket_is_configured(
     assert spec["command"] == "python train.py"
     assert result.notes == []
     index = LocalIndex().get(result.job_id)
-    assert index is not None and index.spec_uri == f"s3://bkt/{spec_key(result.job_id)}"
+    assert index is not None and index.host == "gpubox"
 
 
 def test_the_fit_is_judged_against_the_sessions_fresh_config_not_the_cache(

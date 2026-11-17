@@ -238,10 +238,10 @@ class LocalTransport:
 class SshTransport:
     host: str
     target: str
+    control_dir: Path
+    known_hosts: Path
     port: int = 22
     key: str | None = None
-    control_dir: Path | None = None
-    known_hosts: Path | None = None
 
     def ssh_options(self) -> list[str]:
         # Here, not in each caller: every ssh this builds needs the socket
@@ -254,28 +254,22 @@ class SshTransport:
             f"ConnectTimeout={CONNECT_TIMEOUT_S}",
             "-o",
             "ServerAliveInterval=30",
-        ]
-        if self.known_hosts is not None:
             # accept-new pins the key on first contact and then behaves like
             # StrictHostKeyChecking=yes, which is what we want for an ephemeral
             # pod that we will never see again.
-            options += [
-                "-o",
-                f"UserKnownHostsFile={self.known_hosts}",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-            ]
-        if self.control_dir is not None:
+            "-o",
+            f"UserKnownHostsFile={self.known_hosts}",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
             # %C is a hash of (host, port, user, jump): one socket per real
             # connection, and a fixed 40 characters whatever the host is called.
-            options += [
-                "-o",
-                "ControlMaster=auto",
-                "-o",
-                f"ControlPath={control_path(self.control_dir)}",
-                "-o",
-                "ControlPersist=60",
-            ]
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={control_path(self.control_dir)}",
+            "-o",
+            "ControlPersist=60",
+        ]
         if self.key:
             options += ["-i", str(Path(self.key).expanduser()), "-o", "IdentitiesOnly=yes"]
         options += ["-p", str(self.port)]
@@ -300,13 +294,11 @@ class SshTransport:
         return ["ssh", *kept, "-t", self.target, command]
 
     def _prepare(self) -> None:
-        if self.control_dir is not None:
-            self.control_dir.mkdir(parents=True, exist_ok=True)
-            # 0700: the socket is a live authenticated channel to the host.
-            self.control_dir.chmod(0o700)
-        if self.known_hosts is not None:
-            self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
-            self.known_hosts.touch(exist_ok=True)
+        self.control_dir.mkdir(parents=True, exist_ok=True)
+        # 0700: the socket is a live authenticated channel to the host.
+        self.control_dir.chmod(0o700)
+        self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
+        self.known_hosts.touch(exist_ok=True)
 
     def run(
         self, command: str, *, timeout: float = DEFAULT_TIMEOUT_S, check: bool = True
@@ -516,28 +508,3 @@ def uncommitted_patch(root: Path) -> str:
         # job never syncs, while `git add -N` above only ever saw `.`.
         code, stdout, _ = _git(root, ["diff", "HEAD", "--", "."], env)
     return stdout.decode("utf-8", "replace") if code == 0 else ""
-
-
-def make_transport(
-    host: str,
-    *,
-    ssh: str | None = None,
-    port: int = 22,
-    key: str | None = None,
-    known_hosts: Path | None = None,
-) -> Transport:
-    """``known_hosts`` is where host keys are pinned: the shared file for most
-    hosts, a per-pod one for provisioning, so a recycled RunPod address cannot
-    collide with a pinned key. The ControlMaster socket always goes in the
-    short runtime directory (see ``control_socket_dir``).
-    """
-    if ssh is None:
-        return LocalTransport(host=host)
-    return SshTransport(
-        host=host,
-        target=ssh,
-        port=port,
-        key=key,
-        control_dir=control_socket_dir(),
-        known_hosts=known_hosts,
-    )

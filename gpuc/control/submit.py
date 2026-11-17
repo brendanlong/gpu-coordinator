@@ -712,7 +712,6 @@ def submit_spec(
     response = enqueue_spec(session, prepared)
 
     s3 = s3 if s3 is not None else S3Index.from_settings(settings)
-    spec_uri: str | None = None
     if s3 is None:
         notes.append(
             "s3_bucket is unset, so the spec was not mirrored and `gpuc requeue` "
@@ -720,7 +719,7 @@ def submit_spec(
         )
     else:
         try:
-            spec_uri = s3.put_spec_document(spec.job_id, prepared.mirrored())
+            s3.put_spec_document(spec.job_id, prepared.mirrored())
         except S3IndexError as exc:
             notes.append(f"could not mirror the spec to S3: {exc}")
     index_entry = IndexEntry(
@@ -729,8 +728,7 @@ def submit_spec(
         name=spec.name,
         requeued_from=prepared.requeued_from,
         submitted_at=utc_now(),
-        s3_prefix=session.config.s3_prefix or default_s3_prefix(settings, entry.name),
-        spec_uri=spec_uri,
+        s3_prefix=session.config.s3_prefix,
     )
     LocalIndex().record(index_entry)
     if s3 is not None:

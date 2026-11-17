@@ -13,7 +13,7 @@ import os
 import shutil
 import time
 import tomllib
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,7 +26,12 @@ from gpuc.control.gpuinfo import GpuInfo
 from gpuc.control.jsonout import warn
 from gpuc.control.providers.base import DEFAULT_DISK_GB, DEFAULT_PREFIX
 from gpuc.control.tolerant import TolerantModel
-from gpuc.control.transport import Transport, make_transport
+from gpuc.control.transport import (
+    LocalTransport,
+    SshTransport,
+    Transport,
+    control_socket_dir,
+)
 from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import SCHEMA_VERSION, HostConfig
 
@@ -432,16 +437,11 @@ def _show(value: Any, key: str = "") -> str:
     return str(value)
 
 
-def config_drift(
-    existing: Any, incoming: HostConfig, keys: Collection[str] | None = None
-) -> list[str]:
+def config_drift(existing: Any, incoming: HostConfig) -> list[str]:
     """How the config a host holds differs from the one we are about to give it.
 
-    Only the keys `existing` actually has are compared, so this takes a whole
-    `config.json` read off the host or a subset of one, and `keys` narrows it
-    further for a caller that only cares about some of them. It is how `gpuc
-    host add` and `gpuc host set` name, field by field, what a flag is about to
-    change on a host somebody already configured.
+    Only the keys `existing` actually has are compared, so a caller narrows the
+    comparison by narrowing `existing`.
 
     `env` reports the names that differ and never the values -- it is
     free-form, it is where somebody hand-sets an HF_TOKEN, and this text ends
@@ -454,7 +454,7 @@ def config_drift(
         return []
     drift: list[str] = []
     for key, ours in incoming.to_dict().items():
-        if key in NOT_DRIFT or key not in existing or (keys is not None and key not in keys):
+        if key in NOT_DRIFT or key not in existing:
             continue
         theirs = existing[key]
         if theirs == ours:
@@ -485,7 +485,7 @@ def config_changes(existing: Any, patch: Mapping[str, Any]) -> list[str]:
     # a key it has never written does not read as a change to its own default.
     held = HostConfig.from_dict(fields).to_dict()
     base = {key: held.get(key) for key in patch}
-    return config_drift(base, HostConfig.from_dict({**fields, **patch}), keys=set(patch))
+    return config_drift(base, HostConfig.from_dict({**fields, **patch}))
 
 
 class Registry(TolerantModel):
@@ -769,15 +769,18 @@ def transport_for(entry: HostEntry, settings: Settings | None = None) -> Transpo
                 f"host {entry.name!r} is a rental with no ssh target recorded.\n"
                 f"Re-add it with: gpuc host add {entry.name} --pod {entry.rental.pod_id}"
             )
-        return make_transport(entry.name)
-    return make_transport(
-        entry.name,
-        ssh=entry.ssh,
+        return LocalTransport(host=entry.name)
+    return SshTransport(
+        host=entry.name,
+        target=entry.ssh,
         port=entry.port,
         key=settings.ssh_key_path,
+        # A rental's own file: a recycled provider address must not collide
+        # with a key pinned for another pod.
         known_hosts=(
             pod_known_hosts_file(entry.name) if entry.rental is not None else known_hosts_file()
         ),
+        control_dir=control_socket_dir(),
     )
 
 
