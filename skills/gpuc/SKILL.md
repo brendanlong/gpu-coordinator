@@ -276,9 +276,12 @@ unchanged by the flag. Prefer it to scraping any of the text output.
 
 | command | the document |
 | --- | --- |
+| `submit`, `requeue` | The queue fields are all null when the host could not be asked again; the job is queued regardless, and `starts_unknown` is why there is no start time |
+| `logs` | Not with `-f` (exit 2) |
 | `wait` | `{jobs[], errors[]}`, once every job has ended. **Check each job's `error`, not its `status`**: when it is not null, `status` is only the last thing its host managed to say. Exit 1 unless every job succeeded |
 | `status <jobid> ...` | `wait`'s document as things stand now. Exit 4 if an id is unknown, 1 if any other job has an `error`, else 0 however the jobs went |
 | `cancel`, `preempt`, `set` | `{jobs[], errors[]}`, one entry per id. **Check `error`**: when it is set the host did not confirm the change. Read `warnings`: one may say the mirrored spec kept the old value, so a `requeue` would not carry it. Exit 4 if an id is unknown, else 1 if any `error` |
+| `host quote` | Each offer's `price_usd_hr` is for the whole pod, and `offers[]` is in the order `host rent` would try them |
 | `host terminate` | `checked` false means the host could not be asked, so `running`, `queued` and `outputs_pending` are empty for want of an answer |
 
 Rules, and they are not optional:
