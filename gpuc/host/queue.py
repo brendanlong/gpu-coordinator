@@ -12,7 +12,7 @@ import contextlib
 import os
 from dataclasses import dataclass, field
 
-from gpuc.host import checkout, cleanup, jobs, paths
+from gpuc.host import checkout, cleanup, jobs, paths, settable
 from gpuc.host.jobs import CANCEL, PREEMPT, JobSpec, JobState
 from gpuc.host.procs import runner_from_another_boot
 
@@ -151,8 +151,8 @@ def preempt(job_id: str, priority: int | None = None) -> str:
     """
     if not paths.job_dir(job_id).is_dir():
         raise FileNotFoundError(f"no such job: {job_id}")
-    if priority is not None and not 0 <= priority <= 99:
-        raise ValueError(f"priority must be 0-99 (lower dispatches first), got {priority}")
+    if priority is not None and (problem := settable.BY_FIELD["priority"].value_error(priority)):
+        raise ValueError(problem)
     with jobs.locked(job_id):
         state = jobs.read_state(job_id)
         if state.finished:
@@ -180,24 +180,6 @@ def preempt(job_id: str, priority: int | None = None) -> str:
     return "preempting"
 
 
-def queued_ahead_of(job_id: str, priority: int) -> QueueEntry | None:
-    """The first queued job wanting cards that would be dispatched before this
-    one if it came back at `priority`, or None if none would.
-
-    At the same priority the tie-break is the job id, and a preempted job's id
-    is older than anything queued while it was running, so it sorts ahead of
-    all of them. A job asking for no cards is passed over: it is dispatched
-    whatever is running, so the cards a preempt frees are nothing to it.
-    """
-    mine = QueueEntry(priority, job_id)
-    for entry in list_queued():
-        if entry >= mine:
-            break  # sorted, so nothing after this sorts earlier either
-        if entry.job_id != job_id and _wants_cards(entry.job_id):
-            return entry
-    return None
-
-
 def _wants_cards(job_id: str) -> bool:
     """An unreadable spec counts as wanting some: that job is about to be
     failed, and refusing the preempt on its account would be a guess too."""
@@ -220,9 +202,11 @@ def refuse_if_nothing_else_can_run(job_id: str, priority: int) -> None:
             f"this host is draining, so it will not start anything else: preempting "
             f"job {job_id} would throw away what it has done for nothing"
         )
-    if queued_ahead_of(job_id, priority) is not None:
-        return
+    # A job asking for no cards is passed over: it is dispatched whatever is
+    # running, so the cards a preempt frees are nothing to it.
     ahead = [e for e in list_queued() if e.job_id != job_id and _wants_cards(e.job_id)]
+    if ahead and ahead[0] < QueueEntry(priority, job_id):
+        return
     if not ahead:
         raise ValueError(
             f"nothing else is queued on this host for a GPU, so preempting job {job_id} would "
@@ -268,7 +252,7 @@ def next_attempt(job_id: str, *, ran: bool) -> int | None:
         state = jobs.read_state(job_id)
         if state.status != "running" or state.intent != PREEMPT:
             return None
-        attempt = _write_queued_again(job_id, state, ran=state.ran or ran)
+        attempt = _write_queued_again(job_id, state, ran=state.ran or ran).attempt
     note(
         job_id,
         f"preempted; queued again as attempt {attempt} at priority {state.priority}, "
@@ -279,23 +263,20 @@ def next_attempt(job_id: str, *, ran: bool) -> int | None:
 
 def _write_queued_again(
     job_id: str, state: JobState, *, ran: bool, restarts: int | None = None
-) -> int:
+) -> JobState:
     """The fresh `queued` state of the next attempt, written under the lock
     the caller holds. See `next_attempt` for what survives and why."""
-    attempt = state.attempt + 1
-    jobs.write_state(
-        job_id,
-        JobState(
-            status="queued",
-            attempt=attempt,
-            priority=state.priority,
-            estimated_runtime_min=state.estimated_runtime_min,
-            max_runtime_min=state.max_runtime_min,
-            ran=ran,
-            restarts=state.restarts if restarts is None else restarts,
-        ),
+    queued = JobState(
+        status="queued",
+        attempt=state.attempt + 1,
+        priority=state.priority,
+        estimated_runtime_min=state.estimated_runtime_min,
+        max_runtime_min=state.max_runtime_min,
+        ran=ran,
+        restarts=state.restarts if restarts is None else restarts,
     )
-    return attempt
+    jobs.write_state(job_id, queued)
+    return queued
 
 
 MAX_RESTARTS = 3
@@ -327,12 +308,11 @@ def requeue_after_restart(job_id: str) -> JobState | None:
         if state.status != "running" or not runner_from_another_boot(state):
             return None
         preempting = state.intent == PREEMPT
-        attempt = None
+        written = None
         if preempting:
-            attempt = _write_queued_again(job_id, state, ran=state.ran)
+            written = _write_queued_again(job_id, state, ran=state.ran)
         elif state.intent != CANCEL and state.restarts < MAX_RESTARTS:
-            attempt = _write_queued_again(job_id, state, ran=state.ran, restarts=state.restarts + 1)
-        written = jobs.read_state(job_id) if attempt is not None else None
+            written = _write_queued_again(job_id, state, ran=state.ran, restarts=state.restarts + 1)
     if written is None:
         outcome = (
             jobs.Outcome("cancelled", "cancelled", ran=False)
@@ -343,7 +323,7 @@ def requeue_after_restart(job_id: str) -> JobState | None:
     counted = "" if preempting else f" (restart {written.restarts} of at most {MAX_RESTARTS})"
     note(
         job_id,
-        f"the host restarted while this job was running; queued again as attempt {attempt}"
+        f"the host restarted while this job was running; queued again as attempt {written.attempt}"
         f"{counted}, to run from the start in this same workdir",
     )
     return written

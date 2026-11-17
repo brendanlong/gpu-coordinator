@@ -320,8 +320,8 @@ def test_a_job_needing_no_gpu_does_not_count_as_something_waiting(gpuc_home: Pat
     queue.enqueue(make_spec(gpus=0, priority=10))
     with pytest.raises(ValueError, match="nothing else is queued on this host for a GPU"):
         queue.preempt(job_id)
-    later = queue.enqueue(make_spec(priority=20))
-    assert queue.queued_ahead_of(job_id, 50) == queue.QueueEntry(20, later)
+    queue.enqueue(make_spec(priority=20))
+    assert queue.preempt(job_id) == "preempting"
 
 
 def test_preempt_refuses_a_job_holding_no_gpu(gpuc_home: Path) -> None:

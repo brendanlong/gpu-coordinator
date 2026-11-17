@@ -2027,9 +2027,9 @@ def test_a_shared_entry_that_names_no_card_is_logged_and_skipped(gpuc_home: Path
     assert "config.shared_gpus lists 9" in paths.dispatcher_log().read_text()
 
 
-def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) -> None:
-    """The preflight would be an nvidia-smi exec every two seconds if it were
-    taken unconditionally, and most passes have nothing that could use it."""
+def test_a_pass_reads_nvidia_smi_once_however_many_borrow(gpuc_home: Path) -> None:
+    """The shared cards' readings come from the pass's own card table, so a
+    borrower costs no second exec and is judged at the same instant."""
     asked: list[list[str]] = []
     dispatcher, _ = shared_host()
     inner = dispatcher.deps.smi
@@ -2041,14 +2041,13 @@ def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) 
     dispatcher.deps.smi = counting
     enqueue_in_order({"gpus": 1})
     dispatcher.run_once()
-    assert len(asked) == 1, "only the pass's own card table"
+    assert len(asked) == 1
 
-    # Two borrowers, one pass: one sample, judged the same way for both.
     asked.clear()
     enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
     queue.enqueue(make_spec(gpus=1, use_shared=True))
     dispatcher.run_once()
-    assert len(asked) == 2, "the card table and one sample"
+    assert len(asked) == 1
 
 
 # -- automatic preemption -----------------------------------------------------
@@ -2756,7 +2755,7 @@ def test_a_dispatcher_takes_over_a_queue_whose_owner_went_quiet(gpuc_home: Path)
     assert dispatcher.run(lock) == 0
     assert owner.STALE_S <= clock.t - 1000.0 <= owner.CLAIM_WAIT_S
     record = owner.current()
-    assert record is not None and record[0] == dispatcher.instance
+    assert record is not None and record.instance == dispatcher.instance
     assert "taking this queue over from another-pod/another-boot" in (
         paths.dispatcher_log().read_text()
     )
@@ -2815,12 +2814,12 @@ def test_a_beat_renews_only_its_own_claim(gpuc_home: Path) -> None:
     os.utime(paths.owner_file(), (stale, stale))
     lock.beat(force=True)
     record = owner.current()
-    assert record is not None and record[1] > stale + 50
+    assert record is not None and record.renewed > stale + 50
     another_machine_owns_the_queue(renewed_s_ago=100)
     lock.beat(force=True)
     record = owner.current()
-    assert record is not None and record[0] == "another-pod/another-boot"
-    assert record[1] < time.time() - 50
+    assert record is not None and record.instance == "another-pod/another-boot"
+    assert record.renewed < time.time() - 50
 
 
 def test_a_replaced_dispatcher_writes_nothing_and_exits(gpuc_home: Path) -> None:
