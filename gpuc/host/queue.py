@@ -64,7 +64,6 @@ def enqueue(spec: JobSpec) -> str:
     staged.mkdir(parents=True, exist_ok=True)
     if not (staged / checkout.ARCHIVE_NAME).exists():
         (staged / "workdir").mkdir(exist_ok=True)
-    (staged / "outputs").mkdir(exist_ok=True)
     jobs.atomic_write_json(staged / "spec.json", spec.to_dict())
     jobs.atomic_write_json(staged / "state.json", JobState.initial(spec).file_document())
     (staged / "log.txt").touch()

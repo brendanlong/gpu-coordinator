@@ -15,7 +15,6 @@ def test_enqueue_writes_the_spec_and_a_queued_state(gpuc_home: Path) -> None:
     state = jobs.read_state(job_id)
     assert (state.status, state.priority, state.intent) == ("queued", 7, None)
     assert paths.workdir(job_id).is_dir()
-    assert paths.outputs_dir(job_id).is_dir()
     assert paths.log_file(job_id).exists()
     assert queue.list_queued() == [queue.QueueEntry(7, job_id)]
 

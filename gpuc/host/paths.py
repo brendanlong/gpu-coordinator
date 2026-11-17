@@ -177,10 +177,6 @@ def partial_workdir(job_id: str) -> Path:
     return workdir(job_id).with_name(f".{job_id}.partial")
 
 
-def outputs_dir(job_id: str) -> Path:
-    return job_dir(job_id) / "outputs"
-
-
 def outputs_baseline_file(job_id: str) -> Path:
     """What was already under the job's `outputs:` paths when it started."""
     return job_dir(job_id) / "outputs_baseline.json"
@@ -220,4 +216,3 @@ def ensure_layout() -> None:
 def ensure_job_layout(job_id: str) -> None:
     job_dir(job_id).mkdir(parents=True, exist_ok=True)
     workdir(job_id).mkdir(parents=True, exist_ok=True)
-    outputs_dir(job_id).mkdir(parents=True, exist_ok=True)

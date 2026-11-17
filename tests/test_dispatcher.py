@@ -1384,6 +1384,36 @@ def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     assert terminated == ["pod-1"]
 
 
+def test_the_drain_uploads_with_the_jobs_secrets_and_its_spec_env(
+    gpuc_home: Path, fake_aws: None
+) -> None:
+    """The same environment as the runner's own uploads: a spec `env` that
+    points `aws` at another endpoint must not be dropped on the last try."""
+    configure_pod(idle_minutes=0.0)
+    spec = make_spec(
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+        env={"AWS_ENDPOINT_URL": "https://r2.example"},
+    )
+    job_id = queue.enqueue(spec)
+    jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now(), ran=True)
+    (paths.workdir(job_id) / "results").mkdir(parents=True, exist_ok=True)
+    (paths.workdir(job_id) / "results" / "a.txt").write_text("hi\n")
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    uploads: list[dict[str, str]] = []
+
+    def recording(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        if f"s3://bucket/{job_id}" in argv:
+            assert env is not None
+            uploads.append({k: env.get(k, "") for k in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID")})
+        return sync.CommandResult(argv, 0, "")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.command_runner = recording
+    dispatcher.drain_and_terminate("test")
+    assert outputs_uploaded(job_id)
+    assert uploads == [{"AWS_ENDPOINT_URL": "https://r2.example", "AWS_ACCESS_KEY_ID": "AKIA"}]
+
+
 def test_giving_up_on_outputs_marks_them_lost_and_changes_nothing_else(
     gpuc_home: Path, monkeypatch: pytest.MonkeyPatch, fake_aws: None
 ) -> None:

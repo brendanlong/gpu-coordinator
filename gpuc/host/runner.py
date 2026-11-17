@@ -170,9 +170,7 @@ def build_env(
     so the index means the same card to CUDA. Without a full index map the
     UUIDs go through as they are, which every torch accepts.
     """
-    env = dict(os.environ)
-    env.update(jobs.parse_env_file(paths.job_env_file(spec.job_id)))
-    env.update(spec.env)
+    env = jobs.job_env(spec, os.environ)
     if indices is not None and assigned and all(uuid in indices for uuid in assigned):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(indices[uuid]) for uuid in assigned)
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -180,7 +178,6 @@ def build_env(
         env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned)
     env["GPUC_JOB_ID"] = spec.job_id
     env["GPUC_JOB_DIR"] = str(paths.job_dir(spec.job_id))
-    env["GPUC_OUTPUTS"] = str(paths.outputs_dir(spec.job_id))
     env["GPUC_EXPECTED_GPUS"] = str(len(assigned))
     env["GPUC_DATA_DIR"] = str(paths.data_dir(env))
     # `hf` puts this in its own User-Agent, so a Hub-side question about our

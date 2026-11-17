@@ -1435,14 +1435,10 @@ class Dispatcher:
 
     def _upload_outputs(self, job_id: str, config: jobs.HostConfig, timeout: float) -> None:
         spec = jobs.read_spec(job_id)
-        # The job's own secrets file if the runner left it (it does exactly for
-        # this case on an ephemeral host); otherwise our own environment, which
-        # already carries the host env.
-        env: dict[str, str] | None = None
-        env_file = paths.job_env_file(job_id)
-        if env_file.exists():
-            env = config.apply_env(dict(os.environ))
-            env.update(jobs.parse_env_file(env_file))
+        # As the runner's own uploads were made: the secrets file is there if
+        # the runner left it, which it does exactly for this case on an
+        # ephemeral host.
+        env = jobs.job_env(spec, config.apply_env(dict(os.environ)))
         sync.sync_outputs(
             spec.outputs,
             paths.workdir(job_id),

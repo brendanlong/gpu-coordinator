@@ -448,7 +448,6 @@ def test_build_env_exposes_job_paths(gpuc_home: Path) -> None:
     env = runner.build_env(spec, [FAKE_GPUS[0]])
     assert env["GPUC_JOB_ID"] == "j1"
     assert env["GPUC_EXPECTED_GPUS"] == "1"
-    assert env["GPUC_OUTPUTS"] == str(paths.outputs_dir("j1"))
 
 
 def run_detached(job_id: str, home: Path) -> subprocess.Popen[bytes]:

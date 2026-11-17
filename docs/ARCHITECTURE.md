@@ -117,7 +117,6 @@ jobs/<jobid>/
                      # `<scratch>/<jobid>/` instead on a host with scratch
                      # (`paths.workdir`)
   log.txt            # combined stdout/stderr of setup + command, line-buffered
-  outputs/           # default output root; JobSpec.outputs paths are relative to workdir
 dispatcher.lock      # fd flock held by the running dispatcher
 dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
