@@ -22,7 +22,7 @@ from gpuc.control.transport import Transport
 from gpuc.host import dispatcher, health, jobs, runner
 from gpuc.host.jobs import HostConfig
 from tests.conftest import host_entry, make_spec
-from tests.test_bootstrap import ScriptedHost, entry
+from tests.test_bootstrap import ScriptedHost, bootstrapped, entry
 
 # -- (a) nothing we ship may defeat uv's linking ------------------------------
 
@@ -138,7 +138,7 @@ def test_a_cache_the_host_already_names_is_never_overridden(control_env: Path) -
 
 def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="99")
-    updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    updated, _ = bootstrapped(entry(), host)
     assert updated.config.env.get("UV_CACHE_DIR") == "/home/u/.cache/uv"
     assert host.config is not None
     # No persistent root, so the user's own Hugging Face cache is left alone.
@@ -147,7 +147,7 @@ def test_bootstrap_writes_the_cache_dir_into_the_hosts_config(control_env: Path)
 
 def test_bootstrap_on_one_filesystem_writes_no_cache_dir(control_env: Path) -> None:
     host = ScriptedHost(cache_dev="66", home_dev="66")
-    updated, _ = bootstrap_host(entry(), transport=host, report=lambda _: None)
+    updated, _ = bootstrapped(entry(), host)
     assert "UV_CACHE_DIR" not in updated.config.env
     assert host.config is not None
     assert host.config["env"] == {}

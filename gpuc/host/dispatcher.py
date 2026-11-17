@@ -983,8 +983,8 @@ class Dispatcher:
         run, so it is taken fresh each pass rather than inferred from anything
         longer-lived. Every job that pass is judged against that one reading,
         which is also what stops two of them being handed the same card, and
-        what stops `preempt_for_waiting` disagreeing with the `launch_ready` it
-        is reasoning about. The count comes from the same
+        what stops the preemption half of `launch_ready` disagreeing with its
+        launches. The count comes from the same
         reading because it decides which short job is stepped over.
 
         The cards the reading found free are re-filtered on the way out: a job
@@ -1082,7 +1082,8 @@ class Dispatcher:
         return not (state.status == "queued" and state.attempt == entry.attempt)
 
     def launch_ready(self) -> None:
-        """Act on `plan`: start what fits, fail what never will, hold the rest.
+        """Act on `plan`: start what fits, fail what never will, hold the rest,
+        and stop `auto_preempt` jobs for the first job held short of cards.
 
         A job wider than the cards nvidia-smi reports fails on the first pass
         that sees it; while nvidia-smi is not answering, only once that has
@@ -1111,6 +1112,11 @@ class Dispatcher:
             if not isinstance(decision, plan.Assigned):
                 continue
             self._launch(job_id, decision.gpus, attempts[job_id], decision.held_for)
+        if self.replaced is not None:
+            # A launch found the queue taken over: the stops this walk chose
+            # are about jobs that may be the new owner's to run now.
+            return
+        self._preempt_for_waiting(decisions, requests, pool.preemptable)
 
     def _launch(
         self, job_id: str, assigned: list[str], attempt: int, held_for: Sequence[str] = ()
@@ -1161,12 +1167,19 @@ class Dispatcher:
         self.log(f"launched {job_id} (pid {proc.pid}) on {','.join(assigned) or 'cpu'}{note}")
 
     # -- automatic preemption --------------------------------------------
-    def preempt_for_waiting(self) -> None:
+    def _preempt_for_waiting(
+        self,
+        decisions: Sequence[plan.Decision],
+        requests: Sequence[tuple[queue.QueueEntry, plan.Request]],
+        preemptable: Sequence[plan.Preemptable],
+    ) -> None:
         """Stop `auto_preempt` jobs when that starts a job ahead of them now.
 
-        After `launch_ready`, so everything still queued is something the free
-        cards could not take, and the only question left is whether stopping a
-        job that said it may be stopped would let one of them run.
+        From the same walk as the launches, which already handed the free cards
+        out, so everything still held is something they could not take, and the
+        only question left is whether stopping a job that said it may be
+        stopped would let one of them run. A launch that failed mid-pass leaves
+        its cards free, and the next pass's walk sees them.
 
         **Exactly one queued job is asked that question**: the first one the
         queue is actually stuck on. Anything behind it is not a reason to stop
@@ -1223,18 +1236,12 @@ class Dispatcher:
         it would rather start over than hold a card something better wants, and
         a host with a steady supply of better work may never run it at all.
         """
-        if self.going_away is not None:
-            return
-        pool = self._pool()
-        if not pool.preemptable:
-            return
         # Cards a job on its way out is handing back are `coming`: a gap they
         # cover needs no second job stopped for it, and leaves a `Holds` with
         # no gap, which is not stuck.
-        requests = self._requests()
         by_id = {request.job_id: entry for entry, request in requests}
-        candidates = {p.job_id: p for p in pool.preemptable}
-        for decision in plan.plan([request for _, request in requests], pool):
+        candidates = {p.job_id: p for p in preemptable}
+        for decision in decisions:
             if not isinstance(decision, plan.Holds) or not decision.gap:
                 continue
             for job_id in decision.preempts:
@@ -1543,9 +1550,8 @@ class Dispatcher:
             return
         self.escalate_stops()
         self.launch_ready()
-        self.preempt_for_waiting()
-        # The listing is shared by the two walks above and by nothing after
-        # them: a reclaim can take seconds, and a job accepted during it must
+        # The listing is shared by the walk above and by nothing after it: a
+        # reclaim can take seconds, and a job accepted during it must
         # be seen by the idle clock.
         self._queued = None
         self.maybe_reclaim()

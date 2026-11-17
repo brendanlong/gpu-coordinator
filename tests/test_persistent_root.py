@@ -39,6 +39,7 @@ from tests.conftest import (
 )
 from tests.fakehost import FakeHost
 from tests.test_bootstrap import ScriptedHost
+from tests.test_bootstrap import bootstrapped as bootstrap_registered
 from tests.test_runner import log_of, prepare, run
 
 ROOT = "/mnt/ssd-2/brendan"
@@ -225,9 +226,7 @@ class RootedHost(ScriptedHost):
 
 def bootstrapped(**overrides: object) -> tuple[RootedHost, HostEntry]:
     host = RootedHost()
-    updated, _ = bootstrap_host(
-        rooted(gpus=["GPU-a"], **overrides), transport=host, report=lambda _: None
-    )
+    updated, _ = bootstrap_registered(rooted(gpus=["GPU-a"], **overrides), host)
     return host, updated
 
 

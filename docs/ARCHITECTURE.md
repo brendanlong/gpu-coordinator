@@ -229,11 +229,11 @@ The rules it holds to:
 - **One dispatch rule** (`plan.plan`), pure, over one pass's inputs: the queue
   in dispatch order, the owned cards free now, how many owned and
   shared cards nvidia-smi reports (capacity: a job wider than that fails), and
-  one nvidia-smi reading of the shared cards taken only if a job
-  needs to borrow. Per job it decides assigned, holds, stepped over or fails,
-  and, for a job that holds, which running `auto_preempt` jobs would cover its
-  gap; `launch_ready` acts on it every 2 s, and automatic preemption on that
-  set for the first job with a gap. Run forward over the running jobs' etas
+  the shared cards' usage from that same reading. Per job it decides
+  assigned, holds, stepped over or fails, and, for a job that holds, which
+  running `auto_preempt` jobs would cover its gap; `launch_ready` acts on one
+  walk every 2 s: the launches, then automatic preemption on that set for the
+  first job with a gap. Run forward over the running jobs' etas
   (`plan.project`) it is how the host says when each queued job will start.
 - **An `auto_preempt` job may take held cards**, launched like any other,
   unless the holder is *covered*: short of nothing once the cards on their
@@ -280,7 +280,7 @@ The rules it holds to:
   finished in between. An attempt that ended on its own first, or was
   cancelled while stopping, ends that way instead. A draining host refuses
   one.
-- **Automatic preemption** (`preempt_for_waiting`, after `launch_ready`): for
+- **Automatic preemption** (the end of `launch_ready`): for
   the one queued job the host is stuck on, stop the set of running
   `auto_preempt` jobs that together cover the gap, least important first, and
   only jobs the waiting one is ahead of in dispatch order. Nothing is
@@ -1014,7 +1014,8 @@ so it would otherwise choose what its keys reach.
 ## Web dashboard (`gpuc web serve`)
 
 **Nothing the dashboard shows or does exists only in
-the dashboard**, and anything it gains lands in `actions` first. An answer
+the dashboard**, and anything it gains lands in `actions` first. It may show
+less than the CLI. An answer
 goes on the wire under the HTTP status its exit code maps to
 (`exits.http_status`); the API's failure document is `--json`'s.
 
@@ -1048,9 +1049,9 @@ What `status` prints is usage.md, and every flag is `gpuc status --help`. The in
   printed. For a pod the provider reports
   stopped or gone no ssh is attempted, and the reason is what the provider
   said. One `actions.status` builds the text form, `--json` and the
-  dashboard's document, including `--all`'s `unhosted` list, each job in it
-  labelled with what the same run found its host to be, and `gpuc requeue`
-  offered only where that host cannot still be running it. Per host, `errors`
+  dashboard's document. `--all`'s `unhosted` list labels each job in it
+  with what the same run found its host to be, and offers `gpuc requeue`
+  only where that host cannot still be running it. Per host, `errors`
   decide the exit code and `warnings` (the build) do not.
 - Nothing that decides an exit code may be visible only under `--json`: a host
   that answered and still carries an `error` prints it as an `ERROR` line.

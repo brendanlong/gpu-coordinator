@@ -268,7 +268,7 @@ def test_a_shared_card_somebody_else_is_on_still_counts_against_never() -> None:
 
 
 def test_a_job_the_cards_on_their_way_back_cover_is_not_stuck() -> None:
-    """The stop in flight covers the gap, so `preempt_for_waiting` stops
+    """The stop in flight covers the gap, so automatic preemption stops
     nothing more for it, and no filler takes the card it will start on."""
     p, _ = pool(["a"], owned_present=2, shared_free=[], coming=["s"], shared=["s"])
     p.shared_visible = 1

@@ -820,7 +820,7 @@ def test_ctrl_c_during_bootstrap_terminates_the_pod(
 ) -> None:
     """A KeyboardInterrupt is not a narrow provisioning error, and still owns a pod."""
 
-    def interrupted(*_: object, **__: object) -> tuple[HostEntry, object]:
+    def interrupted(*_: object, **__: object) -> object:
         raise KeyboardInterrupt
 
     provider = FakeProvider([make_offer()])

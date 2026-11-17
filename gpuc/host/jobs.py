@@ -360,7 +360,7 @@ class JobSpec:
     auto_preempt: bool = False
     """Let the dispatcher stop this job whenever that starts one ahead of it in
     dispatch order right away, as often as it takes: see
-    `dispatcher.preempt_for_waiting`. In return it may take cards held for a
+    `dispatcher._preempt_for_waiting`. In return it may take cards held for a
     job ahead of it (`plan`).
 
     It costs everything the attempt has done, so it is opt-in and belongs to

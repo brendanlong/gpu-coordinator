@@ -99,18 +99,6 @@ function short(commit) {
   return commit ? commit.slice(0, 12) : "unknown";
 }
 
-// The line `gpuc submit` and `gpuc set --priority` print about where the job landed.
-function queueNote(result) {
-  if (result.dispatched) return "dispatched already; it is running now";
-  if (result.queue_position === null || result.queue_position === undefined) return "";
-  const starts = result.starts_in_s !== null
-    ? `starts ${fmtWait(result.starts_in_s)}`
-    : result.starts_unknown
-      ? `start time unknown (${result.starts_unknown})`
-      : "start time unknown";
-  return `position ${result.queue_position} of ${result.queue_length}; ${starts}`;
-}
-
 // -- the API ----------------------------------------------------------------
 
 async function api(path, options) {
@@ -150,18 +138,18 @@ function notify(message, level) {
   setTimeout(() => note.remove(), 12000);
 }
 
-// One shape for every action button: disable it, POST, report what the CLI
-// would have printed, and redraw. A failure re-enables the button so the
-// action can be retried without waiting for the next refresh. A job action
-// answers `{jobs, errors}` for the one job it was sent.
-async function act(button, path, body, describe) {
+// One shape for every action button: disable it, POST, show the text the CLI
+// prints for it, and redraw. A failure re-enables the button so the action
+// can be retried without waiting for the next refresh. A job action answers
+// `{jobs, errors}` for the one job it was sent.
+async function act(button, path, body) {
   button.disabled = true;
   try {
     const answer = await post(path, body);
     const result = answer.jobs ? answer.jobs[0] : answer;
     if (result.error) throw new Error(result.error);
     for (const warning of result.warnings || []) notify(warning, "warn");
-    notify(describe(result));
+    notify(answer.text);
     await load();
   } catch (err) {
     notify(err.message, "bad");
@@ -215,8 +203,7 @@ function forgetButton(host) {
     type: "button", class: "danger",
     onclick: () => {
       if (!window.confirm(`Forget host ${host.name} here? Nothing on it changes.`)) return;
-      act(button, `/api/hosts/${encodeURIComponent(host.name)}/remove`, {},
-        (r) => [`removed host ${r.host}`, ...r.notes].join("; "));
+      act(button, `/api/hosts/${encodeURIComponent(host.name)}/remove`, {});
     },
   }, "Forget host");
   return button;
@@ -227,8 +214,7 @@ function cancelButton(host, job) {
     type: "button", class: "danger",
     onclick: () => {
       if (!window.confirm(`Cancel ${job.name || job.job_id} on ${host.name}?`)) return;
-      act(button, jobPath(job, "cancel"), { host: host.name },
-        (r) => `job ${job.job_id} on ${r.host}: ${r.status}`);
+      act(button, jobPath(job, "cancel"), { host: host.name });
     },
   }, "Cancel");
   return button;
@@ -239,9 +225,7 @@ function preemptButton(host, job) {
     type: "button",
     onclick: () => {
       if (!window.confirm(`Stop ${job.name || job.job_id} on ${host.name} and queue it again? It re-runs from the start.`)) return;
-      act(button, jobPath(job, "preempt"), { host: host.name },
-        (r) => `job ${job.job_id} on ${r.host}: ${r.status}`
-          + (r.priority === null ? "" : `; it will be queued again at priority ${r.priority}`));
+      act(button, jobPath(job, "preempt"), { host: host.name });
     },
   }, "Preempt");
   return button;
@@ -254,17 +238,14 @@ function priorityControl(host, job) {
     onclick: () => {
       const priority = Number.parseInt(input.value, 10);
       if (Number.isNaN(priority)) return;
-      act(button, jobPath(job, "set"), { host: host.name, priority }, (r) => {
-        const note = queueNote(r);
-        return `job ${job.job_id} on ${r.host} moved to priority ${r.priority}${note ? `; ${note}` : ""}`;
-      });
+      act(button, jobPath(job, "set"), { host: host.name, priority });
     },
   }, "Set priority");
   return el("span", { class: "actions" }, input, button);
 }
 
 // `gpuc set --estimate` and `--max-runtime`: a number of minutes, or blank to clear.
-function minutesButton(host, job, field, label, question, described) {
+function minutesButton(host, job, field, label, question) {
   const button = el("button", {
     type: "button",
     onclick: () => {
@@ -282,20 +263,18 @@ function minutesButton(host, job, field, label, question, described) {
         }
         body[field] = minutes;
       }
-      act(button, jobPath(job, "set"), body, (r) => `job ${job.job_id} on ${r.host} ${described(r[field])}`);
+      act(button, jobPath(job, "set"), body);
     },
   }, label);
   return button;
 }
 
 function estimateButton(host, job) {
-  return minutesButton(host, job, "estimated_runtime_min", "Estimate", "Estimated runtime",
-    (m) => (m === null ? "no longer estimates a runtime" : `now estimates ${m} min`));
+  return minutesButton(host, job, "estimated_runtime_min", "Estimate", "Estimated runtime");
 }
 
 function maxRuntimeButton(host, job) {
-  return minutesButton(host, job, "max_runtime_min", "Limit", "Wall-clock limit",
-    (m) => (m === null ? "no longer has a wall-clock limit" : `is now limited to ${m} min`));
+  return minutesButton(host, job, "max_runtime_min", "Limit", "Wall-clock limit");
 }
 
 function table(headers, rows) {

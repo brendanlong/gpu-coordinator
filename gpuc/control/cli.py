@@ -27,7 +27,6 @@ from gpuc.control.actions import (
     PROVIDERS,
     Answer,
     CliError,
-    Done,
     Interrupted,
     NotFound,
     UsageError,
@@ -304,9 +303,7 @@ def cmd_host_set(args: argparse.Namespace) -> Answer:
 
 
 def cmd_host_remove(args: argparse.Namespace) -> Answer:
-    document = remove_host(args.name)
-    lines = [f"removed host {args.name}", *[f"  {text}" for text in document["notes"]]]
-    return Answer(document, "\n".join(lines))
+    return remove_host(args.name)
 
 
 def cmd_host_rent(args: argparse.Namespace) -> Answer:
@@ -722,27 +719,19 @@ def cmd_ssh(args: argparse.Namespace) -> Answer:
     os.execvp(argv[0], argv)
 
 
-def _jobs_answer(done: list[Done], line: Callable[[Done], str]) -> Answer:
+def _jobs_answer(answer: Answer) -> Answer:
     """A job command's last word: each job's warnings and errors on stderr,
     then the document or a line per job it acted on."""
-    for job in done:
-        for warning in job.warnings:
-            warn(f"job {job.job_id}: {warning}")
-        if job.error is not None:
-            print(f"error: {job.error}", file=sys.stderr)
-    return jobs_answer(done, "\n".join(line(job) for job in done if job.error is None))
+    for job in answer.document["jobs"]:
+        for warning in job["warnings"]:
+            warn(f"job {job['job_id']}: {warning}")
+        if job["error"] is not None:
+            print(f"error: {job['error']}", file=sys.stderr)
+    return answer
 
 
 def cmd_cancel(args: argparse.Namespace) -> Answer:
-    def line(job: Done) -> str:
-        whence = (
-            ", which is gone: it had already ended (from the S3 mirror)"
-            if job.source == "mirror"
-            else ""
-        )
-        return f"job {job.job_id} on host {job.host}{whence}: {job.fields['status']}"
-
-    return _jobs_answer(cancel_jobs(args.job_ids, args.host, load_settings()), line)
+    return _jobs_answer(cancel_jobs(args.job_ids, args.host, load_settings()))
 
 
 def cmd_fetch(args: argparse.Namespace) -> Answer:
@@ -754,35 +743,14 @@ def cmd_fetch(args: argparse.Namespace) -> Answer:
         to=Path(args.to),
         list_only=args.list,
     )
-    return _jobs_answer(done, fetch_line)
+    return _jobs_answer(jobs_answer(done, fetch_line))
 
 
 def cmd_preempt(args: argparse.Namespace) -> Answer:
-    """Stop running jobs and put them back in their hosts' queues.
-
-    The text output says which priority each comes back at, because that is
-    what decides which job runs next: dispatch order is `<priority>-<job id>`,
-    so a job waiting at a lower number takes the cards, and one waiting at the
-    *same* priority does not -- the preempted job was submitted first, so its
-    id sorts ahead and it takes its own cards straight back. The host refuses
-    outright when nothing at all would go first, rather than throw away what
-    the job has done to re-run the same job.
-    """
-
-    def line(job: Done) -> str:
-        priority = job.fields.get("priority")
-        at = f"; it will be queued again at priority {priority}" if priority is not None else ""
-        return f"job {job.job_id} on host {job.host}: {job.fields['status']}{at}"
-
-    return _jobs_answer(preempt_jobs(args.job_ids, args.priority, args.host, load_settings()), line)
-
-
-def _described(name: str, value: Any) -> str:
-    if value is None:
-        return f"{name} cleared"
-    if name == "priority":
-        return f"priority {value}"
-    return f"{name} {value:g} min"
+    """Stop running jobs and put them back in their hosts' queues. The host
+    refuses outright when nothing at all would go first, rather than throw
+    away what the job has done to re-run the same job."""
+    return _jobs_answer(preempt_jobs(args.job_ids, args.priority, args.host, load_settings()))
 
 
 def cmd_set(args: argparse.Namespace) -> Answer:
@@ -810,13 +778,7 @@ def cmd_set(args: argparse.Namespace) -> Answer:
             + ", ".join(f"--{settable.option}" for settable in settable_mod.FIELDS)
         )
 
-    def line(job: Done) -> str:
-        what = ", ".join(_described(settable_mod.BY_FIELD[f].option, job.fields[f]) for f in patch)
-        said = f"job {job.job_id} on host {job.host}: {what}"
-        placed = status_mod.queue_note(job.fields) if "priority" in patch else None
-        return f"{said}\n{placed}" if placed else said
-
-    return _jobs_answer(set_jobs(args.job_ids, patch, args.host, load_settings()), line)
+    return _jobs_answer(set_jobs(args.job_ids, patch, args.host, load_settings()))
 
 
 def _follow_argv(transport: Transport, remote_path: str, lines: int) -> list[str]:

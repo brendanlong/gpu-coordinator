@@ -146,7 +146,7 @@ class BootstrapFn(Protocol):
         transport: Transport | None = ...,
         report: Reporter = ...,
         health_options: HealthOptions = ...,
-    ) -> tuple[HostEntry, BootstrapResult]: ...
+    ) -> BootstrapResult: ...
 
 
 @dataclass
@@ -400,11 +400,12 @@ def _try_offer(
         with registry_transaction() as registry:
             registry.put(entry)
 
-        entry, result = deps.bootstrap(
+        result = deps.bootstrap(
             entry, settings, transport=transport, report=progress, health_options=health_options
         )
-        with registry_transaction() as registry:
-            registry.put(entry)
+        # Somebody may have run `gpuc host remove` meanwhile; the pod is
+        # healthy and its own now, so that is no reason to terminate it.
+        entry = open_registry().registry.hosts.get(entry.name, entry)
         progress(
             f"host {name} ready: dispatcher pid {result.dispatcher_pid}, "
             f"idle terminate {idle_minutes:g} min"
