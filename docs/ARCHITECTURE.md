@@ -1049,9 +1049,9 @@ What `status` prints is usage.md, and every flag is `gpuc status --help`. The in
   printed. For a pod the provider reports
   stopped or gone no ssh is attempted, and the reason is what the provider
   said. One `actions.status` builds the text form, `--json` and the
-  dashboard's document, including `--all`'s `unhosted` list, each job in it
-  labelled with what the same run found its host to be, and `gpuc requeue`
-  offered only where that host cannot still be running it. Per host, `errors`
+  dashboard's document. `--all`'s `unhosted` list labels each job in it
+  with what the same run found its host to be, and offers `gpuc requeue`
+  only where that host cannot still be running it. Per host, `errors`
   decide the exit code and `warnings` (the build) do not.
 - Nothing that decides an exit code may be visible only under `--json`: a host
   that answered and still carries an `error` prints it as an `ERROR` line.
