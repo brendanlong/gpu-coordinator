@@ -8,7 +8,7 @@ with no GPU, and so the dispatcher can share one fake in integration tests.
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 SmiRunner = Callable[[list[str]], str]
@@ -274,37 +274,25 @@ def snapshot(smi: SmiRunner = run_nvidia_smi) -> tuple[list[Gpu], dict[str, Usag
 
 
 def unused_gpus(
-    uuids: Sequence[str], smi: SmiRunner = run_nvidia_smi
+    uuids: Sequence[str], usage: Mapping[str, Usage]
 ) -> tuple[list[str], dict[str, str]]:
-    """Split `uuids` into the cards nobody is using and the rest, with a reason.
+    """Split `uuids` into the cards nobody is using and the rest, with a reason,
+    by a `snapshot`'s readings.
 
     For shared cards, which gpuc may only take while their real owner is not on
-    them. Every way of not knowing -- nvidia-smi failing, a card it did not
-    answer about, a reading it would not give -- lands in the second half: this
-    decides whether to run a job on somebody else's GPU, so the absence of
-    evidence has to count against. `status` reads the same `Usage` from
-    `snapshot`, so the verdict on a reading -- `Usage.unused` -- is written once.
+    them. A card with no reading, or a reading nvidia-smi would not give, lands
+    in the second half: this decides whether to run a job on somebody else's
+    GPU, so the absence of evidence has to count against. `status` reads the
+    same `Usage`, so the verdict on a reading -- `Usage.unused` -- is written once.
     """
-    if not uuids:
-        return [], {}
-    samples: dict[str, Usage] = {}
-    failure: str | None = None
-    try:
-        _, samples = snapshot(smi)
-    except GpuError as exc:
-        failure = str(exc)
     unused: list[str] = []
     in_use: dict[str, str] = {}
     for uuid in uuids:
-        usage = samples.get(uuid)
-        if usage is None:
-            in_use[uuid] = (
-                f"could not be read ({failure})"
-                if failure
-                else "nvidia-smi reported nothing about it"
-            )
-        elif usage.unused:
+        reading = usage.get(uuid)
+        if reading is None:
+            in_use[uuid] = "nvidia-smi reported nothing about it"
+        elif reading.unused:
             unused.append(uuid)
         else:
-            in_use[uuid] = usage.describe()
+            in_use[uuid] = reading.describe()
     return unused, in_use

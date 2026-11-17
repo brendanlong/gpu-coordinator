@@ -57,7 +57,7 @@ REQUEUE_WINDOW_S = 600.0
 """How long after a takeover to keep looking for jobs the old machine
 claimed late: its runners check the owner record every few seconds and
 before every claim, so anything it could still claim is long settled."""
-HEARTBEAT_STALE_S = 30.0
+HEARTBEAT_STALE_S = owner.STALE_S
 LOOP_INTERVAL_S = 2.0
 SYNC_STOP_PATIENCE_S = 1800.0
 """How long a stop request waits on a runner in its final sync before the
@@ -532,7 +532,6 @@ class DispatcherDeps:
     monotonic: Callable[[], float] = time.monotonic
     utcnow: Callable[[], datetime] = lambda: datetime.now(UTC)
     sleep: Callable[[float], None] = time.sleep
-    interval_s: float = LOOP_INTERVAL_S
     kill_grace_s: float = KILL_GRACE_S
 
 
@@ -599,6 +598,8 @@ class Dispatcher:
     _shared_unavailable: tuple[str, ...] = ()
     _duplicates: tuple[str, ...] = ()
     _table_error: str | None = None
+    _usage: dict[str, gpus.Usage] = field(default_factory=dict)
+    """The shared cards' readings from the same nvidia-smi call as `_cards`."""
     _unreadable_since: float | None = None
     """When nvidia-smi started failing to answer, if it is failing now."""
     _borrowable: tuple[list[str], int] | None = None
@@ -895,16 +896,16 @@ class Dispatcher:
         return self._resolution().shared
 
     def _resolution(self) -> gpus.Resolution:
-        """One nvidia-smi read per pass, both lists against it; every change
-        in what could not be resolved is logged once, not every two seconds.
-        A driver that will not answer costs the pass its cards; jobs wait,
-        for `SMI_PATIENCE_S` at most."""
+        """One nvidia-smi read per pass, both lists and the shared cards'
+        readings against it; every change in what could not be resolved is
+        logged once, not every two seconds. A driver that will not answer costs
+        the pass its cards; jobs wait, for `SMI_PATIENCE_S` at most."""
         if self._cards is None:
             try:
-                table = gpus.list_gpus(self.deps.smi)
+                table, self._usage = gpus.snapshot(self.deps.smi)
                 error = None
             except gpus.GpuError as exc:
-                table, error = [], str(exc)
+                table, self._usage, error = [], {}, str(exc)
             if error != self._table_error:
                 self._table_error = error
                 if error:
@@ -977,14 +978,13 @@ class Dispatcher:
         """Shared cards nothing of ours holds *and* nobody else is using either,
         and how many shared cards somebody else *is* on.
 
-        The nvidia-smi read is the whole of the preflight, and it is the one
-        thing standing between a borrowed card and somebody else's training
+        The pass's nvidia-smi read is the whole of the preflight, and it is the
+        one thing standing between a borrowed card and somebody else's training
         run, so it is taken fresh each pass rather than inferred from anything
-        longer-lived. It is taken *once* a pass, and only when a job actually
-        needs to borrow: every job that pass is then judged against one
-        reading, which is also what stops two of them being handed the same
-        card, and what stops `preempt_for_waiting` disagreeing with the
-        `launch_ready` it is reasoning about. The count comes from the same
+        longer-lived. Every job that pass is judged against that one reading,
+        which is also what stops two of them being handed the same card, and
+        what stops `preempt_for_waiting` disagreeing with the `launch_ready` it
+        is reasoning about. The count comes from the same
         reading because it decides which short job is stepped over.
 
         The cards the reading found free are re-filtered on the way out: a job
@@ -993,9 +993,8 @@ class Dispatcher:
         """
         busy = self._busy_gpus()
         if self._borrowable is None:
-            unused, in_use = gpus.unused_gpus(
-                [uuid for uuid in self.shared_gpus() if uuid not in busy], self.deps.smi
-            )
+            mine_to_borrow = [uuid for uuid in self.shared_gpus() if uuid not in busy]
+            unused, in_use = gpus.unused_gpus(mine_to_borrow, self._usage)
             self._borrowable = (unused, len(in_use))
             # Logged when the *set* changes, not when the numbers do: this is
             # sampled every pass a job is waiting, and somebody else's job moves
@@ -1436,14 +1435,10 @@ class Dispatcher:
 
     def _upload_outputs(self, job_id: str, config: jobs.HostConfig, timeout: float) -> None:
         spec = jobs.read_spec(job_id)
-        # The job's own secrets file if the runner left it (it does exactly for
-        # this case on an ephemeral host); otherwise our own environment, which
-        # already carries the host env.
-        env: dict[str, str] | None = None
-        env_file = paths.job_env_file(job_id)
-        if env_file.exists():
-            env = config.apply_env(dict(os.environ))
-            env.update(jobs.parse_env_file(env_file))
+        # As the runner's own uploads were made: the secrets file is there if
+        # the runner left it, which it does exactly for this case on an
+        # ephemeral host.
+        env = jobs.job_env(spec, config.apply_env(dict(os.environ)))
         sync.sync_outputs(
             spec.outputs,
             paths.workdir(job_id),
@@ -1629,7 +1624,7 @@ class Dispatcher:
                 # actually ran: a failing one knows nothing about the queue.
                 if healthy and self.idle_and_not_ephemeral():
                     break
-                self.deps.sleep(self.deps.interval_s)
+                self.deps.sleep(LOOP_INTERVAL_S)
         finally:
             lock.release()
         self.log("dispatcher exiting")

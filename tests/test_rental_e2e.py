@@ -14,7 +14,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,7 @@ from gpuc.control.providers.base import Offer, Pod, Provider
 from gpuc.control.providers.runpod import RunPodProvider
 from gpuc.control.providers.vast import VastProvider
 from gpuc.control.s3index import LocalIndex
-from tests.conftest import git_commit, load_registry
+from tests.conftest import git_commit, load_registry, wait_until
 
 pytestmark = pytest.mark.rental
 
@@ -97,17 +97,6 @@ max_runtime_min: 20
 
 def log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
-
-
-def wait_until(
-    predicate: Callable[[], bool], timeout_s: float, what: str, interval_s: float = 10.0
-) -> float:
-    start = time.monotonic()
-    while time.monotonic() - start < timeout_s:
-        if predicate():
-            return time.monotonic() - start
-        time.sleep(interval_s)
-    raise AssertionError(f"timed out after {timeout_s:.0f}s waiting for {what}")
 
 
 def recording(cls: Any, prefix: str) -> Any:
@@ -237,6 +226,7 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
                 lambda: job_state(entry, live_settings, job_id)["status"] == "running",
                 JOB_TIMEOUT_S,
                 "the job to start running",
+                interval=10.0,
             )
             assert main(["logs", job_id, "-n", "20"]) == 0
             elapsed = wait_until(
@@ -246,6 +236,7 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
                 ),
                 JOB_TIMEOUT_S,
                 "the job to finish",
+                interval=10.0,
             )
             final = job_state(entry, live_settings, job_id)
             log(f"job finished after {elapsed:.0f}s: {final}")
@@ -262,7 +253,10 @@ def test_a_rented_pod_runs_a_gpu_job_and_tears_itself_down(
 
             log("waiting for the host to terminate itself after 2 idle minutes")
             idle = wait_until(
-                lambda: _gone(provider, pod.id), IDLE_TIMEOUT_S, "the pod to self-terminate"
+                lambda: _gone(provider, pod.id),
+                IDLE_TIMEOUT_S,
+                "the pod to self-terminate",
+                interval=10.0,
             )
             log(f"pod gone {idle:.0f}s after the job finished")
             assert pod.id not in [p.id for p in provider.list_ours()]

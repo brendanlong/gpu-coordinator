@@ -70,7 +70,6 @@ class IndexEntry(TolerantModel):
     """The job this one was requeued from, for a listing to say so."""
     submitted_at: str = ""
     s3_prefix: str | None = None
-    spec_uri: str | None = None
 
 
 def spec_key(job_id: str) -> str:

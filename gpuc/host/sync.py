@@ -304,7 +304,6 @@ class SyncLoop:
         self._env = env
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._tick_lock = threading.Lock()
         self.last_error: str | None = None
         self._missing_ticks = 0
         """Consecutive periodic ticks that found an output path missing."""
@@ -312,39 +311,25 @@ class SyncLoop:
     def _note(self, message: str) -> None:
         queue.note(self._spec.job_id, f"sync: {message}")
 
-    def _tick(
-        self,
-        min_age_s: float,
-        timeout: float | None = DEFAULT_TIMEOUT_S,
-        *,
-        record_missing: bool = True,
-        meta: bool = True,
-    ) -> None:
-        with self._tick_lock:
-            sync_outputs(
-                self._spec.outputs,
-                self._workdir,
-                self._spec.job_id,
-                min_age_s=min_age_s,
-                runner=self._runner,
-                timeout=timeout,
-                env=self._env,
-                record_missing=record_missing,
-            )
-            if meta:
-                sync_job_meta(
-                    self._spec.job_id,
-                    self._s3_prefix,
-                    runner=self._runner,
-                    timeout=timeout,
-                    env=self._env,
-                )
-
     def _loop(self) -> None:
         interval = max(1, self._spec.sync_interval_s)
         while not self._stop.wait(interval):
             try:
-                self._tick(MIN_AGE_S, record_missing=self._missing_ticks >= MISSING_TICKS)
+                sync_outputs(
+                    self._spec.outputs,
+                    self._workdir,
+                    self._spec.job_id,
+                    runner=self._runner,
+                    env=self._env,
+                    record_missing=self._missing_ticks >= MISSING_TICKS,
+                )
+                sync_job_meta(
+                    self._spec.job_id,
+                    self._s3_prefix,
+                    runner=self._runner,
+                    timeout=DEFAULT_TIMEOUT_S,
+                    env=self._env,
+                )
             except MissingOutput as exc:
                 # Not an error yet: the job may simply not have written the
                 # path. Once it has stayed missing for `MISSING_TICKS` it goes
@@ -389,4 +374,12 @@ class SyncLoop:
         self.stop()
         with contextlib.suppress(RuntimeError, OSError):
             jobs.clear_output_uploads(self._spec.job_id)
-        self._tick(min_age_s=0.0, timeout=None, meta=False)
+        sync_outputs(
+            self._spec.outputs,
+            self._workdir,
+            self._spec.job_id,
+            min_age_s=0.0,
+            runner=self._runner,
+            timeout=None,
+            env=self._env,
+        )

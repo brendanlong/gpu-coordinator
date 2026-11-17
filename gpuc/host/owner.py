@@ -23,6 +23,7 @@ import socket
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from typing import NamedTuple
 
 from gpuc.host import jobs, paths
 from gpuc.host.procs import boot_id, init_start
@@ -58,28 +59,35 @@ def instance() -> str:
     return f"{boot}/{init}" if init else f"{boot}@{socket.gethostname()}"
 
 
-def current() -> tuple[str, float] | None:
-    """The instance the record names and its modification time, or None
-    with no readable record: a queue nobody claimed is nobody's."""
+class Record(NamedTuple):
+    instance: str
+    renewed: float
+    """The record's modification time."""
+    host: str | None
+
+
+def current() -> Record | None:
+    """What the record says, or None with no readable record: a queue nobody
+    claimed is nobody's."""
     path = paths.owner_file()
     try:
         renewed = path.stat().st_mtime
-        owner = jobs.as_opt_str(jobs.fields_of(jobs.read_json(path, attempts=2)), "instance")
+        fields = jobs.fields_of(jobs.read_json(path, attempts=2))
     except (OSError, RuntimeError):
         return None
-    return (owner, renewed) if owner else None
+    owner = jobs.as_opt_str(fields, "instance")
+    return Record(owner, renewed, jobs.as_opt_str(fields, "host")) if owner else None
 
 
 def claim(
     me: str,
     *,
-    wait_s: float = CLAIM_WAIT_S,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
 ) -> str | None:
     """Record `me` as serving the queue once whoever else is recorded has
     gone quiet; the instance it took over from, if any. Raises `Busy` when
-    the other is still renewing after `wait_s`.
+    the other is still renewing after `CLAIM_WAIT_S`.
 
     Quiet is judged by watching the record's modification time not move for
     `STALE_S` on this machine's own clock: the time itself was set by
@@ -87,17 +95,17 @@ def claim(
     turn clock skew into a takeover or into a queue nobody can ever claim.
     """
     record = current()
-    if record is not None and record[0] != me and time.time() - record[1] < LONG_GONE_S:
-        deadline = now() + wait_s
+    if record is not None and record.instance != me and time.time() - record.renewed < LONG_GONE_S:
+        deadline = now() + CLAIM_WAIT_S
         quiet_since = now()
         while True:
             if now() - quiet_since >= STALE_S:
                 break
             if now() >= deadline:
-                raise Busy(f"{record[0]} is serving this queue and still renewing its claim")
+                raise Busy(f"{record.instance} is serving this queue and still renewing its claim")
             sleep(1.0)
             seen = current()
-            if seen is None or seen[0] == me:
+            if seen is None or seen.instance == me:
                 record = seen
                 break
             if seen != record:
@@ -106,13 +114,13 @@ def claim(
         paths.owner_file(),
         {"instance": me, "host": socket.gethostname(), "since": jobs.utc_now()},
     )
-    return record[0] if record is not None and record[0] != me else None
+    return record.instance if record is not None and record.instance != me else None
 
 
 def renew(me: str) -> None:
     """Keep a claim fresh, if it is still `me`'s. Never writes over another's."""
     record = current()
-    if record is not None and record[0] == me:
+    if record is not None and record.instance == me:
         with suppress(OSError):
             os.utime(paths.owner_file())
 
@@ -121,18 +129,13 @@ def serving_elsewhere(me: str) -> str | None:
     """The host of another machine still renewing this queue's claim, for
     `status`; None for a claim that has gone quiet, which is most often this
     machine's own before a restart."""
-    path = paths.owner_file()
     record = current()
-    if record is None or record[0] == me or time.time() - record[1] > STALE_S:
+    if record is None or record.instance == me or time.time() - record.renewed > STALE_S:
         return None
-    try:
-        host = jobs.as_opt_str(jobs.fields_of(jobs.read_json(path, attempts=2)), "host")
-    except RuntimeError:
-        host = None
-    return host or record[0]
+    return record.host or record.instance
 
 
 def replaced_by(me: str) -> str | None:
     """The instance that took this queue over from `me`, or None."""
     record = current()
-    return record[0] if record is not None and record[0] != me else None
+    return record.instance if record is not None and record.instance != me else None

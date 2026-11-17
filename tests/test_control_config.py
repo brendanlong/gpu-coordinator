@@ -23,7 +23,7 @@ from gpuc.control.config import (
     transport_for,
 )
 from gpuc.control.gpuinfo import GpuInfo
-from gpuc.control.transport import LocalTransport, SshTransport
+from gpuc.control.transport import LocalTransport, SshTransport, control_socket_dir
 from gpuc.host.cleanup import DEFAULT_WORKDIR_DAYS
 from gpuc.host.jobs import HostConfig
 from tests.conftest import SEEN_AT, host_entry, load_registry, register_host
@@ -68,6 +68,7 @@ def test_transport_kind_follows_the_entry(control_env: Path) -> None:
     assert isinstance(ssh, SshTransport)
     assert ssh.port == 2222
     assert ssh.known_hosts == config.state_dir() / "known_hosts"
+    assert ssh.control_dir == control_socket_dir()
 
 
 def test_the_entry_reads_the_hosts_own_config_out_of_its_cache() -> None:

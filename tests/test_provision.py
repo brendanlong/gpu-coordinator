@@ -531,7 +531,7 @@ def test_a_read_that_fails_inside_the_confirm_loop_is_asked_again() -> None:
 
     provider.get = flaky  # type: ignore[method-assign]
     reports: list[str] = []
-    provider.terminate_confirmed("pod1", report=reports.append, sleep=lambda _: None)
+    provider.terminate_confirmed("pod1", report=reports.append)
     assert provider.terminated == ["pod1"]
     assert any("asking again" in line for line in reports)
 

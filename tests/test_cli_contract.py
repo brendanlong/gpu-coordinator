@@ -49,7 +49,7 @@ from tests.conftest import (
     load_registry,
     register_host,
 )
-from tests.fakehost import FakeHost
+from tests.fakehost import FakeHost, ScriptedTransport
 from tests.test_cli import bootstrapping
 
 GPU = FAKE_GPUS[0]
@@ -63,10 +63,14 @@ BAD_ENTRY = {"name": "bad", "kind": "a kind that does not exist", "port": "twent
 
 
 def write_hosts(document: object) -> Path:
+    """Write `document` as the registry: as JSON, or verbatim if it is text."""
     path = hosts_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(document))
+    path.write_text(document if isinstance(document, str) else json.dumps(document))
     return path
+
+
+NOT_JSON = "{ this is not json"
 
 
 # -- a broken registry must not brick the CLI ---------------------------------
@@ -108,14 +112,12 @@ def test_a_write_puts_back_the_entry_this_build_could_not_read(
 def test_an_unparseable_registry_says_so_takes_a_bak_and_exits_three(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    path = hosts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{ this is not json")
+    path = write_hosts(NOT_JSON)
     assert main(["status"]) == EXIT_LOCAL_STATE
     err = capsys.readouterr().err
     assert str(path) in err
     assert ".bak" in err
-    assert backup_path(path).read_text() == "{ this is not json"
+    assert backup_path(path).read_text() == NOT_JSON
 
 
 def test_status_does_not_call_an_unreadable_registry_an_empty_one(
@@ -129,21 +131,17 @@ def test_status_does_not_call_an_unreadable_registry_an_empty_one(
 def test_a_mutation_refuses_to_overwrite_a_registry_it_could_not_read(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    path = hosts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{ this is not json")
+    path = write_hosts(NOT_JSON)
     assert main(["host", "set", "local", "--idle-min", "9"]) == EXIT_LOCAL_STATE
     assert "not a readable host registry" in capsys.readouterr().err
-    assert path.read_text() == "{ this is not json"
+    assert path.read_text() == NOT_JSON
 
 
 def test_a_job_command_on_an_unreadable_registry_is_unknown_not_missing(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Exit 3, not 4: "no host knows that job" would be a lie."""
-    path = hosts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{ this is not json")
+    write_hosts(NOT_JSON)
     assert main(["logs", "20260101-000000-aaaaaa"]) == EXIT_LOCAL_STATE
     assert main(["cancel", "20260101-000000-aaaaaa"]) == EXIT_LOCAL_STATE
     assert main(["host", "list"]) == EXIT_LOCAL_STATE
@@ -369,10 +367,21 @@ def test_version_exits_one_for_an_entry_it_could_not_read(
     assert "skipping host 'bad'" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["status", "--host", "nope"],
+        ["host", "bootstrap", "nope"],
+        ["host", "set", "nope", "--idle-min", "1"],
+        # A shell needs a host to open: there `--host` names a destination,
+        # not a hint about where the job is.
+        ["ssh", "--host", "nope", "--print", "20260101-000000-aaaaaa"],
+    ],
+)
 def test_a_named_host_that_does_not_exist_is_four(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
+    command: list[str], control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["status", "--host", "nope"]) == EXIT_NOT_FOUND
+    assert main(command) == EXIT_NOT_FOUND
     assert "no host named 'nope'" in capsys.readouterr().err
 
 
@@ -677,18 +686,6 @@ def test_status_json_says_unaskable_rather_than_empty(
     assert host["reachable"] is False
     assert host["running"] == []
     assert host["errors"] == ["ssh timed out"]
-
-
-def test_status_json_on_an_unreadable_registry_is_exit_three_and_still_json(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    path = hosts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{ not json")
-    assert main(["status", "--json"]) == EXIT_LOCAL_STATE
-    document = status_json(capsys)
-    assert document["hosts"] == []
-    assert "could not be read" in document["errors"][-1]
 
 
 def test_status_json_carries_the_skipped_entry_as_a_top_level_error(
@@ -1017,13 +1014,6 @@ def test_a_ctrl_c_is_exit_130_and_a_document_whoever_was_running(
     assert (document["exit_code"], document["error"]) == (130, "interrupted")
 
 
-def test_a_usage_error_under_json_is_a_document_too(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["host", "clean", "local", "--json"]) == EXIT_USAGE
-    assert json.loads(capsys.readouterr().out)["exit_code"] == EXIT_USAGE
-
-
 def test_a_command_line_argparse_rejects_still_prints_a_document(
     control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1128,16 +1118,6 @@ def test_host_set_json_reports_an_address_change_made_here(
     assert document["changes"] == []
     assert document["persistent_root"] == "/vol/me"
     assert document["remote_home"] == "/vol/me/gpuc"
-
-
-def test_host_set_json_with_nothing_to_set_is_usage_in_both_forms(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    register_host(name="local", gpus=GPU)
-    assert main(["host", "set", "local"]) == EXIT_USAGE
-    capsys.readouterr()
-    assert main(["host", "set", "local", "--json"]) == EXIT_USAGE
-    assert document_of(capsys)["exit_code"] == EXIT_USAGE
 
 
 def test_host_remove_json_says_what_was_forgotten_and_that_a_pod_is_not_touched(
@@ -1299,23 +1279,11 @@ def test_host_bootstrap_all_json_on_a_registry_that_breaks_mid_run_is_the_error_
     assert "1/2 host(s) bootstrapped" in captured.err
 
 
-class PruningTransport:
-    """A host whose `uv cache prune` reports the cache size either side."""
-
-    def __init__(self, output: str) -> None:
-        self.output = output
-
-    def run(self, command: str, *, timeout: float = 120.0, check: bool = True) -> Any:
-        from gpuc.control.transport import CommandResult
-
-        return CommandResult("fake", ["sh", "-c", command], 0, self.output, "")
-
-
 def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
     control_env: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register_host(name="local", gpus=GPU, python="/py")
-    host = PruningTransport("before_kib=18874368\nafter_kib=11534336\ndir=/home/u/.cache/uv\n")
+    host = ScriptedTransport("before_kib=18874368\nafter_kib=11534336\ndir=/home/u/.cache/uv\n")
     monkeypatch.setattr("gpuc.control.remote.transport_for", lambda entry, settings=None: host)
     assert main(["host", "clean", "local", "--uv-cache"]) == EXIT_OK
     assert "pruned 18.0 GiB -> 11.0 GiB" in capsys.readouterr().out
@@ -1336,13 +1304,15 @@ def test_host_clean_json_is_the_cache_and_what_the_prune_freed(
     }
 
 
-def test_host_clean_json_without_the_flag_is_usage_in_both_forms(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("command", [["host", "clean", "local"], ["host", "set", "local"]])
+def test_a_host_command_with_nothing_to_do_is_usage_in_both_forms(
+    command: list[str], control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Under --json a usage error is a document too."""
     register_host(name="local", gpus=GPU)
-    assert main(["host", "clean", "local"]) == EXIT_USAGE
+    assert main(command) == EXIT_USAGE
     capsys.readouterr()
-    assert main(["host", "clean", "local", "--json"]) == EXIT_USAGE
+    assert main([*command, "--json"]) == EXIT_USAGE
     assert document_of(capsys)["exit_code"] == EXIT_USAGE
 
 
@@ -1364,16 +1334,21 @@ def test_config_init_json_is_the_path_and_whether_it_was_there(
     assert document_of(capsys)["existed"] is True
 
 
-def test_host_list_json_on_an_unreadable_registry_is_exit_three_and_still_json(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("command", "error"),
+    [
+        (["status", "--json"], "could not be read"),
+        (["host", "list", "--json"], "not a readable host registry"),
+    ],
+)
+def test_json_on_an_unreadable_registry_is_exit_three_and_still_json(
+    command: list[str], error: str, control_env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    path = hosts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{ not json")
-    assert main(["host", "list", "--json"]) == EXIT_LOCAL_STATE
+    write_hosts(NOT_JSON)
+    assert main(command) == EXIT_LOCAL_STATE
     document = document_of(capsys)
     assert document["hosts"] == []
-    assert document["errors"]
+    assert error in document["errors"][-1]
 
 
 def test_version_json_says_which_hosts_are_current(

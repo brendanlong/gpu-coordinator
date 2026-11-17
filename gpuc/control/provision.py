@@ -438,7 +438,7 @@ def _abandon(
     """Terminate and forget a pod this run gave up on; False if it still bills."""
     progress(f"terminating {name} ({pod_id}): {reason}")
     try:
-        provider.terminate_confirmed(pod_id, report=progress, sleep=deps.sleep)
+        provider.terminate_confirmed(pod_id, report=progress)
     except ProviderError as exc:
         # A pod that is still billing must stay visible: its registry entry, if
         # it got one, is what `gpuc status` shows a POD line for.
@@ -678,7 +678,9 @@ def matching_rentals(
     entries = [
         entry
         for entry in open_registry().registry.hosts.values()
-        if entry.rental is not None and entry.rental.provider == provider.name
+        if entry.rental is not None
+        and entry.rental.provider == provider.name
+        and entry.trusted == trusted
     ]
     if not entries:
         return []
@@ -705,7 +707,7 @@ def matching_rentals(
             report(f"could not ask the provider about rental {entry.name}: {asked.pod_error}")
             continue
         match = _match(entry, asked, constraints, provider)
-        if match is not None and entry.trusted == trusted:
+        if match is not None:
             matches.append(match)
     return matches
 

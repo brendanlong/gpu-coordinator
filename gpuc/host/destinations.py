@@ -39,7 +39,7 @@ class SyncError(RuntimeError):
 class MissingOutput(SyncError):
     """The output path the spec names is not there. Not the same failure as a
     broken upload: nothing was produced, so `sync` would be a misleading
-    reason. Raised by `sync.sync_outputs`, the one place that looks."""
+    reason. Raised by `sync._sync_output`, the one place that looks."""
 
 
 class PreflightFailed(RuntimeError):
@@ -144,18 +144,14 @@ def _run(argv: list[str], runner: CommandRunner, timeout: float | None, env: Env
 
 
 def of(output: Output, job_id: str) -> list[Destination]:
-    """The destinations one spec `outputs:` entry names, `{job_id}` expanded."""
+    """The destinations one spec `outputs:` entry names. Submit has already
+    expanded `{job_id}` in them, so formatting them again here would turn an
+    escaped `{{` back into a placeholder."""
     found: list[Destination] = []
     if output.s3:
-        found.append(S3(output.s3.format(job_id=job_id)))
+        found.append(S3(output.s3))
     if output.hf:
-        found.append(
-            HuggingFace(
-                output.hf.format(job_id=job_id),
-                (output.hf_path or job_id).format(job_id=job_id),
-                create=output.hf_create,
-            )
-        )
+        found.append(HuggingFace(output.hf, output.hf_path or job_id, create=output.hf_create))
     return found
 
 

@@ -16,17 +16,12 @@ two halves that share only `gpuc/_version.py` (stdlib only):
 - `gpuc/host/` runs on hosts, as `python -m gpuc.host <cmd>`, and imports
   nothing outside the standard library.
 - `gpuc/control/` runs on the client and may use third-party dependencies.
-  Every command is one function in `actions.py` returning its `Answer`; the
-  CLI (`cli.py`) and the web app (`web/`) both call those, and nothing else.
 
 The wheel also carries `snakemake_executor_plugin_gpuc/`, a second top-level
 package, and the agent guide `skills/gpuc/SKILL.md` as `gpuc/SKILL.md`.
 
-`gpuc.host` must be importable and runnable with a bare interpreter: the
-bootstrap rsyncs the package to the host and runs it with the uv-managed
-Python, with no `uv sync` needed for the queue to work. Everything the
-dispatcher spawns gets `$HOME/.local/bin` and `$HOME/.cargo/bin` (when they
-exist) and the host env's PATH keys (`jobs.MANAGED_ENV`) prepended to `PATH`
+Everything the dispatcher spawns gets `$HOME/.local/bin` and
+`$HOME/.cargo/bin` (when they exist) and the host env's PATH keys (`jobs.MANAGED_ENV`) prepended to `PATH`
 (`dispatcher._child_env`). Upload helpers shell out to binaries the bootstrap
 installs into `$HOME` (`aws` CLI v2 bundle, `hf` from `uv tool install
 huggingface_hub`), and a missing binary fails the *job's* sync step, never the
@@ -117,7 +112,6 @@ jobs/<jobid>/
                      # `<scratch>/<jobid>/` instead on a host with scratch
                      # (`paths.workdir`)
   log.txt            # combined stdout/stderr of setup + command, line-buffered
-  outputs/           # default output root; JobSpec.outputs paths are relative to workdir
 dispatcher.lock      # fd flock held by the running dispatcher
 dispatcher.heartbeat # mtime touched every 5 s by the dispatcher
 dispatcher.log
@@ -187,8 +181,10 @@ defaults.
 `gpuc submit` expands `{job_id}` in output destinations and refuses an `s3` or
 `hf_path` whose expanded form does not contain the id (no `hf_path` means the
 id itself). Output namespaces are unique by construction; there is no other
-overwrite guard anywhere. The S3 mirror holds the spec with `{job_id}`
-unexpanded, so `gpuc requeue` expands it with the new id.
+overwrite guard anywhere. The host takes destinations as submitted and never
+formats them again (an escaped `{{` is a literal brace by then); it fills
+`{job_id}` into `path` itself, which submit only checks. The S3 mirror holds
+the spec with `{job_id}` unexpanded, so `gpuc requeue` expands it with the new id.
 
 Job id: `YYYYMMDD-HHMMSS-<6 hex>`, assigned by `gpuc submit`. Dispatch order
 is the queue's lexical order in `(priority, job_id)`; two jobs submitted in
@@ -318,13 +314,14 @@ The order is the contract; each step is in `runner.py`.
    runner exits 0 and writes nothing. Then, on a host with scratch, unpack the
    archived checkout if the workdir is missing (`checkout.restore`); with
    neither, fail `checkout-lost` before anything runs.
-1. Verify the assignment (UUIDs) against `nvidia-smi --query-gpu=index,uuid`;
-   fail `gpu-assert` if it names a card that is not here, or is empty for a
-   job that asked for cards. Export `CUDA_VISIBLE_DEVICES` as the cards'
-   nvidia-smi **indices** with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, as UUIDs only if
-   the index table could not be read, and empty -- never unset -- for a job
-   with no cards. Then the secrets file and the spec `env`; the host's `env` and PATH
-   are the runner's own, from the dispatcher.
+1. Verify the assignment (UUIDs) against the nvidia-smi table; fail
+   `gpu-assert` if the table cannot be read, if it names a card that is not
+   here or one card twice, or is empty for a job that asked for cards. Export
+   `CUDA_VISIBLE_DEVICES` as the cards' nvidia-smi **indices** with
+   `CUDA_DEVICE_ORDER=PCI_BUS_ID`, as UUIDs only if some assigned card has no
+   index in the table, and empty -- never unset -- for a job with no cards.
+   Then the secrets file and the spec `env`; the host's `env` and PATH are the
+   runner's own, from the dispatcher.
 1b. Snapshot every declared `outputs:` path into `outputs_baseline.json`,
    **before `setup`** and once per job (a later attempt keeps the first
    baseline). Every upload excludes files that still match, and a path holding
@@ -391,9 +388,7 @@ submitter is [usage.md](usage.md#progress-and-estimates).
 - `progress_command` runs in `workdir/` with the job's environment, during
   `main` only; `progress.parse` accepts a fraction with a decimal point or a
   percentage with a `%`, and nothing else. Above 0% the runner replaces `eta`
-  with `now + elapsed_main * (100 - pct) / pct`. The poll is synchronous in
-  the loop that watches for a cancel, with a fixed `progress.TIMEOUT_S` and a
-  `killpg` behind it, and only the last `MAX_OUTPUT_BYTES` of output is read.
+  with `now + elapsed_main * (100 - pct) / pct`.
 - A failed, timed-out or unparseable poll writes `progress_error`, logged the
   first time each distinct message appears. `eta` is cleared when the job
   ends; `progress_pct` is not.
@@ -409,12 +404,7 @@ submitter is [usage.md](usage.md#progress-and-estimates).
 ## Process isolation (cgroup scope, else process group)
 
 Where a lingering `systemd --user` instance with cgroup delegation exists each
-phase runs as:
-
-```
-systemd-run --user --scope --collect --quiet -p TimeoutStopSec=15 \
-  --unit=gpuc-<jobid>-<phase>.scope -- bash -c 'base64 -d <<<"$1" | bash' _ <b64>
-```
+phase runs in its own transient scope, `gpuc-<jobid>-<phase>.scope`.
 
 Every stop goes through one object, `procs.JobProcesses` (the scope, the job's
 own process group, and the runner), built from the job's state: the runner's
@@ -474,9 +464,7 @@ removing it removes both (`cleanup.has_checkout`, `cleanup.remove_workdir`). Wha
   with every destination's last upload recorded, with its workdir gone, or
   with nothing ever written under the declared paths; anything unreadable
   counts as content.
-- `python -m gpuc.host clean (--all-finished | --older-than DAYS | --only IDS)
-  [--dry-run]` and `purge [--older-than DAYS] [--only IDS] [--verified IDS]
-  [--dry-run] [--force]` print JSON and **fail closed**: a running or queued
+- The on-host `clean` and `purge` **fail closed**: a running or queued
   job, an unreadable `state.json`, and (under an age gate) a job with no
   parseable `ended_at` are skipped. `--only` replaces the age gate, and a named
   id no job dir matches removes nothing and exits 1; the control side reads
@@ -498,8 +486,7 @@ removing it removes both (`cleanup.has_checkout`, `cleanup.remove_workdir`). Wha
   finds its workdir, within `cleanup.MEASURING_BUDGET_S` per call, and reports
   `null` past the budget. `gpuc clean` measures afresh. Every byte figure is
   what deleting the tree gives the filesystem back (`reclaimable_bytes`), not
-  what `du` says; `cleanup.dir_size` is the `du` twin, used only for the uv
-  cache in `health`.
+  what `du` says.
 
 ## The shared uv cache
 
@@ -687,11 +674,6 @@ asked with its reason at once and never from the mirror.
   first poll: for `logs -f` at once, for `wait` once the other jobs named have
   been waited for and reported. A job that *was* listed and then vanishes is
   trouble, not a missing id.
-- `logs -f` runs `tail -F` as a child writing straight to stdout while the loop
-  polls, started on the first poll the host answers, and gives the stream
-  `FLUSH_GRACE_S` to catch up before stopping it. A plain read's `tail` never
-  retries, and its non-zero exit on a missing log is what routes `gpuc logs` to
-  the mirror.
 
 ## Transport
 
@@ -772,10 +754,7 @@ and nowhere else, so one box driven from two machines has one configuration.
    exception is a host with **no** config at all, which gets `first_config`
    with the last config this machine read off it on top.
 4. Run `python -m gpuc.host health` and fail bootstrap on a failed check.
-5. Start the dispatcher. The shipping is `bootstrap.ensure_build`, the one
-   ship path (see *Which build is a host running*). Bootstrap is never blocked
-   by running jobs: the package is replaced, and whichever dispatcher takes
-   over adopts them.
+5. Start the dispatcher.
 6. Record the driver version health reported into the registry's cache. The
    cards are the probe's to record (`gpuc host add`, `gpuc host probe`,
    provisioning), the one look at nvidia-smi the control side takes.
@@ -826,8 +805,8 @@ already has a config is never defaulted.
 spelled and resolved the same way. What it means for a submitter is
 [usage.md](usage.md#shared-gpus).
 
-- Two gates: the job asked (`use_shared`, fixed at submit), and `nvidia-smi
-  --query-gpu=memory.used,utilization.gpu` reports 0 MiB *and* 0% right now.
+- Two gates: the job asked (`use_shared`, fixed at submit), and nvidia-smi
+  reports the card at 0 MiB used *and* 0% utilization right now.
   Every way of not knowing counts as in use.
 - Owned cards first, always; a job borrows only its shortfall.
 - The sample is taken once per dispatch pass, and every job in that pass is
@@ -984,9 +963,6 @@ the same submit path as every other host.
 
 ## Ending a rental on purpose (`gpuc host terminate`, `teardown.py`)
 
-Client-side: the provider call works whether or not the pod still answers, and
-once it returns there is no host left to own any state.
-
 - The target is a registry name, else a pod id, else a pod name; the pod search
   is over `list_ours()`, so a name that is not a registered host only ever
   resolves to a pod with our prefix. A `local` or `ssh` host is refused; an
@@ -1037,9 +1013,7 @@ so it would otherwise choose what its keys reach.
 
 ## Web dashboard (`gpuc web serve`)
 
-A thin view, by construction: `gpuc.control.actions` holds one function per
-command returning the `Answer` its `--json` form prints, and both `cli.py` and
-`web/app.py` call those. **Nothing the dashboard shows or does exists only in
+**Nothing the dashboard shows or does exists only in
 the dashboard**, and anything it gains lands in `actions` first. An answer
 goes on the wire under the HTTP status its exit code maps to
 (`exits.http_status`); the API's failure document is `--json`'s.
@@ -1049,9 +1023,7 @@ dependency. One password, hashed into `config_dir()/web-password` (0600) and
 read once at startup; a server with no password refuses to start. Sessions are
 random tokens held in memory, `HttpOnly; SameSite=Strict`, seven days, and a
 POST carrying an `Origin` must match `Host`. Wrong passwords are throttled
-(`web/auth.py`). Idle keep-alive connections time out after 30 s, a body over
-1 MiB is refused before it is read, and a bug in a handler is a 500 with a
-traceback in the server log. No TLS: localhost, a VPN, or behind a proxy.
+(`web/auth.py`). No TLS: localhost, a VPN, or behind a proxy.
 
 Status is gathered across hosts in parallel (`actions.gather_all`), and a
 host that cannot be reached delays only its own answer: the text form prints
@@ -1148,8 +1120,7 @@ every bootstrap and reported back by `python -m gpuc.host status`
   not report `tests.conftest.LOCAL_GPU_UUID` -- which is every CI runner.
 - Rental integration (`test_rental_e2e.py`, one case per provider): the
   cheapest small card, a job whose command is under two minutes, `--idle-min 2`, and the test asserts
-  the self-terminate via the provider's `get`. A pod whose name lacks the `runpod_pod_prefix` belongs to
-  someone else: read it in `list()`, never act on it. Every test that creates
+  the self-terminate via the provider's `get`. Every test that creates
   a pod has a `finally` that terminates it.
 
 ## Code conventions

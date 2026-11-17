@@ -21,8 +21,6 @@ could never have answered.
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -260,7 +258,6 @@ def terminate(
     providers: Providers,
     force: bool = False,
     report: Reporter = print,
-    sleep: Callable[[float], None] = time.sleep,
 ) -> Termination:
     """Resolve, ask the host unless `--force`, terminate, forget it here.
 
@@ -312,7 +309,7 @@ def terminate(
             )
         report(f"terminating {resolved.label}")
         try:
-            provider.terminate_confirmed(resolved.pod_id, report=report, sleep=sleep)
+            provider.terminate_confirmed(resolved.pod_id, report=report)
         except ProviderError as exc:
             raise TerminateFailed(
                 f"{resolved.label}: {exc}\n"

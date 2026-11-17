@@ -218,7 +218,67 @@ def make_spec(**overrides: object) -> JobSpec:
         "gpus": 1,
     }
     document.update(overrides)
-    return JobSpec.from_dict(document)
+    spec = JobSpec.from_dict(document)
+    # What submit hands the host: `{job_id}` already filled into destinations.
+    for output in spec.outputs:
+        for key in ("s3", "hf", "hf_path"):
+            if value := getattr(output, key):
+                setattr(output, key, value.replace("{job_id}", spec.job_id))
+    return spec
+
+
+JOB_PREFIX = "s3://bucket/gpuc/test-host"
+"""The s3_prefix `make_job` records a job's mirror under."""
+OUTPUT = {"path": "results", "s3": "s3://bucket/exp/{job_id}"}
+
+
+def make_job(
+    *,
+    status: str = "succeeded",
+    days_old: float = 30.0,
+    mirrored: bool = True,
+    prefix: str = JOB_PREFIX,
+    outputs: bool = False,
+    output: dict[str, Any] = OUTPUT,
+    outputs_uploaded: bool = False,
+    produced: bool = True,
+    workdir: bool = True,
+    ran: bool = True,
+    **spec: object,
+) -> str:
+    """A job in the queue that has got as far as `status`, `days_old` days ago,
+    with a workdir (`venv.bin`, and `results/checkpoint.pt` if it has
+    `outputs` it `produced`) and, as `mirrored`/`outputs_uploaded` say, its
+    mirror under `prefix` and its outputs confirmed. `spec` goes to
+    `make_spec`."""
+    job_spec = make_spec(outputs=[output] if outputs else [], **spec)
+    job_id = queue.enqueue(job_spec)
+    ended = datetime.now(UTC) - timedelta(days=days_old)
+    fields: dict[str, Any] = {"status": status, "ran": ran}
+    if status in jobs.FINISHED_STATUSES:
+        fields["ended_at"] = ended.isoformat()
+    uploads: list[jobs.Upload] = []
+    if mirrored:
+        uploads.append(jobs.Upload(to=f"{prefix}/jobs/{job_id}", ok_at=ended.isoformat()))
+    if outputs_uploaded:
+        uploads += [
+            jobs.Upload(to=destination.uri, output=out.path, ok_at=ended.isoformat())
+            for out in job_spec.outputs
+            for destination in destinations.of(out, job_id)
+        ]
+    jobs.update_state(job_id, uploads=uploads, **fields)
+    if workdir:
+        paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
+        (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
+        if outputs and produced:
+            results = paths.workdir(job_id) / "results"
+            results.mkdir(exist_ok=True)
+            (results / "checkpoint.pt").write_bytes(b"y" * 2048)
+    else:
+        for path in sorted(paths.workdir(job_id).rglob("*"), reverse=True):
+            path.unlink()
+        paths.workdir(job_id).rmdir()
+    return job_id
 
 
 def wait_until(
@@ -226,11 +286,12 @@ def wait_until(
     timeout: float = 30.0,
     what: str = "condition",
     interval: float = 0.05,
-) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+) -> float:
+    """Poll `predicate` until it holds; return how long that took."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
         if predicate():
-            return
+            return time.monotonic() - start
         time.sleep(interval)
     raise AssertionError(f"timed out after {timeout}s waiting for {what}")
 

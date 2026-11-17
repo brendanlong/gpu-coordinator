@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -16,7 +15,7 @@ import pytest
 from gpuc.host import __main__ as host_cli
 from gpuc.host import cleanup, destinations, jobs, paths, queue, runner
 from gpuc.host.jobs import JobSpec
-from tests.conftest import make_spec
+from tests.conftest import make_job, make_spec
 from tests.test_runner import deps, log_of, prepare, run, stopping_after_claim
 
 # -- the policy matrix --------------------------------------------------------
@@ -155,16 +154,8 @@ def test_outputs_are_synced_before_the_workdir_goes(gpuc_home: Path) -> None:
 # -- the clean sweep ----------------------------------------------------------
 
 
-def finished_job(job_id_status: str, *, ended: datetime | None = None, size: int = 8192) -> str:
-    job_id = queue.enqueue(make_spec())
-    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
-    (paths.workdir(job_id) / "blob.bin").write_bytes(b"y" * size)
-    jobs.update_state(
-        job_id,
-        status=job_id_status,
-        ended_at=(ended or datetime.now(UTC)).isoformat(timespec="microseconds"),
-    )
-    return job_id
+def finished_job(status: str, *, days_old: float = 0.0) -> str:
+    return make_job(status=status, days_old=days_old, mirrored=False)
 
 
 def test_clean_removes_every_finished_workdir(gpuc_home: Path) -> None:
@@ -182,7 +173,7 @@ def test_dry_run_deletes_nothing_but_reports_the_same_jobs(gpuc_home: Path) -> N
     result = cleanup.clean(all_finished=True, dry_run=True)
     assert [c.job_id for c in result.removed] == [job_id]
     assert result.freed_bytes > 0
-    assert (paths.workdir(job_id) / "blob.bin").exists()
+    assert (paths.workdir(job_id) / "venv.bin").exists()
     assert jobs.read_state(job_id).workdir_bytes is None
 
 
@@ -191,7 +182,7 @@ def test_clean_never_touches_a_running_job(gpuc_home: Path) -> None:
     finished = finished_job("succeeded")
     result = cleanup.clean(all_finished=True)
     assert [c.job_id for c in result.removed] == [finished]
-    assert (paths.workdir(running) / "blob.bin").exists()
+    assert (paths.workdir(running) / "venv.bin").exists()
     assert any(s.job_id == running and s.why == "status running" for s in result.skipped)
 
 
@@ -219,28 +210,18 @@ def test_clean_leaves_a_job_whose_state_is_corrupt(gpuc_home: Path) -> None:
     paths.state_file(job_id).write_text("{not json")
     result = cleanup.clean(all_finished=True)
     assert not result.removed
-    assert (paths.workdir(job_id) / "blob.bin").exists()
+    assert (paths.workdir(job_id) / "venv.bin").exists()
 
 
 # -- what only the automatic sweep refuses ------------------------------------
 
 
 def job_wanting_its_workdir_kept(policy: str) -> str:
-    job_id = queue.enqueue(make_spec(cleanup=policy))
-    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
-    (paths.workdir(job_id) / "blob.bin").write_bytes(b"y" * 8192)
-    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now())
-    return job_id
+    return make_job(status="failed", days_old=0.0, mirrored=False, cleanup=policy)
 
 
 def job_with_outputs_still_only_here() -> str:
-    spec = make_spec(outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}])
-    job_id = queue.enqueue(spec)
-    results = paths.workdir(job_id) / "results"
-    results.mkdir(parents=True, exist_ok=True)
-    (results / "checkpoint.pt").write_bytes(b"w" * 8192)
-    jobs.update_state(job_id, status="failed", ended_at=jobs.utc_now(), ran=True)
-    return job_id
+    return make_job(status="failed", days_old=0.0, mirrored=False, outputs=True)
 
 
 def test_the_automatic_sweep_leaves_a_job_that_asked_to_keep_its_workdir(
@@ -250,7 +231,7 @@ def test_the_automatic_sweep_leaves_a_job_that_asked_to_keep_its_workdir(
     on_success = job_wanting_its_workdir_kept("on_success")
     result = cleanup.clean(all_finished=True, evidence=cleanup.Evidence(automatic=True))
     assert [c.job_id for c in result.removed] == [on_success]
-    assert (paths.workdir(never) / "blob.bin").exists()
+    assert (paths.workdir(never) / "venv.bin").exists()
     assert any(s.job_id == never and s.why == "cleanup: never" for s in result.skipped)
 
 
@@ -285,7 +266,7 @@ def test_the_automatic_sweep_leaves_a_job_whose_spec_is_unreadable(gpuc_home: Pa
     paths.job_dir(job_id).joinpath("spec.json").write_text("{not json")
     result = cleanup.clean(all_finished=True, evidence=cleanup.Evidence(automatic=True))
     assert not result.removed
-    assert (paths.workdir(job_id) / "blob.bin").exists()
+    assert (paths.workdir(job_id) / "venv.bin").exists()
 
 
 def test_the_purge_implied_sweep_is_guarded_too_when_it_is_automatic(gpuc_home: Path) -> None:
@@ -405,12 +386,11 @@ def test_clean_keeps_spec_state_and_log(gpuc_home: Path) -> None:
 
 
 def test_older_than_only_takes_jobs_past_the_cutoff(gpuc_home: Path) -> None:
-    now = datetime.now(UTC)
-    old = finished_job("succeeded", ended=now - timedelta(days=9))
-    young = finished_job("succeeded", ended=now - timedelta(hours=2))
+    old = finished_job("succeeded", days_old=9)
+    young = finished_job("succeeded", days_old=2 / 24)
     result = cleanup.clean(older_than_days=7.0)
     assert [c.job_id for c in result.removed] == [old]
-    assert (paths.workdir(young) / "blob.bin").exists()
+    assert (paths.workdir(young) / "venv.bin").exists()
 
 
 def test_older_than_skips_a_job_with_no_end_time(gpuc_home: Path) -> None:
@@ -425,7 +405,7 @@ def test_neither_flag_removes_nothing(gpuc_home: Path) -> None:
     job_id = finished_job("succeeded")
     result = cleanup.clean()
     assert not result.removed
-    assert (paths.workdir(job_id) / "blob.bin").exists()
+    assert (paths.workdir(job_id) / "venv.bin").exists()
 
 
 def test_a_workdir_already_gone_is_not_an_error(gpuc_home: Path) -> None:
@@ -511,7 +491,7 @@ def test_host_cli_clean_only_takes_the_named_jobs_however_recent(
     payload = json.loads(capsys.readouterr().out)
     assert [c["job_id"] for c in payload["removed"]] == [wanted]
     assert not paths.workdir(wanted).exists()
-    assert (paths.workdir(other) / "blob.bin").exists()
+    assert (paths.workdir(other) / "venv.bin").exists()
 
 
 def test_host_cli_clean_only_empty_means_none(
@@ -520,7 +500,7 @@ def test_host_cli_clean_only_empty_means_none(
     job_id = finished_job("succeeded")
     assert host_cli.main(["clean", "--only", ""]) == 0
     assert json.loads(capsys.readouterr().out)["removed"] == []
-    assert (paths.workdir(job_id) / "blob.bin").exists()
+    assert (paths.workdir(job_id) / "venv.bin").exists()
 
 
 def test_host_cli_clean_refuses_a_selection_holding_a_job_id_it_does_not_know(
@@ -534,7 +514,7 @@ def test_host_cli_clean_refuses_a_selection_holding_a_job_id_it_does_not_know(
         "refused the whole selection: nothing was removed",
     ]
     assert payload["removed"] == []
-    assert (paths.workdir(job_id) / "blob.bin").exists()
+    assert (paths.workdir(job_id) / "venv.bin").exists()
 
 
 def test_host_cli_clean_only_ignores_a_job_with_no_usable_ended_at(gpuc_home: Path) -> None:

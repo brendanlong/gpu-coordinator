@@ -491,7 +491,12 @@ def test_preempt_is_the_preempt_command(logged_in: Client, stub: StubSession) ->
     status, document = logged_in.post_json(
         f"/api/jobs/{RUNNING_JOB}/preempt", {"host": "gpubox", "priority": "7"}
     )
-    assert status == 400 and "0-99" in document["error"]
+    assert status == 400 and "priority" in document["error"]
+    stub.answers.append({"jobs": [{"job_id": RUNNING_JOB, "status": "preempting", "priority": 7}]})
+    status, document = logged_in.post_json(
+        f"/api/jobs/{RUNNING_JOB}/preempt", {"host": "gpubox", "priority": 7.0}
+    )
+    assert status == 200 and stub.commands[-1] == f"preempt {RUNNING_JOB} --priority 7"
 
 
 def test_set_priority_is_the_set_command_and_checks_the_range(

@@ -244,7 +244,6 @@ class Provider(ABC):
         pod_id: str,
         *,
         report: Callable[[str], None],
-        sleep: Callable[[float], None],
     ) -> None:
         """End `pod_id` and return only once the provider says it is gone.
 
@@ -268,7 +267,7 @@ class Provider(ABC):
                 report(
                     f"terminate {pod_id} failed ({exc}); retrying in {self.terminate_retry_s:g}s"
                 )
-                sleep(self.terminate_retry_s)
+                self._sleep(self.terminate_retry_s)
         status = "unread"
         for _ in range(self.confirm_polls):
             try:
@@ -277,13 +276,13 @@ class Provider(ABC):
                 # The terminate went through; one 5xx on the read must not
                 # turn that into "could not confirm, still billing".
                 report(f"could not read pod {pod_id} after the terminate ({exc}); asking again")
-                sleep(self.confirm_poll_s)
+                self._sleep(self.confirm_poll_s)
                 continue
             if self.is_gone(pod):
                 return
             assert pod is not None
             status = pod.status
-            sleep(self.confirm_poll_s)
+            self._sleep(self.confirm_poll_s)
         raise ProviderError(
             f"pod {pod_id} still {status} {self.confirm_polls * self.confirm_poll_s:.0f}s "
             f"after terminate"

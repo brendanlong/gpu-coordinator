@@ -15,7 +15,6 @@ def test_enqueue_writes_the_spec_and_a_queued_state(gpuc_home: Path) -> None:
     state = jobs.read_state(job_id)
     assert (state.status, state.priority, state.intent) == ("queued", 7, None)
     assert paths.workdir(job_id).is_dir()
-    assert paths.outputs_dir(job_id).is_dir()
     assert paths.log_file(job_id).exists()
     assert queue.list_queued() == [queue.QueueEntry(7, job_id)]
 
@@ -320,8 +319,8 @@ def test_a_job_needing_no_gpu_does_not_count_as_something_waiting(gpuc_home: Pat
     queue.enqueue(make_spec(gpus=0, priority=10))
     with pytest.raises(ValueError, match="nothing else is queued on this host for a GPU"):
         queue.preempt(job_id)
-    later = queue.enqueue(make_spec(priority=20))
-    assert queue.queued_ahead_of(job_id, 50) == queue.QueueEntry(20, later)
+    queue.enqueue(make_spec(priority=20))
+    assert queue.preempt(job_id) == "preempting"
 
 
 def test_preempt_refuses_a_job_holding_no_gpu(gpuc_home: Path) -> None:

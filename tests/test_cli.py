@@ -463,13 +463,6 @@ def test_host_list_and_remove(control_env: Path, capsys: pytest.CaptureFixture[s
     assert "no hosts registered" in capsys.readouterr().out
 
 
-def test_commands_on_an_unknown_host_explain_themselves(
-    control_env: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["host", "bootstrap", "nope"]) == EXIT_NOT_FOUND
-    assert "no host named 'nope'" in capsys.readouterr().err
-
-
 def test_submit_without_a_host_says_which_flag_is_missing(
     control_env: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

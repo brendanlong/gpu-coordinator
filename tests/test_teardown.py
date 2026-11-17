@@ -76,7 +76,6 @@ def terminate(provider: FakeProvider, target: str, **kwargs: Any) -> teardown.Te
         registry=load_registry(),
         providers={provider.name: provider},
         report=lambda _: None,
-        sleep=lambda _: None,
         **kwargs,
     )
 
@@ -435,7 +434,6 @@ def test_a_pod_found_at_one_provider_never_takes_another_providers_host(
         providers={"runpod": provider, "vast": vast},
         force=True,
         report=lambda _: None,
-        sleep=lambda _: None,
     )
     assert result.terminated and result.target.entry is None
     assert vast.terminated == ["pod1"] and provider.terminated == []

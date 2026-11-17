@@ -31,7 +31,7 @@ from gpuc.host import dispatcher as host_dispatcher
 from gpuc.host import procs as procinfo
 from gpuc.host.dispatcher import Dispatcher, DispatcherDeps
 from gpuc.host.jobs import HostConfig, Outcome
-from tests.conftest import FAKE_GPUS, fake_smi, make_spec
+from tests.conftest import FAKE_GPUS, fake_smi, make_job, make_spec
 from tests.test_runner import deps as runner_deps
 
 
@@ -1152,14 +1152,7 @@ def test_spawned_children_get_the_home_tool_dirs_on_path(
 
 
 def finished_job(days_old: float = 30.0, *, mirrored: bool = True) -> str:
-    job_id = queue.enqueue(make_spec())
-    ended = (datetime.now(UTC) - timedelta(days=days_old)).isoformat()
-    jobs.update_state(job_id, status="succeeded", ended_at=ended)
-    if mirrored:
-        jobs.record_upload(job_id, f"s3://b/gpuc/h/jobs/{job_id}", None, ok_at=ended)
-    paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
-    (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
-    return job_id
+    return make_job(days_old=days_old, mirrored=mirrored, prefix="s3://b/gpuc/h")
 
 
 def configure_retention(days: float | None, workdir_days: float | None = None) -> None:
@@ -1382,6 +1375,36 @@ def test_the_drain_gives_up_after_three_tries_and_marks_the_outputs_lost(
     # The pod still goes away: it is billing, and a bucket we cannot reach is
     # no reason to keep paying for it.
     assert terminated == ["pod-1"]
+
+
+def test_the_drain_uploads_with_the_jobs_secrets_and_its_spec_env(
+    gpuc_home: Path, fake_aws: None
+) -> None:
+    """The same environment as the runner's own uploads: a spec `env` that
+    points `aws` at another endpoint must not be dropped on the last try."""
+    configure_pod(idle_minutes=0.0)
+    spec = make_spec(
+        outputs=[{"path": "results", "s3": "s3://bucket/{job_id}"}],
+        env={"AWS_ENDPOINT_URL": "https://r2.example"},
+    )
+    job_id = queue.enqueue(spec)
+    jobs.update_state(job_id, status="succeeded", reason="sync", ended_at=jobs.utc_now(), ran=True)
+    (paths.workdir(job_id) / "results").mkdir(parents=True, exist_ok=True)
+    (paths.workdir(job_id) / "results" / "a.txt").write_text("hi\n")
+    paths.job_env_file(job_id).write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+    uploads: list[dict[str, str]] = []
+
+    def recording(argv: list[str], timeout: float | None = None, env: sync.Env = None):
+        if f"s3://bucket/{job_id}" in argv:
+            assert env is not None
+            uploads.append({k: env.get(k, "") for k in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID")})
+        return sync.CommandResult(argv, 0, "")
+
+    dispatcher, _ = make_dispatcher()
+    dispatcher.deps.command_runner = recording
+    dispatcher.drain_and_terminate("test")
+    assert outputs_uploaded(job_id)
+    assert uploads == [{"AWS_ENDPOINT_URL": "https://r2.example", "AWS_ACCESS_KEY_ID": "AKIA"}]
 
 
 def test_giving_up_on_outputs_marks_them_lost_and_changes_nothing_else(
@@ -1927,6 +1950,18 @@ def test_a_shared_card_somebody_else_is_on_is_not_borrowed(gpuc_home: Path) -> N
     assert "is in use" in paths.dispatcher_log().read_text()
 
 
+def test_nothing_is_borrowed_when_nvidia_smi_will_not_answer(gpuc_home: Path) -> None:
+    dispatcher, _ = shared_host()
+    *_, borrower = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
+
+    def broken(args: list[str]) -> str:
+        raise gpus.GpuError("nvidia-smi exited 9")
+
+    dispatcher.deps.smi = broken
+    dispatcher.run_once()
+    assert jobs.read_state(borrower).status == "queued"
+
+
 def test_two_borrowers_in_one_pass_do_not_get_the_same_card(gpuc_home: Path) -> None:
     dispatcher, _ = shared_host()
     *_, first, second = enqueue_in_order(
@@ -2027,9 +2062,9 @@ def test_a_shared_entry_that_names_no_card_is_logged_and_skipped(gpuc_home: Path
     assert "config.shared_gpus lists 9" in paths.dispatcher_log().read_text()
 
 
-def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) -> None:
-    """The preflight would be an nvidia-smi exec every two seconds if it were
-    taken unconditionally, and most passes have nothing that could use it."""
+def test_a_pass_reads_nvidia_smi_once_however_many_borrow(gpuc_home: Path) -> None:
+    """The shared cards' readings come from the pass's own card table, so a
+    borrower costs no second exec and is judged at the same instant."""
     asked: list[list[str]] = []
     dispatcher, _ = shared_host()
     inner = dispatcher.deps.smi
@@ -2041,14 +2076,13 @@ def test_nothing_is_sampled_when_no_queued_job_wants_to_borrow(gpuc_home: Path) 
     dispatcher.deps.smi = counting
     enqueue_in_order({"gpus": 1})
     dispatcher.run_once()
-    assert len(asked) == 1, "only the pass's own card table"
+    assert len(asked) == 1
 
-    # Two borrowers, one pass: one sample, judged the same way for both.
     asked.clear()
     enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
     queue.enqueue(make_spec(gpus=1, use_shared=True))
     dispatcher.run_once()
-    assert len(asked) == 2, "the card table and one sample"
+    assert len(asked) == 1
 
 
 # -- automatic preemption -----------------------------------------------------
@@ -2756,7 +2790,7 @@ def test_a_dispatcher_takes_over_a_queue_whose_owner_went_quiet(gpuc_home: Path)
     assert dispatcher.run(lock) == 0
     assert owner.STALE_S <= clock.t - 1000.0 <= owner.CLAIM_WAIT_S
     record = owner.current()
-    assert record is not None and record[0] == dispatcher.instance
+    assert record is not None and record.instance == dispatcher.instance
     assert "taking this queue over from another-pod/another-boot" in (
         paths.dispatcher_log().read_text()
     )
@@ -2815,12 +2849,12 @@ def test_a_beat_renews_only_its_own_claim(gpuc_home: Path) -> None:
     os.utime(paths.owner_file(), (stale, stale))
     lock.beat(force=True)
     record = owner.current()
-    assert record is not None and record[1] > stale + 50
+    assert record is not None and record.renewed > stale + 50
     another_machine_owns_the_queue(renewed_s_ago=100)
     lock.beat(force=True)
     record = owner.current()
-    assert record is not None and record[0] == "another-pod/another-boot"
-    assert record[1] < time.time() - 50
+    assert record is not None and record.instance == "another-pod/another-boot"
+    assert record.renewed < time.time() - 50
 
 
 def test_a_replaced_dispatcher_writes_nothing_and_exits(gpuc_home: Path) -> None:

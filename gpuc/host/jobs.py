@@ -281,6 +281,15 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return out
 
 
+def job_env(spec: JobSpec, base: Mapping[str, str]) -> dict[str, str]:
+    """`base`, then the job's secrets file, then its spec `env`: what the job
+    and every upload made on its behalf run with."""
+    env = dict(base)
+    env.update(parse_env_file(paths.job_env_file(spec.job_id)))
+    env.update(spec.env)
+    return env
+
+
 @dataclass
 class Output:
     path: str

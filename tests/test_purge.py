@@ -8,61 +8,15 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from gpuc.host import __main__ as host_cli
-from gpuc.host import baseline, cleanup, destinations, jobs, paths, queue
+from gpuc.host import baseline, cleanup, destinations, jobs, paths
 from gpuc.host.jobs import HostConfig
-from tests.conftest import make_spec
-
-PREFIX = "s3://bucket/gpuc/test-host"
-OUTPUT = {"path": "results", "s3": "s3://bucket/exp/{job_id}"}
-
-
-def make_job(
-    *,
-    status: str = "succeeded",
-    days_old: float = 30.0,
-    mirrored: bool = True,
-    outputs: bool = False,
-    output: dict[str, Any] = OUTPUT,
-    outputs_uploaded: bool = False,
-    produced: bool = True,
-    workdir: bool = True,
-    ran: bool = True,
-) -> str:
-    spec = make_spec(outputs=[output] if outputs else [])
-    job_id = queue.enqueue(spec)
-    ended = datetime.now(UTC) - timedelta(days=days_old)
-    fields: dict[str, Any] = {"status": status, "ran": ran}
-    if status in jobs.FINISHED_STATUSES:
-        fields["ended_at"] = ended.isoformat()
-    uploads: list[jobs.Upload] = []
-    if mirrored:
-        uploads.append(jobs.Upload(to=f"{PREFIX}/jobs/{job_id}", ok_at=ended.isoformat()))
-    if outputs_uploaded:
-        uploads += [
-            jobs.Upload(to=destination.uri, output=output.path, ok_at=ended.isoformat())
-            for output in spec.outputs
-            for destination in destinations.of(output, job_id)
-        ]
-    jobs.update_state(job_id, uploads=uploads, **fields)
-    if workdir:
-        paths.workdir(job_id).mkdir(parents=True, exist_ok=True)
-        (paths.workdir(job_id) / "venv.bin").write_bytes(b"x" * 4096)
-        if outputs and produced:
-            results = paths.workdir(job_id) / "results"
-            results.mkdir(exist_ok=True)
-            (results / "checkpoint.pt").write_bytes(b"y" * 2048)
-    else:
-        for path in sorted(paths.workdir(job_id).rglob("*"), reverse=True):
-            path.unlink()
-        paths.workdir(job_id).rmdir()
-    return job_id
+from tests.conftest import JOB_PREFIX as PREFIX
+from tests.conftest import OUTPUT, make_job
 
 
 def with_prefix() -> None:

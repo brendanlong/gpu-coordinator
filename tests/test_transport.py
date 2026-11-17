@@ -203,16 +203,6 @@ def test_git_tracked_files_lists_the_repo() -> None:
     assert "docs/ARCHITECTURE.md" in files
 
 
-def test_make_transport_picks_the_right_kind(tmp_path: Path) -> None:
-    assert isinstance(transport.make_transport("local"), LocalTransport)
-    remote = transport.make_transport(
-        "gpubox", ssh="u@h", port=2200, known_hosts=tmp_path / "known_hosts"
-    )
-    assert isinstance(remote, SshTransport)
-    assert remote.control_dir == transport.control_socket_dir()
-    assert remote.known_hosts == tmp_path / "known_hosts"
-
-
 def test_a_missing_binary_is_a_transport_error_about_this_machine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -268,7 +258,13 @@ def test_rsync_ssh_command_quotes_a_key_path_with_a_space(tmp_path: Path) -> Non
     key = tmp_path / "my keys" / "id_ed25519"
     key.parent.mkdir()
     key.touch()
-    ssh = SshTransport(host="gpubox", target="user@box", key=str(key))
+    ssh = SshTransport(
+        host="gpubox",
+        target="user@box",
+        key=str(key),
+        control_dir=SHORT_CONTROL_DIR,
+        known_hosts=tmp_path / "known_hosts",
+    )
     command = ssh.rsync_ssh_command()
     assert f"'{key}'" in command
     assert shlex.split(command) == ["ssh", *ssh.ssh_options()]
@@ -414,9 +410,11 @@ def test_control_socket_dir_falls_back_to_a_per_uid_tmp_dir(
     assert transport.control_socket_dir() == Path(f"/tmp/gpuc-{os.getuid()}")
 
 
-def test_building_an_ssh_command_makes_the_control_socket_dir_0700() -> None:
+def test_building_an_ssh_command_makes_the_control_socket_dir_0700(tmp_path: Path) -> None:
     shutil.rmtree(SHORT_CONTROL_DIR, ignore_errors=True)
-    SshTransport(host="h", target="u@h", control_dir=SHORT_CONTROL_DIR).argv("true")
+    SshTransport(
+        host="h", target="u@h", control_dir=SHORT_CONTROL_DIR, known_hosts=tmp_path / "kh"
+    ).argv("true")
     assert stat.S_IMODE(SHORT_CONTROL_DIR.stat().st_mode) == 0o700
 
 
