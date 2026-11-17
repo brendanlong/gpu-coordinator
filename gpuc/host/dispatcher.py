@@ -1112,6 +1112,10 @@ class Dispatcher:
             if not isinstance(decision, plan.Assigned):
                 continue
             self._launch(job_id, decision.gpus, attempts[job_id], decision.held_for)
+        if self.replaced is not None:
+            # A launch found the queue taken over: the stops this walk chose
+            # are about jobs that may be the new owner's to run now.
+            return
         self._preempt_for_waiting(decisions, requests, pool.preemptable)
 
     def _launch(

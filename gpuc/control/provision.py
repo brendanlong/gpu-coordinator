@@ -403,7 +403,9 @@ def _try_offer(
         result = deps.bootstrap(
             entry, settings, transport=transport, report=progress, health_options=health_options
         )
-        entry = open_registry().require(entry.name)
+        # Somebody may have run `gpuc host remove` meanwhile; the pod is
+        # healthy and its own now, so that is no reason to terminate it.
+        entry = open_registry().registry.hosts.get(entry.name, entry)
         progress(
             f"host {name} ready: dispatcher pid {result.dispatcher_pid}, "
             f"idle terminate {idle_minutes:g} min"

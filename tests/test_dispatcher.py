@@ -2886,6 +2886,22 @@ def test_a_replaced_dispatcher_launches_nothing(gpuc_home: Path) -> None:
     assert spawned == {}
 
 
+def test_a_dispatcher_replaced_mid_pass_stops_no_job(gpuc_home: Path) -> None:
+    """The takeover lands between the pass's start and its first launch: the
+    walk had already decided to stop the cheap job, and the job may by now be
+    the new owner's to run."""
+    cheap = queue.enqueue(make_spec(gpus=2, priority=80, auto_preempt=True))
+    dispatcher, _ = make_dispatcher()
+    dispatcher.run_once()
+    queue.enqueue(make_spec(gpus=2, priority=10))
+    queue.enqueue(make_spec(gpus=0, priority=20))
+    another_machine_owns_the_queue()
+    dispatcher._queued = None
+    dispatcher.launch_ready()
+    assert dispatcher.replaced == "another-pod/another-boot"
+    assert not queue.is_preempted(cheap)
+
+
 def test_a_replaced_rental_does_not_terminate_or_leave_the_queue_draining(
     gpuc_home: Path,
 ) -> None:
