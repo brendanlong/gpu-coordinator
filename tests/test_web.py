@@ -353,33 +353,11 @@ def test_status_is_the_status_json_document(logged_in: Client, one_host: None) -
     assert host["finished"][0]["reason"] == "timeout"
 
 
-def test_status_narrows_to_one_host_and_refuses_a_bad_since(
-    logged_in: Client, one_host: None
-) -> None:
-    status, document = logged_in.get_json("/api/status?host=gpubox&recent=1&since=24h")
+def test_status_narrows_to_one_host(logged_in: Client, one_host: None) -> None:
+    status, document = logged_in.get_json("/api/status?host=gpubox")
     assert status == 200 and len(document["hosts"]) == 1
     status, document = logged_in.get_json("/api/status?host=nope")
     assert status == 404 and "no host named 'nope'" in document["error"]
-    status, document = logged_in.get_json("/api/status?since=soon")
-    assert status == 400 and document["exit_code"] == EXIT_USAGE
-
-
-def test_all_is_a_flag_and_zero_means_no(logged_in: Client, one_host: None) -> None:
-    """`bool("0")` is True: `?all=0` used to list every index-only job."""
-    from gpuc.control.s3index import IndexEntry, LocalIndex
-
-    LocalIndex().record(IndexEntry(job_id="20260101-000000-aaaaaa", host="gone-box", name="lost"))
-    for query, listed in [
-        ("all=1", True),
-        ("all=true", True),
-        ("all=0", False),
-        ("all=false", False),
-        ("all=", False),
-        ("", False),
-    ]:
-        status, document = logged_in.get_json(f"/api/status?{query}")
-        assert status == 200, query
-        assert bool(document["unhosted"]) is listed, query
 
 
 def test_hosts_and_version_are_the_list_and_version_documents(
@@ -464,6 +442,9 @@ def test_cancel_is_the_cancel_command(logged_in: Client, stub: StubSession) -> N
     stub.answers.append({"jobs": [{"job_id": RUNNING_JOB, "status": "cancelling"}]})
     status, document = logged_in.post_json(f"/api/jobs/{RUNNING_JOB}/cancel", {"host": "gpubox"})
     assert status == 200
+    # What the page shows: the CLI's own line for it.
+    text = document.pop("text")
+    assert RUNNING_JOB in text and "cancelling" in text
     assert document == {
         "schema_version": 2,
         "jobs": [

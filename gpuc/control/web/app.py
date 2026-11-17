@@ -28,7 +28,6 @@ from importlib import resources
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from gpuc.control import status as status_mod
 from gpuc.control.actions import (
     Answer,
     UsageError,
@@ -37,13 +36,11 @@ from gpuc.control.actions import (
     exit_code_for,
     failure_message,
     hosts_document,
-    jobs_answer,
     preempt_jobs,
     read_log,
     registry_answer,
     remove_host,
     set_jobs,
-    since_seconds,
     status,
     version_document,
 )
@@ -131,6 +128,12 @@ class Response:
         carrying every host that answered, exactly as the CLI exits 1 having
         printed them."""
         return Response.json({**answer.document, **extra}, http_status(answer.exit_code))
+
+    @staticmethod
+    def action(answer: Answer) -> Response:
+        """An action's answer, with the text the CLI prints for it, which is
+        what the page tells the user."""
+        return Response.answer(answer, text=answer.text)
 
     @staticmethod
     def redirect(location: str) -> Response:
@@ -266,14 +269,7 @@ class Dashboard:
         with nobody watching, so `forget_gone_rentals` is the CLI's alone."""
         settings = self.load_settings()
         read = read_registry()
-        result = status(
-            read,
-            settings,
-            host=request.param("host") or None,
-            all_jobs=flag_param(request, "all"),
-            recent=int_param(request, "recent", status_mod.RECENT_FINISHED),
-            since_s=since_seconds(request.param("since"), "since"),
-        )
+        result = status(read, settings, host=request.param("host") or None)
         return Response.answer(result.answer(), gathered_at=utc_now())
 
     def api_hosts(self, request: Request) -> Response:
@@ -291,7 +287,7 @@ class Dashboard:
         """`gpuc host remove`: the one host action the CLI has that needs no
         provider, so the page offers it too."""
         assert request.match is not None
-        return Response.json(remove_host(request.match.group(1)))
+        return Response.action(remove_host(request.match.group(1)))
 
     def api_logs(self, request: Request) -> Response:
         job_id = job_id_of(request)
@@ -302,17 +298,13 @@ class Dashboard:
     def api_cancel(self, request: Request) -> Response:
         job_id = job_id_of(request)
         body = request.json()
-        return Response.answer(
-            jobs_answer(cancel_jobs([job_id], host_of(body), self.load_settings()))
-        )
+        return Response.action(cancel_jobs([job_id], host_of(body), self.load_settings()))
 
     def api_preempt(self, request: Request) -> Response:
         job_id = job_id_of(request)
         body = request.json()
-        return Response.answer(
-            jobs_answer(
-                preempt_jobs([job_id], body.get("priority"), host_of(body), self.load_settings())
-            )
+        return Response.action(
+            preempt_jobs([job_id], body.get("priority"), host_of(body), self.load_settings())
         )
 
     def api_set(self, request: Request) -> Response:
@@ -320,9 +312,7 @@ class Dashboard:
         job_id = job_id_of(request)
         body = request.json()
         patch = {name: value for name, value in body.items() if name != "host"}
-        return Response.answer(
-            jobs_answer(set_jobs([job_id], patch, host_of(body), self.load_settings()))
-        )
+        return Response.action(set_jobs([job_id], patch, host_of(body), self.load_settings()))
 
 
 def job_id_of(request: Request) -> str:
@@ -340,16 +330,6 @@ def host_of(body: dict[str, Any]) -> str | None:
     if not isinstance(host, str):
         raise UsageError("`host` must be a host name")
     return host
-
-
-FALSE_WORDS = {"", "0", "false", "no", "off"}
-
-
-def flag_param(request: Request, name: str) -> bool:
-    """A boolean query parameter: absent, empty, `0`, `false`, `no` and `off`
-    are false. `bool("0")` is True, which is how `?all=0` asked for everything."""
-    raw = request.param(name)
-    return raw is not None and raw.strip().lower() not in FALSE_WORDS
 
 
 def int_param(request: Request, name: str, default: int) -> int:

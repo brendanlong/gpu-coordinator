@@ -641,7 +641,7 @@ def connection_document(
     }
 
 
-def remove_host(name: str) -> dict[str, Any]:
+def remove_host(name: str) -> Answer:
     """Forget a host here. Nothing on the host, or at its provider, changes.
 
     A rental in particular is not terminated: after handoff it ends itself
@@ -660,7 +660,8 @@ def remove_host(name: str) -> dict[str, Any]:
         )
         # By pod id, not by name: this machine has just forgotten the name.
         notes.append(f"`gpuc host terminate {entry.rental.pod_id}` ends it now instead")
-    return {"host": entry.name, "kind": entry.kind, "pod_id": entry.pod_id, "notes": notes}
+    document = {"host": entry.name, "kind": entry.kind, "pod_id": entry.pod_id, "notes": notes}
+    return Answer(document, "\n".join([f"removed host {name}", *[f"  {n}" for n in notes]]))
 
 
 def init_config(*, force: bool) -> dict[str, Any]:
@@ -1033,15 +1034,16 @@ class Done:
         }
 
 
-def jobs_answer(done: Sequence[Done], text: str | None = None) -> Answer:
+def jobs_answer(done: Sequence[Done], line: Callable[[Done], str]) -> Answer:
     """The answer of every command that acts on jobs by id: `{jobs, errors}`,
-    one entry per id. Exit 4 when an id is unknown and 1 when anything else
-    failed, as `wait` does -- after every other id has been carried out, since
-    one typo in a list of twenty must not cost the nineteen."""
+    one entry per id, and a `line` per job it acted on. Exit 4 when an id is
+    unknown and 1 when anything else failed, as `wait` does -- after every
+    other id has been carried out, since one typo in a list of twenty must not
+    cost the nineteen."""
     errors = [job.error for job in done if job.error is not None]
     return Answer(
         {"jobs": [job.document() for job in done], "errors": errors},
-        text,
+        "\n".join(line(job) for job in done if job.error is None),
         failures=errors,
         outcome=EXIT_NOT_FOUND if any(job.missing for job in done) else None,
     )
@@ -1221,19 +1223,28 @@ def ended_on_gone_host(
     )
 
 
-def cancel_jobs(job_ids: Sequence[str], host: str | None, settings: Settings) -> list[Done]:
+def cancel_jobs(job_ids: Sequence[str], host: str | None, settings: Settings) -> Answer:
     """The host's own word for what it did to each: `cancelled` for a queued
     job it dequeued, `cancelling` for a running one whose runner has been
     marked, a finished job's own status. A job whose host is gone has already
     ended, and the mirror says how -- the same answer its host would have
     given."""
     done, _ = job_verbs("cancel", job_ids, host, settings, ended_is_answer=True)
-    return done
+
+    def line(job: Done) -> str:
+        whence = (
+            ", which is gone: it had already ended (from the S3 mirror)"
+            if job.source == "mirror"
+            else ""
+        )
+        return f"job {job.job_id} on host {job.host}{whence}: {job.fields['status']}"
+
+    return jobs_answer(done, line)
 
 
 def preempt_jobs(
     job_ids: Sequence[str], priority: int | None, host: str | None, settings: Settings
-) -> list[Done]:
+) -> Answer:
     """Stop running jobs and put them back in their hosts' queues.
 
     Each keeps its id and re-runs from the start as its next attempt, from
@@ -1253,7 +1264,16 @@ def preempt_jobs(
         args="" if priority is None else f" --priority {priority}",
         mirror=None if priority is None else {"priority": priority},
     )
-    return done
+
+    def line(job: Done) -> str:
+        # The priority it comes back at is what decides which job runs next:
+        # one waiting at the *same* priority does not go first, since the
+        # preempted job was submitted earlier and its id sorts ahead.
+        priority = job.fields.get("priority")
+        at = f"; it will be queued again at priority {priority}" if priority is not None else ""
+        return f"job {job.job_id} on host {job.host}: {job.fields['status']}{at}"
+
+    return jobs_answer(done, line)
 
 
 def placement_after(session: HostSession, job_id: str, settings: Settings) -> dict[str, Any]:
@@ -1304,7 +1324,7 @@ def mirror_spec_fields(job_id: str, fields: Mapping[str, Any], settings: Setting
 
 def set_jobs(
     job_ids: Sequence[str], patch: Mapping[str, Any], host: str | None, settings: Settings
-) -> list[Done]:
+) -> Answer:
     """Change queued or running jobs' settings (`gpuc.host.settable`), each
     one all or nothing. A job whose priority moved says where it now sits.
 
@@ -1337,7 +1357,22 @@ def set_jobs(
         for job in moved:
             assert job.host is not None
             job.fields.update(status_mod.queue_placement(views[job.host], job.job_id))
-    return done
+
+    def line(job: Done) -> str:
+        what = ", ".join(_described(settable.BY_FIELD[f].option, job.fields[f]) for f in patch)
+        said = f"job {job.job_id} on host {job.host}: {what}"
+        placed = status_mod.queue_note(job.fields) if "priority" in patch else None
+        return f"{said}\n{placed}" if placed else said
+
+    return jobs_answer(done, line)
+
+
+def _described(name: str, value: Any) -> str:
+    if value is None:
+        return f"{name} cleared"
+    if name == "priority":
+        return f"priority {value}"
+    return f"{name} {value:g} min"
 
 
 @dataclass

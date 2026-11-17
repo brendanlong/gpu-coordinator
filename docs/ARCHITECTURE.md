@@ -1014,7 +1014,8 @@ so it would otherwise choose what its keys reach.
 ## Web dashboard (`gpuc web serve`)
 
 **Nothing the dashboard shows or does exists only in
-the dashboard**, and anything it gains lands in `actions` first. An answer
+the dashboard**, and anything it gains lands in `actions` first. It may show
+less than the CLI. An answer
 goes on the wire under the HTTP status its exit code maps to
 (`exits.http_status`); the API's failure document is `--json`'s.
 

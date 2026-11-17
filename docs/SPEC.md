@@ -202,9 +202,8 @@ backup destinations. Adding another of either changes nothing else in this docum
 - **Every command that reports something supports JSON output**, and exit
   codes distinguish "failed", "usage", "local state unreadable, so unknown"
   and "no such job or host".
-- **The web app shows the same information and offers the same actions as
-  the CLI, and nothing else.** A capability exists in the CLI first, and the
-  web app calls the same code.
+- **The web app offers nothing the CLI does not.** It may show and do less;
+  a capability exists in the CLI first, and the web app calls the same code.
 - Monitoring asks the host. The mirror is read only when the host is gone.
 
 ## Upgrades and compatibility
