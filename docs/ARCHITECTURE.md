@@ -181,8 +181,10 @@ defaults.
 `gpuc submit` expands `{job_id}` in output destinations and refuses an `s3` or
 `hf_path` whose expanded form does not contain the id (no `hf_path` means the
 id itself). Output namespaces are unique by construction; there is no other
-overwrite guard anywhere. The S3 mirror holds the spec with `{job_id}`
-unexpanded, so `gpuc requeue` expands it with the new id.
+overwrite guard anywhere. The host takes destinations as submitted and never
+formats them again (an escaped `{{` is a literal brace by then); it fills
+`{job_id}` into `path` itself, which submit only checks. The S3 mirror holds
+the spec with `{job_id}` unexpanded, so `gpuc requeue` expands it with the new id.
 
 Job id: `YYYYMMDD-HHMMSS-<6 hex>`, assigned by `gpuc submit`. Dispatch order
 is the queue's lexical order in `(priority, job_id)`; two jobs submitted in

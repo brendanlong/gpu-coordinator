@@ -1950,6 +1950,18 @@ def test_a_shared_card_somebody_else_is_on_is_not_borrowed(gpuc_home: Path) -> N
     assert "is in use" in paths.dispatcher_log().read_text()
 
 
+def test_nothing_is_borrowed_when_nvidia_smi_will_not_answer(gpuc_home: Path) -> None:
+    dispatcher, _ = shared_host()
+    *_, borrower = enqueue_in_order(*filling_the_owned_cards(), {"gpus": 1, "use_shared": True})
+
+    def broken(args: list[str]) -> str:
+        raise gpus.GpuError("nvidia-smi exited 9")
+
+    dispatcher.deps.smi = broken
+    dispatcher.run_once()
+    assert jobs.read_state(borrower).status == "queued"
+
+
 def test_two_borrowers_in_one_pass_do_not_get_the_same_card(gpuc_home: Path) -> None:
     dispatcher, _ = shared_host()
     *_, first, second = enqueue_in_order(
