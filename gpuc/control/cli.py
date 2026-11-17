@@ -1745,9 +1745,9 @@ def add_bootstrap_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-bootstrap",
         action="store_true",
-        help="enqueue even if the host's package is older than this machine's; without it, "
-        "a host on another commit (or none) gets the package re-synced and its dispatcher "
-        "restarted first",
+        help="enqueue whatever build the host is on; without it, a host on a different build "
+        "gets the package re-synced and its dispatcher restarted first, and a host never "
+        "bootstrapped is refused",
     )
 
 

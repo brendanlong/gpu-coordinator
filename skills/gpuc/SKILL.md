@@ -259,21 +259,11 @@ gpuc status --json | jq '[.hosts[].running[] | {job_id, name, phase, elapsed_s, 
 ```
 
 The document is `{schema_version, hosts: [...], unhosted: [...], errors: [...]}`.
-Each host has `name, kind, state, reachable, pkg_commit,
-dispatcher{alive, heartbeat_age_s}, provider_util, gpus, queued,
-running, finished, errors, warnings`; `state` is `answered`, `unaskable` (a
-failure, with the reason in `errors`; it may still hold its jobs) or `gone`
-(the rental ended: not a failure). Each job in the three lists has `job_id,
-name, status, reason, problems, upload_errors, phase, priority, attempt,
-requeued_from, elapsed_s, util, util_mean, util_samples, progress_pct, eta, eta_s,
-estimated_runtime_min, max_runtime_min, progress_error, gpus, gpus_requested, use_shared,
-starts_in_s, starts_at, starts_unknown, iso, ended_at, outputs_pending`
-(`starts_*` are null unless the job is queued). `unhosted` is `--all`'s list of
-jobs only the index knows, each `{job_id, name, host, host_state, status,
-requeue, requeued_from, submitted_at, s3_prefix, outputs_lost}`. **Requeue one only if
-`requeue` is true**: an `unaskable` host may still be running that job, and a
-second copy is not recovery. Each card in `gpus` has `shared`, `state` (`free`,
-`busy`, `in_use` or `unavailable`), `busy_job`, `memory_mib` and `utilization_pct`.
+A host's `state` is `answered`, `unaskable` (a failure, with the reason in
+`errors`; it may still hold its jobs) or `gone` (the rental ended: not a
+failure). `unhosted` is `--all`'s list of jobs only the index knows. **Requeue
+one only if `requeue` is true**: an `unaskable` host may still be running that
+job, and a second copy is not recovery.
 
 `priority` (0-99, **lower runs first**) is the field that explains queue order,
 and `queued` is already in dispatch order. `starts_in_s` is when that job's
@@ -286,18 +276,10 @@ unchanged by the flag. Prefer it to scraping any of the text output.
 
 | command | the document |
 | --- | --- |
-| `submit`, `requeue` | `{job_id, host, requeued_from, notes[], queue_position, queue_length, dispatched, starts_in_s, starts_at, starts_unknown}`; the queue fields are all null when the host could not be asked again (the job is queued regardless), and `starts_unknown` is why there is no start time |
-| `logs` | `{job_id, host, source, location, lines[], notes[]}`; `source` is `host` or `s3`. Not with `-f` (exit 2) |
-| `wait` | `{jobs[], errors[]}`, once every job has ended. Each of `jobs[]` is that job's final state in the shape `status --json` uses, plus `host`, `source` (`host` or `mirror`) and `error`. **Check `error`, not `status`**: when it is not null, `status` is only the last thing its host managed to say. Exit 1 unless every job succeeded |
+| `wait` | `{jobs[], errors[]}`, once every job has ended. **Check each job's `error`, not its `status`**: when it is not null, `status` is only the last thing its host managed to say. Exit 1 unless every job succeeded |
 | `status <jobid> ...` | `wait`'s document as things stand now. Exit 4 if an id is unknown, 1 if any other job has an `error`, else 0 however the jobs went |
-| `cancel`, `preempt`, `set` | `{jobs[], errors[]}`, one entry per id: `{job_id, host, source, error, warnings[]}` plus `status` and the verb's own fields (`priority`; each field `set` changed, and with `priority` the queue fields of `submit`). **Check `error`**: when it is set the host did not confirm the change, and the verb's fields are absent. A `warnings` entry means the mirrored spec kept the old value, so a `requeue` would not carry it. Exit 4 if an id is unknown, else 1 if any `error` |
-| `pods` | `{pods[], hourly_usd, others[], notes[]}` |
-| `version` | `{version, commit, source, dirty, python, executable, hosts[], errors[]}` |
-| `host list` | `{hosts[], errors[]}` |
-| `host quote` | `{provider, gpu_count, offers[], offers_found, matching_rentals[], would_refuse}`; each offer's `price_usd_hr` is for the whole pod, and `offers[]` is in the order `host rent` would try them |
-| `host remove` | `{host, kind, pod_id, notes[]}`; a rental is not terminated by this |
-| `host terminate` | `{host, pod_id, pod_name, pod_status, cost_usd_hr, checked, running[], queued[], outputs_pending[], terminated, forgotten, notes[]}`; `checked` false means the host could not be asked, so the three lists are empty for want of an answer |
-| `clean` | `{host, dry_run, purge, freed_bytes, removed[], skipped[], purged[], errors[], ...}` |
+| `cancel`, `preempt`, `set` | `{jobs[], errors[]}`, one entry per id. **Check `error`**: when it is set the host did not confirm the change. Read `warnings`: one may say the mirrored spec kept the old value, so a `requeue` would not carry it. Exit 4 if an id is unknown, else 1 if any `error` |
+| `host terminate` | `checked` false means the host could not be asked, so `running`, `queued` and `outputs_pending` are empty for want of an answer |
 
 Rules, and they are not optional:
 
@@ -368,7 +350,7 @@ Rules, and they are not optional:
   stopped is `UNASKABLE`, exit 1, and stays until `gpuc host terminate <name>`
   ends it or `gpuc host remove <name>` forgets it and leaves it billing.
 - `gpuc host add <name> --pod <pod-id>` adopts a pod this machine did not
-  create, and is the fix for a `registered by an earlier build` warning.
+  create.
 - Only act on pods named `gpuc-*`. Others belong to other people.
 
 ## Housekeeping
